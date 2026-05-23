@@ -1,0 +1,506 @@
+{
+  "branchName": "feat/runner-capability-enforcement",
+  "description": "Runner-Trait-Hygiene Phase 2. Add a typed RunnerCapability enum and LlmRunner::supports trait method (default false) so dispatch can refuse any RunnerOpts field encoding a capability the runner does not support. Eliminates silent `_` destructures of provider-asymmetric fields (use_pty: _ on Grok today; future fields automatically protected). Both production runners override `supports` with exhaustive matches that fail to compile when a new variant is added. dispatch() validates capabilities before spawn and returns a new TaskMgrError::UnsupportedRunnerCapability variant on mismatch. Audits every RunnerKind::Claude/Grok match site in src/ and migrates at least one CAPABILITY-MISLABELED branch (if any qualify). Sets up the capability surface that Phases 3-5 (error taxonomy, args builder, RAII session tracking) consume. Phase 1 (cleanup_session + FakeRunner) is already merged; this PRD reuses the FakeRunner seam.",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "Rust: `cargo fmt --check` passes",
+      "Rust: `cargo check --all-targets --all-features` passes with no new warnings",
+      "Rust: `cargo clippy -- -D warnings` passes",
+      "Rust: Scoped tests for touched files pass with `cargo test`",
+      "No new .unwrap() / .expect() in production paths",
+      "Error messages include enough context to identify the offending call site (runner_kind, capability_name, field_name)",
+      "Static-dispatch RunnerKind path preserved on every spawn boundary (no Box<dyn LlmRunner> on hot path)",
+      "Static `checks` registry table is the SINGLE place that maps RunnerOpts fields to RunnerCapability variants",
+      "Comments explain WHY (capability surface contract, fail-closed rationale), never narrate WHAT or restate the enum"
+    ],
+    "description": "These criteria apply to ALL implementation tasks in this PRD"
+  },
+  "mergeStrategy": "Merge to main after REVIEW-001 passes the full quality gate. Squash optional.",
+  "model": "claude-sonnet-4-6",
+  "priorityPhilosophy": {
+    "description": "Hierarchy of what matters most when adding the capability surface",
+    "hierarchy": [
+      "1. PLAN — Anticipate the registry table shape; pick variants that cover every capability-asymmetric field in RunnerOpts today",
+      "2. PHASE 2 FOUNDATION — Make supports() exhaustive on both production runners (no wildcard arms) so future RunnerCapability variants force a compile-time decision on each runner. This is the single most important architectural choice.",
+      "3. FUNCTIONING CODE — Dispatch enforcement is fail-closed: if a capability-driven field is set and the runner does not support it, refuse before spawn",
+      "4. CORRECTNESS — Compiles, type-checks, scoped tests pass deterministically; per-capability test matrix covers every (runner × capability) pair",
+      "5. CODE QUALITY — qualityDimensions satisfied, no warnings, error messages identify both runner_kind AND field_name AND capability_name",
+      "6. POLISH — CLAUDE.md subsection, design doc retrospective, grep lint for `<field>: _,` patterns"
+    ],
+    "principles": [
+      "Capability is a typed surface, never an ad-hoc string. The enum is the single source of truth.",
+      "supports() default returns false. A new runner that forgets to override opts out of every capability — the safe direction.",
+      "Production runners use exhaustive matches without wildcard arms. Adding a new RunnerCapability variant must fail to compile on each production runner until handled.",
+      "Capability enforcement is field-presence, not value-validity. Value-level rejection ('this effort level is unknown') stays inside the runner's spawn, not at dispatch.",
+      "KIND-CORRECT vs CAPABILITY-MISLABELED is a deliberate distinction. Provider-identity branches (auth-failure stderr-sniffing, fallback-target selection) stay as RunnerKind matches; only branches that read 'if runner has feature X' migrate.",
+      "Static-dispatch RunnerKind path preserved — no Box<dyn LlmRunner> on the hot path. The brief &dyn LlmRunner used for enforce_capabilities is zero-allocation and one indirect call.",
+      "Boundary contract with coherence-refactoring engine-orchestration PRD: this PRD touches at most one branch in engine.rs (the FR-006 opportunistic migration) plus comment annotations. No new shared state."
+    ]
+  },
+  "prohibitedOutcomes": [
+    "Adding a wildcard arm (`_ => ...`) in any production LlmRunner::supports impl — exhaustive matches are the entire forcing function for future-variant safety",
+    "Allowing a capability-driven RunnerOpts field to remain destructured as `<field>: _,` in any production runner — the grep lint must reject this",
+    "Returning UnsupportedRunnerCapability for a RunnerOpts::default() call on any runner — only NON-DEFAULT capability-driven field values trigger enforcement",
+    "Introducing Box<dyn LlmRunner> on the hot path; static-dispatch RunnerKind stays the spawn boundary",
+    "Removing or altering the WORKAROUND() markers established by Phase 1 — this PRD adds typed surfaces, not new workarounds",
+    "Adding RunnerCapability variants without a corresponding entry in the `checks` enforcement table (or a documented reason why the variant has no field to check, like ThinkingTokens forward-looking placeholder)",
+    "Migrating a KIND-CORRECT branch in engine.rs to runner.supports(cap) — the distinction matters; provider-identity branches stay",
+    "Using a String or Box<str> for the capability_name / field_name fields in UnsupportedRunnerCapability — both are static; allocation here would be a smell",
+    "Tests that only assert dispatch returns Err — must verify the specific error variant AND the capability_name + field_name strings",
+    "Tests that hand-build RunnerOpts via HashMap or similar — must construct the real RunnerOpts struct so a wrong field name fails to compile"
+  ],
+  "project": "task-mgr",
+  "requires": [],
+  "reviewGuidelines": {
+    "priorityGuidelines": {
+      "critical": "1-10: Blocks further work, fix immediately",
+      "high": "11-20: Fix before phase completion",
+      "low": "51-99: Defer to hardening phase",
+      "medium": "21-50: Fix in current phase if time permits"
+    }
+  },
+  "taskPrefix": "4a81bf67",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "Every `runner::dispatch(...)` call site in src/ enumerated with file:line + the RunnerKind it dispatches to + which capability-driven fields are set non-default",
+        "Confirmation that ZERO production call sites today would be rejected by the new enforcement (e.g., no `use_pty: true` paired with RunnerKind::Grok). If any are found, document them — they become CLARIFY items, not silently broken",
+        "RunnerKind match inventory: file:line + surrounding context + KIND-CORRECT or CAPABILITY-MISLABELED classification + one-line rationale, covering every src/ hit",
+        "engine.rs:5044 (`if effective_runner != RunnerKind::Claude { return Ok((escalated, None)); }` in escalate_task_model_if_needed_inner) classified explicitly (PRD §6 suggests KIND-CORRECT; verify by reading the surrounding function)",
+        "Inventory recorded in progress log under `## ANALYSIS-001 — dispatch audit + RunnerKind classification` header"
+      ],
+      "dependsOn": [],
+      "description": "Two outputs: (1) Grep every `dispatch(...)` call site in src/ and confirm no production caller today sets a capability-driven RunnerOpts field (use_pty, stream_json with default false, effort, disallowed_tools) on a runner that does not support that capability. If ANY production call site would be rejected by the new enforcement, this PRD's risk profile changes — flag it. (2) Inventory every `RunnerKind::Claude` / `RunnerKind::Grok` match in src/ with one-line classification (KIND-CORRECT or CAPABILITY-MISLABELED). The inventory is shared with the parallel engine-orchestration-boundaries PRD's ANALYSIS-001; if that PRD has already produced an inventory, consume it instead of regenerating.",
+      "estimatedEffort": "medium",
+      "id": "ANALYSIS-001",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "Coordinate with the parallel engine-orchestration-boundaries PRD's ANALYSIS-001 (also produces a RunnerKind inventory). Either PRD's owner can produce it first; the other consumes. The dispatch-site grep is unique to this PRD.",
+      "passes": true,
+      "priority": 1,
+      "qualityDimensions": [
+        "Audit is exhaustive — every dispatch() and every RunnerKind match in src/, no sampling",
+        "Classification is honest — if the intent of a match is ambiguous, the rationale says so rather than guessing; reviewers and FEAT-006's migration choice depend on this being signal, not opinion",
+        "If a production call site would be rejected, the finding is surfaced clearly — silently shipping a PRD that breaks production is the worst outcome"
+      ],
+      "requiresHuman": false,
+      "taskType": "analysis",
+      "title": "Audit dispatch() call sites + RunnerKind match inventory",
+      "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": [
+        "src/loop_engine/runner.rs has `#[non_exhaustive] #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)] pub(crate) enum RunnerCapability` with the 4 enforced variants: Effort, StreamJson, Pty, DisallowedTools (declarative-only variants ThinkingTokens, PermissionMode, SessionId are deferred to later phases per ADR; see notes)",
+        "LlmRunner trait has `fn supports(&self, _cap: RunnerCapability) -> bool { false }` with rustdoc explaining the fail-closed default",
+        "ClaudeRunner::supports is an EXHAUSTIVE match (no `_` wildcard arm) declaring: Effort=true, StreamJson=true, Pty=true, DisallowedTools=true",
+        "GrokRunner::supports is an EXHAUSTIVE match (no `_` wildcard arm) declaring: Effort=true, StreamJson=true, Pty=false, DisallowedTools=true",
+        "Unit test in src/loop_engine/runner.rs::tests asserts every (runner × capability) pair matches the declared support matrix (2 runners × 4 capabilities = 8 assertions)",
+        "Known-bad discriminator test: adding a hypothetical 5th RunnerCapability variant and re-running `cargo check` must fail to compile on BOTH ClaudeRunner::supports and GrokRunner::supports — verified manually by tentatively adding a variant during implementation",
+        "RunnerCapability has rustdoc explaining: (a) what the surface is for, (b) the #[non_exhaustive] rationale, (c) the exhaustive-match-in-production-impls convention",
+        "Scoped test passes: `cargo test -p task-mgr loop_engine::runner`",
+        "No new warnings"
+      ],
+      "dependsOn": [
+        "ANALYSIS-001"
+      ],
+      "description": "Implements FR-001, FR-002, FR-003. Add `#[non_exhaustive] pub(crate) enum RunnerCapability` with variants SessionId, Effort, StreamJson, ThinkingTokens, PermissionMode, Pty, DisallowedTools. Add `fn supports(&self, _cap: RunnerCapability) -> bool { false }` default to LlmRunner trait. Both production runners (ClaudeRunner, GrokRunner) implement `supports` with EXHAUSTIVE match (no wildcard arm), declaring true/false for each variant. Tests cover every (runner × capability) pair.",
+      "estimatedEffort": "medium",
+      "id": "FEAT-001",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "Reuses the FakeRunner seam from Phase 1 (FEAT-008 of prefix 8cc50ff5) only in tests; ClaudeRunner/GrokRunner are real production impls. The rustdoc on the trait method explains: 'Used by `dispatch` to refuse calls that set a `RunnerOpts` field encoding an unsupported capability before any subprocess is spawned.' This sets up FEAT-003 (dispatch enforcement) cleanly. ADR: ThinkingTokens, PermissionMode, and SessionId are NOT in this PRD's enum. ThinkingTokens has no RunnerOpts field (deferred to Phase 3 if/when added). PermissionMode is always set and both runners support it; making it a declarative-only variant creates a half-state where the variant exists but never enforces anything (anti-pattern per architect review). SessionId is consumed by cleanup_session (Phase 1 trait method), not by RunnerOpts; same half-state risk. Drop them all from this PRD; reintroduce in the phase that adds an enforced field for each.",
+      "passes": true,
+      "priority": 2,
+      "qualityDimensions": [
+        "supports() is a constant-time match — no allocation, no hashmap",
+        "Both production runners use EXHAUSTIVE matches; the compiler is the enforcement mechanism for future-variant safety. A wildcard arm here defeats the entire point of Phase 2.",
+        "Default `fn supports(_cap) -> bool { false }` is the safe direction — a new runner that forgets to override opts out of everything",
+        "#[non_exhaustive] is at the enum (not at variants); downstream non-trait matches add a wildcard arm or stay incomplete-by-design",
+        "Test matrix is the full Cartesian product (2 runners × 7 capabilities = 14 assertions), not sampled",
+        "RunnerCapability is pub(crate) (not pub); Phase 4 promotes to pub if needed"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Introduce RunnerCapability enum + LlmRunner::supports trait method + both impls",
+      "touchesFiles": [
+        "src/loop_engine/runner.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Find TaskMgrError's enum definition (likely src/errors.rs or src/lib.rs — grep first)",
+        "Add `UnsupportedRunnerCapability { runner_kind: RunnerKind, capability_name: &'static str, field_name: &'static str }` variant with #[error(\"runner {runner_kind:?} does not support capability {capability_name} (field {field_name:?} was set)\")]",
+        "Import RunnerKind into the errors module if not already accessible (use crate::loop_engine::runner::RunnerKind)",
+        "Unit test: construct the variant and assert Display produces a message containing all three field values",
+        "All three fields use the exact types specified: RunnerKind (Copy), &'static str, &'static str. Do NOT use String, Box<str>, or owned types",
+        "Scoped test passes: `cargo test -p task-mgr errors` (or wherever the test lives)",
+        "No new warnings"
+      ],
+      "dependsOn": [
+        "FEAT-001"
+      ],
+      "description": "Implements FR-005. Add a new error variant `UnsupportedRunnerCapability { runner_kind: RunnerKind, capability_name: &'static str, field_name: &'static str }` to the TaskMgrError enum. Use thiserror's `#[error(...)]` annotation with a message that names all three fields. Verify Display round-trips correctly.",
+      "estimatedEffort": "low",
+      "id": "FEAT-002",
+      "modifiesBehavior": false,
+      "notes": "Grep first to find TaskMgrError's actual location: `grep -rn 'pub enum TaskMgrError' src/`. The PRD's example assumes thiserror; verify with the existing pattern.",
+      "passes": true,
+      "priority": 3,
+      "qualityDimensions": [
+        "&'static str fields — capability_name and field_name come from a static registry table (FEAT-003), never user input or runtime-built strings",
+        "Display message includes ALL THREE field values so operators can diagnose without re-reading source",
+        "RunnerKind is Copy — no ownership / lifetime gymnastics needed",
+        "Variant is the strict subset of 'the call would have proceeded silently' — it cannot widen what runs",
+        "thiserror's #[error(...)] annotation provides Display via derive; no manual fmt::Display impl needed"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Add TaskMgrError::UnsupportedRunnerCapability error variant",
+      "touchesFiles": [
+        "src/errors.rs",
+        "src/lib.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "dispatch() at runner.rs:877 calls enforce_capabilities(runner, kind, &opts)? BEFORE the kind match that calls spawn",
+        "enforce_capabilities is a private fn taking `&dyn LlmRunner`, RunnerKind, `&RunnerOpts<'_>`, returning TaskMgrResult<()>",
+        "Static `checks` table maps (RunnerCapability, field-is-set-non-default, &'static str field_name): rows for Pty (opts.use_pty), StreamJson (opts.stream_json), Effort (opts.effort.is_some_and(|e| !e.trim().is_empty())), DisallowedTools (opts.disallowed_tools.is_some_and(|d| !d.trim().is_empty())). Every enforced RunnerCapability variant has a checks row — there are no declarative-only variants in this PRD",
+        "Enforcement completeness guard: a `#[test]` iterates every `RunnerCapability` variant (via `strum::EnumIter` if already a dep, else hand-rolled exhaustive match) and asserts each variant is in the `checks` table. New variant added without a table row fails this test. This catches the silent-no-op regression at unit-test time, not just at runtime.",
+        "All capability-driven RunnerOpts string fields treat empty-or-whitespace-only as 'no opinion' (`trim().is_empty()`); only non-default, non-whitespace values trigger enforcement",
+        "Helper `fn capability_name(cap: RunnerCapability) -> &'static str` returns a canonical label per variant (e.g., RunnerCapability::Pty => \"Pty\")",
+        "Tests cover: (Claude × use_pty: true) → Ok; (Grok × use_pty: true) → Err(UnsupportedRunnerCapability { capability_name: \"Pty\", field_name: \"use_pty\", runner_kind: RunnerKind::Grok }); (both × RunnerOpts::default()) → Ok; (Claude × stream_json: true) → Ok; (Grok × stream_json: true) → Ok; (both × effort: Some(\"\")) → Ok (empty value treated as no opinion via trim().is_empty()); (both × effort: Some(\"  \")) → Ok (whitespace also no opinion)",
+        "Static-dispatch RunnerKind path preserved — the match arms still call ClaudeRunner.spawn / GrokRunner.spawn directly (no Box<dyn LlmRunner> on the hot path)",
+        "Scoped test passes: `cargo test -p task-mgr loop_engine::runner`",
+        "No new warnings"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002"
+      ],
+      "description": "Implements FR-004. Modify dispatch() at src/loop_engine/runner.rs:877 to call `enforce_capabilities(runner, kind, &opts)?` BEFORE the match that delegates to ClaudeRunner.spawn / GrokRunner.spawn. Add a new private `enforce_capabilities` fn with a static `checks: &[(RunnerCapability, bool, &'static str)]` table mapping (capability, field-is-set-non-default, field-name) tuples. For each row, if field_is_set && !runner.supports(cap), return Err(TaskMgrError::UnsupportedRunnerCapability { ... }). Add a `capability_name` helper that maps RunnerCapability variants to &'static str labels. dispatch becomes fail-closed: setting use_pty on a Grok dispatch returns Err before any spawn.",
+      "edgeCases": [
+        "Caller sets `RunnerOpts { use_pty: true, .. }` and dispatches to RunnerKind::Grok: dispatch returns Err(UnsupportedRunnerCapability { runner_kind: Grok, capability_name: \"Pty\", field_name: \"use_pty\" }) BEFORE spawning",
+        "Caller sets RunnerOpts::default() and dispatches to either runner: succeeds (no capability-driven field is set non-default)",
+        "Caller sets effort: Some(\"\") (empty string) on Grok: succeeds (empty is treated as 'no opinion' by the field-set check)",
+        "Caller sets effort: Some(\"  \") (whitespace) on Grok: succeeds (trim().is_empty() catches it)",
+        "Caller sets disallowed_tools: Some(\"Bash\") on either runner: succeeds (both support DisallowedTools)",
+        "Caller sets stream_json: true on either runner: succeeds (both support StreamJson, even though the flag string differs — Phase 4 codifies the spelling)",
+        "Future field added without a checks-table row: silently no-op (the field is never enforcement-checked) — caught by FR-009's grep lint added in FEAT-005"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Caller dispatches to Grok with use_pty: true (a hypothetical future call site)",
+          "expectedBehavior": "dispatch returns Err(UnsupportedRunnerCapability) before any subprocess is spawned; operator sees stderr message naming runner_kind, capability_name, field_name"
+        },
+        {
+          "cause": "Adding a new RunnerOpts field for a hypothetical future capability without updating the checks table",
+          "expectedBehavior": "Field is silently no-op at dispatch (no enforcement); FEAT-005's grep lint catches the `<field>: _,` destructure pattern on any runner that does not consume the field"
+        }
+      ],
+      "id": "FEAT-003",
+      "invariants": [
+        "enforce_capabilities never spawns a subprocess — its only side effect is returning Ok or Err",
+        "RunnerOpts::default() always passes enforcement for any runner",
+        "Capability enforcement is field-presence, not value-validity — invalid values are the runner's concern (return a different error variant)",
+        "The static `checks` table is the SINGLE place that maps RunnerOpts fields to RunnerCapability variants — duplicating this mapping elsewhere is a bug"
+      ],
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": true,
+      "notes": "This task is `modifiesBehavior: true` — it changes dispatch's return shape (new error variant). ANALYSIS-001 confirmed (or must confirm) no production call site would be rejected; that's the safety net. The static `checks` table is the registry that FEAT-005's grep lint enforces (`<field>: _,` patterns for fields in the checks table are forbidden). Edge cases drive the test matrix — every edge case above becomes a #[test].",
+      "passes": true,
+      "priority": 4,
+      "qualityDimensions": [
+        "Enforcement is fail-closed — refuse rather than proceed silently. No subprocess is spawned when a capability check fails.",
+        "Zero allocation on the hot path. &'static str everywhere. The checks table is a `const` array or `pub const`-style static slice.",
+        "Default RunnerOpts always passes. Existing call sites (which set zero capability-driven fields beyond what their runner already supports) are not affected.",
+        "PermissionMode exclusion is documented inline (always-set type, both runners support, no per-call check is meaningful)",
+        "SessionId / ThinkingTokens exclusion is documented inline (no field encodes them today)",
+        "The `<dyn LlmRunner>` borrow used for enforce_capabilities is a brief one-method-call indirection; the spawn match arms still use direct ClaudeRunner.spawn / GrokRunner.spawn (no dyn dispatch on the hot path)"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "dispatch() capability enforcement + registry table",
+      "touchesFiles": [
+        "src/loop_engine/runner.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "FakeRunner struct gains `pub supports_fn: fn(RunnerCapability) -> bool` field",
+        "impl LlmRunner for FakeRunner adds `fn supports(&self, cap: RunnerCapability) -> bool { (self.supports_fn)(cap) }`",
+        "All existing Phase 1 FakeRunner constructions are updated to include `supports_fn: |_| true` (or a struct-update default if FakeRunner: Default is used) — verified by `cargo test` passing without modification of test logic",
+        "New test demonstrates a FakeRunner with `supports_fn: |_| false` and asserts dispatch refuses every capability-driven field (Pty, StreamJson, Effort, DisallowedTools)",
+        "New test demonstrates a FakeRunner with `supports_fn: |cap| matches!(cap, RunnerCapability::StreamJson)` and asserts dispatch accepts stream_json: true but refuses use_pty: true",
+        "FakeRunner field naming follows the existing convention in Phase 1 (look at adjacent fields for style)",
+        "Scoped test passes: `cargo test` for the test file or module FakeRunner lives in",
+        "No new warnings"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-003"
+      ],
+      "description": "Implements FR-008. The Phase 1 FakeRunner (in src/loop_engine/runner.rs::tests OR tests/runner_cleanup.rs — find first via grep) is extended with a `pub supports_fn: fn(RunnerCapability) -> bool` field. `impl LlmRunner for FakeRunner` overrides supports to call `(self.supports_fn)(cap)`. Tests can construct FakeRunners with any capability matrix, including all-true (legacy default) and all-false (strict). Backward compatibility: existing Phase 1 tests that construct FakeRunner with no capability concern get `supports_fn: |_| true` so they accept everything by default.",
+      "estimatedEffort": "low",
+      "id": "FEAT-004",
+      "modifiesBehavior": false,
+      "notes": "Find FakeRunner first: `grep -rn 'struct FakeRunner' src/ tests/`. The Phase 1 FEAT-008 (prefix 8cc50ff5) introduced it. Look at the existing field shape (cleanup_fn, etc.) for style consistency.",
+      "passes": true,
+      "priority": 5,
+      "qualityDimensions": [
+        "Backward compatibility: every existing Phase 1 FakeRunner construction continues to work without re-thinking what capabilities to declare",
+        "supports_fn uses a function pointer (`fn`), not Box<dyn Fn> — zero allocation, copyable, matches the trait method shape",
+        "The seam is preserved — Phases 3-5 reuse the same FakeRunner extension for their integration tests",
+        "Tests demonstrate the seam works for both ends of the matrix (all-true, all-false, partial)"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Extend FakeRunner with supports_fn for per-capability test control",
+      "touchesFiles": [
+        "src/loop_engine/runner.rs",
+        "tests/runner_cleanup.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "src/loop_engine/runner.rs no longer contains `use_pty: _,` in GrokRunner::spawn's RunnerOpts destructure",
+        "GrokRunner::spawn destructures only the fields it actually consumes; use_pty is omitted from the destructure entirely (via `..` rest pattern if needed for the unused remaining fields, OR by explicit omission if the destructure already lists every other field)",
+        "If a `..` rest pattern is used to elide unused fields, a comment explains: 'Capabilities the runner does not support are enforced at dispatch; this destructure consumes only the fields Grok actively uses.'",
+        "New grep lint test in tests/ (or as a script in scripts/) that scans src/loop_engine/runner.rs for `\\b\\w+: _,` patterns inside LlmRunner::spawn impls and fails if any match a RunnerCapability field name from the FEAT-003 checks table",
+        "The grep lint test passes on the current state (no offending patterns remain after FEAT-005 changes)",
+        "Scoped test passes: `cargo test -p task-mgr loop_engine::runner`",
+        "No new warnings"
+      ],
+      "dependsOn": [
+        "FEAT-003"
+      ],
+      "description": "Implements FR-007 (remove use_pty destructure) and the grep lint scaffolding referenced by FR-009 (preserve WORKAROUND markers — verified by CODE-REVIEW-1's marker-count check, not by this task). Once FEAT-003 lands and dispatch refuses use_pty: true for Grok, GrokRunner::spawn never sees use_pty set, so the `use_pty: _,` line at src/loop_engine/runner.rs:492 is redundant. Remove it. Add a grep lint test that fails if any `<field>: _,` pattern exists in any LlmRunner::spawn impl for fields that map to a RunnerCapability AND are unsupported by that runner.",
+      "estimatedEffort": "low",
+      "id": "FEAT-005",
+      "modifiesBehavior": false,
+      "notes": "The Phase 1 PRD's similar `cleanup_title_artifact: _,` was already removed. This task closes the use_pty equivalent. The grep lint is a one-shot regex test; it does not need to parse Rust AST.",
+      "passes": true,
+      "priority": 6,
+      "qualityDimensions": [
+        "The grep lint catches future regressions — any maintainer who reintroduces a silent destructure of a capability-driven field gets a CI failure",
+        "Removal of the explicit `use_pty: _,` line is a strict improvement — the capability surface is now the explanation, and the destructure noise is redundant",
+        "The lint is grep-based (simple, fast, no syntactic parsing) — it does not need to understand Rust's grammar, only match the textual pattern",
+        "If `..` rest pattern is used, the lint must still catch a regression where a future maintainer adds `<new-field>: _,` explicitly"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Remove use_pty: _ destructure from GrokRunner + add `<field>: _,` grep lint (FR-007)",
+      "touchesFiles": [
+        "src/loop_engine/runner.rs",
+        "tests/runner_capability_lint.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Every `RunnerKind::Claude` / `RunnerKind::Grok` match site identified by ANALYSIS-001 has a one-line annotation: either `// kind-correct: <one-line rationale>` or `// capability-mislabeled: <which capability + why>`",
+        "engine.rs:5044 (the Grok-fallback hook gate) is annotated KIND-CORRECT with rationale 'fires from Claude only because Grok is the fallback target — provider identity, not capability'",
+        "If ANY clean CAPABILITY-MISLABELED candidate exists, AT LEAST ONE is migrated to `runner.supports(<cap>)` in this task with: (a) a regression test asserting pre/post behavior is identical for both Claude and Grok cases, (b) a comment explaining why the migration is safe",
+        "If ZERO clean candidates exist (the audit's honest conclusion), the progress log documents: which sites were considered, why each is KIND-CORRECT, and a forward-looking note that Phases 3-5 may discover candidates",
+        "No KIND-CORRECT branch is migrated (the distinction matters; migrating a provider-identity branch creates incorrect semantics)",
+        "Scoped tests for any touched site pass: `cargo test -p task-mgr <relevant module>`",
+        "No new warnings"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "ANALYSIS-001"
+      ],
+      "description": "Implements FR-006. For every `RunnerKind::Claude` / `RunnerKind::Grok` match in src/ (per ANALYSIS-001's inventory), add a one-line comment annotation: `// kind-correct: provider identity, not capability` OR `// capability-mislabeled: candidate for migration to runner.supports()`. Migrate AT LEAST ONE CAPABILITY-MISLABELED branch to `runner.supports(cap)` in this task. If ANALYSIS-001 found ZERO clean candidates, ship the audit annotations only and document the finding in the progress log (Phases 3-5 may discover candidates as they touch the code).",
+      "estimatedEffort": "medium",
+      "id": "FEAT-006",
+      "modifiesBehavior": false,
+      "notes": "Consume ANALYSIS-001's inventory verbatim. Do NOT re-grep — that risks divergence. The opportunistic migration is the smallest possible: if the simplest CAPABILITY-MISLABELED branch can be migrated in <50 lines of diff (including regression test), do it. Otherwise document and defer to Phases 3-5.",
+      "passes": true,
+      "priority": 7,
+      "qualityDimensions": [
+        "Annotations are line-level and surgical — never refactor surrounding code in the same commit",
+        "KIND-CORRECT vs CAPABILITY-MISLABELED is decided by reading the branch's INTENT, not its current form. 'If this runner is Claude, do X' where X is provider-specific is KIND-CORRECT; where X is 'feature Y is supported' is CAPABILITY-MISLABELED.",
+        "If the audit found zero candidates, the PRD ships honestly — no fake migration to satisfy the FR. The capability surface is still valuable for Phase 4 even with zero engine.rs migrations.",
+        "Migrated branches preserve byte-identical observable behavior — regression test asserts both Claude and Grok cases produce the same result post-migration as pre-migration"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "RunnerKind audit annotation + opportunistic capability migration",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/runner.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "src/loop_engine/CLAUDE.md has a new 'Capability surface' subsection under 'LLM runner dispatch' (or the closest existing heading) explaining: (a) RunnerCapability enum exists and is the typed surface, (b) LlmRunner::supports default returns false, (c) dispatch refuses calls that set capability-driven fields on unsupported runners with TaskMgrError::UnsupportedRunnerCapability, (d) production runners use exhaustive supports() matches",
+        "Touchpoints table in CLAUDE.md gains a row pointing at RunnerCapability + enforce_capabilities",
+        "docs/designs/runner-trait-hygiene.md gains a Phase 2 retrospective appendix (under the Phase 2 section or as a new appendix) noting: (a) PRD landed, (b) audit results (X KIND-CORRECT sites, Y CAPABILITY-MISLABELED, Z migrated), (c) one-line forward note for Phase 3",
+        "Phase 2 row in the design doc's roadmap is marked complete",
+        "cargo doc builds without warnings on src/loop_engine/runner.rs",
+        "No CLAUDE.md content is deleted — only added"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-003",
+        "FEAT-005",
+        "FEAT-006"
+      ],
+      "description": "Update src/loop_engine/CLAUDE.md to add a 'Capability surface' subsection under 'LLM runner dispatch' explaining RunnerCapability + supports + dispatch enforcement. Add a brief Phase 2 retrospective appendix to docs/designs/runner-trait-hygiene.md. Check off Phase 2 in the roadmap section of that doc.",
+      "estimatedEffort": "low",
+      "id": "FEAT-007",
+      "modifiesBehavior": false,
+      "notes": "Last implementation task before review. Run `cargo doc --no-deps` to verify rustdoc on runner.rs builds cleanly. The retrospective is short — 5-10 bullets max.",
+      "passes": true,
+      "priority": 8,
+      "qualityDimensions": [
+        "CLAUDE.md changes are surgical (one new subsection + one new touchpoint row) — preserve voice and ordering",
+        "Retrospective is honest about what shipped vs. what didn't (if zero migrations, say so)",
+        "No speculative content about Phases 3-5 beyond a forward note — the design doc already covers them"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "CLAUDE.md update + design doc Phase 2 retrospective appendix",
+      "touchesFiles": [
+        "src/loop_engine/CLAUDE.md",
+        "docs/designs/runner-trait-hygiene.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Every acceptance criterion in FEAT-001 through FEAT-007 verified by reading the diff",
+        "Both production runners' supports() are exhaustive matches (grep for `_ => ` inside ClaudeRunner::supports and GrokRunner::supports returns zero hits)",
+        "checks table is the only place that maps RunnerOpts fields to RunnerCapability variants (grep for any other mapping pattern)",
+        "UnsupportedRunnerCapability fields are `&'static str` (not String / Box<str>)",
+        "FakeRunner.supports_fn is `fn(RunnerCapability) -> bool` (not `Box<dyn Fn>` / closure)",
+        "Static-dispatch RunnerKind path preserved: grep for `Box<dyn LlmRunner>` returns zero hits in src/loop_engine/",
+        "RunnerKind audit annotations: every site touched by FEAT-006 has either a KIND-CORRECT or CAPABILITY-MISLABELED comment; the rationale is grep-verified against the surrounding code",
+        "FR-009 marker preservation: grep for `WORKAROUND(` in src/loop_engine/runner.rs returns the same set of markers as on main (pre-PRD). This PRD introduces typed surfaces, not new workarounds; if the count changed, audit each delta and revert any unintentional additions/removals",
+        "Phase 1 tests still pass without modification (FakeRunner backward compat)",
+        "Issues found, if any, become CODE-FIX-xxx / WIRE-FIX-xxx tasks via `task-mgr add --stdin --depended-on-by REVIEW-001` with rootCause/exactFix/verifyCommand",
+        "If no issues: progress note `## CODE-REVIEW-1 — capability surface clean, enforcement fail-closed, audit honest`"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "FEAT-005",
+        "FEAT-006",
+        "FEAT-007"
+      ],
+      "description": "Review FEAT-001 through FEAT-007. Verify: (a) RunnerCapability enum has the right variant set, (b) both production runners' supports() are EXHAUSTIVE (no wildcard arms), (c) checks registry table is the SINGLE source of capability-to-field mapping, (d) enforce_capabilities is fail-closed and zero-allocation, (e) UnsupportedRunnerCapability uses static lifetimes correctly, (f) FakeRunner extension is backward-compatible with Phase 1, (g) grep lint catches `<field>: _,` regressions, (h) RunnerKind audit annotations are honest (no fake KIND-CORRECT to avoid migration work), (i) no Box<dyn LlmRunner> on the hot path, (j) zero production call sites broken by the new enforcement (per ANALYSIS-001's audit). Spawn CODE-FIX-xxx / WIRE-FIX-xxx for any issues.",
+      "estimatedEffort": "medium",
+      "id": "CODE-REVIEW-1",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "Use the rust-python-code-reviewer agent: `Agent(subagent_type='rust-python-code-reviewer', prompt='Review the runner-capability-enforcement Phase 2 PRD landing. Focus: exhaustive supports() matches with no wildcard arms, static lifetimes in UnsupportedRunnerCapability, no Box<dyn LlmRunner> on hot path, audit annotation honesty, FakeRunner backward compat.')`.",
+      "passes": true,
+      "priority": 13,
+      "qualityDimensions": [
+        "Review is reading + grepping, NOT implementing — fixes go into spawned CODE-FIX/WIRE-FIX tasks",
+        "Wildcard-arm check is mechanical: grep both supports() impls for `_ =>` and fail if found",
+        "The 'no Box<dyn LlmRunner> on hot path' check is mechanical: grep src/loop_engine/ for `Box<dyn LlmRunner>` and `Arc<dyn LlmRunner>` — the brief &dyn LlmRunner inside enforce_capabilities is OK; allocation is not",
+        "Honesty audit on FEAT-006: spot-check 2-3 KIND-CORRECT annotations to confirm the rationale matches the actual branch intent"
+      ],
+      "requiresHuman": false,
+      "taskType": "review",
+      "title": "Code review: capability surface + enforcement + audit annotations",
+      "touchesFiles": [
+        "src/loop_engine/runner.rs",
+        "src/errors.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/CLAUDE.md",
+        "docs/designs/runner-trait-hygiene.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "checks table reviewed for clarity and scalability (does the shape work with 15+ capabilities? if not, document the limit)",
+        "supports() impls reviewed for any leakage of field knowledge (a supports() impl that knows which RunnerOpts field maps to a capability is a smell — that knowledge belongs in checks table only)",
+        "enforce_capabilities's loop is examined for any short-circuit edge cases (does an early-exit accidentally skip a check?)",
+        "Substantive findings spawn REFACTOR-xxx tasks via `task-mgr add --stdin --depended-on-by REVIEW-001` (priority 71-85)",
+        "Small touchpoints fixed inline via /simplify",
+        "If no substantive issues: progress note `## REFACTOR-REVIEW-FINAL — capability surface is clean; Phase 4 can build on it`"
+      ],
+      "dependsOn": [
+        "CODE-REVIEW-1"
+      ],
+      "description": "Full-context review of the capability surface. Look for: (a) any duplication between the checks table and the supports() impls (the table should be the SOLE source of capability-to-field mapping; supports() declares per-capability support but does NOT duplicate field knowledge), (b) any place where enforce_capabilities could grow into a hotspot (e.g., adding 20 more capabilities — does the table scale?), (c) coupling between RunnerCapability and RunnerOpts that should be made more explicit, (d) contract fidelity (is the fail-closed contract actually fail-closed in every code path?). Spawn REFACTOR-xxx for substantive findings. Use /simplify for small touchpoints.",
+      "estimatedEffort": "low",
+      "id": "REFACTOR-REVIEW-FINAL",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "Final pass before REVIEW-001. The PRD is small so this review is likely short. If REFACTOR-xxx tasks are spawned, they complete before REVIEW-001 can claim.",
+      "passes": true,
+      "priority": 70,
+      "qualityDimensions": [
+        "Findings are concrete (file:line + proposed change), not vague",
+        "Phase 4 readiness: the surface this PRD ships must be ergonomic for Phase 4's RunnerArgs builder to consume",
+        "This is a refactor pass — REFACTOR-xxx tasks address structural issues from this PRD's changes only, not unrelated tech debt"
+      ],
+      "requiresHuman": false,
+      "taskType": "review",
+      "title": "Final refactor pass: DRY, complexity, contract fidelity",
+      "touchesFiles": [
+        "src/loop_engine/runner.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Full unscoped quality suite is GREEN: `cargo fmt --check && cargo check --all-targets --all-features && cargo clippy --all-targets -- -D warnings && cargo test -p task-mgr` all exit 0",
+        "Capability contract end-to-end test: a single integration test in tests/runner_capability_contract.rs that walks the full (runner × capability) matrix via dispatch + FakeRunner, asserting Ok or Err(UnsupportedRunnerCapability) per the support matrix",
+        "Phase 1 integration tests (tests/runner_cleanup.rs) still pass without modification beyond FEAT-004's FakeRunner.supports_fn addition",
+        "Grep lint test (FEAT-005) passes — no `<field>: _,` patterns for capability-driven fields in any LlmRunner::spawn impl",
+        "Exhaustive-match assertion: tentatively add a fake 5th RunnerCapability variant in a scratch commit and verify both ClaudeRunner::supports and GrokRunner::supports fail to compile; revert the scratch commit",
+        "Documentation: src/loop_engine/CLAUDE.md has the Capability surface subsection; docs/designs/runner-trait-hygiene.md has the Phase 2 retrospective",
+        "If any pre-existing test failure exists in the full suite that predates this PRD: fix inline (≤12 failures) OR spawn a single FIX-xxx task via task-mgr add --stdin --depended-on-by REVIEW-001 and BLOCKED until resolved (> 12 unrelated failures only)"
+      ],
+      "dependsOn": [
+        "REFACTOR-REVIEW-FINAL"
+      ],
+      "description": "Run the full unscoped quality gate (cargo fmt --check, cargo check, cargo clippy -D warnings, cargo test — entire workspace). Verify the capability contract holds end-to-end: dispatch refuses every (runner × unsupported capability) pair with the right error variant; succeeds for every (runner × supported capability) pair; succeeds for RunnerOpts::default() on every runner. Verify Phase 1's tests + integration test (tests/runner_cleanup.rs) still pass. Fix every failure, including pre-existing ones (trunk-green invariant).",
+      "estimatedEffort": "medium",
+      "id": "REVIEW-001",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "Equivalent to MILESTONE-FINAL in other PRDs. The scratch-commit exhaustive-match check is critical — do it once during this milestone, then revert. If the scratch commit DOES compile, FEAT-001 had a wildcard arm that wasn't caught — fix and re-verify.",
+      "passes": true,
+      "priority": 99,
+      "qualityDimensions": [
+        "The full-suite gate catches accidental drift in the broader codebase — pre-existing failures are this milestone's responsibility (with the >12-unrelated-failures escape hatch)",
+        "The end-to-end matrix test is the contract's smoke test — if this passes, the capability surface works as designed",
+        "The exhaustive-match scratch-commit verification is the foundational guarantee — if it does NOT fail to compile, future variants will silently break"
+      ],
+      "requiresHuman": false,
+      "taskType": "verification",
+      "timeoutSecs": 1800,
+      "title": "Final gate: full quality suite + capability contract verification",
+      "touchesFiles": [
+        "tests/runner_capability_contract.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "RunnerOpts.cleanup_title_artifact is either removed (option A) OR covered by a CHECKS row + supports() entry (option B) — no silent `..` elision on Grok survives",
+        "GrokRunner cannot silently accept cleanup_title_artifact: true — must either error at dispatch with UnsupportedRunnerCapability (option B) or the field no longer compiles (option A)",
+        "docs/designs/runner-trait-hygiene.md Phase-1 retrospective statement is factually accurate for this branch's actual lineage",
+        "tests/runner_capability_lint.rs CAPABILITY_FIELDS list matches CHECKS field-name set (option B only)",
+        "All existing tests pass; cargo fmt + clippy clean"
+      ],
+      "description": "Phase 2 design doc (docs/designs/runner-trait-hygiene.md:28-31) claims Phase 1 removed `cleanup_title_artifact: _` as the worst silent-destructure offender, but this branch was forked from PR #11 (f02943d) and never absorbed that removal — `pub cleanup_title_artifact: bool` still exists on RunnerOpts (src/loop_engine/runner.rs:166) and GrokRunner silently elides it via the `..` rest pattern (line 584). This is the textbook silent-ignore anti-pattern Phase 2 was designed to prevent. Two resolutions exist (see key-decision emitted from CODE-REVIEW-1).\n\nrootCause: Branch forked from f02943d without absorbing main's Phase 1 cleanup_title_artifact removal (fe10bc8), but FEAT-007 retrospective text was written as if it had.\n\nexactFix: Option A (preferred — least new code): rebase this branch onto main so Phase 1's field removal lands automatically and the design-doc statement becomes accurate. Option B: extend capability surface — add RunnerCapability::TitleArtifactCleanup variant, ClaudeRunner=true / GrokRunner=false in supports(), append (TitleArtifactCleanup, |o| o.cleanup_title_artifact, \"cleanup_title_artifact\") to CHECKS, extend CAPABILITY_FIELDS in tests/runner_capability_lint.rs:18, update the support matrix table in src/loop_engine/CLAUDE.md.\n\nverifyCommand: `cargo test -p task-mgr loop_engine::runner && cargo test -p task-mgr --test runner_capability_lint && grep -c 'cleanup_title_artifact' src/loop_engine/runner.rs` — option A expects 0 hits; option B expects matching entries in CHECKS / supports / lint / matrix.",
+      "estimatedEffort": "medium",
+      "id": "4a81bf67-CODE-FIX-001",
+      "passes": true,
+      "priority": 0,
+      "title": "Close cleanup_title_artifact silent-ignore gap on Grok + reconcile design doc claim",
+      "touchesFiles": [
+        "src/loop_engine/runner.rs",
+        "docs/designs/runner-trait-hygiene.md",
+        "tests/runner_capability_lint.rs",
+        "src/loop_engine/CLAUDE.md"
+      ]
+    }
+  ],
+  "version": "1.0"
+}

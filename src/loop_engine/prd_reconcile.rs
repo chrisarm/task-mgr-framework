@@ -11,10 +11,12 @@ use crate::TaskMgrResult;
 use crate::commands::complete as complete_cmd;
 use crate::commands::dependency_checker;
 use crate::db::prefix::prefix_and;
+use crate::lifecycle::{ReconcileItem, ReconcilePlan, TaskLifecycle};
 use crate::loop_engine::claude;
 use crate::loop_engine::config::PermissionMode;
 use crate::loop_engine::model::SONNET_MODEL;
 use crate::loop_engine::output_parsing::strip_task_prefix;
+use crate::models::TaskStatus;
 
 /// Build a per-writer tmp path next to `prd_path` for atomic rename.
 ///
@@ -218,7 +220,7 @@ pub(crate) fn mark_task_done(
 /// git detection, or a previous loop exit reset it). Mark it `done` to prevent
 /// infinite re-selection loops.
 pub(crate) fn reconcile_passes_with_db(
-    conn: &Connection,
+    conn: &mut Connection,
     prd_path: &Path,
     task_prefix: Option<&str>,
 ) {
@@ -229,22 +231,24 @@ pub(crate) fn reconcile_passes_with_db(
     let rpdb_sql = format!(
         "SELECT id FROM tasks WHERE status IN ('todo', 'in_progress') AND archived_at IS NULL {rpdb_pfx_clause}"
     );
-    let mut stmt = match conn.prepare(&rpdb_sql) {
-        Ok(s) => s,
-        Err(_) => return,
+    // Scope stmt so it's dropped before the convergence loop, which needs &mut conn.
+    let candidate_ids: Vec<String> = {
+        let mut stmt = match conn.prepare(&rpdb_sql) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let rpdb_params: Vec<&dyn rusqlite::types::ToSql> = match &rpdb_pfx_param {
+            Some(p) => vec![p],
+            None => vec![],
+        };
+        stmt.query_map(rpdb_params.as_slice(), |row| row.get(0))
+            .ok()
+            .map(|rows| {
+                rows.filter_map(|r: rusqlite::Result<String>| r.ok())
+                    .collect()
+            })
+            .unwrap_or_default()
     };
-    let rpdb_params: Vec<&dyn rusqlite::types::ToSql> = match &rpdb_pfx_param {
-        Some(p) => vec![p],
-        None => vec![],
-    };
-    let candidate_ids: Vec<String> = stmt
-        .query_map(rpdb_params.as_slice(), |row| row.get(0))
-        .ok()
-        .map(|rows| {
-            rows.filter_map(|r: rusqlite::Result<String>| r.ok())
-                .collect()
-        })
-        .unwrap_or_default();
 
     if candidate_ids.is_empty() {
         return;
@@ -301,15 +305,22 @@ pub(crate) fn reconcile_passes_with_db(
                 if !dependency_checker::are_dependencies_satisfied(conn, task_id) {
                     continue;
                 }
-                if let Ok(1) = conn.execute(
-                    "UPDATE tasks SET status = 'done', completed_at = datetime('now') WHERE id = ? AND status IN ('todo', 'in_progress')",
-                    [task_id.as_str()],
-                ) {
-                    eprintln!(
-                        "Reconciled task {} as done (passes: true in PRD but was not done in DB)",
-                        task_id
-                    );
-                    updated_count += 1;
+                let plan = ReconcilePlan {
+                    items: vec![ReconcileItem {
+                        task_id: task_id.clone(),
+                        target: TaskStatus::Done,
+                        audit_label: Some("prd_marked_done".to_string()),
+                    }],
+                };
+                match TaskLifecycle::new(conn).reconcile_from_prd(plan) {
+                    Ok(report) if report.applied > 0 => {
+                        eprintln!(
+                            "Reconciled task {} as done (passes: true in PRD but was not done in DB)",
+                            task_id
+                        );
+                        updated_count += 1;
+                    }
+                    _ => {}
                 }
             }
         }
@@ -493,7 +504,7 @@ fn apply_modifications_to_prd(
 /// (new task insert). Errors are logged per-task but never propagate — the PRD
 /// JSON is the source of truth and will sync the DB on the next iteration.
 fn sync_mutations_to_db(
-    conn: &Connection,
+    conn: &mut Connection,
     modifications: &[serde_json::Value],
     task_prefix: Option<&str>,
 ) {
@@ -546,11 +557,14 @@ fn sync_mutations_to_db(
                 }
             }
             "irrelevant" => {
-                if let Err(e) = conn.execute(
-                    "UPDATE tasks SET status = 'irrelevant', updated_at = datetime('now') \
-                     WHERE id = ? AND status IN ('todo', 'in_progress')",
-                    [db_id.as_str()],
-                ) {
+                let plan = ReconcilePlan {
+                    items: vec![ReconcileItem {
+                        task_id: db_id.clone(),
+                        target: TaskStatus::Irrelevant,
+                        audit_label: None,
+                    }],
+                };
+                if let Err(e) = TaskLifecycle::new(conn).reconcile_from_prd(plan) {
                     eprintln!(
                         "Warning: task mutation DB update failed marking {} irrelevant: {}",
                         db_id, e
@@ -598,7 +612,7 @@ fn sync_mutations_to_db(
 pub(crate) fn mutate_prd_from_feedback(
     prd_path: &Path,
     human_feedback: &str,
-    conn: &Connection,
+    conn: &mut Connection,
     task_prefix: Option<&str>,
     model: Option<&str>,
     permission_mode: &PermissionMode,
@@ -667,6 +681,9 @@ pub(crate) fn mutate_prd_from_feedback(
         permission_mode,
         claude::SpawnOpts {
             model: Some(effective_model),
+            // Reconcile is a text-only mutation pass — clean the ai-title stub
+            // so it doesn't clutter the resume picker. See claude.rs:119.
+            cleanup_title_artifact: true,
             ..Default::default()
         },
     ) {
@@ -870,7 +887,7 @@ mod tests {
         use std::io::Write;
 
         // Set up DB with A → B → C dependency chain, all todo
-        let (temp_dir, conn) = setup_test_db();
+        let (temp_dir, mut conn) = setup_test_db();
 
         // Insert tasks in reverse order (C, B, A) to stress ordering
         for (id, status) in &[("C", "todo"), ("B", "todo"), ("A", "todo")] {
@@ -902,7 +919,7 @@ mod tests {
         )
         .unwrap();
 
-        reconcile_passes_with_db(&conn, &prd_path, None);
+        reconcile_passes_with_db(&mut conn, &prd_path, None);
 
         // All three should be done
         for id in &["A", "B", "C"] {
@@ -919,7 +936,7 @@ mod tests {
     fn test_reconcile_passes_with_db_only_marks_p1_tasks_done() {
         use crate::loop_engine::test_utils::setup_test_db;
 
-        let (_temp_dir, conn) = setup_test_db();
+        let (_temp_dir, mut conn) = setup_test_db();
         // P1: both in_progress and todo; P2: one todo
         conn.execute_batch(
             "INSERT INTO tasks (id, title, status, priority) VALUES
@@ -940,7 +957,7 @@ mod tests {
         });
         std::fs::write(&prd_path, prd_json.to_string()).unwrap();
 
-        reconcile_passes_with_db(&conn, &prd_path, Some("P1"));
+        reconcile_passes_with_db(&mut conn, &prd_path, Some("P1"));
 
         // P1-TASK-001 (base id TASK-001, passes: true) should be done
         let p1_001_status = crate::loop_engine::test_utils::get_task_status(&conn, "P1-TASK-001");
@@ -965,7 +982,7 @@ mod tests {
     fn test_reconcile_passes_with_db_none_prefix_marks_all_matching() {
         use crate::loop_engine::test_utils::setup_test_db;
 
-        let (_temp_dir, conn) = setup_test_db();
+        let (_temp_dir, mut conn) = setup_test_db();
         conn.execute_batch(
             "INSERT INTO tasks (id, title, status, priority) VALUES
              ('TASK-001', 'Task 1', 'in_progress', 1),
@@ -983,7 +1000,7 @@ mod tests {
         });
         std::fs::write(&prd_path, prd_json.to_string()).unwrap();
 
-        reconcile_passes_with_db(&conn, &prd_path, None);
+        reconcile_passes_with_db(&mut conn, &prd_path, None);
 
         let status = crate::loop_engine::test_utils::get_task_status(&conn, "TASK-001");
         assert_eq!(
@@ -1323,7 +1340,7 @@ mod tests {
     #[test]
     fn test_sync_mutations_to_db_modify_updates_fields() {
         use crate::loop_engine::test_utils::setup_test_db;
-        let (_tmp, conn) = setup_test_db();
+        let (_tmp, mut conn) = setup_test_db();
         conn.execute(
             "INSERT INTO tasks (id, title, status, priority) VALUES ('TASK-001', 'Old', 'todo', 10)",
             [],
@@ -1334,7 +1351,7 @@ mod tests {
             "id": "TASK-001", "action": "modify",
             "fields": {"notes": "synced notes", "title": "Updated title"}
         })];
-        sync_mutations_to_db(&conn, &mods, None);
+        sync_mutations_to_db(&mut conn, &mods, None);
 
         let title: String = conn
             .query_row("SELECT title FROM tasks WHERE id = 'TASK-001'", [], |r| {
@@ -1353,7 +1370,7 @@ mod tests {
     #[test]
     fn test_sync_mutations_to_db_irrelevant_changes_status() {
         use crate::loop_engine::test_utils::setup_test_db;
-        let (_tmp, conn) = setup_test_db();
+        let (_tmp, mut conn) = setup_test_db();
         conn.execute(
             "INSERT INTO tasks (id, title, status, priority) VALUES ('TASK-002', 'T2', 'todo', 5)",
             [],
@@ -1361,7 +1378,7 @@ mod tests {
         .unwrap();
 
         let mods = vec![serde_json::json!({"id": "TASK-002", "action": "irrelevant"})];
-        sync_mutations_to_db(&conn, &mods, None);
+        sync_mutations_to_db(&mut conn, &mods, None);
 
         let status = crate::loop_engine::test_utils::get_task_status(&conn, "TASK-002");
         assert_eq!(status, "irrelevant");
@@ -1370,13 +1387,13 @@ mod tests {
     #[test]
     fn test_sync_mutations_to_db_add_inserts_task() {
         use crate::loop_engine::test_utils::setup_test_db;
-        let (_tmp, conn) = setup_test_db();
+        let (_tmp, mut conn) = setup_test_db();
 
         let mods = vec![serde_json::json!({
             "id": "NEW-001", "action": "add",
             "title": "Brand new task", "description": "Do stuff", "priority": 7
         })];
-        sync_mutations_to_db(&conn, &mods, None);
+        sync_mutations_to_db(&mut conn, &mods, None);
 
         let (title, status, priority): (String, String, i32) = conn
             .query_row(
@@ -1409,7 +1426,7 @@ mod tests {
         let prd_path = temp_dir.path().join("tasks.json");
         write_test_prd(&prd_path);
 
-        let (_db, conn) = setup_test_db();
+        let (_db, mut conn) = setup_test_db();
         conn.execute(
             "INSERT INTO tasks (id, title, status, priority) VALUES ('TASK-001', 'T', 'todo', 1)",
             [],
@@ -1419,7 +1436,7 @@ mod tests {
         let mode = PermissionMode::Scoped {
             allowed_tools: None,
         };
-        mutate_prd_from_feedback(&prd_path, "feedback", &conn, None, None, &mode);
+        mutate_prd_from_feedback(&prd_path, "feedback", &mut conn, None, None, &mode);
 
         let bak_path = temp_dir.path().join("tasks.json.bak");
         assert!(
@@ -1445,13 +1462,13 @@ mod tests {
         write_test_prd(&prd_path);
         let original = std::fs::read_to_string(&prd_path).unwrap();
 
-        let (_db, conn) = setup_test_db();
+        let (_db, mut conn) = setup_test_db();
         let mode = PermissionMode::Scoped {
             allowed_tools: None,
         };
 
         // Must not panic
-        mutate_prd_from_feedback(&prd_path, "some feedback", &conn, None, None, &mode);
+        mutate_prd_from_feedback(&prd_path, "some feedback", &mut conn, None, None, &mode);
 
         let after = std::fs::read_to_string(&prd_path).unwrap();
         assert_eq!(
@@ -1477,13 +1494,13 @@ mod tests {
         write_test_prd(&prd_path);
         let original = std::fs::read_to_string(&prd_path).unwrap();
 
-        let (_db, conn) = setup_test_db();
+        let (_db, mut conn) = setup_test_db();
         let mode = PermissionMode::Scoped {
             allowed_tools: None,
         };
 
         // Must not panic
-        mutate_prd_from_feedback(&prd_path, "feedback here", &conn, None, None, &mode);
+        mutate_prd_from_feedback(&prd_path, "feedback here", &mut conn, None, None, &mode);
 
         let after = std::fs::read_to_string(&prd_path).unwrap();
         assert_eq!(

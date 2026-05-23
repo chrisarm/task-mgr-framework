@@ -367,9 +367,9 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
             };
 
             if decay_threshold > 0 {
-                let conn = open_connection(&cli.dir)?;
+                let mut conn = open_connection(&cli.dir)?;
                 let decayed = task_mgr::commands::next::apply_decay(
-                    &conn,
+                    &mut conn,
                     decay_threshold,
                     cli.verbose,
                     None,
@@ -525,9 +525,9 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                     None
                 };
 
-                let conn = open_connection(&cli.dir)?;
+                let mut conn = open_connection(&cli.dir)?;
                 let result = doctor(
-                    &conn,
+                    &mut conn,
                     auto_fix,
                     dry_run,
                     decay_threshold,
@@ -679,16 +679,16 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
 
         Commands::Unblock { task_id } => {
             let _lock = LockGuard::acquire(&cli.dir)?;
-            let conn = open_connection(&cli.dir)?;
-            let result = unblock(&conn, &task_id)?;
+            let mut conn = open_connection(&cli.dir)?;
+            let result = unblock(&mut conn, &task_id)?;
             output_result(&result, cli.format);
             Ok(())
         }
 
         Commands::Unskip { task_id } => {
             let _lock = LockGuard::acquire(&cli.dir)?;
-            let conn = open_connection(&cli.dir)?;
-            let result = unskip(&conn, &task_id)?;
+            let mut conn = open_connection(&cli.dir)?;
+            let result = unskip(&mut conn, &task_id)?;
             output_result(&result, cli.format);
             Ok(())
         }
@@ -724,12 +724,12 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
         Commands::Reset { task_ids, all, yes } => {
             if all {
                 let _lock = LockGuard::acquire(&cli.dir)?;
-                let conn = open_connection(&cli.dir)?;
+                let mut conn = open_connection(&cli.dir)?;
 
                 if !yes {
                     let count = count_resettable_tasks(&conn)?;
                     if count == 0 {
-                        let result = reset_all_tasks(&conn)?;
+                        let result = reset_all_tasks(&mut conn)?;
                         output_result(&result, cli.format);
                         return Ok(());
                     }
@@ -747,7 +747,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                     ));
                 }
 
-                let result = reset_all_tasks(&conn)?;
+                let result = reset_all_tasks(&mut conn)?;
                 output_result(&result, cli.format);
                 Ok(())
             } else {
@@ -761,8 +761,8 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                 }
 
                 let _lock = LockGuard::acquire(&cli.dir)?;
-                let conn = open_connection(&cli.dir)?;
-                let result = reset_tasks(&conn, &task_ids)?;
+                let mut conn = open_connection(&cli.dir)?;
+                let result = reset_tasks(&mut conn, &task_ids)?;
                 output_result(&result, cli.format);
                 Ok(())
             }
@@ -894,8 +894,8 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
 
             if auto {
                 let _lock = LockGuard::acquire(&cli.dir)?;
-                let conn = open_connection(&cli.dir)?;
-                let result = auto_unblock_all(&conn, &options)?;
+                let mut conn = open_connection(&cli.dir)?;
+                let result = auto_unblock_all(&mut conn, &options)?;
                 output_result(&result, cli.format);
             } else {
                 let conn = open_connection(&cli.dir)?;
@@ -1093,10 +1093,18 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                     // iteration if the fallback runner binary is missing.
                     {
                         use task_mgr::loop_engine::project_config::{
-                            check_fallback_runner_binary, read_project_config,
+                            check_fallback_runner_binary, check_review_model_binary,
+                            read_project_config,
                         };
                         let proj_cfg = read_project_config(&cli.dir);
                         check_fallback_runner_binary(proj_cfg.fallback_runner.as_ref())?;
+                        check_review_model_binary(
+                            proj_cfg.review_model.as_deref(),
+                            proj_cfg
+                                .fallback_runner
+                                .as_ref()
+                                .and_then(|fr| fr.cli_binary.as_deref()),
+                        )?;
                     }
 
                     let run_config = task_mgr::loop_engine::engine::LoopRunConfig {

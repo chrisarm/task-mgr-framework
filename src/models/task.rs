@@ -62,50 +62,17 @@ impl TaskStatus {
         matches!(self, TaskStatus::Done)
     }
 
-    /// Check if a transition from this status to the target status is valid.
+    /// Check if a transition from this status to the target status is valid
+    /// for a direct CLI / Operator invocation.
     ///
-    /// Valid transitions:
-    /// - `todo` -> `in_progress` (claim)
-    /// - `in_progress` -> `done`, `blocked`, `skipped`, `irrelevant`
-    /// - `blocked` -> `todo` (unblock)
-    /// - `skipped` -> `todo` (unskip)
-    ///
-    /// Invalid transitions:
-    /// - `todo` -> `done` (must claim first via in_progress)
-    /// - `done` -> anything (terminal state)
-    /// - `irrelevant` -> anything (terminal state, permanent exclusion)
+    /// This is a thin wrapper around `lifecycle::matrix::validate` for the
+    /// `Operator` source axis. Source-specific allowances (ReconcilePrd,
+    /// Recovery, DoctorRepair) are not exposed here; call `matrix::validate`
+    /// directly when the source matters.
     #[must_use]
     pub fn can_transition_to(&self, target: TaskStatus) -> bool {
-        // Same status is always valid (no-op)
-        if *self == target {
-            return true;
-        }
-
-        match self {
-            // From todo: can only go to in_progress (claim)
-            TaskStatus::Todo => matches!(target, TaskStatus::InProgress),
-
-            // From in_progress: can go to any terminal state
-            TaskStatus::InProgress => matches!(
-                target,
-                TaskStatus::Done
-                    | TaskStatus::Blocked
-                    | TaskStatus::Skipped
-                    | TaskStatus::Irrelevant
-            ),
-
-            // From blocked: can only return to todo (unblock)
-            TaskStatus::Blocked => matches!(target, TaskStatus::Todo),
-
-            // From skipped: can only return to todo (unskip)
-            TaskStatus::Skipped => matches!(target, TaskStatus::Todo),
-
-            // From done: terminal state, no transitions allowed
-            TaskStatus::Done => false,
-
-            // From irrelevant: terminal state (permanent exclusion), no transitions
-            TaskStatus::Irrelevant => false,
-        }
+        use crate::lifecycle::matrix::{TransitionSource, validate};
+        validate(*self, target, TransitionSource::Operator).is_ok()
     }
 
     /// Get human-readable valid transitions from this status.
@@ -586,6 +553,98 @@ mod tests {
         assert_eq!(TaskStatus::Skipped.valid_transitions(), &["todo"]);
         assert_eq!(TaskStatus::Done.valid_transitions(), &[] as &[&str]);
         assert_eq!(TaskStatus::Irrelevant.valid_transitions(), &[] as &[&str]);
+    }
+
+    // ============ TransitionSource triple matrix test ============
+
+    #[test]
+    fn test_transition_matrix_triple_coverage() {
+        use crate::lifecycle::matrix::{TransitionSource, validate as matrix_validate};
+        use TaskStatus::*;
+        use TransitionSource::*;
+
+        let statuses = [Todo, InProgress, Done, Blocked, Skipped, Irrelevant];
+        let sources = [
+            Operator,
+            LoopStatusTag,
+            Recovery,
+            ReconcilePrd,
+            DoctorRepair,
+            DecayReset,
+        ];
+
+        // Expected outcome of (from, to, source) per PRD §6 Semantic Distinctions.
+        // Operator baseline matches TaskStatus::can_transition_to bit-identically.
+        let expected = |from: TaskStatus, to: TaskStatus, source: TransitionSource| -> bool {
+            let baseline = matches!(
+                (from, to),
+                (Todo, InProgress)
+                    | (InProgress, Done)
+                    | (InProgress, Blocked)
+                    | (InProgress, Skipped)
+                    | (InProgress, Irrelevant)
+                    | (Blocked, Todo)
+                    | (Skipped, Todo)
+            );
+            match source {
+                Operator | LoopStatusTag => baseline,
+                Recovery => baseline || (from == InProgress && to == Todo),
+                // done→irrelevant: PRD removes a story whose task is already done.
+                // todo→done: prd_reconcile.rs:305 uses WHERE status IN ('todo', 'in_progress').
+                // todo→irrelevant: prd_reconcile.rs:550 irrelevant mutation, same WHERE.
+                ReconcilePrd => {
+                    baseline
+                        || (from == Done && to == Irrelevant)
+                        || (from == Todo && to == Done)
+                        || (from == Todo && to == Irrelevant)
+                }
+                // in_progress→todo: fix_stale_task. todo→done: fix_git_reconciliation
+                // (legacy SQL had no WHERE status, so any non-terminal row flips).
+                DoctorRepair => {
+                    baseline || (from == InProgress && to == Todo) || (from == Todo && to == Done)
+                }
+                // blocked→todo and skipped→todo are the only legal decay
+                // transitions; the matrix narrows the baseline rather than
+                // widening it.
+                DecayReset => (from == Skipped || from == Blocked) && to == Todo,
+            }
+        };
+
+        // Cross-product: 6 statuses × 6 statuses × 6 sources = 216 raw cases.
+        // Subtract trivial reflexive (from == to) entries: 6 × 6 = 36. Net = 180.
+        let mut cases: Vec<(TaskStatus, TaskStatus, TransitionSource, bool)> =
+            Vec::with_capacity(180);
+        for &from in &statuses {
+            for &to in &statuses {
+                if from == to {
+                    continue;
+                }
+                for &source in &sources {
+                    cases.push((from, to, source, expected(from, to, source)));
+                }
+            }
+        }
+        assert_eq!(
+            cases.len(),
+            180,
+            "expected 6×6×6 = 216 triples minus 6×6 = 36 reflexive cases = 180",
+        );
+
+        let mut mismatches: Vec<String> = Vec::new();
+        for (from, to, source, want) in cases {
+            let got = matrix_validate(from, to, source).is_ok();
+            if got != want {
+                mismatches.push(format!(
+                    "({from:?}, {to:?}, {source:?}): want {want}, got {got}"
+                ));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "transition matrix mismatches ({} cases):\n  {}",
+            mismatches.len(),
+            mismatches.join("\n  ")
+        );
     }
 
     #[test]

@@ -244,7 +244,6 @@ pub fn curate_enrich(conn: &Connection, params: EnrichParams) -> TaskMgrResult<E
             &PermissionMode::text_only(),
             claude::SpawnOpts {
                 model: Some("haiku"),
-                cleanup_title_artifact: true,
                 ..Default::default()
             },
         ) {

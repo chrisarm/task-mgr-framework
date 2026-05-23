@@ -1,0 +1,1352 @@
+{
+  "branchName": "refactor/tasklifecycle-extraction",
+  "description": "Phase 1, PRD 1 of 2 of the coherence refactoring. Extracts a TaskLifecycle service at src/lifecycle/ that owns all tasks.status mutations + side effects (run_tasks insert, PRD JSON sync, decay columns, notes formatting, stderr warning shape). Replaces ~20 raw `UPDATE tasks SET status` sites across 13+ files with a single named surface (six verbs: apply, try_claim, recover_in_progress_for_prefix, auto_block_after_failures, resurrect_for_iteration, reconcile_from_prd, repair_stale). Vertical-slice migration (skip.rs first, with M=3 mini-dogfood gate) precedes the bulk migration. Strict ordering vs the parallel runner-trait-hygiene effort enforced via CLARIFY-001.",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "Rust: No warnings in `cargo check` output for affected crate",
+      "Rust: No warnings in `cargo clippy -- -D warnings` for affected crate",
+      "Rust: Scoped `cargo test -p task-mgr <module>` passes for the touched module",
+      "Rust: `cargo fmt --check` passes",
+      "No raw `UPDATE tasks SET status` SQL added to production code (only one exception in commands/init/mod.rs is permitted, marked LIFECYCLE-EXCEPTION)",
+      "No new `.unwrap()` in production paths; use `?` propagation",
+      "All status-write call sites that previously called raw SQL now call a TaskLifecycle verb (or are explicitly out-of-scope per LIFECYCLE-EXCEPTION lint)",
+      "The five contract-level invariants (auto-claim, per-task partial-failure tolerance, DB-authoritative-PRD-best-effort, exact stderr warning shape, conditional-WHERE in API) are preserved bit-identically"
+    ],
+    "description": "These criteria apply to ALL implementation tasks"
+  },
+  "mergeStrategy": "Merge to main after MILESTONE-FINAL passes and the full-dogfood gate (VERIFY-001) is signed off. Squash optional. PRD 2 (Engine Orchestration Boundaries) is authored only after this PRD merges and the dogfood gate is satisfied.",
+  "model": "claude-sonnet-4-6",
+  "priorityPhilosophy": {
+    "description": "Hierarchy of what matters most when implementing tasks",
+    "hierarchy": [
+      "1. PLAN — Anticipate edge cases before coding; this refactor touches live-dogfooded code",
+      "2. PHASE 2 FOUNDATION — Stable lifecycle seam unblocks Phase 1 PRD 2 (engine carve) and Phase 2 prompt assembler; 1:10+ savings ratio justified",
+      "3. FUNCTIONING CODE — Pragmatic, reliable, wired in per plan; preserve all five contract-level invariants",
+      "4. CORRECTNESS — Compiles, type-checks, scoped tests pass deterministically; shadow tests assert byte-identical DB diff",
+      "5. CODE QUALITY — Clean code, qualityDimensions satisfied, no warnings, no .unwrap() in production",
+      "6. POLISH — Docs (src/lifecycle/CLAUDE.md, project CLAUDE.md pointer), formatting"
+    ],
+    "principles": [
+      "Quality dimensions explicit — every task carries qualityDimensions for THIS refactor's contract-preservation focus",
+      "Phase 2 foundation — the lifecycle seam is the prerequisite for PRD 2; over-investing in correctness here is correct",
+      "Edge cases = test cases — every named edge case (auto-claim, partial failure, etc.) becomes a TEST-INIT entry",
+      "Scoped per-iteration tests, full suite at milestones; milestones must leave the trunk green",
+      "Shadow tests are the safety net — a site is migrated only when its shadow test is green",
+      "Per-task partial-failure tolerance in apply() is a HARD contract — never convert to batch-level Result<(), Err>"
+    ]
+  },
+  "prohibitedOutcomes": [
+    "Converting apply() to return a single Result<(), Err> at the batch level (per-task outcomes are a contract; learning #2284)",
+    "Hiding the conditional-WHERE expected-status set behind an unconditional try_claim method (must remain explicit per FR-005)",
+    "Adding a NEW transaction wrapper around code that previously ran outside one (changes observable failure semantics)",
+    "Adding SELECT-before-UPDATE round-trips where today's SQL writes via a conditional WHERE",
+    "Reformatting the 'PRD JSON sync failed for {task}: {err}' stderr line (operators grep for this exact prefix)",
+    "Folding doctor/fixes.rs into reconcile_from_prd (must remain a distinct repair_stale verb per §6 doctor sub-decision)",
+    "Editing tasks/tasklifecycle-extraction.json directly — use task-mgr CLI",
+    "Touching the five parallel-slot cascade defenses (synthetic shared-infra slot, buildy-prefix heuristic, ephemeral overlay, consecutive-merge-fail halt, stale-ephemeral hygiene)",
+    "Removing the LIFECYCLE-EXCEPTION comment from commands/init/mod.rs:517 (lint-enforced)",
+    "Bulk migration starting before CLARIFY-002 (mini-dogfood gate) passes",
+    "Renaming TaskStatus enum variants or changing on-disk task status strings (DB migration impact; orthogonal to refactor goal — PRD §5 Non-Goal)",
+    "Changing the <task-status> side-band tag wire format or recognized status set (the tag contract is stable across both this PRD and the runner-trait-hygiene PRD — PRD §5 Non-Goal)"
+  ],
+  "project": "task-mgr",
+  "requires": [],
+  "reviewGuidelines": {
+    "priorityGuidelines": {
+      "critical": "1-10: Blocks further work, fix immediately",
+      "high": "11-20: Fix before milestone",
+      "low": "51-99: Defer to hardening phase",
+      "medium": "21-50: Fix in current phase if time permits"
+    }
+  },
+  "taskPrefix": "035925a9",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "Runner-hygiene PRD status confirmed: merged, paused, or ordered-after",
+        "Reciprocal pointer to tasks/prd-tasklifecycle-extraction.md exists in docs/designs/runner-trait-hygiene.md or in tasks/prd-runner-trait-hygiene.md",
+        "Decision recorded in tasks/progress-<prefix>.txt with humanReviewOutcome block embedded in this task's JSON entry",
+        "If 'ordered-after': no overlapping commits land while this PRD is in progress"
+      ],
+      "dependsOn": [],
+      "description": "Before any task in this PRD spawns, the parallel `tasks/prd-runner-trait-hygiene.md` effort must be in one of: (a) merged to main, (b) paused with a written status update in its progress file, or (c) ordered as 'runs after this PRD' with a recorded decision. Also confirm a reciprocal pointer to this PRD exists in `docs/designs/runner-trait-hygiene.md` §'Boundary Contract' or equivalent. Both efforts edit overlapping spawn → post-process windows in engine.rs; the design-doc boundary contract is necessary but not sufficient — explicit ordering eliminates the merge-collision risk entirely.",
+      "estimatedEffort": "low",
+      "humanReviewOutcome": null,
+      "id": "CLARIFY-001",
+      "notes": "Per PRD §8 step 0.5: this is a MUST-CLEAR gate, not a non-blocking open question. Architect review (production-code-architect) promoted this from open question to blocker. Emit <promise>BLOCKED</promise> with this task ID until human resolves.",
+      "passes": true,
+      "priority": 0,
+      "requiresHuman": true,
+      "taskType": "clarify",
+      "title": "Gate: runner-trait-hygiene PRD ordering decision",
+      "touchesFiles": [
+        "docs/designs/runner-trait-hygiene.md",
+        "tasks/prd-runner-trait-hygiene.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Consumer Impact Table generated in tasks/progress-<prefix>.txt with one row per audited site",
+        "Each row identifies: file:line, category (A-E), current SQL shape, target verb (apply/try_claim/recovery/reconcile/repair), TransitionSource variant",
+        "Confirmed site count vs PRD §1 (expected ~20); any discrepancy flagged in the table",
+        "List of test files that exercise current behavior (so shadow tests can re-exercise them post-refactor)",
+        "Identified callers of can_transition_to: confirmed only 2 (commands/complete.rs:199, commands/fail/transition.rs:123) per PRD"
+      ],
+      "dependsOn": [
+        "CLARIFY-001"
+      ],
+      "description": "Map every production caller of apply_status_updates (engine.rs:4703), can_transition_to (models/task.rs:78), auto_block_task (engine.rs:5140), and claim_slot_task (engine.rs:787). Verify the audit count of ~20 raw `UPDATE tasks SET status` sites across 13+ files (PRD §1). For each call site, document: (1) which TransitionSource variant maps to it (Operator/LoopStatusTag/Recovery/ReconcilePrd/DoctorRepair), (2) the expected-status predicate (for try_claim equivalents), (3) the side-effect set today (run_tasks insert, PRD JSON sync, decay column writes, notes formatting). Output a Consumer Impact Table in the progress file that the implementing FEAT tasks reference.",
+      "estimatedEffort": "medium",
+      "id": "ANALYSIS-001",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "Use: `grep -rn 'UPDATE tasks SET status\\|UPDATE tasks SET\\s\\+status' src/ | grep -v '/tests/'`. Multi-line SQL (e.g. reset.rs:78-79) needs extended grep. Reference PRD §6 'Affected Components' table as the starting checklist.",
+      "passes": true,
+      "priority": 0,
+      "qualityDimensions": [
+        "Audit must be exhaustive — every grep hit accounted for",
+        "TransitionSource mapping must be unambiguous; flag any site that doesn't fit a single source"
+      ],
+      "requiresHuman": false,
+      "taskType": "analysis",
+      "title": "Audit consumers of apply_status_updates / can_transition_to / status-write sites",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/overflow.rs",
+        "src/loop_engine/prd_reconcile.rs",
+        "src/commands/complete.rs",
+        "src/commands/fail/transition.rs",
+        "src/commands/skip.rs",
+        "src/commands/irrelevant.rs",
+        "src/commands/unblock.rs",
+        "src/commands/reset.rs",
+        "src/commands/review.rs",
+        "src/commands/next/mod.rs",
+        "src/commands/doctor/fixes.rs",
+        "src/commands/init/mod.rs",
+        "src/models/task.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Test enumerates the cross-product of every (from_status, to_status, source) triple — 6 statuses × 6 statuses × 5 source variants = 180 cases (minus trivial reflexive same-state)",
+        "Each case asserts the expected accept/reject outcome from the validator matrix (matrix table is documented in PRD §6 plus extended along source axis)",
+        "Expected outcomes for Operator source: match current can_transition_to behavior bit-identically (preserving existing matrix from task.rs:513-571)",
+        "Expected outcomes for ReconcilePrd source: allows done → irrelevant (per PRD §6 'Semantic Distinctions' table)",
+        "Expected outcomes for DoctorRepair source: allows in_progress → todo and in_progress → done (matching doctor/fixes.rs:30,93)",
+        "Test currently fails or is #[ignore]'d (it asserts behavior the validator does not yet have)",
+        "Test file compiles with `cargo check`"
+      ],
+      "dependsOn": [
+        "ANALYSIS-001"
+      ],
+      "description": "Write exhaustive unit test asserting the (from, to, source) triple acceptance matrix for the future TaskLifecycle validator. Tests live initially in src/models/task.rs (alongside existing matrix tests at lines 513-571) and will move with the matrix to src/lifecycle/matrix.rs in FEAT-002. The triple shape is load-bearing: TransitionSource::ReconcilePrd is allowed to flip terminal states that TransitionSource::Operator cannot. A (from, to)-only test would let regressions land green.",
+      "edgeCases": [
+        "(from=Todo, to=Done, source=Operator) — REJECTED today (must claim first), but ACCEPTED through apply() auto-claim path (preserved as service-internal behavior, not a matrix change)",
+        "(from=Done, to=Irrelevant, source=Operator) — REJECTED (terminal → terminal disallowed for operator intent)",
+        "(from=Done, to=Irrelevant, source=ReconcilePrd) — ACCEPTED (prd_reconcile.rs:550 deliberately flips terminal states)",
+        "(from=InProgress, to=Todo, source=DoctorRepair) — ACCEPTED (doctor/fixes.rs:30 stale recovery)",
+        "(from=Blocked, to=InProgress, source=any) — REJECTED (must go Blocked → Todo → InProgress; unblock.rs path)",
+        "(from=Skipped, to=Todo, source=Recovery) — ACCEPTED (resurrect_for_iteration)"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Test uses (from, to) pair without source",
+          "expectedBehavior": "Test fails to compile — table-driven design requires the third axis"
+        }
+      ],
+      "id": "TEST-INIT-001",
+      "invariants": [
+        "The Operator-source matrix must be byte-identical to the legacy can_transition_to table",
+        "No source variant ever permits Done → Todo (truly terminal in all contexts)",
+        "Every (from, to) pair has at least one source that permits it OR every source rejects it (no orphaned rejection-only pairs without rationale)"
+      ],
+      "model": "claude-opus-4-7",
+      "notes": "Per FR-002. Use a table-driven test (Vec<(from, to, source, expected)>) so failures pinpoint the regressing triple. Existing matrix tests in task.rs:513-571 are the Operator-source baseline.",
+      "passes": true,
+      "priority": 1,
+      "qualityDimensions": [
+        "Each case must have a clear expected-outcome rationale (link to PRD section or existing matrix)",
+        "Test failures must identify which (from, to, source) triple regressed (use a table-driven test)"
+      ],
+      "requiresHuman": false,
+      "taskType": "test",
+      "title": "Transition matrix (from, to, source) triple coverage test",
+      "touchesFiles": [
+        "src/models/task.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Unit test: recover_in_progress_for_prefix(None) reverts all in_progress → todo, returns count, clears started_at",
+        "Unit test: recover_in_progress_for_prefix(Some(\"FEAT-\")) is prefix-scoped — does not touch FIX-* rows",
+        "Unit test: recover_in_progress_for_prefix on empty result returns Ok(0) with no transaction commit overhead",
+        "Unit test: auto_block_after_failures(id, err, iter) sets status='blocked', last_error=err, blocked_at_iteration=iter; only when current status is in_progress",
+        "Unit test: auto_block_after_failures on a task already in done is a no-op (returns applied=false; no stderr emission)",
+        "Unit test: resurrect_for_iteration(prefix, &[id1, id2]) flips * → todo, clears started_at, returns count",
+        "Unit test: claim_slot_task predicate — succeeds when status IN ('todo', 'in_progress'); fails when status='blocked'",
+        "All tests run against in-memory rusqlite (no .task-mgr/tasks.db side effects); use task-mgr test_utils helper if it exposes the right scaffolding"
+      ],
+      "dependsOn": [
+        "ANALYSIS-001"
+      ],
+      "description": "Add unit tests against an in-memory rusqlite::Connection for every Category C recovery primitive — these today have only integration-level coverage (PRD §FR-010). Tests target the future signatures of TaskLifecycle::recover_in_progress_for_prefix, auto_block_after_failures, resurrect_for_iteration, and try_claim (the conditional-WHERE predicate semantics of claim_slot_task at engine.rs:787). Currently they call the legacy functions in engine.rs / overflow.rs; the same tests must pass after migration to the service. This is the safety harness for FR-006.",
+      "edgeCases": [
+        "Empty input slice to resurrect_for_iteration: returns Ok(0)",
+        "Prefix with hyphen vs prefix without: 'FEAT-' must match 'FEAT-001' but not 'FEAT001'",
+        "Bulk recover when 50+ tasks are in_progress: single transaction, no per-row overhead",
+        "auto_block_after_failures called concurrently with manual `task-mgr complete` (race): legacy uses WHERE status='in_progress', service preserves this"
+      ],
+      "estimatedEffort": "medium",
+      "id": "TEST-INIT-002",
+      "invariants": [
+        "Recovery primitives never touch tasks in terminal status (done, irrelevant)",
+        "Bulk operations are single transactions",
+        "Returned counts match SQL affected-rows count"
+      ],
+      "model": "claude-opus-4-7",
+      "notes": "Today these primitives are tested only via end-to-end integration tests (tests/crash_escalation_per_task.rs, etc.). Unit-level coverage is the precondition for confident migration. Learning #2807: record baseline `cargo test` count before adding these so any miscount is visible.",
+      "passes": true,
+      "priority": 2,
+      "qualityDimensions": [
+        "Tests must use production-shaped data (real Task struct via tests::insert_task helper or equivalent), not hand-built INSERTs missing columns",
+        "Each test names the specific behavior it locks (e.g. prefix-scoping, no-op on terminal, count return value) — not 'tests recovery primitive'"
+      ],
+      "requiresHuman": false,
+      "taskType": "test",
+      "title": "Category C recovery primitive unit tests",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/overflow.rs",
+        "src/loop_engine/test_utils.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Snapshot test captures stderr output when update_prd_task_passes fails (use a read-only file path or rename-mid-write to force the failure)",
+        "Snapshot asserts the exact prefix: `PRD JSON sync failed for ` (10 bytes locked)",
+        "Snapshot asserts format string shape: `PRD JSON sync failed for {task_id}: {err}\\n` (Display, not Debug)",
+        "Snapshot includes the stderr-vs-DB-commit ORDER: warning must appear AFTER the DB row is durable (capture both stderr line and a follow-up SELECT to assert ordering)",
+        "Test uses the existing engine.rs test infrastructure (see engine.rs:7220 test_apply_status_update_todo_auto_claim_writes_run_tasks for setup pattern)",
+        "Snapshot saved in tests/snapshots/ or as a `expect_test::expect` literal — make the bytes visible in source"
+      ],
+      "dependsOn": [
+        "ANALYSIS-001"
+      ],
+      "description": "Lock the exact stderr line shape emitted by apply_status_updates on PRD JSON sync failure (engine.rs:4787-4793). Operators grep stderr for this string; it is a stable public contract. The snapshot test must capture the current bytes verbatim and assert that future implementations (the service's apply()) produce the same bytes. Per PRD FR-010, format string is locked at `\"PRD JSON sync failed for {task_id}: {err}\\n\"` using `Display` (NOT `Debug`) on the error chain.",
+      "edgeCases": [
+        "Error chain with multiple causes (anyhow::Error::context) — Display vs Debug formatting differs significantly; whichever legacy uses, lock it",
+        "Task ID contains a special character — verify no escape transformation",
+        "Failure on first task in a multi-task batch — DB still commits the first; subsequent task's warnings also emit"
+      ],
+      "estimatedEffort": "medium",
+      "id": "TEST-INIT-003",
+      "invariants": [
+        "DB commit ALWAYS precedes stderr emission",
+        "TransitionOutcome.applied = true even when stderr fires (DB is authoritative)",
+        "Stderr writes are best-effort — they never fail the apply() call"
+      ],
+      "model": "claude-opus-4-7",
+      "notes": "Per PRD FR-010 and §2.5 Correctness Requirements. Use `expect_test::expect` for byte-visible snapshots. If `expect_test` isn't already a dev-dependency in Cargo.toml, add it. The whole point of locking now is so the migration cannot silently drift; this test is the safety net.",
+      "passes": true,
+      "priority": 3,
+      "qualityDimensions": [
+        "Snapshot must be DIFF-VISIBLE — use expect_test or insta so bytes appear in source review",
+        "Failure injection must use a real failure mode (read-only file, rename mid-write), NOT a mock",
+        "Lock the format on Display, not Debug; if legacy currently uses Debug, the snapshot captures that and the service preserves it (the lock is 'whatever bytes legacy produces')"
+      ],
+      "requiresHuman": false,
+      "taskType": "test",
+      "title": "Stderr snapshot test for PRD JSON sync failure warning",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs",
+        "tests/lifecycle_stderr_contract.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "tests/lifecycle_shadow.rs exists with a reusable `assert_shadow_equivalent(legacy_fn, service_fn, initial_state, expected_columns)` helper",
+        "Skip-site shadow test: sets task in 'in_progress' state, runs legacy skip SQL on clone A, runs service call (currently stub-returning, will be wired up in FEAT-007) on clone B, asserts identical row in tasks (modulo updated_at)",
+        "Helper normalizes timestamps (updated_at, started_at, completed_at) before diff — same timestamp class on both sides",
+        "Helper diffs run_tasks rows in addition to tasks (matters when run_id is set)",
+        "Write-ordering assertion (FR-008 point 6): if legacy writes tasks then inserts run_tasks, helper asserts service does same ordering",
+        "Stderr-vs-commit ordering captured (FR-008 point 8): helper records ORDER of stderr emission and DB visibility from a second connection",
+        "Test is currently #[ignore]'d (service call is stub) OR asserts a known-failing diff that flips green when FEAT-007 lands",
+        "Helper has a `crash_test_prd_atomicity(intents: &[…], fail_after_item: usize)` mode (FR-008 point 7) that injects PRD JSON sync failure mid-batch and asserts no torn JSON state"
+      ],
+      "dependsOn": [
+        "ANALYSIS-001",
+        "TEST-INIT-002",
+        "TEST-INIT-003"
+      ],
+      "description": "Build the shadow-test harness skeleton (tests/lifecycle_shadow.rs) and the first concrete shadow test for commands/skip.rs. Per PRD FR-008: for the skip site, set up an in-memory DB with a representative task in the relevant pre-state, run the legacy raw SQL path against one DB clone, run the (future) service call against another, diff every column of tasks/run_tasks (modulo normalized timestamps). The skip site is the vertical-slice migration target — its shadow test is the gate for FEAT-007 / CLARIFY-002.",
+      "edgeCases": [
+        "Task with NULL started_at vs Some(timestamp): timestamp normalization must preserve NULL-ness",
+        "Multi-task batch (apply with 5 intents): write-ordering across all 5",
+        "Mid-batch PRD JSON failure at item 3 of 5: items 1-2 DB-committed and PRD-synced, item 3 DB-committed and stderr-warning, items 4-5 DB-committed and PRD-synced",
+        "Concurrent reader on a second connection during apply() transaction (WAL mode visibility)"
+      ],
+      "estimatedEffort": "medium",
+      "id": "TEST-INIT-004",
+      "invariants": [
+        "Post-commit DB state diff is the primary assertion; observability-during-transaction is a documented gap (PRD §FR-008 known gap)",
+        "Timestamp normalization is the only modification of legacy/service outputs before comparison"
+      ],
+      "model": "claude-opus-4-7",
+      "notes": "Per FR-008. This task lands the harness but only one concrete test (skip). FEAT-008 / TEST-001 extend coverage to the remaining 21 sites. The 'service stub' is just a TODO call to TaskLifecycle::apply once FEAT-003 lands. Learning #2806: consolidate helpers in test_utils to avoid duplication across the shadow test file and existing tests.",
+      "passes": true,
+      "priority": 4,
+      "qualityDimensions": [
+        "Shadow harness is the SAFETY NET — it must catch byte-level drift, not just 'looks right'",
+        "Use rusqlite::Connection::open_in_memory() for both clones to isolate from .task-mgr/tasks.db",
+        "Helper API must be ergonomic enough that adding a shadow test for the next 6 Category A sites is a 10-line addition each (FEAT-008 will exercise this)",
+        "Do NOT use mocks for the failure-injection — use real failure modes (read-only file, rename-mid-write, dropped connection)"
+      ],
+      "requiresHuman": false,
+      "taskType": "test",
+      "title": "Shadow harness skeleton + skip.rs shadow test",
+      "touchesFiles": [
+        "tests/lifecycle_shadow.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "tests/lifecycle_exception_lint.rs exists; #[test] greps `src/` for `LIFECYCLE-EXCEPTION:` (excluding `/tests/`, `#[cfg(test)]` modules, and test_utils.rs)",
+        "Lint test asserts exactly one match and that the file path matches `src/commands/init/mod.rs`",
+        "Lint test would FAIL if the comment is removed in a future edit",
+        "Baseline `cargo test 2>&1 | grep 'test result'` numbers recorded in tasks/progress-<prefix>.txt with date stamp",
+        "Baseline iteration latency recorded: build a 5-task FEAT-only PRD locally, run `time task-mgr loop run` (or equivalent), record median over 3 runs",
+        "Recorded numbers are referenced by MILESTONE-2 and VERIFY-001 acceptance criteria"
+      ],
+      "dependsOn": [
+        "ANALYSIS-001"
+      ],
+      "description": "Two co-located tasks (combined to keep the test suite lean): (1) Add a grep-based lint test that asserts exactly one `LIFECYCLE-EXCEPTION:` token exists in `src/` outside test code, and it lives in `src/commands/init/mod.rs` (per FR-009). (2) Record baseline metrics before any extraction work begins: `cargo test` test count (learning #2807), and median iteration latency for a 5-task FEAT-only loop (PRD §2.5 Performance Requirements).",
+      "edgeCases": [
+        "The comment exists in a CLAUDE.md or doc file (acceptable — lint only checks src/)",
+        "The comment exists inside a #[cfg(test)] module (acceptable — lint excludes test code)"
+      ],
+      "estimatedEffort": "low",
+      "id": "TEST-INIT-005",
+      "invariants": [
+        "Exactly one LIFECYCLE-EXCEPTION token in non-test src/ at all times after FEAT-013 lands"
+      ],
+      "notes": "Per FR-009 and FR-010. The lint must run as part of `cargo test` (not a separate make target) so it can't be skipped. Median latency baseline: 3 runs is enough — record raw numbers in progress file, not just the median.",
+      "passes": true,
+      "priority": 5,
+      "qualityDimensions": [
+        "Lint test must use std::process::Command (or std::fs walk) — no external dependency",
+        "Baseline metrics must be reproducible: record the exact command + commit hash used to capture them"
+      ],
+      "requiresHuman": false,
+      "taskType": "test",
+      "title": "LIFECYCLE-EXCEPTION grep lint test + baseline metrics capture",
+      "touchesFiles": [
+        "tests/lifecycle_exception_lint.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "src/lifecycle/ exists with mod.rs, matrix.rs, apply.rs, claim.rs, recovery.rs, reconcile.rs, repair.rs, tests.rs",
+        "src/lifecycle/mod.rs declares: pub use {TaskLifecycle, TransitionIntent, TransitionOutcome, TransitionSource, TransitionRejectReason, ReconcilePlan, ReconcileReport, RepairPlan, RepairReport}",
+        "TaskLifecycle struct exists with fields: conn: &'a Connection, run_id: Option<&'a str>, iteration: Option<u32>, prd_json_path: Option<&'a Path>, task_prefix: Option<&'a str>",
+        "Constructors: TaskLifecycle::new(conn), with_run(conn, run_id, iter), with_prd_sync(self, path, prefix)",
+        "Method signatures match PRD §6 Public Contracts table exactly (apply, try_claim, recover_in_progress_for_prefix, auto_block_after_failures, resurrect_for_iteration, reconcile_from_prd, repair_stale)",
+        "TransitionIntent / TransitionOutcome / TransitionSource / TransitionRejectReason enums and structs defined per PRD FR-001",
+        "TransitionSource variants: Operator, LoopStatusTag, Recovery, ReconcilePrd, DoctorRepair (exactly 5)",
+        "Module declared in src/lib.rs (or src/main.rs as appropriate) — `pub mod lifecycle;`",
+        "`cargo check` passes with the new module (no callers yet; type-only)",
+        "`cargo build` passes",
+        "No raw `UPDATE tasks SET status` SQL in any new file (all SQL waits for FEAT-002+)"
+      ],
+      "dependsOn": [
+        "ANALYSIS-001",
+        "TEST-INIT-005"
+      ],
+      "description": "Create the `src/lifecycle/` module with all public/internal types and method signatures (per PRD FR-001 and §6 Affected Components). No business logic yet — this task lands the structural seam so dependent tasks can fill in implementations. Files: mod.rs (re-exports), matrix.rs (validator signatures), apply.rs (apply signature), claim.rs (try_claim signature), recovery.rs (3 recovery verb signatures), reconcile.rs (reconcile_from_prd signature), repair.rs (repair_stale signature), tests.rs (empty test module). Wire into src/lib.rs so the module compiles. All method bodies are `todo!()` or stub-returning with the correct return type.",
+      "estimatedEffort": "high",
+      "id": "FEAT-001",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "Foundation task — FEAT-002 through FEAT-006 fill in the implementations. Re-export TaskLifecycle from the crate root if convenient for callers. Learning #2740: extracting modules can break test-module access; use `pub(crate)` for shared internals. Learning #2070: existing iteration_pipeline.rs is the design template — same shape but for status-write axis.",
+      "passes": true,
+      "priority": 6,
+      "qualityDimensions": [
+        "Module placement is `src/lifecycle/` (sibling of commands/, loop_engine/, models/) — NOT inside commands/ or loop_engine/ (Approach A in PRD §6)",
+        "TransitionRejectReason is an enum with explicit variants (InvalidTransition { from, to }, UnknownTaskId, SourceMismatch { from, to, source }) — no string errors",
+        "Service struct holds &Connection (per-process, per-connection model per PRD FR-001 concurrency notes); no Arc<Mutex<…>> wrapping",
+        "Public method signatures use anyhow::Result at the boundary; internal TransitionRejectReason surfaces via TransitionOutcome.reason"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Lifecycle module scaffolding — types, signatures, mod.rs",
+      "touchesFiles": [
+        "src/lifecycle/mod.rs",
+        "src/lifecycle/matrix.rs",
+        "src/lifecycle/apply.rs",
+        "src/lifecycle/claim.rs",
+        "src/lifecycle/recovery.rs",
+        "src/lifecycle/reconcile.rs",
+        "src/lifecycle/repair.rs",
+        "src/lifecycle/tests.rs",
+        "src/lib.rs",
+        "src/main.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "matrix::validate exists with the signature above",
+        "Operator source matrix matches legacy can_transition_to in models/task.rs:78 byte-for-byte (same accept/reject for every (from, to) pair)",
+        "ReconcilePrd allows: done → irrelevant, in_progress → done, todo → done (matches prd_reconcile.rs:305,550)",
+        "DoctorRepair allows: in_progress → todo, in_progress → done (matches doctor/fixes.rs:30,93)",
+        "LoopStatusTag mirrors Operator except permits auto-claim chain (todo → in_progress within apply()) — note: this is internal to apply(), the matrix itself rejects (todo → done, LoopStatusTag) and apply() handles the auto-claim separately",
+        "Recovery permits: in_progress → todo (bulk recover), in_progress → blocked (auto_block), * → todo (resurrect for any non-terminal)",
+        "TEST-INIT-001 passes (the (from, to, source) triple matrix test)",
+        "The existing tests in models/task.rs:513-571 continue to pass — they exercise can_transition_to which is now retained as a thin wrapper around validate(from, to, Operator)",
+        "No raw `UPDATE tasks SET status` SQL — pure validation"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "TEST-INIT-001"
+      ],
+      "description": "Implement `pub(crate) fn validate(from: TaskStatus, to: TaskStatus, source: TransitionSource) -> Result<(), TransitionRejectReason>` in src/lifecycle/matrix.rs (per FR-002). The table replaces the existing `TaskStatus::can_transition_to` for the Operator source axis (verbatim translation) and extends it along the source axis to encode the semantic distinctions in PRD §6 'Semantic Distinctions' (ReconcilePrd may flip terminal states, DoctorRepair may resurrect in_progress, etc.). The exhaustive triple matrix test from TEST-INIT-001 must pass after this lands.",
+      "estimatedEffort": "medium",
+      "id": "FEAT-002",
+      "modifiesBehavior": false,
+      "notes": "Per FR-002. The validator is `pub(crate)` — only the service module calls it. Callers go through TaskLifecycle::apply() / try_claim() / etc. Learning #1581: function-signature changes ripple to 9+ callers — keep validate's signature stable from this task forward.",
+      "passes": true,
+      "priority": 7,
+      "qualityDimensions": [
+        "Use match statement against (from, to, source) — explicit, exhaustive, easy to diff vs legacy",
+        "Reject reasons must be precise: SourceMismatch carries from/to/source so callers can surface 'why' in audit logs",
+        "If legacy can_transition_to is retained as a thin wrapper (rather than deleted now), mark it `#[deprecated(note = \"use lifecycle::matrix::validate\")]`"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Matrix validator implementation — (from, to, source) table",
+      "touchesFiles": [
+        "src/lifecycle/matrix.rs",
+        "src/models/task.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "apply() returns Vec<TransitionOutcome> of length input.len() — one outcome per intent",
+        "AUTO-CLAIM: For LoopStatusTag intent targeting Done from a todo task, apply() silently transitions todo → in_progress → done in the same DB transaction; outcome.previous = Some(Todo), outcome.applied = true",
+        "PER-TASK PARTIAL FAILURE: If intent K has invalid transition, outcomes[K].applied = false with reason populated; other N-1 intents still apply and commit (NOT batch-level Result::Err — learning #2284)",
+        "run_tasks bookkeeping: when run_id.is_some() && iteration.is_some(), apply() INSERTs one run_tasks row per successful transition matching engine.rs:4739-4748",
+        "PRD JSON sync: when prd_json_path.is_some() && task_prefix.is_some(), apply() calls update_prd_task_passes for done transitions, identical to engine.rs:4785",
+        "STDERR WARNING: PRD JSON sync failure emits `PRD JSON sync failed for {task}: {err}\\n` to stderr (Display, byte-identical to TEST-INIT-003 snapshot); DB transaction still commits",
+        "applied = true reflects DB-write success regardless of PRD JSON sync outcome (DB authoritative)",
+        "Notes/error_count/last_error/blocked_at_iteration/skipped_at_iteration/started_at/completed_at written per legacy SQL — shadow test will assert byte-identical column values",
+        "Empty intents slice returns Ok(Vec::new()) with no transaction",
+        "TransitionOutcome carries enough information for callers to prune terminal-status tasks from tracking maps (learnings #2796, #2304) — at minimum: target, previous, applied. Verify by reading iteration_pipeline.rs callers post-shim.",
+        "Status-tag completion gate at iteration_pipeline.rs:275-286 continues to read per-task outcomes (NOT a global counter) post-refactor — learning #2238 contract preserved by the shim's return shape"
+      ],
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/loop_engine/engine.rs",
+            "impact": "NEEDS_REVIEW",
+            "line": 4703,
+            "mitigation": "engine.rs::apply_status_updates becomes a thin shim that builds intents and calls TaskLifecycle::apply (preserves wire compatibility). Marked #[deprecated(note=\"use TaskLifecycle::apply\")] after FEAT-008 lands.",
+            "usage": "apply_status_updates is called from sequential (~L3204) and wave (~L1166) iteration paths"
+          },
+          {
+            "file": "src/loop_engine/iteration_pipeline.rs",
+            "impact": "OK",
+            "line": 275,
+            "mitigation": "Per-task TransitionOutcome shape matches existing Vec<(task_id, change, applied)> — iteration_pipeline only needs to map field names",
+            "usage": "Reads per-task outcomes from apply_status_updates to gate completion (learning #2238)"
+          }
+        ],
+        "semanticDistinctions": [
+          {
+            "context": "CLI direct call (commands/complete.rs etc.)",
+            "currentBehavior": "Raw UPDATE; no run_tasks insert; no PRD JSON sync",
+            "requiredBehavior": "TaskLifecycle::new(conn) — no run_id; apply() skips run_tasks and PRD sync when those fields are None"
+          },
+          {
+            "context": "Loop iteration (sequential or wave)",
+            "currentBehavior": "apply_status_updates writes tasks + run_tasks + calls update_prd_task_passes + emits stderr warning",
+            "requiredBehavior": "TaskLifecycle::with_run(conn, run_id, iter).with_prd_sync(path, prefix) — all side effects fire"
+          },
+          {
+            "context": "Reconcile/repair (prd_reconcile, doctor)",
+            "currentBehavior": "Raw UPDATE bypassing user-facing matrix",
+            "requiredBehavior": "reconcile_from_prd / repair_stale verbs (FEAT-006), NOT apply() — different TransitionSource, different validation rules"
+          }
+        ]
+      },
+      "dependsOn": [
+        "FEAT-002",
+        "TEST-INIT-003"
+      ],
+      "description": "Implement `TaskLifecycle::apply(intents: &[TransitionIntent]) -> Result<Vec<TransitionOutcome>>` in src/lifecycle/apply.rs (per FR-003 and §2.5 Correctness Requirements). This is the load-bearing method — it owns the side-effect set previously in engine.rs::apply_status_updates (engine.rs:4703-4793): auto-claim of todo → in_progress when LoopStatusTag emits :done without prior claim, per-task partial-failure tolerance, run_tasks INSERT (when run_id+iteration are set), update_prd_task_passes call (when prd_json_path is set), exact stderr warning shape (locked by TEST-INIT-003). Also writes notes, error_count, last_error, blocked_at_iteration, skipped_at_iteration, started_at, completed_at per the legacy SQL strings.",
+      "edgeCases": [
+        "Auto-claim for todo task with LoopStatusTag:done — outcome.previous=Some(Todo), applied=true, single row in run_tasks (iteration's run_tasks row only)",
+        "Two intents for same task_id in one apply() call (LLM emits :done and :failed) — apply in emission order, both outcomes returned",
+        "PRD JSON read-only filesystem — DB commits, stderr emits, outcome.applied=true",
+        "Empty intents — Ok(Vec::new()), no transaction overhead",
+        "Intent for unknown task_id — outcome.applied=false, reason=UnknownTaskId; subsequent intents unaffected",
+        "Service called outside a run (no run_id) — run_tasks bookkeeping skipped silently"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "DB lock conflict mid-batch",
+          "expectedBehavior": "Whole batch fails with anyhow::Error; transaction rolls back; outcomes vec not returned"
+        },
+        {
+          "cause": "update_prd_task_passes fails after DB commit",
+          "expectedBehavior": "Stderr warning emitted; outcomes returned with applied=true"
+        }
+      ],
+      "id": "FEAT-003",
+      "invariants": [
+        "outcomes.len() == intents.len()",
+        "DB is authoritative; PRD JSON is best-effort with stderr warning",
+        "applied=true ⟹ DB row reflects the transition",
+        "Single transaction for all intents in one call"
+      ],
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": true,
+      "notes": "Per FR-003. This is the load-bearing function — reference engine.rs:4703-4793 line-by-line during implementation. Learning #2284: per-task tuples, not global bool. Learning #2238: completion gate reads per-task outcomes. Learning #2796: terminal-status tasks pruned from caller tracking maps based on outcome — service preserves this. Learning #2304: Step 7 crash-tracking nuance — service's outcome shape preserves the information caller needs.",
+      "passes": true,
+      "priority": 8,
+      "qualityDimensions": [
+        "Per-task partial failure is a HARD contract — NEVER convert to batch-level Result::Err (learning #2284)",
+        "Auto-claim is silent — no stderr emission, no second outcome row",
+        "PRD JSON sync error chain: use Display formatting on anyhow::Error (e.is_caused_by chain), NOT Debug",
+        "DB transaction commits BEFORE stderr emission (PRD §2.5 invariant)",
+        "Use single transaction wrapping all intents (matches legacy behavior — do NOT introduce a NEW transaction boundary if legacy ran outside one; review engine.rs:4703 for the current boundary)"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "apply() implementation — auto-claim, per-task outcomes, run_tasks, PRD JSON sync",
+      "touchesFiles": [
+        "src/lifecycle/apply.rs",
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "try_claim(id, &[Todo]) succeeds only when current status is Todo, returns true; otherwise false (no Result::Err)",
+        "try_claim(id, &[Todo, InProgress]) succeeds for either pre-state (slot-resumption idempotency)",
+        "Successful claim sets status='in_progress', started_at=datetime('now'), updated_at=datetime('now')",
+        "Failed claim (status not in allowed) leaves the row untouched — no SELECT-before-UPDATE round-trip; use SQL with `WHERE id = ? AND status IN (...)` and check rows_affected",
+        "Empty allowed slice returns false without DB write (defensive boundary)",
+        "Result::Err only on infrastructure failure (DB lock, etc.) — not on missing task ID (returns Ok(false))",
+        "Caller-side test confirms allowed slice is part of the public signature (not hidden)"
+      ],
+      "dependsOn": [
+        "FEAT-001"
+      ],
+      "description": "Implement `TaskLifecycle::try_claim(task_id: &str, allowed: &[TaskStatus]) -> Result<bool>` in src/lifecycle/claim.rs (per FR-005). Returns true on successful claim (status flipped to in_progress, started_at set), false when the task's current status is not in the allowed slice. Conditional-WHERE predicate is part of the API surface (PRD §2.5 'Conditional-WHERE predicates are part of the API'); must NOT be hidden behind an unconditional method. Two distinct caller patterns will use this in FEAT-009: commands/next/mod.rs (allowed=[Todo]) and the future replacement for engine.rs:787 claim_slot_task (allowed=[Todo, InProgress] for slot-resumption idempotency).",
+      "edgeCases": [
+        "Task in Blocked status, try_claim with allowed=[Todo]: returns false, no DB write",
+        "Task in Todo, try_claim with allowed=[Todo, InProgress]: succeeds, status=InProgress",
+        "Task in InProgress, try_claim with allowed=[Todo, InProgress]: succeeds (slot-resumption), started_at and updated_at refresh; matches engine.rs:787 idempotency",
+        "Unknown task_id: returns Ok(false)"
+      ],
+      "estimatedEffort": "low",
+      "id": "FEAT-004",
+      "invariants": [
+        "Single round-trip to DB regardless of allowed slice length",
+        "Allowed slice is explicit in the API — no overload that hides it"
+      ],
+      "modifiesBehavior": false,
+      "notes": "Per FR-005. Two distinct uses in FEAT-009: commands/next/mod.rs:244 (allowed=[Todo]) and the replacement for engine.rs:787 (allowed=[Todo, InProgress]). The PRD explicitly calls out the latter's idempotency as required behavior — second-call refreshes started_at.",
+      "passes": true,
+      "priority": 8,
+      "qualityDimensions": [
+        "Build the SQL `WHERE … status IN (?, ?, …)` clause from the allowed slice — use rusqlite::params_from_iter for the variadic",
+        "No SELECT-before-UPDATE: a single UPDATE … WHERE id=? AND status IN (...) + rows_affected check is the entire operation",
+        "Idempotent: calling try_claim twice in succession against same task with allowed=[Todo, InProgress] succeeds first time (Todo→InProgress) and second time (InProgress is in allowed, treated as no-op? or fails?). Decision: match engine.rs:787 legacy behavior — second call succeeds with rows_affected=1 because the row IS updated (started_at and updated_at refresh). Document this in code."
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "try_claim() implementation — explicit allowed-status predicate",
+      "touchesFiles": [
+        "src/lifecycle/claim.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "recover_in_progress_for_prefix(None) — bulk UPDATE WHERE status='in_progress' SET status='todo', started_at=NULL; returns affected count",
+        "recover_in_progress_for_prefix(Some(prefix)) — same but with `AND id LIKE ? || '%'`; returns affected count; preserves the prefix-scoping behavior used by engine.rs:2410/3264/5750/5775/5811/5900/6258/6284",
+        "auto_block_after_failures(id, err, iter) — UPDATE WHERE id=? AND status='in_progress' SET status='blocked', last_error=err, blocked_at_iteration=iter, updated_at=now(); returns true if applied",
+        "auto_block_after_failures on already-terminal task (done/irrelevant) returns Ok(false) with NO stderr emission (matches legacy 0-rows-affected behavior at engine.rs:5151)",
+        "resurrect_for_iteration(prefix, &[ids]) — bulk UPDATE WHERE id IN (?,?,...) AND id LIKE prefix || '%' SET status='todo', started_at=NULL; returns affected count",
+        "resurrect_for_iteration with empty ids slice returns Ok(0) with no transaction commit",
+        "All three verbs run in single transactions",
+        "All TEST-INIT-002 unit tests pass against the new service implementations",
+        "TransitionSource::Recovery used internally for audit log (when audit logging is wired in CODE-REVIEW-1 follow-ups)"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "TEST-INIT-002"
+      ],
+      "description": "Implement the three Category C recovery verbs in src/lifecycle/recovery.rs (per FR-006). These replace the 12 inlined sites in engine.rs and 2 in overflow.rs. They are NOT user-intent transitions — they are bulk recovery primitives that the engine calls during iteration claim guards, mid-iteration recovery, and overflow ladder steps. Routing them through the service is the only way to make recovery behavior observable and testable (PRD §6 'TaskLifecycle Scope Decision'). The TEST-INIT-002 unit tests pass after this lands.",
+      "edgeCases": [
+        "recover_in_progress_for_prefix when zero rows match: returns Ok(0), no transaction commit overhead",
+        "auto_block_after_failures when task is already in blocked: returns Ok(false) (status='in_progress' predicate filters it)",
+        "resurrect_for_iteration with prefix='FEAT-' and ids=['FIX-001']: zero rows affected (prefix mismatch)",
+        "Bulk recover during a parallel-slot iteration: must not touch tasks held by OTHER slots — prefix-scoping is the guard"
+      ],
+      "estimatedEffort": "medium",
+      "id": "FEAT-005",
+      "invariants": [
+        "All three verbs are bulk-safe: a single failure does not partial-commit",
+        "Recovery never touches terminal-state tasks (done, irrelevant)",
+        "auto_block emits no stderr on no-op (matches legacy)"
+      ],
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": true,
+      "notes": "Per FR-006. Today these live as 14 inlined UPDATE sites. Migration to call sites happens in FEAT-010/011, not this task. The five parallel-slot cascade defenses (PRD §5 Non-Goals) are NOT touched — recover_in_progress_for_prefix is the bottom-up primitive they orchestrate, not the orchestrator itself.",
+      "passes": true,
+      "priority": 9,
+      "qualityDimensions": [
+        "Bulk operations are single transactions — do NOT loop with per-row UPDATEs",
+        "Prefix-scoping uses `id LIKE ? || '%'` (matches existing engine.rs pattern) — case-sensitive",
+        "auto_block's `WHERE … AND status='in_progress'` predicate is essential — preserves the race-safety of legacy engine.rs:5151",
+        "Use rusqlite::params_from_iter for the variadic IN clause in resurrect_for_iteration",
+        "Return rusqlite::Connection::execute's affected-rows count directly; no separate SELECT COUNT"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Recovery verbs — recover_in_progress_for_prefix, auto_block_after_failures, resurrect_for_iteration",
+      "touchesFiles": [
+        "src/lifecycle/recovery.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "ReconcilePlan struct: { items: Vec<ReconcileItem { task_id: String, target: TaskStatus, audit_label: Option<String> }> }",
+        "RepairPlan struct: same shape (RepairItem fields identical)",
+        "ReconcileReport / RepairReport: { applied: usize, skipped: usize, rejected: Vec<TaskId> }",
+        "reconcile_from_prd uses TransitionSource::ReconcilePrd; permits done → irrelevant and todo|in_progress → done (matches prd_reconcile.rs:305,550)",
+        "repair_stale uses TransitionSource::DoctorRepair; permits in_progress → todo and in_progress → done (matches doctor/fixes.rs:30,93)",
+        "Internal helper apply_plan_with_source(items, source) is shared between both — single implementation of the per-item dispatch + matrix validation + side effects",
+        "Both verbs preserve the same DB+PRD+stderr contracts as apply() (DB authoritative, best-effort PRD JSON, exact stderr warning shape) — share the helper for these too",
+        "Plan-building logic remains in prd_reconcile.rs / doctor/fixes.rs — only plan-application moves into the service (PRD §FR-007 'explicitly NOT consolidated')",
+        "TEST-INIT-001 source-axis cases (ReconcilePrd, DoctorRepair) pass against the matrix"
+      ],
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/loop_engine/prd_reconcile.rs",
+            "impact": "BREAKS",
+            "line": 305,
+            "mitigation": "Split into ReconcilePlan-building (stays here) + lifecycle.reconcile_from_prd(plan) (moves to service). Wired in FEAT-012.",
+            "usage": "Raw UPDATE for todo|in_progress → done from PRD JSON"
+          },
+          {
+            "file": "src/loop_engine/prd_reconcile.rs",
+            "impact": "BREAKS",
+            "line": 550,
+            "mitigation": "Same split.",
+            "usage": "Raw UPDATE for * → irrelevant from PRD"
+          },
+          {
+            "file": "src/commands/doctor/fixes.rs",
+            "impact": "BREAKS",
+            "line": 30,
+            "mitigation": "Split into RepairPlan-building + lifecycle.repair_stale(plan). Wired in FEAT-012.",
+            "usage": "Stale in_progress → todo repair (time-based heuristic)"
+          },
+          {
+            "file": "src/commands/doctor/fixes.rs",
+            "impact": "BREAKS",
+            "line": 93,
+            "mitigation": "Same split.",
+            "usage": "Stale * → done repair"
+          }
+        ],
+        "semanticDistinctions": [
+          {
+            "context": "PRD JSON declares a task done",
+            "currentBehavior": "Raw UPDATE WHERE status IN ('todo','in_progress')",
+            "requiredBehavior": "lifecycle.reconcile_from_prd with TransitionSource::ReconcilePrd; same predicate via matrix"
+          },
+          {
+            "context": "Doctor detects stale in_progress",
+            "currentBehavior": "Raw UPDATE WHERE id = ?",
+            "requiredBehavior": "lifecycle.repair_stale with TransitionSource::DoctorRepair; different rationale, different audit_label, but same side-effect plumbing"
+          }
+        ]
+      },
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003"
+      ],
+      "description": "Implement two distinct verbs in src/lifecycle/reconcile.rs and src/lifecycle/repair.rs (per FR-007 and PRD §6 doctor sub-decision). Both consume a structured plan (ReconcilePlan / RepairPlan) built upstream by the calling module — plan-building stays in prd_reconcile.rs and doctor/fixes.rs respectively. Plan-application moves into the service. Internally, both verbs share a `pub(crate) fn apply_plan_with_source(plan_items, source)` helper to avoid duplication. Doctor is NOT folded into reconcile — they have different provenance (heuristic vs external-truth) per the architect-review-revised PRD.",
+      "edgeCases": [
+        "Empty plan: Ok(ReconcileReport { applied: 0, skipped: 0, rejected: vec![] }) with no transaction",
+        "Plan item targeting a task that no longer exists: outcome.applied=false, rejected vec entry",
+        "ReconcilePrd plan tries to flip a `superseded` (future) status — matrix rejects; reported in skipped/rejected",
+        "Same task_id in plan twice: apply in order; second call may be a no-op if first reached terminal"
+      ],
+      "estimatedEffort": "medium",
+      "id": "FEAT-006",
+      "invariants": [
+        "Service NEVER builds a plan — only consumes",
+        "reconcile_from_prd and repair_stale are observably distinct in audit/logging",
+        "Both verbs honor the same DB-authoritative/PRD-best-effort/stderr-warning contract as apply()"
+      ],
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": true,
+      "notes": "Per FR-007 and architect-review-revised §6 doctor sub-decision. The decision to keep them as two verbs (rather than fold doctor into reconcile) is intentionally locked — see PRD §7 Resolved during review. A future maintainer who tries to consolidate them should be redirected to read the rationale.",
+      "passes": true,
+      "priority": 9,
+      "qualityDimensions": [
+        "Two distinct public verbs (NOT one verb with a source enum field) — readability of the public API trumps DRY here",
+        "Internal apply_plan_with_source helper is `pub(crate)` and shared — DRY of the implementation is the right scope",
+        "Plan structs are owned by the caller (prd_reconcile builds ReconcilePlan, doctor/fixes builds RepairPlan); service consumes only",
+        "Audit-label carries the rationale (e.g. 'stale_in_progress_24h' or 'prd_marked_done') so logs can distinguish provenance"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "reconcile_from_prd + repair_stale — separate verbs sharing apply_plan_with_source helper",
+      "touchesFiles": [
+        "src/lifecycle/reconcile.rs",
+        "src/lifecycle/repair.rs",
+        "src/lifecycle/mod.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "commands/skip.rs:125 raw `UPDATE tasks SET status = 'skipped', notes = ?, updated_at = datetime('now') WHERE id = ?` is REMOVED",
+        "skip.rs builds a TransitionIntent { task_id, target: Skipped, notes, source: Operator } and calls TaskLifecycle::new(&conn).apply(&[intent])",
+        "skip.rs uses TransitionOutcome.applied + .reason to determine exit code (preserves current CLI exit codes — verify against existing tests)",
+        "TEST-INIT-004 shadow test for skip PASSES (legacy SQL vs service call produces byte-identical DB diff)",
+        "skip.rs LINE COUNT shrinks by ≥30% (excluding tests) per FR-004 acceptance",
+        "Scoped `cargo test -p task-mgr commands::skip` passes",
+        "All existing tests in commands/skip.rs (and tests/ that exercise skip flows) remain green",
+        "Public CLI: `task-mgr skip <id>` produces bit-identical stdout/stderr to legacy"
+      ],
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/commands/skip.rs",
+            "impact": "BREAKS (intentional)",
+            "line": 125,
+            "mitigation": "This task migrates it; shadow test asserts byte-identical DB diff",
+            "usage": "Direct CLI skip — raw UPDATE"
+          }
+        ],
+        "semanticDistinctions": [
+          {
+            "context": "CLI direct (`task-mgr skip <id>`)",
+            "currentBehavior": "Raw UPDATE; no run_tasks; no PRD JSON sync",
+            "requiredBehavior": "TaskLifecycle::new(&conn).apply (no run_id, no PRD path) — service skips run_tasks and PRD sync when those fields are None"
+          }
+        ]
+      },
+      "dependsOn": [
+        "FEAT-003",
+        "FEAT-002",
+        "TEST-INIT-004"
+      ],
+      "description": "Migrate ONLY commands/skip.rs to the new TaskLifecycle service (per PRD §8 step 1.5). This is the vertical-slice migration target — skip has the smallest side-effect set among Category A verbs, making it the lowest-blast-radius first migration. After this lands, CLARIFY-002 holds the bulk migration until a mini-dogfood gate (M=3 iterations on a single live PRD) confirms zero regressions. Rollback cost if shadow tests miss something: one verb's worth of files, not 22.",
+      "edgeCases": [
+        "Skip a task not in Todo/InProgress: outcome.applied=false, reason=InvalidTransition; CLI exits non-zero with current error message preserved",
+        "Skip with --reason flag: notes field populated; shadow test asserts byte-identical notes column",
+        "Skip non-existent task ID: outcome.applied=false, reason=UnknownTaskId; legacy SQL would have rows_affected=0; service path must produce same exit code"
+      ],
+      "estimatedEffort": "medium",
+      "id": "FEAT-007",
+      "invariants": [
+        "Shadow test must be green before this task is marked done",
+        "Legacy `cargo test -p task-mgr commands::skip` test count is preserved (no test removed; deletions only of the raw SQL line)"
+      ],
+      "modifiesBehavior": true,
+      "notes": "Per PRD §8 step 1.5. After this commits, CLARIFY-002 (mini-dogfood gate) is the next blocker. Do NOT migrate any other Category A site in this task — strictly one verb.",
+      "passes": true,
+      "priority": 10,
+      "qualityDimensions": [
+        "Thin shell: parse args → build intent → call service → format output; no business logic in skip.rs",
+        "Outcome → exit code mapping preserved (check current commands/skip.rs error paths)",
+        "No new .unwrap() — propagate with ?",
+        "Shadow test is THE gate — if it doesn't pass, the migration is not complete"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Vertical-slice migration: commands/skip.rs → TaskLifecycle::apply",
+      "touchesFiles": [
+        "src/commands/skip.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "M=3 successful iterations completed on a live PRD (the maintainer picks which — recommend a small in-progress PRD) (WAIVED 2026-05-19: runner-hygiene effort effectively merged for this branch's purposes; maintainer waiver path per PRD §8 step 1.5 + notes)",
+        "Zero loop-internal regressions observed (no DB corruption, no spurious stderr, no unexpected status flips) (WAIVED 2026-05-19: see humanReviewOutcome)",
+        "humanReviewOutcome block embedded in this task's JSON entry with: confirmedM, prdUsed, iterationDurations, anyRegressions (CONFIRMED 2026-05-19: waiver block embedded — confirmedM=0/waived, prdUsed=null, iterationDurations=[], anyRegressions=false/n-a)",
+        "If a regression is found: blocking CODE-FIX task spawned via `task-mgr add --stdin --depended-on-by CLARIFY-002` and gate re-run after the fix (N/A under waiver — escalation path remains available if regressions surface during bulk-migration FEAT-008..012)"
+      ],
+      "dependsOn": [
+        "FEAT-007"
+      ],
+      "description": "Per PRD §8 step 1.5: after the skip vertical slice (FEAT-007) lands, run `task-mgr loop` for M=3 iterations on a single live PRD with the refactored code. Zero regressions required before bulk migration proceeds. This is the safety net for the shadow harness — anything the harness missed surfaces here at minimal blast radius (one verb, not 22). If a regression appears: root-cause it, fix in a CODE-FIX task spawned via task-mgr add, re-run the gate.",
+      "estimatedEffort": "low",
+      "humanReviewOutcome": {
+        "additionalRequirements": [
+          "Bulk-migration tasks (FEAT-008 through FEAT-012) remain individually shadow-tested per FR-008 — the waiver removes the M=3 live-loop step but does not weaken the per-site shadow-test gate.",
+          "If any regression surfaces during the bulk migration, spawn a blocking CODE-FIX via `task-mgr add --stdin --depended-on-by CLARIFY-002` and surface it for maintainer review before proceeding."
+        ],
+        "confirmedValues": {
+          "anyRegressions": false,
+          "confirmedM": 0,
+          "iterationDurations": [],
+          "prdUsed": null
+        },
+        "deltasFromProposed": [
+          "Mini-dogfood gate waived per PRD §8 step 1.5 escape clause and CLARIFY-002 notes: 'Acceptable to skip ONLY if the runner-hygiene effort is fully merged and an explicit waiver is recorded in this task's humanReviewOutcome.'",
+          "Maintainer judgment: feat/runner-trait-hygiene is effectively complete (final MILESTONE-FINAL landed at ccf1fc1) and the refactor/tasklifecycle-extraction worktree is operating as if runner-hygiene were merged — no spawn-site collisions have surfaced, and the boundary contract in docs/designs/runner-trait-hygiene.md §6 has held."
+        ],
+        "resolutionType": "waiver",
+        "resolvedAt": "2026-05-19",
+        "resolvedBy": "Chris (maintainer)"
+      },
+      "id": "CLARIFY-002",
+      "notes": "Per PRD §8 step 1.5 — mini-gate. WAIVED 2026-05-19 by maintainer per the escape clause in these notes (runner-hygiene effort effectively merged; explicit waiver recorded in humanReviewOutcome). FEAT-008..012 may proceed.",
+      "passes": true,
+      "priority": 11,
+      "requiresHuman": true,
+      "taskType": "clarify",
+      "title": "Mini-dogfood gate: M=3 iterations with skip vertical slice in place",
+      "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": [
+        "commands/complete.rs:248 raw UPDATE removed; complete() builds TransitionIntent { target: Done, source: Operator } and calls apply()",
+        "commands/fail/transition.rs:83 raw UPDATE removed; sets target=Blocked|Failed and error_count via the intent (notes field of TransitionIntent carries the error)",
+        "commands/irrelevant.rs:136 raw UPDATE removed; target=Irrelevant",
+        "commands/unblock.rs:87+146 raw UPDATEs removed; both sites use apply() (one is the standard unblock-to-todo, one is the prefix-bulk path)",
+        "commands/reset.rs:78-79 multi-line raw UPDATE removed; reset() uses apply() (or recover_in_progress_for_prefix when bulk-resetting)",
+        "commands/review.rs:215,242,282 raw UPDATEs removed; all three sites use apply()",
+        "can_transition_to callers in complete.rs:199 and fail/transition.rs:123 removed — the matrix validation is now internal to apply()",
+        "Each migrated command file shrinks by ≥30% (line count excluding tests)",
+        "Scoped `cargo test -p task-mgr commands::{complete,fail,irrelevant,unblock,reset,review}` passes",
+        "Public CLI surface unchanged: existing integration tests for each command remain green",
+        "Shadow tests for all 6 verbs are added in TEST-001 (next phase)"
+      ],
+      "dependsOn": [
+        "CLARIFY-002",
+        "FEAT-003"
+      ],
+      "description": "Migrate the remaining 6 Category A verbs to TaskLifecycle::apply (per FR-004). These are the user-facing command modules: commands/complete.rs, commands/fail/transition.rs, commands/irrelevant.rs, commands/unblock.rs, commands/reset.rs, commands/review.rs. Each file's raw `UPDATE tasks SET status …` SQL is deleted; each becomes a thin shell that builds TransitionIntent(s) and calls the service. Reset.rs has a multi-line SQL at lines 78-79 (PRD §7 resolved verification). Each shrinks by ≥30% (excluding tests). Shadow tests added in TEST-001 follow-up.",
+      "estimatedEffort": "high",
+      "id": "FEAT-008",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": true,
+      "notes": "Per FR-004. The 6 verbs are independent — order them by complexity (complete and fail are most complex due to error_count, started_at, completed_at; irrelevant is simplest). The shadow-harness-extension to all 6 happens in TEST-001 (next phase). Learning #2740: extracting from a module that has #[cfg(test)] modules requires re-routing test access (the matrix tests in models/task.rs:513-571 stay put; this task only touches commands/).",
+      "passes": true,
+      "priority": 11,
+      "qualityDimensions": [
+        "Six thin shells, all built from the same template — copy-paste the skip.rs pattern from FEAT-007",
+        "Each file's existing exit-code mapping is preserved (use TransitionOutcome.applied + reason)",
+        "No new .unwrap() in any file",
+        "Reset.rs may need both single-task and bulk variants — use apply() for single, recover_in_progress_for_prefix for bulk"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Bulk Category A migration — complete, fail/transition, irrelevant, unblock, reset, review",
+      "touchesFiles": [
+        "src/commands/complete.rs",
+        "src/commands/fail/transition.rs",
+        "src/commands/irrelevant.rs",
+        "src/commands/unblock.rs",
+        "src/commands/reset.rs",
+        "src/commands/review.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "commands/next/mod.rs:244 raw `UPDATE … status='in_progress' … WHERE id=? AND status='todo'` REMOVED",
+        "commands/next/mod.rs uses TaskLifecycle::new(&conn).try_claim(&task_id, &[TaskStatus::Todo])",
+        "engine.rs:787 claim_slot_task uses try_claim(id, &[Todo, InProgress]) — preserves slot-resumption idempotency",
+        "claim_slot_task body shrinks to a one-line delegation, OR the function is deleted and its callers call try_claim directly",
+        "Scoped `cargo test -p task-mgr commands::next` and any slot-resumption tests pass",
+        "Existing race-test for next (commands/next/tests.rs:829) still passes"
+      ],
+      "dependsOn": [
+        "CLARIFY-002",
+        "FEAT-004"
+      ],
+      "description": "Replace commands/next/mod.rs:244 raw UPDATE and engine.rs:787 claim_slot_task with TaskLifecycle::try_claim calls (per FR-005). next.rs uses allowed=[Todo] (single-state guard); claim_slot_task uses allowed=[Todo, InProgress] (slot-resumption idempotency). The conditional-WHERE predicate is now explicit in the API (PRD §2.5 Correctness Requirements). claim_slot_task at engine.rs:787 either becomes a thin private wrapper around try_claim or is deleted entirely.",
+      "edgeCases": [
+        "Slot resumes a task it claimed in a prior iteration: try_claim([Todo, InProgress]) succeeds (rows_affected=1 because started_at/updated_at refresh)",
+        "Two slots race to claim the same task: SQLite row-locking serializes; second slot's try_claim sees status=in_progress with started_at from first slot and returns true OR false depending on slot scheduler invariant — preserve legacy behavior"
+      ],
+      "estimatedEffort": "low",
+      "id": "FEAT-009",
+      "modifiesBehavior": false,
+      "notes": "Per FR-005. The race-safety of the legacy code lives in the SQL `WHERE id=? AND status IN (...)` predicate; try_claim preserves this exactly. Learning #2070: engine.rs uses iteration_pipeline as a module export pattern — same applies to lifecycle.",
+      "passes": true,
+      "priority": 12,
+      "qualityDimensions": [
+        "Allowed slice is the public-API expression of the WHERE predicate — preserve the distinction between [Todo] (CLI) and [Todo, InProgress] (slot)",
+        "If claim_slot_task is retained as a wrapper, mark it `#[deprecated(note = \"use TaskLifecycle::try_claim\")]`"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Category B migration — next.rs + claim_slot_task to TaskLifecycle::try_claim",
+      "touchesFiles": [
+        "src/commands/next/mod.rs",
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "engine.rs:1645 (per-task in_progress → todo) — uses recover_in_progress_for_prefix",
+        "engine.rs:2410, 3264, 5750, 5775, 5811, 5900, 6258, 6284 (bulk in_progress → todo with optional prefix) — use recover_in_progress_for_prefix(prefix_opt)",
+        "engine.rs:4730 (auto-claim inside apply_status_updates) — REMOVED at this site; auto-claim is now internal to lifecycle.apply()",
+        "engine.rs:5151 (auto_block_task) — auto_block_task body becomes `lifecycle.auto_block_after_failures(...)`; function retained as deprecated wrapper or removed",
+        "engine.rs::apply_status_updates (4703) — becomes a thin shim: builds Vec<TransitionIntent> from inputs, calls lifecycle.apply(), returns the per-task outcomes",
+        "apply_status_updates shim return type stays exactly Vec<(String, StatusChange, bool)> (or equivalent) — DOWNSTREAM callers depend on this shape; documented in the prompt 'Common Wiring Failures' section",
+        "apply_status_updates retains its current pub signature for now (re-exports the shim); marked `#[deprecated(note = \"use TaskLifecycle::apply\")]`",
+        "All callers of apply_status_updates (iteration_pipeline.rs:275, sequential ~L3204, wave ~L1166) continue to compile without changes",
+        "Status-tag completion gate at iteration_pipeline.rs:275-286 verified post-shim: it reads per-task outcomes (NOT a global counter); learning #2238 contract preserved",
+        "Terminal-status tasks (Done/Failed/Skipped/Irrelevant) still observable to callers post-shim so they can prune tracking maps (learnings #2796, #2304)",
+        "auto_block_task function decl (engine.rs:5140) — its body is one-line delegation to lifecycle.auto_block_after_failures, OR the fn is deleted with `#[deprecated]` shim; the UPDATE at 5151 is removed in either case",
+        "Scoped tests pass: `cargo test -p task-mgr loop_engine::engine`",
+        "Engine.rs line count decreases (target: shed at least 200 lines from the 9644 baseline)"
+      ],
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/loop_engine/iteration_pipeline.rs",
+            "impact": "OK",
+            "line": 275,
+            "mitigation": "Shim returns same shape; learning #2284 contract preserved",
+            "usage": "Reads per-task outcomes from apply_status_updates"
+          },
+          {
+            "file": "src/loop_engine/engine.rs",
+            "impact": "OK",
+            "line": 3204,
+            "mitigation": "Shim is wire-compatible",
+            "usage": "Sequential iteration calls apply_status_updates"
+          },
+          {
+            "file": "src/loop_engine/engine.rs",
+            "impact": "OK",
+            "line": 1166,
+            "mitigation": "Same",
+            "usage": "Wave iteration post-process calls apply_status_updates"
+          }
+        ],
+        "semanticDistinctions": [
+          {
+            "context": "Auto-claim (engine.rs:4730 inline)",
+            "currentBehavior": "Loop emits :done for todo task; engine UPDATE flips todo → in_progress before completion",
+            "requiredBehavior": "Removed from engine; same effect achieved inside lifecycle.apply() when intent is (target=Done, source=LoopStatusTag) against a Todo task"
+          }
+        ]
+      },
+      "dependsOn": [
+        "CLARIFY-002",
+        "FEAT-005",
+        "FEAT-003"
+      ],
+      "description": "Replace the 12 inlined raw `UPDATE tasks SET status` production sites in engine.rs (verified by `grep -n 'UPDATE tasks SET status' src/loop_engine/engine.rs` excluding test code at line 9454): lines 789, 1645, 2410, 3264, 4730, 5151 (UPDATE inside auto_block_task at fn-decl line 5140 — these are the SAME site, not two), 5750, 5775, 5811, 5900, 6258, 6284. Wire them through TaskLifecycle recovery verbs per FR-006 mapping table. Specifically: bulk `in_progress → todo` sites become `lifecycle.recover_in_progress_for_prefix(prefix_opt)`; the auto-block site at 5151 (inside auto_block_task) becomes `lifecycle.auto_block_after_failures(id, err, iter)`; the auto-claim site (4730) is internal to apply() and the engine site is removed since apply() handles it; claim_slot_task at 789 was already covered in FEAT-009. Engine.rs::apply_status_updates (engine.rs:4703) becomes a thin shim that builds intents and calls lifecycle.apply().",
+      "estimatedEffort": "high",
+      "id": "FEAT-010",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": true,
+      "notes": "Per FR-006 mapping table. This is the largest behavior-affecting task — coordinate with shadow tests in TEST-001. The shim approach (apply_status_updates as deprecated wrapper) is the migration scaffold; the deprecation note flags it for eventual removal in PRD 2 (engine carve).",
+      "passes": true,
+      "priority": 12,
+      "qualityDimensions": [
+        "The five parallel-slot cascade defenses (synthetic shared-infra slot, buildy-prefix heuristic, ephemeral overlay, consecutive-merge-fail halt, stale-ephemeral hygiene) are NOT touched — only the bottom-up UPDATE primitives change",
+        "Engine.rs::apply_status_updates shim preserves the exact return-tuple shape callers expect (learning #2284)",
+        "Per-task partial-failure tolerance preserved end-to-end (test it explicitly with a multi-intent call where one intent is invalid)",
+        "Audit log behavior preserved or improved (audit on every recovery call via TransitionSource::Recovery)"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Category C engine.rs recovery sites — route 12 sites through TaskLifecycle::recovery verbs",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "overflow.rs:460 raw UPDATE removed; uses auto_block_after_failures",
+        "overflow.rs:473 raw UPDATE removed; uses resurrect_for_iteration(prefix, &[id])",
+        "prd_reconcile.rs:305 raw UPDATE removed; the function builds a ReconcilePlan { items: vec![ReconcileItem { task_id, target: Done, audit_label: Some('prd_marked_done') }] } and calls lifecycle.reconcile_from_prd(plan)",
+        "prd_reconcile.rs:550 raw UPDATE removed; same pattern with target=Irrelevant",
+        "doctor/fixes.rs:30 raw UPDATE removed; builds RepairPlan and calls lifecycle.repair_stale",
+        "doctor/fixes.rs:93 raw UPDATE removed; same pattern",
+        "ReconcilePlan building and RepairPlan building stay in their respective modules — verify no plan-construction logic leaked into src/lifecycle/",
+        "Scoped `cargo test -p task-mgr loop_engine::overflow loop_engine::prd_reconcile commands::doctor` passes",
+        "PRD reconcile end-to-end test passes (existing integration test from tests/)"
+      ],
+      "dependsOn": [
+        "CLARIFY-002",
+        "FEAT-005",
+        "FEAT-006"
+      ],
+      "description": "Combine the two smaller remaining migrations into one task. (1) overflow.rs:460 (in_progress → blocked at overflow ceiling) becomes auto_block_after_failures; overflow.rs:473 (in_progress → todo on recovery) becomes resurrect_for_iteration. (2) prd_reconcile.rs:305 and :550 split into ReconcilePlan-building (stays in prd_reconcile.rs) + lifecycle.reconcile_from_prd(plan) (service). doctor/fixes.rs:30 and :93 split into RepairPlan-building (stays in fixes.rs) + lifecycle.repair_stale(plan) (service).",
+      "edgeCases": [
+        "Overflow recovery for a task already in Blocked (race with parallel auto_block): resurrect_for_iteration is no-op",
+        "Empty PRD reconcile plan: lifecycle.reconcile_from_prd returns Ok(ReconcileReport { applied: 0, ... })",
+        "Doctor finds 0 stale tasks: repair_stale with empty plan returns Ok early"
+      ],
+      "estimatedEffort": "medium",
+      "id": "FEAT-011",
+      "modifiesBehavior": true,
+      "notes": "Per FR-007 and FR-006 (overflow.rs sites). The doctor decision (separate repair_stale verb) is intentionally locked — see PRD §7 Resolved during review.",
+      "passes": true,
+      "priority": 12,
+      "qualityDimensions": [
+        "Plan-building stays in its origin module (prd_reconcile / doctor/fixes) — do NOT consolidate it into the service",
+        "audit_label is populated with rationale strings (e.g. 'stale_in_progress_24h', 'prd_marked_done', 'prd_marked_irrelevant') so logs distinguish provenance",
+        "ReconcilePlan and RepairPlan are owned types in the service module; constructors are simple"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Category C overflow.rs migration + Category D prd_reconcile/doctor",
+      "touchesFiles": [
+        "src/loop_engine/overflow.rs",
+        "src/loop_engine/prd_reconcile.rs",
+        "src/commands/doctor/fixes.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Comment added immediately above commands/init/mod.rs:517 reading: `// LIFECYCLE-EXCEPTION: bootstrap ingest — see tasks/prd-tasklifecycle-extraction.md and docs/designs/coherence-refactoring.md §\"TaskLifecycle Scope Decision\"`",
+        "Raw UPDATE at line 517 is RETAINED (Category E is the documented exception)",
+        "tests/lifecycle_exception_lint.rs (from TEST-INIT-005) passes — exactly one LIFECYCLE-EXCEPTION token in non-test src/, in commands/init/mod.rs",
+        "Grep against compiled binary or `cargo test --no-run` to confirm comment is preserved (some build tooling strips comments — verify ours does not)"
+      ],
+      "dependsOn": [
+        "CLARIFY-002",
+        "TEST-INIT-005"
+      ],
+      "description": "Add the documented exception comment for the Category E bootstrap write at commands/init/mod.rs:517 (per FR-009). The comment locks the exception with a pointer back to this PRD and the design doc. The grep-based lint test (added in TEST-INIT-005) must pass after this lands.",
+      "estimatedEffort": "low",
+      "id": "FEAT-012",
+      "modifiesBehavior": false,
+      "notes": "Per FR-009. After all migration tasks land, this is the ONLY raw `UPDATE tasks SET status` site in production code.",
+      "passes": true,
+      "priority": 12,
+      "qualityDimensions": [
+        "Comment is verbatim the format above — the lint test matches on a fixed token prefix",
+        "Pointer in the comment includes both the PRD filename and the design-doc section, so a future maintainer can find rationale in either"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "LIFECYCLE-EXCEPTION comment in commands/init/mod.rs + lint passes",
+      "touchesFiles": [
+        "src/commands/init/mod.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Read every file in src/lifecycle/ + every migrated file (commands/{complete,fail,irrelevant,unblock,reset,review,skip}.rs, commands/next/mod.rs, commands/doctor/fixes.rs, loop_engine/{engine,overflow,prd_reconcile}.rs)",
+        "Verify: `grep -rn 'UPDATE tasks SET status' src/ | grep -v '/tests/'` returns ONE hit at commands/init/mod.rs with LIFECYCLE-EXCEPTION comment immediately above",
+        "Verify: `grep -rn 'can_transition_to' src/ | grep -v 'matrix.rs\\|tests'` returns ZERO hits (all matrix consultation goes through the service)",
+        "Verify: every public TaskLifecycle method has at least one production caller (use `cargo check -- -W dead_code`)",
+        "Per-task partial-failure tolerance verified by an integration test that submits 3 intents with the middle one invalid",
+        "All issues found spawned as CODE-FIX-xxx via `task-mgr add --stdin --depended-on-by MILESTONE-1`",
+        "If no issues found: emit <task-status>CODE-REVIEW-1:done</task-status> with one-line 'No issues found' in progress file"
+      ],
+      "dependsOn": [
+        "FEAT-008",
+        "FEAT-009",
+        "FEAT-010",
+        "FEAT-011",
+        "FEAT-012"
+      ],
+      "description": "Full code review of all migrated files (Category A, B, C, D) and the new src/lifecycle/ module. Focus areas: (1) all five contract-level invariants preserved (auto-claim, per-task partial-failure, DB-authoritative-PRD-best-effort, exact stderr warning shape, conditional-WHERE in API); (2) no new .unwrap() in production; (3) no raw `UPDATE tasks SET status` SQL outside commands/init/mod.rs; (4) qualityDimensions met on every migrated task; (5) wiring is reachable (every public lifecycle verb has at least one production caller, no dead code).",
+      "estimatedEffort": "medium",
+      "id": "CODE-REVIEW-1",
+      "model": "claude-opus-4-7",
+      "notes": "Use the rust-python-code-reviewer agent. Focus areas above. Common wiring failures to check: unused-import warnings, dead-code warnings on lifecycle methods, missing `#[deprecated]` on retained shims, .unwrap() introductions, raw SQL slipping into the service (it must use rusqlite::params! / params_from_iter for variadic IN).",
+      "passes": true,
+      "priority": 13,
+      "requiresHuman": false,
+      "taskType": "review",
+      "title": "Code review: post-migration quality + wiring + invariant preservation",
+      "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": [
+        "All dependsOn tasks have passes: true",
+        "Full quality gate green: `cargo fmt --check && cargo check && cargo clippy -- -D warnings && cargo test`",
+        "Test count matches or exceeds the TEST-INIT-005 baseline (no test silently removed during refactor)",
+        "Lifecycle exception lint passes (exactly one LIFECYCLE-EXCEPTION token in production code)",
+        "Scoped UPDATE-grep audit: only the LIFECYCLE-EXCEPTION site has raw `UPDATE tasks SET status`",
+        "Any pre-existing failure unrelated to this PRD is either fixed inline or has a spawned FIX-xxx task with verifyCommand"
+      ],
+      "dependsOn": [
+        "CODE-REVIEW-1"
+      ],
+      "description": "First milestone — all Category A, B, C, D migrations are complete and the lifecycle exception is locked. Runs the FULL test suite (not scoped) per PRD §8 milestone protocol. Any pre-existing failures get fixed inline (≤12 unrelated) or spawned as FIX tasks (>12 unrelated). Leaves the trunk green.",
+      "estimatedEffort": "medium",
+      "id": "MILESTONE-1",
+      "model": "claude-opus-4-7",
+      "notes": "Per PRD §8 step 2 — bulk migration milestone. Full test suite, not scoped. Trunk-green is the invariant.",
+      "passes": true,
+      "priority": 20,
+      "requiresHuman": false,
+      "taskType": "milestone",
+      "timeoutSecs": 1800,
+      "title": "Milestone 1: All migrations complete + scoped tests green + lint passes",
+      "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": [
+        "Shadow test for every Category A site (7 verbs: complete, fail, skip, irrelevant, unblock, reset, review)",
+        "Shadow test for Category B (try_claim from next.rs + slot-claim with [Todo, InProgress])",
+        "Shadow test for representative Category C sites (one for recover_in_progress_for_prefix, one for auto_block_after_failures, one for resurrect_for_iteration)",
+        "Shadow test for Category D (reconcile_from_prd and repair_stale, one each)",
+        "Write-ordering assertion: when legacy did tasks-UPDATE then run_tasks-INSERT, service does same order",
+        "PRD JSON atomicity crash test (FR-008 point 7): inject failure at item k of an N-intent batch; assert no torn PRD JSON state",
+        "Stderr-vs-commit ordering captured for at least the apply() shadow tests",
+        "All shadow tests pass; failures pinpoint the specific column or behavior that drifted"
+      ],
+      "dependsOn": [
+        "MILESTONE-1"
+      ],
+      "description": "Extend tests/lifecycle_shadow.rs (skeleton from TEST-INIT-004) to cover every migrated site. One shadow test per audited row in PRD §6 Affected Components, asserting byte-identical DB diff between the (now historical) legacy SQL and the service call. Add the write-ordering assertion and PRD JSON atomicity crash-test (FR-008 points 6, 7, 8).",
+      "estimatedEffort": "high",
+      "id": "TEST-001",
+      "notes": "Per FR-008. The skip shadow test (TEST-INIT-004) is the template. Reach 100% migrated-site coverage.",
+      "passes": true,
+      "priority": 25,
+      "qualityDimensions": [
+        "Each shadow test is a small focused function — do NOT build a massive table-driven test that obscures which site regressed",
+        "Tests use real failure modes for the crash test (read-only file, rename-mid-write)",
+        "Known gap (observability of in-flight state) is documented in a module-level comment — not silently absent"
+      ],
+      "requiresHuman": false,
+      "taskType": "test",
+      "title": "Extend shadow harness to all migrated Category A/B/C/D sites",
+      "touchesFiles": [
+        "tests/lifecycle_shadow.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Run the same 5-task FEAT-only loop used to capture TEST-INIT-005 baseline; record median over 3 runs",
+        "Median latency within ±10% of baseline; record in progress file",
+        "If outside ±10%: identify the regression (likely a SELECT-before-UPDATE or new transaction) and spawn IMPL-FIX-xxx",
+        "Concurrency soak: run wave-mode with N=3 slots on a representative PRD for 20 iterations; assert no double-claim, no orphaned in_progress, no PRD JSON corruption",
+        "Soak test results recorded in progress file"
+      ],
+      "dependsOn": [
+        "MILESTONE-1",
+        "TEST-INIT-005"
+      ],
+      "description": "Verify post-migration median iteration latency is within ±10% of the TEST-INIT-005 baseline (per PRD §2.5 Performance Requirements). Add a concurrency soak test exercising parallel-slot wave-mode behavior to ensure the service's per-process per-connection model holds up under realistic load. REQUIRES TEST-INIT-005 baseline numbers — if the baseline isn't recorded, the ±10% check is meaningless.",
+      "estimatedEffort": "medium",
+      "id": "TEST-002",
+      "notes": "Per PRD §2.5 Performance Requirements. ±10% is the contract. Concurrency test exercises the wave-mode invariant that no two slots write the same task_id. Depends on TEST-INIT-005 baseline (without it, ±10% check is meaningless).",
+      "passes": true,
+      "priority": 30,
+      "requiresHuman": false,
+      "taskType": "test",
+      "title": "Performance regression check + concurrency soak test",
+      "touchesFiles": [
+        "tests/lifecycle_performance.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Full quality gate green: `cargo fmt --check && cargo check && cargo clippy -- -D warnings && cargo test`",
+        "All shadow tests in tests/lifecycle_shadow.rs pass",
+        "Performance regression check (TEST-002) within ±10% — recorded numbers referenced",
+        "LIFECYCLE-EXCEPTION lint passes (still exactly one)",
+        "Concurrency soak test passes (no parallel-slot regressions)",
+        "Any pre-existing failures triaged (fixed inline if ≤12 unrelated, spawned FIX-xxx if >12)"
+      ],
+      "dependsOn": [
+        "TEST-001",
+        "TEST-002"
+      ],
+      "description": "Second milestone — comprehensive verification before the full-dogfood gate. Runs the unscoped test suite, asserts all shadow tests are green, performance is within ±10% of baseline, lint passes.",
+      "estimatedEffort": "medium",
+      "id": "MILESTONE-2",
+      "model": "claude-opus-4-7",
+      "notes": "Per PRD milestone protocol. The trunk MUST be green before the dogfood gate (VERIFY-001). Pre-existing failures are in-scope.",
+      "passes": true,
+      "priority": 50,
+      "requiresHuman": false,
+      "taskType": "milestone",
+      "timeoutSecs": 1800,
+      "title": "Milestone 2: Full test suite + shadow tests + performance + lint all green",
+      "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": [
+        "Trace documented in progress file: file:line at each handoff",
+        "All handoffs verified by reading source — not just by running the CLI",
+        "Any wiring gap (e.g. missing call site, dropped error, lost field) spawns a WIRE-FIX-xxx task",
+        "Edge case verified: `task-mgr complete <unknown-id>` produces the same exit code and stderr message as pre-refactor"
+      ],
+      "dependsOn": [
+        "MILESTONE-2"
+      ],
+      "description": "Trace a representative CLI verb (recommend `task-mgr complete <id>`) end-to-end through the new service. Verify every handoff point: argument parsing → TransitionIntent construction → service apply() → matrix validation → DB UPDATE → optional run_tasks INSERT → optional update_prd_task_passes → outcome formatting → CLI exit code. Does NOT write new code unless a wiring gap is found.",
+      "estimatedEffort": "low",
+      "id": "INT-001",
+      "notes": "Verification, not implementation. The cross-boundary path is commands/ → lifecycle/ → DB; PRD-JSON-sync touches loop_engine/prd_reconcile (via the existing function call).",
+      "passes": true,
+      "priority": 55,
+      "requiresHuman": false,
+      "taskType": "verification",
+      "title": "Integration trace: CLI verb → TaskLifecycle → DB UPDATE → PRD JSON sync",
+      "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": [
+        "Trace documented: every handoff verified from source (engine.rs:4703 → lifecycle.apply → iteration_pipeline.rs:275)",
+        "Auto-claim path verified: simulate a (todo task + LoopStatusTag:done intent); confirm apply() flips todo → in_progress → done in one transaction; outcome.previous=Some(Todo)",
+        "Per-task partial-failure verified: 3-intent batch with middle intent invalid; confirm DB writes for intents 1 and 3, outcome[1].applied=false, no batch abort",
+        "Stderr warning shape matches TEST-INIT-003 snapshot",
+        "Any drift from the contract-level invariants spawns a WIRE-FIX-xxx"
+      ],
+      "dependsOn": [
+        "MILESTONE-2"
+      ],
+      "description": "Trace the loop-side path: LLM emits `<task-status>TASK-X:done</task-status>` → iteration_pipeline.rs extracts → engine.rs::apply_status_updates shim → TaskLifecycle::apply (with run_id + PRD JSON sync) → auto-claim (if Todo) → DB write → run_tasks INSERT → update_prd_task_passes call → stderr warning on failure. Verify per-task partial-failure tolerance by reading code; assert the iteration_pipeline.rs:275 gate still reads outcomes correctly.",
+      "estimatedEffort": "medium",
+      "id": "INT-002",
+      "notes": "The most behavior-sensitive path. Reference learning #2284 (per-task outcomes contract) and #2238 (per-task gate at iteration_pipeline.rs:275).",
+      "passes": true,
+      "priority": 60,
+      "requiresHuman": false,
+      "taskType": "verification",
+      "title": "Integration trace: loop <task-status> tag → engine → lifecycle → side effects",
+      "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": [
+        "Read every file in src/lifecycle/ + all migrated files in full",
+        "Identify simplification opportunities (DRY violations, unnecessary indirection, dead Option<T>) — spawn REFACTOR-N-xxx tasks via task-mgr add --stdin --depended-on-by MILESTONE-FINAL",
+        "Verify naming consistency: TransitionIntent / TransitionOutcome / ReconcilePlan / RepairPlan / ReconcileReport / RepairReport — look for accidental inconsistencies",
+        "Verify module boundaries: plan-building stays in prd_reconcile/doctor, service consumes only",
+        "Confirm CLAUDE.md and src/lifecycle/CLAUDE.md docs are in sync with the final code",
+        "If no issues: emit <task-status>REFACTOR-REVIEW-FINAL:done</task-status> with 'No refactor needed'"
+      ],
+      "dependsOn": [
+        "INT-001",
+        "INT-002"
+      ],
+      "description": "Final review pass with full context. Look for: simplification opportunities in the lifecycle module (DRY, complexity, coupling); naming consistency (TransitionIntent vs ReconcileItem vs RepairItem); module boundary cleanliness (no plan-building leaked into service); any code that 'works but is ugly'. Spawn REFACTOR-N-xxx for fixes. Use the rust-python-code-reviewer agent. Use /simplify on individual touchpoints if a small ugliness is faster to fix than to file.",
+      "estimatedEffort": "medium",
+      "id": "REFACTOR-REVIEW-FINAL",
+      "model": "claude-opus-4-7",
+      "notes": "Final review with full context. Learning #2747: large linear orchestrator functions are sometimes justified — don't over-split. Learning #487: skip single-function modules. Learning #2806: consolidate test helpers.",
+      "passes": true,
+      "priority": 70,
+      "requiresHuman": false,
+      "taskType": "review",
+      "title": "Final refactor review: simplification opportunities + naming + module boundaries",
+      "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": [
+        "src/lifecycle/CLAUDE.md exists with: scope (status transitions + recovery + reconcile + repair, NOT bootstrap), invariants (auto-claim, per-task outcomes, DB-authoritative-PRD-best-effort, stderr warning shape), FR-006 site→verb mapping table",
+        "Project CLAUDE.md updated with `src/lifecycle/CLAUDE.md` pointer under Subsystem design notes (replaces or extends the existing list)",
+        "src/loop_engine/CLAUDE.md updated: remove or rewrite 'if you touch status, also update X, Y, Z' rules — replace with 'call TaskLifecycle'",
+        "Retrospective appended to docs/designs/coherence-refactoring.md with: verified site count (20), the doctor-vs-reconcile decision rationale, vertical-slice migration outcome, runner-hygiene ordering gate value, any approach revisions",
+        "Each doc update is committed in its own commit (or a single chore commit) with clear message",
+        "All four files compile/render correctly (markdown lints if configured)"
+      ],
+      "dependsOn": [
+        "MILESTONE-2"
+      ],
+      "description": "Write the four code-writable doc updates from PRD §6 Documentation table. Decoupled from VERIFY-001 dogfood gate so docs can land independently of the maintainer-driven soak. Per PRD §6: src/lifecycle/CLAUDE.md (module scope + invariants + FR-006 mapping), project CLAUDE.md pointer, src/loop_engine/CLAUDE.md updates (remove 'if you touch status, also update X' rules), design-doc retrospective.",
+      "estimatedEffort": "medium",
+      "id": "DOCS-001",
+      "modifiesBehavior": false,
+      "notes": "Split from VERIFY-001 per md-to-json-prd-reviewer feedback so the maintainer-gated soak isn't blocked on docs (and vice versa). Run task-mgr learn for the four learnings listed in VERIFY-001 from THIS task too.",
+      "passes": true,
+      "priority": 85,
+      "qualityDimensions": [
+        "Docs match the final code shape — read src/lifecycle/ before writing src/lifecycle/CLAUDE.md",
+        "Project CLAUDE.md addition is one concise line under Subsystem design notes — does NOT duplicate content from src/lifecycle/CLAUDE.md",
+        "Retrospective is honest about what changed from the design doc (verified site count was 20 not 15; doctor stayed separate; vertical slice helped)"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Documentation updates — lifecycle CLAUDE.md, project pointers, design-doc retrospective",
+      "touchesFiles": [
+        "src/lifecycle/CLAUDE.md",
+        "CLAUDE.md",
+        "src/loop_engine/CLAUDE.md",
+        "docs/designs/coherence-refactoring.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "N=10 successful iterations across two distinct live PRDs recorded in humanReviewOutcome",
+        "Zero loop-internal regressions observed across all 10 iterations",
+        "Iteration durations recorded in humanReviewOutcome for cross-reference against TEST-002 perf check",
+        "If any regression: blocking CODE-FIX task spawned via task-mgr add --stdin --depended-on-by VERIFY-001 with the failure detail; soak re-run after fix",
+        "Grep verification: every public TaskLifecycle method has at least one production caller (no dead code post-refactor)",
+        "task-mgr learn commands fired for: shadow-test harness pattern, vertical-slice migration win, two-verb split (reconcile vs repair) decision, runner-hygiene ordering gate value"
+      ],
+      "dependsOn": [
+        "REFACTOR-REVIEW-FINAL",
+        "DOCS-001"
+      ],
+      "description": "Per PRD §8 step 3: main-branch `task-mgr loop` runs continuously for N=10 iterations across two distinct in-progress PRDs on the refactored code with zero loop-internal regressions. After this passes (along with DOCS-001), PRD 2 ('Engine Orchestration Boundaries') can be authored.",
+      "estimatedEffort": "high",
+      "humanReviewOutcome": {
+        "resolvedAt": "2026-05-20",
+        "resolvedBy": "Chris",
+        "confirmedValues": {
+          "soakPassed": true,
+          "binaryUnderTest": "task-mgr 0.2.0-a (built from refactor/tasklifecycle-extraction)"
+        },
+        "deltasFromProposed": [
+          "Per-iteration durations not recorded in this outcome block (minimal-ceremony close-out); maintainer confirmed soak passed without regression."
+        ],
+        "additionalRequirements": []
+      },
+      "id": "VERIFY-001",
+      "model": "claude-opus-4-7",
+      "notes": "Per PRD §8 step 3-5. requiresHuman: maintainer must drive the 10-iteration soak across two PRDs. learning #2807 baseline numbers from TEST-INIT-005 inform pass/fail. Docs are now in DOCS-001 (separate task) — VERIFY-001 only verifies the soak.",
+      "passes": false,
+      "priority": 90,
+      "requiresHuman": true,
+      "taskType": "verification",
+      "timeoutSecs": 1800,
+      "title": "Full dogfood gate — N=10 iterations across 2 PRDs",
+      "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": [
+        "All dependsOn tasks have passes: true",
+        "Full quality gate green on a clean checkout: `cargo fmt --check && cargo check && cargo clippy -- -D warnings && cargo test`",
+        "VERIFY-001 humanReviewOutcome confirms 10/10 successful dogfood iterations",
+        "Branch ready for merge: no merge conflicts with main, no uncommitted changes",
+        "PRD 2 (Engine Orchestration Boundaries) is unblocked — explicitly noted in progress file as the next planned PRD"
+      ],
+      "dependsOn": [
+        "VERIFY-001"
+      ],
+      "description": "Final gate. All tasks pass, full dogfood gate satisfied, docs updated. After this passes, merge to main and author PRD 2 ('Engine Orchestration Boundaries').",
+      "estimatedEffort": "low",
+      "id": "MILESTONE-FINAL",
+      "model": "claude-opus-4-7",
+      "notes": "Per PRD §8 step 4. Merge unblocks PRD 2.",
+      "passes": false,
+      "priority": 99,
+      "requiresHuman": false,
+      "taskType": "milestone",
+      "timeoutSecs": 1800,
+      "title": "Final milestone: ready to merge to main, PRD 2 unblocked",
+      "touchesFiles": []
+    }
+  ],
+  "version": "1.0"
+}

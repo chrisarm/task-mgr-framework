@@ -26,6 +26,10 @@
 //! DB setup uses `open_connection` + `create_schema` + `run_migrations` (same
 //! pattern as `tests/retry_tracking.rs`) so the full schema is available.
 
+// FEAT-010: this test crate intentionally exercises the deprecated
+// `apply_status_updates` shim to lock its contract during the migration.
+#![allow(deprecated)]
+
 use std::path::PathBuf;
 
 use rusqlite::Connection;

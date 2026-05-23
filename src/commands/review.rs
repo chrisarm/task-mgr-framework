@@ -1,106 +1,68 @@
-//! Review command implementation.
-//!
-//! The review command provides an interactive or batch way to cycle through
-//! blocked and skipped tasks, allowing users to resolve, unblock, skip,
-//! or move to the next task.
+//! Review command — interactive / batch cycle through blocked and skipped
+//! tasks. The three status-mutation sites (auto-unblock, auto-unskip,
+//! resolve-with-notes) route through `TaskLifecycle::apply` with
+//! `audit_note` overrides for the custom `[AUTO-UNBLOCKED]` /
+//! `[AUTO-UNSKIPPED]` / `[RESOLVED] ...` audit prefixes.
 
 use rusqlite::Connection;
 use serde::Serialize;
 
+use crate::lifecycle::{TaskLifecycle, TransitionChange, TransitionIntent, TransitionSource};
 use crate::models::TaskStatus;
 use crate::{TaskMgrError, TaskMgrResult};
 
-/// Task details for review.
 #[derive(Debug, Clone, Serialize)]
 pub struct ReviewTask {
-    /// Task ID
     pub id: String,
-    /// Task title
     pub title: String,
-    /// Task description
     pub description: Option<String>,
-    /// Current status (blocked or skipped)
     pub status: TaskStatus,
-    /// Last error message (for blocked tasks)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
-    /// Notes (may contain skip/block reason)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
-    /// Priority
     pub priority: i32,
 }
 
-/// Result of reviewing tasks.
 #[derive(Debug, Clone, Serialize)]
 pub struct ReviewResult {
-    /// Tasks that were reviewed and are still blocked/skipped
     pub blocked_tasks: Vec<ReviewTask>,
-    /// Tasks that were reviewed and are still skipped
     pub skipped_tasks: Vec<ReviewTask>,
-    /// Total count of tasks available for review
     pub total_count: usize,
-    /// Actions taken during review (for text output)
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub actions_taken: Vec<ReviewAction>,
 }
 
-/// An action taken during review.
 #[derive(Debug, Clone, Serialize)]
 pub struct ReviewAction {
-    /// Task ID that was acted on
     pub task_id: String,
-    /// Action type
     pub action: ReviewActionType,
-    /// Optional notes (for resolve action)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
 }
 
-/// Type of action taken on a task during review.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewActionType {
-    /// Task was unblocked (returned to todo)
     Unblocked,
-    /// Task was unskipped (returned to todo)
     Unskipped,
-    /// Task was resolved with notes (returned to todo)
     Resolved,
-    /// Task was skipped (remains skipped or updated reason)
     Skipped,
-    /// Task was kept as-is
     Kept,
 }
 
-/// Options for the review command.
 #[derive(Debug, Clone, Default)]
 pub struct ReviewOptions {
-    /// Only review blocked tasks
     pub blocked_only: bool,
-    /// Only review skipped tasks
     pub skipped_only: bool,
-    /// Auto-unblock all tasks without prompts
     pub auto_unblock: bool,
 }
 
-/// Get all blocked and/or skipped tasks for review.
-///
-/// # Arguments
-/// * `conn` - Database connection
-/// * `options` - Review options controlling which tasks to fetch
-///
-/// # Returns
-/// * `Ok(ReviewResult)` - List of tasks to review
-/// * `Err(TaskMgrError)` - On database error
+/// List blocked / skipped tasks for review.
 pub fn get_reviewable_tasks(
     conn: &Connection,
     options: &ReviewOptions,
 ) -> TaskMgrResult<ReviewResult> {
-    let mut blocked_tasks = Vec::new();
-    let mut skipped_tasks = Vec::new();
-
-    // Build query based on options
     let status_filter = if options.blocked_only {
         "status = 'blocked'"
     } else if options.skipped_only {
@@ -108,40 +70,30 @@ pub fn get_reviewable_tasks(
     } else {
         "status IN ('blocked', 'skipped')"
     };
-
     let query = format!(
         "SELECT id, title, description, status, last_error, notes, priority \
-         FROM tasks \
-         WHERE {} AND archived_at IS NULL \
-         ORDER BY priority ASC, id ASC",
-        status_filter
+         FROM tasks WHERE {status_filter} AND archived_at IS NULL \
+         ORDER BY priority ASC, id ASC"
     );
-
     let mut stmt = conn.prepare(&query)?;
-    let rows = stmt.query_map([], |row| {
-        let status_str: String = row.get(3)?;
-        Ok(ReviewTask {
-            id: row.get(0)?,
-            title: row.get(1)?,
-            description: row.get(2)?,
-            status: status_str.parse().unwrap_or(TaskStatus::Blocked),
-            last_error: row.get(4)?,
-            notes: row.get(5)?,
-            priority: row.get(6)?,
-        })
-    })?;
-
-    for row in rows {
-        let task = row?;
-        match task.status {
-            TaskStatus::Blocked => blocked_tasks.push(task),
-            TaskStatus::Skipped => skipped_tasks.push(task),
-            _ => {} // Shouldn't happen with our query
-        }
-    }
-
+    let rows = stmt
+        .query_map([], |row| {
+            let status_str: String = row.get(3)?;
+            Ok(ReviewTask {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                description: row.get(2)?,
+                status: status_str.parse().unwrap_or(TaskStatus::Blocked),
+                last_error: row.get(4)?,
+                notes: row.get(5)?,
+                priority: row.get(6)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let (blocked_tasks, skipped_tasks): (Vec<_>, Vec<_>) = rows
+        .into_iter()
+        .partition(|t| t.status == TaskStatus::Blocked);
     let total_count = blocked_tasks.len() + skipped_tasks.len();
-
     Ok(ReviewResult {
         blocked_tasks,
         skipped_tasks,
@@ -150,40 +102,41 @@ pub fn get_reviewable_tasks(
     })
 }
 
-/// Auto-unblock all blocked tasks.
-///
-/// # Arguments
-/// * `conn` - Database connection
-/// * `options` - Review options
-///
-/// # Returns
-/// * `Ok(ReviewResult)` - Result with actions taken
-pub fn auto_unblock_all(conn: &Connection, options: &ReviewOptions) -> TaskMgrResult<ReviewResult> {
-    let mut actions = Vec::new();
-
-    // Get all reviewable tasks first
+/// Auto-unblock all blocked / skipped tasks. The `audit_note` override
+/// sidesteps the lifecycle service's expected-state checks so any blocked
+/// or skipped row cycles back to Todo with the AUTO prefix.
+pub fn auto_unblock_all(
+    conn: &mut Connection,
+    options: &ReviewOptions,
+) -> TaskMgrResult<ReviewResult> {
     let tasks = get_reviewable_tasks(conn, options)?;
-
-    // Unblock all blocked tasks
+    let mut actions = Vec::with_capacity(tasks.total_count);
     for task in &tasks.blocked_tasks {
-        unblock_task(conn, &task.id)?;
+        apply_review_unblock(
+            conn,
+            &task.id,
+            TransitionChange::Unblock,
+            "[AUTO-UNBLOCKED] Returned to todo via review --auto",
+        )?;
         actions.push(ReviewAction {
             task_id: task.id.clone(),
             action: ReviewActionType::Unblocked,
             notes: None,
         });
     }
-
-    // Unskip all skipped tasks
     for task in &tasks.skipped_tasks {
-        unskip_task(conn, &task.id)?;
+        apply_review_unblock(
+            conn,
+            &task.id,
+            TransitionChange::Unskip,
+            "[AUTO-UNSKIPPED] Returned to todo via review --auto",
+        )?;
         actions.push(ReviewAction {
             task_id: task.id.clone(),
             action: ReviewActionType::Unskipped,
             notes: None,
         });
     }
-
     Ok(ReviewResult {
         blocked_tasks: Vec::new(),
         skipped_tasks: Vec::new(),
@@ -192,102 +145,60 @@ pub fn auto_unblock_all(conn: &Connection, options: &ReviewOptions) -> TaskMgrRe
     })
 }
 
-/// Unblock a single task (internal helper).
-fn unblock_task(conn: &Connection, task_id: &str) -> TaskMgrResult<()> {
-    let audit_note = "[AUTO-UNBLOCKED] Returned to todo via review --auto".to_string();
-
-    // Get current notes
-    let current_notes: Option<String> = conn
-        .query_row("SELECT notes FROM tasks WHERE id = ?", [task_id], |row| {
-            row.get(0)
-        })
-        .map_err(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => TaskMgrError::task_not_found(task_id),
-            _ => TaskMgrError::from(e),
-        })?;
-
-    let new_notes = match &current_notes {
-        Some(existing) if !existing.is_empty() => format!("{}\n\n{}", existing, audit_note),
-        _ => audit_note,
-    };
-
-    conn.execute(
-        "UPDATE tasks SET status = ?, last_error = NULL, notes = ?, updated_at = datetime('now') WHERE id = ?",
-        rusqlite::params![TaskStatus::Todo.as_db_str(), new_notes, task_id],
-    )?;
-
-    Ok(())
-}
-
-/// Unskip a single task (internal helper).
-fn unskip_task(conn: &Connection, task_id: &str) -> TaskMgrResult<()> {
-    let audit_note = "[AUTO-UNSKIPPED] Returned to todo via review --auto".to_string();
-
-    // Get current notes
-    let current_notes: Option<String> = conn
-        .query_row("SELECT notes FROM tasks WHERE id = ?", [task_id], |row| {
-            row.get(0)
-        })
-        .map_err(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => TaskMgrError::task_not_found(task_id),
-            _ => TaskMgrError::from(e),
-        })?;
-
-    let new_notes = match &current_notes {
-        Some(existing) if !existing.is_empty() => format!("{}\n\n{}", existing, audit_note),
-        _ => audit_note,
-    };
-
-    conn.execute(
-        "UPDATE tasks SET status = ?, notes = ?, updated_at = datetime('now') WHERE id = ?",
-        rusqlite::params![TaskStatus::Todo.as_db_str(), new_notes, task_id],
-    )?;
-
-    Ok(())
-}
-
-/// Resolve a task with custom notes (returns to todo).
-///
-/// # Arguments
-/// * `conn` - Database connection
-/// * `task_id` - Task to resolve
-/// * `resolution_notes` - Notes explaining the resolution
+/// Resolve a task with custom resolution notes (returns to Todo, clears
+/// `last_error`).
 pub fn resolve_task(
-    conn: &Connection,
+    conn: &mut Connection,
     task_id: &str,
     resolution_notes: &str,
 ) -> TaskMgrResult<ReviewAction> {
-    let audit_note = format!("[RESOLVED] {}", resolution_notes);
-
-    // Get current status and notes
-    let (status_str, current_notes): (String, Option<String>) = conn
-        .query_row(
-            "SELECT status, notes FROM tasks WHERE id = ?",
-            [task_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .map_err(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => TaskMgrError::task_not_found(task_id),
-            _ => TaskMgrError::from(e),
-        })?;
-
-    let _status: TaskStatus = status_str.parse()?;
-
-    let new_notes = match &current_notes {
-        Some(existing) if !existing.is_empty() => format!("{}\n\n{}", existing, audit_note),
-        _ => audit_note.clone(),
-    };
-
-    conn.execute(
-        "UPDATE tasks SET status = ?, last_error = NULL, notes = ?, updated_at = datetime('now') WHERE id = ?",
-        rusqlite::params![TaskStatus::Todo.as_db_str(), new_notes, task_id],
-    )?;
-
+    let audit = format!("[RESOLVED] {resolution_notes}");
+    apply_review_unblock(conn, task_id, TransitionChange::Unblock, &audit)?;
     Ok(ReviewAction {
         task_id: task_id.to_string(),
         action: ReviewActionType::Resolved,
         notes: Some(resolution_notes.to_string()),
     })
+}
+
+/// Shared apply() call for review's three Todo-bound paths. The
+/// caller-supplied `audit_note` overrides the lifecycle service's default
+/// prefix and bypasses the expected-state validation.
+fn apply_review_unblock(
+    conn: &mut Connection,
+    task_id: &str,
+    change: TransitionChange,
+    audit: &str,
+) -> TaskMgrResult<()> {
+    let intent = TransitionIntent {
+        task_id: task_id.to_string(),
+        change,
+        source: TransitionSource::Operator,
+        reason: None,
+        fail_status: None,
+        audit_note: Some(audit.to_string()),
+    };
+    let outcomes = {
+        let mut lc = TaskLifecycle::new(conn);
+        lc.apply(&[intent])
+    };
+    let outcome = &outcomes[0];
+    if !outcome.applied {
+        return Err(match outcome.previous {
+            None => TaskMgrError::task_not_found(task_id),
+            _ => {
+                let msg = match &outcome.reason {
+                    Some(crate::lifecycle::TransitionRejectReason::DispatchFailed(m)) => m.clone(),
+                    _ => "unknown lifecycle dispatch failure".to_string(),
+                };
+                TaskMgrError::lock_error_with_hint(
+                    format!("review dispatch failed for {task_id}: {msg}"),
+                    "internal lifecycle dispatch error; check earlier stderr for details",
+                )
+            }
+        });
+    }
+    Ok(())
 }
 
 /// Format review result as human-readable text.
@@ -510,7 +421,7 @@ mod tests {
 
     #[test]
     fn test_auto_unblock_all() {
-        let (_dir, conn) = setup_test_db();
+        let (_dir, mut conn) = setup_test_db();
         insert_test_task(&conn, "US-001", "blocked", 10);
         insert_test_task(&conn, "US-002", "skipped", 20);
         insert_test_task(&conn, "US-003", "blocked", 5);
@@ -519,7 +430,7 @@ mod tests {
             auto_unblock: true,
             ..Default::default()
         };
-        let result = auto_unblock_all(&conn, &options).unwrap();
+        let result = auto_unblock_all(&mut conn, &options).unwrap();
 
         assert_eq!(result.actions_taken.len(), 3);
         assert!(result.blocked_tasks.is_empty());
@@ -539,7 +450,7 @@ mod tests {
 
     #[test]
     fn test_auto_unblock_blocked_only() {
-        let (_dir, conn) = setup_test_db();
+        let (_dir, mut conn) = setup_test_db();
         insert_test_task(&conn, "US-001", "blocked", 10);
         insert_test_task(&conn, "US-002", "skipped", 20);
 
@@ -548,7 +459,7 @@ mod tests {
             blocked_only: true,
             ..Default::default()
         };
-        let result = auto_unblock_all(&conn, &options).unwrap();
+        let result = auto_unblock_all(&mut conn, &options).unwrap();
 
         assert_eq!(result.actions_taken.len(), 1);
         assert_eq!(result.actions_taken[0].action, ReviewActionType::Unblocked);
@@ -570,7 +481,7 @@ mod tests {
 
     #[test]
     fn test_resolve_task() {
-        let (_dir, conn) = setup_test_db();
+        let (_dir, mut conn) = setup_test_db();
         insert_task_with_details(
             &conn,
             "US-001",
@@ -581,7 +492,7 @@ mod tests {
             Some("Initial notes"),
         );
 
-        let action = resolve_task(&conn, "US-001", "Fixed by upgrading dependency").unwrap();
+        let action = resolve_task(&mut conn, "US-001", "Fixed by upgrading dependency").unwrap();
 
         assert_eq!(action.task_id, "US-001");
         assert_eq!(action.action, ReviewActionType::Resolved);
@@ -621,9 +532,9 @@ mod tests {
 
     #[test]
     fn test_resolve_nonexistent_task() {
-        let (_dir, conn) = setup_test_db();
+        let (_dir, mut conn) = setup_test_db();
 
-        let result = resolve_task(&conn, "NONEXISTENT", "Notes");
+        let result = resolve_task(&mut conn, "NONEXISTENT", "Notes");
 
         assert!(result.is_err());
         match result {

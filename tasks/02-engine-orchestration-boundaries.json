@@ -1,0 +1,593 @@
+{
+  "branchName": "refactor/engine-orchestration-boundaries",
+  "description": "Coherence Phase 1, second PRD. Carve src/loop_engine/engine.rs (9644 lines) into orchestrator.rs / iteration.rs / wave_scheduler.rs / slot.rs / recovery.rs while preserving the five layers of parallel-slot cascade defenses, the overflow ladder, the auto-review trigger, the shared iteration_pipeline.rs parity contract, and the operator escape valve (check_override_invalidation). Strengthens the iteration_pipeline parity invariant into a compile-time / test-time assertion. Hard prerequisite: prd-tasklifecycle-extraction.md (prefix 035925a9) MUST have merged first so the LIFECYCLE-EXCEPTION grep lint is green and the carve does not have to also move ~15 status-write sites. Boundary contract with the parallel runner-trait-hygiene Phase 2 effort: whichever PRD merges first leaves clear seams.",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "Rust: `cargo fmt --check` passes",
+      "Rust: `cargo check --all-targets --all-features` passes with no new warnings",
+      "Rust: `cargo clippy -- -D warnings` passes",
+      "Rust: Scoped tests for touched files pass with `cargo test`",
+      "No new .unwrap() / .expect() in production paths (existing ones move verbatim; #[cfg(test)] unchanged)",
+      "No new raw `UPDATE tasks SET status` SQL anywhere — LIFECYCLE-EXCEPTION grep lint stays green",
+      "Static-dispatch RunnerKind path preserved on every spawn boundary (no Box<dyn LlmRunner>)",
+      "Send + Sync invariants on SlotPromptBundle + LlmRunner preserved (compile-time assertion in prompt/mod.rs still passes)",
+      "Public surface stable: `cargo check --all-targets` passes without import changes outside src/loop_engine/",
+      "Comments explain WHY (boundary contracts, defense-layer invariants), never narrate WHAT or the extraction itself"
+    ],
+    "description": "These criteria apply to ALL implementation tasks in this PRD"
+  },
+  "mergeStrategy": "Merge to main after REVIEW-001 passes the full quality gate AND the dogfood gate (10 iterations across 2 distinct PRDs with byte-identical observable behavior). Squash optional.",
+  "model": "claude-sonnet-4-6",
+  "priorityPhilosophy": {
+    "description": "Hierarchy of what matters most when carving the loop engine",
+    "hierarchy": [
+      "1. PLAN — Anticipate which extraction order minimizes blast radius (bottom-up: recovery → slot → wave_scheduler → iteration → orchestrator)",
+      "2. PHASE 2 FOUNDATION — Extract recovery.rs even though Approach B (keep in engine.rs) would be cheaper now; future recovery primitives compound. ~1 day extra now saves ~2+ weeks of next-refactor churn (1:10+ ratio)",
+      "3. FUNCTIONING CODE — Byte-identical observable behavior is non-negotiable. Same stderr, same DB state, same exit codes",
+      "4. CORRECTNESS — Compiles, type-checks, scoped tests pass deterministically; all five defense-layer regression tests stay green",
+      "5. CODE QUALITY — qualityDimensions satisfied, no warnings, visibility ladder respected (pub(super) → pub(crate) → pub)",
+      "6. POLISH — Module rustdocs, CLAUDE.md touchpoints table, retrospective appendix"
+    ],
+    "principles": [
+      "This is a refactor, not a hardening pass. Existing .unwrap()s, error-handling shapes, and stderr emissions move verbatim.",
+      "Carve along existing seams, do not invent new ones. The PRD names the target modules and the symbols each owns; the implementer does not redesign.",
+      "Each extraction is one commit (or one PR) — never split a function's body across commits.",
+      "Defense layers move with regression tests in scope; if a defense layer's test moves between files, the test moves in the same commit as the code it covers.",
+      "Dogfood gate is the final arbiter — pre-refactor stderr/DB baseline vs. post-refactor must match byte-identically on the same input.",
+      "Boundary contract with runner-trait-hygiene Phase 2: avoid editing the same engine.rs hunks; coordinate via comments + reviewer overlap"
+    ]
+  },
+  "prohibitedOutcomes": [
+    "Adding a raw UPDATE tasks SET status site, even temporarily, anywhere in the new modules — LIFECYCLE-EXCEPTION grep lint MUST stay green at every commit",
+    "Introducing dynamic dispatch (Box<dyn LlmRunner>, Box<dyn Scheduler>, etc.) on the hot path; static-dispatch RunnerKind enum stays the path",
+    "Recomputing slot 0's worktree path via compute_slot_worktree_path(_, branch, 0) — defense layer #1 hinges on threading the path from ensure_slot_worktrees",
+    "Splitting the apply_pending_promotion / escalate_task_model_if_needed_inner pair across commits — the after-tx.commit() invariant must move atomically",
+    "Removing or refactoring the SYNTHETIC_DEADLOCK_SLOT sentinel — defense layer #4's deadlock-guard contract depends on it",
+    "Widening visibility beyond what an extraction strictly requires (pub(super) → pub(crate) → pub ladder)",
+    "Adding pub use chains that pierce three or more modules to preserve a single import path",
+    "Renaming exported symbols (run_loop, run_iteration, run_wave_iteration, process_slot_result, etc.) — public surface stability per FR-008",
+    "Editing iteration_pipeline.rs's production code (the FR-006 assertion lives in tests/ or as a #[cfg(test)] block)",
+    "Skipping the dogfood gate. 10 iterations × 2 distinct PRDs with byte-identical stderr/DB capture is REVIEW-001's gate",
+    "Tidying or refactoring extracted code during the move. Carve first, polish (if needed) in a separate REFACTOR-xxx after REFACTOR-REVIEW-FINAL"
+  ],
+  "project": "task-mgr",
+  "requires": [
+    {
+      "prd": "tasklifecycle-extraction.json",
+      "reason": "TaskLifecycle service must own every status write (LIFECYCLE-EXCEPTION grep lint green) before the carve begins — otherwise the carve would also have to move the ~15 raw UPDATE sites in engine.rs, which inflates blast radius and creates merge hell against an in-flight migration.",
+      "task": "MILESTONE-FINAL"
+    }
+  ],
+  "reviewGuidelines": {
+    "priorityGuidelines": {
+      "critical": "1-10: Blocks further work, fix immediately",
+      "high": "11-20: Fix before phase completion",
+      "low": "51-99: Defer to hardening phase",
+      "medium": "21-50: Fix in current phase if time permits"
+    }
+  },
+  "taskPrefix": "d4e04fae",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "task-mgr show 035925a9-MILESTONE-FINAL shows status=done",
+        "git log on main shows the merge commit for the tasklifecycle-extraction branch",
+        "grep test for raw `UPDATE tasks SET status` outside src/lifecycle/ returns only LIFECYCLE-EXCEPTION-annotated sites (init/mod.rs bootstrap)",
+        "src/loop_engine/engine.rs claim_slot_task calls TaskLifecycle::try_claim (not raw SQL)",
+        "If any check fails, emit <promise>BLOCKED</promise> with a clear reason"
+      ],
+      "dependsOn": [],
+      "description": "Verify prd-tasklifecycle-extraction.md (prefix 035925a9) has reached MILESTONE-FINAL and been merged to main. Confirm the LIFECYCLE-EXCEPTION grep lint test exists and is green. Confirm claim_slot_task routes through TaskLifecycle::try_claim. Output <promise>BLOCKED</promise> with task ID and reason if not. The Cluster A serialization rule (per coherence design — Dogfood concurrency, N-iteration exit gate) forbids parallel PRDs in this cluster.",
+      "estimatedEffort": "low",
+      "id": "CLARIFY-001",
+      "modifiesBehavior": false,
+      "notes": "This is the Cluster A serialization gate from the coherence design. Do not start any extraction work until this task passes.",
+      "passes": false,
+      "priority": 0,
+      "qualityDimensions": [
+        "Fail-closed: any check ambiguity is a BLOCKED, not a proceed",
+        "The check is a one-time gate; subsequent iterations do not re-check (they read the green state from CLARIFY-001's progress note)"
+      ],
+      "requiresHuman": false,
+      "taskType": "review",
+      "title": "Gate: TaskLifecycle Extraction PRD must merge first",
+      "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": [
+        "Two baseline scenarios chosen and named (one sequential, one 2-slot wave) and their input PRD + initial git state recorded",
+        "Baseline stderr captures saved (one per scenario) with timestamps stripped or normalized to a sentinel so REVIEW-001's diff is signal-only",
+        "Baseline DB-final-state snapshot saved via a single deterministic command captured verbatim in the progress log (proposal: `sqlite3 .task-mgr/tasks.db .dump | sed -E 's/[0-9]{4}-[0-9]{2}-[0-9]{2}T[^\"]+/TIMESTAMP/g; s/run_[0-9a-f]{8,}/run_ID/g' | sort > tests/fixtures/refactor-baselines/<scenario>.db.txt`)",
+        "Baselines checked into git under tests/fixtures/refactor-baselines/ with a one-line README.md noting: 'Frozen pre-refactor captures of engine.rs behavior; regenerating requires checking out main at <commit-sha> and re-running the capture commands recorded in the ANALYSIS-001 progress section.' This makes the dogfood gate reviewable and machine-portable.",
+        "Baseline reproducibility check: capture twice on main (with the normalizer applied each time), `diff` the two captures, confirm zero output. If non-zero, the chosen scenario is non-deterministic and must be replaced or constrained",
+        "Wave-mode stderr ordering: document explicitly whether today's stderr is deterministic line-by-line (slot output is captured to per-slot files and serialized in slot-index order) OR whether the contract is set-equality after normalization. If non-deterministic, REVIEW-001's diff uses sorted-line comparison; otherwise byte-identical",
+        "RunnerKind match site inventory in progress log: file:line, surrounding context, KIND-CORRECT or CAPABILITY-MISLABELED label, one-line rationale",
+        "Existing inventory from grep `RunnerKind::Grok\\|RunnerKind::Claude` src/loop_engine/engine.rs starts the count at ~15 sites; cover every src/ hit"
+      ],
+      "dependsOn": [
+        "CLARIFY-001"
+      ],
+      "description": "Two outputs: (1) Capture a pre-refactor stderr + DB-final-state baseline for the dogfood gate. Run two representative loop scenarios (one sequential PRD, one 2-slot wave PRD) against current main, save the stderr captures and a DB-final-state snapshot to a private path (e.g., .task-mgr/refactor-baselines/). REVIEW-001 will diff against these. (2) Inventory every `RunnerKind::Claude` / `RunnerKind::Grok` match in src/ with line numbers and a one-line classification (KIND-CORRECT or CAPABILITY-MISLABELED) — this is shared work with the parallel runner-trait-hygiene Phase 2 PRD's FR-005 audit; the inventory lives in progress log for both PRDs to consume.",
+      "estimatedEffort": "medium",
+      "id": "ANALYSIS-001",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "Pick PRDs that exercise the relevant defenses: sequential = curate-session-cleanup.json (mostly sequential, exercises overflow ladder); wave = parallel-task-execution.json (exercises slot-0 path threading, halt threshold, ephemeral overlay). If those PRDs are unavailable, pick equivalents. The RunnerKind audit is shared with prd-01-runner-capability-enforcement.md FR-005; either PRD's owner can produce it first; the other consumes it.",
+      "passes": false,
+      "priority": 1,
+      "qualityDimensions": [
+        "Baselines are deterministic — re-running on main produces a byte-identical capture (modulo intentionally-normalized timestamps / run-ids)",
+        "RunnerKind audit annotations are honest — if classification is ambiguous, the annotation says so; reviewers and the parallel runner-PRD author rely on this being signal, not opinion",
+        "Baselines live under tests/fixtures/refactor-baselines/ (checked into git so the dogfood gate is reproducible across machines and reviewable as a frozen artifact)"
+      ],
+      "requiresHuman": false,
+      "taskType": "analysis",
+      "title": "Pre-refactor baseline capture + RunnerKind audit",
+      "touchesFiles": [
+        "tests/fixtures/refactor-baselines/README.md",
+        "tests/fixtures/refactor-baselines/sequential.stderr.txt",
+        "tests/fixtures/refactor-baselines/sequential.db.txt",
+        "tests/fixtures/refactor-baselines/wave.stderr.txt",
+        "tests/fixtures/refactor-baselines/wave.db.txt"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Test exists in tests/iteration_pipeline_parity.rs (or as #[cfg(test)] inside iteration_pipeline.rs)",
+        "Test references both call sites by their post-carve location (iteration.rs and slot.rs) — initially this is engine.rs:run_iteration and engine.rs:process_slot_result; FEAT tasks update the references as they extract",
+        "Test mechanism: each call site has a #[cfg(test)] helper fn (e.g., call_sites_destructure_full_params(params: ProcessingParams<'_>)) that exhaustively destructures `params` without using `..`. The test calls both helpers.",
+        "Known-bad discriminator: a test that deliberately adds a field to ProcessingParams without updating both helpers MUST fail to compile (verify manually during implementation by tentatively adding a field, observing compile error, removing it)",
+        "Test passes on current main (it codifies an existing invariant, not a new one)"
+      ],
+      "dependsOn": [
+        "CLARIFY-001"
+      ],
+      "description": "Add a test or compile-time assertion that BOTH `iteration::run_iteration` (sequential) and `slot::process_slot_result` (wave) call `iteration_pipeline::process_iteration_output` with a `ProcessingParams` built from exhaustively-destructured fields. Adding a new field to `ProcessingParams` without updating both call sites must fail to compile. Today this invariant is maintained by a comment in `prompt/mod.rs`; this test mechanically enforces it. Lives in tests/iteration_pipeline_parity.rs OR as a #[cfg(test)] block inside iteration_pipeline.rs.",
+      "edgeCases": [
+        "ProcessingParams currently has N fields — the test destructure enumerates all N exhaustively, never using `..`",
+        "A future field added to ProcessingParams that is only meaningful to one path (e.g., wave-only telemetry) must still appear in both destructures — the field's presence in `params` is what enforces parity; conditional consumption inside the path is allowed but the field reference is mandatory"
+      ],
+      "estimatedEffort": "low",
+      "failureModes": [
+        {
+          "cause": "Helper uses `..` (rest pattern) for ergonomic destructure",
+          "expectedBehavior": "Code review rejects; the explicit destructure is the entire enforcement mechanism"
+        }
+      ],
+      "id": "TEST-INIT-001",
+      "invariants": [
+        "Adding a field to ProcessingParams without updating both helpers fails to compile",
+        "Removing a field from ProcessingParams without updating both helpers fails to compile",
+        "Renaming a field in ProcessingParams without updating both helpers fails to compile"
+      ],
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "Phase 2 foundation: this assertion is the long-term enforcement mechanism. The PRD's biggest risk (wave/sequential divergence as fields drift) is closed by this test. Spend the time to make it robust — manual verification that adding a field breaks compile is the acceptance test for the test itself.",
+      "passes": false,
+      "priority": 2,
+      "qualityDimensions": [
+        "The test must actually fail to compile (not run-time fail) when ProcessingParams drifts — the whole point is compile-time enforcement",
+        "The test is structural — it does not assert behavior, only that both call sites destructure exhaustively",
+        "Does not touch iteration_pipeline.rs's production code beyond adding the #[cfg(test)] helpers if that location is chosen"
+      ],
+      "requiresHuman": false,
+      "taskType": "test",
+      "title": "iteration_pipeline parity assertion test (FR-006)",
+      "touchesFiles": [
+        "tests/iteration_pipeline_parity.rs",
+        "src/loop_engine/iteration_pipeline.rs",
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Inventory in progress log: defense layer 1-5, test file:test_fn for each, currently passing on main (cargo test confirms)",
+        "For each defense, the symbols it tests (e.g., `merge_slot_branches_with_resolver`, `apply_merge_fail_reset_and_halt_check`, `reconcile_stale_ephemeral_slots`, `select_parallel_group`, `classify_ephemeral_branch`) are listed",
+        "Any defense layer that LACKS a dedicated regression test today is flagged as a gap — gaps spawn an IMPL-FIX or a separate TEST-xxx task before the corresponding FEAT extraction touches the defense's symbols",
+        "Slot-0 safety guard (slot==0 rejection in classify_ephemeral_branch) has at least one negative-case test confirmed"
+      ],
+      "dependsOn": [
+        "CLARIFY-001"
+      ],
+      "description": "Inventory every existing test that proves one of the five parallel-slot defenses (slot-path threading, halt threshold, implicit-overlap baseline, ephemeral overlay, stale ephemeral hygiene). For each, confirm it (a) exists and is currently passing on main, (b) will continue to compile/pass after the extraction (i.e., the defense's symbols are not renamed by this refactor). Record the inventory in the progress log so REVIEW-001 can audit at the end.",
+      "edgeCases": [
+        "Stale `<branch>-slot-0` ref in test fixture: classify_ephemeral_branch returns Err",
+        "SYNTHETIC_DEADLOCK_SLOT path: handle_ephemeral_deadlock with malformed-suffix-only blockers populates failed_merges with usize::MAX entry",
+        "Empty touchesFiles for buildy-prefix task: claims __shared_infra__ slot anyway (selection.rs heuristic)",
+        "halt_threshold=0: legacy log-and-continue behavior preserved bit-for-bit on the same forced-fail input",
+        "Cross-wave ephemeral overlay deadlock: ephemeral_block_diagnostics populated AND trips FEAT-002 reset/halt"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Defense lacks a test today",
+          "expectedBehavior": "Spawn a TEST-xxx task to add one BEFORE the corresponding FEAT extraction begins; the FEAT depends on the new test"
+        }
+      ],
+      "id": "TEST-INIT-002",
+      "invariants": [
+        "Each defense layer has at least one regression test; the refactor cannot ship if a defense has no test",
+        "All defense tests currently pass on main — the inventory baseline"
+      ],
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "See src/loop_engine/CLAUDE.md `## Parallel-slot scheduling` section for the canonical defense-layer list (1-5). Touch the test files only to verify their existence and current pass status; do not modify them in this task. Any gap-fill TEST-xxx spawned here is its own task.",
+      "passes": false,
+      "priority": 3,
+      "qualityDimensions": [
+        "Inventory is exhaustive — if you cannot find a test for defense layer N, flag the gap explicitly rather than silently moving on",
+        "Inventory is honest — a test that asserts 'no crash' or that exercises an unrelated symbol does not count as covering the defense",
+        "Inventory is grep-verified — file:line citations match what's actually in main"
+      ],
+      "requiresHuman": false,
+      "taskType": "test",
+      "title": "Defense-layer regression test inventory",
+      "touchesFiles": [
+        "src/loop_engine/worktree.rs",
+        "src/loop_engine/engine.rs",
+        "src/commands/next/selection.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "src/loop_engine/slot.rs created with the listed symbols",
+        "src/loop_engine/engine.rs no longer defines those symbols",
+        "src/loop_engine/mod.rs declares `pub(crate) mod slot;` and re-exports any items consumed from `crate::loop_engine::` paths (e.g., `pub use slot::run_slot_iteration` if external callers exist)",
+        "SlotContext, SlotResult, SlotEarlyExit, SlotFailureKind types stay in engine.rs; slot.rs imports them",
+        "claim_slot_task still routes through TaskLifecycle::try_claim (no raw SQL — LIFECYCLE-EXCEPTION grep lint stays green)",
+        "process_slot_result still calls iteration_pipeline::process_iteration_output (parity assertion from TEST-INIT-001 still passes; the test's call-site reference updates to `slot::process_slot_result` in this commit)",
+        "Existing wave-mode tests in tests/parallel_* continue to pass without modification",
+        "Defense layer #5 slot-0 safety guard preserved: classify_ephemeral_branch still returns Err for slot=0 (this lives in worktree.rs and is not touched by this extraction; verified by re-running the existing test)",
+        "cargo test -p task-mgr passes after the extraction",
+        "engine.rs line count decreased by ~700 lines (combined slot symbols)"
+      ],
+      "dependsOn": [
+        "TEST-INIT-001",
+        "TEST-INIT-002",
+        "ANALYSIS-001"
+      ],
+      "description": "Move slot-related symbols from engine.rs into src/loop_engine/slot.rs. Symbols: run_slot_iteration (engine.rs:557), slot_early_exit (engine.rs:512), claim_slot_task (engine.rs:787), slot_failure_result (engine.rs:818), process_slot_result (engine.rs:1409). The SlotContext / SlotResult / SlotEarlyExit / SlotFailureKind types stay in engine.rs and are re-exported (consumed by IterationContext + tests outside the loop_engine module). slot.rs has no cross-module dependency yet (recovery.rs and other modules still in engine.rs); it imports recovery functions from their engine.rs location and those imports update in FEAT-002 when recovery.rs lands. process_slot_result still calls iteration_pipeline::process_iteration_output — that contract is preserved.",
+      "estimatedEffort": "high",
+      "id": "FEAT-001",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "First extraction. slot.rs imports recovery functions from their current engine.rs locations; those `use crate::loop_engine::engine::{check_override_invalidation, ...}` lines update to `use crate::loop_engine::recovery::{...}` in FEAT-002 when recovery.rs lands. Bottom-up extraction order: slot.rs is the leaf consumer that wave_scheduler.rs (FEAT-003) will import; recovery.rs (FEAT-002) is the cross-cutting helper. Architect-rec order: slot before recovery so the second extraction (recovery) exercises the cross-module call shape with a real consumer (slot.rs).",
+      "passes": false,
+      "priority": 4,
+      "qualityDimensions": [
+        "Byte-identical observable behavior on a 2-slot wave-mode dogfood scenario",
+        "claim_slot_task's WHERE id = ? AND status IN ('todo', 'in_progress') predicate semantics preserved exactly via TaskLifecycle::try_claim — no behavior change",
+        "Send + Sync on SlotPromptBundle preserved (compile-time assertion in prompt/mod.rs still passes)",
+        "Thread-spawn boundary in run_parallel_wave (slot iterations run on separate threads) preserved exactly — slot.rs::run_slot_iteration retains its full signature including any Send + Sync bounds on inputs",
+        "The TEST-INIT-001 parity assertion's call-site reference updates atomically in this commit (no transient broken state where the assertion points at the old engine.rs::process_slot_result)"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Extract slot.rs — slot lifecycle + result processing (first extraction)",
+      "touchesFiles": [
+        "src/loop_engine/slot.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/mod.rs",
+        "tests/iteration_pipeline_parity.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "src/loop_engine/recovery.rs created with all listed symbols",
+        "src/loop_engine/engine.rs no longer defines those symbols",
+        "src/loop_engine/slot.rs imports updated: `use crate::loop_engine::recovery::{...}` (replacing the temporary `use crate::loop_engine::engine::{...}` from FEAT-001) — atomic with this commit",
+        "src/loop_engine/mod.rs declares `pub(crate) mod recovery;`",
+        "Public re-exports preserved: `crate::loop_engine::{escalate_task_model_if_needed, should_auto_block, ...}` if they were public, via `pub use recovery::...` in mod.rs",
+        "Existing tests for the recovery cluster (transactional promotion, override-invalidation, auto-block) move with their code in the same commit",
+        "apply_pending_promotion is called ONLY after tx.commit()? returns Ok — the inner/apply pattern moves atomically (one commit)",
+        "PendingPromotion type moves with the helpers (same file)",
+        "cargo test -p task-mgr passes after the extraction",
+        "LIFECYCLE-EXCEPTION grep lint stays green",
+        "engine.rs line count decreased by approximately the size of the extracted cluster (~1000 lines)"
+      ],
+      "dependsOn": [
+        "FEAT-001"
+      ],
+      "description": "Move the per-task recovery cluster from engine.rs into a new src/loop_engine/recovery.rs. Symbols: check_crash_escalation, check_override_invalidation, should_auto_block, should_escalate_for_consecutive_failures, apply_pending_promotion, escalate_task_model_if_needed_inner, escalate_task_model_if_needed, increment_consecutive_failures, reset_consecutive_failures, auto_block_task, handle_task_failure, prompt_overflow_result, probe_rate_limit_lifted, update_trackers, normalize_baseline, PendingPromotion type. After this extraction, slot.rs (already extracted in FEAT-001) updates its imports from `crate::loop_engine::engine::{...}` to `crate::loop_engine::recovery::{...}` in the same commit. mod.rs adds `pub(crate) mod recovery;`. Existing tests in engine.rs covering the recovery cluster (transactional promotion pattern, override-invalidation escape valve, auto-block threshold) move with the cluster.",
+      "estimatedEffort": "high",
+      "id": "FEAT-002",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "Approach A per PRD §6. Approach B (leave recovery in engine.rs) was rejected because future recovery primitives compound the refactor cost. Tests for this cluster live in engine.rs today — they move in the SAME commit as the code, no exceptions. The slot.rs import-update is included in this task's commit because slot.rs is the first cross-module consumer of recovery functions; iteration.rs and wave_scheduler.rs come in later FEATs and will import recovery directly from the new location.",
+      "passes": false,
+      "priority": 5,
+      "qualityDimensions": [
+        "Byte-identical observable behavior on the dogfood-baseline scenarios — REVIEW-001's diff will catch any drift",
+        "Visibility ladder: items consumed only within recovery.rs are `pub(super)` or private; items consumed by iteration.rs/wave_scheduler.rs/slot.rs are `pub(crate)`; only items re-exported from `crate::loop_engine::` are `pub`",
+        "The transactional invariant (inner returns PendingPromotion → caller applies after tx.commit()?) is preserved verbatim. Do not 'simplify' the pattern.",
+        "WORKAROUND() markers (if any cross the boundary) move with their code",
+        "The check_override_invalidation order-before-resolve constraint (top of every iteration, before resolve_effective_runner) is preserved at the call site — but that call site is in iteration.rs/wave_scheduler.rs/slot.rs, not recovery.rs; recovery.rs just provides the function",
+        "slot.rs's import-update is atomic with this commit — no transient state where slot.rs imports a recovery symbol from engine.rs while recovery.rs already exists"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Extract recovery.rs — per-task recovery cluster (Approach A)",
+      "touchesFiles": [
+        "src/loop_engine/recovery.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/mod.rs",
+        "src/loop_engine/slot.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "src/loop_engine/wave_scheduler.rs created with the listed symbols",
+        "src/loop_engine/engine.rs no longer defines those symbols",
+        "src/loop_engine/mod.rs declares `pub(crate) mod wave_scheduler;` and re-exports run_wave_iteration if external callers exist",
+        "SYNTHETIC_DEADLOCK_SLOT = usize::MAX moves to wave_scheduler.rs verbatim (defense layer #4)",
+        "Slot-path-threading invariant (defense layer #1): wave_scheduler MUST pass slot_paths: &[PathBuf] from ensure_slot_worktrees through to merge_slot_branches_with_resolver — a unit test asserts the threading at type level",
+        "handle_ephemeral_deadlock still emits the synthetic-slot FailedMerge record (defense layer #4's deadlock-guard contract)",
+        "apply_merge_fail_reset_and_halt_check still trips the FEAT-002 consecutive-merge-fail halt at the configured threshold",
+        "Existing tests in src/loop_engine/worktree.rs and src/commands/next/selection.rs covering defense layers 1, 2, 3, 4 continue to pass without modification",
+        "Wave-mode dogfood scenario (2-slot, then 4-slot) completes with byte-identical DB state + stderr capture vs. pre-refactor baseline",
+        "cargo test -p task-mgr passes after the extraction",
+        "engine.rs line count decreased by ~1800 lines"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002"
+      ],
+      "description": "Move wave-scheduling symbols from engine.rs into src/loop_engine/wave_scheduler.rs. Symbols: run_wave_iteration (engine.rs:1835), run_parallel_wave (engine.rs:871), wave_preflight_check (engine.rs:1093), handle_no_eligible_tasks (engine.rs:1158), handle_ephemeral_deadlock (engine.rs:1220), build_slot_contexts (engine.rs:1316), build_shared_slot_params (engine.rs:1358), build_slot_prompt_params (engine.rs:1377), count_remaining_active_tasks (engine.rs:1597), wait_inter_wave_delay (engine.rs:1615), reset_task_to_todo (engine.rs:1643), apply_merge_fail_reset_and_halt_check (engine.rs:1691), read_prd_implicit_overlap_files (engine.rs:1762), apply_post_merge_reconcile (engine.rs:1790), SYNTHETIC_DEADLOCK_SLOT constant. wave_scheduler.rs depends on slot.rs (FEAT-001) and recovery.rs (FEAT-002).",
+      "estimatedEffort": "high",
+      "id": "FEAT-003",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "Largest extraction by line count (~1800). Approach: move symbols in dependency-order within wave_scheduler.rs (build_* helpers first, then handle_*, then the orchestration entry points). Each step is a separate cargo check; do not let the half-extracted state survive across iterations. The test for defense layer #1 (slot-path threading) is NEW in this extraction — it's a regression test the existing code lacks; add it as the first thing inside wave_scheduler.rs.",
+      "passes": false,
+      "priority": 6,
+      "qualityDimensions": [
+        "All five defense-layer regression tests stay green throughout (run scoped suite after every step of the extraction)",
+        "The slot-path-threading defense (layer #1) gets a dedicated type-level test in wave_scheduler.rs: construct a WaveIterationParams and confirm slot_worktree_paths is the literal vector ensure_slot_worktrees returned (not a recomputation)",
+        "SYNTHETIC_DEADLOCK_SLOT sentinel moves together with handle_ephemeral_deadlock — the synthesis pattern emit-at-least-one-record contract is preserved",
+        "Run-level config caching (ProjectConfig + PRD-side implicit_overlap_files loaded ONCE at run_loop startup, threaded through WaveIterationParams) is preserved — wave_scheduler reads from cached references, never calls read_project_config or read_prd_implicit_overlap_files mid-wave",
+        "The PRD merge-fail halt threshold semantics preserved: 0=never halt, 1=halt on any failure, 2=halt after two consecutive (default)"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Extract wave_scheduler.rs — parallel wave + merge-back orchestration",
+      "touchesFiles": [
+        "src/loop_engine/wave_scheduler.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/mod.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "src/loop_engine/iteration.rs created with run_iteration + any sequential-only helpers",
+        "src/loop_engine/engine.rs no longer defines those symbols",
+        "src/loop_engine/mod.rs declares `pub(crate) mod iteration;` and re-exports run_iteration if external callers exist",
+        "IterationContext, IterationResult, IterationOutcome stay in engine.rs as the public hand-off types",
+        "run_iteration still calls iteration_pipeline::process_iteration_output (TEST-INIT-001 parity assertion's call-site reference updates to iteration::run_iteration in this commit)",
+        "check_override_invalidation is still called at the TOP of every sequential iteration, BEFORE resolve_effective_runner (order-before-resolve constraint preserved)",
+        "A sequential-mode dogfood scenario completes with byte-identical DB state + stderr capture vs. pre-refactor baseline",
+        "cargo test -p task-mgr passes after the extraction",
+        "engine.rs line count decreased by ~700-1000 lines"
+      ],
+      "dependsOn": [
+        "FEAT-002"
+      ],
+      "description": "Move src/loop_engine/engine.rs::run_iteration (engine.rs:2230) and any sequential-only helpers into src/loop_engine/iteration.rs. iteration.rs depends on recovery.rs (FEAT-002) for the recovery primitives it calls. run_iteration still calls iteration_pipeline::process_iteration_output (parity preserved).",
+      "estimatedEffort": "high",
+      "id": "FEAT-004",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "Sequential iteration is the simpler of the two execution paths. Symbol set is smaller than wave_scheduler. The biggest risk is the order-before-resolve constraint for check_override_invalidation — read the existing code carefully before moving.",
+      "passes": false,
+      "priority": 7,
+      "qualityDimensions": [
+        "Byte-identical observable behavior on the sequential dogfood scenario",
+        "The check_override_invalidation order-before-resolve constraint is preserved by keeping the call in iteration.rs at the same point in the iteration body — verified by reading the diff and confirming the call sits before resolve_effective_runner",
+        "iteration.rs is < 2000 lines after extraction (PRD target ~1500); if it exceeds, identify which symbol or block should have moved elsewhere and document the deviation",
+        "The TEST-INIT-001 parity assertion's call-site reference updates atomically with this commit",
+        "No new dependency cycles introduced (iteration.rs → recovery.rs, never the other way)"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Extract iteration.rs — sequential per-task body",
+      "touchesFiles": [
+        "src/loop_engine/iteration.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/mod.rs",
+        "tests/iteration_pipeline_parity.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "src/loop_engine/orchestrator.rs created with the listed symbols",
+        "src/loop_engine/engine.rs no longer defines those symbols",
+        "src/loop_engine/mod.rs declares `pub(crate) mod orchestrator;` and `pub use orchestrator::run_loop;` (run_loop is the canonical public entry point)",
+        "LoopRunConfig and LoopResult stay in engine.rs as public types (consumed by external callers like main.rs)",
+        "Signal handler ownership: orchestrator owns the SignalFlag construction + arming; the flag is threaded through WaveIterationParams + SlotIterationParams + IterationContext exactly as before",
+        "Auto-review trigger: the existing auto_review::maybe_fire invocation in run_loop stays at the same point in the run lifecycle (after the loop body completes, before run_cmd::end)",
+        "Stale ephemeral reconcile (defense layer #5): the worktree::reconcile_stale_ephemeral_slots call is preserved in orchestrator.rs and runs BEFORE ensure_slot_worktrees — order is contractual per CLAUDE.md Step 9.5",
+        "Both a sequential and a 2-slot wave dogfood scenario complete byte-identically",
+        "cargo test -p task-mgr passes after the extraction",
+        "engine.rs line count is < 1500 (PRD success metric)"
+      ],
+      "dependsOn": [
+        "FEAT-003",
+        "FEAT-004"
+      ],
+      "description": "Move outer-loop symbols from engine.rs into src/loop_engine/orchestrator.rs. Symbols: run_loop (engine.rs:3048, ~1300 lines), setup_signal_handler (engine.rs:4562), on_run_completed (engine.rs:4609), record_session_guidance (engine.rs:4631), check_global_skills (engine.rs:2985), trigger_human_reviews (engine.rs:4426), query_human_review_tasks (engine.rs:4388), prompt_pending_key_decisions (engine.rs:4467). orchestrator.rs depends on iteration.rs (FEAT-004) and wave_scheduler.rs (FEAT-003) — it dispatches to one or the other at the iteration boundary.",
+      "estimatedEffort": "high",
+      "id": "FEAT-005",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "Largest single function by line count (run_loop ~1300 lines). This extraction is mostly a copy-paste because run_loop is already a self-contained outer body. The risk is the surrounding helpers (signal_handler, on_run_completed, etc.) — confirm each is referenced only from run_loop's body before assuming it's exclusively orchestrator territory. If a helper is called from iteration.rs or wave_scheduler.rs, it stays in engine.rs (or moves to recovery.rs).",
+      "passes": false,
+      "priority": 8,
+      "qualityDimensions": [
+        "Public surface stability: `crate::loop_engine::run_loop` remains importable from the same path (via `pub use orchestrator::run_loop` in mod.rs)",
+        "Stale ephemeral reconcile + auto-review trigger + decisions prompt all fire at the exact same points in the run lifecycle as before",
+        "Signal handler arming happens at the same point relative to the rest of run_loop's body — moving it earlier or later changes user-visible behavior on Ctrl-C",
+        "Batch-mode auto-review semantics preserved: ONE review at end-of-batch for the LAST successful PRD that met the threshold; never per-PRD"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Extract orchestrator.rs — outer run_loop + lifecycle",
+      "touchesFiles": [
+        "src/loop_engine/orchestrator.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/mod.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "src/loop_engine/CLAUDE.md Touchpoints table updated: every `src/loop_engine/engine.rs` reference is verified — either updated to the new module or confirmed to still be in engine.rs",
+        "Narrative section updates: any `engine.rs::<symbol>` mention is re-pointed (manual grep for `engine.rs::` and verify each)",
+        "Each new module file has a module-level rustdoc (//! at top of file) explaining: (a) what this module owns, (b) what it does NOT own (pointer to sibling modules), (c) the key invariants it preserves (defense layers, parity assertions, etc.)",
+        "orchestrator.rs rustdoc references iteration.rs and wave_scheduler.rs as the iteration dispatchers",
+        "iteration.rs rustdoc references iteration_pipeline.rs as the shared post-Claude pipeline AND recovery.rs as the per-task recovery cluster",
+        "wave_scheduler.rs rustdoc references slot.rs (per-slot work), iteration_pipeline.rs (shared), recovery.rs (per-task), and worktree.rs (merge-back)",
+        "slot.rs rustdoc references iteration_pipeline.rs (post-spawn processing) and recovery.rs (per-task recovery)",
+        "recovery.rs rustdoc explains the transactional invariant (inner returns PendingPromotion → caller applies after tx.commit()?)",
+        "cargo doc builds without warnings on the new modules"
+      ],
+      "dependsOn": [
+        "FEAT-005"
+      ],
+      "description": "Update src/loop_engine/CLAUDE.md so every Touchpoints row points at the new module file. Update narrative sections (Overflow recovery and diagnostics, Iteration pipeline (shared), Parallel-slot scheduling) where they reference engine.rs::<symbol> by name — re-point to the new location. Add a module-level rustdoc to each new module (orchestrator.rs, iteration.rs, wave_scheduler.rs, slot.rs, recovery.rs) explaining its scope, sibling modules, and the contracts it preserves. This is FR-007.",
+      "estimatedEffort": "low",
+      "id": "FEAT-006",
+      "modifiesBehavior": false,
+      "notes": "This is the cleanup task after the carve. Run cargo doc to confirm rustdocs are valid. CLAUDE.md edits are the slowest part — there are ~40 Touchpoints rows and ~10 narrative references.",
+      "passes": false,
+      "priority": 9,
+      "qualityDimensions": [
+        "CLAUDE.md changes are line-level surgical, never wholesale rewrites — preserve the existing narrative's voice and ordering",
+        "Module rustdocs are concise (~10-30 lines each) and pointer-heavy, not narrative-heavy — readers navigate to sibling modules, they don't learn the system from one rustdoc",
+        "The 'Touchpoints' table is grep-verified: every `src/loop_engine/engine.rs` mention is either updated or explicitly justified as still-in-engine.rs"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Update CLAUDE.md touchpoints + add module rustdocs",
+      "touchesFiles": [
+        "src/loop_engine/CLAUDE.md",
+        "src/loop_engine/orchestrator.rs",
+        "src/loop_engine/iteration.rs",
+        "src/loop_engine/wave_scheduler.rs",
+        "src/loop_engine/slot.rs",
+        "src/loop_engine/recovery.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Each of the 5 defense layers verified: regression test exists, references valid symbols, passes on the post-extraction branch",
+        "Each of the public surface items in PRD FR-008 verified: import path stable, no external callers had to update imports",
+        "Visibility audit: every `pub` in a new module is justified by an external consumer; otherwise downgraded to `pub(crate)` or `pub(super)`",
+        "No raw `UPDATE tasks SET status` introduced in any new module (LIFECYCLE-EXCEPTION grep lint green)",
+        "No new dynamic dispatch on the hot path (grep for `Box<dyn LlmRunner>` or `Box<dyn Scheduler>` returns zero hits in src/loop_engine/)",
+        "Issues found, if any, become CODE-FIX-xxx / WIRE-FIX-xxx tasks added via `task-mgr add --stdin --depended-on-by REVIEW-001` with rootCause/exactFix/verifyCommand",
+        "If no issues found: progress note `## CODE-REVIEW-1 — no issues found, all defense layers preserved, public surface stable`"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "FEAT-005",
+        "FEAT-006"
+      ],
+      "description": "Review FEAT-001 through FEAT-006. For each defense layer (1-5), confirm the regression test still exists, still references valid symbols, and still passes. For each public surface item, confirm `crate::loop_engine::<symbol>` still resolves from the original import path. For each new module, confirm visibility is at the appropriate ladder rung (pub(super) → pub(crate) → pub). Audit for any silent behavior change. Spawn CODE-FIX-xxx / WIRE-FIX-xxx tasks for any issues. Use the rust-python-code-reviewer agent for substantive review.",
+      "estimatedEffort": "medium",
+      "id": "CODE-REVIEW-1",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "Use the rust-python-code-reviewer agent: `Agent(subagent_type='rust-python-code-reviewer', prompt='Review FEAT-001..006 of the engine orchestration carve. Focus: defense-layer preservation, public-surface stability, visibility ladder hygiene, no new dynamic dispatch, LIFECYCLE-EXCEPTION grep stays green.')`. Spawn each finding as CODE-FIX-xxx / WIRE-FIX-xxx with task-mgr add --stdin --depended-on-by REVIEW-001.",
+      "passes": false,
+      "priority": 13,
+      "qualityDimensions": [
+        "Review is reading + grepping, NOT implementing — fixes go into spawned CODE-FIX/WIRE-FIX tasks",
+        "Defense-layer audit is line-by-line against the TEST-INIT-002 inventory; any drift is a finding",
+        "Visibility audit catches both over-permissive (pub when pub(crate) suffices) and under-permissive (pub(super) when pub(crate) is needed) classifications"
+      ],
+      "requiresHuman": false,
+      "taskType": "review",
+      "title": "Code review: post-extraction quality + wiring + defense-layer preservation",
+      "touchesFiles": [
+        "src/loop_engine/orchestrator.rs",
+        "src/loop_engine/iteration.rs",
+        "src/loop_engine/wave_scheduler.rs",
+        "src/loop_engine/slot.rs",
+        "src/loop_engine/recovery.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/mod.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Each new module surveyed for: near-duplicates, functions > 100 lines, excessive sibling imports, vague visibility",
+        "REFACTOR-xxx tasks spawned for substantive findings via `task-mgr add --stdin --depended-on-by REVIEW-001` (priority 71-85)",
+        "Small touchpoints fixed inline via /simplify rather than spawned (within this task's commit)",
+        "If no substantive issues: progress note `## REFACTOR-REVIEW-FINAL — no substantive refactors needed; the carve is clean`",
+        "Contract fidelity verified: each defense layer's invariant is asserted by a test (not just documented in CLAUDE.md)"
+      ],
+      "dependsOn": [
+        "CODE-REVIEW-1"
+      ],
+      "description": "Full-context review of the carve. Look for: (a) opportunities to consolidate near-duplicate code that ended up in two modules (e.g., similar slot-context build code in wave_scheduler.rs and orchestrator.rs), (b) complexity hotspots (functions > 100 lines that should be split now that the surrounding context has changed), (c) coupling hotspots (modules that import too many sibling-module items), (d) contract fidelity (every defense layer's invariants still expressed in code, not just CLAUDE.md). Spawn REFACTOR-xxx tasks for anything substantive. Use /simplify on small touchpoints.",
+      "estimatedEffort": "medium",
+      "id": "REFACTOR-REVIEW-FINAL",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "Final pass before REVIEW-001. If REFACTOR-xxx tasks are spawned, they must complete before REVIEW-001 can claim. Use `/simplify` on small touchpoints — don't file a task just to dedent a closure.",
+      "passes": false,
+      "priority": 70,
+      "qualityDimensions": [
+        "Findings are concrete (file:line + proposed change), not vague ('this could be cleaner')",
+        "The 'this is a refactor, not a hardening pass' constraint stays — REFACTOR-xxx tasks address structural issues introduced or revealed by the carve, NOT pre-existing tech debt unrelated to the extraction"
+      ],
+      "requiresHuman": false,
+      "taskType": "review",
+      "title": "Final refactor pass: DRY, complexity, coupling, contract fidelity",
+      "touchesFiles": [
+        "src/loop_engine/orchestrator.rs",
+        "src/loop_engine/iteration.rs",
+        "src/loop_engine/wave_scheduler.rs",
+        "src/loop_engine/slot.rs",
+        "src/loop_engine/recovery.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Full unscoped quality suite is GREEN: `cargo fmt --check && cargo check --all-targets --all-features && cargo clippy --all-targets -- -D warnings && cargo test -p task-mgr` all exit 0",
+        "Dogfood gate sequential scenario: re-run the ANALYSIS-001 sequential baseline scenario against refactored code; stderr diff is empty (modulo intentionally-normalized timestamps / run-ids); DB-final-state snapshot diff is empty",
+        "Dogfood gate wave scenario: re-run the ANALYSIS-001 wave baseline scenario against refactored code; same byte-identical contract",
+        "Aggregate iteration count >= 10 across both scenarios (e.g., sequential PRD with 6 tasks + wave PRD with 5 tasks = 11 iterations, satisfies the gate)",
+        "src/loop_engine/engine.rs line count is < 1500 (`wc -l src/loop_engine/engine.rs`)",
+        "Every FR-008 public surface item is importable from its original path (verified by `cargo check` succeeding with the existing import statements in main.rs, lib.rs, tests/, etc.)",
+        "Every defense layer's regression test passes",
+        "iteration_pipeline parity assertion (TEST-INIT-001) passes",
+        "LIFECYCLE-EXCEPTION grep lint stays green",
+        "If any pre-existing test failure exists in the full suite that predates this PRD: fix inline (≤12 failures) OR spawn a single FIX-xxx task via task-mgr add --stdin --depended-on-by REVIEW-001 and BLOCKED until resolved (> 12 unrelated failures only)"
+      ],
+      "dependsOn": [
+        "REFACTOR-REVIEW-FINAL"
+      ],
+      "description": "The PRD's exit criterion. Run: (1) Full unscoped quality gate (cargo fmt --check, cargo check, cargo clippy -D warnings, cargo test — entire workspace). (2) Dogfood gate: 10 iterations across 2 distinct PRDs (one sequential, one 2-slot wave) on the refactored code; diff the stderr capture and DB-final-state snapshot against the ANALYSIS-001 baselines. Any divergence is a hard fail. (3) Verify engine.rs is < 1500 lines (PRD success metric). (4) Verify all FR-008 public surface items resolve from their original import paths. Fix every failure, including pre-existing failures in the full suite (per the milestone protocol; trunk-green is the invariant).",
+      "estimatedEffort": "high",
+      "id": "REVIEW-001",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "This is the final milestone — equivalent to MILESTONE-FINAL in other PRDs. Update merge_strategy decision: per coherence design Cluster A, the dogfood gate is the rule before the next Cluster A PRD opens (there isn't one — Phase 1 is done at this point), but the parallel runner-trait-hygiene Phase 2 PRD may have its own milestone that this informs. Do NOT skip the dogfood gate even if CI is green; that gate exists precisely because CI alone doesn't catch byte-level behavior drift.",
+      "passes": false,
+      "priority": 99,
+      "qualityDimensions": [
+        "The dogfood diff is the source of truth. CI green + dogfood diff empty = refactor ships. CI green + dogfood diff non-empty = silent regression, fix before merge.",
+        "Pre-existing full-suite failures are this milestone's responsibility — the lean-path 'trunk-green is the invariant' rule applies. Punt only if the >12-unrelated-failures escape hatch fires.",
+        "The 10-iteration × 2-PRD count is a floor, not a target. If the scenarios chosen in ANALYSIS-001 produce 7 + 6 = 13 iterations, you've exceeded the gate; if they produce 4 + 3 = 7, pick longer scenarios or extend one PRD's task list."
+      ],
+      "requiresHuman": false,
+      "taskType": "verification",
+      "timeoutSecs": 3600,
+      "title": "Final gate: full quality suite + dogfood gate (10 iterations × 2 PRDs)",
+      "touchesFiles": []
+    }
+  ],
+  "version": "1.0"
+}

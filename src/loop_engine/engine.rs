@@ -22,7 +22,6 @@ use std::time::{Duration, Instant};
 use rusqlite::Connection;
 
 use crate::TaskMgrResult;
-use crate::commands::complete as complete_cmd;
 use crate::commands::decisions::find_option;
 use crate::commands::doctor::setup_checks::pre_check_loop_setup;
 use crate::commands::doctor::setup_output::SetupSeverity;
@@ -33,6 +32,7 @@ use crate::db::LockGuard;
 use crate::db::prefix::{prefix_and, validate_prefix};
 use crate::db::schema::key_decisions as key_decisions_db;
 use crate::error::TaskMgrError;
+use crate::lifecycle::TaskLifecycle;
 use crate::loop_engine::branch;
 use crate::loop_engine::calibrate;
 use crate::loop_engine::claude;
@@ -57,7 +57,6 @@ use crate::loop_engine::oauth;
 use crate::loop_engine::overflow;
 use crate::loop_engine::prd_reconcile::{
     self as prd_reconcile, hash_file, read_prd_metadata, reconcile_passes_with_db,
-    update_prd_task_passes,
 };
 use crate::loop_engine::progress;
 use crate::loop_engine::project_config;
@@ -70,6 +69,7 @@ use crate::loop_engine::usage::{self, UsageCheckResult};
 use crate::loop_engine::watchdog;
 use crate::loop_engine::worktree;
 use crate::models::RunStatus;
+use crate::models::TaskStatus;
 
 /// Maximum consecutive reorder attempts before forcing algorithmic pick.
 const MAX_CONSECUTIVE_REORDERS: u32 = 2;
@@ -110,8 +110,10 @@ impl UsageParams {
 /// Groups the read-only parameters that `run_iteration()` needs,
 /// keeping the mutable `IterationContext` as a separate argument.
 pub struct IterationParams<'a> {
-    /// Database connection
-    pub conn: &'a Connection,
+    /// Database connection. `&mut` because the mid-iteration auto-recovery
+    /// sweep routes through `TaskLifecycle::recover_in_progress_for_prefix`,
+    /// which requires `&mut Connection` to honour the lifecycle SSoT.
+    pub conn: &'a mut Connection,
     /// Database directory (--dir flag, for task selection queries)
     pub db_dir: &'a Path,
     /// Git repository root (for source scanning, monitoring)
@@ -351,10 +353,43 @@ pub fn resolve_effective_runner(
     ctx.runner_overrides
         .get(task_id)
         .copied()
+        // kind-correct: identity translation — maps Provider enum to RunnerKind, two representations of the same provider concept
         .unwrap_or_else(|| match model::provider_for_model(effective_model) {
             model::Provider::Grok => RunnerKind::Grok,
             model::Provider::Claude => RunnerKind::Claude,
         })
+}
+
+/// Compute the `reviewModel` routing override for a single task.
+///
+/// Returns `Some(trimmed_model_id)` when both conditions hold:
+/// - [`model::is_review_class`] classifies `task_id` as review-class
+///   (`CODE-REVIEW-*`, `MILESTONE-FINAL`, `REVIEW-*`; project-prefixed ids
+///   are matched after stripping the leading 8-hex-char prefix).
+/// - `review_model` is `Some(v)` with non-whitespace content.
+///
+/// Returns `None` in every other case — non-review tasks, unset/empty
+/// `reviewModel`. Pure function: no side effects, no I/O, no access to
+/// `IterationContext`. Used at both dispatch sites (`run_iteration` for
+/// the sequential path, `run_wave_iteration` for the wave path) so the
+/// routing decision is identical regardless of execution mode.
+///
+/// The override deliberately changes the **model string** that flows into
+/// [`resolve_effective_runner`] and the `--model` CLI flag, NOT
+/// `ctx.runner_overrides`. The override map is reserved for the overflow
+/// ladder's promotion writes — leaving it untouched preserves its
+/// precedence over `provider_for_model(...)` so an in-flight overflow
+/// promotion isn't shadowed by review-model routing.
+pub fn apply_review_model_override(review_model: Option<&str>, task_id: &str) -> Option<String> {
+    if !model::is_review_class(task_id) {
+        return None;
+    }
+    let trimmed = review_model?.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 /// Per-slot execution context for parallel wave iterations.
@@ -651,6 +686,9 @@ pub fn run_slot_iteration(
             target_task_id: Some(task_id),
             slot_label: Some(&slot_label_buf),
             active_prefix: params.task_prefix.as_deref(),
+            // Each iteration's ai-title metadata stub otherwise clutters the
+            // worktree's interactive resume picker. See claude.rs:119.
+            cleanup_title_artifact: true,
             ..Default::default()
         },
     );
@@ -781,13 +819,12 @@ pub fn run_slot_iteration(
 /// that the loop wants to take over. The selection layer is responsible for
 /// not surfacing in-flight rows to other slots in the same wave; this guard
 /// only protects against `done`/`blocked` transitions, not duplicate claims.
-fn claim_slot_task(conn: &Connection, task_id: &str) -> bool {
-    match conn.execute(
-        "UPDATE tasks SET status = 'in_progress', started_at = datetime('now'), \
-         updated_at = datetime('now') WHERE id = ? AND status IN ('todo', 'in_progress')",
-        [task_id],
-    ) {
-        Ok(rows) => rows > 0,
+#[deprecated(
+    note = "use TaskLifecycle::try_claim — this shim will be removed in PRD 2 (engine carve)"
+)]
+fn claim_slot_task(conn: &mut Connection, task_id: &str) -> bool {
+    match TaskLifecycle::new(conn).try_claim(task_id, &[TaskStatus::Todo, TaskStatus::InProgress]) {
+        Ok(claimed) => claimed,
         Err(e) => {
             eprintln!(
                 "Warning: failed to claim slot task {}: {} — skipping slot",
@@ -838,7 +875,7 @@ fn slot_failure_result(
         section_sizes: Vec::new(),
         dropped_sections: Vec::new(),
         task_difficulty: None,
-        effective_runner: RunnerKind::Claude,
+        effective_runner: RunnerKind::Claude, // kind-correct: sentinel default; main-thread enrichment overwrites with resolved provider before slot spawn
     }
 }
 
@@ -866,7 +903,7 @@ fn slot_failure_result(
 /// Thread panics are captured from `JoinHandle::join`'s `Err` branch and
 /// converted into `Crash(RuntimeError)` entries — we never unwrap on join.
 pub fn run_parallel_wave(
-    conn: &Connection,
+    conn: &mut Connection,
     slots: Vec<SlotContext>,
     params: Arc<SlotIterationParams>,
 ) -> WaveResult {
@@ -874,6 +911,7 @@ pub fn run_parallel_wave(
 
     let mut claimed: Vec<(SlotContext, bool)> = Vec::with_capacity(slots.len());
     for slot in slots {
+        #[allow(deprecated)]
         let ok = claim_slot_task(conn, &slot.prompt_bundle.task_id);
         claimed.push((slot, ok));
     }
@@ -1149,13 +1187,93 @@ fn wave_preflight_check(
     None
 }
 
-/// No eligible tasks were selected for this wave. Drives the stale tracker
-/// exactly like sequential does on `IterationOutcome::NoEligibleTasks`,
-/// returning a terminal outcome when the tracker tripped its abort threshold.
+/// No eligible tasks were selected for this wave.
+///
+/// Before counting an empty selection as a stale iteration, this mirrors the
+/// two checks the sequential path runs when `build_prompt` returns `Ok(None)`
+/// (`run_iteration`, the `remaining == 0` exit and the auto-recovery sweep) —
+/// behaviors the wave path previously lacked, which let a fully-completed PRD
+/// abort with the misleading "no eligible tasks after N consecutive stale
+/// iterations" (exit 1) instead of exiting cleanly:
+///
+/// 1. **Queue drained → terminal exit.** If no schedulable tasks remain, return
+///    a terminal outcome via `classify_drained_queue` (the shared
+///    sequential/wave predicate): exit 0 when only done/irrelevant remain,
+///    exit 1 when `blocked`/`skipped` work was left stuck. Same classifier used
+///    by the all-complete exit at the bottom of `run_wave_iteration`.
+/// 2. **Stranded `in_progress` recovery.** Reconcile any PRD `passes: true`
+///    rows the DB never marked done, then reset tasks a prior wave left in
+///    `in_progress` (merge-back failure / completion-detection gap). Safe here:
+///    selection runs on the main thread before any slot spawns, and the prior
+///    wave's slot threads have all joined, so nothing is legitimately
+///    mid-flight. If recovery frees anything, retry next wave WITHOUT touching
+///    the stale tracker — progress is now possible. A *static* stranding
+///    self-corrects: the next empty-group pass recovers nothing and falls
+///    through to the stale path. A task that is repeatedly claimed then
+///    re-stranded would not advance the stale counter, but it is bounded by
+///    `max_iterations` (and, for the merge-back-failure variant, by the FEAT-002
+///    consecutive-merge-fail halt threshold).
+///
+/// Only a genuinely stuck queue (tasks remain, none eligible, nothing
+/// recoverable) drives the stale tracker, returning a terminal outcome when the
+/// tracker tripped its abort threshold.
 fn handle_no_eligible_tasks(
-    params: &WaveIterationParams<'_>,
+    params: &mut WaveIterationParams<'_>,
     ctx: &mut IterationContext,
 ) -> WaveOutcome {
+    let task_prefix = params.task_prefix;
+    let prd_path = params.prd_path;
+
+    // (1) Queue genuinely drained → terminal completion exit, NOT a stale
+    // failure. The classifier separates a fully-successful drain (exit 0) from
+    // one where tasks were left blocked/skipped (non-zero exit, named reason)
+    // so the loop-end banner is honest.
+    if let Some(drained) = classify_drained_queue(params.conn, task_prefix) {
+        progress::log_iteration(
+            params.progress_path,
+            params.iteration,
+            None,
+            &IterationOutcome::Completed,
+            &[],
+            None,
+            None,
+            None,
+        );
+        return WaveOutcome {
+            tasks_completed: 0,
+            iteration_consumed: true,
+            terminal: Some(WaveTerminal {
+                exit_code: drained.exit_code,
+                reason: drained.reason,
+                run_status: Some(drained.run_status),
+            }),
+            was_stopped: false,
+            failed_merges: Vec::new(),
+        };
+    }
+
+    // (2) Tasks remain but none are eligible → attempt auto-recovery before
+    // counting this as stale.
+    reconcile_passes_with_db(params.conn, prd_path, task_prefix);
+    let recovered = TaskLifecycle::new(params.conn)
+        .recover_in_progress_for_prefix(task_prefix)
+        .unwrap_or(0);
+    if recovered > 0 {
+        eprintln!(
+            "Auto-recovered {} stale in_progress task(s), retrying task selection next wave...",
+            recovered
+        );
+        return WaveOutcome {
+            tasks_completed: 0,
+            iteration_consumed: true,
+            terminal: None,
+            was_stopped: false,
+            failed_merges: Vec::new(),
+        };
+    }
+
+    // (3) Genuinely stuck: nothing eligible, nothing recoverable. Count toward
+    // the stale-abort threshold exactly as before.
     ctx.stale_tracker.check("stale", "stale");
     progress::log_iteration(
         params.progress_path,
@@ -1339,7 +1457,7 @@ fn build_slot_contexts(
                 // thread spawns. Test fixtures that call `build_slot_contexts`
                 // directly (without the enrichment step) inherit Claude —
                 // the default-empty regression behavior.
-                effective_runner: RunnerKind::Claude,
+                effective_runner: RunnerKind::Claude, // kind-correct: sentinel default; same pattern as SlotPromptBundle — provider identity, not capability
             }
         })
         .collect()
@@ -1593,9 +1711,14 @@ fn process_slot_result(
 /// still work to do.
 fn count_remaining_active_tasks(conn: &Connection, task_prefix: Option<&str>) -> i64 {
     let (clause, param) = prefix_and(task_prefix);
+    // `archived_at IS NULL` is mandatory: archiving stamps `archived_at` on all
+    // prefix-matched rows regardless of status (archive.rs), so an archived
+    // todo/in_progress row would otherwise count as remaining work and the wave
+    // would never recognize completion. Matches the sequential predicate and is
+    // locked by archive.rs::test_archived_tasks_invisible_to_status_count_query.
     let sql = format!(
         "SELECT COUNT(*) FROM tasks WHERE status NOT IN \
-         ('done','irrelevant','skipped','blocked') {clause}"
+         ('done','irrelevant','skipped','blocked') AND archived_at IS NULL {clause}"
     );
     let p_vec: Vec<&dyn rusqlite::types::ToSql> = match &param {
         Some(p) => vec![p],
@@ -1603,6 +1726,76 @@ fn count_remaining_active_tasks(conn: &Connection, task_prefix: Option<&str>) ->
     };
     conn.query_row(&sql, p_vec.as_slice(), |r| r.get(0))
         .unwrap_or(0)
+}
+
+/// Count tasks in a single terminal-but-unfinished `status` for the current PRD
+/// prefix (`blocked` or `skipped`). Both are excluded from
+/// `count_remaining_active_tasks` (not schedulable) but, unlike
+/// `done`/`irrelevant`, represent work that did not finish — the drain
+/// classifier uses them to avoid reporting a clean "all tasks complete".
+/// `archived_at IS NULL` — see `count_remaining_active_tasks`.
+fn count_tasks_in_status(conn: &Connection, task_prefix: Option<&str>, status: &str) -> i64 {
+    let (clause, param) = prefix_and(task_prefix);
+    let sql =
+        format!("SELECT COUNT(*) FROM tasks WHERE status = ?1 AND archived_at IS NULL {clause}");
+    let mut p_vec: Vec<&dyn rusqlite::types::ToSql> = vec![&status];
+    if let Some(p) = &param {
+        p_vec.push(p);
+    }
+    conn.query_row(&sql, p_vec.as_slice(), |r| r.get(0))
+        .unwrap_or(0)
+}
+
+/// Terminal outcome for a loop that finds no schedulable tasks. Shared by the
+/// sequential and wave paths so the "what counts as clean completion vs stuck"
+/// predicate lives in exactly one place (see `src/loop_engine/CLAUDE.md`).
+struct DrainedOutcome {
+    exit_code: i32,
+    reason: String,
+    run_status: RunStatus,
+}
+
+/// Classify the loop-end state when no *schedulable* tasks remain (no `todo` /
+/// `in_progress` rows — `count_remaining_active_tasks == 0`).
+///
+/// Returns `None` while schedulable work is still in flight (the caller should
+/// keep looping / recovering). When the queue is drained, distinguishes:
+///
+/// - **Fully successful** — every remaining row is `done`/`irrelevant`: exit 0,
+///   `RunStatus::Completed`, reason "all tasks complete".
+/// - **Stuck** — at least one `blocked` and/or `skipped` row remains: a
+///   non-zero exit, `RunStatus::Aborted`, and a reason naming the counts plus a
+///   `task-mgr review` hint. `skipped` is treated as unfinished work (not a
+///   clean success) — a deliberate product decision so neither execution path
+///   claims completion while deferred work is outstanding.
+fn classify_drained_queue(conn: &Connection, task_prefix: Option<&str>) -> Option<DrainedOutcome> {
+    if count_remaining_active_tasks(conn, task_prefix) != 0 {
+        return None;
+    }
+    let blocked = count_tasks_in_status(conn, task_prefix, "blocked");
+    let skipped = count_tasks_in_status(conn, task_prefix, "skipped");
+    if blocked == 0 && skipped == 0 {
+        return Some(DrainedOutcome {
+            exit_code: 0,
+            reason: "all tasks complete".to_string(),
+            run_status: RunStatus::Completed,
+        });
+    }
+    let mut parts = Vec::new();
+    if blocked > 0 {
+        parts.push(format!("{blocked} blocked"));
+    }
+    if skipped > 0 {
+        parts.push(format!("{skipped} skipped"));
+    }
+    Some(DrainedOutcome {
+        exit_code: 1,
+        reason: format!(
+            "no schedulable tasks remain ({}) — run `task-mgr review` to resolve",
+            parts.join(", ")
+        ),
+        run_status: RunStatus::Aborted,
+    })
 }
 
 /// Sleep between waves so the loop respects `--iteration-delay` the same
@@ -1623,10 +1816,12 @@ fn wait_inter_wave_delay(delay: Duration, signal_flag: &SignalFlag) -> bool {
     false
 }
 
-/// Reset a single in-progress task back to `todo` so the next iteration (or
-/// next loop run) can re-claim it. No-ops when the row's status is not
-/// `in_progress` — we never demote terminal states (`done`, `blocked`,
-/// `skipped`) here.
+/// Reset a listed task back to `todo` (used by wave FEAT-002 and overflow
+/// recovery rungs). The per-ID `resurrect_for_iteration` verb intentionally
+/// accepts any status for the IDs in the list — callers are responsible for
+/// only passing tasks whose state warrants a reset to the next iteration.
+/// Contrast with `recover_in_progress_for_prefix`, which keeps the
+/// `status = 'in_progress'` guard.
 ///
 /// Used by:
 /// - The wave-loop FEAT-002 reset/halt-check contract — a slot's task whose
@@ -1637,13 +1832,10 @@ fn wait_inter_wave_delay(delay: Duration, signal_flag: &SignalFlag) -> bool {
 /// Logs success / no-op / failure to stderr; failures never propagate
 /// (matches the FEAT-002 failure-mode AC: "if reset itself fails for a task,
 /// log the failure but continue with remaining failed slots").
-fn reset_task_to_todo(conn: &Connection, task_id: &str, kind_label: &str) {
-    match conn.execute(
-        "UPDATE tasks SET status = 'todo', started_at = NULL WHERE id = ? AND status = 'in_progress'",
-        [task_id],
-    ) {
+fn reset_task_to_todo(conn: &mut Connection, task_id: &str, kind_label: &str) {
+    match TaskLifecycle::new(conn).resurrect_for_iteration(None, &[task_id]) {
         Ok(1) => eprintln!("Reset {} {} to todo", kind_label, task_id),
-        Ok(_) => {} // already terminal, or status changed by reconciliation
+        Ok(_) => {} // row missing, or status changed by reconciliation
         Err(e) => eprintln!("Warning: failed to reset task {}: {}", task_id, e),
     }
 }
@@ -1686,7 +1878,7 @@ pub(crate) enum MergeFailHaltDecision {
 /// When `failed_merges.is_empty()` the counter is reset to `0` and `Continue`
 /// is returned without doing any reset / diagnostic work.
 fn apply_merge_fail_reset_and_halt_check(
-    conn: &Connection,
+    conn: &mut Connection,
     ctx: &mut IterationContext,
     branch: &str,
     failed_merges: &[FailedMerge],
@@ -1917,7 +2109,7 @@ pub fn run_wave_iteration(
         if !result.ephemeral_block_diagnostics.is_empty() {
             return handle_ephemeral_deadlock(&params, ctx, result.ephemeral_block_diagnostics);
         }
-        return handle_no_eligible_tasks(&params, ctx);
+        return handle_no_eligible_tasks(&mut params, ctx);
     }
 
     // Selected at least one eligible task → reset stale tracker (mirrors
@@ -1938,6 +2130,27 @@ pub fn run_wave_iteration(
     for slot in slot_contexts.iter_mut() {
         // FEAT-008: operator escape valve — clear stale overrides if tasks.model changed.
         check_override_invalidation(ctx, params.conn, &slot.prompt_bundle.task_id);
+        // FEAT-002: route review-class slots to `reviewModel` BEFORE recomputing
+        // `effective_model`. Mutating the bundle's `resolved_model` (not just a
+        // local) keeps runner selection, the `--model` flag in
+        // `run_slot_iteration`, and the prompt-baked model consistent — a
+        // drift-`assert!` cross-check on `slot_result.effective_runner` would
+        // panic if these disagreed.
+        if let Some(review_model_override) = apply_review_model_override(
+            params.project_config.review_model.as_deref(),
+            &slot.prompt_bundle.task_id,
+        ) {
+            let old = slot
+                .prompt_bundle
+                .resolved_model
+                .as_deref()
+                .unwrap_or("(default)");
+            eprintln!(
+                "Review-class routing [slot {}]: {} → {} (reviewModel)",
+                slot.slot_index, old, review_model_override,
+            );
+            slot.prompt_bundle.resolved_model = Some(review_model_override);
+        }
         let effective_model = slot
             .prompt_bundle
             .resolved_model
@@ -2176,14 +2389,16 @@ pub fn run_wave_iteration(
         };
     }
 
-    if agg.any_completed && count_remaining_active_tasks(params.conn, params.task_prefix) == 0 {
+    if agg.any_completed
+        && let Some(drained) = classify_drained_queue(params.conn, params.task_prefix)
+    {
         return WaveOutcome {
             tasks_completed,
             iteration_consumed: true,
             terminal: Some(WaveTerminal {
-                exit_code: 0,
-                reason: "all tasks complete".to_string(),
-                run_status: Some(RunStatus::Completed),
+                exit_code: drained.exit_code,
+                reason: drained.reason,
+                run_status: Some(drained.run_status),
             }),
             was_stopped: false,
             failed_merges,
@@ -2226,7 +2441,7 @@ pub fn run_wave_iteration(
 /// Returns `IterationResult` describing the outcome and whether to stop.
 pub fn run_iteration(
     ctx: &mut IterationContext,
-    params: &IterationParams,
+    params: &mut IterationParams<'_>,
 ) -> TaskMgrResult<IterationResult> {
     // Step 0: Check for SIGINT/SIGTERM
     if params.signal_flag.is_signaled() {
@@ -2339,16 +2554,27 @@ pub fn run_iteration(
         ctx.reorder_hint.take()
     };
 
-    // Step 4: Build prompt (selects and claims task)
+    // Step 4: Build prompt (selects and claims task).
+    //
+    // We call `build_prompt` up to twice: once initially, and once again after
+    // the mid-run auto-recovery sweep (when the first call returned
+    // `Ok(None)`). The sweep mutates `params.conn` via
+    // `TaskLifecycle::recover_in_progress_for_prefix`, which would conflict
+    // with a long-lived `BuildPromptParams` borrowing `params.conn`
+    // immutably. Each `BuildPromptParams` is therefore constructed inline
+    // and bound to a `let` so the temporary is dropped at the semicolon and
+    // the immutable conn borrow is released before the lifecycle call.
     let session_guidance_text = ctx.session_guidance.format_for_prompt();
-    let prompt_params = BuildPromptParams {
+    let effective_reorder_hint_str = effective_reorder_hint.as_deref();
+
+    let first_attempt = prompt::build_prompt(&BuildPromptParams {
         dir: params.db_dir,
         project_root: params.project_root,
         conn: params.conn,
         after_files: &ctx.last_files,
         run_id: Some(params.run_id),
         iteration: params.iteration,
-        reorder_hint: effective_reorder_hint.as_deref(),
+        reorder_hint: effective_reorder_hint_str,
         session_guidance: &session_guidance_text,
         base_prompt_path: params.base_prompt_path,
         steering_path: params.steering_path,
@@ -2359,9 +2585,9 @@ pub fn run_iteration(
         task_prefix: params.task_prefix,
         batch_sibling_prds: params.batch_sibling_prds,
         permission_mode: params.permission_mode,
-    };
+    });
 
-    let prompt_result = match prompt::build_prompt(&prompt_params) {
+    let prompt_result = match first_attempt {
         Ok(Some(result)) => result,
         Ok(None) => {
             // No eligible task found — check if truly all done or just temporarily unavailable
@@ -2377,7 +2603,17 @@ pub fn run_iteration(
                 .conn
                 .query_row(&rem_sql, rem_params.as_slice(), |row| row.get(0))
                 .unwrap_or(0);
-            if remaining == 0 {
+            // Clean-completion decision routes through the shared
+            // `classify_drained_queue` so the sequential and wave paths cannot
+            // drift on "what counts as complete". A clean drain (only
+            // done/irrelevant) exits here as `Completed`; a stuck drain
+            // (blocked/skipped left, nothing schedulable) falls through to the
+            // no-op recovery below and returns `NoEligibleTasks`, which the
+            // outer loop turns into an immediate, named exit via the same
+            // classifier (so it no longer has to spin three stale iterations).
+            if classify_drained_queue(params.conn, params.task_prefix)
+                .is_some_and(|d| d.exit_code == 0)
+            {
                 eprintln!("All tasks complete!");
                 return Ok(IterationResult {
                     outcome: IterationOutcome::Completed,
@@ -2402,17 +2638,12 @@ pub fn run_iteration(
                 reconcile_passes_with_db(params.conn, prd, params.task_prefix);
             }
 
-            let (mid_pfx_clause, mid_pfx_param) = prefix_and(params.task_prefix);
-            let mid_recovery_sql = format!(
-                "UPDATE tasks SET status = 'todo', started_at = NULL WHERE status = 'in_progress' {mid_pfx_clause}"
-            );
-            let mid_params: Vec<&dyn rusqlite::types::ToSql> = match &mid_pfx_param {
-                Some(p) => vec![p],
-                None => vec![],
-            };
-            let recovered = params
-                .conn
-                .execute(&mid_recovery_sql, mid_params.as_slice())
+            // Bulk in_progress → todo sweep routed through the lifecycle
+            // service. `recover_in_progress_for_prefix(None)` matches the
+            // legacy unscoped path; `Some(prefix)` mirrors the old
+            // `prefix_and(...)`-scoped UPDATE.
+            let recovered = TaskLifecycle::new(params.conn)
+                .recover_in_progress_for_prefix(params.task_prefix)
                 .unwrap_or(0);
 
             if recovered > 0 {
@@ -2420,8 +2651,29 @@ pub fn run_iteration(
                     "Auto-recovered {} stale in_progress task(s), retrying task selection...",
                     recovered
                 );
-                // Retry build_prompt once with the same params
-                match prompt::build_prompt(&prompt_params) {
+                // Retry build_prompt once with a fresh BuildPromptParams (the
+                // previous temporary was dropped at the let above so the
+                // conn re-borrow path is clean here).
+                let retry_attempt = prompt::build_prompt(&BuildPromptParams {
+                    dir: params.db_dir,
+                    project_root: params.project_root,
+                    conn: params.conn,
+                    after_files: &ctx.last_files,
+                    run_id: Some(params.run_id),
+                    iteration: params.iteration,
+                    reorder_hint: effective_reorder_hint_str,
+                    session_guidance: &session_guidance_text,
+                    base_prompt_path: params.base_prompt_path,
+                    steering_path: params.steering_path,
+                    verbose: params.verbose,
+                    default_model: params.default_model,
+                    project_default_model: params.project_default_model,
+                    user_default_model: params.user_default_model,
+                    task_prefix: params.task_prefix,
+                    batch_sibling_prds: params.batch_sibling_prds,
+                    permission_mode: params.permission_mode,
+                });
+                match retry_attempt {
                     Ok(Some(result)) => result,
                     Ok(None) => {
                         eprintln!(
@@ -2484,7 +2736,7 @@ pub fn run_iteration(
     let shown_learning_ids = prompt_result.shown_learning_ids.clone();
 
     // Step 4.5: Apply crash escalation and PromptTooLong model overrides
-    let effective_model = {
+    let mut effective_model = {
         let resolved = prompt_result.resolved_model.as_deref();
         let after_crash_escalation =
             match check_crash_escalation(&ctx.crashed_last_iteration, &task_id, resolved) {
@@ -2507,6 +2759,22 @@ pub fn run_iteration(
             after_crash_escalation
         }
     };
+
+    // FEAT-002: route review-class tasks to `reviewModel` after the crash /
+    // overflow escalation block so escalation can't overwrite this routing.
+    // The single `effective_model` here feeds both `resolve_effective_runner`
+    // (runner selection) and the `--model` flag passed to the runner, so one
+    // assignment keeps selection and dispatch in sync.
+    if let Some(review_model_override) =
+        apply_review_model_override(params.project_config.review_model.as_deref(), &task_id)
+    {
+        let old = effective_model.as_deref().unwrap_or("(default)");
+        eprintln!(
+            "Review-class routing: {} → {} (reviewModel)",
+            old, review_model_override,
+        );
+        effective_model = Some(review_model_override);
+    }
 
     // Use the cluster-wide effort computed by `build_prompt` — parallels the
     // cluster-wide `resolved_model` so both axes scale with the hardest task
@@ -2579,6 +2847,9 @@ pub fn run_iteration(
             use_pty: false,
             target_task_id: Some(&task_id),
             active_prefix: params.task_prefix,
+            // Each iteration's ai-title metadata stub otherwise clutters the
+            // project's interactive resume picker. See claude.rs:119.
+            cleanup_title_artifact: true,
             ..Default::default()
         },
     );
@@ -3253,15 +3524,8 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
     // Safe because we hold the per-prefix loop lock — no other loop with the same
     // prefix can be running. (Loops on different prefixes CAN run concurrently.)
     // Recovery is scoped by prefix so concurrent loops don't reset each other.
-    let (recovery_pfx_clause, recovery_pfx_param) = prefix_and(early_task_prefix.as_deref());
-    let recovery_sql = format!(
-        "UPDATE tasks SET status = 'todo', started_at = NULL WHERE status = 'in_progress' {recovery_pfx_clause}"
-    );
-    let recovery_params: Vec<&dyn rusqlite::types::ToSql> = match &recovery_pfx_param {
-        Some(p) => vec![p as &dyn rusqlite::types::ToSql],
-        None => vec![],
-    };
-    match conn.execute(&recovery_sql, recovery_params.as_slice()) {
+    match TaskLifecycle::new(&mut conn).recover_in_progress_for_prefix(early_task_prefix.as_deref())
+    {
         Ok(count) if count > 0 => {
             eprintln!(
                 "Recovered {} stale in_progress task(s) from previous run",
@@ -3338,7 +3602,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
     // Step 7.1: Reconcile tasks that have passes: true in PRD but are not done in DB.
     // This catches tasks completed in a previous run where the DB status was never
     // updated (e.g., rate limit interrupted git detection, or loop exit reset them).
-    reconcile_passes_with_db(&conn, &run_config.prd_file, task_prefix.as_deref());
+    reconcile_passes_with_db(&mut conn, &run_config.prd_file, task_prefix.as_deref());
 
     // Step 7.2: Setup pre-check for new task lists only.
     // "New" = no tasks are done yet (first-ever run, or all tasks were reset).
@@ -3933,7 +4197,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                 exit_code: halt_code,
                 exit_reason: halt_reason,
             } = apply_merge_fail_reset_and_halt_check(
-                &conn,
+                &mut conn,
                 &mut ctx,
                 branch,
                 &outcome.failed_merges,
@@ -3958,8 +4222,8 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
             continue;
         }
 
-        let iteration_params = IterationParams {
-            conn: &conn,
+        let mut iteration_params = IterationParams {
+            conn: &mut conn,
             db_dir: &run_config.db_dir,
             project_root: &working_root,
             tasks_dir: &paths.tasks_dir,
@@ -3983,7 +4247,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
             project_config: &project_config,
         };
 
-        let mut result = match run_iteration(&mut ctx, &iteration_params) {
+        let mut result = match run_iteration(&mut ctx, &mut iteration_params) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("Iteration error: {}", e);
@@ -4136,7 +4400,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
         // external reconciliation). Pre-completed tasks have older timestamps and are skipped.
         if !matches!(result.outcome, IterationOutcome::Empty) {
             trigger_human_reviews(
-                &conn,
+                &mut conn,
                 HumanReviewParams {
                     completion_epoch_start,
                     iteration,
@@ -4190,6 +4454,20 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
 
         // Track consecutive stale iterations and abort if stuck
         if matches!(result.outcome, IterationOutcome::NoEligibleTasks) {
+            // Drained-but-stuck short-circuit (shared with the wave path): if
+            // no schedulable work remains and only blocked/skipped tasks are
+            // left, exit immediately with the classifier's named verdict
+            // instead of spinning to the stale-abort threshold. `classify`
+            // never returns the clean (exit 0) variant here — `run_iteration`
+            // already returns `Completed` for that case — but we apply whatever
+            // it reports so the two paths share one source of truth.
+            if let Some(drained) = classify_drained_queue(&conn, task_prefix.as_deref()) {
+                eprintln!("{}", drained.reason);
+                exit_code = drained.exit_code;
+                exit_reason = drained.reason;
+                final_run_status = drained.run_status;
+                break;
+            }
             ctx.stale_tracker.check("stale", "stale"); // same hash → increment
             if ctx.stale_tracker.should_abort() {
                 eprintln!(
@@ -4250,7 +4528,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
 
     // Step 17.5: Reset uncompleted claimed task so it's not stuck in_progress for next run
     if let Some(ref task_id) = last_claimed_task {
-        reset_task_to_todo(&conn, task_id, "uncompleted task");
+        reset_task_to_todo(&mut conn, task_id, "uncompleted task");
     }
 
     // Step 17.6: Reset any parallel-mode slot tasks still pending. Sequential
@@ -4258,11 +4536,17 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
     // claimed task in `ctx.pending_slot_tasks` and removes it on `done`, so
     // anything remaining was claimed but never closed (deadline / max-iter
     // exit, slot crash, or output without a `<completed>` tag).
-    for task_id in &ctx.pending_slot_tasks {
-        if Some(task_id) == last_claimed_task.as_ref() {
-            continue; // already handled by step 17.5
-        }
-        reset_task_to_todo(&conn, task_id, "uncompleted slot task");
+    //
+    // Clone the IDs out of ctx so the mutable borrow on conn doesn't conflict
+    // with the immutable borrow on ctx.pending_slot_tasks across iterations.
+    let pending_slot_task_ids: Vec<String> = ctx
+        .pending_slot_tasks
+        .iter()
+        .filter(|t| Some(*t) != last_claimed_task.as_ref())
+        .cloned()
+        .collect();
+    for task_id in &pending_slot_task_ids {
+        reset_task_to_todo(&mut conn, task_id, "uncompleted slot task");
     }
 
     // Step 18: Record session guidance if any
@@ -4417,7 +4701,7 @@ pub(crate) fn query_human_review_tasks(
 /// paths (tags, git, output scan, external reconciliation). For each such task, calls
 /// `handle_human_review` and — if feedback was provided — calls `mutate_prd_from_feedback`
 /// to update downstream tasks.
-fn trigger_human_reviews(conn: &Connection, params: HumanReviewParams<'_>) {
+fn trigger_human_reviews(conn: &mut Connection, params: HumanReviewParams<'_>) {
     let HumanReviewParams {
         completion_epoch_start,
         iteration,
@@ -4694,6 +4978,7 @@ fn record_session_guidance(guidance: &SessionGuidance, progress_path: &Path, yes
 /// `(claimed_id, Done, true)` tuple instead of a global "any update
 /// succeeded" flag (M2 fix — learning #2238).
 #[allow(clippy::too_many_arguments)]
+#[deprecated(note = "use TaskLifecycle::apply — this shim will be removed in PRD 2 (engine carve)")]
 pub fn apply_status_updates(
     conn: &mut Connection,
     updates: &[detection::TaskStatusUpdate],
@@ -4704,126 +4989,97 @@ pub fn apply_status_updates(
     db_dir: Option<&Path>,
     mut ctx: Option<&mut IterationContext>,
 ) -> Vec<(String, detection::TaskStatusChange, bool)> {
+    use crate::lifecycle::matrix::TransitionSource;
+    use crate::lifecycle::{
+        TaskLifecycle, TransitionChange, TransitionIntent, TransitionRejectReason,
+    };
     use detection::TaskStatusChange;
 
-    let mut results: Vec<(String, TaskStatusChange, bool)> = Vec::with_capacity(updates.len());
-    for update in updates {
-        let task_ids = [update.task_id.clone()];
-        let dispatch: Result<(), TaskMgrError> = match update.status {
-            TaskStatusChange::Done => {
-                // Auto-claim unclaimed tasks: todo -> in_progress -> done
-                let current: Result<String, _> = conn.query_row(
-                    "SELECT status FROM tasks WHERE id = ?",
-                    [update.task_id.as_str()],
-                    |row| row.get(0),
-                );
-                if let Ok(ref s) = current
-                    && s == "todo"
-                {
-                    let _ = conn.execute(
-                        "UPDATE tasks SET status = 'in_progress', \
-                         started_at = datetime('now'), \
-                         updated_at = datetime('now') \
-                         WHERE id = ? AND status = 'todo'",
-                        [update.task_id.as_str()],
-                    );
-                    if let Some(rid) = run_id {
-                        let iter: i64 = conn
-                            .query_row(
-                                "SELECT COALESCE(MAX(iteration), 0) + 1 FROM run_tasks WHERE run_id = ?",
-                                [rid],
-                                |row| row.get(0),
-                            )
-                            .unwrap_or(1);
-                        let _ = conn.execute(
-                            "INSERT OR IGNORE INTO run_tasks (run_id, task_id, iteration, status) \
-                             VALUES (?, ?, ?, 'started')",
-                            rusqlite::params![rid, update.task_id, iter],
-                        );
-                    }
-                }
-                complete_cmd::complete(conn, &task_ids, run_id, None, false).map(|_| ())
-            }
-            TaskStatusChange::Failed => crate::commands::fail(
-                conn,
-                &task_ids,
-                None,
-                crate::cli::FailStatus::Blocked,
-                run_id,
-                false,
-            )
-            .map(|_| ()),
-            TaskStatusChange::Skipped => {
-                crate::commands::skip(conn, &task_ids, "<task-status> tag", run_id).map(|_| ())
-            }
-            TaskStatusChange::Irrelevant => {
-                crate::commands::irrelevant(conn, &task_ids, "<task-status> tag", run_id, None)
-                    .map(|_| ())
-            }
-            TaskStatusChange::Unblock => {
-                crate::commands::unblock(conn, &update.task_id).map(|_| ())
-            }
-            TaskStatusChange::Reset => {
-                crate::commands::reset::reset_tasks(conn, &task_ids).map(|_| ())
-            }
-        };
+    if updates.is_empty() {
+        return Vec::new();
+    }
 
-        let applied = dispatch.is_ok();
-        match dispatch {
-            Ok(()) => {
-                // Only Done flips PRD JSON `passes` — other transitions leave
-                // `passes: false` unchanged.
-                if matches!(update.status, TaskStatusChange::Done) {
-                    if let Some(path) = prd_path
-                        && let Err(e) =
-                            update_prd_task_passes(path, &update.task_id, true, task_prefix)
-                    {
-                        eprintln!(
-                            "Warning: <task-status> dispatched {} to done in DB but PRD JSON sync failed ({}): {}",
-                            update.task_id,
-                            path.display(),
-                            e,
-                        );
-                    }
-                    // Milestone hook: when a MILESTONE-* task flips to done,
-                    // append a summary block to progress-*.txt covering every
-                    // entry since the last milestone summary, with crash-
-                    // avoidance recommendations for any task that crashed/
-                    // overflowed ≥2 times in the window.
-                    // Hyphen-anchored to avoid false matches like
-                    // `PRE-MILESTONE-NOTES` or `MILESTONEISH-1`.
-                    let is_milestone = update.task_id.contains("-MILESTONE-")
-                        || update.task_id.starts_with("MILESTONE-")
-                        || update.task_id == "MILESTONE"
-                        || update.task_id.ends_with("-MILESTONE");
-                    if is_milestone && let Some(pp) = progress_path {
-                        progress::summarize_milestone(pp, &update.task_id, db_dir);
-                    }
-                }
-                // Prune crashed_last_iteration for terminal transitions. A
-                // terminal row is no longer "active", so the map entry would
-                // accumulate past the "bounded by active task count" invariant
-                // documented on the field. Reset and Unblock are NOT terminal.
-                if let Some(ref mut c) = ctx
-                    && matches!(
-                        update.status,
-                        TaskStatusChange::Done
-                            | TaskStatusChange::Failed
-                            | TaskStatusChange::Skipped
-                            | TaskStatusChange::Irrelevant
-                    )
-                {
-                    c.crashed_last_iteration.remove(&update.task_id);
+    // Convert loop-engine TaskStatusUpdates to lifecycle TransitionIntents.
+    // Source is fixed: this shim is only reached from the iteration pipeline,
+    // i.e. side-band `<task-status>` tags.
+    let intents: Vec<TransitionIntent> = updates
+        .iter()
+        .map(|u| TransitionIntent {
+            task_id: u.task_id.clone(),
+            change: match u.status {
+                TaskStatusChange::Done => TransitionChange::Done,
+                TaskStatusChange::Failed => TransitionChange::Failed,
+                TaskStatusChange::Skipped => TransitionChange::Skipped,
+                TaskStatusChange::Irrelevant => TransitionChange::Irrelevant,
+                TaskStatusChange::Unblock => TransitionChange::Unblock,
+                TaskStatusChange::Reset => TransitionChange::Reset,
+            },
+            source: TransitionSource::LoopStatusTag,
+            reason: None,
+            fail_status: None,
+            audit_note: None,
+        })
+        .collect();
+
+    let outcomes = {
+        let mut lc = match run_id {
+            Some(rid) => TaskLifecycle::with_run(conn, rid),
+            None => TaskLifecycle::new(conn),
+        };
+        lc = match (prd_path, task_prefix) {
+            (Some(p), Some(prefix)) => lc.with_prd_sync(p, prefix),
+            // Calling apply() without a prefix when prd_path is set would
+            // skip PRD sync silently — preserve legacy by using "" as
+            // prefix when none is supplied (matches `task_prefix: None`
+            // behavior of `update_prd_task_passes` via `strip_task_prefix`).
+            (Some(p), None) => lc.with_prd_sync(p, ""),
+            _ => lc,
+        };
+        lc.apply(&intents)
+    };
+
+    // Loop-engine-specific post-processing the lifecycle service does NOT
+    // own (these touch progress files, the per-task crash map, and the
+    // dispatch-failed warning stream — all owned by the iteration pipeline,
+    // not the status mutation primitive).
+    let mut results: Vec<(String, TaskStatusChange, bool)> = Vec::with_capacity(updates.len());
+    for (update, outcome) in updates.iter().zip(outcomes.iter()) {
+        if outcome.applied {
+            // Milestone summary hook — fires on Done success for MILESTONE-*
+            // task IDs. Hyphen-anchored to avoid `PRE-MILESTONE-NOTES`-style
+            // false matches.
+            if matches!(update.status, TaskStatusChange::Done) {
+                let is_milestone = update.task_id.contains("-MILESTONE-")
+                    || update.task_id.starts_with("MILESTONE-")
+                    || update.task_id == "MILESTONE"
+                    || update.task_id.ends_with("-MILESTONE");
+                if is_milestone && let Some(pp) = progress_path {
+                    progress::summarize_milestone(pp, &update.task_id, db_dir);
                 }
             }
-            Err(e) => {
-                eprintln!(
-                    "Warning: <task-status>{}:{:?}</task-status> dispatch failed: {}",
-                    update.task_id, update.status, e,
-                );
+            // Prune crashed_last_iteration on terminal transitions only —
+            // Reset/Unblock leave the row active so the map entry stays.
+            if let Some(ref mut c) = ctx
+                && matches!(
+                    update.status,
+                    TaskStatusChange::Done
+                        | TaskStatusChange::Failed
+                        | TaskStatusChange::Skipped
+                        | TaskStatusChange::Irrelevant
+                )
+            {
+                c.crashed_last_iteration.remove(&update.task_id);
             }
+        } else if let Some(TransitionRejectReason::DispatchFailed(msg)) = &outcome.reason {
+            // Legacy dispatch-failed warning. Format matches engine.rs's
+            // pre-FEAT-003 emit at the previous line ~4821 byte-for-byte:
+            // `Warning: <task-status>{id}:{Debug status}</task-status> dispatch failed: {err}`.
+            eprintln!(
+                "Warning: <task-status>{}:{:?}</task-status> dispatch failed: {}",
+                update.task_id, update.status, msg,
+            );
         }
-        results.push((update.task_id.clone(), update.status, applied));
+        results.push((update.task_id.clone(), update.status, outcome.applied));
     }
     results
 }
@@ -4960,6 +5216,7 @@ pub(crate) fn apply_pending_promotion(ctx: &mut IterationContext, p: &PendingPro
         .entry(p.task_id.clone())
         .or_insert_with(|| p.pre_promotion_model.clone());
     let already_promoted = ctx.runner_overrides.contains_key(&p.task_id);
+    // kind-correct: writes the promoted provider identity into the override map — the VALUE is the provider, not a capability flag
     ctx.runner_overrides
         .insert(p.task_id.clone(), RunnerKind::Grok);
     ctx.model_overrides
@@ -5035,6 +5292,7 @@ pub(crate) fn escalate_task_model_if_needed_inner(
         return Ok((escalated, None));
     }
     let effective_runner = resolve_effective_runner(ctx, task_id, current_model.as_deref());
+    // kind-correct: fires from Claude only because Grok is the fallback target — provider identity, not capability
     if effective_runner != RunnerKind::Claude {
         return Ok((escalated, None));
     }
@@ -5131,8 +5389,15 @@ pub fn reset_consecutive_failures(conn: &Connection, task_id: &str) -> TaskMgrRe
 ///
 /// Called when `should_auto_block()` returns true after an iteration.
 /// Sets `blocked_at_iteration` for decay tracking (consistent with `fail/transition.rs`).
+///
+/// Now a thin shim over [`TaskLifecycle::auto_block_after_failures`]. The
+/// lifecycle verb gates on `status = 'in_progress'` (conditional WHERE);
+/// terminal rows are a clean `Ok(_)` no-op which tightens the legacy behavior
+/// without losing observability (callers ignore the row-count and rely on the
+/// stderr emission elsewhere).
+#[deprecated(note = "use TaskLifecycle::auto_block_after_failures")]
 pub fn auto_block_task(
-    conn: &Connection,
+    conn: &mut Connection,
     task_id: &str,
     consecutive_failures: i32,
     current_iteration: i64,
@@ -5141,10 +5406,7 @@ pub fn auto_block_task(
         "Auto-blocked after {} consecutive failures (task: {})",
         consecutive_failures, task_id
     );
-    conn.execute(
-        "UPDATE tasks SET status = 'blocked', last_error = ?, blocked_at_iteration = ?, updated_at = datetime('now') WHERE id = ?",
-        rusqlite::params![msg, current_iteration, task_id],
-    )?;
+    TaskLifecycle::new(conn).auto_block_after_failures(task_id, &msg, current_iteration)?;
     Ok(())
 }
 
@@ -5169,46 +5431,69 @@ pub fn handle_task_failure(
     ctx: &mut IterationContext,
     cfg: Option<&project_config::FallbackRunnerConfig>,
 ) -> TaskMgrResult<()> {
-    let tx = conn.transaction()?;
-
-    let new_count = increment_consecutive_failures(&tx, task_id).map_err(|e| {
-        eprintln!(
-            "Warning: failed to increment consecutive_failures for {}: {}",
-            task_id, e
-        );
-        e
-    })?;
-
-    let max_retries: i32 = tx
-        .query_row(
-            "SELECT max_retries FROM tasks WHERE id = ?",
-            [task_id],
-            |r| r.get(0),
-        )
-        .unwrap_or(3);
-
-    // W5: stage the Grok promotion's ctx mutations as a `PendingPromotion`
-    // and defer applying them until `tx.commit()?` returns Ok below. If
-    // commit fails, the in-memory ctx stays consistent with the rolled-back
-    // DB (no dirty `runner_overrides` / `model_overrides` entries pointing
-    // to a Grok model the DB still records as Opus).
+    // Phase 1: increment consecutive_failures + (conditional) model escalation
+    // inside a single transaction so a mid-flight failure rolls both back.
     //
-    // Only escalate if auto-block won't immediately follow — the escalated
-    // model would never be used.
-    let mut pending_promotion: Option<PendingPromotion> = None;
-    if !should_auto_block(new_count, max_retries) {
-        match escalate_task_model_if_needed_inner(&tx, task_id, new_count, ctx, cfg) {
-            Ok((_model, promotion)) => {
-                pending_promotion = promotion;
-            }
-            Err(e) => {
-                eprintln!("Warning: failed to escalate model for {}: {}", task_id, e);
+    // Phase 2 (auto-block) is intentionally OUTSIDE the transaction: the
+    // lifecycle service requires `&mut Connection`, and `rusqlite::Transaction`
+    // does not implement `DerefMut`. Pulling auto-block out of the tx
+    // is acceptable degradation — a crash between commit and auto-block
+    // simply means the bumped `consecutive_failures` re-triggers auto-block
+    // on the next iteration via the same `should_auto_block` check.
+    let (new_count, max_retries, pending_promotion) = {
+        let tx = conn.transaction()?;
+
+        let new_count = increment_consecutive_failures(&tx, task_id).map_err(|e| {
+            eprintln!(
+                "Warning: failed to increment consecutive_failures for {}: {}",
+                task_id, e
+            );
+            e
+        })?;
+
+        let max_retries: i32 = tx
+            .query_row(
+                "SELECT max_retries FROM tasks WHERE id = ?",
+                [task_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(3);
+
+        // W5: stage the Grok promotion's ctx mutations as a `PendingPromotion`
+        // and defer applying them until `tx.commit()?` returns Ok below. If
+        // commit fails, the in-memory ctx stays consistent with the rolled-back
+        // DB (no dirty `runner_overrides` / `model_overrides` entries pointing
+        // to a Grok model the DB still records as Opus).
+        //
+        // Only escalate if auto-block won't immediately follow — the escalated
+        // model would never be used.
+        let mut pending_promotion: Option<PendingPromotion> = None;
+        if !should_auto_block(new_count, max_retries) {
+            match escalate_task_model_if_needed_inner(&tx, task_id, new_count, ctx, cfg) {
+                Ok((_model, promotion)) => {
+                    pending_promotion = promotion;
+                }
+                Err(e) => {
+                    eprintln!("Warning: failed to escalate model for {}: {}", task_id, e);
+                }
             }
         }
+
+        tx.commit()?;
+        (new_count, max_retries, pending_promotion)
+    };
+
+    // Commit succeeded — safe to mutate ctx.
+    if let Some(p) = pending_promotion {
+        apply_pending_promotion(ctx, &p);
     }
 
+    // Phase 2: auto-block (outside the transaction; routed through the
+    // lifecycle service via the deprecated shim).
     if should_auto_block(new_count, max_retries) {
-        if let Err(e) = auto_block_task(&tx, task_id, new_count, current_iteration) {
+        #[allow(deprecated)]
+        let res = auto_block_task(conn, task_id, new_count, current_iteration);
+        if let Err(e) = res {
             eprintln!("Warning: failed to auto-block task {}: {}", task_id, e);
         } else {
             eprintln!(
@@ -5216,13 +5501,6 @@ pub fn handle_task_failure(
                 task_id, new_count
             );
         }
-    }
-
-    tx.commit()?;
-
-    // Commit succeeded — safe to mutate ctx.
-    if let Some(p) = pending_promotion {
-        apply_pending_promotion(ctx, &p);
     }
 
     Ok(())
@@ -5352,6 +5630,7 @@ fn update_trackers(ctx: &mut IterationContext, outcome: &IterationOutcome) -> bo
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // FEAT-010: tests exercise the deprecated apply_status_updates / auto_block_task shims directly.
 mod tests {
     use super::*;
     use crate::loop_engine::model::{HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL};
@@ -5441,6 +5720,132 @@ mod tests {
         assert!(
             ctx.overflow_original_task_model.is_empty(),
             "fresh IterationContext.overflow_original_task_model MUST be empty",
+        );
+    }
+
+    // --- FEAT-002: apply_review_model_override ---
+    //
+    // Pure-function tests for the predicate used at both dispatch sites
+    // (sequential `run_iteration` + wave `run_wave_iteration`). Failure here
+    // means review-class routing fired on a non-review task, or vice versa.
+
+    #[test]
+    fn feat_002_review_override_fires_for_review_class_ids() {
+        for id in &[
+            "CODE-REVIEW-1",
+            "CODE-REVIEW-007",
+            "MILESTONE-FINAL",
+            "REVIEW-001",
+            // Prefixed (production shape) — strips ^[0-9a-f]{8}- before matching.
+            "8d71d1f7-CODE-REVIEW-1",
+            "8d71d1f7-MILESTONE-FINAL",
+            "8d71d1f7-REVIEW-001",
+        ] {
+            assert_eq!(
+                apply_review_model_override(Some("grok-4"), id),
+                Some("grok-4".to_string()),
+                "review-class id {id} MUST receive the reviewModel override",
+            );
+        }
+    }
+
+    #[test]
+    fn feat_002_review_override_skips_non_review_ids() {
+        for id in &[
+            "FEAT-001",
+            "VERIFY-001",
+            "MILESTONE-1",
+            "MILESTONE-2",
+            "REFACTOR-001",
+            "REFACTOR-REVIEW-FINAL",
+            // Prefixed non-review ids must also be skipped — the `is_review_class`
+            // strip-then-match keeps REFACTOR-REVIEW-FINAL out of the REVIEW-* path.
+            "8d71d1f7-FEAT-001",
+            "8d71d1f7-VERIFY-001",
+            "8d71d1f7-MILESTONE-1",
+            "8d71d1f7-REFACTOR-REVIEW-FINAL",
+        ] {
+            assert_eq!(
+                apply_review_model_override(Some("grok-4"), id),
+                None,
+                "non-review id {id} MUST NOT receive the reviewModel override",
+            );
+        }
+    }
+
+    #[test]
+    fn feat_002_review_override_returns_none_when_review_model_unset() {
+        // Absent / empty / whitespace-only — review tasks stay on whatever
+        // model was already baked in (typically Opus).
+        for review_model in &[None, Some(""), Some("   "), Some("\t\n")] {
+            assert_eq!(
+                apply_review_model_override(*review_model, "CODE-REVIEW-1"),
+                None,
+                "unset/empty reviewModel ({review_model:?}) MUST NOT override review-class tasks",
+            );
+        }
+    }
+
+    #[test]
+    fn feat_002_review_override_trims_whitespace() {
+        // Outer whitespace is trimmed so a `"reviewModel": "  grok-4  "` config
+        // doesn't ship a model id with surprise whitespace to the runner.
+        assert_eq!(
+            apply_review_model_override(Some("  grok-4  "), "CODE-REVIEW-1"),
+            Some("grok-4".to_string()),
+        );
+    }
+
+    #[test]
+    fn feat_002_review_override_passes_through_any_provider() {
+        // The helper itself does not classify provider — it only routes
+        // review-class tasks. A Claude id, an unknown id, or Grok id all
+        // propagate identically; provider classification happens later in
+        // `resolve_effective_runner` via `provider_for_model`.
+        assert_eq!(
+            apply_review_model_override(Some(OPUS_MODEL), "REVIEW-001"),
+            Some(OPUS_MODEL.to_string()),
+        );
+        assert_eq!(
+            apply_review_model_override(Some("gpt-4"), "REVIEW-001"),
+            Some("gpt-4".to_string()),
+        );
+        assert_eq!(
+            apply_review_model_override(Some("grok-4-fast"), "REVIEW-001"),
+            Some("grok-4-fast".to_string()),
+        );
+    }
+
+    #[test]
+    fn feat_002_review_override_into_resolver_yields_grok_runner() {
+        // End-to-end shape: when the override fires for a review task with a
+        // Grok model id, feeding the result into `resolve_effective_runner`
+        // selects `RunnerKind::Grok`. This is the contract the sequential
+        // dispatch site relies on to keep selection + `--model` consistent.
+        let ctx = IterationContext::new(8);
+        let task_id = "8d71d1f7-CODE-REVIEW-1";
+        let effective_model = apply_review_model_override(Some("grok-4"), task_id);
+        assert_eq!(effective_model.as_deref(), Some("grok-4"));
+        assert_eq!(
+            resolve_effective_runner(&ctx, task_id, effective_model.as_deref()),
+            RunnerKind::Grok,
+        );
+    }
+
+    #[test]
+    fn feat_002_no_override_leaves_resolver_on_claude_for_review_tasks() {
+        // Negative path: reviewModel unset → effective_model is unchanged at
+        // the baked-in Opus, and the resolver returns Claude. This locks in
+        // the "no behavior change when reviewModel is absent" guarantee.
+        let ctx = IterationContext::new(8);
+        let task_id = "8d71d1f7-CODE-REVIEW-1";
+        let override_model = apply_review_model_override(None, task_id);
+        assert_eq!(override_model, None);
+        // Caller keeps the baked-in model — here, Opus.
+        let effective_model = override_model.or(Some(OPUS_MODEL.to_string()));
+        assert_eq!(
+            resolve_effective_runner(&ctx, task_id, effective_model.as_deref()),
+            RunnerKind::Claude,
         );
     }
 
@@ -6654,14 +7059,15 @@ mod tests {
     /// Auto-block sets last_error with a descriptive message.
     #[test]
     fn test_auto_block_sets_last_error_with_descriptive_message() {
-        let (_dir, conn) = setup_test_db();
+        let (_dir, mut conn) = setup_test_db();
         conn.execute(
             "INSERT INTO tasks (id, title, status, consecutive_failures, max_retries) VALUES ('T-001', 'Test', 'in_progress', 3, 3)",
             [],
         )
         .unwrap();
 
-        auto_block_task(&conn, "T-001", 3, 1).unwrap();
+        #[allow(deprecated)]
+        auto_block_task(&mut conn, "T-001", 3, 1).unwrap();
 
         let (status, last_error): (String, Option<String>) = conn
             .query_row(
@@ -7506,7 +7912,9 @@ mod tests {
         use crate::loop_engine::prompt::slot::{
             SlotPromptBundle, SlotPromptParams, build_prompt as build_slot_prompt_bundle,
         };
-        use crate::loop_engine::test_utils::{insert_task, insert_task_file};
+        use crate::loop_engine::test_utils::{
+            get_task_status, insert_relationship, insert_task, insert_task_file,
+        };
         use crate::models::Task;
         use rusqlite::Connection;
 
@@ -7706,9 +8114,9 @@ mod tests {
 
         #[test]
         fn test_claim_slot_task_updates_todo_to_in_progress() {
-            let (_tmp, conn) = setup_test_db();
+            let (_tmp, mut conn) = setup_test_db();
             insert_task(&conn, "FEAT-1", "t", "todo", 10);
-            assert!(claim_slot_task(&conn, "FEAT-1"));
+            assert!(claim_slot_task(&mut conn, "FEAT-1"));
             let status: String = conn
                 .query_row("SELECT status FROM tasks WHERE id = 'FEAT-1'", [], |r| {
                     r.get(0)
@@ -7719,33 +8127,33 @@ mod tests {
 
         #[test]
         fn test_claim_slot_task_idempotent_on_already_in_progress() {
-            let (_tmp, conn) = setup_test_db();
+            let (_tmp, mut conn) = setup_test_db();
             insert_task(&conn, "FEAT-1", "t", "in_progress", 10);
             // UPDATE matches because WHERE clause accepts in_progress too
-            assert!(claim_slot_task(&conn, "FEAT-1"));
+            assert!(claim_slot_task(&mut conn, "FEAT-1"));
         }
 
         #[test]
         fn test_claim_slot_task_rejects_done_task() {
-            let (_tmp, conn) = setup_test_db();
+            let (_tmp, mut conn) = setup_test_db();
             insert_task(&conn, "FEAT-1", "t", "done", 10);
-            assert!(!claim_slot_task(&conn, "FEAT-1"));
+            assert!(!claim_slot_task(&mut conn, "FEAT-1"));
         }
 
         // --- run_parallel_wave: orchestration + panic handling (AC 9, 10, 11, 12) ---
 
         #[test]
         fn test_run_parallel_wave_empty_slots_returns_empty_outcomes() {
-            let (temp, conn) = setup_test_db();
+            let (temp, mut conn) = setup_test_db();
 
             let params = Arc::new(make_slot_params(temp.path(), SignalFlag::new()));
-            let wave = run_parallel_wave(&conn, vec![], params);
+            let wave = run_parallel_wave(&mut conn, vec![], params);
             assert!(wave.outcomes.is_empty());
         }
 
         #[test]
         fn test_run_parallel_wave_reports_claim_failure_for_done_task() {
-            let (temp, conn) = setup_test_db();
+            let (temp, mut conn) = setup_test_db();
             let tmp = tempfile::TempDir::new().unwrap();
 
             // Task is already done — claim_slot_task returns false; wave must
@@ -7759,7 +8167,7 @@ mod tests {
             let params = Arc::new(make_slot_params(temp.path(), signal));
 
             let slot = make_slot(0, tmp.path().to_path_buf(), dummy_bundle("FEAT-DONE"));
-            let wave = run_parallel_wave(&conn, vec![slot], params);
+            let wave = run_parallel_wave(&mut conn, vec![slot], params);
             assert_eq!(wave.outcomes.len(), 1);
             assert_eq!(wave.outcomes[0].slot_index, 0);
             assert!(matches!(
@@ -7777,7 +8185,7 @@ mod tests {
             // Main-thread claim must flip every task to in_progress before any
             // slot thread runs. We verify by pre-signaling so slot threads bail
             // immediately; the DB must still show in_progress for both tasks.
-            let (temp, conn) = setup_test_db();
+            let (temp, mut conn) = setup_test_db();
             let tmp = tempfile::TempDir::new().unwrap();
 
             insert_task(&conn, "FEAT-A", "a", "todo", 10);
@@ -7790,7 +8198,7 @@ mod tests {
             let slot_a = make_slot(0, tmp.path().to_path_buf(), dummy_bundle("FEAT-A"));
             let slot_b = make_slot(1, tmp.path().to_path_buf(), dummy_bundle("FEAT-B"));
 
-            let wave = run_parallel_wave(&conn, vec![slot_a, slot_b], params);
+            let wave = run_parallel_wave(&mut conn, vec![slot_a, slot_b], params);
             assert_eq!(wave.outcomes.len(), 2);
 
             let status_a: String = conn
@@ -7811,7 +8219,7 @@ mod tests {
         fn test_run_parallel_wave_outcomes_sorted_by_slot_index() {
             // Mix claim-failure and successful pre-signal early-exits to force
             // the reorder path. Outcomes must always emerge slot-ordered.
-            let (temp, conn) = setup_test_db();
+            let (temp, mut conn) = setup_test_db();
             let tmp = tempfile::TempDir::new().unwrap();
 
             insert_task(&conn, "FEAT-A", "a", "todo", 10);
@@ -7828,7 +8236,7 @@ mod tests {
                 make_slot(2, tmp.path().to_path_buf(), dummy_bundle("FEAT-C")),
             ];
 
-            let wave = run_parallel_wave(&conn, slots, params);
+            let wave = run_parallel_wave(&mut conn, slots, params);
             assert_eq!(wave.outcomes.len(), 3);
             assert_eq!(wave.outcomes[0].slot_index, 0);
             assert_eq!(wave.outcomes[1].slot_index, 1);
@@ -7837,10 +8245,10 @@ mod tests {
 
         #[test]
         fn test_run_parallel_wave_measures_wall_clock_duration() {
-            let (temp, conn) = setup_test_db();
+            let (temp, mut conn) = setup_test_db();
 
             let params = Arc::new(make_slot_params(temp.path(), SignalFlag::new()));
-            let wave = run_parallel_wave(&conn, vec![], params);
+            let wave = run_parallel_wave(&mut conn, vec![], params);
             // Empty wave still records a non-negative duration; ensures the
             // Instant::now() → elapsed() contract holds.
             assert!(wave.wave_duration < Duration::from_secs(5));
@@ -7939,6 +8347,14 @@ mod tests {
         #[test]
         fn test_run_wave_iteration_no_eligible_tasks_increments_stale_tracker() {
             let (temp, mut conn) = setup_test_db();
+            // Genuinely-stuck queue: FEAT-B (todo) dependsOn FEAT-A (blocked).
+            // FEAT-A is terminal so it isn't a candidate; FEAT-B's dependency is
+            // unsatisfied so it isn't eligible → empty group, but FEAT-B keeps
+            // `count_remaining_active_tasks` non-zero so the all-complete and
+            // recovery short-circuits don't fire and we exercise the stale path.
+            insert_task(&conn, "FEAT-A", "Blocked dep", "blocked", 10);
+            insert_task(&conn, "FEAT-B", "Dependent", "todo", 20);
+            insert_relationship(&conn, "FEAT-B", "FEAT-A", "dependsOn");
             let tmp = tempfile::TempDir::new().unwrap();
             let base_prompt = tmp.path().join("base.md");
             std::fs::write(&base_prompt, "base").unwrap();
@@ -7981,6 +8397,12 @@ mod tests {
         #[test]
         fn test_run_wave_iteration_third_no_eligible_wave_aborts_via_stale() {
             let (temp, mut conn) = setup_test_db();
+            // Genuinely-stuck queue (see sibling test): a todo task whose only
+            // dependency is blocked. Keeps the queue non-empty so the stale
+            // path — not the all-complete short-circuit — is exercised.
+            insert_task(&conn, "FEAT-A", "Blocked dep", "blocked", 10);
+            insert_task(&conn, "FEAT-B", "Dependent", "todo", 20);
+            insert_relationship(&conn, "FEAT-B", "FEAT-A", "dependsOn");
             let tmp = tempfile::TempDir::new().unwrap();
             let base_prompt = tmp.path().join("base.md");
             std::fs::write(&base_prompt, "base").unwrap();
@@ -8017,6 +8439,155 @@ mod tests {
             assert_eq!(t.exit_code, 1);
             assert!(t.reason.contains("no eligible tasks"), "got: {}", t.reason);
             assert!(t.run_status.is_none());
+        }
+
+        /// Regression: a wave that selects no eligible tasks because the queue
+        /// is fully and successfully drained (only done/irrelevant) must exit
+        /// cleanly as "all tasks complete" (exit 0, RunStatus::Completed) — NOT
+        /// spin into the stale tracker and abort with exit 1. Mirrors the
+        /// sequential `remaining == 0 → "All tasks complete!"` exit that the
+        /// wave path previously lacked.
+        #[test]
+        fn test_run_wave_iteration_drained_queue_exits_complete_not_stale() {
+            let (temp, mut conn) = setup_test_db();
+            // Every row terminal AND successful: done + irrelevant only.
+            insert_task(&conn, "FEAT-A", "Done", "done", 10);
+            insert_task(&conn, "FEAT-D", "Irrelevant", "irrelevant", 40);
+            let tmp = tempfile::TempDir::new().unwrap();
+            let base_prompt = tmp.path().join("base.md");
+            std::fs::write(&base_prompt, "base").unwrap();
+            let prd = tmp.path().join("prd.json");
+            let progress = tmp.path().join("progress.txt");
+            let mode = PermissionMode::Dangerous;
+            let signal = SignalFlag::new();
+            let mut ctx = IterationContext::new(5);
+            let project_cfg = project_config::ProjectConfig::default();
+            let prd_implicit: Vec<String> = Vec::new();
+            let outcome = run_wave_iteration(
+                make_wave_params(
+                    &mut conn,
+                    temp.path(),
+                    tmp.path(),
+                    "main",
+                    &[],
+                    &base_prompt,
+                    &mode,
+                    &signal,
+                    tmp.path(),
+                    &prd,
+                    &progress,
+                    2,
+                    &project_cfg,
+                    &prd_implicit,
+                ),
+                &mut ctx,
+            );
+            let t = outcome.terminal.expect("terminal expected");
+            assert_eq!(t.exit_code, 0, "drained queue must exit 0, got {t:?}");
+            assert_eq!(t.reason, "all tasks complete");
+            assert!(matches!(t.run_status, Some(RunStatus::Completed)));
+            // Crucially, the stale tracker was NOT touched.
+            assert_eq!(ctx.stale_tracker.count(), 0);
+        }
+
+        /// A drained queue that still has `blocked` and/or `skipped` tasks must
+        /// NOT report a clean "all tasks complete". The classifier downgrades it
+        /// to a non-zero exit with `RunStatus::Aborted` and a reason naming the
+        /// counts, so the loop-end banner is honest about stuck/deferred work.
+        /// `skipped` downgrades just like `blocked` (product decision).
+        #[test]
+        fn test_run_wave_iteration_drained_with_blocked_downgrades() {
+            let (temp, mut conn) = setup_test_db();
+            insert_task(&conn, "FEAT-A", "Done", "done", 10);
+            insert_task(&conn, "FEAT-C", "Blocked", "blocked", 30);
+            insert_task(&conn, "FEAT-E", "Skipped", "skipped", 50);
+            let tmp = tempfile::TempDir::new().unwrap();
+            let base_prompt = tmp.path().join("base.md");
+            std::fs::write(&base_prompt, "base").unwrap();
+            let prd = tmp.path().join("prd.json");
+            let progress = tmp.path().join("progress.txt");
+            let mode = PermissionMode::Dangerous;
+            let signal = SignalFlag::new();
+            let mut ctx = IterationContext::new(5);
+            let project_cfg = project_config::ProjectConfig::default();
+            let prd_implicit: Vec<String> = Vec::new();
+            let outcome = run_wave_iteration(
+                make_wave_params(
+                    &mut conn,
+                    temp.path(),
+                    tmp.path(),
+                    "main",
+                    &[],
+                    &base_prompt,
+                    &mode,
+                    &signal,
+                    tmp.path(),
+                    &prd,
+                    &progress,
+                    2,
+                    &project_cfg,
+                    &prd_implicit,
+                ),
+                &mut ctx,
+            );
+            let t = outcome.terminal.expect("terminal expected");
+            assert_eq!(t.exit_code, 1, "blocked/skipped must downgrade exit, got {t:?}");
+            assert!(t.reason.contains("blocked"), "got: {}", t.reason);
+            assert!(t.reason.contains("skipped"), "got: {}", t.reason);
+            assert!(matches!(t.run_status, Some(RunStatus::Aborted)));
+            assert_eq!(ctx.stale_tracker.count(), 0);
+        }
+
+        /// Regression: a wave that selects nothing because a prior wave left a
+        /// task stranded in `in_progress` (merge-back / completion-detection
+        /// gap) must auto-recover it to `todo` and retry next wave WITHOUT
+        /// counting toward the stale-abort threshold. Mirrors the sequential
+        /// auto-recovery sweep the wave path previously lacked.
+        #[test]
+        fn test_run_wave_iteration_recovers_stranded_in_progress_not_stale() {
+            let (temp, mut conn) = setup_test_db();
+            // No eligible todo candidate; the only active row is stranded
+            // in_progress (not a selection candidate, so the group is empty).
+            insert_task(&conn, "FEAT-A", "Stranded", "in_progress", 10);
+            let tmp = tempfile::TempDir::new().unwrap();
+            let base_prompt = tmp.path().join("base.md");
+            std::fs::write(&base_prompt, "base").unwrap();
+            let prd = tmp.path().join("prd.json");
+            let progress = tmp.path().join("progress.txt");
+            let mode = PermissionMode::Dangerous;
+            let signal = SignalFlag::new();
+            let mut ctx = IterationContext::new(5);
+            let project_cfg = project_config::ProjectConfig::default();
+            let prd_implicit: Vec<String> = Vec::new();
+            let outcome = run_wave_iteration(
+                make_wave_params(
+                    &mut conn,
+                    temp.path(),
+                    tmp.path(),
+                    "main",
+                    &[],
+                    &base_prompt,
+                    &mode,
+                    &signal,
+                    tmp.path(),
+                    &prd,
+                    &progress,
+                    2,
+                    &project_cfg,
+                    &prd_implicit,
+                ),
+                &mut ctx,
+            );
+            // Recovery path: iteration consumed, no terminal, stale untouched.
+            assert!(
+                outcome.terminal.is_none(),
+                "recovery wave must not be terminal, got {:?}",
+                outcome.terminal
+            );
+            assert!(outcome.iteration_consumed);
+            assert_eq!(ctx.stale_tracker.count(), 0, "recovery must not bump stale");
+            // The stranded task was reset to todo so the next wave can claim it.
+            assert_eq!(get_task_status(&conn, "FEAT-A"), "todo");
         }
 
         #[test]
@@ -8522,7 +9093,7 @@ mod tests {
                 // non-Empty outcome instead of a silent pass.
                 let _guard = EnvGuard::set("CLAUDE_BINARY", "/nonexistent_binary_for_signal_test");
 
-                let (temp, conn) = setup_test_db();
+                let (temp, mut conn) = setup_test_db();
                 insert_task(&conn, "FEAT-A", "a", "todo", 10);
                 insert_task(&conn, "FEAT-B", "b", "todo", 20);
 
@@ -8536,7 +9107,7 @@ mod tests {
                     make_slot(0, tmp.path().to_path_buf(), dummy_bundle("FEAT-A")),
                     make_slot(1, tmp.path().to_path_buf(), dummy_bundle("FEAT-B")),
                 ];
-                let wave = run_parallel_wave(&conn, slots, params);
+                let wave = run_parallel_wave(&mut conn, slots, params);
 
                 assert_eq!(wave.outcomes.len(), 2, "every slot must report an outcome");
                 for outcome in &wave.outcomes {
@@ -9049,13 +9620,13 @@ mod tests {
     /// AC: ctx.consecutive_merge_fail_waves increments on a failed wave.
     #[test]
     fn test_consecutive_counter_increments_on_failure() {
-        let (_dir, conn) = crate::loop_engine::test_utils::setup_test_db();
+        let (_dir, mut conn) = crate::loop_engine::test_utils::setup_test_db();
         insert_in_progress_task(&conn, "FEAT-001");
         let mut ctx = IterationContext::new(5);
         assert_eq!(ctx.consecutive_merge_fail_waves, 0);
 
         let decision = apply_merge_fail_reset_and_halt_check(
-            &conn,
+            &mut conn,
             &mut ctx,
             "feat/test",
             &[FailedMerge {
@@ -9071,11 +9642,12 @@ mod tests {
     /// AC: counter resets to 0 on a fully-successful wave (failed_merges empty).
     #[test]
     fn test_consecutive_counter_resets_on_success() {
-        let (_dir, conn) = crate::loop_engine::test_utils::setup_test_db();
+        let (_dir, mut conn) = crate::loop_engine::test_utils::setup_test_db();
         let mut ctx = IterationContext::new(5);
         ctx.consecutive_merge_fail_waves = 3;
 
-        let decision = apply_merge_fail_reset_and_halt_check(&conn, &mut ctx, "feat/test", &[], 2);
+        let decision =
+            apply_merge_fail_reset_and_halt_check(&mut conn, &mut ctx, "feat/test", &[], 2);
         assert_eq!(ctx.consecutive_merge_fail_waves, 0);
         assert_eq!(decision, MergeFailHaltDecision::Continue);
     }
@@ -9083,13 +9655,13 @@ mod tests {
     /// AC: failed slot's task is reset back to `todo`.
     #[test]
     fn test_failed_slot_task_reset_to_todo() {
-        let (_dir, conn) = crate::loop_engine::test_utils::setup_test_db();
+        let (_dir, mut conn) = crate::loop_engine::test_utils::setup_test_db();
         insert_in_progress_task(&conn, "FEAT-001");
         let mut ctx = IterationContext::new(5);
         ctx.pending_slot_tasks.push("FEAT-001".to_string());
 
         apply_merge_fail_reset_and_halt_check(
-            &conn,
+            &mut conn,
             &mut ctx,
             "feat/test",
             &[FailedMerge {
@@ -9109,13 +9681,13 @@ mod tests {
     /// counter / threshold values.
     #[test]
     fn test_halt_returned_when_threshold_reached() {
-        let (_dir, conn) = crate::loop_engine::test_utils::setup_test_db();
+        let (_dir, mut conn) = crate::loop_engine::test_utils::setup_test_db();
         insert_in_progress_task(&conn, "FEAT-001");
         let mut ctx = IterationContext::new(5);
         ctx.consecutive_merge_fail_waves = 1; // already 1, the next hit makes it 2.
 
         let decision = apply_merge_fail_reset_and_halt_check(
-            &conn,
+            &mut conn,
             &mut ctx,
             "feat/test",
             &[FailedMerge {
@@ -9149,14 +9721,14 @@ mod tests {
     /// failed-slot task is `todo` even when the threshold was reached.
     #[test]
     fn test_reset_runs_before_halt_decision() {
-        let (_dir, conn) = crate::loop_engine::test_utils::setup_test_db();
+        let (_dir, mut conn) = crate::loop_engine::test_utils::setup_test_db();
         insert_in_progress_task(&conn, "FEAT-001");
         let mut ctx = IterationContext::new(5);
         ctx.consecutive_merge_fail_waves = 0;
 
         // threshold 1 → halts on this very wave.
         let decision = apply_merge_fail_reset_and_halt_check(
-            &conn,
+            &mut conn,
             &mut ctx,
             "feat/test",
             &[FailedMerge {
@@ -9180,13 +9752,13 @@ mod tests {
     /// the loop aborting.
     #[test]
     fn test_threshold_zero_never_halts() {
-        let (_dir, conn) = crate::loop_engine::test_utils::setup_test_db();
+        let (_dir, mut conn) = crate::loop_engine::test_utils::setup_test_db();
         insert_in_progress_task(&conn, "FEAT-001");
         let mut ctx = IterationContext::new(5);
         ctx.consecutive_merge_fail_waves = 100; // arbitrarily high.
 
         let decision = apply_merge_fail_reset_and_halt_check(
-            &conn,
+            &mut conn,
             &mut ctx,
             "feat/test",
             &[FailedMerge {
@@ -9202,13 +9774,14 @@ mod tests {
     /// AC: failed_merges empty → no reset, counter cleared, Continue.
     #[test]
     fn test_empty_failed_merges_resets_counter_no_side_effects() {
-        let (_dir, conn) = crate::loop_engine::test_utils::setup_test_db();
+        let (_dir, mut conn) = crate::loop_engine::test_utils::setup_test_db();
         insert_in_progress_task(&conn, "FEAT-001"); // stays in_progress.
         let mut ctx = IterationContext::new(5);
         ctx.consecutive_merge_fail_waves = 5;
         ctx.pending_slot_tasks.push("FEAT-001".to_string());
 
-        let decision = apply_merge_fail_reset_and_halt_check(&conn, &mut ctx, "feat/test", &[], 2);
+        let decision =
+            apply_merge_fail_reset_and_halt_check(&mut conn, &mut ctx, "feat/test", &[], 2);
         assert_eq!(decision, MergeFailHaltDecision::Continue);
         assert_eq!(ctx.consecutive_merge_fail_waves, 0);
         // Did NOT touch unrelated in-progress task.
@@ -9222,7 +9795,7 @@ mod tests {
     /// pending_slot_tasks.
     #[test]
     fn test_multiple_failed_slots_all_reset() {
-        let (_dir, conn) = crate::loop_engine::test_utils::setup_test_db();
+        let (_dir, mut conn) = crate::loop_engine::test_utils::setup_test_db();
         insert_in_progress_task(&conn, "FEAT-001");
         insert_in_progress_task(&conn, "FEAT-002");
         let mut ctx = IterationContext::new(5);
@@ -9230,7 +9803,7 @@ mod tests {
         ctx.pending_slot_tasks.push("FEAT-002".to_string());
 
         apply_merge_fail_reset_and_halt_check(
-            &conn,
+            &mut conn,
             &mut ctx,
             "feat/test",
             &[
@@ -9264,12 +9837,12 @@ mod tests {
     /// full failed_merges count.
     #[test]
     fn test_reset_failure_modes_dont_skip_threshold_check() {
-        let (_dir, conn) = crate::loop_engine::test_utils::setup_test_db();
+        let (_dir, mut conn) = crate::loop_engine::test_utils::setup_test_db();
         let mut ctx = IterationContext::new(5);
 
         // Two failed slots, neither has a resolved task_id.
         let decision = apply_merge_fail_reset_and_halt_check(
-            &conn,
+            &mut conn,
             &mut ctx,
             "feat/test",
             &[
@@ -9312,14 +9885,14 @@ mod tests {
     /// `{branch}-slot-18446744073709551615` name.
     #[test]
     fn test_synthetic_deadlock_slot_sentinel_increments_counter() {
-        let (_dir, conn) = crate::loop_engine::test_utils::setup_test_db();
+        let (_dir, mut conn) = crate::loop_engine::test_utils::setup_test_db();
         let mut ctx = IterationContext::new(5);
         ctx.consecutive_merge_fail_waves = 0;
 
         // Sentinel-only failed_merges (simulates the all-malformed deadlock
         // path). Generous threshold so we observe the increment without halt.
         let decision = apply_merge_fail_reset_and_halt_check(
-            &conn,
+            &mut conn,
             &mut ctx,
             "feat/test",
             &[FailedMerge {
@@ -9343,13 +9916,13 @@ mod tests {
     /// appears in the rendered exit_reason on this halt).
     #[test]
     fn test_synthetic_deadlock_slot_diagnostic_does_not_render_huge_name() {
-        let (_dir, conn) = crate::loop_engine::test_utils::setup_test_db();
+        let (_dir, mut conn) = crate::loop_engine::test_utils::setup_test_db();
         let mut ctx = IterationContext::new(5);
         ctx.consecutive_merge_fail_waves = 0;
 
         // threshold=1 → halt on this very wave; sentinel-only failed_merges.
         let decision = apply_merge_fail_reset_and_halt_check(
-            &conn,
+            &mut conn,
             &mut ctx,
             "feat/test",
             &[FailedMerge {
@@ -9382,13 +9955,13 @@ mod tests {
     /// of consecutive failures — i.e. one good wave breaks the cascade.
     #[test]
     fn test_consecutive_counter_lifecycle_failure_then_success() {
-        let (_dir, conn) = crate::loop_engine::test_utils::setup_test_db();
+        let (_dir, mut conn) = crate::loop_engine::test_utils::setup_test_db();
         insert_in_progress_task(&conn, "FEAT-001");
         let mut ctx = IterationContext::new(5);
 
         // Wave 1: fail.
         apply_merge_fail_reset_and_halt_check(
-            &conn,
+            &mut conn,
             &mut ctx,
             "feat/test",
             &[FailedMerge {
@@ -9400,7 +9973,7 @@ mod tests {
         assert_eq!(ctx.consecutive_merge_fail_waves, 1);
 
         // Wave 2: clean.
-        apply_merge_fail_reset_and_halt_check(&conn, &mut ctx, "feat/test", &[], 5);
+        apply_merge_fail_reset_and_halt_check(&mut conn, &mut ctx, "feat/test", &[], 5);
         assert_eq!(ctx.consecutive_merge_fail_waves, 0);
     }
 
@@ -9416,7 +9989,7 @@ mod tests {
     /// and halts. Both waves' failed-slot tasks must end up `todo`.
     #[test]
     fn test_two_consecutive_failures_halt_with_default_threshold() {
-        let (_dir, conn) = crate::loop_engine::test_utils::setup_test_db();
+        let (_dir, mut conn) = crate::loop_engine::test_utils::setup_test_db();
         insert_in_progress_task(&conn, "FEAT-001");
         insert_in_progress_task(&conn, "FEAT-002");
         let mut ctx = IterationContext::new(5);
@@ -9425,7 +9998,7 @@ mod tests {
 
         // Wave 1: slot 1 merge fails for FEAT-001. Below threshold → continue.
         let d1 = apply_merge_fail_reset_and_halt_check(
-            &conn,
+            &mut conn,
             &mut ctx,
             "feat/test",
             &[FailedMerge {
@@ -9453,7 +10026,7 @@ mod tests {
 
         // Wave 2: slot 1 fails again. Counter hits threshold → Halt.
         let d2 = apply_merge_fail_reset_and_halt_check(
-            &conn,
+            &mut conn,
             &mut ctx,
             "feat/test",
             &[FailedMerge {
@@ -9634,5 +10207,345 @@ mod tests {
             crate::loop_engine::test_utils::get_task_status(&conn, "FEAT-001"),
             "in_progress"
         );
+    }
+
+    /// Category C recovery primitive unit tests (035925a9-TEST-INIT-002).
+    ///
+    /// Shadow tests for the future `TaskLifecycle` service surface. Each
+    /// future verb is mirrored by a thin in-module wrapper whose SQL matches
+    /// today's legacy site byte-for-byte (the inline bulk-recovery UPDATE at
+    /// `engine.rs:2407` / `engine.rs:3258`, `auto_block_task` at
+    /// `engine.rs:5145`, and `reset_task_to_todo` at `engine.rs:1642`). The
+    /// FEAT-006 migration replaces the wrappers with `TaskLifecycle::xxx`
+    /// calls; the tests themselves stay identical and become the safety
+    /// harness for that swap.
+    ///
+    /// `claim_slot_task` (Category B `try_claim`) is exercised directly —
+    /// no wrapper needed because today's signature already matches the
+    /// future predicate.
+    mod recovery_primitives {
+        use super::*;
+        use crate::db::prefix::prefix_and;
+        use crate::loop_engine::test_utils::{insert_task, setup_test_db};
+        use rusqlite::{Connection, params};
+
+        /// Future `TaskLifecycle::recover_in_progress_for_prefix`.
+        ///
+        /// Today: inline SQL at engine.rs:2407 (mid-loop sweep) and
+        /// engine.rs:3258 (startup Step 6.6). Both share this exact shape.
+        fn recover_in_progress_for_prefix(
+            conn: &Connection,
+            prefix: Option<&str>,
+        ) -> rusqlite::Result<usize> {
+            let (clause, param) = prefix_and(prefix);
+            let sql = format!(
+                "UPDATE tasks SET status = 'todo', started_at = NULL \
+                 WHERE status = 'in_progress' {clause}"
+            );
+            let ps: Vec<&dyn rusqlite::types::ToSql> = match &param {
+                Some(p) => vec![p as &dyn rusqlite::types::ToSql],
+                None => vec![],
+            };
+            conn.execute(&sql, ps.as_slice())
+        }
+
+        /// Future `TaskLifecycle::auto_block_after_failures(id, err, iter)`.
+        ///
+        /// Today: `auto_block_task` writes unconditionally; the future verb
+        /// gates on `status='in_progress'` and returns `applied: bool` so
+        /// terminal rows are a clean no-op. The wrapper pre-checks status
+        /// to encode that contract today; post-migration the gate moves
+        /// into the service body.
+        fn auto_block_after_failures(
+            conn: &Connection,
+            task_id: &str,
+            err: &str,
+            iteration: i64,
+        ) -> rusqlite::Result<bool> {
+            let status: String =
+                conn.query_row("SELECT status FROM tasks WHERE id = ?", [task_id], |r| {
+                    r.get(0)
+                })?;
+            if status != "in_progress" {
+                return Ok(false);
+            }
+            let rows = conn.execute(
+                "UPDATE tasks SET status = 'blocked', last_error = ?, \
+                 blocked_at_iteration = ?, updated_at = datetime('now') \
+                 WHERE id = ?",
+                params![err, iteration, task_id],
+            )?;
+            Ok(rows > 0)
+        }
+
+        /// Future `TaskLifecycle::resurrect_for_iteration(prefix, ids)`.
+        ///
+        /// Today: per-id reset (cf. `reset_task_to_todo` at engine.rs:1642).
+        /// The future verb takes an explicit id slice and an optional prefix
+        /// scope guard so cross-PRD ids are rejected at the boundary.
+        fn resurrect_for_iteration(
+            conn: &Connection,
+            prefix: Option<&str>,
+            ids: &[&str],
+        ) -> rusqlite::Result<usize> {
+            let mut count = 0;
+            for id in ids {
+                if let Some(pfx) = prefix
+                    && !id.starts_with(pfx)
+                {
+                    continue;
+                }
+                count += conn.execute(
+                    "UPDATE tasks SET status = 'todo', started_at = NULL, \
+                     updated_at = datetime('now') WHERE id = ?",
+                    [id],
+                )?;
+            }
+            Ok(count)
+        }
+
+        // --- AC 1, 2, 3: recover_in_progress_for_prefix ---
+
+        #[test]
+        fn recover_in_progress_unscoped_reverts_all_in_progress_to_todo() {
+            let (_tmp, conn) = setup_test_db();
+            insert_task(&conn, "FEAT-1", "t", "in_progress", 10);
+            insert_task(&conn, "FIX-2", "t", "in_progress", 10);
+            insert_task(&conn, "FEAT-3", "t", "done", 10);
+            conn.execute(
+                "UPDATE tasks SET started_at = datetime('now') WHERE status = 'in_progress'",
+                [],
+            )
+            .unwrap();
+
+            let count = recover_in_progress_for_prefix(&conn, None).unwrap();
+            assert_eq!(count, 2, "both in_progress rows must be reset");
+
+            for id in ["FEAT-1", "FIX-2"] {
+                let (status, started): (String, Option<String>) = conn
+                    .query_row(
+                        "SELECT status, started_at FROM tasks WHERE id = ?",
+                        [id],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .unwrap();
+                assert_eq!(status, "todo", "{id} must be reset to todo");
+                assert!(started.is_none(), "{id} started_at must be cleared");
+            }
+            // Terminal row untouched.
+            let done: String = conn
+                .query_row("SELECT status FROM tasks WHERE id = 'FEAT-3'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(done, "done", "terminal row must not be touched");
+        }
+
+        #[test]
+        fn recover_in_progress_prefix_scoped_only_touches_matching_rows() {
+            let (_tmp, conn) = setup_test_db();
+            insert_task(&conn, "FEAT-1", "t", "in_progress", 10);
+            insert_task(&conn, "FEAT-2", "t", "in_progress", 10);
+            insert_task(&conn, "FIX-1", "t", "in_progress", 10);
+
+            // `prefix_and` convention: bare prefix without trailing dash;
+            // the helper appends `-%` to produce the LIKE pattern. Concurrent
+            // loops on different PRDs MUST NOT reset each other's rows.
+            let count = recover_in_progress_for_prefix(&conn, Some("FEAT")).unwrap();
+            assert_eq!(count, 2, "only FEAT- rows in scope");
+
+            let fix_status: String = conn
+                .query_row("SELECT status FROM tasks WHERE id = 'FIX-1'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(
+                fix_status, "in_progress",
+                "prefix scope MUST NOT leak across PRD boundaries",
+            );
+        }
+
+        #[test]
+        fn recover_in_progress_empty_result_returns_zero() {
+            let (_tmp, conn) = setup_test_db();
+            insert_task(&conn, "FEAT-1", "t", "todo", 10);
+            insert_task(&conn, "FEAT-2", "t", "done", 10);
+
+            let count = recover_in_progress_for_prefix(&conn, None).unwrap();
+            assert_eq!(
+                count, 0,
+                "no in_progress rows — no-op (autocommit; no transaction overhead)",
+            );
+
+            // No row should have changed.
+            let mut stmt = conn
+                .prepare("SELECT id, status FROM tasks ORDER BY id")
+                .unwrap();
+            let rows: Vec<(String, String)> = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert_eq!(
+                rows,
+                vec![
+                    ("FEAT-1".to_string(), "todo".to_string()),
+                    ("FEAT-2".to_string(), "done".to_string()),
+                ],
+            );
+        }
+
+        // --- AC 4, 5: auto_block_after_failures ---
+
+        #[test]
+        fn auto_block_after_failures_sets_blocked_when_in_progress() {
+            let (_tmp, conn) = setup_test_db();
+            insert_task(&conn, "FEAT-1", "t", "in_progress", 10);
+
+            let applied =
+                auto_block_after_failures(&conn, "FEAT-1", "max retries exceeded", 42).unwrap();
+            assert!(applied, "in_progress→blocked transition must apply");
+
+            let (status, last_err, blocked_iter): (String, String, i64) = conn
+                .query_row(
+                    "SELECT status, last_error, blocked_at_iteration \
+                     FROM tasks WHERE id = 'FEAT-1'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(status, "blocked");
+            assert_eq!(
+                last_err, "max retries exceeded",
+                "free-form err must be stored verbatim",
+            );
+            assert_eq!(blocked_iter, 42, "iteration recorded for decay-tracking",);
+        }
+
+        #[test]
+        fn auto_block_after_failures_is_noop_on_done_task() {
+            let (_tmp, conn) = setup_test_db();
+            insert_task(&conn, "FEAT-1", "t", "done", 10);
+
+            let applied = auto_block_after_failures(&conn, "FEAT-1", "err", 7).unwrap();
+            assert!(!applied, "terminal Done must NOT be re-blocked");
+
+            let (status, last_err): (String, Option<String>) = conn
+                .query_row(
+                    "SELECT status, last_error FROM tasks WHERE id = 'FEAT-1'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(status, "done", "row untouched");
+            assert!(
+                last_err.is_none(),
+                "no stderr emission AND no last_error mutation on no-op path",
+            );
+        }
+
+        // --- AC 6: resurrect_for_iteration ---
+
+        #[test]
+        fn resurrect_for_iteration_flips_listed_ids_to_todo() {
+            let (_tmp, conn) = setup_test_db();
+            insert_task(&conn, "FEAT-1", "t", "in_progress", 10);
+            insert_task(&conn, "FEAT-2", "t", "blocked", 10);
+            insert_task(&conn, "FEAT-3", "t", "done", 10);
+            conn.execute(
+                "UPDATE tasks SET started_at = datetime('now') WHERE id IN ('FEAT-1','FEAT-2')",
+                [],
+            )
+            .unwrap();
+
+            let count =
+                resurrect_for_iteration(&conn, Some("FEAT-"), &["FEAT-1", "FEAT-2"]).unwrap();
+            assert_eq!(count, 2);
+
+            for id in ["FEAT-1", "FEAT-2"] {
+                let (status, started): (String, Option<String>) = conn
+                    .query_row(
+                        "SELECT status, started_at FROM tasks WHERE id = ?",
+                        [id],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .unwrap();
+                assert_eq!(status, "todo", "{id}");
+                assert!(started.is_none(), "{id} started_at must be cleared");
+            }
+
+            // Out-of-list row untouched.
+            let unchanged: String = conn
+                .query_row("SELECT status FROM tasks WHERE id = 'FEAT-3'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(unchanged, "done");
+        }
+
+        #[test]
+        fn resurrect_for_iteration_prefix_filters_out_cross_prd_ids() {
+            let (_tmp, conn) = setup_test_db();
+            insert_task(&conn, "FEAT-1", "t", "in_progress", 10);
+            insert_task(&conn, "FIX-1", "t", "in_progress", 10);
+
+            // FIX-1 is in the list but the FEAT- prefix guard must skip it.
+            let count =
+                resurrect_for_iteration(&conn, Some("FEAT-"), &["FEAT-1", "FIX-1"]).unwrap();
+            assert_eq!(count, 1, "only FEAT-1 reset");
+
+            let fix_status: String = conn
+                .query_row("SELECT status FROM tasks WHERE id = 'FIX-1'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(
+                fix_status, "in_progress",
+                "cross-PRD id must be skipped at the boundary",
+            );
+        }
+
+        // --- AC 7: claim_slot_task / try_claim predicate semantics ---
+
+        #[test]
+        fn try_claim_succeeds_on_todo() {
+            let (_tmp, mut conn) = setup_test_db();
+            insert_task(&conn, "FEAT-1", "t", "todo", 10);
+            assert!(claim_slot_task(&mut conn, "FEAT-1"));
+
+            let status: String = conn
+                .query_row("SELECT status FROM tasks WHERE id = 'FEAT-1'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(status, "in_progress");
+        }
+
+        #[test]
+        fn try_claim_idempotent_on_in_progress() {
+            let (_tmp, mut conn) = setup_test_db();
+            insert_task(&conn, "FEAT-1", "t", "in_progress", 10);
+            assert!(
+                claim_slot_task(&mut conn, "FEAT-1"),
+                "in_progress is in the WHERE set — re-claim is idempotent",
+            );
+        }
+
+        #[test]
+        fn try_claim_rejects_blocked() {
+            let (_tmp, mut conn) = setup_test_db();
+            insert_task(&conn, "FEAT-1", "t", "blocked", 10);
+            assert!(
+                !claim_slot_task(&mut conn, "FEAT-1"),
+                "blocked is outside the WHERE set — slot must skip",
+            );
+
+            let status: String = conn
+                .query_row("SELECT status FROM tasks WHERE id = 'FEAT-1'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(status, "blocked", "row must not change on failed claim");
+        }
     }
 }

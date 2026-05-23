@@ -110,9 +110,6 @@ pub fn extract_learnings_from_output(
         &PermissionMode::text_only(),
         claude::SpawnOpts {
             db_dir,
-            // Text-only metadata pass — same leak profile as curate; clean up
-            // the ai-title jsonl after the child exits.
-            cleanup_title_artifact: true,
             // Cheap, fast classification — Haiku is the right tool here.
             model: Some(HAIKU_MODEL),
             // Bounded so a rate-limited or stalled extraction can't hang the

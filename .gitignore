@@ -36,3 +36,7 @@ tasks/.last-branch
 # OS files
 .DS_Store
 Thumbs.db
+
+# task-mgr begin: progress files (untracked)
+tasks/progress-*.txt
+# task-mgr end: progress files (untracked)

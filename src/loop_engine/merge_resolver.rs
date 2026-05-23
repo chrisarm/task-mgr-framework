@@ -257,7 +257,6 @@ impl<'a> ClaudeMergeResolver<'a> {
                 timeout: Some(timeout),
                 db_dir: self.db_dir,
                 disallowed_tools: Some(RESOLVER_DISALLOWED_TOOLS),
-                cleanup_title_artifact: true,
                 ..SpawnOpts::default()
             },
         ) {

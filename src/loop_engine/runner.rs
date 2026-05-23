@@ -13,8 +13,9 @@
 //! `SpawnOpts` / `ClaudeResult` names remain valid as `pub type` aliases in
 //! `claude.rs`, so existing call sites compile unchanged.
 
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -26,8 +27,7 @@ use crate::error::{TaskMgrError, TaskMgrResult};
 #[cfg(unix)]
 use crate::loop_engine::claude::open_pty_for_child_output;
 use crate::loop_engine::claude::{
-    ACTIVE_PREFIX_ENV, cleanup_title_artifact_sync, emit_prefixed_lines, is_pty_read_eof,
-    tee_stream_json,
+    ACTIVE_PREFIX_ENV, emit_prefixed_lines, is_pty_read_eof, tee_stream_json,
 };
 use crate::loop_engine::config::PermissionMode;
 use crate::loop_engine::signals::SignalFlag;
@@ -120,6 +120,10 @@ pub struct RunnerResult {
     /// Tool calls denied by the permission system during this invocation.
     /// Each entry is a raw JSON value from the stream-json `permission_denials` array.
     pub permission_denials: Vec<serde_json::Value>,
+    /// Session UUID injected via `--session-id` into the LLM CLI invocation.
+    /// `Some(uuid)` for ClaudeRunner (unconditional as of FEAT-003).
+    /// `None` for GrokRunner (Grok capture lands in FEAT-004).
+    pub session_id: Option<Uuid>,
 }
 
 /// Optional settings for a runner invocation.
@@ -134,7 +138,6 @@ pub struct RunnerResult {
 /// dispatch(RunnerKind::Claude, &prompt, &permission_mode, RunnerOpts {
 ///     model: Some(HAIKU_MODEL),
 ///     db_dir: Some(db_dir),
-///     cleanup_title_artifact: true,
 ///     ..RunnerOpts::default()
 /// })
 /// ```
@@ -159,11 +162,6 @@ pub struct RunnerOpts<'a> {
     pub disallowed_tools: Option<&'a str>,
     /// Canonical task-mgr DB dir to pin via `TASK_MGR_DIR` env.
     pub db_dir: Option<&'a Path>,
-    /// When `true`, inject `--session-id <uuid>` before `-p` and synchronously
-    /// delete `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl` after the
-    /// child process exits. Workaround for Claude Code 2.1.110 leaking
-    /// ai-title metadata despite `--no-session-persistence`.
-    pub cleanup_title_artifact: bool,
     /// When `true` (Unix only), wire the child's stdout+stderr to a
     /// pseudo-TTY slave instead of a regular pipe. Node.js (and therefore
     /// Claude Code) line-buffers stdout only when `isatty(1)` is true, so
@@ -194,10 +192,22 @@ pub struct RunnerOpts<'a> {
     /// to the correct PRD. All non-loop callers (curate, learnings, merge
     /// resolver, etc.) pass `None`, leaving the variable unset in the child.
     pub active_prefix: Option<&'a str>,
+    /// When `true`, signal that the caller wants per-session ai-title artifact
+    /// cleanup for this invocation. Used as the opt-in field that drives the
+    /// [`RunnerCapability::TitleArtifactCleanup`] enforcement gate in `dispatch`:
+    /// if set to `true` on a runner that returns `false` for
+    /// `supports(TitleArtifactCleanup)` (e.g. [`GrokRunner`]), dispatch returns
+    /// [`TaskMgrError::UnsupportedRunnerCapability`] before spawning.
+    ///
+    /// When `true` on a supported runner ([`ClaudeRunner`]), dispatch drives
+    /// `cleanup_session` post-spawn (FEAT-006). Callers that do not need
+    /// the cleanup workaround (e.g. non-loop callers) leave this `false`
+    /// (the default), and cleanup is skipped.
+    pub cleanup_title_artifact: bool,
     /// Fallback runner CLI binary path resolved from `FallbackRunnerConfig.cli_binary`.
-    /// Only consumed by [`GrokRunner`]: used as the second link in the binary
+    /// Only consumed by `GrokRunner`: used as the second link in the binary
     /// resolution chain (`$GROK_BINARY` → `fallback_cli_binary` → `"grok"` on
-    /// PATH). [`ClaudeRunner`] ignores it. `None` falls through to the PATH
+    /// PATH). `ClaudeRunner` ignores it. `None` falls through to the PATH
     /// default; `Some(p)` is invoked verbatim (no PATH re-resolution).
     pub fallback_cli_binary: Option<&'a str>,
 }
@@ -210,6 +220,55 @@ pub struct RunnerOpts<'a> {
 pub enum RunnerKind {
     Claude,
     Grok,
+}
+
+/// Typed capability surface used by `dispatch` to refuse a spawn whose
+/// [`RunnerOpts`] sets a field encoding a capability the chosen runner
+/// does not support — before any subprocess is launched.
+///
+/// (a) **Surface contract**: each variant maps 1:1 to a `RunnerOpts` field
+/// whose presence (non-default value) implies the caller wants behavior
+/// the runner may or may not deliver. The mapping from variant to
+/// `RunnerOpts` field lives in a single `checks` registry table on the
+/// `dispatch` side (FEAT-003), never duplicated across runner impls.
+///
+/// (b) **`#[non_exhaustive]` rationale**: capabilities are an open set —
+/// future runners (Gemini, local llama.cpp, …) will surface new flags
+/// (`ThinkingTokens`, `PermissionMode`, `SessionId`, …) as `RunnerOpts`
+/// grows. Marking the enum non-exhaustive means external crates cannot
+/// pattern-match without a wildcard, leaving us free to add variants
+/// without a major-version bump. Internal `LlmRunner` impls intentionally
+/// match exhaustively (see (c)) — `#[non_exhaustive]` does NOT change
+/// in-crate match semantics.
+///
+/// (c) **Exhaustive-match-in-production-impls convention**: every
+/// production [`LlmRunner::supports`] impl MUST use an exhaustive match
+/// (NO `_` wildcard arm). Adding a new variant then forces a per-runner
+/// compile error so the capability decision is made deliberately — never
+/// silently defaulted. This is the forcing function that makes the
+/// capability surface a contract instead of a hint; a wildcard arm here
+/// defeats the entire mechanism.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum RunnerCapability {
+    /// Runner accepts an `--effort` (or equivalent) flag for reasoning depth.
+    /// Maps to [`RunnerOpts::effort`].
+    Effort,
+    /// Runner emits stream-json (or `streaming-json`) output when requested.
+    /// Maps to [`RunnerOpts::stream_json`].
+    StreamJson,
+    /// Runner honors PTY allocation for stdout line-buffering workarounds.
+    /// Maps to [`RunnerOpts::use_pty`]. Claude-specific today (Node.js
+    /// line-buffering); Grok uses plain pipes.
+    Pty,
+    /// Runner accepts a disallowed-tools list. Maps to
+    /// [`RunnerOpts::disallowed_tools`].
+    DisallowedTools,
+    /// Runner needs to inject `--session-id` and clean up the ai-title jsonl
+    /// artifact after the subprocess exits. Claude-specific workaround for the
+    /// 2.1.110 session-leak; Grok has no equivalent artifact. Maps to
+    /// [`RunnerOpts::cleanup_title_artifact`].
+    TitleArtifactCleanup,
 }
 
 /// Common interface implemented by every concrete LLM runner.
@@ -227,6 +286,150 @@ pub(crate) trait LlmRunner: Send + Sync {
         permission_mode: &PermissionMode,
         opts: RunnerOpts<'_>,
     ) -> TaskMgrResult<RunnerResult>;
+
+    /// Declare whether this runner supports a given capability.
+    ///
+    /// Used by [`dispatch`] (FEAT-003) to refuse calls that set a
+    /// [`RunnerOpts`] field encoding an unsupported capability **before**
+    /// any subprocess is spawned — fail-closed at the boundary instead of
+    /// silently dropping the flag in the runner body.
+    ///
+    /// The default returns `false` for every capability: an
+    /// implementation that forgets to override `supports` is treated as
+    /// "supports nothing", so every capability-driven call against it
+    /// will be rejected by dispatch. Choosing the safe direction here
+    /// means a future runner added without thinking about capabilities
+    /// fails loudly at the spawn boundary instead of silently no-op'ing
+    /// on flags the operator depended on.
+    ///
+    /// Production impls MUST override this with an **exhaustive** match
+    /// (no `_` wildcard arm) — see the
+    /// [`RunnerCapability`] rustdoc, paragraph (c).
+    fn supports(&self, _cap: RunnerCapability) -> bool {
+        false
+    }
+
+    /// Delete the per-session artifact (file or directory) that this runner's
+    /// CLI wrote to disk for the given `(session_id, cwd)` tuple.
+    ///
+    /// **Target identification**: implementations MUST derive the artifact
+    /// path deterministically from `session_id` + `cwd` and remove ONLY that
+    /// path. Never enumerate-and-sweep; shared session directories that
+    /// accumulate cross-session state (e.g. `prompt_history.jsonl`) must be
+    /// preserved.
+    ///
+    /// **Idempotency**: `NotFound` is silent success — the artifact may have
+    /// never been written (e.g. a future CLI release stops leaking) or may
+    /// already have been removed by a prior call.
+    ///
+    /// **Default impl returns `Ok(())`**: providers with no headless artifact
+    /// (future cloud-API runners, in-process backends) need zero cleanup
+    /// code. The trait method is statically dispatched per `RunnerKind`
+    /// variant — no dynamic dispatch overhead.
+    ///
+    /// **Dispatch-side contract** (FEAT-006): `dispatch` calls this
+    /// unconditionally after every spawn. Errors are surfaced via the
+    /// warn-once banner so a misconfigured `~/.claude/` or `~/.grok/` mount
+    /// produces one diagnostic line instead of per-iteration spam.
+    fn cleanup_session(&self, _session_id: Uuid, _cwd: &Path) -> TaskMgrResult<()> {
+        Ok(())
+    }
+}
+
+/// Warn-once guard for cleanup_session errors in [`dispatch`].
+/// Prevents a misconfigured `~/.claude/` or `~/.grok/` mount from printing
+/// one stderr line per spawn across a 50-batch run. The first error prints;
+/// subsequent errors in the same process are silent.
+static CLEANUP_WARN_ONCE: AtomicBool = AtomicBool::new(false);
+
+/// Reset the [`CLEANUP_WARN_ONCE`] gate to `false`.
+///
+/// Intended exclusively for integration tests that need to observe the
+/// first-banner transition in isolation. Production code must never call
+/// this — the gate is intentionally sticky across a process lifetime.
+pub fn reset_cleanup_warn_once_for_test() {
+    CLEANUP_WARN_ONCE.store(false, Ordering::SeqCst);
+}
+
+/// Read the current [`CLEANUP_WARN_ONCE`] state.
+///
+/// Returns `true` if at least one cleanup error has been logged in this
+/// process. Intended for integration tests that need to verify the
+/// warn-once rate-limit transitions without capturing stderr at the fd level.
+pub fn cleanup_warn_once_was_triggered() -> bool {
+    CLEANUP_WARN_ONCE.load(Ordering::SeqCst)
+}
+
+// WORKAROUND(claude-code-2.1.110-session-stub): Claude Code 2.1.110 writes a
+// per-session ai-title jsonl under `<HOME>/.claude/projects/<encoded-cwd>/`
+// despite `--no-session-persistence`. Until upstream stops leaking, the
+// runner injects a known UUID via `--session-id` and synchronously deletes
+// the matching file after the child exits. Dispatch (FEAT-006) calls this
+// unconditionally post-spawn and routes Err via the CLEANUP_WARN_ONCE banner.
+pub(crate) fn cleanup_claude_session_artifact(
+    session_id: Uuid,
+    cwd: Option<&Path>,
+) -> TaskMgrResult<()> {
+    use crate::loop_engine::claude::encoded_cwd_dir;
+    let home = match std::env::var("HOME") {
+        Ok(h) if !h.is_empty() => PathBuf::from(h),
+        _ => return Ok(()),
+    };
+    let cwd_buf = match cwd {
+        Some(p) => p.to_path_buf(),
+        None => match std::env::current_dir() {
+            Ok(p) => p,
+            Err(_) => return Ok(()),
+        },
+    };
+    let target = encoded_cwd_dir(&cwd_buf, &home).join(format!("{}.jsonl", session_id));
+    match std::fs::remove_file(&target) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(TaskMgrError::IoErrorWithContext {
+            file_path: target.display().to_string(),
+            operation: "deleting ai-title session artifact".to_string(),
+            source: e,
+        }),
+    }
+}
+
+/// Compute the directory the Grok CLI uses for a given working directory.
+///
+/// Grok writes per-session artifacts under
+/// `<HOME>/.grok/sessions/<percent-encoded-cwd>/<session-uuid>/`. The cwd
+/// is percent-encoded so embedded slashes don't collide with the directory
+/// hierarchy (e.g. `/home/user/repo` → `%2Fhome%2Fuser%2Frepo`).
+///
+/// Pure: takes `&Path` inputs, no filesystem access. Trailing slashes are
+/// trimmed before encoding so `/foo/` and `/foo` map to the same directory.
+pub(crate) fn grok_encoded_session_dir(cwd: &Path, home: &Path) -> PathBuf {
+    let cwd_str = cwd.to_string_lossy();
+    let trimmed = cwd_str.trim_end_matches('/');
+    let encoded = urlencoding::encode(trimmed).into_owned();
+    home.join(".grok").join("sessions").join(encoded)
+}
+
+/// Tiebreaker for the FEAT-004 pre/post dir diff when multiple new UUID
+/// subdirectories appear under `grok_dir` after the child exits (rare
+/// parallel-slot race). Returns the UUID whose directory has the latest
+/// modification time (last-write-wins). Returns `None` if mtime is
+/// unreadable for every candidate — safest outcome under unexpected FS state.
+fn pick_newest_by_mtime(grok_dir: &Path, ids: &[Uuid]) -> Option<Uuid> {
+    let mut best: Option<(std::time::SystemTime, Uuid)> = None;
+    for &id in ids {
+        let dir_path = grok_dir.join(id.to_string());
+        if let Ok(meta) = std::fs::metadata(&dir_path)
+            && let Ok(mtime) = meta.modified()
+        {
+            match &best {
+                None => best = Some((mtime, id)),
+                Some((prev, _)) if mtime > *prev => best = Some((mtime, id)),
+                _ => {}
+            }
+        }
+    }
+    best.map(|(_, id)| id)
 }
 
 /// Claude CLI runner.
@@ -240,6 +443,20 @@ pub(crate) trait LlmRunner: Send + Sync {
 pub(crate) struct ClaudeRunner;
 
 impl LlmRunner for ClaudeRunner {
+    // EXHAUSTIVE match (no `_` arm) is the forcing function — a new
+    // `RunnerCapability` variant must cause a per-runner compile error so
+    // the support decision is made deliberately. See `RunnerCapability`
+    // rustdoc paragraph (c).
+    fn supports(&self, cap: RunnerCapability) -> bool {
+        match cap {
+            RunnerCapability::Effort => true,
+            RunnerCapability::StreamJson => true,
+            RunnerCapability::Pty => true,
+            RunnerCapability::DisallowedTools => true,
+            RunnerCapability::TitleArtifactCleanup => true,
+        }
+    }
+
     /// Spawn Claude with the given prompt and collect its output.
     ///
     /// The subprocess runs `<binary> <base-flags> <permission-flags> [-model m] -p <prompt>`.
@@ -276,13 +493,15 @@ impl LlmRunner for ClaudeRunner {
             effort,
             disallowed_tools,
             db_dir,
-            cleanup_title_artifact,
             use_pty,
             target_task_id,
             slot_label,
             active_prefix,
             // Grok-only knob; Claude resolves its binary purely via $CLAUDE_BINARY.
+            // cleanup_title_artifact is a capability-gate signal enforced at dispatch;
+            // spawn body does not read it. Use `..` to elide all remaining fields.
             fallback_cli_binary: _,
+            ..
         } = opts;
         let binary = std::env::var("CLAUDE_BINARY").unwrap_or_else(|_| "claude".to_string());
         let base: &[&str] = if stream_json {
@@ -321,15 +540,14 @@ impl LlmRunner for ClaudeRunner {
         push_optional_flag(&mut args, "--disallowedTools", disallowed_tools);
         push_optional_flag(&mut args, "--model", model);
         push_optional_flag(&mut args, "--effort", effort);
-        // Claude Code 2.1.110 writes an ai-title jsonl despite --no-session-persistence;
-        // forcing a known UUID lets the post-wait cleanup delete that exact file.
-        // Must stay before -p — Claude only parses flags left of the prompt.
-        let cleanup_session_id: Option<Uuid> = cleanup_title_artifact.then(|| {
-            let id = Uuid::new_v4();
-            args.push("--session-id".to_string());
-            args.push(id.to_string());
-            id
-        });
+        // WORKAROUND(claude-code-2.1.110): Claude writes an ai-title jsonl despite
+        // --no-session-persistence. Forcing a known UUID lets the post-wait cleanup
+        // delete that exact file. Must stay before -p — Claude only parses flags left
+        // of the prompt. Unconditional as of FEAT-003; inline cleanup moves to dispatch
+        // in FEAT-006.
+        let uuid = Uuid::new_v4();
+        args.push("--session-id".to_string());
+        args.push(uuid.to_string());
         args.push("-p".to_string());
 
         let mut cmd = Command::new(&binary);
@@ -417,11 +635,6 @@ impl LlmRunner for ClaudeRunner {
 
         let (timed_out, completion_killed) = watchdog.teardown();
 
-        // Child has exited: ai-title jsonl is guaranteed written (or never will be).
-        if let Some(uuid) = cleanup_session_id {
-            cleanup_title_artifact_sync(uuid, working_dir);
-        }
-
         Ok(RunnerResult {
             exit_code: exit_code_from_status(status),
             output,
@@ -429,7 +642,12 @@ impl LlmRunner for ClaudeRunner {
             timed_out,
             completion_killed,
             permission_denials,
+            session_id: Some(uuid),
         })
+    }
+
+    fn cleanup_session(&self, session_id: Uuid, cwd: &Path) -> TaskMgrResult<()> {
+        cleanup_claude_session_artifact(session_id, Some(cwd))
     }
 }
 
@@ -453,9 +671,19 @@ impl LlmRunner for ClaudeRunner {
 /// - `--dangerously-skip-permissions` → `--permission-mode bypassPermissions`
 /// - `--output-format stream-json` → `--output-format streaming-json`
 ///   (different spelling)
-/// - `cleanup_title_artifact: true` is silently ignored — grok has no
-///   ai-title-jsonl leak so no `--session-id` flag is emitted and no
-///   post-run cleanup runs
+/// - `cleanup_title_artifact: true` is rejected at dispatch with
+///   [`TaskMgrError::UnsupportedRunnerCapability`] — grok has no
+///   ai-title-jsonl leak and the `TitleArtifactCleanup` capability is
+///   `false` on [`GrokRunner`].
+///
+/// Session capture: `spawn` snapshots `~/.grok/sessions/<encoded-cwd>/`
+/// immediately before and after the child exits (pre/post diff). Entries
+/// that are valid UUIDs and appear only in the post-snapshot are the
+/// candidate session ids. Zero new ids → `session_id: None`. Exactly one
+/// → `session_id: Some(uuid)`. Multiple (rare parallel-slot race) →
+/// the UUID directory with the most recent mtime is chosen
+/// (last-write-wins heuristic; see `pick_newest_by_mtime`). `HOME` absent
+/// → snapshot is skipped and `session_id` stays `None` (best-effort).
 ///
 /// Auth-failure detection (FR-007): stderr is captured into a bounded buffer
 /// while still being tee'd to the parent process. After the child exits, if
@@ -469,6 +697,20 @@ impl LlmRunner for ClaudeRunner {
 pub(crate) struct GrokRunner;
 
 impl LlmRunner for GrokRunner {
+    // EXHAUSTIVE match (no `_` arm) per the `RunnerCapability` convention.
+    // `Pty=false`: grok uses plain pipes; the Node.js line-buffering
+    // workaround does not apply.
+    // `TitleArtifactCleanup=false`: grok has no ai-title-jsonl leak.
+    fn supports(&self, cap: RunnerCapability) -> bool {
+        match cap {
+            RunnerCapability::Effort => true,
+            RunnerCapability::StreamJson => true,
+            RunnerCapability::Pty => false,
+            RunnerCapability::DisallowedTools => true,
+            RunnerCapability::TitleArtifactCleanup => false,
+        }
+    }
+
     fn spawn(
         &self,
         prompt: &str,
@@ -484,17 +726,33 @@ impl LlmRunner for GrokRunner {
             effort,
             disallowed_tools,
             db_dir,
-            // Claude-only ai-title workaround; grok has no equivalent artifact.
-            // PRD §6: silently ignored — no flag emitted, no post-run cleanup.
-            cleanup_title_artifact: _,
-            // PTY workaround is Claude-specific (Node.js line-buffering).
-            // Out of scope for v1; grok uses plain pipes.
-            use_pty: _,
             target_task_id,
             slot_label,
             active_prefix,
             fallback_cli_binary,
+            // Capabilities the runner does not support are enforced at dispatch;
+            // this destructure consumes only the fields Grok actively uses.
+            ..
         } = opts;
+
+        // Resolve cwd and HOME for the session-dir snapshot. HOME absence
+        // suppresses the snapshot (best-effort; mirrors Claude helper behavior).
+        let cwd = working_dir
+            .map(|p| p.to_path_buf())
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_default();
+        let home_opt = std::env::var("HOME").ok().map(PathBuf::from);
+        let grok_dir_opt = home_opt.as_ref().map(|h| grok_encoded_session_dir(&cwd, h));
+        // Pre-spawn snapshot of entry names; missing dir → empty set (first run).
+        let before: HashSet<String> = grok_dir_opt
+            .as_ref()
+            .and_then(|d| std::fs::read_dir(d).ok())
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
 
         let binary = resolve_grok_binary(fallback_cli_binary);
 
@@ -584,6 +842,26 @@ impl LlmRunner for GrokRunner {
         let elapsed = spawn_instant.elapsed();
         let exit_code = exit_code_from_status(status);
 
+        // Post-spawn snapshot: diff against before to find the new session dir.
+        let session_id: Option<Uuid> = grok_dir_opt.as_ref().and_then(|grok_dir| {
+            let after: HashSet<String> = std::fs::read_dir(grok_dir)
+                .map(|rd| {
+                    rd.filter_map(|e| e.ok())
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let new_ids: Vec<Uuid> = after
+                .difference(&before)
+                .filter_map(|s| Uuid::parse_str(s).ok())
+                .collect();
+            match new_ids.len() {
+                0 => None,
+                1 => Some(new_ids[0]),
+                _ => pick_newest_by_mtime(grok_dir, &new_ids),
+            }
+        });
+
         // Auth-failure sniff: only credible when the child died fast AND with
         // a known auth-phrase on stderr. Either condition alone falls through
         // to a normal RunnerResult. Window is overridable via env var for tests.
@@ -603,7 +881,30 @@ impl LlmRunner for GrokRunner {
             timed_out,
             completion_killed,
             permission_denials,
+            session_id,
         })
+    }
+
+    // WORKAROUND(grok-cli-no-persistence-off): grok has no --no-session-persistence
+    // equivalent and writes a directory of artifacts per session at
+    // ~/.grok/sessions/<percent-encoded-cwd>/<uuid>/. Remove only the uuid subdir;
+    // prompt_history.jsonl in the parent dir accumulates across sessions by design
+    // and must be preserved.
+    fn cleanup_session(&self, session_id: Uuid, cwd: &Path) -> TaskMgrResult<()> {
+        let home = match std::env::var("HOME") {
+            Ok(h) if !h.is_empty() => PathBuf::from(h),
+            _ => return Ok(()),
+        };
+        let target = grok_encoded_session_dir(cwd, &home).join(session_id.to_string());
+        match std::fs::remove_dir_all(&target) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(TaskMgrError::IoErrorWithContext {
+                file_path: target.display().to_string(),
+                operation: "deleting grok session directory".to_string(),
+                source: e,
+            }),
+        }
     }
 }
 
@@ -863,27 +1164,169 @@ fn read_plain_stdout(
     buf
 }
 
-/// Route a runner invocation to the correct backend.
+/// Canonical &'static str label for a [`RunnerCapability`] variant.
 ///
-/// `RunnerKind::Claude` → [`ClaudeRunner::spawn`] (the existing Claude
-/// subprocess body, byte-identical behavior). `RunnerKind::Grok` →
-/// [`GrokRunner::spawn`] (FEAT-003).
+/// Used as the `capability_name` field of
+/// [`TaskMgrError::UnsupportedRunnerCapability`]. Exhaustive match: a new
+/// variant added to `RunnerCapability` forces a compile error here so the
+/// label is never silently `"unknown"`.
+fn capability_name(cap: RunnerCapability) -> &'static str {
+    match cap {
+        RunnerCapability::Effort => "Effort",
+        RunnerCapability::StreamJson => "StreamJson",
+        RunnerCapability::Pty => "Pty",
+        RunnerCapability::DisallowedTools => "DisallowedTools",
+        RunnerCapability::TitleArtifactCleanup => "TitleArtifactCleanup",
+    }
+}
+
+/// Function-pointer predicate that returns `true` when an opts field
+/// encodes a non-default, non-whitespace request for the paired capability.
+type CapabilityFieldCheck = for<'a> fn(&RunnerOpts<'a>) -> bool;
+
+/// Single source of truth mapping each [`RunnerCapability`] variant to the
+/// [`RunnerOpts`] field whose presence asks the runner to honor that
+/// capability, plus the field's snake_case name for error reporting.
+///
+/// Every enforced variant has exactly one row. The completeness-guard test
+/// [`checks_table_covers_every_capability_variant`] iterates all variants
+/// and asserts each appears here — a new variant added without a matching
+/// row fails the test at unit-test time, before the silent-no-op
+/// regression can reach production.
+///
+/// Empty / whitespace-only `Option<&str>` values are treated as "no
+/// opinion" (`trim().is_empty()`) — matching the same convention used by
+/// [`push_optional_flag`]. Only a meaningful value triggers enforcement.
+const CHECKS: &[(RunnerCapability, CapabilityFieldCheck, &str)] = &[
+    (RunnerCapability::Pty, |o| o.use_pty, "use_pty"),
+    (
+        RunnerCapability::StreamJson,
+        |o| o.stream_json,
+        "stream_json",
+    ),
+    (
+        RunnerCapability::Effort,
+        |o| o.effort.is_some_and(|e| !e.trim().is_empty()),
+        "effort",
+    ),
+    (
+        RunnerCapability::DisallowedTools,
+        |o| o.disallowed_tools.is_some_and(|d| !d.trim().is_empty()),
+        "disallowed_tools",
+    ),
+    (
+        RunnerCapability::TitleArtifactCleanup,
+        |o| o.cleanup_title_artifact,
+        "cleanup_title_artifact",
+    ),
+];
+
+/// Refuse a dispatch whose [`RunnerOpts`] sets a capability-driven field
+/// the chosen runner does not support, before any subprocess is spawned.
+///
+/// Walks [`CHECKS`] in order; the first row whose `field_is_set` predicate
+/// fires AND for which `runner.supports(cap)` is `false` returns
+/// [`TaskMgrError::UnsupportedRunnerCapability`] carrying the runner kind,
+/// canonical capability label, and the opts field name.
+///
+/// `runner` is `&dyn LlmRunner` purely for the duration of this call so a
+/// single body can be runner-polymorphic; the hot spawn path in
+/// [`dispatch`] remains static-dispatch on [`RunnerKind`].
+fn enforce_capabilities(
+    runner: &dyn LlmRunner,
+    kind: RunnerKind,
+    opts: &RunnerOpts<'_>,
+) -> TaskMgrResult<()> {
+    for (cap, is_set, field_name) in CHECKS {
+        if is_set(opts) && !runner.supports(*cap) {
+            return Err(TaskMgrError::UnsupportedRunnerCapability {
+                runner_kind: kind,
+                capability_name: capability_name(*cap),
+                field_name,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Route a runner invocation to the correct backend, enforcing capability
+/// constraints pre-spawn and cleaning up per-session artifacts post-spawn.
+///
+/// `RunnerKind::Claude` → [`ClaudeRunner::spawn`]; `RunnerKind::Grok` →
+/// [`GrokRunner::spawn`].
+///
+/// **Pre-spawn**: `enforce_capabilities` walks the `CHECKS` registry. Any
+/// `RunnerOpts` field encoding a capability the chosen runner does not support
+/// returns [`TaskMgrError::UnsupportedRunnerCapability`] before any subprocess
+/// is launched (fail-closed). See `enforce_capabilities` and `CHECKS`.
+///
+/// **Post-spawn**: after spawn returns, [`LlmRunner::cleanup_session`] is
+/// called for the `(session_id, cwd)` tuple when `RunnerResult::session_id`
+/// is `Some`. Cleanup runs on both clean-exit and non-zero-exit spawns. The
+/// return value is always the spawn's original `RunnerResult` / `Err`,
+/// never modified by cleanup.
+///
+/// `cwd` is `opts.working_dir` when `Some`; falls back to
+/// `std::env::current_dir()`, then `PathBuf::default()` if that fails.
 ///
 /// # Errors
 ///
 /// Returns whatever the underlying backend returns. Grok adds one provider-
 /// specific error variant ([`TaskMgrError::GrokAuthFailure`]); Claude has no
-/// equivalent.
+/// equivalent. Either backend may surface
+/// [`TaskMgrError::UnsupportedRunnerCapability`] from the pre-spawn check.
+///
+/// # Best-effort limitation (PRD §6)
+///
+/// When spawn itself returns `Err` (e.g. binary not found), the session UUID
+/// is not surfaced in the error type, so cleanup is skipped. In practice no
+/// artifact is written because the CLI never ran.
+///
+/// When `cleanup_session` returns `Err`, a single `[cleanup warn] <provider>:
+/// <error> (<cwd>)` line is emitted to stderr via [`CLEANUP_WARN_ONCE`];
+/// subsequent errors in the same process are silent.
 pub fn dispatch(
     kind: RunnerKind,
     prompt: &str,
     permission_mode: &PermissionMode,
     opts: RunnerOpts<'_>,
 ) -> TaskMgrResult<RunnerResult> {
-    match kind {
-        RunnerKind::Claude => ClaudeRunner.spawn(prompt, permission_mode, opts),
-        RunnerKind::Grok => GrokRunner.spawn(prompt, permission_mode, opts),
+    // Resolve cwd once for post-spawn cleanup (FEAT-006).
+    // The brief &dyn LlmRunner borrow inside enforce_capabilities keeps capability enforcement
+    // runner-polymorphic without putting Box<dyn LlmRunner> on the hot path.
+    let cwd: PathBuf = opts
+        .working_dir
+        .map(|p| p.to_path_buf())
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_default();
+    let result = match kind {
+        RunnerKind::Claude => {
+            enforce_capabilities(&ClaudeRunner, kind, &opts)?;
+            ClaudeRunner.spawn(prompt, permission_mode, opts)
+        }
+        RunnerKind::Grok => {
+            enforce_capabilities(&GrokRunner, kind, &opts)?;
+            GrokRunner.spawn(prompt, permission_mode, opts)
+        }
+    };
+    if let Ok(ref r) = result
+        && let Some(sid) = r.session_id
+    {
+        let cleanup_result = match kind {
+            RunnerKind::Claude => ClaudeRunner.cleanup_session(sid, &cwd),
+            RunnerKind::Grok => GrokRunner.cleanup_session(sid, &cwd),
+        };
+        if let Err(ref e) = cleanup_result
+            && !CLEANUP_WARN_ONCE.swap(true, Ordering::Relaxed)
+        {
+            let provider = match kind {
+                RunnerKind::Claude => "claude",
+                RunnerKind::Grok => "grok",
+            };
+            eprintln!("[cleanup warn] {provider}: {e} ({})", cwd.display());
+        }
     }
+    result
 }
 
 #[cfg(test)]
@@ -906,6 +1349,235 @@ mod tests {
     #[allow(dead_code)]
     fn _assert_claude_result_is_runner_result(r: ClaudeResult) -> RunnerResult {
         r
+    }
+
+    /// AC: every (runner × capability) pair matches the declared support
+    /// matrix. 2 runners × 4 capabilities = 8 assertions.
+    ///
+    /// The expected table is written inline (not derived from
+    /// `supports()`) so a copy-paste flip of any bit in either production
+    /// impl produces a test failure that names the offending pair.
+    #[test]
+    fn supports_matrix_matches_declared_capability_table() {
+        use RunnerCapability::*;
+        let expectations: &[(&str, &dyn LlmRunner, RunnerCapability, bool)] = &[
+            ("claude", &ClaudeRunner, Effort, true),
+            ("claude", &ClaudeRunner, StreamJson, true),
+            ("claude", &ClaudeRunner, Pty, true),
+            ("claude", &ClaudeRunner, DisallowedTools, true),
+            ("claude", &ClaudeRunner, TitleArtifactCleanup, true),
+            ("grok", &GrokRunner, Effort, true),
+            ("grok", &GrokRunner, StreamJson, true),
+            ("grok", &GrokRunner, Pty, false),
+            ("grok", &GrokRunner, DisallowedTools, true),
+            ("grok", &GrokRunner, TitleArtifactCleanup, false),
+        ];
+        for (name, runner, cap, expected) in expectations {
+            assert_eq!(
+                runner.supports(*cap),
+                *expected,
+                "{name}.supports({cap:?}) expected {expected}",
+            );
+        }
+    }
+
+    /// AC#4: enforcement completeness guard. Every `RunnerCapability` variant
+    /// MUST appear in [`CHECKS`]; otherwise its field silently no-ops at
+    /// dispatch and FEAT-003's contract is violated.
+    ///
+    /// `all_variants` is hand-rolled (no `strum` dep). The companion
+    /// `assert_exhaustive` match has NO wildcard arm — a new variant added
+    /// without updating this list fails to compile, which in turn fails the
+    /// runtime "every variant in CHECKS" assertion below.
+    #[test]
+    fn checks_table_covers_every_capability_variant() {
+        use RunnerCapability::*;
+        let all_variants: &[RunnerCapability] = &[
+            Effort,
+            StreamJson,
+            Pty,
+            DisallowedTools,
+            TitleArtifactCleanup,
+        ];
+        fn assert_exhaustive(cap: RunnerCapability) {
+            match cap {
+                Effort | StreamJson | Pty | DisallowedTools | TitleArtifactCleanup => {}
+            }
+        }
+        for v in all_variants {
+            assert_exhaustive(*v);
+            assert!(
+                CHECKS.iter().any(|(c, _, _)| c == v),
+                "RunnerCapability::{v:?} missing from CHECKS registry — \
+                 add a row in runner.rs::CHECKS or the dispatch guard \
+                 will silently ignore its RunnerOpts field"
+            );
+        }
+        assert_eq!(
+            CHECKS.len(),
+            all_variants.len(),
+            "CHECKS must contain exactly one row per variant; \
+             duplicate or stale rows mean enforcement order matters in ways \
+             the surface contract doesn't promise"
+        );
+    }
+
+    /// AC#6: `capability_name` returns the canonical label per variant.
+    /// Failure here means [`TaskMgrError::UnsupportedRunnerCapability`]'s
+    /// `capability_name` field carries the wrong string for operators.
+    #[test]
+    fn capability_name_returns_canonical_labels() {
+        assert_eq!(capability_name(RunnerCapability::Effort), "Effort");
+        assert_eq!(capability_name(RunnerCapability::StreamJson), "StreamJson");
+        assert_eq!(capability_name(RunnerCapability::Pty), "Pty");
+        assert_eq!(
+            capability_name(RunnerCapability::DisallowedTools),
+            "DisallowedTools"
+        );
+    }
+
+    /// AC#7 (Grok × use_pty: true) → Err(UnsupportedRunnerCapability {…}).
+    /// Asserts the specific error variant AND every static-string field so
+    /// a regression that flipped capability_name or field_name would fail
+    /// here, not just produce a vague Err.
+    #[test]
+    fn enforce_capabilities_grok_use_pty_rejected() {
+        let opts = RunnerOpts {
+            use_pty: true,
+            ..RunnerOpts::default()
+        };
+        let err = enforce_capabilities(&GrokRunner, RunnerKind::Grok, &opts)
+            .expect_err("Grok must refuse use_pty: true");
+        match err {
+            TaskMgrError::UnsupportedRunnerCapability {
+                runner_kind,
+                capability_name,
+                field_name,
+            } => {
+                assert_eq!(runner_kind, RunnerKind::Grok);
+                assert_eq!(capability_name, "Pty");
+                assert_eq!(field_name, "use_pty");
+            }
+            other => panic!("expected UnsupportedRunnerCapability, got {other:?}"),
+        }
+    }
+
+    /// AC#7 (Claude × use_pty: true) → Ok. Claude supports PTY; the field
+    /// being set is fine.
+    #[test]
+    fn enforce_capabilities_claude_use_pty_accepted() {
+        let opts = RunnerOpts {
+            use_pty: true,
+            ..RunnerOpts::default()
+        };
+        enforce_capabilities(&ClaudeRunner, RunnerKind::Claude, &opts)
+            .expect("Claude must accept use_pty: true");
+    }
+
+    /// AC#7 (both × RunnerOpts::default()) → Ok. No capability-driven
+    /// field is set, so no row in CHECKS fires.
+    #[test]
+    fn enforce_capabilities_default_opts_always_ok() {
+        enforce_capabilities(&ClaudeRunner, RunnerKind::Claude, &RunnerOpts::default())
+            .expect("Claude must accept RunnerOpts::default()");
+        enforce_capabilities(&GrokRunner, RunnerKind::Grok, &RunnerOpts::default())
+            .expect("Grok must accept RunnerOpts::default()");
+    }
+
+    /// AC#7 (Claude × stream_json: true) and (Grok × stream_json: true) → Ok.
+    /// Both runners declare `StreamJson` support.
+    #[test]
+    fn enforce_capabilities_stream_json_both_ok() {
+        let opts = RunnerOpts {
+            stream_json: true,
+            ..RunnerOpts::default()
+        };
+        enforce_capabilities(&ClaudeRunner, RunnerKind::Claude, &opts)
+            .expect("Claude must accept stream_json: true");
+        enforce_capabilities(&GrokRunner, RunnerKind::Grok, &opts)
+            .expect("Grok must accept stream_json: true");
+    }
+
+    /// AC#5 + AC#7: `Some("")` is treated as "no opinion" by the
+    /// `trim().is_empty()` predicate; both runners accept it regardless of
+    /// declared support.
+    #[test]
+    fn enforce_capabilities_effort_empty_value_is_no_opinion() {
+        let opts = RunnerOpts {
+            effort: Some(""),
+            ..RunnerOpts::default()
+        };
+        enforce_capabilities(&ClaudeRunner, RunnerKind::Claude, &opts)
+            .expect("empty effort must be treated as unset");
+        enforce_capabilities(&GrokRunner, RunnerKind::Grok, &opts)
+            .expect("empty effort must be treated as unset");
+    }
+
+    /// AC#5 + AC#7: whitespace-only effort is also "no opinion". Same
+    /// convention as [`push_optional_flag`] — a stray space from a config
+    /// file must not trip enforcement.
+    #[test]
+    fn enforce_capabilities_effort_whitespace_is_no_opinion() {
+        let opts = RunnerOpts {
+            effort: Some("  "),
+            ..RunnerOpts::default()
+        };
+        enforce_capabilities(&ClaudeRunner, RunnerKind::Claude, &opts)
+            .expect("whitespace-only effort must be treated as unset");
+        enforce_capabilities(&GrokRunner, RunnerKind::Grok, &opts)
+            .expect("whitespace-only effort must be treated as unset");
+    }
+
+    /// AC#5 + AC#7: same "no opinion" treatment for `disallowed_tools`
+    /// (the other Option<&str> field in the registry).
+    #[test]
+    fn enforce_capabilities_disallowed_tools_empty_is_no_opinion() {
+        let opts = RunnerOpts {
+            disallowed_tools: Some(""),
+            ..RunnerOpts::default()
+        };
+        enforce_capabilities(&ClaudeRunner, RunnerKind::Claude, &opts)
+            .expect("empty disallowed_tools must be treated as unset");
+        enforce_capabilities(&GrokRunner, RunnerKind::Grok, &opts)
+            .expect("empty disallowed_tools must be treated as unset");
+    }
+
+    /// AC#1: `dispatch` calls `enforce_capabilities` BEFORE the spawn
+    /// match. We assert this by setting `use_pty: true` on a Grok dispatch
+    /// with no `GROK_BINARY` configured — if enforcement ran AFTER spawn we
+    /// would see an `IoErrorWithContext` from the missing binary; instead we
+    /// must see `UnsupportedRunnerCapability` because the check fires first.
+    ///
+    /// No mutex needed: the Err path returns before any env read.
+    #[test]
+    fn dispatch_grok_use_pty_returns_unsupported_capability_before_spawn() {
+        let perm = scoped_coding();
+        let err = dispatch(
+            RunnerKind::Grok,
+            "probe",
+            &perm,
+            RunnerOpts {
+                use_pty: true,
+                ..RunnerOpts::default()
+            },
+        )
+        .expect_err("dispatch must reject Grok + use_pty before spawning");
+        match err {
+            TaskMgrError::UnsupportedRunnerCapability {
+                runner_kind,
+                capability_name,
+                field_name,
+            } => {
+                assert_eq!(runner_kind, RunnerKind::Grok);
+                assert_eq!(capability_name, "Pty");
+                assert_eq!(field_name, "use_pty");
+            }
+            other => panic!(
+                "enforcement must run before spawn; got {other:?} \
+                 (an IoErrorWithContext here would mean dispatch reached \
+                 the spawn match before the capability check)"
+            ),
+        }
     }
 
     fn scoped_coding() -> PermissionMode {
@@ -1044,18 +1716,12 @@ mod tests {
         );
     }
 
-    /// TEST-INIT-002 — cleanup_title_artifact is silently ignored. Grok
-    /// has no ai-title-jsonl leak, so the runner must not emit `--session-id`
-    /// and must not fail on `cleanup_title_artifact: true`. Verified by
-    /// dispatching with the flag set and asserting the run succeeds. (The
-    /// stronger argv assertion lives in the integration test
-    /// `tests/grok_runner_unit.rs::grok_runner_silently_ignores_cleanup_title_artifact`.)
+    /// TEST-INIT-002 — cleanup_title_artifact: true is rejected at dispatch for
+    /// Grok with `UnsupportedRunnerCapability`. Grok has no ai-title-jsonl leak;
+    /// `TitleArtifactCleanup` is `false` on `GrokRunner`. No subprocess should
+    /// be launched — dispatch must return Err before spawning.
     #[test]
-    fn dispatch_grok_silently_ignores_cleanup_title_artifact() {
-        let _guard = GROK_BINARY_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        let marker = "GROK_CLEANUP_IGNORED_MARKER";
-        let script = make_grok_marker_script("cleanup_ignored", marker);
-        unsafe { std::env::set_var("GROK_BINARY", script.to_str().unwrap()) };
+    fn dispatch_grok_rejects_cleanup_title_artifact() {
         let perm = scoped_coding();
         let result = dispatch(
             RunnerKind::Grok,
@@ -1066,14 +1732,93 @@ mod tests {
                 ..RunnerOpts::default()
             },
         );
-        unsafe { std::env::remove_var("GROK_BINARY") };
-        let _ = std::fs::remove_file(&script);
+        match result {
+            Err(TaskMgrError::UnsupportedRunnerCapability {
+                runner_kind,
+                capability_name,
+                field_name,
+            }) => {
+                assert_eq!(runner_kind, RunnerKind::Grok);
+                assert_eq!(capability_name, "TitleArtifactCleanup");
+                assert_eq!(field_name, "cleanup_title_artifact");
+            }
+            other => panic!("expected UnsupportedRunnerCapability, got {other:?}"),
+        }
+    }
 
-        let r = result.expect("dispatch returned Err");
-        assert_eq!(r.exit_code, 0);
-        assert!(
-            r.output.contains(marker),
-            "prompt round-trip lost when cleanup_title_artifact was set"
+    /// TEST-INIT-002 — GrokRunner discovers session id from pre/post dir diff.
+    ///
+    /// The mock grok binary reads `GROK_TEST_SESSION_DIR` and creates a fixed
+    /// UUID subdirectory there (simulating what the real Grok CLI does). After
+    /// child exit, GrokRunner computes the diff and populates
+    /// `RunnerResult::session_id` with the discovered UUID.
+    ///
+    /// Lock ordering: `RUNNER_HOME_ENV_MUTEX` first, then `GROK_BINARY_MUTEX`.
+    /// Any future test that holds both must use the same order to avoid deadlock.
+    #[test]
+    fn grok_runner_discovers_session_id_from_pre_post_dir_diff() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        // HOME mutex first, then GROK_BINARY mutex — consistent acquisition order.
+        let _guard_home = RUNNER_HOME_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard_bin = GROK_BINARY_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake_home = tmp.path().to_path_buf();
+        let fake_cwd = fake_home.join("workspace");
+        std::fs::create_dir_all(&fake_cwd).unwrap();
+
+        // Pre-create the encoded session dir (empty). Simulates a cwd with prior
+        // Grok activity but no session dirs from THIS run.
+        let session_dir = grok_encoded_session_dir(&fake_cwd, &fake_home);
+        std::fs::create_dir_all(&session_dir).unwrap();
+
+        // Known UUID the mock binary creates as a subdir during its execution.
+        let expected_uuid_str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let expected_uuid = Uuid::parse_str(expected_uuid_str).unwrap();
+
+        // Mock grok: create $GROK_TEST_SESSION_DIR/<uuid>/ then exit 0.
+        let script_path = std::env::temp_dir().join("task_mgr_grok_session_id_capture_test.sh");
+        {
+            let mut f = std::fs::File::create(&script_path).unwrap();
+            writeln!(f, "#!/bin/sh").unwrap();
+            writeln!(
+                f,
+                r#"mkdir -p "$GROK_TEST_SESSION_DIR/{expected_uuid_str}""#
+            )
+            .unwrap();
+            writeln!(f, r#"echo "session-capture-ok""#).unwrap();
+        }
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        unsafe { std::env::set_var("GROK_BINARY", script_path.to_str().unwrap()) };
+        unsafe { std::env::set_var("GROK_TEST_SESSION_DIR", session_dir.to_str().unwrap()) };
+        let _home = RunnerHomeGuard::set(&fake_home);
+
+        let perm = scoped_coding();
+        let result = dispatch(
+            RunnerKind::Grok,
+            "session-capture-probe",
+            &perm,
+            RunnerOpts {
+                working_dir: Some(&fake_cwd),
+                ..RunnerOpts::default()
+            },
+        );
+
+        unsafe { std::env::remove_var("GROK_BINARY") };
+        unsafe { std::env::remove_var("GROK_TEST_SESSION_DIR") };
+        let _ = std::fs::remove_file(&script_path);
+
+        let r = result.expect("dispatch(Grok) returned Err");
+        assert_eq!(r.exit_code, 0, "expected clean exit, got {r:?}");
+        assert_eq!(
+            r.session_id,
+            Some(expected_uuid),
+            "GrokRunner must discover session_id from pre/post dir diff, got {:?}",
+            r.session_id
         );
     }
 
@@ -1198,9 +1943,7 @@ mod tests {
         // Negative controls — common error phrases that must NOT match.
         assert!(!stderr_contains_auth_failure("file not found"));
         assert!(!stderr_contains_auth_failure("rate limit exceeded"));
-        assert!(!stderr_contains_auth_failure(
-            "internal server error (500)"
-        ));
+        assert!(!stderr_contains_auth_failure("internal server error (500)"));
     }
 
     /// Unit: binary resolution chain prefers `$GROK_BINARY`, then
@@ -1231,6 +1974,962 @@ mod tests {
         );
 
         unsafe { std::env::remove_var("GROK_BINARY") };
+    }
+
+    /// Test double for capability-gate unit tests.
+    ///
+    /// Callers set `supports_fn` to any closure-compatible `fn(RunnerCapability) -> bool`
+    /// so each test can construct an arbitrary capability matrix without touching
+    /// a production runner. `spawn` is unreachable in capability-gate tests;
+    /// it exists only to satisfy `LlmRunner`.
+    struct CapabilityFakeRunner {
+        pub supports_fn: fn(RunnerCapability) -> bool,
+    }
+
+    impl LlmRunner for CapabilityFakeRunner {
+        fn supports(&self, cap: RunnerCapability) -> bool {
+            (self.supports_fn)(cap)
+        }
+
+        fn spawn(
+            &self,
+            _prompt: &str,
+            _permission_mode: &PermissionMode,
+            _opts: RunnerOpts<'_>,
+        ) -> TaskMgrResult<RunnerResult> {
+            unreachable!(
+                "CapabilityFakeRunner exists only for capability-gate tests; spawn is never called"
+            )
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // TEST-INIT-001 — TDD scaffolding for FEAT-001/-002.
+    //
+    // These tests pin the cleanup-side contracts of the Phase 1 trait
+    // hygiene work. Each test names the FEAT that owns its acceptance
+    // criterion in the `#[ignore]` reason (learning #2813); the gating
+    // FEAT task removes the `#[ignore]` line as part of its acceptance.
+    //
+    // Why some tests remain #[ignore]d:
+    //   - `cleanup_claude_session_artifact` is fully promoted (FEAT-001 done).
+    //     The three FEAT-001 tests are now live.
+    //   - `grok_encoded_session_dir` uses `urlencoding::encode` (FEAT-002 done).
+    //     All three grok round-trip tests are now live.
+    // ---------------------------------------------------------------------
+
+    /// Serializes env-var mutation across HOME-sensitive tests; HOME is
+    /// process-global and leaking it into concurrent tests would make them
+    /// flaky. Mirrors the pattern at `claude.rs:3056` so the two test
+    /// modules don't race against each other when both touch HOME.
+    static RUNNER_HOME_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Restores HOME (or unsets it) on drop, so a failed assertion doesn't
+    /// leak the fake HOME into subsequent tests. Mirrors `claude.rs:3060`.
+    struct RunnerHomeGuard {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl RunnerHomeGuard {
+        fn set(value: &Path) -> Self {
+            let previous = std::env::var_os("HOME");
+            unsafe { std::env::set_var("HOME", value) };
+            Self { previous }
+        }
+    }
+
+    impl Drop for RunnerHomeGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(v) => unsafe { std::env::set_var("HOME", v) },
+                None => unsafe { std::env::remove_var("HOME") },
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Test infrastructure: FakeRunner
+    //
+    // `#[cfg(test)]` only — NOT a production dry-run mode (PRD non-goals §5).
+    // Production dispatch always routes through `RunnerKind` → a real CLI binary.
+    //
+    // Design: closures for both spawn and cleanup results so tests capture
+    // any pre-built RunnerResult or error without needing RunnerResult: Clone.
+    // -----------------------------------------------------------------
+
+    /// Test-only seam implementing [`LlmRunner`] without invoking a real CLI subprocess.
+    ///
+    /// Use this struct to verify dispatch's post-spawn cleanup hook and any other
+    /// code that calls through the `LlmRunner` trait. It is `#[cfg(test)]` only —
+    /// NOT a production dry-run mode (PRD non-goals §5).
+    ///
+    /// # Construction
+    ///
+    /// ```ignore
+    /// let recorder = Arc::new(Mutex::new(Vec::new()));
+    /// let runner = FakeRunner::new(
+    ///     Box::new(|| Ok(RunnerResult { exit_code: 0, output: "ok".into(), … })),
+    ///     Some(Box::new(|cwd| { std::fs::write(cwd.join("uuid.jsonl"), "").unwrap(); })),
+    ///     Arc::clone(&recorder),
+    ///     Box::new(|| Ok(())),
+    /// );
+    /// ```
+    pub(super) type SpawnFn = Box<dyn Fn() -> TaskMgrResult<RunnerResult> + Send + Sync>;
+    pub(super) type ArtifactFn = Box<dyn Fn(&Path) + Send + Sync>;
+    pub(super) type CleanupFn = Box<dyn Fn() -> TaskMgrResult<()> + Send + Sync>;
+
+    pub(super) struct FakeRunner {
+        /// Returns the RunnerResult (or Err) for each `spawn()` call.
+        spawn_fn: SpawnFn,
+        /// Optional side-effect closure invoked inside `spawn()` BEFORE returning,
+        /// simulating what the real CLI writes to disk (e.g. a `<uuid>.jsonl` for
+        /// Claude, or a `<uuid>/` directory for Grok). Receives the cwd `&Path`.
+        artifact_fn: Option<ArtifactFn>,
+        /// Records every `(session_id, cwd)` pair passed to `cleanup_session()`.
+        cleanup_recorder: Arc<Mutex<Vec<(Uuid, PathBuf)>>>,
+        /// Returns `Ok(())` or `Err(…)` for each `cleanup_session()` call.
+        cleanup_fn: CleanupFn,
+    }
+
+    impl FakeRunner {
+        pub(super) fn new(
+            spawn_fn: SpawnFn,
+            artifact_fn: Option<ArtifactFn>,
+            cleanup_recorder: Arc<Mutex<Vec<(Uuid, PathBuf)>>>,
+            cleanup_fn: CleanupFn,
+        ) -> Self {
+            Self {
+                spawn_fn,
+                artifact_fn,
+                cleanup_recorder,
+                cleanup_fn,
+            }
+        }
+    }
+
+    impl LlmRunner for FakeRunner {
+        fn spawn(
+            &self,
+            _prompt: &str,
+            _permission_mode: &PermissionMode,
+            opts: RunnerOpts<'_>,
+        ) -> TaskMgrResult<RunnerResult> {
+            let cwd = opts
+                .working_dir
+                .map(|p| p.to_path_buf())
+                .or_else(|| std::env::current_dir().ok())
+                .unwrap_or_default();
+            if let Some(ref f) = self.artifact_fn {
+                f(&cwd);
+            }
+            (self.spawn_fn)()
+        }
+
+        fn cleanup_session(&self, session_id: Uuid, cwd: &Path) -> TaskMgrResult<()> {
+            if let Ok(mut recorder) = self.cleanup_recorder.lock() {
+                recorder.push((session_id, cwd.to_path_buf()));
+            }
+            (self.cleanup_fn)()
+        }
+    }
+
+    /// AC (FEAT-008): `cleanup_session` pushes the exact `(session_id, cwd)` pair
+    /// onto the recorder and returns the configured `Ok(())`.
+    #[test]
+    fn fake_runner_cleanup_records_session_and_cwd() {
+        let recorder: Arc<Mutex<Vec<(Uuid, PathBuf)>>> = Arc::new(Mutex::new(Vec::new()));
+        let runner = FakeRunner::new(
+            Box::new(|| {
+                Ok(RunnerResult {
+                    exit_code: 0,
+                    output: String::new(),
+                    conversation: None,
+                    timed_out: false,
+                    completion_killed: false,
+                    permission_denials: Vec::new(),
+                    session_id: None,
+                })
+            }),
+            None,
+            Arc::clone(&recorder),
+            Box::new(|| Ok(())),
+        );
+
+        let session_id = Uuid::new_v4();
+        let cwd = Path::new("/tmp/fake-runner-test-cwd");
+        let result = runner.cleanup_session(session_id, cwd);
+
+        assert!(
+            result.is_ok(),
+            "cleanup_fn=Ok must return Ok, got {result:?}"
+        );
+        let recorded = recorder.lock().unwrap();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "one cleanup_session call must push one entry"
+        );
+        assert_eq!(
+            recorded[0].0, session_id,
+            "recorded session_id must match arg"
+        );
+        assert_eq!(
+            recorded[0].1,
+            PathBuf::from(cwd),
+            "recorded cwd must match arg"
+        );
+    }
+
+    /// AC (FEAT-008): configuring `cleanup_fn` to return `Err` is surfaced to the
+    /// caller unchanged — the recorder still captures the call first.
+    #[test]
+    fn fake_runner_cleanup_returns_configured_err() {
+        let recorder: Arc<Mutex<Vec<(Uuid, PathBuf)>>> = Arc::new(Mutex::new(Vec::new()));
+        let runner = FakeRunner::new(
+            Box::new(|| {
+                Ok(RunnerResult {
+                    exit_code: 0,
+                    output: String::new(),
+                    conversation: None,
+                    timed_out: false,
+                    completion_killed: false,
+                    permission_denials: Vec::new(),
+                    session_id: None,
+                })
+            }),
+            None,
+            Arc::clone(&recorder),
+            Box::new(|| {
+                Err(TaskMgrError::IoErrorWithContext {
+                    file_path: "/fake/path".to_string(),
+                    operation: "fake cleanup error".to_string(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "fake denied",
+                    ),
+                })
+            }),
+        );
+
+        let session_id = Uuid::new_v4();
+        let result = runner.cleanup_session(session_id, Path::new("/tmp"));
+        assert!(
+            result.is_err(),
+            "cleanup_fn=Err must return Err, got {result:?}"
+        );
+        // Recorder still captures the call even when cleanup returns Err.
+        let recorded = recorder.lock().unwrap();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "recorder must capture the call even on cleanup Err"
+        );
+    }
+
+    /// AC (FEAT-008): `spawn` invokes `artifact_fn` with the resolved cwd BEFORE
+    /// returning the templated `RunnerResult`. Tests that simulate CLI side-effects
+    /// (writing files / dirs) rely on this ordering.
+    #[test]
+    fn fake_runner_spawn_invokes_artifact_fn_with_working_dir() {
+        let artifact_log: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
+        let log_clone = Arc::clone(&artifact_log);
+        let recorder: Arc<Mutex<Vec<(Uuid, PathBuf)>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let runner = FakeRunner::new(
+            Box::new(|| {
+                Ok(RunnerResult {
+                    exit_code: 0,
+                    output: "spawned".into(),
+                    conversation: None,
+                    timed_out: false,
+                    completion_killed: false,
+                    permission_denials: Vec::new(),
+                    session_id: None,
+                })
+            }),
+            Some(Box::new(move |cwd| {
+                log_clone.lock().unwrap().push(cwd.to_path_buf());
+            })),
+            Arc::clone(&recorder),
+            Box::new(|| Ok(())),
+        );
+
+        let perm = scoped_coding();
+        let result = runner.spawn(
+            "test-prompt",
+            &perm,
+            RunnerOpts {
+                working_dir: Some(Path::new("/tmp/test-working-dir")),
+                ..RunnerOpts::default()
+            },
+        );
+        assert!(
+            result.is_ok(),
+            "spawn must return the configured result, got {result:?}"
+        );
+        assert!(
+            result.unwrap().output.contains("spawned"),
+            "spawn must return the configured RunnerResult"
+        );
+        let log = artifact_log.lock().unwrap();
+        assert_eq!(
+            log.len(),
+            1,
+            "artifact_fn must be called exactly once inside spawn"
+        );
+        assert_eq!(
+            log[0],
+            PathBuf::from("/tmp/test-working-dir"),
+            "artifact_fn receives opts.working_dir as cwd"
+        );
+    }
+
+    /// `#[cfg(test)]` stub that implements `LlmRunner` without overriding
+    /// `cleanup_session`. Exists exclusively to exercise the trait's
+    /// default-method body. `spawn` is `unreachable!()` because the
+    /// default-impl tests never invoke it.
+    struct FakeNoOpRunner;
+
+    impl LlmRunner for FakeNoOpRunner {
+        fn spawn(
+            &self,
+            _prompt: &str,
+            _permission_mode: &PermissionMode,
+            _opts: RunnerOpts<'_>,
+        ) -> TaskMgrResult<RunnerResult> {
+            unreachable!("FakeNoOpRunner exists only to test the trait default cleanup_session")
+        }
+    }
+
+    /// AC (TEST-INIT-001 #1): the `LlmRunner::cleanup_session` default impl
+    /// returns `Ok(())` for any (session_id, cwd) pair when the implementing
+    /// type does NOT override the method. Drives the FEAT-002 contract that
+    /// providers without a headless artifact opt out of cleanup by simply
+    /// inheriting the default — no boilerplate `fn cleanup_session(...) {
+    /// Ok(()) }` overrides scattered through future impls.
+    #[test]
+    fn cleanup_session_default_impl_returns_ok() {
+        let session = Uuid::new_v4();
+        let cwd = Path::new("/tmp/does-not-matter-for-noop-default");
+        let result = FakeNoOpRunner.cleanup_session(session, cwd);
+        assert!(
+            result.is_ok(),
+            "default cleanup_session impl must be a silent no-op success, got {result:?}"
+        );
+    }
+
+    /// AC (TEST-INIT-001 #2): `grok_encoded_session_dir(/home/user/repo,
+    /// /home/user)` returns `<home>/.grok/sessions/%2Fhome%2Fuser%2Frepo/`.
+    /// The `/` → `%2F` substitution is the documented percent-encoding
+    /// contract (FEAT-002 will satisfy via `urlencoding::encode`).
+    #[test]
+    fn grok_encoded_session_dir_matches_observed_on_disk_path() {
+        let cwd = Path::new("/home/user/repo");
+        let home = Path::new("/home/user");
+        let got = grok_encoded_session_dir(cwd, home);
+        let expected: PathBuf = [
+            home.to_string_lossy().as_ref(),
+            ".grok",
+            "sessions",
+            "%2Fhome%2Fuser%2Frepo",
+        ]
+        .iter()
+        .collect();
+        assert_eq!(
+            got, expected,
+            "grok_encoded_session_dir must produce <home>/.grok/sessions/<encoded-cwd>/, \
+             got {got:?}",
+        );
+    }
+
+    /// AC (TEST-INIT-001 #3): a trailing-slash cwd MUST normalize to the
+    /// same directory as the no-slash form. Closes the divergence that
+    /// would otherwise let `/foo/` and `/foo` accumulate two distinct
+    /// per-session directories that never get cleaned together.
+    #[test]
+    fn grok_encoded_session_dir_trailing_slash_normalizes_to_no_slash() {
+        let home = Path::new("/home/user");
+        let with_slash = grok_encoded_session_dir(Path::new("/home/user/repo/"), home);
+        let no_slash = grok_encoded_session_dir(Path::new("/home/user/repo"), home);
+        assert_eq!(
+            with_slash, no_slash,
+            "trailing slash must be trimmed before encoding; got {with_slash:?} vs {no_slash:?}",
+        );
+    }
+
+    /// AC (TEST-INIT-001 #8): structural assertion — the encoded directory
+    /// is absolute when `home` is absolute. Guards against an accidental
+    /// future refactor that strips `home` (e.g. by encoding the absolute
+    /// cwd alone and forgetting to prepend the sessions root).
+    #[test]
+    fn grok_encoded_session_dir_result_is_absolute_when_home_is_absolute() {
+        let got = grok_encoded_session_dir(Path::new("/home/user/repo"), Path::new("/home/user"));
+        assert!(
+            PathBuf::from(&got).is_absolute(),
+            "encoded session dir must be absolute when HOME is absolute, got {got:?}",
+        );
+    }
+
+    /// AC (TEST-INIT-001 #4 + #7): the helper deletes ONLY the deterministic
+    /// UUID-named jsonl and leaves a bystander jsonl in the same encoded_cwd
+    /// directory untouched. Mirrors the bystander test at `claude.rs:3087`
+    /// but drives the **runner.rs** symbol so FEAT-001's promotion is what
+    /// gets exercised, not the legacy claude.rs site.
+    ///
+    /// Known-bad discriminator: a stub returning `Ok(())` without removing
+    /// anything would pass the return-value check but fail
+    /// `assert!(!target.exists())`. The presence of the existence-check is
+    /// load-bearing — do not relax it.
+    #[test]
+    fn cleanup_claude_session_artifact_deletes_target_preserves_bystander() {
+        use crate::loop_engine::claude::encoded_cwd_dir;
+        let _guard = RUNNER_HOME_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake_home = tmp.path().to_path_buf();
+        let fake_cwd = fake_home.join("workspace");
+        std::fs::create_dir_all(&fake_cwd).unwrap();
+
+        let projects_dir = encoded_cwd_dir(&fake_cwd, &fake_home);
+        std::fs::create_dir_all(&projects_dir).unwrap();
+
+        let bystander_uuid = Uuid::new_v4();
+        let bystander = projects_dir.join(format!("{}.jsonl", bystander_uuid));
+        std::fs::write(&bystander, "untouched").unwrap();
+
+        let target_uuid = Uuid::new_v4();
+        let target = projects_dir.join(format!("{}.jsonl", target_uuid));
+        std::fs::write(&target, "to-be-deleted").unwrap();
+
+        let _home = RunnerHomeGuard::set(&fake_home);
+        let result = cleanup_claude_session_artifact(target_uuid, Some(&fake_cwd));
+
+        assert!(
+            result.is_ok(),
+            "expected Ok on successful removal, got {result:?}"
+        );
+        assert!(
+            !target.exists(),
+            "cleanup_claude_session_artifact must remove the UUID-matched target file",
+        );
+        assert!(
+            bystander.exists(),
+            "cleanup_claude_session_artifact must not touch a .jsonl with a different UUID",
+        );
+    }
+
+    /// AC (TEST-INIT-001 #5): a missing target file is silent success.
+    /// Claude may crash before writing the ai-title artifact (or a future
+    /// upstream may stop leaking entirely); `NotFound` must collapse to
+    /// `Ok(())` so dispatch doesn't paint a misleading red banner.
+    #[test]
+    fn cleanup_claude_session_artifact_missing_target_is_ok() {
+        let _guard = RUNNER_HOME_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake_home = tmp.path().to_path_buf();
+        let fake_cwd = fake_home.join("workspace");
+        std::fs::create_dir_all(&fake_cwd).unwrap();
+        // Deliberately do NOT create the encoded projects dir or any file.
+
+        let _home = RunnerHomeGuard::set(&fake_home);
+        let result = cleanup_claude_session_artifact(Uuid::new_v4(), Some(&fake_cwd));
+
+        assert!(
+            result.is_ok(),
+            "NotFound must be silent success, got {result:?}",
+        );
+    }
+
+    /// AC (TEST-INIT-001 #6): a non-`NotFound` IO error (here:
+    /// `PermissionDenied` from a read-only parent dir) returns
+    /// `Err(TaskMgrError::IoErrorWithContext { .. })` so dispatch can route
+    /// it to the warn-once banner. The exact variant must be
+    /// `IoErrorWithContext` (not bare `IoError`) so the operator sees the
+    /// path + operation context.
+    ///
+    /// Skipped on root (euid 0) — root bypasses unix DAC permission checks
+    /// and `remove_file` would succeed against a 0o555 parent.
+    #[test]
+    fn cleanup_claude_session_artifact_propagates_permission_denied_as_io_error() {
+        use crate::loop_engine::claude::encoded_cwd_dir;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // SAFETY: getuid() is always safe; just an FFI call returning u32.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!(
+                "skipping cleanup_claude_session_artifact_propagates_permission_denied_as_io_error: \
+                 root bypasses DAC checks"
+            );
+            return;
+        }
+
+        let _guard = RUNNER_HOME_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake_home = tmp.path().to_path_buf();
+        let fake_cwd = fake_home.join("workspace");
+        std::fs::create_dir_all(&fake_cwd).unwrap();
+
+        let projects_dir = encoded_cwd_dir(&fake_cwd, &fake_home);
+        std::fs::create_dir_all(&projects_dir).unwrap();
+
+        let target_uuid = Uuid::new_v4();
+        let target = projects_dir.join(format!("{}.jsonl", target_uuid));
+        std::fs::write(&target, "blocked-by-readonly-parent").unwrap();
+
+        // Make the parent dir read+exec only — file exists but cannot be removed.
+        let original = std::fs::metadata(&projects_dir).unwrap().permissions();
+        std::fs::set_permissions(&projects_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let _home = RunnerHomeGuard::set(&fake_home);
+        let result = cleanup_claude_session_artifact(target_uuid, Some(&fake_cwd));
+
+        // Restore perms before assertions so the tempdir can be cleaned up
+        // even when assertions fail.
+        std::fs::set_permissions(&projects_dir, original).unwrap();
+
+        match result {
+            Err(TaskMgrError::IoErrorWithContext { source, .. }) => {
+                assert_eq!(
+                    source.kind(),
+                    std::io::ErrorKind::PermissionDenied,
+                    "expected PermissionDenied IO kind, got {:?}",
+                    source.kind(),
+                );
+            }
+            Err(TaskMgrError::IoError(e)) => panic!(
+                "expected IoErrorWithContext for cleanup failure context, got bare IoError({e:?})",
+            ),
+            Err(other) => panic!("expected IoErrorWithContext, got Err({other:?})"),
+            Ok(()) => panic!("expected Err on PermissionDenied, got Ok(())"),
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // TEST-INIT-002 — TDD scaffolding for FEAT-005 + FEAT-006.
+    //
+    // These tests pin the concrete `LlmRunner::cleanup_session` overrides on
+    // `ClaudeRunner` and `GrokRunner`. Both impls currently inherit the
+    // trait's default `Ok(())` body, so EVERY test below fails its
+    // post-condition (target file/dir still exists) until FEAT-006 wires
+    // the real per-runner cleanup. The tests stay `#[ignore]`d on the
+    // FEAT-006 gate per learning #2813 — FEAT-006 un-ignores them as part
+    // of its acceptance.
+    //
+    // Discriminator vs default impl: each test asserts BOTH that the call
+    // returned `Ok(())` AND that the deterministic target was removed (or
+    // preserved, for bystander cases). A stub returning `Ok(())` without
+    // touching the filesystem (i.e. today's default impl) fails the
+    // existence assertion — that's the FEAT-006 driver.
+    //
+    // Idempotency note: a second call against a fully-cleaned tempdir must
+    // collapse `NotFound` to `Ok(())`. Learning #2847 — never enumerate-
+    // and-sweep; deletion targets the exact (session_id, cwd) tuple.
+    // ---------------------------------------------------------------------
+
+    /// AC (TEST-INIT-002 #1): `ClaudeRunner::cleanup_session` removes the
+    /// per-session ai-title jsonl at `<HOME>/.claude/projects/<encoded-cwd>/<uuid>.jsonl`.
+    /// Mirrors the bystander fixture pattern at `claude.rs:3121-3138` but
+    /// targets the runner trait method so FEAT-006's override is the path
+    /// under test.
+    #[test]
+    fn claude_runner_cleanup_session_deletes_target_when_present() {
+        use crate::loop_engine::claude::encoded_cwd_dir;
+        let _guard = RUNNER_HOME_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake_home = tmp.path().to_path_buf();
+        let fake_cwd = fake_home.join("workspace");
+        std::fs::create_dir_all(&fake_cwd).unwrap();
+
+        let projects_dir = encoded_cwd_dir(&fake_cwd, &fake_home);
+        std::fs::create_dir_all(&projects_dir).unwrap();
+
+        let target_uuid = Uuid::new_v4();
+        let target = projects_dir.join(format!("{}.jsonl", target_uuid));
+        std::fs::write(&target, "to-be-deleted").unwrap();
+
+        let _home = RunnerHomeGuard::set(&fake_home);
+        let result = ClaudeRunner.cleanup_session(target_uuid, &fake_cwd);
+
+        assert!(
+            result.is_ok(),
+            "expected Ok on successful removal, got {result:?}",
+        );
+        assert!(
+            !target.exists(),
+            "ClaudeRunner::cleanup_session must remove <home>/.claude/projects/<encoded-cwd>/<uuid>.jsonl",
+        );
+    }
+
+    /// AC (TEST-INIT-002 #2): a second `cleanup_session` call against the
+    /// already-cleaned tuple must collapse `NotFound` into silent
+    /// `Ok(())`. Guards against a regression where the impl unconditionally
+    /// raises `IoErrorWithContext` on missing targets and paints the
+    /// warn-once banner every iteration of a stable, leak-free build.
+    #[test]
+    fn claude_runner_cleanup_session_is_idempotent() {
+        use crate::loop_engine::claude::encoded_cwd_dir;
+        let _guard = RUNNER_HOME_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake_home = tmp.path().to_path_buf();
+        let fake_cwd = fake_home.join("workspace");
+        std::fs::create_dir_all(&fake_cwd).unwrap();
+
+        let projects_dir = encoded_cwd_dir(&fake_cwd, &fake_home);
+        std::fs::create_dir_all(&projects_dir).unwrap();
+
+        let target_uuid = Uuid::new_v4();
+        let target = projects_dir.join(format!("{}.jsonl", target_uuid));
+        std::fs::write(&target, "first-pass-removes-me").unwrap();
+
+        let _home = RunnerHomeGuard::set(&fake_home);
+        let first = ClaudeRunner.cleanup_session(target_uuid, &fake_cwd);
+        assert!(first.is_ok(), "first cleanup expected Ok, got {first:?}");
+        assert!(!target.exists(), "first cleanup must remove the target");
+
+        let second = ClaudeRunner.cleanup_session(target_uuid, &fake_cwd);
+        assert!(
+            second.is_ok(),
+            "second cleanup against missing target must be silent Ok (NotFound collapses), got {second:?}",
+        );
+    }
+
+    /// AC (TEST-INIT-002 #3): two jsonl files share the encoded_cwd dir.
+    /// `cleanup_session(target_uuid, cwd)` removes ONLY the matching uuid.jsonl
+    /// and leaves the unrelated jsonl untouched. Drives the "deterministic
+    /// UUID lookup, never enumerate-and-sweep" invariant (learning #2847).
+    #[test]
+    fn claude_runner_cleanup_session_preserves_unrelated_jsonl() {
+        use crate::loop_engine::claude::encoded_cwd_dir;
+        let _guard = RUNNER_HOME_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake_home = tmp.path().to_path_buf();
+        let fake_cwd = fake_home.join("workspace");
+        std::fs::create_dir_all(&fake_cwd).unwrap();
+
+        let projects_dir = encoded_cwd_dir(&fake_cwd, &fake_home);
+        std::fs::create_dir_all(&projects_dir).unwrap();
+
+        let bystander_uuid = Uuid::new_v4();
+        let bystander = projects_dir.join(format!("{}.jsonl", bystander_uuid));
+        std::fs::write(&bystander, "untouched").unwrap();
+
+        let target_uuid = Uuid::new_v4();
+        let target = projects_dir.join(format!("{}.jsonl", target_uuid));
+        std::fs::write(&target, "to-be-deleted").unwrap();
+
+        let _home = RunnerHomeGuard::set(&fake_home);
+        let result = ClaudeRunner.cleanup_session(target_uuid, &fake_cwd);
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+        assert!(!target.exists(), "target uuid.jsonl must be removed");
+        assert!(
+            bystander.exists(),
+            "bystander uuid.jsonl in the same encoded_cwd dir must NOT be touched",
+        );
+    }
+
+    /// AC (TEST-INIT-002 #4): `GrokRunner::cleanup_session` recursively
+    /// removes the per-session DIRECTORY at
+    /// `<HOME>/.grok/sessions/<percent-encoded-cwd>/<uuid>/`. Grok leaks a
+    /// directory of artifacts per session (strictly worse than Claude's
+    /// single file), so the impl must `remove_dir_all` the uuid subdir —
+    /// not just unlink one file inside it.
+    #[test]
+    fn grok_runner_cleanup_session_recursively_deletes_session_dir() {
+        let _guard = RUNNER_HOME_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake_home = tmp.path().to_path_buf();
+        let fake_cwd = fake_home.join("workspace");
+        std::fs::create_dir_all(&fake_cwd).unwrap();
+
+        let encoded = grok_encoded_session_dir(&fake_cwd, &fake_home);
+        let target_uuid = Uuid::new_v4();
+        let target_dir = encoded.join(target_uuid.to_string());
+        // Populate the session dir with nested children so a non-recursive
+        // remove would fail loudly. Mirrors the on-disk shape FEAT-005 captures.
+        std::fs::create_dir_all(target_dir.join("nested")).unwrap();
+        std::fs::write(target_dir.join("session.json"), "{}").unwrap();
+        std::fs::write(target_dir.join("nested/chunk.json"), "{}").unwrap();
+
+        let _home = RunnerHomeGuard::set(&fake_home);
+        let result = GrokRunner.cleanup_session(target_uuid, &fake_cwd);
+
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+        assert!(
+            !target_dir.exists(),
+            "GrokRunner::cleanup_session must recursively remove <home>/.grok/sessions/<encoded-cwd>/<uuid>/",
+        );
+    }
+
+    /// AC (TEST-INIT-002 #5): `prompt_history.jsonl` at
+    /// `<HOME>/.grok/sessions/<percent-encoded-cwd>/prompt_history.jsonl`
+    /// accumulates across sessions by design. The cleanup MUST leave it
+    /// alone; widening the delete to the encoded_cwd dir is the failure
+    /// mode this test guards.
+    #[test]
+    fn grok_runner_cleanup_session_preserves_prompt_history_jsonl() {
+        let _guard = RUNNER_HOME_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake_home = tmp.path().to_path_buf();
+        let fake_cwd = fake_home.join("workspace");
+        std::fs::create_dir_all(&fake_cwd).unwrap();
+
+        let encoded = grok_encoded_session_dir(&fake_cwd, &fake_home);
+        std::fs::create_dir_all(&encoded).unwrap();
+        let prompt_history = encoded.join("prompt_history.jsonl");
+        std::fs::write(&prompt_history, "{\"keep\":\"me\"}\n").unwrap();
+
+        let target_uuid = Uuid::new_v4();
+        let target_dir = encoded.join(target_uuid.to_string());
+        std::fs::create_dir_all(&target_dir).unwrap();
+        std::fs::write(target_dir.join("session.json"), "{}").unwrap();
+
+        let _home = RunnerHomeGuard::set(&fake_home);
+        let result = GrokRunner.cleanup_session(target_uuid, &fake_cwd);
+
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+        assert!(!target_dir.exists(), "target session dir must be removed");
+        assert!(
+            prompt_history.exists(),
+            "prompt_history.jsonl at <encoded-cwd>/prompt_history.jsonl must be preserved \
+             (it accumulates across sessions by design)",
+        );
+        // Content untouched, not just existence — the file might have been
+        // truncated by a buggy impl that opened it for write.
+        let body = std::fs::read_to_string(&prompt_history).unwrap();
+        assert_eq!(
+            body, "{\"keep\":\"me\"}\n",
+            "prompt_history.jsonl content mutated"
+        );
+    }
+
+    /// AC (TEST-INIT-002 #6): two session uuid subdirs share the
+    /// encoded_cwd dir. `cleanup_session(target_uuid, cwd)` removes ONLY
+    /// the matching one. Parallel-slot loops have multiple grok sessions
+    /// in flight under the same cwd; a wrong impl that sweeps the
+    /// encoded_cwd dir would nuke a peer slot's live session.
+    #[test]
+    fn grok_runner_cleanup_session_preserves_other_uuid_subdirs() {
+        let _guard = RUNNER_HOME_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake_home = tmp.path().to_path_buf();
+        let fake_cwd = fake_home.join("workspace");
+        std::fs::create_dir_all(&fake_cwd).unwrap();
+
+        let encoded = grok_encoded_session_dir(&fake_cwd, &fake_home);
+
+        let bystander_uuid = Uuid::new_v4();
+        let bystander_dir = encoded.join(bystander_uuid.to_string());
+        std::fs::create_dir_all(&bystander_dir).unwrap();
+        std::fs::write(bystander_dir.join("session.json"), "peer-slot").unwrap();
+
+        let target_uuid = Uuid::new_v4();
+        let target_dir = encoded.join(target_uuid.to_string());
+        std::fs::create_dir_all(&target_dir).unwrap();
+        std::fs::write(target_dir.join("session.json"), "to-be-deleted").unwrap();
+
+        let _home = RunnerHomeGuard::set(&fake_home);
+        let result = GrokRunner.cleanup_session(target_uuid, &fake_cwd);
+
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+        assert!(!target_dir.exists(), "target uuid dir must be removed");
+        assert!(
+            bystander_dir.exists(),
+            "peer uuid session dir under the same encoded_cwd must NOT be touched",
+        );
+        assert!(
+            bystander_dir.join("session.json").exists(),
+            "peer session.json must remain intact (no enumerate-and-sweep)",
+        );
+    }
+
+    /// AC (TEST-INIT-002 #7): a second `GrokRunner::cleanup_session` call
+    /// against the already-removed tuple is silent `Ok(())`. Symmetric to
+    /// the Claude idempotency case; Grok's `remove_dir_all` raises
+    /// `NotFound` on a missing dir and the impl must collapse it.
+    #[test]
+    fn grok_runner_cleanup_session_is_idempotent() {
+        let _guard = RUNNER_HOME_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake_home = tmp.path().to_path_buf();
+        let fake_cwd = fake_home.join("workspace");
+        std::fs::create_dir_all(&fake_cwd).unwrap();
+
+        let encoded = grok_encoded_session_dir(&fake_cwd, &fake_home);
+        let target_uuid = Uuid::new_v4();
+        let target_dir = encoded.join(target_uuid.to_string());
+        std::fs::create_dir_all(&target_dir).unwrap();
+        std::fs::write(target_dir.join("session.json"), "first-pass-removes-me").unwrap();
+
+        let _home = RunnerHomeGuard::set(&fake_home);
+        let first = GrokRunner.cleanup_session(target_uuid, &fake_cwd);
+        assert!(first.is_ok(), "first cleanup expected Ok, got {first:?}");
+        assert!(
+            !target_dir.exists(),
+            "first cleanup must remove the target dir"
+        );
+
+        let second = GrokRunner.cleanup_session(target_uuid, &fake_cwd);
+        assert!(
+            second.is_ok(),
+            "second cleanup against missing dir must be silent Ok (NotFound collapses), got {second:?}",
+        );
+    }
+
+    /// AC (TEST-INIT-002 #8): both impls accept an absolute, path-resolved
+    /// `&Path` for `cwd` — the shape dispatch will hand them in FEAT-006
+    /// after resolving `RunnerOpts.working_dir` or falling back to
+    /// `current_dir`. This is primarily a type/wiring sanity check: a
+    /// resolved cwd produces a deterministic encoded dir on both providers
+    /// and the cleanup call returns `Ok(())`. Empty/missing-dir state on
+    /// disk is fine — idempotency already covers that path.
+    #[test]
+    fn runners_cleanup_session_accepts_resolved_cwd_path() {
+        let _guard = RUNNER_HOME_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake_home = tmp.path().to_path_buf();
+        // Resolved absolute path, matching the dispatch wiring contract.
+        let resolved_cwd: PathBuf = fake_home.join("resolved-workspace");
+        std::fs::create_dir_all(&resolved_cwd).unwrap();
+        assert!(
+            resolved_cwd.is_absolute(),
+            "test fixture must mirror dispatch's path-resolved cwd shape",
+        );
+
+        let _home = RunnerHomeGuard::set(&fake_home);
+        let session = Uuid::new_v4();
+
+        let claude = ClaudeRunner.cleanup_session(session, &resolved_cwd);
+        assert!(
+            claude.is_ok(),
+            "ClaudeRunner::cleanup_session must accept an absolute resolved cwd, got {claude:?}",
+        );
+
+        let grok = GrokRunner.cleanup_session(session, &resolved_cwd);
+        assert!(
+            grok.is_ok(),
+            "GrokRunner::cleanup_session must accept an absolute resolved cwd, got {grok:?}",
+        );
+    }
+
+    /// AC: a FakeRunner that supports no capabilities refuses every
+    /// capability-driven RunnerOpts field (Pty, StreamJson, Effort,
+    /// DisallowedTools) via enforce_capabilities.
+    #[test]
+    fn fake_runner_all_false_refuses_every_capability_driven_field() {
+        let runner = CapabilityFakeRunner {
+            supports_fn: |_| false,
+        };
+        let cases: &[(&str, RunnerOpts<'_>)] = &[
+            (
+                "use_pty",
+                RunnerOpts {
+                    use_pty: true,
+                    ..RunnerOpts::default()
+                },
+            ),
+            (
+                "stream_json",
+                RunnerOpts {
+                    stream_json: true,
+                    ..RunnerOpts::default()
+                },
+            ),
+            (
+                "effort",
+                RunnerOpts {
+                    effort: Some("high"),
+                    ..RunnerOpts::default()
+                },
+            ),
+            (
+                "disallowed_tools",
+                RunnerOpts {
+                    disallowed_tools: Some("BashTool"),
+                    ..RunnerOpts::default()
+                },
+            ),
+        ];
+        for (field, opts) in cases {
+            let err = enforce_capabilities(&runner, RunnerKind::Claude, opts)
+                .expect_err(&format!("expected Err for field {field}"));
+            assert!(
+                matches!(err, TaskMgrError::UnsupportedRunnerCapability { .. }),
+                "expected UnsupportedRunnerCapability for field {field}, got {err:?}"
+            );
+        }
+    }
+
+    /// AC: a FakeRunner that supports only StreamJson accepts stream_json: true
+    /// but refuses use_pty: true, demonstrating per-capability control.
+    #[test]
+    fn fake_runner_stream_json_only_accepts_stream_json_refuses_pty() {
+        let runner = CapabilityFakeRunner {
+            supports_fn: |cap| matches!(cap, RunnerCapability::StreamJson),
+        };
+
+        enforce_capabilities(
+            &runner,
+            RunnerKind::Claude,
+            &RunnerOpts {
+                stream_json: true,
+                ..RunnerOpts::default()
+            },
+        )
+        .expect("StreamJson-capable runner must accept stream_json: true");
+
+        let err = enforce_capabilities(
+            &runner,
+            RunnerKind::Claude,
+            &RunnerOpts {
+                use_pty: true,
+                ..RunnerOpts::default()
+            },
+        )
+        .expect_err("StreamJson-only runner must refuse use_pty: true");
+        match err {
+            TaskMgrError::UnsupportedRunnerCapability {
+                runner_kind,
+                capability_name,
+                field_name,
+            } => {
+                assert_eq!(runner_kind, RunnerKind::Claude);
+                assert_eq!(capability_name, "Pty");
+                assert_eq!(field_name, "use_pty");
+            }
+            other => panic!("expected UnsupportedRunnerCapability, got {other:?}"),
+        }
     }
 
     /// AC: existing spawn_claude_echo (claude.rs:1221) compiles and behaves

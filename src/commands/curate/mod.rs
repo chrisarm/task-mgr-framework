@@ -635,7 +635,6 @@ fn process_batches_parallel(
                     &PermissionMode::text_only(),
                     SpawnOpts {
                         model: Some(&model),
-                        cleanup_title_artifact: true,
                         ..Default::default()
                     },
                 ) {

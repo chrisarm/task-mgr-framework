@@ -218,6 +218,20 @@ violation is loud (panic in a downstream layer) or whose cost is
 real (e.g., O(n) over a large collection). The drift sentinel is
 cheap and the failure is silent — use `assert!`.
 
+### Session artifact cleanup
+
+Every `LlmRunner` impl provides `cleanup_session(session_id, cwd)`; `dispatch`
+calls it unconditionally post-spawn when `RunnerResult.session_id.is_some()`.
+`NotFound` is silent success — the artifact may never have been written or may
+already be gone. Other errors emit one banner per process gated by
+`CLEANUP_WARN_ONCE` (`AtomicBool::swap(true, Relaxed)`) and never modify the
+spawn return value. Implementations derive the path deterministically from
+`(session_id, cwd)` and remove ONLY that path — never enumerate-and-sweep,
+never touch shared per-cwd dirs (e.g. Grok's `prompt_history.jsonl`).
+`WORKAROUND(claude-code-2.1.110-session-stub)` and
+`WORKAROUND(grok-cli-no-persistence-off)` markers tag the cleanup sites so
+future upstream fixes are a one-grep removal.
+
 ## Iteration pipeline (shared)
 
 Sequential (`run_iteration`) and parallel-wave (`run_slot_iteration` +
@@ -252,6 +266,45 @@ external-git reconciliation, post-merge-back slot completion reconciliation
 table below), human-review trigger, rate-limit waits, pause-signal
 handling, slot merge resolution (see "Slot merge-back conflict
 resolution" below).
+
+## Drained-queue classification (sequential ↔ wave parity)
+
+When no *schedulable* task can be selected, both execution paths decide the
+loop-end verdict through ONE helper, `engine::classify_drained_queue`, so they
+cannot drift on "what counts as complete vs stuck":
+
+- **Clean drain** — only `done`/`irrelevant` remain → exit 0,
+  `RunStatus::Completed`, reason "all tasks complete".
+- **Stuck drain** — at least one `blocked` and/or `skipped` row remains with no
+  schedulable work → exit 1, `RunStatus::Aborted`, reason names the counts +
+  a `task-mgr review` hint. **`skipped` is treated as unfinished work, not a
+  clean success** (deliberate product decision — neither path may claim
+  completion while deferred work is outstanding).
+- **Not drained** — any `todo`/`in_progress` row exists →
+  `count_remaining_active_tasks != 0` → returns `None`; the caller keeps
+  looping / recovering.
+
+Call sites:
+- **Wave**: `handle_no_eligible_tasks` (empty group) AND the all-complete exit
+  at the bottom of `run_wave_iteration` (guarded by `agg.any_completed`).
+- **Sequential**: the clean-complete check in `run_iteration`'s `build_prompt`
+  `Ok(None)` arm, plus a drained-but-stuck short-circuit in `run_loop`'s
+  `NoEligibleTasks` branch (exits immediately with the named reason instead of
+  spinning to the 3-iteration stale-abort threshold).
+
+**Empty-group ≠ stale.** Before counting an empty wave selection toward the
+stale tracker, `handle_no_eligible_tasks` first runs the same auto-recovery the
+sequential path does (`reconcile_passes_with_db` + `recover_in_progress_for_prefix`)
+— a task a finished slot left stranded in `in_progress` is reset to `todo` and
+retried next wave WITHOUT incrementing stale. Only a genuinely stuck queue
+(nothing schedulable, nothing recoverable, no blocked/skipped terminal) drives
+the stale counter. This closed a bug where a fully-completed PRD aborted with
+exit 1 "no eligible tasks after 3 consecutive stale iterations".
+
+**`archived_at IS NULL` is mandatory** in `count_remaining_active_tasks` and
+`count_tasks_in_status` — archiving stamps `archived_at` on prefix-matched rows
+regardless of status, so an archived row would otherwise mis-classify the drain
+(locked by `archive.rs::test_archived_tasks_invisible_to_status_count_query`).
 
 ## Slot merge-back conflict resolution
 
@@ -497,10 +550,79 @@ problem" into "produce a failure record" must always emit at least
 one record, even if the upstream parsers all rejected the input** —
 otherwise downstream "is_empty" checks invert the safety guarantee.
 
+## LLM runner dispatch
+
+`dispatch` in `src/loop_engine/runner.rs` is the single spawn boundary. It
+routes a `RunnerOpts` + `RunnerKind` pair to the matching backend
+(`ClaudeRunner` or `GrokRunner`) via a static-dispatch `match` — no
+`Box<dyn LlmRunner>` on the hot path.
+
+### Capability surface
+
+`RunnerCapability` (an exhaustive `pub(crate)` enum in `runner.rs`) is the
+typed surface for expressing what a runner can and cannot do. Adding a new
+capability-asymmetric feature MUST go through this enum — never a naked
+`RunnerKind` identity check dressed as a capability test.
+
+Key invariants:
+
+- **`LlmRunner::supports` default returns `false`** (fail-closed). A new
+  runner that forgets to override `supports` is treated as "supports
+  nothing", so every capability-driven call against it is rejected at the
+  dispatch boundary rather than silently no-op'ing runner flags.
+- **Production runners use exhaustive matches** (no `_ =>` wildcard arm) in
+  their `supports` impl. Adding a new `RunnerCapability` variant is a
+  compile error in every production impl simultaneously — the runner owner
+  must make a deliberate per-variant decision before the code can compile.
+- **`dispatch` is fail-closed**: before the spawn `match`, `enforce_capabilities`
+  walks the `CHECKS` registry table. For each `(RunnerCapability, field_check,
+  field_name)` row, if the field is set to a non-default value AND the chosen
+  runner's `supports(cap)` returns `false`, dispatch returns
+  `TaskMgrError::UnsupportedRunnerCapability` immediately — no subprocess is
+  launched. Field presence drives enforcement; value semantics are the
+  backend's concern.
+- **`CHECKS` is the single source of truth** mapping `RunnerOpts` fields to
+  `RunnerCapability` variants. Every enforced capability has exactly one row.
+  A completeness-guard test (`checks_table_covers_every_capability_variant`)
+  asserts full coverage — a new variant without a matching row fails at
+  unit-test time.
+
+Current capabilities and their production support matrix:
+
+| Capability | Claude | Grok |
+|---|---|---|
+| `Effort` | ✓ | ✓ |
+| `StreamJson` | ✓ | ✓ |
+| `Pty` | ✓ | ✗ |
+| `DisallowedTools` | ✓ | ✓ |
+| `TitleArtifactCleanup` | ✓ | ✗ |
+
+`Pty` and `TitleArtifactCleanup` are the asymmetric capabilities today.
+`Pty` maps to `use_pty` (Node.js line-buffering workaround, Claude-only).
+`TitleArtifactCleanup` maps to `cleanup_title_artifact` (ai-title jsonl
+session-leak workaround for Claude Code 2.1.110; Grok has no equivalent).
+
+## Status mutations — use TaskLifecycle
+
+All `tasks.status` writes inside `loop_engine/` go through `TaskLifecycle`
+verbs. Do **not** add raw `UPDATE tasks SET status …` SQL here.
+
+| Context | Verb | Constructor |
+|---|---|---|
+| Loop `<task-status>` tag dispatch | `apply()` | `TaskLifecycle::with_run(conn, run_id).with_prd_sync(path, prefix)` |
+| Slot pre-claim (wave) | `try_claim()` | same connection, no run context needed |
+| Stuck in-progress reset (stale sweep, slot release) | `recover_in_progress_for_prefix()` | `TaskLifecycle::with_run(conn, run_id)` |
+| Consecutive-failure auto-block | `auto_block_after_failures()` | `TaskLifecycle::with_run(conn, run_id)` |
+| Overflow rung reset / provider promote | `resurrect_for_iteration()` | `TaskLifecycle::with_run(conn, run_id)` |
+
+For the full site→verb audit table and source-allowance matrix see
+[`src/lifecycle/CLAUDE.md`](../lifecycle/CLAUDE.md).
+
 ## Touchpoints
 
 | Concern | File | Symbol |
 | --- | --- | --- |
+| Status mutation SSoT | `src/lifecycle/mod.rs` | `TaskLifecycle`, six public verbs |
 | Slot path threading | `src/loop_engine/worktree.rs` | `merge_slot_branches_with_resolver` |
 | Halt threshold contract | `src/loop_engine/engine.rs` | `apply_merge_fail_reset_and_halt_check` |
 | Failed-merge struct | `src/loop_engine/engine.rs` | `FailedMerge`, `SYNTHETIC_DEADLOCK_SLOT` |
@@ -510,6 +632,7 @@ otherwise downstream "is_empty" checks invert the safety guarantee.
 | Run-level config caching | `src/loop_engine/engine.rs` | `WaveIterationParams::project_config`, `prd_implicit_overlap_files` |
 | Overflow recovery ladder | `src/loop_engine/overflow.rs` | `handle_prompt_too_long`, `sanitize_id_for_filename`, `rotate_dumps_keep_n`, `RecoveryAction::FallbackToProvider` |
 | LLM runner dispatch | `src/loop_engine/runner.rs` + `src/loop_engine/engine.rs` | `RunnerKind`, `dispatch`, `ClaudeRunner`, `GrokRunner`, `resolve_effective_runner` |
+| Capability surface | `src/loop_engine/runner.rs` | `RunnerCapability`, `LlmRunner::supports`, `enforce_capabilities`, `CHECKS` |
 | Provider routing | `src/loop_engine/model.rs` | `Provider`, `provider_for_model` |
 | Operator escape valve | `src/loop_engine/engine.rs` | `check_override_invalidation`, `IterationContext::overflow_original_task_model` |
 | Fallback runner config | `src/loop_engine/project_config.rs` | `FallbackRunnerConfig`, `check_fallback_runner_binary` |

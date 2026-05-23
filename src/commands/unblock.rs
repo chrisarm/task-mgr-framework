@@ -1,178 +1,125 @@
-//! Unblock and Unskip command implementations.
-//!
-//! The unblock command returns a blocked task to todo status for retry.
-//! The unskip command returns a skipped task to todo status for retry.
+//! Unblock and Unskip — return a Blocked / Skipped task to Todo via
+//! `TaskLifecycle::apply` (PRD §6 Category A).
 
 use rusqlite::Connection;
 use serde::Serialize;
 
+use crate::lifecycle::{
+    TaskLifecycle, TransitionChange, TransitionIntent, TransitionOutcome, TransitionRejectReason,
+    TransitionSource,
+};
 use crate::models::TaskStatus;
 use crate::{TaskMgrError, TaskMgrResult};
 
-/// Result of unblocking a task.
 #[derive(Debug, Clone, Serialize)]
 pub struct UnblockResult {
-    /// The task that was unblocked
     pub task_id: String,
-    /// Previous status (should be 'blocked')
     pub previous_status: TaskStatus,
-    /// New status (always 'todo')
     pub new_status: TaskStatus,
-    /// The error that was cleared
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cleared_error: Option<String>,
-    /// Note added for audit trail
     pub audit_note: String,
 }
 
-/// Result of unskipping a task.
 #[derive(Debug, Clone, Serialize)]
 pub struct UnskipResult {
-    /// The task that was unskipped
     pub task_id: String,
-    /// Previous status (should be 'skipped')
     pub previous_status: TaskStatus,
-    /// New status (always 'todo')
     pub new_status: TaskStatus,
-    /// Note added for audit trail
     pub audit_note: String,
 }
 
-/// Return a blocked task to todo status for retry.
-///
-/// # Arguments
-/// * `conn` - Database connection
-/// * `task_id` - ID of the task to unblock
-///
-/// # Returns
-/// * `Ok(UnblockResult)` - Information about the unblocked task
-/// * `Err(TaskMgrError)` - If task not found or not in blocked status
-///
-/// # Status Transition
-/// Changes status from `blocked` to `todo` and clears `last_error`.
-pub fn unblock(conn: &Connection, task_id: &str) -> TaskMgrResult<UnblockResult> {
-    // Query current task status, notes, and last_error
-    let (status_str, current_notes, last_error): (String, Option<String>, Option<String>) = conn
+/// Return a Blocked task to Todo. Reads `last_error` before delegating so
+/// the cleared value can be surfaced in the result.
+pub fn unblock(conn: &mut Connection, task_id: &str) -> TaskMgrResult<UnblockResult> {
+    let last_error: Option<String> = conn
         .query_row(
-            "SELECT status, notes, last_error FROM tasks WHERE id = ?",
+            "SELECT last_error FROM tasks WHERE id = ?",
             [task_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| row.get(0),
         )
         .map_err(|e| match e {
             rusqlite::Error::QueryReturnedNoRows => TaskMgrError::task_not_found(task_id),
             _ => TaskMgrError::from(e),
         })?;
-
-    let previous_status: TaskStatus = status_str.parse()?;
-
-    // Validate that task is in blocked status
-    if previous_status != TaskStatus::Blocked {
-        return Err(TaskMgrError::invalid_state(
-            "Task",
-            task_id,
-            "blocked",
-            previous_status.to_string(),
-        ));
+    let outcome = apply_single(conn, task_id, TransitionChange::Unblock);
+    if !outcome.applied {
+        return Err(map_failure(task_id, "blocked", &outcome));
     }
-
-    // Build audit note
-    let audit_note = "[UNBLOCKED] Returned to todo from blocked status".to_string();
-    let new_notes = match &current_notes {
-        Some(existing) if !existing.is_empty() => format!("{}\n\n{}", existing, audit_note),
-        _ => audit_note.clone(),
-    };
-
-    // Update task: status to todo, clear last_error, add audit note
-    conn.execute(
-        "UPDATE tasks SET status = ?, last_error = NULL, notes = ?, updated_at = datetime('now') WHERE id = ?",
-        rusqlite::params![TaskStatus::Todo.as_db_str(), new_notes, task_id],
-    )?;
-
     Ok(UnblockResult {
         task_id: task_id.to_string(),
-        previous_status,
+        previous_status: outcome.previous.unwrap_or(TaskStatus::Blocked),
         new_status: TaskStatus::Todo,
         cleared_error: last_error,
-        audit_note,
+        audit_note: "[UNBLOCKED] Returned to todo from blocked status".to_string(),
     })
 }
 
-/// Return a skipped task to todo status for retry.
-///
-/// # Arguments
-/// * `conn` - Database connection
-/// * `task_id` - ID of the task to unskip
-///
-/// # Returns
-/// * `Ok(UnskipResult)` - Information about the unskipped task
-/// * `Err(TaskMgrError)` - If task not found or not in skipped status
-///
-/// # Status Transition
-/// Changes status from `skipped` to `todo`.
-pub fn unskip(conn: &Connection, task_id: &str) -> TaskMgrResult<UnskipResult> {
-    // Query current task status and notes
-    let (status_str, current_notes): (String, Option<String>) = conn
-        .query_row(
-            "SELECT status, notes FROM tasks WHERE id = ?",
-            [task_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .map_err(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => TaskMgrError::task_not_found(task_id),
-            _ => TaskMgrError::from(e),
-        })?;
-
-    let previous_status: TaskStatus = status_str.parse()?;
-
-    // Validate that task is in skipped status
-    if previous_status != TaskStatus::Skipped {
-        return Err(TaskMgrError::invalid_state(
-            "Task",
-            task_id,
-            "skipped",
-            previous_status.to_string(),
-        ));
+/// Return a Skipped task to Todo.
+pub fn unskip(conn: &mut Connection, task_id: &str) -> TaskMgrResult<UnskipResult> {
+    let outcome = apply_single(conn, task_id, TransitionChange::Unskip);
+    if !outcome.applied {
+        return Err(map_failure(task_id, "skipped", &outcome));
     }
-
-    // Build audit note
-    let audit_note = "[UNSKIPPED] Returned to todo from skipped status".to_string();
-    let new_notes = match &current_notes {
-        Some(existing) if !existing.is_empty() => format!("{}\n\n{}", existing, audit_note),
-        _ => audit_note.clone(),
-    };
-
-    // Update task: status to todo, add audit note
-    conn.execute(
-        "UPDATE tasks SET status = ?, notes = ?, updated_at = datetime('now') WHERE id = ?",
-        rusqlite::params![TaskStatus::Todo.as_db_str(), new_notes, task_id],
-    )?;
-
     Ok(UnskipResult {
         task_id: task_id.to_string(),
-        previous_status,
+        previous_status: outcome.previous.unwrap_or(TaskStatus::Skipped),
         new_status: TaskStatus::Todo,
-        audit_note,
+        audit_note: "[UNSKIPPED] Returned to todo from skipped status".to_string(),
     })
 }
 
-/// Format unblock result as human-readable text.
+fn apply_single(
+    conn: &mut Connection,
+    task_id: &str,
+    change: TransitionChange,
+) -> TransitionOutcome {
+    let intent = TransitionIntent {
+        task_id: task_id.to_string(),
+        change,
+        source: TransitionSource::Operator,
+        reason: None,
+        fail_status: None,
+        audit_note: None,
+    };
+    let mut lc = TaskLifecycle::new(conn);
+    lc.apply(&[intent]).remove(0)
+}
+
+/// Recover the legacy typed `TaskMgrError` shape from a non-applied
+/// outcome. `outcome.previous == None` ⇒ the row was missing.
+fn map_failure(task_id: &str, expected: &str, outcome: &TransitionOutcome) -> TaskMgrError {
+    match outcome.previous {
+        None => TaskMgrError::task_not_found(task_id),
+        Some(previous) if previous.as_db_str() != expected => {
+            TaskMgrError::invalid_state("Task", task_id, expected, previous.to_string())
+        }
+        _ => {
+            let msg = match &outcome.reason {
+                Some(TransitionRejectReason::DispatchFailed(m)) => m.clone(),
+                _ => "unknown lifecycle dispatch failure".to_string(),
+            };
+            TaskMgrError::lock_error_with_hint(
+                format!("{expected} dispatch failed for {task_id}: {msg}"),
+                "internal lifecycle dispatch error; check earlier stderr for details",
+            )
+        }
+    }
+}
+
 #[must_use]
 pub fn format_unblock_text(result: &UnblockResult) -> String {
     let mut output = format!(
         "Unblocked task {} (was {}, now {}).\n",
         result.task_id, result.previous_status, result.new_status
     );
-
     if let Some(ref error) = result.cleared_error {
-        output.push_str(&format!("Cleared error: {}\n", error));
+        output.push_str(&format!("Cleared error: {error}\n"));
     }
-
     output.push_str("Task is now available for selection.\n");
-
     output
 }
 
-/// Format unskip result as human-readable text.
 #[must_use]
 pub fn format_unskip_text(result: &UnskipResult) -> String {
     format!(
@@ -206,7 +153,7 @@ mod tests {
 
     #[test]
     fn test_unblock_blocked_task() {
-        let (_dir, conn) = setup_test_db();
+        let (_dir, mut conn) = setup_test_db();
         insert_test_task(&conn, "US-001", "blocked");
 
         // Set last_error
@@ -216,7 +163,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = unblock(&conn, "US-001").unwrap();
+        let result = unblock(&mut conn, "US-001").unwrap();
 
         assert_eq!(result.task_id, "US-001");
         assert_eq!(result.previous_status, TaskStatus::Blocked);
@@ -238,14 +185,14 @@ mod tests {
 
     #[test]
     fn test_unblock_preserves_existing_notes() {
-        let (_dir, conn) = setup_test_db();
+        let (_dir, mut conn) = setup_test_db();
         conn.execute(
             "INSERT INTO tasks (id, title, status, priority, notes, error_count) VALUES ('US-002', 'Test', 'blocked', 10, 'Existing notes', 0)",
             [],
         )
         .unwrap();
 
-        unblock(&conn, "US-002").unwrap();
+        unblock(&mut conn, "US-002").unwrap();
 
         let notes: String = conn
             .query_row("SELECT notes FROM tasks WHERE id = 'US-002'", [], |row| {
@@ -258,10 +205,10 @@ mod tests {
 
     #[test]
     fn test_unblock_todo_task_fails() {
-        let (_dir, conn) = setup_test_db();
+        let (_dir, mut conn) = setup_test_db();
         insert_test_task(&conn, "US-003", "todo");
 
-        let result = unblock(&conn, "US-003");
+        let result = unblock(&mut conn, "US-003");
 
         assert!(result.is_err());
         match result {
@@ -277,10 +224,10 @@ mod tests {
 
     #[test]
     fn test_unblock_done_task_fails() {
-        let (_dir, conn) = setup_test_db();
+        let (_dir, mut conn) = setup_test_db();
         insert_test_task(&conn, "US-004", "done");
 
-        let result = unblock(&conn, "US-004");
+        let result = unblock(&mut conn, "US-004");
 
         assert!(result.is_err());
         match result {
@@ -296,10 +243,10 @@ mod tests {
 
     #[test]
     fn test_unblock_skipped_task_fails() {
-        let (_dir, conn) = setup_test_db();
+        let (_dir, mut conn) = setup_test_db();
         insert_test_task(&conn, "US-005", "skipped");
 
-        let result = unblock(&conn, "US-005");
+        let result = unblock(&mut conn, "US-005");
 
         assert!(result.is_err());
         match result {
@@ -315,9 +262,9 @@ mod tests {
 
     #[test]
     fn test_unblock_nonexistent_task_fails() {
-        let (_dir, conn) = setup_test_db();
+        let (_dir, mut conn) = setup_test_db();
 
-        let result = unblock(&conn, "NONEXISTENT");
+        let result = unblock(&mut conn, "NONEXISTENT");
 
         assert!(result.is_err());
         match result {
@@ -330,10 +277,10 @@ mod tests {
 
     #[test]
     fn test_unskip_skipped_task() {
-        let (_dir, conn) = setup_test_db();
+        let (_dir, mut conn) = setup_test_db();
         insert_test_task(&conn, "US-010", "skipped");
 
-        let result = unskip(&conn, "US-010").unwrap();
+        let result = unskip(&mut conn, "US-010").unwrap();
 
         assert_eq!(result.task_id, "US-010");
         assert_eq!(result.previous_status, TaskStatus::Skipped);
@@ -351,14 +298,14 @@ mod tests {
 
     #[test]
     fn test_unskip_preserves_existing_notes() {
-        let (_dir, conn) = setup_test_db();
+        let (_dir, mut conn) = setup_test_db();
         conn.execute(
             "INSERT INTO tasks (id, title, status, priority, notes, error_count) VALUES ('US-011', 'Test', 'skipped', 10, 'Previous notes', 0)",
             [],
         )
         .unwrap();
 
-        unskip(&conn, "US-011").unwrap();
+        unskip(&mut conn, "US-011").unwrap();
 
         let notes: String = conn
             .query_row("SELECT notes FROM tasks WHERE id = 'US-011'", [], |row| {
@@ -371,10 +318,10 @@ mod tests {
 
     #[test]
     fn test_unskip_todo_task_fails() {
-        let (_dir, conn) = setup_test_db();
+        let (_dir, mut conn) = setup_test_db();
         insert_test_task(&conn, "US-012", "todo");
 
-        let result = unskip(&conn, "US-012");
+        let result = unskip(&mut conn, "US-012");
 
         assert!(result.is_err());
         match result {
@@ -390,10 +337,10 @@ mod tests {
 
     #[test]
     fn test_unskip_blocked_task_fails() {
-        let (_dir, conn) = setup_test_db();
+        let (_dir, mut conn) = setup_test_db();
         insert_test_task(&conn, "US-013", "blocked");
 
-        let result = unskip(&conn, "US-013");
+        let result = unskip(&mut conn, "US-013");
 
         assert!(result.is_err());
         match result {
@@ -409,10 +356,10 @@ mod tests {
 
     #[test]
     fn test_unskip_done_task_fails() {
-        let (_dir, conn) = setup_test_db();
+        let (_dir, mut conn) = setup_test_db();
         insert_test_task(&conn, "US-014", "done");
 
-        let result = unskip(&conn, "US-014");
+        let result = unskip(&mut conn, "US-014");
 
         assert!(result.is_err());
         match result {
@@ -428,9 +375,9 @@ mod tests {
 
     #[test]
     fn test_unskip_nonexistent_task_fails() {
-        let (_dir, conn) = setup_test_db();
+        let (_dir, mut conn) = setup_test_db();
 
-        let result = unskip(&conn, "NONEXISTENT");
+        let result = unskip(&mut conn, "NONEXISTENT");
 
         assert!(result.is_err());
         match result {

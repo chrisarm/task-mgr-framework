@@ -1,0 +1,257 @@
+{
+  "version": "1.0",
+  "project": "task-mgr",
+  "model": "claude-sonnet-4-6",
+  "branchName": "feat/doctor-orphan-prd-check",
+  "description": "Add a `task-mgr doctor` check that flags PRDs whose `branch_name` doesn't exist as a local or remote git branch. The check is PRINT-ONLY by default — plain `--fix` prints a `task-mgr archive --branch <branch>` remediation hint but does NOT auto-archive, because archiving a PRD whose branch only exists on a coworker's fork would destroy legitimate work. Motivated by a row pair that leaked into the live DB from `tests/fixtures/prd_p1_alpha.json` (branch `feat/p1-alpha`, which does not exist in this repo).",
+  "requires": [],
+  "priorityPhilosophy": {
+    "description": "Hierarchy of what matters most when implementing tasks",
+    "hierarchy": [
+      "1. PLAN — Anticipate edge cases before coding",
+      "2. PHASE 2 FOUNDATION — ~1 day now to save ~2+ weeks later (1:10+ ratio); we are pre-launch, foundations compound",
+      "3. FUNCTIONING CODE — Pragmatic, reliable, wired in per plan",
+      "4. CORRECTNESS — Compiles, type-checks, scoped tests pass deterministically",
+      "5. CODE QUALITY — Clean code, qualityDimensions satisfied, no warnings",
+      "6. POLISH — Docs, formatting, minor improvements"
+    ],
+    "principles": [
+      "Quality dimensions explicit — qualityDimensions on every task tells you what 'good' looks like",
+      "Print-only by default — this check NEVER auto-archives; doctor's other auto-fixes are reversible, archiving a PRD is not",
+      "Edge cases = test cases — every known edge case must have a corresponding test",
+      "Scoped per-iteration tests, full suite at REVIEW-001 — REVIEW must leave the trunk green including pre-existing failures",
+      "Follow existing doctor pattern — checks.rs / output.rs / fixes.rs / mod.rs / tests.rs split is the contract; do not invent a new layout"
+    ]
+  },
+  "prohibitedOutcomes": [
+    "Auto-archiving orphan PRDs on plain `--fix` — must be print-only; archive only via the operator explicitly running `task-mgr archive --branch <branch>`",
+    "Hardcoding `origin/` as the remote prefix — must use generic first-segment strip so `upstream/`, `fork/`, etc. also work",
+    "Two-call branch enumeration (`git branch --list` + `git branch -r`) — one `git for-each-ref refs/heads refs/remotes` call is faster, no `HEAD ->` noise, no enumerate-remotes-by-name fragility",
+    "Erroring when git is unavailable or directory is not a git repo — must return Ok(vec![]) silently, matching the existing `find_git_reconciliation_tasks` convention",
+    "Flagging PRDs with `branch_name IS NULL` (single-PRD prefix-less layout) or PRDs where every task is already `archived_at IS NOT NULL`",
+    "Tests that only assert 'no crash' or check return type without verifying content",
+    "Tests that mirror implementation internals (break when refactoring)",
+    "Catch-all error handlers that swallow context"
+  ],
+  "globalAcceptanceCriteria": {
+    "description": "These criteria apply to ALL implementation tasks",
+    "criteria": [
+      "Rust: No warnings in `cargo check` output",
+      "Rust: No warnings in `cargo clippy --all-targets -- -D warnings` output",
+      "Rust: All scoped tests pass with `cargo test -p task-mgr doctor::`",
+      "Rust: `cargo fmt --check` passes",
+      "No breaking changes to existing doctor output (text or JSON) — only additive",
+      "Print-only contract: `task-mgr doctor --fix` MUST NOT mutate `archived_at` for any orphan-branch PRD row"
+    ]
+  },
+  "userStories": [
+    {
+      "id": "FEAT-001",
+      "title": "Add find_orphan_branch_prds check + unit tests",
+      "taskType": "implementation",
+      "description": "Add `find_orphan_branch_prds(conn: &Connection, dir: &Path) -> TaskMgrResult<Vec<(String, String, String)>>` in `src/commands/doctor/checks.rs` returning `(task_prefix, project, branch_name)` for each active PRD whose branch doesn't exist locally or on any remote.\n\nDO:\n- Run ONE git command: `git -C <dir> for-each-ref --format=%(refname:short) refs/heads refs/remotes` via std::process::Command (mirror the swallow-error pattern in `find_git_reconciliation_tasks` at src/commands/doctor/checks.rs ~lines 148-161).\n- Build a HashSet<String> of branch names. SKIP any line containing ` -> ` (drops the `origin/HEAD -> origin/main` symbolic-ref noise).\n- For each candidate `branch_name`, check membership against BOTH the raw set entry AND the entry with its first `/`-segment stripped. So `feat/p1-alpha` matches both a stored local `feat/p1-alpha` AND a stored remote `origin/feat/p1-alpha`. This generalizes to any remote name (upstream/, fork/, etc.).\n- SQL: select task_prefix, project, branch_name FROM prd_metadata WHERE branch_name IS NOT NULL AND branch_name != '' AND task_prefix IS NOT NULL AND EXISTS (SELECT 1 FROM tasks WHERE id LIKE prd_metadata.task_prefix || '-%' ESCAPE '\\\\' AND archived_at IS NULL). Skips already-resolved PRDs and prefix-less single-PRD layouts.\n- If git is unavailable, the directory is not a git repo, or for-each-ref exits non-zero, return Ok(vec![]) silently.\n- Add six unit tests in `src/commands/doctor/tests.rs` (use `tempfile::TempDir` + `git init`):\n  1. doctor_flags_prd_with_nonexistent_branch — seed prd_metadata + one active task with branch_name='feat/does-not-exist'; expect one result.\n  2. doctor_ignores_prd_with_extant_local_branch — same but create the branch via `git branch feat/p1-alpha`; expect zero results.\n  3. doctor_ignores_prd_with_remote_only_branch — seed branch_name='feat/foo', create `refs/remotes/origin/feat/foo` via `git update-ref`; expect zero results. Proves first-segment-strip.\n  4. doctor_ignores_prd_with_null_branch_name — branch_name IS NULL; expect zero results.\n  5. doctor_ignores_prd_with_all_archived_rows — branch_name is orphan but every task row has `archived_at IS NOT NULL`; expect zero results.\n  6. doctor_returns_empty_in_non_git_directory — TempDir without `git init`; expect Ok(vec![]) (no panic, no error).\n\nDO NOT:\n- Use two separate `git branch --list` / `git branch -r` calls — single for-each-ref.\n- Hardcode the string `origin/` anywhere in the matching logic.\n- Return Err when git is missing — the existing pattern is silent fallback.\n- Use unwrap() on Command::new('git').output() — propagate or swallow.",
+      "acceptanceCriteria": [
+        "Function `find_orphan_branch_prds(conn: &Connection, dir: &Path) -> TaskMgrResult<Vec<(String, String, String)>>` exists in src/commands/doctor/checks.rs and is `pub fn` (so mod.rs can call it).",
+        "Function uses exactly ONE `Command::new(\"git\")` invocation with subcommand `for-each-ref`, args `--format=%(refname:short) refs/heads refs/remotes`, current_dir set to `dir`.",
+        "Lines from the for-each-ref output containing ` -> ` are filtered out before set construction.",
+        "Membership test checks both raw entry AND first-segment-stripped entry (split on '/' once, take rest).",
+        "SQL filters: branch_name IS NOT NULL, branch_name != '', task_prefix IS NOT NULL, AND at least one tasks row with id LIKE prefix||'-%' AND archived_at IS NULL exists.",
+        "Returns Ok(vec![]) (no panic, no Err) when: (a) git binary missing — Command::output() returns Err, (b) for-each-ref exits non-zero — output.status.success() is false, (c) dir is not a git repo.",
+        "Unit test: doctor_flags_prd_with_nonexistent_branch — expect Vec len 1 with the seeded prefix/project/branch.",
+        "Unit test: doctor_ignores_prd_with_extant_local_branch — expect Vec len 0 after `git branch feat/<name>`.",
+        "Unit test: doctor_ignores_prd_with_remote_only_branch — seed `refs/remotes/origin/feat/foo` via `git update-ref refs/remotes/origin/feat/foo HEAD`, branch_name='feat/foo'; expect Vec len 0.",
+        "Unit test: doctor_ignores_prd_with_null_branch_name — branch_name IS NULL; expect Vec len 0.",
+        "Unit test: doctor_ignores_prd_with_all_archived_rows — every task row has archived_at = datetime('now'); expect Vec len 0 (already-resolved PRDs are skipped).",
+        "Unit test: doctor_returns_empty_in_non_git_directory — TempDir without git init; expect Ok(vec![]) with no error.",
+        "Known-bad: if the membership test only checks the raw entry (no first-segment strip), the remote_only test FAILS because stored `origin/feat/foo` would not match candidate `feat/foo`. The test must catch this.",
+        "Known-bad: if `branch --list` + `branch -r` is used instead of `for-each-ref`, the symbolic-ref `origin/HEAD -> origin/main` line slips into the set unfiltered and causes false matches when a candidate branch_name happens to equal `origin/HEAD`. The `-> ` filter must be in place.",
+        "Known-bad: if SQL omits the EXISTS clause for active rows, PRDs whose tasks are all archived get re-flagged on every doctor run — `doctor_ignores_prd_with_all_archived_rows` must catch this.",
+        "Failure mode: if `Command::new(\"git\").output()` returns Err (binary missing), the function returns Ok(vec![]) — verified by `doctor_returns_empty_in_non_git_directory`."
+      ],
+      "priority": 1,
+      "estimatedEffort": "medium",
+      "passes": false,
+      "notes": "Reuse pattern: src/commands/doctor/checks.rs:148-161 (`find_git_reconciliation_tasks`) — same swallow-error-silently convention, same Command::new style. Existing IssueType structure: src/commands/doctor/output.rs:15 (enum), :42 (Issue struct), :82 (DoctorSummary). Test scaffolding: existing tests in src/commands/doctor/tests.rs use TempDir + open_connection + raw SQL inserts for seeding. Learning [1060]: doctor command follows checks/output/fixes module separation strictly — keep new code in the right file. Learning [1067]: checks.rs functions are pure readers returning structs; never mutate DB from a check.",
+      "qualityDimensions": [
+        "ONE Command::new('git') call total — for-each-ref over both refs/heads refs/remotes in a single invocation",
+        "Generic remote handling — strip first '/'-segment, never hardcode 'origin/'",
+        "Silent fallback on git-unavailable — Ok(vec![]) not Err",
+        "Membership via HashSet<String> built once, not N rev-parse subprocess calls",
+        "Pure read — no DB writes, no side effects, function takes &Connection (not &mut)",
+        "SQL EXISTS clause skips already-resolved PRDs to keep doctor idempotent across runs"
+      ],
+      "edgeCases": [
+        "branch_name IS NULL (single-PRD prefix-less layout) — must NOT be flagged",
+        "Every task row archived_at IS NOT NULL (already-resolved PRD) — must NOT be flagged",
+        "Remote-only branch (origin/feat/foo) — must NOT be flagged",
+        "Empty branch_name string ('') — must NOT be flagged (treat as NULL)",
+        "Branch name with multiple slashes (feat/sub/feature) — first-segment strip must still match correctly when stored as origin/feat/sub/feature",
+        "Symbolic ref noise (`origin/HEAD -> origin/main`) — must be filtered out",
+        "Non-git directory or missing git binary — return Ok(vec![]) silently"
+      ],
+      "failureModes": [
+        {
+          "cause": "git binary missing or directory not a git repo",
+          "expectedBehavior": "Return Ok(vec![]) — silent fallback matching find_git_reconciliation_tasks convention"
+        },
+        {
+          "cause": "for-each-ref exits non-zero (rare — corrupted repo)",
+          "expectedBehavior": "Return Ok(vec![]) — no error propagation"
+        },
+        {
+          "cause": "prd_metadata row has branch_name but no tasks at all",
+          "expectedBehavior": "EXISTS clause returns false; PRD is skipped (not flagged)"
+        }
+      ],
+      "touchesFiles": [
+        "src/commands/doctor/checks.rs",
+        "src/commands/doctor/tests.rs"
+      ],
+      "dependsOn": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "FEAT-002",
+      "title": "Wire OrphanBranchPrd into doctor output + print-only fix + integration tests + CLAUDE.md",
+      "taskType": "implementation",
+      "description": "Wire the new check into doctor's IssueType / output formatters / mod.rs orchestration with PRINT-ONLY remediation. Add end-to-end tests proving `--fix` does NOT mutate `archived_at` for orphan PRDs.\n\nDO (output.rs):\n- Add `OrphanBranchPrd` variant to `IssueType` enum at src/commands/doctor/output.rs:15.\n- Add matching arm in the `Display for IssueType` impl at ~line 28: `IssueType::OrphanBranchPrd => write!(f, \"orphan_branch_prd\")`.\n- Add `pub orphan_branch_prds: usize` field to `DoctorSummary` struct at src/commands/doctor/output.rs:82.\n- Update `format_doctor_verbose` (line 103) to add a new Check 5 block listing OrphanBranchPrd issues by entity_id.\n- Update `format_text` (line 202) to add a new section emitting `PRD '<project>' (prefix: <prefix>, branch: <branch>) references a branch that doesn't exist locally or on any remote — likely test pollution or a stale import.\\n  Fix: task-mgr archive --branch <branch>` for each OrphanBranchPrd issue.\n- DO NOT add a separate JSON formatter — `IssueType` already derives `Serialize` with `#[serde(rename_all = \"snake_case\")]`, so the new variant auto-serializes as `orphan_branch_prd` in `--format json`.\n\nDO (fixes.rs):\n- Add `pub fn fix_orphan_branch_prd_remediation(prefix: &str, branch: &str) -> String` in src/commands/doctor/fixes.rs that returns the remediation hint string: `format!(\"task-mgr archive --branch {}\", branch)` — used as the `action` field on the would_fix `Fix` entry.\n- DO NOT add a mutating fix function. No DB writes. No call to `archive_prd_data`.\n\nDO (mod.rs):\n- Re-export `find_orphan_branch_prds` from the `use checks::{...}` block at src/commands/doctor/mod.rs:37-40.\n- After the `find_orphaned_relationships` block in `doctor()` (around src/commands/doctor/mod.rs:106), add a new block:\n  - Call `find_orphan_branch_prds(conn, dir)?`.\n  - For each `(prefix, project, branch)`: push an `Issue { issue_type: OrphanBranchPrd, entity_id: prefix.clone(), description: <human-readable> }` into `issues`.\n  - If `effective_auto_fix`: push a `Fix { issue_type: OrphanBranchPrd, entity_id: prefix, action: fix_orphan_branch_prd_remediation(&prefix, &branch) }` into `would_fix` — NEVER into `fixed`, NEVER mutate the DB.\n- Update `DoctorSummary` construction to populate `orphan_branch_prds` and include it in `total_issues`.\n- Pass `dir` through to the new check — `dir: &Path` is already a `doctor()` parameter.\n\nDO (tests.rs — integration):\n- Add `doctor_reports_orphan_branch_prd_as_issue` — TempDir + git init, seed orphan PRD + active task, call `doctor()` (NOT `find_orphan_branch_prds` directly), assert one Issue with IssueType::OrphanBranchPrd, summary.orphan_branch_prds == 1.\n- Add `doctor_fix_orphan_branch_prd_is_print_only` — same seed, call `doctor()` with `auto_fix=true, dry_run=false`. Assert: (a) result.would_fix has 1 entry with action containing `task-mgr archive --branch feat/`, (b) result.fixed has 0 OrphanBranchPrd entries, (c) sqlite SELECT count(*) FROM tasks WHERE archived_at IS NOT NULL still equals 0 (no DB mutation). THIS IS THE PRINT-ONLY CONTRACT TEST — it must fail loudly if anyone accidentally wires up an auto-archive.\n\nDO (CLAUDE.md):\n- Add ONE line to the project CLAUDE.md (`/home/chris/Documents/startat0/Projects/task-mgr/CLAUDE.md`) under the `task-mgr workflow` cheat sheet documenting the new issue type and remediation: `task-mgr doctor flags PRDs whose branch_name doesn't exist locally/remote; run task-mgr archive --branch <branch> to clean up`.\n\nDO NOT:\n- Add a `fix_orphan_branch_prd` function that calls `archive_prd_data` — print-only contract.\n- Push the orphan fix entry into `fixed` (it goes into `would_fix` even when `auto_fix=true && !dry_run`).\n- Change visibility of `archive_prd_data` in src/loop_engine/archive.rs — no callers needed.\n- Add a separate JSON formatter — serde derive handles it.\n- Write a full doctor command integration test using subprocess — call the `doctor()` library function directly with a `&Connection`.",
+      "acceptanceCriteria": [
+        "`IssueType::OrphanBranchPrd` variant added with Display arm returning `\"orphan_branch_prd\"`.",
+        "`DoctorSummary.orphan_branch_prds: usize` field added; populated in `doctor()` and included in `total_issues`.",
+        "`format_text` emits a section for OrphanBranchPrd issues with the exact remediation phrasing: `Fix: task-mgr archive --branch <branch>`.",
+        "`format_doctor_verbose` includes a Check 5 block listing OrphanBranchPrd entity_ids.",
+        "`fix_orphan_branch_prd_remediation(prefix, branch) -> String` exists in fixes.rs and returns `task-mgr archive --branch <branch>` (no DB writes).",
+        "`doctor()` calls `find_orphan_branch_prds(conn, dir)` after the orphaned_relationships block; pushes Issue per result; pushes Fix into `would_fix` (NOT `fixed`) when effective_auto_fix is true.",
+        "Integration test: `doctor_reports_orphan_branch_prd_as_issue` — TempDir + git init, seed orphan PRD, call `doctor()`, assert result.summary.orphan_branch_prds == 1 and one issue of type OrphanBranchPrd.",
+        "Integration test: `doctor_fix_orphan_branch_prd_is_print_only` — seed orphan PRD, call `doctor(conn, auto_fix=true, dry_run=false, ...)`, assert (a) result.would_fix has 1 entry with `task-mgr archive --branch feat/` substring in action, (b) result.fixed.iter().filter(|f| f.issue_type == OrphanBranchPrd).count() == 0, (c) sqlite count of archived_at IS NOT NULL rows still 0.",
+        "CLAUDE.md gains exactly ONE new line under the task-mgr workflow cheat sheet describing the new issue and remediation.",
+        "Manual sanity (verified in REVIEW-001): `task-mgr doctor` prints the issue; `task-mgr doctor --fix` lists the would_fix hint but leaves `archived_at` unchanged.",
+        "Known-bad: if `doctor()` pushes the orphan fix into `fixed` instead of `would_fix`, the `doctor_fix_orphan_branch_prd_is_print_only` test fails on the (b) assertion. The test MUST catch this.",
+        "Known-bad: if a developer wires in a call to `archive_prd_data` to make `--fix` actually archive, the print-only test fails on assertion (c). Keep the architecture pure-functional for this issue type.",
+        "Known-bad: if `format_text` uses `format!(\"Fix: task-mgr archive --branch={}\", ...)` (= instead of space), users copy-pasting the hint into a shell will hit `error: unexpected argument '--branch=feat/foo'`. Acceptance criterion fixes the exact phrasing.",
+        "Failure mode: if `find_orphan_branch_prds` returns Err (it never should — see FEAT-001), `doctor()` propagates with `?` — no swallow.",
+        "Failure mode: integration test must NOT depend on the host's git config — use `git -c init.defaultBranch=main init` in test setup.",
+        "CONTRACT: `IssueType` enum variants are serialized via `#[serde(rename_all = \"snake_case\")]` — verify by grepping `output.rs` that the derive is intact; do NOT add a manual Serialize impl.",
+        "CONTRACT: `Fix` struct fields are `issue_type`, `entity_id`, `action` (grep src/commands/doctor/output.rs:52 to verify); the integration test constructs assertions against these exact field names."
+      ],
+      "priority": 2,
+      "estimatedEffort": "medium",
+      "passes": false,
+      "notes": "Reuse the print-only-fix-via-would_fix pattern: existing fixes push into `fixed` for real fixes and `would_fix` for dry-run previews. This task uses `would_fix` regardless of dry_run state because the issue type is never auto-applied. Architect-flagged: do NOT lift `archive_prd_data` to pub(crate) — it stays private. Learning [1075]: idempotent fix functions return structs, not DB-mutation results — `fix_orphan_branch_prd_remediation` returning a String fits this pattern. JSON output is automatic via serde derive — do not write a manual JSON formatter. The CLAUDE.md update is a single line, not a section.",
+      "qualityDimensions": [
+        "Print-only enforced at the architecture level — no fix function that touches the DB exists for this issue type",
+        "Additive only — no changes to existing IssueType variant text output, no breaking changes to JSON shape (new field/variant is additive)",
+        "Serde-driven JSON consistency — rely on derive(Serialize) + rename_all, never write a manual JSON formatter",
+        "Test asserts the contract loudly — `doctor_fix_orphan_branch_prd_is_print_only` is the safety net; if a future PR adds an auto-archive path, this test fails",
+        "Single CLAUDE.md line — not a section, not a paragraph; one line in the cheat sheet"
+      ],
+      "edgeCases": [
+        "auto_fix=true && dry_run=true — would_fix populated (existing dry-run path)",
+        "auto_fix=true && dry_run=false — STILL populates would_fix (NOT fixed) for OrphanBranchPrd specifically; this is the print-only override",
+        "auto_fix=false — only Issue is pushed, no would_fix entry",
+        "Multiple orphan PRDs in one doctor() call — each gets its own Issue and would_fix entry",
+        "find_orphan_branch_prds returns empty Vec — no Issues, no would_fix entries, summary.orphan_branch_prds == 0"
+      ],
+      "failureModes": [
+        {
+          "cause": "Developer accidentally pushes OrphanBranchPrd fix into `fixed` instead of `would_fix`",
+          "expectedBehavior": "doctor_fix_orphan_branch_prd_is_print_only test fails on assertion (b) — count of fixed OrphanBranchPrd entries must be 0"
+        },
+        {
+          "cause": "Developer adds a call to archive_prd_data in the auto_fix branch",
+          "expectedBehavior": "Test fails on assertion (c) — DB row count of archived_at IS NOT NULL rows must stay 0"
+        },
+        {
+          "cause": "format_text uses `--branch=<value>` syntax instead of `--branch <value>`",
+          "expectedBehavior": "Acceptance criterion explicitly requires space-separated form; test asserts substring `task-mgr archive --branch feat/`"
+        }
+      ],
+      "touchesFiles": [
+        "src/commands/doctor/output.rs",
+        "src/commands/doctor/fixes.rs",
+        "src/commands/doctor/mod.rs",
+        "src/commands/doctor/tests.rs",
+        "CLAUDE.md"
+      ],
+      "dependsOn": ["FEAT-001"],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "REFACTOR-001",
+      "title": "Review for refactoring opportunities",
+      "taskType": "review",
+      "description": "Review all implementation for DRY violations, complexity, coupling, and maintainability across src/commands/doctor/{checks,output,fixes,mod,tests}.rs.\n\nDO: Check for duplicated branch-set construction logic (FEAT-001 vs any reuse from `find_git_reconciliation_tasks`), functions >30 lines, tight coupling between the new check and unrelated doctor checks, test scaffolding that could be deduplicated across the six new tests.\nDO NOT: Skip — this gate catches issues before the final review. DO NOT refactor unrelated code in the doctor module.",
+      "acceptanceCriteria": [
+        "No code duplication: branch-set construction in FEAT-001 is not duplicated elsewhere (if `find_git_reconciliation_tasks` could share a helper, extract one).",
+        "Functions under 30 lines (flag any complex ones).",
+        "Clear separation of concerns: checks.rs reads, fixes.rs renders strings, mod.rs orchestrates, output.rs formats.",
+        "Code follows the existing doctor pattern: pure-reader check + would_fix-only entry for print-only fixes.",
+        "Test scaffolding: if the six FEAT-001 + two FEAT-002 tests share >5 lines of seeding logic, extract a `seed_orphan_prd(prefix, branch)` helper in tests.rs.",
+        "Any issues found spawn REFACTOR-FIX-xxx tasks via `task-mgr add --stdin --depended-on-by REVIEW-001` (priority 50-97) — atomic DB+JSON sync, no manual JSON edit.",
+        "If no issues, invoke `/simplify` on any rough touchpoint and emit `<task-status>REFACTOR-001:done</task-status>` with a one-line 'No refactor needed' note."
+      ],
+      "priority": 98,
+      "estimatedEffort": "high",
+      "passes": false,
+      "model": "claude-opus-4-7",
+      "timeoutSecs": 1800,
+      "notes": "Spawn fixes via `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001` — DB + JSON synced atomically, no manual edit. Focus on the new code in doctor/; do not refactor unrelated doctor checks.",
+      "qualityDimensions": [
+        "DRY across doctor module — no duplicated branch enumeration or test seeding",
+        "Single-responsibility functions — find_orphan_branch_prds is a pure reader, fix_orphan_branch_prd_remediation is pure rendering",
+        "Pattern consistency with existing doctor checks (StaleInProgressTask, ActiveRunWithoutEnd, OrphanedRelationship)"
+      ],
+      "touchesFiles": [
+        "src/commands/doctor/checks.rs",
+        "src/commands/doctor/output.rs",
+        "src/commands/doctor/fixes.rs",
+        "src/commands/doctor/mod.rs",
+        "src/commands/doctor/tests.rs"
+      ],
+      "dependsOn": ["FEAT-001", "FEAT-002"],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "REVIEW-001",
+      "title": "Code review + final verification (full suite)",
+      "taskType": "review",
+      "description": "Review all implementation for quality, security, integration wiring, and documentation needs. RUN THE FULL QUALITY GATE (unscoped test suite).\n\nDO: Check the print-only contract holds end-to-end (manual `task-mgr doctor --fix` against a seeded orphan PRD must leave archived_at unchanged). Check serde rename_all derive intact. Check CLAUDE.md edit is one line, not a section. Run FULL cargo test (no scope filter), cargo clippy --all-targets -- -D warnings, cargo fmt --check.\nDO NOT: Skip the print-only manual check — automated test asserts it but the manual run catches real-binary regressions (CLI dispatch wiring, etc.). Do NOT scope the test suite — this is THE place the full suite runs.",
+      "acceptanceCriteria": [
+        "Positive: All new code reachable from production entry points — `task-mgr doctor` actually surfaces the OrphanBranchPrd issue when a seeded orphan PRD exists (grep `pub use` re-exports, verify dispatcher chain from src/cli/commands.rs through to doctor()).",
+        "Positive: All errors propagated with context (map_err, no unwrap) in the new functions.",
+        "Positive: FULL `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check` all clean (no scope filter, no `-p task-mgr` restriction).",
+        "Positive: Manual sanity in a real shell (after `cargo install --path .`): seed an orphan PRD, run `task-mgr doctor`, see the issue; run `task-mgr doctor --fix`, see the would-fix hint, verify `sqlite3 .task-mgr/tasks.db 'SELECT count(*) FROM tasks WHERE archived_at IS NOT NULL'` returns the SAME value before and after the --fix call.",
+        "Positive: `task-mgr doctor --format json` includes the new `orphan_branch_prd` issue type in the issues array (serde derive auto-handled).",
+        "Negative: No unwrap() in production code paths in the new functions.",
+        "Negative: No dead code warnings for new symbols (`find_orphan_branch_prds`, `fix_orphan_branch_prd_remediation`, `IssueType::OrphanBranchPrd`).",
+        "Negative: No fix function for OrphanBranchPrd that writes to the DB. Grep src/commands/doctor/fixes.rs for `archived_at` / `archive_prd_data` to confirm absence.",
+        "Documentation: CLAUDE.md cheat-sheet line added (verify it's ONE line, not a section).",
+        "Pre-existing test failures fixed (or spawned as FIX-xxx with verifyCommand if >~12 unrelated).",
+        "If issues found: FIX-xxx tasks spawned via `task-mgr add --stdin --depended-on-by REVIEW-001`."
+      ],
+      "priority": 99,
+      "estimatedEffort": "medium",
+      "passes": false,
+      "model": "claude-opus-4-7",
+      "timeoutSecs": 1800,
+      "notes": "Spawn fixes via `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001` — DB + JSON synced atomically. If no issues: emit `<task-status>REVIEW-001:done</task-status>` with 'Clean review' note. The print-only contract is the security-critical invariant here — verify it manually as well as in unit tests.",
+      "qualityDimensions": [
+        "Print-only contract holds in the real binary (not just unit tests)",
+        "No unwrap in production code paths",
+        "All new code wired to production entry point — `task-mgr doctor` surfaces the issue, `--format json` includes it",
+        "Full suite green including any pre-existing failures",
+        "CLAUDE.md edit is minimal (one line)"
+      ],
+      "touchesFiles": [
+        "src/commands/doctor/checks.rs",
+        "src/commands/doctor/output.rs",
+        "src/commands/doctor/fixes.rs",
+        "src/commands/doctor/mod.rs",
+        "src/commands/doctor/tests.rs",
+        "CLAUDE.md"
+      ],
+      "dependsOn": ["FEAT-001", "FEAT-002", "REFACTOR-001"],
+      "modifiesBehavior": false
+    }
+  ]
+}

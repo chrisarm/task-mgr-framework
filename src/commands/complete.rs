@@ -1,7 +1,7 @@
-//! Complete command implementation.
-//!
-//! The complete command marks one or more tasks as done, updating timestamps
-//! and run tracking information.
+//! Complete command — mark tasks done. Routes the status mutation through
+//! `TaskLifecycle::apply` (PRD §6 Category A). Retains CLI-specific
+//! pre-validation (dependencies, required tests, force gate) and
+//! post-apply bookkeeping (`runs.last_commit`, `runs.iteration_count`).
 
 use std::process::Command;
 
@@ -9,62 +9,37 @@ use rusqlite::Connection;
 use serde::Serialize;
 
 use crate::commands::dependency_checker::check_dependencies_satisfied;
+use crate::lifecycle::{TaskLifecycle, TransitionChange, TransitionIntent, TransitionSource};
 use crate::models::TaskStatus;
 use crate::{TaskMgrError, TaskMgrResult};
 
 pub use crate::commands::dependency_checker::are_dependencies_satisfied;
 
-/// Result of completing a single task.
 #[derive(Debug, Clone, Serialize)]
 pub struct TaskCompletionResult {
-    /// The task that was completed
     pub task_id: String,
-    /// Previous status before completion
     pub previous_status: TaskStatus,
-    /// Whether the task was already done
     pub was_already_done: bool,
-    /// Warning message if task was not in_progress
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
 }
 
-/// Result of completing multiple tasks.
 #[derive(Debug, Clone, Serialize)]
 pub struct CompleteResult {
-    /// Results for each task
     pub tasks: Vec<TaskCompletionResult>,
-    /// Number of tasks successfully completed
     pub completed_count: usize,
-    /// Number of tasks that were already done
     pub already_done_count: usize,
-    /// Run ID if tracking was enabled
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
-    /// Commit hash if provided
     #[serde(skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
 }
 
-/// Complete one or more tasks.
-///
-/// # Arguments
-/// * `conn` - Database connection (mutable for transaction support)
-/// * `task_ids` - IDs of tasks to complete
-/// * `run_id` - Optional run ID for tracking
-/// * `commit` - Optional commit hash to record
-/// * `force` - If true, skip status transition validation
-///
-/// # Returns
-/// * `Ok(CompleteResult)` - Information about completed tasks
-/// * `Err(TaskMgrError)` - If any task not found, invalid transition, or database error
-///
-/// # Atomicity
-/// When multiple task IDs are provided, all operations are wrapped in a
-/// transaction. Either all tasks are completed, or none are (on error).
-///
-/// # Status Transition Validation
-/// By default, only tasks in `in_progress` status can be completed.
-/// Tasks in `todo` must be claimed first. Use `force=true` to override.
+/// Complete one or more tasks. Pre-validates dependencies, required tests,
+/// and transition validity (when `!force`) on every task before any writes;
+/// either all tasks pass or the call returns an error without touching any
+/// row. Status mutation runs through `TaskLifecycle::apply`; per-run
+/// `runs.last_commit` / `iteration_count` updates happen as a follow-up.
 pub fn complete(
     conn: &mut Connection,
     task_ids: &[String],
@@ -72,44 +47,141 @@ pub fn complete(
     commit: Option<&str>,
     force: bool,
 ) -> TaskMgrResult<CompleteResult> {
-    // Wrap all operations in a transaction for atomicity when completing multiple tasks
-    let tx = conn.transaction()?;
-
-    let mut results = Vec::with_capacity(task_ids.len());
-    let mut completed_count = 0;
-    let mut already_done_count = 0;
-
+    // Snapshot previous statuses + warnings before any writes. Failing
+    // here preserves the legacy all-or-nothing semantics.
+    let mut previous_statuses = Vec::with_capacity(task_ids.len());
+    let mut warnings = Vec::with_capacity(task_ids.len());
     for task_id in task_ids {
-        let result = complete_single_task(&tx, task_id, run_id, force)?;
-        if result.was_already_done {
-            already_done_count += 1;
-        } else {
-            completed_count += 1;
+        let prev_str: String = conn
+            .query_row("SELECT status FROM tasks WHERE id = ?", [task_id], |r| {
+                r.get(0)
+            })
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => TaskMgrError::task_not_found(task_id),
+                _ => TaskMgrError::from(e),
+            })?;
+        let previous: TaskStatus = prev_str.parse()?;
+        let done = previous == TaskStatus::Done;
+        let needs_force = !done && previous != TaskStatus::InProgress;
+        if !done && !force {
+            check_dependencies_satisfied(conn, task_id)?;
+            check_required_tests_pass(conn, task_id)?;
         }
-        results.push(result);
+        if needs_force && !force {
+            return Err(invalid_transition_error(task_id, previous));
+        }
+        warnings.push(if needs_force && force {
+            Some(format!(
+                "Forced completion: task was in '{previous}' status (invalid transition, overridden with --force)."
+            ))
+        } else if needs_force {
+            Some(format!(
+                "Task was in '{previous}' status, not 'in_progress'. Completing anyway."
+            ))
+        } else {
+            None
+        });
+        previous_statuses.push(previous);
     }
 
-    // If commit provided and run_id exists, update run's last_commit
-    if let (Some(rid), Some(commit_hash)) = (run_id, commit) {
-        tx.execute(
-            "UPDATE runs SET last_commit = ? WHERE run_id = ?",
-            rusqlite::params![commit_hash, rid],
-        )?;
+    // Force-advance non-InProgress / non-Done rows to InProgress via the
+    // lifecycle's race-safe claim before apply() — the matrix gate inside
+    // `TaskLifecycle::apply` would otherwise reject e.g. Operator Todo →
+    // Done. Routing through `try_claim` keeps the raw `UPDATE tasks SET
+    // status` SQL inside the lifecycle service (PRD §11 invariant).
+    if force {
+        let advancable: Vec<&String> = task_ids
+            .iter()
+            .zip(previous_statuses.iter())
+            .filter_map(|(id, prev)| {
+                (!matches!(prev, TaskStatus::InProgress | TaskStatus::Done)).then_some(id)
+            })
+            .collect();
+        if !advancable.is_empty() {
+            let lc = TaskLifecycle::new(conn);
+            for id in advancable {
+                // Conditional WHERE on the row's actual prior status — when
+                // the row has already advanced via a concurrent process,
+                // try_claim returns Ok(false) and we leave it alone.
+                let _ = lc.try_claim(
+                    id,
+                    &[
+                        TaskStatus::Todo,
+                        TaskStatus::Blocked,
+                        TaskStatus::Skipped,
+                        TaskStatus::Irrelevant,
+                    ],
+                );
+            }
+        }
     }
 
-    // Increment run's iteration_count if run_id provided
+    let intents: Vec<TransitionIntent> = task_ids
+        .iter()
+        .map(|id| TransitionIntent {
+            task_id: id.clone(),
+            change: TransitionChange::Done,
+            source: TransitionSource::Operator,
+            reason: None,
+            fail_status: None,
+            audit_note: None,
+        })
+        .collect();
+    let outcomes = {
+        let mut lc = match run_id {
+            Some(rid) => TaskLifecycle::with_run(conn, rid),
+            None => TaskLifecycle::new(conn),
+        };
+        lc.apply(&intents)
+    };
+    for outcome in &outcomes {
+        if !outcome.applied
+            && let Some(crate::lifecycle::TransitionRejectReason::DispatchFailed(msg)) =
+                &outcome.reason
+        {
+            return Err(TaskMgrError::lock_error_with_hint(
+                format!("complete dispatch failed for {}: {msg}", outcome.task_id),
+                "internal lifecycle dispatch error; check earlier stderr for details",
+            ));
+        }
+    }
+
     if let Some(rid) = run_id {
-        tx.execute(
+        if let Some(commit_hash) = commit {
+            conn.execute(
+                "UPDATE runs SET last_commit = ? WHERE run_id = ?",
+                rusqlite::params![commit_hash, rid],
+            )?;
+        }
+        conn.execute(
             "UPDATE runs SET iteration_count = iteration_count + 1 WHERE run_id = ?",
             [rid],
         )?;
     }
 
-    // Commit the transaction - all changes are atomic
-    tx.commit()?;
-
+    let mut completed_count = 0;
+    let mut already_done_count = 0;
+    let tasks: Vec<TaskCompletionResult> = task_ids
+        .iter()
+        .zip(previous_statuses)
+        .zip(warnings)
+        .map(|((id, previous_status), warning)| {
+            let was_already_done = previous_status == TaskStatus::Done;
+            if was_already_done {
+                already_done_count += 1;
+            } else {
+                completed_count += 1;
+            }
+            TaskCompletionResult {
+                task_id: id.clone(),
+                previous_status,
+                was_already_done,
+                warning,
+            }
+        })
+        .collect();
     Ok(CompleteResult {
-        tasks: results,
+        tasks,
         completed_count,
         already_done_count,
         run_id: run_id.map(String::from),
@@ -117,13 +189,30 @@ pub fn complete(
     })
 }
 
-/// Check that all required tests pass for a task.
-///
-/// Queries `required_tests` column for the task. If empty/null, returns Ok.
-/// For each test filter string, runs `cargo test <filter>` in the current directory.
-/// Returns Err with the list of failed test filters if any fail.
+/// CLI-side invalid-transition hint (references `task-mgr next --claim` /
+/// `--force` affordances, so it doesn't belong in the lifecycle service).
+fn invalid_transition_error(task_id: &str, previous: TaskStatus) -> TaskMgrError {
+    let valid = previous.valid_transitions();
+    let hint = if valid.is_empty() {
+        format!(
+            "Task '{task_id}' is in '{previous}' status which is a terminal state. No transitions allowed."
+        )
+    } else if previous == TaskStatus::Todo {
+        format!(
+            "Task '{task_id}' is in 'todo' status. Use 'task-mgr next --claim {task_id}' to claim it first, then complete. Or use --force to override."
+        )
+    } else {
+        format!(
+            "Task '{task_id}' is in '{previous}' status. Valid transitions: {}. Use --force to override.",
+            valid.join(", ")
+        )
+    };
+    TaskMgrError::invalid_transition(task_id, previous.to_string(), "done", hint)
+}
+
+/// Check that all required tests pass for a task. Queries `required_tests`;
+/// empty/null → Ok. For each filter, runs `cargo test <filter>`.
 fn check_required_tests_pass(conn: &Connection, task_id: &str) -> TaskMgrResult<()> {
-    // Column may not exist in pre-v11 databases; treat as no required tests
     let required_tests: Option<String> = conn
         .query_row(
             "SELECT required_tests FROM tasks WHERE id = ?",
@@ -136,23 +225,20 @@ fn check_required_tests_pass(conn: &Connection, task_id: &str) -> TaskMgrResult<
         Some(s) if !s.is_empty() => serde_json::from_str(&s).unwrap_or_default(),
         _ => return Ok(()),
     };
-
     if filters.is_empty() {
         return Ok(());
     }
 
     let mut failed = Vec::new();
     for filter in &filters {
-        let result = Command::new("cargo")
+        let status = Command::new("cargo")
             .args(["test", filter, "--", "--no-capture"])
             .status();
-
-        match result {
-            Ok(status) if status.success() => {} // test passed
+        match status {
+            Ok(s) if s.success() => {}
             _ => failed.push(filter.clone()),
         }
     }
-
     if failed.is_empty() {
         Ok(())
     } else {
@@ -163,148 +249,10 @@ fn check_required_tests_pass(conn: &Connection, task_id: &str) -> TaskMgrResult<
     }
 }
 
-/// Complete a single task.
-fn complete_single_task(
-    conn: &Connection,
-    task_id: &str,
-    run_id: Option<&str>,
-    force: bool,
-) -> TaskMgrResult<TaskCompletionResult> {
-    // Query current task status
-    let previous_status_str: String = conn
-        .query_row("SELECT status FROM tasks WHERE id = ?", [task_id], |row| {
-            row.get(0)
-        })
-        .map_err(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => TaskMgrError::task_not_found(task_id),
-            _ => TaskMgrError::from(e),
-        })?;
-
-    let previous_status: TaskStatus = previous_status_str.parse()?;
-
-    // Check if already done
-    let was_already_done = previous_status == TaskStatus::Done;
-
-    // Gate on dependency satisfaction (skip if already done or forcing)
-    if !was_already_done && !force {
-        check_dependencies_satisfied(conn, task_id)?;
-    }
-
-    // Gate on required tests (skip if already done or forcing)
-    if !was_already_done && !force {
-        check_required_tests_pass(conn, task_id)?;
-    }
-
-    // Validate status transition
-    let can_transition = previous_status.can_transition_to(TaskStatus::Done);
-
-    // If invalid transition and not forcing, return error
-    if !was_already_done && !can_transition && !force {
-        let valid_transitions = previous_status.valid_transitions();
-        let hint = if valid_transitions.is_empty() {
-            format!(
-                "Task '{}' is in '{}' status which is a terminal state. No transitions allowed.",
-                task_id, previous_status
-            )
-        } else if previous_status == TaskStatus::Todo {
-            format!(
-                "Task '{}' is in 'todo' status. Use 'task-mgr next --claim {}' to claim it first, then complete. Or use --force to override.",
-                task_id, task_id
-            )
-        } else {
-            format!(
-                "Task '{}' is in '{}' status. Valid transitions: {}. Use --force to override.",
-                task_id,
-                previous_status,
-                valid_transitions.join(", ")
-            )
-        };
-        return Err(TaskMgrError::invalid_transition(
-            task_id,
-            previous_status.to_string(),
-            "done",
-            hint,
-        ));
-    }
-
-    // Generate warning if task was not in_progress (but force was used)
-    let warning = if !was_already_done && !can_transition && force {
-        Some(format!(
-            "Forced completion: task was in '{}' status (invalid transition, overridden with --force).",
-            previous_status
-        ))
-    } else if !was_already_done && previous_status != TaskStatus::InProgress {
-        Some(format!(
-            "Task was in '{}' status, not 'in_progress'. Completing anyway.",
-            previous_status
-        ))
-    } else {
-        None
-    };
-
-    if !was_already_done {
-        // Update task status to done
-        conn.execute(
-            "UPDATE tasks SET status = 'done', completed_at = datetime('now'), updated_at = datetime('now') WHERE id = ?",
-            [task_id],
-        )?;
-        // Reset consecutive_failures on success (column added by migration v13;
-        // tolerated on pre-v13 schemas that lack the column).
-        if let Err(e) = conn.execute(
-            "UPDATE tasks SET consecutive_failures = 0 WHERE id = ?",
-            [task_id],
-        ) {
-            eprintln!(
-                "Warning: failed to reset consecutive_failures for {}: {}",
-                task_id, e
-            );
-        }
-    }
-
-    // If run_id provided, update run_tasks entry
-    if let Some(rid) = run_id {
-        // Check if there's an existing run_tasks entry
-        let run_task_exists: bool = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM run_tasks WHERE run_id = ? AND task_id = ?)",
-                rusqlite::params![rid, task_id],
-                |row| row.get(0),
-            )
-            .unwrap_or(false);
-
-        if run_task_exists {
-            // Update existing entry with completion info
-            // Calculate duration using julianday
-            conn.execute(
-                r#"
-                UPDATE run_tasks
-                SET status = 'completed',
-                    ended_at = datetime('now'),
-                    duration_seconds = CAST(
-                        (julianday('now') - julianday(started_at)) * 86400 AS INTEGER
-                    )
-                WHERE run_id = ? AND task_id = ? AND status = 'started'
-                "#,
-                rusqlite::params![rid, task_id],
-            )?;
-        }
-    }
-
-    Ok(TaskCompletionResult {
-        task_id: task_id.to_string(),
-        previous_status,
-        was_already_done,
-        warning,
-    })
-}
-
-/// Format complete result as human-readable text.
 #[must_use]
 pub fn format_text(result: &CompleteResult) -> String {
     let mut output = String::new();
-
     if result.tasks.len() == 1 {
-        // Single task output
         let task = &result.tasks[0];
         if task.was_already_done {
             output.push_str(&format!("Task {} was already done.\n", task.task_id));
@@ -315,10 +263,9 @@ pub fn format_text(result: &CompleteResult) -> String {
             ));
         }
         if let Some(ref warning) = task.warning {
-            output.push_str(&format!("Warning: {}\n", warning));
+            output.push_str(&format!("Warning: {warning}\n"));
         }
     } else {
-        // Multiple tasks output
         output.push_str(&format!(
             "Completed {} task(s), {} already done.\n",
             result.completed_count, result.already_done_count
@@ -333,19 +280,16 @@ pub fn format_text(result: &CompleteResult) -> String {
                 ));
             }
             if let Some(ref warning) = task.warning {
-                output.push_str(&format!("    Warning: {}\n", warning));
+                output.push_str(&format!("    Warning: {warning}\n"));
             }
         }
     }
-
     if let Some(ref commit) = result.commit {
-        output.push_str(&format!("Recorded commit: {}\n", commit));
+        output.push_str(&format!("Recorded commit: {commit}\n"));
     }
-
     if let Some(ref rid) = result.run_id {
-        output.push_str(&format!("Run: {}\n", rid));
+        output.push_str(&format!("Run: {rid}\n"));
     }
-
     output
 }
 

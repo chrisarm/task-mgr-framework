@@ -205,12 +205,15 @@ Do **not** hardcode model IDs — they change with each Claude release and must 
 
 Set the resolved **sonnet** model as the PRD-level `"model"` field. Sonnet is the iteration default; opus tasks explicitly override per-task.
 
+**Resolve review model** — Before stamping `model` on `REVIEW-001`, read `.task-mgr/config.json` and check `reviewModel`. If set, use that value; otherwise fall back to opus. Default recommendation: `grok-4`.
+
 **Model assignment rubric** (set `model` field only where listed; omit for everything else — uses PRD default):
 
 | Task type                                                                   | Assign `model`             | Rationale                                              |
 | --------------------------------------------------------------------------- | -------------------------- | ------------------------------------------------------ |
 | `FEAT-xxx` / `FIX-xxx` with `estimatedEffort: "high"` OR `modifiesBehavior: true` | opus                 | Complex implementation — stronger model reduces rework |
-| `REFACTOR-001` / `REVIEW-001`                                               | opus                       | Nuanced quality/security/architecture judgment; full suite run |
+| `REVIEW-001`                                                                | reviewModel (default `grok-4`, else opus) | Second-model perspective; full suite run |
+| `REFACTOR-001`                                                              | opus                       | Nuanced quality/security/architecture judgment; full suite run |
 | All other implementation, test, and fix tasks                               | _(omit — use PRD default)_ | Standard work handled by the Sonnet default            |
 
 > The old "first FEAT is always opus" rule is gone — it was pattern-worship. Iterations don't inherit patterns across runs.
@@ -508,7 +511,7 @@ The agent checks these before starting any task. If the required task hasn't pas
       "priority": 99,
       "estimatedEffort": "medium",
       "passes": false,
-      "model": "<resolved-opus-id>",
+      "model": "<resolved-reviewModel-id>",
       "timeoutSecs": 1800,
       "notes": "Spawn fixes via `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001` — DB + JSON synced atomically, no manual edit. If no issues: emit `<task-status>REVIEW-001:done</task-status>` with 'Clean review' note. Review remaining tasks — if implementation changed APIs, data structures, or assumptions, update task descriptions/criteria to match (via `task-mgr init --from-json ... --append --update-existing`).",
       "qualityDimensions": ["No unwrap in production", "All new code wired to production entry point", "Full suite green including pre-existing"],
@@ -967,7 +970,8 @@ Verify:
 - [ ] Each implementation task has `qualityDimensions` populated as a **flat array** (NOT `{correctness, performance, style}` sub-objects)
 - [ ] Each task's known edge cases appear in `edgeCases` field
 - [ ] Tasks with `modifiesBehavior: true` have caller impact documented in description
-- [ ] REFACTOR-001 and REVIEW-001 both have `model: <opus-id>` and `timeoutSecs: 1800`
+- [ ] REFACTOR-001 has `model: <opus-id>` and `timeoutSecs: 1800`
+- [ ] REVIEW-001 has `model: <reviewModel-id>` (read from `.task-mgr/config.json` `reviewModel`; default `grok-4`, else opus) and `timeoutSecs: 1800`
 - [ ] **No task has `synergyWith` / `batchWith` / `conflictsWith` populated** (dropped — `touchesFiles` drives synergy at runtime)
 - [ ] **Context-economy placeholders populated in the generated prompt** (the agent can't read the JSON, so these MUST be in the prompt):
   - [ ] `{{PROHIBITED_OUTCOMES}}` — rendered from JSON `prohibitedOutcomes[]` as a bullet list

@@ -54,7 +54,7 @@ use fixes::{fix_active_run, fix_git_reconciliation, fix_orphaned_relationship, f
 /// * `Ok(DoctorResult)` - Information about issues found and fixed
 /// * `Err(TaskMgrError)` - If database error occurs
 pub fn doctor(
-    conn: &Connection,
+    conn: &mut Connection,
     auto_fix: bool,
     dry_run: bool,
     decay_threshold: i64,

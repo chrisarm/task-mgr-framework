@@ -295,8 +295,8 @@ fn test_doctor_fixes_stale_after_crash() {
     // Doctor should find and fix this
 
     // Run doctor check (no auto-fix)
-    let conn = open_connection(temp_dir.path()).unwrap();
-    let doctor_result = doctor::doctor(&conn, false, false, 0, false, temp_dir.path()).unwrap();
+    let mut conn = open_connection(temp_dir.path()).unwrap();
+    let doctor_result = doctor::doctor(&mut conn, false, false, 0, false, temp_dir.path()).unwrap();
     assert!(
         doctor_result.summary.stale_tasks > 0,
         "Doctor should find stale in_progress task"
@@ -307,7 +307,8 @@ fn test_doctor_fixes_stale_after_crash() {
     );
 
     // Run doctor with auto-fix
-    let doctor_fix_result = doctor::doctor(&conn, true, false, 0, false, temp_dir.path()).unwrap();
+    let doctor_fix_result =
+        doctor::doctor(&mut conn, true, false, 0, false, temp_dir.path()).unwrap();
     assert!(
         doctor_fix_result.summary.total_fixed > 0,
         "Doctor should have fixed stale tasks"
@@ -570,11 +571,11 @@ fn test_doctor_dry_run() {
     let task_id = next_result.task.as_ref().unwrap().id.clone();
 
     // Simulate crash by ending run as aborted
-    let conn = open_connection(temp_dir.path()).unwrap();
+    let mut conn = open_connection(temp_dir.path()).unwrap();
     end(&conn, &begin_result.run_id, RunStatus::Aborted).unwrap();
 
     // Run doctor in dry-run mode
-    let doctor_result = doctor::doctor(&conn, true, true, 0, false, temp_dir.path()).unwrap(); // dry_run=true
+    let doctor_result = doctor::doctor(&mut conn, true, true, 0, false, temp_dir.path()).unwrap(); // dry_run=true
     assert!(
         doctor_result.summary.stale_tasks > 0,
         "Should find stale task"

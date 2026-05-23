@@ -1,0 +1,259 @@
+diff --git a/.task-mgr/tasks/loop-reliability.json b/.task-mgr/tasks/loop-reliability.json
+index 20dfda0..3d12fc5 100644
+--- a/.task-mgr/tasks/loop-reliability.json
++++ b/.task-mgr/tasks/loop-reliability.json
+@@ -1296,6 +1296,33 @@
+       "touchesFiles": [
+         "docker/llama-box/Dockerfile"
+       ]
++    },
++    {
++      "acceptanceCriteria": [
++        "New struct PrimaryRunnerConfig in src/loop_engine/project_config.rs with fields: claude_fallback_model: Option<String>, runtime_error_threshold: u32 (default 2), by_task_type: HashMap<String, RunnerSpec>, by_id_prefix: HashMap<String, RunnerSpec>",
++        "New struct RunnerSpec { provider: String, model: String } in the same module",
++        "ProjectConfig gains: pub primary_runner: Option<PrimaryRunnerConfig> (snake_case Rust, camelCase JSON via existing serde rename)",
++        "Default impl for PrimaryRunnerConfig produces enabled-by-presence; absent key → None; explicit null → None (matches FallbackRunnerConfig loader behavior)",
++        "Serde round-trip tests covering: present + populated, present + empty maps, absent, explicit-null, partial (missing optional fields use defaults)",
++        "Behavior unchanged when primaryRunner is absent: existing tests pass byte-identically",
++        "No new warnings in cargo clippy",
++        "Commit message: `feat: FEAT-PRIMARY-001-completed - PrimaryRunnerConfig schema + serde`"
++      ],
++      "dependsOn": [
++        "5ba153a7-MILESTONE-1"
++      ],
++      "description": "Add a new optional `primaryRunner` section to .task-mgr/config.json that routes specific task types/id-prefixes to a non-default runner. Companion to (but independent of) the existing fallbackRunner. Phase 1: schema + serde + tests only. No resolution-chain changes yet.",
++      "estimatedEffort": "medium",
++      "id": "FEAT-PRIMARY-001",
++      "model": "claude-sonnet-4-6",
++      "notes": "Per plan: /home/chris/.claude/plans/plan-out-the-changes-glimmering-pascal.md §Configuration shape.\n\nExample JSON the loader must accept:\n```json\n\"primaryRunner\": {\n  \"claudeFallbackModel\": \"claude-sonnet-4-6\",\n  \"runtimeErrorThreshold\": 2,\n  \"byTaskType\": {\n    \"review\":    { \"provider\": \"grok\", \"model\": \"grok-4\" },\n    \"milestone\": { \"provider\": \"grok\", \"model\": \"grok-4\" }\n  },\n  \"byIdPrefix\": {\n    \"REVIEW-\":    { \"provider\": \"grok\", \"model\": \"grok-4\" },\n    \"MILESTONE-\": { \"provider\": \"grok\", \"model\": \"grok-4\" }\n  }\n}\n```",
++      "passes": false,
++      "priority": 0,
++      "requiresHuman": false,
++      "title": "PrimaryRunnerConfig schema + serde round-trip + default off",
++      "touchesFiles": [
++        "src/loop_engine/project_config.rs"
++      ]
+     }
+   ],
+   "version": "1.0"
+diff --git a/tasks/grok-fallback-runner.json b/tasks/grok-fallback-runner.json
+index 2ccf7a2..3fb0527 100644
+--- a/tasks/grok-fallback-runner.json
++++ b/tasks/grok-fallback-runner.json
+@@ -1248,6 +1248,11 @@
+         "Commit message: `chore: MILESTONE-FINAL-completed - Grok fallback runner ready to merge`"
+       ],
+       "dependsOn": [
++        "5ba153a7-FEAT-PRIMARY-001",
++        "5ba153a7-FEAT-PRIMARY-002",
++        "5ba153a7-FEAT-PRIMARY-003",
++        "5ba153a7-FEAT-PRIMARY-004",
++        "5ba153a7-FEAT-PRIMARY-005",
+         "VERIFY-001"
+       ],
+       "description": "Final gate. ALL tasks have passes: true. Full unscoped suite passes. Manual smoke tests pass. Docs updated. PRD's primary goals and success metrics are demonstrably met.",
+@@ -1339,7 +1344,7 @@
+       "estimatedEffort": "high",
+       "id": "5ba153a7-REVIEW-FIX-2-ALL",
+       "notes": "Spawned by /review-loop on 2026-05-18 after backward-looking review of the completed grok-fallback-runner loop. Bundles H2, H3, M1, M2, M3, M5, L1-L5 into one atomic fix. Depends on 5ba153a7-REVIEW-FIX-1-MERGE-MAIN (H1) so the merged base is the starting point.",
+-      "passes": false,
++      "passes": true,
+       "priority": 81,
+       "title": "Address all remaining /review-loop findings: Opus[1M] gate, drift guards, banner dedupe, startup env parity, auth window env, low nits",
+       "touchesFiles": [
+@@ -1353,7 +1358,193 @@
+         "tests/grok_runner_unit.rs",
+         "tests/fallback_config.rs"
+       ]
++    },
++    {
++      "acceptanceCriteria": [
++        "New struct PrimaryRunnerConfig in src/loop_engine/project_config.rs with fields: claude_fallback_model: Option<String>, runtime_error_threshold: u32 (default 2), by_task_type: HashMap<String, RunnerSpec>, by_id_prefix: HashMap<String, RunnerSpec>",
++        "New struct RunnerSpec { provider: String, model: String } in the same module",
++        "ProjectConfig gains: pub primary_runner: Option<PrimaryRunnerConfig> (snake_case Rust, camelCase JSON via existing serde rename)",
++        "Absent key → None; explicit `null` → None (matches FallbackRunnerConfig loader behavior)",
++        "Serde round-trip tests: present + populated, present + empty maps, absent, explicit-null, partial (missing optional fields use defaults)",
++        "Behavior unchanged when primaryRunner is absent: existing project_config tests pass byte-identically",
++        "No new warnings in cargo clippy",
++        "Commit message: `feat: FEAT-PRIMARY-001-completed - PrimaryRunnerConfig schema + serde`"
++      ],
++      "dependsOn": [
++        "5ba153a7-MILESTONE-1"
++      ],
++      "description": "Add a new optional `primaryRunner` section to .task-mgr/config.json that routes specific task types/id-prefixes to a non-default runner. Companion to (but independent of) the existing fallbackRunner. Phase 1: schema + serde + tests only. No resolution-chain changes yet.",
++      "estimatedEffort": "medium",
++      "id": "5ba153a7-FEAT-PRIMARY-001",
++      "model": "claude-sonnet-4-6",
++      "notes": "Per plan: /home/chris/.claude/plans/plan-out-the-changes-glimmering-pascal.md §Configuration shape.\n\nExample JSON the loader must accept:\n```json\n\"primaryRunner\": {\n  \"claudeFallbackModel\": \"claude-sonnet-4-6\",\n  \"runtimeErrorThreshold\": 2,\n  \"byTaskType\": {\n    \"review\":    { \"provider\": \"grok\", \"model\": \"grok-4\" },\n    \"milestone\": { \"provider\": \"grok\", \"model\": \"grok-4\" }\n  },\n  \"byIdPrefix\": {\n    \"REVIEW-\":    { \"provider\": \"grok\", \"model\": \"grok-4\" },\n    \"MILESTONE-\": { \"provider\": \"grok\", \"model\": \"grok-4\" }\n  }\n}\n```",
++      "passes": false,
++      "priority": 0,
++      "requiresHuman": false,
++      "title": "PrimaryRunnerConfig schema + serde round-trip + default off",
++      "touchesFiles": [
++        "src/loop_engine/project_config.rs"
++      ]
++    },
++    {
++      "acceptanceCriteria": [
++        "ModelResolutionContext (model.rs ~lines 182-193) gains: task_id: Option<&str>, task_type: Option<&str>, primary_runner: Option<&PrimaryRunnerConfig>",
++        "New helper fn primary_runner_match(cfg, task_id, task_type) -> Option<&RunnerSpec>: taskType match wins when both match with different specs; else falls back to first matching id-prefix",
++        "resolve_task_model (model.rs ~lines 207-223) inserts primaryRunner check AFTER explicit task_model and BEFORE difficulty==high escalation",
++        "synergy.rs ~line 44 threads task.id, task.task_type, project_config.primary_runner.as_ref() into ModelResolutionContext",
++        "Test: taskType='review' + no task.model → resolves to 'grok-4'; effective_runner routes to GrokRunner via existing provider_for_model",
++        "Test: taskType='milestone' → resolves to 'grok-4'",
++        "Test: id='REVIEW-001' with taskType='implementation' → resolves to 'grok-4' (prefix match)",
++        "Test: id='FEAT-001' with taskType='review' → resolves to 'grok-4' (taskType match wins over no-prefix-match)",
++        "Test: explicit task.model='claude-opus-4-7' on a review task → resolves to claude-opus-4-7 (rung 1 explicit wins)",
++        "Test: difficulty='high' on a review task → resolves to 'grok-4' (primaryRunner wins over difficulty=high)",
++        "Test: primary_runner is None → behavior byte-identical to today; review tasks resolve via defaults",
++        "Test: taskType='feature' AND id='FEAT-001' → no match; default behavior preserved",
++        "No new warnings in cargo clippy",
++        "Commit message: `feat: FEAT-PRIMARY-002-completed - primaryRunner rung in resolve_task_model`"
++      ],
++      "dependsOn": [
++        "5ba153a7-FEAT-PRIMARY-001",
++        "5ba153a7-FEAT-002"
++      ],
++      "description": "Extend model resolution chain in src/loop_engine/model.rs::resolve_task_model so REVIEW/MILESTONE tasks (matched by taskType OR id prefix) default to the configured Grok model. Rung order becomes: (1) explicit task.model, (2) primaryRunner match, (3) difficulty=high → OPUS_MODEL, (4) prd_default → project_default → user_default. Wires ModelResolutionContext with task_id, task_type, primary_runner config and threads them from the synergy.rs call site.",
++      "estimatedEffort": "medium",
++      "id": "5ba153a7-FEAT-PRIMARY-002",
++      "model": "claude-sonnet-4-6",
++      "notes": "Per plan §Resolution chain change. The existing resolve_effective_runner at engine.rs:346-358 routes via provider_for_model(effective_model) — once resolve_task_model returns 'grok-4', the runner dispatch routes through GrokRunner automatically. No changes needed at engine.rs:1942 (wave) or engine.rs:2527 (sequential).\n\nIMPORTANT: primary_runner_match should return the spec from byTaskType FIRST (if it matches), THEN check byIdPrefix. If both match with the SAME spec, no observable difference. If they match with DIFFERENT specs, taskType wins.",
++      "passes": false,
++      "priority": -1,
++      "requiresHuman": false,
++      "title": "resolve_task_model: insert primaryRunner rung between explicit and difficulty=high",
++      "touchesFiles": [
++        "src/loop_engine/model.rs",
++        "src/loop_engine/synergy.rs"
++      ]
++    },
++    {
++      "id": "5ba153a7-FEAT-PRIMARY-003",
++      "title": "Inverse RuntimeError fallback hook: Grok → Claude in escalate_task_model_if_needed",
++      "description": "Extend src/loop_engine/engine.rs::escalate_task_model_if_needed (lines ~4961-5046) to mirror the existing Claude→Grok promotion in the inverse direction. When effective_runner == RunnerKind::Grok AND tasks.consecutive_failures >= primary_runner.runtime_error_threshold AND primary_runner.claude_fallback_model.is_some(), promote: insert runner_overrides[task_id]=Claude, model_overrides[task_id]=claude_fallback_model, and UPDATE tasks SET model = ? in the same logical operation. Mirrors the Claude→Grok branch at engine.rs:5021-5038 with idempotency guard, GrokAuthFailure short-circuit reuse, and wave-mode wiring on the main thread (NOT slot worker).",
++      "taskType": "implementation",
++      "difficulty": "high",
++      "modifiesBehavior": true,
++      "model": "claude-opus-4-7",
++      "requiresHuman": false,
++      "dependsOn": [
++        "5ba153a7-FEAT-PRIMARY-002",
++        "5ba153a7-FEAT-007"
++      ],
++      "touchesFiles": [
++        "src/loop_engine/engine.rs"
++      ],
++      "acceptanceCriteria": [
++        "escalate_task_model_if_needed gains the inverse branch: gate on (model_now provider == Grok && task_row.consecutive_failures >= cfg.runtime_error_threshold && effective_runner == RunnerKind::Grok && cfg.claude_fallback_model.is_some())",
++        "Promotion writes: ctx.runner_overrides.insert(task_id, Claude); ctx.model_overrides.insert(task_id, cfg.claude_fallback_model.clone()); UPDATE tasks SET model = ?1 WHERE id = ?2 (claude_fallback_model) — IN THE SAME logical operation so resolve_task_model on next iteration doesn't shadow",
++        "ctx.overflow_original_task_model.entry(task_id).or_insert_with(|| previous_value) captures pre-promotion model for FR-008 detection",
++        "Counter preserved: tasks.consecutive_failures is NOT reset by promotion",
++        "Idempotency: a task already promoted to Claude (effective_runner == Claude) does NOT re-enter this branch; falls through to normal failure accounting → auto_block_task per existing max_retries logic",
++        "Wave-mode wiring: hook fires from post-wave aggregation on main thread, NEVER from inside run_slot_iteration (preserves IterationContext thread-safety invariant from learning #1810)",
++        "GrokAuthFailure short-circuit: when a prior iteration returned TaskMgrError::GrokAuthFailure, do NOT increment consecutive_failures AND skip this promotion (cascade prevention; reuses existing FEAT-007 logic)",
++        "Test: Grok-primary task hits consecutive_failures==2 + claudeFallbackModel set → runner_overrides[id]=Claude, model_overrides set, tasks.model UPDATEd, banner reflects switch",
++        "Test: after promotion, next iteration spawns via ClaudeRunner with claude_fallback_model",
++        "Test: claudeFallbackModel absent → no promotion fires; task dead-ends (parity with today's Claude-no-fallback case)",
++        "Test: GrokAuthFailure on Grok-primary task does NOT increment consecutive_failures (regression guard)",
++        "All existing escalate_task_model_if_needed tests continue to pass (regression guard — Claude→Grok behavior byte-identical when primary_runner absent or not matched)",
++        "No new warnings in cargo clippy",
++        "Commit message: `feat: FEAT-PRIMARY-003-completed - Inverse RuntimeError Grok→Claude fallback hook`"
++      ],
++      "qualityDimensions": [
++        "Mirror the existing FEAT-007 Claude→Grok branch shape exactly — same DB write contract, same counter contract, same wave-mode wiring discipline",
++        "Single source of truth: gate on the pre-computed effective_runner value, not a re-derivation",
++        "tasks.model DB UPDATE is paired with the in-memory override insert — never one without the other"
++      ],
++      "notes": "Per plan §Critical files to modify (engine.rs row). Reuses the existing FEAT-007 infrastructure: same function, parallel branch, opposite direction.\n\nIMPORTANT: read FEAT-007's implementation in engine.rs (lines ~5021-5038) before writing this — the goal is byte-for-byte mirror in the inverse direction. Differences: provider check inverts (Grok→Claude instead of Claude→Grok), config source is project_config.primary_runner.claude_fallback_model instead of project_config.fallback_runner.model.",
++      "completionCheck": "cargo test --lib loop_engine::engine 2>&1 | tee /tmp/t.txt | tail -3 && grep -E 'FAILED|error\\[' /tmp/t.txt | head -5",
++      "priority": 0,
++      "passes": false
++    },
++    {
++      "id": "5ba153a7-FEAT-PRIMARY-004",
++      "title": "Inverse FallbackToProvider target in handle_prompt_too_long: Grok → Claude rung",
++      "description": "Generalize the rung-4 FallbackToProvider selection in src/loop_engine/overflow.rs::handle_prompt_too_long. Today the fallback target is hardcoded to cfg.fallback.model (Grok) under Claude-effective_runner. New behavior: target = cfg.fallback.model when effective_runner == Claude; target = primary_runner.claude_fallback_model when effective_runner == Grok. The Claude-ladder rungs (escalate_below_opus, to_1m_model) already return None on grok inputs via existing provider guards (FEAT-002), so the ladder naturally walks to rung 4 for Grok-primary tasks.",
++      "taskType": "implementation",
++      "difficulty": "medium",
++      "modifiesBehavior": true,
++      "model": "claude-opus-4-7",
++      "requiresHuman": false,
++      "dependsOn": [
++        "5ba153a7-FEAT-PRIMARY-002",
++        "5ba153a7-FEAT-PRIMARY-003",
++        "5ba153a7-FEAT-006"
++      ],
++      "touchesFiles": [
++        "src/loop_engine/overflow.rs"
++      ],
++      "acceptanceCriteria": [
++        "handle_prompt_too_long rung-4 (FallbackToProvider) selects target model based on effective_runner: Claude → cfg.fallback.model (Grok); Grok → primary_runner.claude_fallback_model (Claude)",
++        "Selection gated: (effective_runner == Grok && primary_runner.is_some() && primary_runner.claude_fallback_model.is_some()) OR existing Claude→Grok gating preserved",
++        "Idempotency preserved: a task already promoted (was-Claude-now-Grok OR was-Grok-now-Claude) does NOT re-enter rung 4; falls through to rung 5 (Blocked)",
++        "OverflowEvent (overflow.rs:85) runner field correctly reports the post-promotion runner",
++        "RecoveryAction::FallbackToProvider already carries { provider, model } — no new enum variant; just dynamic target",
++        "Test: Grok-primary task that overflows with claudeFallbackModel set → rung 4 fires, target is the claude fallback model",
++        "Test: Grok-primary task that overflows with claudeFallbackModel absent → rung 4 skipped, rung 5 (Blocked)",
++        "Test: existing Claude→Grok rung-4 behavior byte-identical when primary_runner is None (regression guard)",
++        "Test: idempotency — a task promoted Grok→Claude that overflows AGAIN goes to Blocked (no re-promotion)",
++        "No new warnings in cargo clippy",
++        "Commit message: `feat: FEAT-PRIMARY-004-completed - Inverse overflow rung Grok→Claude`"
++      ],
++      "qualityDimensions": [
++        "Reuse existing RecoveryAction::FallbackToProvider variant — do NOT introduce a sibling variant for the inverse direction",
++        "Selection logic is a single match on effective_runner; do not branch in multiple call sites",
++        "Idempotency: post-promotion overflow → Blocked, not infinite cross-provider ping-pong"
++      ],
++      "notes": "Per plan §Critical files to modify (overflow.rs row). Builds on FEAT-006 (which introduced rung 4 in the Claude→Grok direction) and FEAT-PRIMARY-003 (which establishes the inverse direction's override-insertion contract).",
++      "completionCheck": "cargo test --lib loop_engine::overflow 2>&1 | tee /tmp/t.txt | tail -3 && grep -E 'FAILED|error\\[' /tmp/t.txt | head -5",
++      "priority": 0,
++      "passes": false
++    },
++    {
++      "id": "5ba153a7-FEAT-PRIMARY-005",
++      "title": "Docs + end-to-end integration test for REVIEW/MILESTONE primary routing",
++      "description": "Final integration: update src/loop_engine/CLAUDE.md to document primary routing + symmetric Grok→Claude fallback; add tests/primary_runner_routing.rs covering all 8 routing scenarios from the plan + the Grok→Claude fallback path end-to-end. The grok integration test (TEST-001) is gated #[ignore]'d for CI without grok installed — this new integration test follows the same pattern.",
++      "taskType": "test",
++      "difficulty": "medium",
++      "modifiesBehavior": false,
++      "model": "claude-sonnet-4-6",
++      "requiresHuman": false,
++      "dependsOn": [
++        "5ba153a7-FEAT-PRIMARY-001",
++        "5ba153a7-FEAT-PRIMARY-002",
++        "5ba153a7-FEAT-PRIMARY-003",
++        "5ba153a7-FEAT-PRIMARY-004"
++      ],
++      "touchesFiles": [
++        "src/loop_engine/CLAUDE.md",
++        "tests/primary_runner_routing.rs",
++        "tests/grok_to_claude_fallback.rs"
++      ],
++      "acceptanceCriteria": [
++        "src/loop_engine/CLAUDE.md gains a section documenting primaryRunner config block (alongside fallbackRunner), the routing precedence (explicit → primaryRunner → difficulty=high → defaults), and the symmetric Claude↔Grok fallback contract",
++        "src/loop_engine/CLAUDE.md overflow-recovery rung table updated to show BOTH fallback directions (Claude→Grok via fallbackRunner.model; Grok→Claude via primaryRunner.claudeFallbackModel)",
++        "tests/primary_runner_routing.rs created with the 8 routing tests enumerated in the plan §Testing section",
++        "tests/grok_to_claude_fallback.rs created with the 4 inverse-fallback scenarios from the plan §Testing section",
++        "Integration test fixture: a small fake-PRD JSON with REVIEW-001 + taskType:review entries, used to verify the full path config → resolve_task_model → resolve_effective_runner → dispatch",
++        "Both new test files compile and pass with grok binary present; the grok-spawn parts are gated #[ignore]'d for CI without grok (same pattern as existing tests/grok_runner.rs)",
++        "cargo test --lib loop_engine passes with no regressions",
++        "cargo fmt --check passes",
++        "No new warnings in cargo clippy",
++        "Commit message: `feat: FEAT-PRIMARY-005-completed - Docs + integration tests for primary routing`"
++      ],
++      "qualityDimensions": [
++        "Tests use the real ProjectConfig / IterationContext structs — never hand-built HashMaps (compile-time field-name guard)",
++        "Doc updates are concrete: include the example primaryRunner JSON block, not abstract description",
++        "Grok-spawn portions of integration tests follow the existing #[ignore] gating pattern from tests/grok_runner.rs"
++      ],
++      "notes": "Per plan §Testing + §Verification (end-to-end). This is the closing task — when this lands, the feature is complete and MILESTONE-FINAL can fire.",
++      "completionCheck": "cargo test 2>&1 | tee /tmp/t.txt | tail -5 && grep -E 'FAILED|error\\[' /tmp/t.txt | head -5",
++      "priority": 0,
++      "passes": false
+     }
+   ],
+   "version": "1.0"
+-}
+\ No newline at end of file
++}

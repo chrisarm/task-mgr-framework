@@ -28,6 +28,10 @@
 //!   "same-task consecutive crash" case — pinning the contract whether the
 //!   function reads the legacy scalars (today) or the map (post-FEAT-007).
 
+// FEAT-010: this test crate intentionally exercises the deprecated
+// `apply_status_updates` shim to lock its contract during the migration.
+#![allow(deprecated)]
+
 use std::fs;
 use std::path::PathBuf;
 
