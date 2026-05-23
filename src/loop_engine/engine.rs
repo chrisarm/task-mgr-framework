@@ -357,6 +357,38 @@ pub fn resolve_effective_runner(
         })
 }
 
+/// Compute the `reviewModel` routing override for a single task.
+///
+/// Returns `Some(trimmed_model_id)` when both conditions hold:
+/// - [`model::is_review_class`] classifies `task_id` as review-class
+///   (`CODE-REVIEW-*`, `MILESTONE-FINAL`, `REVIEW-*`; project-prefixed ids
+///   are matched after stripping the leading 8-hex-char prefix).
+/// - `review_model` is `Some(v)` with non-whitespace content.
+///
+/// Returns `None` in every other case — non-review tasks, unset/empty
+/// `reviewModel`. Pure function: no side effects, no I/O, no access to
+/// `IterationContext`. Used at both dispatch sites (`run_iteration` for
+/// the sequential path, `run_wave_iteration` for the wave path) so the
+/// routing decision is identical regardless of execution mode.
+///
+/// The override deliberately changes the **model string** that flows into
+/// [`resolve_effective_runner`] and the `--model` CLI flag, NOT
+/// `ctx.runner_overrides`. The override map is reserved for the overflow
+/// ladder's promotion writes — leaving it untouched preserves its
+/// precedence over `provider_for_model(...)` so an in-flight overflow
+/// promotion isn't shadowed by review-model routing.
+pub fn apply_review_model_override(review_model: Option<&str>, task_id: &str) -> Option<String> {
+    if !model::is_review_class(task_id) {
+        return None;
+    }
+    let trimmed = review_model?.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 /// Per-slot execution context for parallel wave iterations.
 ///
 /// Each slot carries the `Send`-safe `SlotPromptBundle` produced on the main
@@ -1938,6 +1970,27 @@ pub fn run_wave_iteration(
     for slot in slot_contexts.iter_mut() {
         // FEAT-008: operator escape valve — clear stale overrides if tasks.model changed.
         check_override_invalidation(ctx, params.conn, &slot.prompt_bundle.task_id);
+        // FEAT-002: route review-class slots to `reviewModel` BEFORE recomputing
+        // `effective_model`. Mutating the bundle's `resolved_model` (not just a
+        // local) keeps runner selection, the `--model` flag in
+        // `run_slot_iteration`, and the prompt-baked model consistent — a
+        // drift-`assert!` cross-check on `slot_result.effective_runner` would
+        // panic if these disagreed.
+        if let Some(review_model_override) = apply_review_model_override(
+            params.project_config.review_model.as_deref(),
+            &slot.prompt_bundle.task_id,
+        ) {
+            let old = slot
+                .prompt_bundle
+                .resolved_model
+                .as_deref()
+                .unwrap_or("(default)");
+            eprintln!(
+                "Review-class routing [slot {}]: {} → {} (reviewModel)",
+                slot.slot_index, old, review_model_override,
+            );
+            slot.prompt_bundle.resolved_model = Some(review_model_override);
+        }
         let effective_model = slot
             .prompt_bundle
             .resolved_model
@@ -2484,7 +2537,7 @@ pub fn run_iteration(
     let shown_learning_ids = prompt_result.shown_learning_ids.clone();
 
     // Step 4.5: Apply crash escalation and PromptTooLong model overrides
-    let effective_model = {
+    let mut effective_model = {
         let resolved = prompt_result.resolved_model.as_deref();
         let after_crash_escalation =
             match check_crash_escalation(&ctx.crashed_last_iteration, &task_id, resolved) {
@@ -2507,6 +2560,22 @@ pub fn run_iteration(
             after_crash_escalation
         }
     };
+
+    // FEAT-002: route review-class tasks to `reviewModel` after the crash /
+    // overflow escalation block so escalation can't overwrite this routing.
+    // The single `effective_model` here feeds both `resolve_effective_runner`
+    // (runner selection) and the `--model` flag passed to the runner, so one
+    // assignment keeps selection and dispatch in sync.
+    if let Some(review_model_override) =
+        apply_review_model_override(params.project_config.review_model.as_deref(), &task_id)
+    {
+        let old = effective_model.as_deref().unwrap_or("(default)");
+        eprintln!(
+            "Review-class routing: {} → {} (reviewModel)",
+            old, review_model_override,
+        );
+        effective_model = Some(review_model_override);
+    }
 
     // Use the cluster-wide effort computed by `build_prompt` — parallels the
     // cluster-wide `resolved_model` so both axes scale with the hardest task
@@ -5441,6 +5510,132 @@ mod tests {
         assert!(
             ctx.overflow_original_task_model.is_empty(),
             "fresh IterationContext.overflow_original_task_model MUST be empty",
+        );
+    }
+
+    // --- FEAT-002: apply_review_model_override ---
+    //
+    // Pure-function tests for the predicate used at both dispatch sites
+    // (sequential `run_iteration` + wave `run_wave_iteration`). Failure here
+    // means review-class routing fired on a non-review task, or vice versa.
+
+    #[test]
+    fn feat_002_review_override_fires_for_review_class_ids() {
+        for id in &[
+            "CODE-REVIEW-1",
+            "CODE-REVIEW-007",
+            "MILESTONE-FINAL",
+            "REVIEW-001",
+            // Prefixed (production shape) — strips ^[0-9a-f]{8}- before matching.
+            "8d71d1f7-CODE-REVIEW-1",
+            "8d71d1f7-MILESTONE-FINAL",
+            "8d71d1f7-REVIEW-001",
+        ] {
+            assert_eq!(
+                apply_review_model_override(Some("grok-4"), id),
+                Some("grok-4".to_string()),
+                "review-class id {id} MUST receive the reviewModel override",
+            );
+        }
+    }
+
+    #[test]
+    fn feat_002_review_override_skips_non_review_ids() {
+        for id in &[
+            "FEAT-001",
+            "VERIFY-001",
+            "MILESTONE-1",
+            "MILESTONE-2",
+            "REFACTOR-001",
+            "REFACTOR-REVIEW-FINAL",
+            // Prefixed non-review ids must also be skipped — the `is_review_class`
+            // strip-then-match keeps REFACTOR-REVIEW-FINAL out of the REVIEW-* path.
+            "8d71d1f7-FEAT-001",
+            "8d71d1f7-VERIFY-001",
+            "8d71d1f7-MILESTONE-1",
+            "8d71d1f7-REFACTOR-REVIEW-FINAL",
+        ] {
+            assert_eq!(
+                apply_review_model_override(Some("grok-4"), id),
+                None,
+                "non-review id {id} MUST NOT receive the reviewModel override",
+            );
+        }
+    }
+
+    #[test]
+    fn feat_002_review_override_returns_none_when_review_model_unset() {
+        // Absent / empty / whitespace-only — review tasks stay on whatever
+        // model was already baked in (typically Opus).
+        for review_model in &[None, Some(""), Some("   "), Some("\t\n")] {
+            assert_eq!(
+                apply_review_model_override(*review_model, "CODE-REVIEW-1"),
+                None,
+                "unset/empty reviewModel ({review_model:?}) MUST NOT override review-class tasks",
+            );
+        }
+    }
+
+    #[test]
+    fn feat_002_review_override_trims_whitespace() {
+        // Outer whitespace is trimmed so a `"reviewModel": "  grok-4  "` config
+        // doesn't ship a model id with surprise whitespace to the runner.
+        assert_eq!(
+            apply_review_model_override(Some("  grok-4  "), "CODE-REVIEW-1"),
+            Some("grok-4".to_string()),
+        );
+    }
+
+    #[test]
+    fn feat_002_review_override_passes_through_any_provider() {
+        // The helper itself does not classify provider — it only routes
+        // review-class tasks. A Claude id, an unknown id, or Grok id all
+        // propagate identically; provider classification happens later in
+        // `resolve_effective_runner` via `provider_for_model`.
+        assert_eq!(
+            apply_review_model_override(Some(OPUS_MODEL), "REVIEW-001"),
+            Some(OPUS_MODEL.to_string()),
+        );
+        assert_eq!(
+            apply_review_model_override(Some("gpt-4"), "REVIEW-001"),
+            Some("gpt-4".to_string()),
+        );
+        assert_eq!(
+            apply_review_model_override(Some("grok-4-fast"), "REVIEW-001"),
+            Some("grok-4-fast".to_string()),
+        );
+    }
+
+    #[test]
+    fn feat_002_review_override_into_resolver_yields_grok_runner() {
+        // End-to-end shape: when the override fires for a review task with a
+        // Grok model id, feeding the result into `resolve_effective_runner`
+        // selects `RunnerKind::Grok`. This is the contract the sequential
+        // dispatch site relies on to keep selection + `--model` consistent.
+        let ctx = IterationContext::new(8);
+        let task_id = "8d71d1f7-CODE-REVIEW-1";
+        let effective_model = apply_review_model_override(Some("grok-4"), task_id);
+        assert_eq!(effective_model.as_deref(), Some("grok-4"));
+        assert_eq!(
+            resolve_effective_runner(&ctx, task_id, effective_model.as_deref()),
+            RunnerKind::Grok,
+        );
+    }
+
+    #[test]
+    fn feat_002_no_override_leaves_resolver_on_claude_for_review_tasks() {
+        // Negative path: reviewModel unset → effective_model is unchanged at
+        // the baked-in Opus, and the resolver returns Claude. This locks in
+        // the "no behavior change when reviewModel is absent" guarantee.
+        let ctx = IterationContext::new(8);
+        let task_id = "8d71d1f7-CODE-REVIEW-1";
+        let override_model = apply_review_model_override(None, task_id);
+        assert_eq!(override_model, None);
+        // Caller keeps the baked-in model — here, Opus.
+        let effective_model = override_model.or(Some(OPUS_MODEL.to_string()));
+        assert_eq!(
+            resolve_effective_runner(&ctx, task_id, effective_model.as_deref()),
+            RunnerKind::Claude,
         );
     }
 

@@ -600,7 +600,11 @@ fn handle_task_failure_defers_promotion_ctx_writes_until_after_commit() {
     let after_open = &source[start..];
     let body_end_rel = ["\nfn ", "\npub fn ", "\npub(crate) fn "]
         .iter()
-        .filter_map(|marker| after_open[marker.len()..].find(marker).map(|p| p + marker.len()))
+        .filter_map(|marker| {
+            after_open[marker.len()..]
+                .find(marker)
+                .map(|p| p + marker.len())
+        })
         .min()
         .expect("expected another top-level fn after handle_task_failure");
     let body = &after_open[..body_end_rel];

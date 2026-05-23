@@ -1198,9 +1198,7 @@ mod tests {
         // Negative controls — common error phrases that must NOT match.
         assert!(!stderr_contains_auth_failure("file not found"));
         assert!(!stderr_contains_auth_failure("rate limit exceeded"));
-        assert!(!stderr_contains_auth_failure(
-            "internal server error (500)"
-        ));
+        assert!(!stderr_contains_auth_failure("internal server error (500)"));
     }
 
     /// Unit: binary resolution chain prefers `$GROK_BINARY`, then

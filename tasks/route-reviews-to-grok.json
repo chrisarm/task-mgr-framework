@@ -1,0 +1,304 @@
+{
+  "branchName": "feat/route-reviews-to-grok",
+  "description": "Add a configurable `reviewModel` knob so the loop routes review-class tasks (CODE-REVIEW-*, MILESTONE-FINAL, REVIEW-001) to a second-perspective model (Grok) while everything else stays on Claude. Engine override is authoritative at runtime; generator skills stamp the same value. Excludes REFACTOR-REVIEW-FINAL, intermediate MILESTONE-1/-2, VERIFY-*, REFACTOR-*, and all spawned *-FIX-*.",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "Rust: no warnings in `cargo check`",
+      "Rust: no warnings in `cargo clippy -- -D warnings`",
+      "Rust: `cargo fmt --check` passes",
+      "Rust: scoped `cargo test` for touched modules passes (full suite at REVIEW-001)",
+      "No unwrap()/expect() on fallible paths in production code — propagate with the crate error type",
+      "No breaking changes to existing config or CLI behavior when reviewModel is absent"
+    ],
+    "description": "These criteria apply to ALL implementation tasks"
+  },
+  "model": "claude-sonnet-4-6",
+  "priorityPhilosophy": {
+    "description": "Hierarchy of what matters most when implementing tasks",
+    "hierarchy": [
+      "1. PLAN — Anticipate edge cases before coding",
+      "2. FOUNDATION — single-source-of-truth seams; do not duplicate routing logic",
+      "3. FUNCTIONING CODE — Pragmatic, reliable, wired in per plan",
+      "4. CORRECTNESS — Compiles, type-checks, scoped tests pass deterministically",
+      "5. CODE QUALITY — Clean code, qualityDimensions satisfied, no warnings",
+      "6. POLISH — Docs, formatting, minor improvements"
+    ],
+    "principles": [
+      "The override must keep runner selection AND the --model flag AND the prompt-baked model consistent — a drift assert! sentinel will panic otherwise (learning 3110).",
+      "ID-prefix predicate must operate on the DISPATCHED (project-prefixed) id, not the on-disk id.",
+      "reviewModel unset/empty => zero behavioral change vs today (review gates stay opus).",
+      "Edge cases = test cases — every known edge case has a corresponding test.",
+      "Scoped per-iteration tests; full unscoped suite at REVIEW-001."
+    ]
+  },
+  "prohibitedOutcomes": [
+    "A predicate that matches unprefixed ids in tests but never matches the prefixed ids seen at dispatch (silent no-op).",
+    "Overriding runner selection without also changing the --model string the runner receives (sends a Claude model id to the Grok runner).",
+    "Putting the routing override in resolve_task_model / ModelResolutionContext (wrong seam — runs in build_prompt, has no task_id).",
+    "Duplicating the review-class routing logic across the two dispatch sites instead of a shared predicate.",
+    "A startup probe that aborts Claude-only loops (must only fire when reviewModel resolves to a Grok provider).",
+    "Editing the auto-generated MODELS:BEGIN/END block by hand (gen-docs --check would clobber/fail).",
+    "Tests that only assert 'no panic' without verifying the resolved model/runner value."
+  ],
+  "project": "task-mgr",
+  "requires": [],
+  "taskPrefix": "4407dc59",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "Positive: `ProjectConfig` deserializes `{\"reviewModel\":\"grok-4\"}` into `review_model == Some(\"grok-4\")`; absent key -> None (round-trips via the existing read_project_config path).",
+        "Positive: `is_review_class` returns true for `CODE-REVIEW-1`, `MILESTONE-FINAL`, `REVIEW-001` and their `8d71d1f7-`-prefixed forms.",
+        "Negative: `is_review_class` returns false for `REFACTOR-REVIEW-FINAL`, `MILESTONE-1`, `MILESTONE-2`, `VERIFY-001`, `REFACTOR-001`, `8d71d1f7-CODE-FIX-001`, `FEAT-001` (prefixed and unprefixed).",
+        "Unit test: `is_review_class(\"8d71d1f7-CODE-REVIEW-1\") == true` — THE regression guard; a bare starts_with(\"CODE-REVIEW-\") implementation fails this.",
+        "Unit test: `is_review_class(\"8d71d1f7-REFACTOR-REVIEW-FINAL\") == false` AND `is_review_class(\"REFACTOR-REVIEW-FINAL\") == false`.",
+        "Known-bad: a predicate that matches `CODE-REVIEW-1` but NOT `8d71d1f7-CODE-REVIEW-1` would pass naive unprefixed-only tests yet silently no-op in production — tests MUST include prefixed ids.",
+        "Known-bad: stripping the first '-' (not specifically 8 hex chars) makes `REFACTOR-REVIEW-FINAL` -> `REVIEW-FINAL` -> falsely true; a test on the unprefixed exclusion catches this.",
+        "Default impl updated: `ProjectConfig::default().review_model` is None; existing Default tests still pass."
+      ],
+      "dependsOn": [],
+      "description": "Foundation: a new optional config knob and the review-class predicate, both pure and fully unit-testable.\n\nDO:\n- Add `#[serde(default)] pub review_model: Option<String>` to `ProjectConfig` (src/loop_engine/project_config.rs:58), camelCase wire name `reviewModel`. Add `review_model: None` to the `Default` impl (project_config.rs:177). Mirror the existing optional-field pattern (learning 2982/2366).\n- Add `pub fn is_review_class(id: &str) -> bool` next to `provider_for_model` in src/loop_engine/model.rs (:81). It must FIRST strip a leading 8-hex-char project prefix (`^[0-9a-f]{8}-`) if present — because dispatched ids are prefixed by `prefix_id` (src/commands/init/mod.rs:82). Then: return false if the remainder starts with `REFACTOR-REVIEW`; else true if it starts with `CODE-REVIEW-`, `MILESTONE-FINAL`, or `REVIEW-`.\n\nDO NOT:\n- Strip on the first '-' generically (would reduce unprefixed `REFACTOR-REVIEW-FINAL` to `REVIEW-FINAL` and falsely match `REVIEW-`). Strip ONLY a leading `[0-9a-f]{8}-` group.\n- Use substring `.contains(\"REVIEW\")` (would catch REFACTOR-REVIEW).\n- Touch the gen-docs MODELS block or any model-id constants.\n\nEdge cases:\n- Prefixed id `8d71d1f7-CODE-REVIEW-1` -> true.\n- Unprefixed `REVIEW-001` -> true; `CODE-REVIEW-1` -> true; `MILESTONE-FINAL` -> true.\n- `REFACTOR-REVIEW-FINAL` (and prefixed) -> false.\n- `MILESTONE-1`, `MILESTONE-2`, `VERIFY-001`, `REFACTOR-001`, `8d71d1f7-CODE-FIX-001`, `FEAT-001` -> false.\n- An 8-char segment that is NOT hex (e.g. `CODE-REV`) must NOT be treated as a prefix.",
+      "edgeCases": [
+        "Prefixed id (8-hex + dash) — strip before matching",
+        "Non-hex 8-char leading segment — do NOT strip",
+        "Empty string id — returns false, no panic",
+        "reviewModel present but empty string \"\" — treated as unset by downstream normalize()"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Predicate run against on-disk (unprefixed) id in a test but dispatched (prefixed) id at runtime",
+          "expectedBehavior": "Tests cover prefixed ids so the mismatch is caught at PR time, not in prod"
+        }
+      ],
+      "id": "FEAT-001",
+      "modifiesBehavior": false,
+      "notes": "Reuse `normalize()` (model.rs:225) when consuming review_model later so empty/whitespace -> None. Config pattern: learning 2982 (optional section into ProjectConfig + tests/fallback_config.rs), 2366/2800 (serde defaults). Provider/predicate co-location: learning 2961/2958 (provider_for_model token-equality). prefix_id is `pub(crate)` at src/commands/init/mod.rs:82 — confirm prefix is exactly 8 lowercase hex (md5[..8]) via generate_prefix (:155).",
+      "passes": true,
+      "priority": 1,
+      "qualityDimensions": [
+        "Pure functions, no I/O, deterministic — trivially unit-testable",
+        "Prefix-strip is exact: only [0-9a-f]{8}- , never a generic first-dash split",
+        "Exclusion (REFACTOR-REVIEW) evaluated before inclusion checks",
+        "Config field follows the existing #[serde(default)] optional-field idiom"
+      ],
+      "taskType": "implementation",
+      "title": "Add reviewModel config field + is_review_class predicate (with prefix stripping)",
+      "touchesFiles": [
+        "src/loop_engine/model.rs",
+        "src/loop_engine/project_config.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive (sequential): with reviewModel=\"grok-4\", a `CODE-REVIEW-1`/`MILESTONE-FINAL`/`REVIEW-001` task resolves effective_model to `grok-4`, resolve_effective_runner returns RunnerKind::Grok, and the spawned `--model` is `grok-4`.",
+        "Positive (wave): with reviewModel=\"grok-4\", the per-slot `prompt_bundle.resolved_model` for a review-class slot is rewritten to `grok-4` BEFORE spawn; assert the bundle field value, not only the RunnerKind.",
+        "Negative: reviewModel unset -> effective_model/resolved_model unchanged at BOTH sites (review gate stays whatever it was baked as, i.e. opus).",
+        "Negative: a `VERIFY-001` / `MILESTONE-1` / `REFACTOR-001` task is NOT rerouted even when reviewModel is set.",
+        "Known-bad: overriding the wave-path local `effective_model` only (leaving `prompt_bundle.resolved_model` as opus) selects Grok but passes `--model claude-opus-4-7`; a test asserting the bundle's resolved_model == grok-4 catches it. The drift assert! would also panic at runtime — do not rely on the panic.",
+        "Known-bad: applying the override BEFORE the crash/overflow escalation block (sequential) lets escalation overwrite it; apply it AFTER that block.",
+        "Invariant: the drift sentinel comparing slot_result.effective_runner vs the re-derivation does NOT fire in any test (selection and model agree).",
+        "CONTRACT: `params.project_config` is in scope at both dispatch sites (grep-verify in run_iteration and run_wave_iteration); read `.review_model` from it, no extra file read."
+      ],
+      "dependsOn": [
+        "FEAT-001"
+      ],
+      "description": "Route review-class tasks to reviewModel at runtime, authoritative over the task's baked model, at the two production dispatch sites. Read `params.project_config.review_model` directly (it is already passed by reference into both param structs — no new IterationContext field).\n\nDO:\n- SEQUENTIAL path (inside `run_iteration`, src/loop_engine/engine.rs:2230): after the crash-escalation / 1M-overflow block that finalizes `effective_model`, and BEFORE `resolve_effective_runner` and the `--model` arg are computed: if `model::is_review_class(&task_id)` and `normalize(params.project_config.review_model)` is Some(rm), set `effective_model = Some(rm)`. Here effective_model feeds both selection and the flag, so this single assignment suffices.\n- WAVE path (inside `run_wave_iteration`, engine.rs:1835, the main-thread per-slot enrichment loop): rewrite `slot.prompt_bundle.resolved_model = Some(rm)` for review-class slots, THEN recompute the local `effective_model` from `slot.prompt_bundle.resolved_model.or(default_model)`. The `--model` flag in `run_slot_iteration` (engine.rs:557, recompute ~:584) and the model baked into the prompt by `format_task_json` both read `resolved_model`, so the bundle field — not a transient local — is the thing to mutate (learnings 2983 main-thread precompute, 2997 move-compute-earlier).\n- Keep a single shared predicate (FEAT-001 is_review_class); do not inline two copies.\n\nDO NOT:\n- Override only the local `effective_model` in the wave path — that changes RunnerKind selection but leaves `--model`/prompt on opus, sending a Claude id to Grok and tripping the drift assert! sentinel (engine.rs ~209-218 of loop_engine/CLAUDE.md; learning 3110).\n- Touch `runner_overrides` — that map (written only by the fallback ladder) is consulted FIRST by resolve_effective_runner (learning 2985); leave its precedence intact. If an override entry already pinned a task to Grok, that is consistent with intent.\n- Implement this in resolve_task_model / ModelResolutionContext (wrong seam, no task_id there).\n\nEdge cases:\n- reviewModel unset/empty -> no change at either site (normalize() -> None).\n- Non-review-class task + reviewModel set -> unchanged.\n- Review-class task whose baked model is already grok -> override is a harmless no-op equal value.",
+      "edgeCases": [
+        "reviewModel unset/empty -> no-op both sites",
+        "Non-review-class task -> untouched",
+        "Baked model already == reviewModel -> idempotent",
+        "Task escalated by the Grok fallback ladder -> runner_overrides still wins (acceptable)"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "Wave override mutates only the selection local",
+          "expectedBehavior": "Drift assert! panics OR (better) test catches resolved_model != grok-4 — fix by mutating the bundle"
+        },
+        {
+          "cause": "reviewModel points to a typo'd grok id",
+          "expectedBehavior": "provider_for_model still routes to Grok runner; grok CLI errors -> surfaced as Crash, not silent"
+        }
+      ],
+      "id": "FEAT-002",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": true,
+      "notes": "Single-source-of-truth: resolve_effective_runner (engine.rs:346) is the ONLY selection helper, called from both sites (learnings 3055/3089). IterationContext holds runner_overrides/model_overrides (loop_engine/CLAUDE.md ~115); do NOT add review_model there — read params.project_config. Wave precompute happens on the main thread before slot spawn (learning 2983). If you must add a field to SlotContext/bundle, update all struct literals incl. tests/prompt_slot.rs (learning 2986) — but mutating the existing resolved_model field needs no new field. Token-equality provider detection: learning 2958.",
+      "passes": false,
+      "priority": 2,
+      "qualityDimensions": [
+        "Runner selection, --model flag, and prompt-baked model are all consistent for a review task (no drift)",
+        "Override applied after escalation/overflow finalizes the base model (sequential)",
+        "Wave path mutates prompt_bundle.resolved_model on the main thread, not a transient",
+        "Shared predicate; no duplicated routing logic across sites",
+        "runner_overrides precedence preserved"
+      ],
+      "taskType": "implementation",
+      "title": "Apply reviewModel override at BOTH dispatch sites (sequential + wave)",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: reviewModel resolves to Grok AND binary reachable -> startup proceeds.",
+        "Positive: reviewModel unset OR resolves to a Claude model -> probe is a no-op (no error, no PATH lookup side effects in the Claude case).",
+        "Negative/abort: reviewModel resolves to Grok AND binary not reachable -> loop aborts at start with an error naming reviewModel and how to fix.",
+        "Unit test: the probe returns Ok when provider is Claude regardless of grok presence.",
+        "Unit test: the probe returns Err when provider is Grok and the resolved binary path is missing (inject a bogus GROK_BINARY or a non-existent cliBinary).",
+        "Known-bad: probing unconditionally would abort every Claude-only loop start; the provider gate test prevents this.",
+        "CONTRACT: binary resolution matches the runner's chain (GROK_BINARY -> fallbackRunner.cliBinary -> `grok`) — grep runner.rs resolve_grok_binary to confirm order."
+      ],
+      "dependsOn": [
+        "FEAT-001"
+      ],
+      "description": "Fail at loop start (not silently at the first review gate) if reviewModel will route to Grok but the grok CLI is not reachable.\n\nDO:\n- Model it on `check_fallback_runner_binary` (src/loop_engine/project_config.rs:306). Add a sibling check that runs at loop start where the existing fallback-binary check already runs.\n- Only act when `model::provider_for_model(review_model.as_deref()) == Provider::Grok`. Resolve the grok binary the SAME way the runner does (the GROK_BINARY env -> fallbackRunner.cliBinary -> bare `grok` chain; reuse `resolve_grok_binary` in runner.rs if accessible, else mirror its resolution) and verify it is on PATH / executable. If unreachable, return the crate error with a clear, actionable message (mention reviewModel + `grok login` / install).\n\nDO NOT:\n- Run the probe when reviewModel is unset/empty or resolves to a Claude model — that must not break Claude-only loops.\n- Hard-require auth (we can only cheaply check the binary exists; an unauthenticated-but-present grok still surfaces as a Crash at run time).\n\nEdge cases:\n- reviewModel unset -> probe is a no-op.\n- reviewModel=\"claude-opus-4-7\" -> no-op (Claude provider).\n- reviewModel=\"grok-4\" and grok on PATH -> ok.\n- reviewModel=\"grok-4\" and grok absent -> abort at start with message.",
+      "edgeCases": [
+        "reviewModel unset -> no-op",
+        "Claude reviewModel -> no-op",
+        "Grok reviewModel + reachable -> ok",
+        "Grok reviewModel + unreachable -> Err at start"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "grok present but not logged in",
+          "expectedBehavior": "Probe passes (binary exists); auth failure surfaces later as a Crash with the runner's auth-sniff message — acceptable, documented"
+        }
+      ],
+      "id": "FEAT-003",
+      "modifiesBehavior": false,
+      "notes": "resolve_grok_binary lives in src/loop_engine/runner.rs (~:614). Wire the probe at the same startup point as check_fallback_runner_binary's caller. Provider gate uses provider_for_model (model.rs:81). Keep the error type consistent with check_fallback_runner_binary (TaskMgrResult).",
+      "passes": true,
+      "priority": 3,
+      "qualityDimensions": [
+        "Provider-gated: only Grok-resolving reviewModel triggers the binary check",
+        "Reuses the runner's binary-resolution chain (no divergent second implementation)",
+        "Actionable error message",
+        "Cheap (existence/PATH check only; no spawning grok)"
+      ],
+      "taskType": "implementation",
+      "title": "Startup fail-fast probe when reviewModel resolves to an unreachable Grok binary",
+      "touchesFiles": [
+        "src/loop_engine/project_config.rs",
+        "src/loop_engine/runner.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "All four files updated; `grep -c '{{' ` is irrelevant (these are skills, not generated prompts) — instead verify each file's review-rubric row now references reviewModel for CODE-REVIEW-*/MILESTONE-FINAL (tasks.md & prd-tasks.md) or REVIEW-001 (plan-tasks.md).",
+        "Positive: REFACTOR-REVIEW-FINAL, MILESTONE-1, MILESTONE-2, VERIFY-001 (heavy) and REFACTOR-001 (lean) still mapped to opus in every file.",
+        "Negative: nothing between `<!-- MODELS:BEGIN -->` and `<!-- MODELS:END -->` is modified in any file (diff the block before/after).",
+        "Positive: a 'Resolve review model' instruction exists OUTSIDE the MODELS block in all four files, telling the generator to read `.task-mgr/config.json` reviewModel (default grok-4, else opus).",
+        "Verify gen-docs stays green: `cargo run --bin gen-docs -- --check` passes (no MODELS drift introduced).",
+        "Known-bad: editing inside the MODELS block to add grok-4 would fail gen-docs --check; the block-diff criterion catches it."
+      ],
+      "dependsOn": [],
+      "description": "Teach the task generators to (a) resolve a review model from `.task-mgr/config.json` `reviewModel` (default `grok-4`, else opus) and (b) stamp it onto review-class tasks. Markdown only — no Rust, no gen-docs change.\n\nEdit FOUR files (content differs between repo source and deployed copies, so match by content/section, NOT by line number):\n- task-mgr repo source: `.claude/commands/tasks.md` (this is the deployed `prd-tasks.md`), `.claude/commands/plan-tasks.md`\n- global deployed: `~/.claude/commands/prd-tasks.md`, `~/.claude/commands/plan-tasks.md`\n\nDO:\n- Add a short 'Resolve review model' note OUTSIDE the `<!-- MODELS:BEGIN -->`/`<!-- MODELS:END -->` markers: read `.task-mgr/config.json` `reviewModel`; if set use it for review-class tasks, else opus. Default recommendation: grok-4.\n- In tasks.md/prd-tasks.md rubric: split the row that maps `CODE-REVIEW-1 / REFACTOR-REVIEW-FINAL` -> opus into `CODE-REVIEW-* -> reviewModel (default grok-4, else opus)` vs `REFACTOR-REVIEW-FINAL -> opus`. Split the `MILESTONE-xxx -> opus` wildcard into `MILESTONE-FINAL -> reviewModel` vs `MILESTONE-1/-2 -> opus`. Update the phased-structure table rows for CODE-REVIEW-1 and MILESTONE-FINAL accordingly; leave MILESTONE-1/-2, REFACTOR-REVIEW-FINAL, VERIFY-001 on opus. Update the per-task JSON template comments that say opus-for-review.\n- In plan-tasks.md: rubric/field-rules -> `REVIEW-001 -> reviewModel (default grok-4, else opus)`; `REFACTOR-001 -> opus`. Update the REVIEW-001 JSON template and the validation checklist line that currently asserts REVIEW-001 == opus.\n\nDO NOT:\n- Edit anything between MODELS:BEGIN/END (auto-generated; gen-docs --check would fail/clobber).\n- Add a GROK_MODEL constant or change model.rs / gen-docs.rs.\n- Change REFACTOR-001/REFACTOR-REVIEW-FINAL/VERIFY-* assignments (stay opus).\n\nNote: the task-mgr repo's two files are git-tracked and will be captured in this task's commit (-> completion detection). The two `~/.claude/commands/` files live in a different repo (~/.claude) and are edited as a side effect; they will NOT be in the task-mgr commit (commit them in ~/.claude separately/manually).",
+      "edgeCases": [
+        "Repo copy and global copy phrase the rubric differently — edit each by content",
+        "reviewModel unset at generation time -> skill stamps opus (preserves today's output)"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Only repo copies edited, global missed (or vice-versa)",
+          "expectedBehavior": "Acceptance criterion requires all four; verify each"
+        }
+      ],
+      "id": "FEAT-004",
+      "modifiesBehavior": false,
+      "notes": "Repo source `.claude/commands/tasks.md` == the deployed `prd-tasks.md` (different filenames, content drift between copies — match by section header/rubric text). gen-docs targets .claude/commands/{tasks.md,plan-tasks.md} (src/bin/gen-docs.rs:32). Doc-key consistency matters (learning 1947 — keep the config key spelled `reviewModel` everywhere).",
+      "passes": false,
+      "priority": 4,
+      "qualityDimensions": [
+        "MODELS:BEGIN/END block untouched in all four files",
+        "Rubric, phased table, and JSON template all consistent within each file",
+        "Same semantic change applied to both repo-source and global copies despite text drift",
+        "Config key spelled `reviewModel` consistently"
+      ],
+      "taskType": "implementation",
+      "title": "Update generator skills (both repo source + global) to stamp reviewModel on review tasks",
+      "touchesFiles": [
+        ".claude/commands/tasks.md",
+        ".claude/commands/plan-tasks.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No duplicated review-class routing logic between the sequential and wave sites (shared predicate + minimal per-site glue)",
+        "Override and startup probe do not introduce a second config read or a divergent grok-binary resolver",
+        "Functions under 30 lines where reasonable; flag complex ones",
+        "Code follows existing engine/model/project_config patterns",
+        "Any issues found spawn REFACTOR-FIX-xxx via `task-mgr add --stdin --depended-on-by REVIEW-001`"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004"
+      ],
+      "description": "Review all implementation for DRY, complexity, coupling, and single-source-of-truth.\n\nDO: Confirm the review-class routing logic is shared (one predicate, applied at both dispatch sites via the same helper), the override reads params.project_config (not a duplicated config read), and the startup probe reuses the runner's binary-resolution chain rather than a second copy. Flag functions >30 lines or duplicated routing.\nDO NOT: Skip — this gate catches duplication before final review.",
+      "estimatedEffort": "high",
+      "id": "REFACTOR-001",
+      "model": "claude-opus-4-7",
+      "notes": "If issues: `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001` (priority 50-97). If clean, emit `<task-status>REFACTOR-001:done</task-status>` with a one-line note.",
+      "passes": false,
+      "priority": 98,
+      "qualityDimensions": [
+        "DRY across the two dispatch sites",
+        "Single-source config read + binary resolver",
+        "Single-responsibility functions"
+      ],
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Review for refactoring opportunities",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/model.rs",
+        "src/loop_engine/project_config.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: FULL `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check`, `cargo run --bin gen-docs -- --check` all clean.",
+        "Positive: override reachable from both `run_iteration` and `run_wave_iteration` (grep-verified); shared predicate used.",
+        "Positive: with reviewModel unset, sequential and wave dispatch are byte-for-byte equivalent to pre-change behavior (a regression test asserts no override when unset).",
+        "Negative: no unwrap()/expect() on fallible paths in the new code; no dead-code warnings.",
+        "Verification reminder (manual, post-merge — record in progress, do NOT block the loop): rebuild+reinstall `cargo install --path .`; set `reviewModel:\"grok-4\"` and run a loop where a real CODE-REVIEW task spawns a CODE-FIX via `task-mgr add` under Grok — confirm (a) dispatched to Grok with --model grok-4, (b) spawn succeeds, (c) the spawned fix lands on Claude, (d) a VERIFY/MILESTONE-1 in the same run stays on Claude.",
+        "Documentation: note in progress that the DeskMaiT `.task-mgr/config.json` `reviewModel` line and the global `~/.claude/CLAUDE.md` §3a note are deferred manual steps (out of this repo).",
+        "If issues found: spawn FIX-xxx via `task-mgr add --stdin --depended-on-by REVIEW-001`."
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "REFACTOR-001"
+      ],
+      "description": "Review quality, security, integration wiring, and docs. RUN THE FULL UNSCOPED SUITE.\n\nDO: Run `cargo fmt --check && cargo check && cargo clippy -- -D warnings && cargo test` (no filter). Verify: is_review_class wired into BOTH dispatch sites; the drift assert! sentinel does not fire; reviewModel unset = zero behavioral change; the startup probe is provider-gated; gen-docs --check is green. Confirm the four skill files were edited and the MODELS block is untouched.\nDO NOT: Scope the suite. Do NOT skip the wiring check — unconnected override logic is the #1 failure mode here.",
+      "estimatedEffort": "medium",
+      "id": "REVIEW-001",
+      "model": "claude-opus-4-7",
+      "notes": "REVIEW-001 stays opus (the reviewModel feature is not active in the running binary during this loop — task-mgr's own config has no reviewModel, and the binary is reinstalled only post-merge). Spawn fixes via `task-mgr add --stdin --depended-on-by REVIEW-001`. If clean, emit `<task-status>REVIEW-001:done</task-status>` with 'Clean review'. Use a rust-python-code-reviewer agent for the diff.",
+      "passes": false,
+      "priority": 99,
+      "qualityDimensions": [
+        "Full suite + gen-docs --check green",
+        "Override wired at both sites, drift sentinel quiet",
+        "Unset reviewModel = zero behavioral change"
+      ],
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Code review + final verification (full suite)",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/model.rs",
+        "src/loop_engine/project_config.rs",
+        ".claude/commands/tasks.md",
+        ".claude/commands/plan-tasks.md"
+      ]
+    }
+  ],
+  "version": "1.0"
+}
