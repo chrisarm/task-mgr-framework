@@ -681,6 +681,9 @@ pub(crate) fn mutate_prd_from_feedback(
         permission_mode,
         claude::SpawnOpts {
             model: Some(effective_model),
+            // Reconcile is a text-only mutation pass — clean the ai-title stub
+            // so it doesn't clutter the resume picker. See claude.rs:119.
+            cleanup_title_artifact: true,
             ..Default::default()
         },
     ) {
