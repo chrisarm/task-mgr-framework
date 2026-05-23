@@ -298,6 +298,44 @@
         ".claude/commands/tasks.md",
         ".claude/commands/plan-tasks.md"
       ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Single shared helper handles env-var to cli-binary to PATH resolve+probe",
+        "check_fallback_runner_binary and check_review_model_binary both call the helper",
+        "Both public fns are under 20 lines",
+        "All existing project_config:: tests pass unchanged",
+        "cargo fmt --check and cargo clippy -- -D warnings clean"
+      ],
+      "description": "The env-var to cli-binary to PATH-walk resolve+probe block in project_config.rs is duplicated almost line-for-line between check_fallback_runner_binary (lines ~326-349) and the new check_review_model_binary (lines ~389-412). Only the gating predicate differs (cfg.enabled vs provider_for_model == Grok). Three copies of the resolution chain now exist (runner::resolve_grok_binary, check_fallback_runner_binary, check_review_model_binary) with drift risk on the next env-var or PATH-handling tweak. Extract a private helper: fn resolve_and_verify_grok_binary(fallback_cli_binary: Option<&str>) -> Result<(), String> that returns Ok(()) on found+executable and Err(binary_name_attempted) on miss. Each caller then wraps with its own enabled-check and error-message construction. Keep is_executable_path private. No behavior change; existing tests must still pass.",
+      "estimatedEffort": "medium",
+      "id": "4407dc59-REFACTOR-FIX-001",
+      "passes": false,
+      "priority": 0,
+      "title": "Extract shared probe_grok_binary helper from check_fallback_runner_binary / check_review_model_binary",
+      "touchesFiles": [
+        "src/loop_engine/project_config.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "cargo test --test no_hardcoded_models passes",
+        "Full cargo test passes with 0 failed",
+        "cargo clippy --all-targets -- -D warnings is clean",
+        "cargo fmt --check is clean",
+        "All three offender lines no longer match the regex pattern (use constants in project_config.rs test asserts; rephrase comment in review_model_routing.rs)"
+      ],
+      "description": "REVIEW-001 found three offenders flagged by tests/no_hardcoded_models.rs (pattern claude-(opus|sonnet|haiku)-\\d): (1) src/loop_engine/project_config.rs:967 assert!(check_review_model_binary(Some(\"claude-opus-4-7\"), None).is_ok()); (2) src/loop_engine/project_config.rs:968 assert!(check_review_model_binary(Some(\"claude-sonnet-4-6\"), None).is_ok()); (3) tests/review_model_routing.rs:149 doc comment mentions claude-opus-4-7 literal. Fix: import OPUS_MODEL/SONNET_MODEL from crate::loop_engine::model and substitute in the asserts; rephrase the doc comment so it doesn't contain the model literal (e.g. 'would still pass the Claude Opus model id'). After fix run cargo test --test no_hardcoded_models then full cargo test plus clippy + fmt.",
+      "estimatedEffort": "low",
+      "id": "4407dc59-CODE-FIX-001",
+      "model": "claude-sonnet-4-6",
+      "passes": false,
+      "priority": 99,
+      "title": "Replace hardcoded model strings in review_model code with OPUS_MODEL/SONNET_MODEL constants",
+      "touchesFiles": [
+        "src/loop_engine/project_config.rs",
+        "tests/review_model_routing.rs"
+      ]
     }
   ],
   "version": "1.0"
