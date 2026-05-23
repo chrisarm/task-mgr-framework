@@ -1997,7 +1997,9 @@ mod tests {
             _permission_mode: &PermissionMode,
             _opts: RunnerOpts<'_>,
         ) -> TaskMgrResult<RunnerResult> {
-            unreachable!("CapabilityFakeRunner exists only for capability-gate tests; spawn is never called")
+            unreachable!(
+                "CapabilityFakeRunner exists only for capability-gate tests; spawn is never called"
+            )
         }
     }
 

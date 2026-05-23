@@ -145,8 +145,8 @@ fn write_base_prompt(temp: &TempDir) -> std::path::PathBuf {
 ///
 /// **Known-bad guard**: this assertion catches the failure mode where a
 /// patch overrides only a local `effective_model` and leaves
-/// `prompt_bundle.resolved_model` as the baked Opus — runner would select
-/// Grok but the `--model` flag would still pass `claude-opus-4-7`.
+/// `prompt_bundle.resolved_model` as the baked Opus constant — runner would select
+/// Grok but the `--model` flag would still pass the Claude model id.
 #[test]
 fn wave_review_class_slot_bundle_resolved_model_is_rewritten_to_grok_4() {
     let (temp, conn) = setup_migrated_db();

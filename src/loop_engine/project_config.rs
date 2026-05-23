@@ -372,16 +372,14 @@ pub fn check_review_model_binary(
     if provider_for_model(review_model) != Provider::Grok {
         return Ok(());
     }
-    resolve_and_verify_grok_binary(fallback_cli_binary).map_err(|binary| {
-        TaskMgrError::NotFound {
-            resource_type: "Grok CLI binary required by reviewModel".to_string(),
-            id: format!(
-                "{binary} — install the Grok CLI or set `fallbackRunner.cliBinary` to the \
+    resolve_and_verify_grok_binary(fallback_cli_binary).map_err(|binary| TaskMgrError::NotFound {
+        resource_type: "Grok CLI binary required by reviewModel".to_string(),
+        id: format!(
+            "{binary} — install the Grok CLI or set `fallbackRunner.cliBinary` to the \
                  correct path, then run `grok login` to authenticate \
                  (reviewModel = {rm})",
-                rm = review_model.unwrap_or("<unknown>")
-            ),
-        }
+            rm = review_model.unwrap_or("<unknown>")
+        ),
     })
 }
 
@@ -962,10 +960,11 @@ mod tests {
 
     #[test]
     fn test_check_review_model_binary_claude_provider_is_noop() {
+        use crate::loop_engine::model::{OPUS_MODEL, SONNET_MODEL};
         // When reviewModel resolves to Claude, the probe must succeed regardless
         // of whether grok is on PATH — no PATH lookup must occur.
-        assert!(check_review_model_binary(Some("claude-opus-4-7"), None).is_ok());
-        assert!(check_review_model_binary(Some("claude-sonnet-4-6"), None).is_ok());
+        assert!(check_review_model_binary(Some(OPUS_MODEL), None).is_ok());
+        assert!(check_review_model_binary(Some(SONNET_MODEL), None).is_ok());
     }
 
     #[test]

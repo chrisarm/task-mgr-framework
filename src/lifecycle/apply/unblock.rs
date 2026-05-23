@@ -39,9 +39,7 @@ impl<'a> TaskLifecycle<'a> {
                         row.get(0)
                     })
                     .map_err(|e| match e {
-                        rusqlite::Error::QueryReturnedNoRows => {
-                            TaskMgrError::task_not_found(id)
-                        }
+                        rusqlite::Error::QueryReturnedNoRows => TaskMgrError::task_not_found(id),
                         _ => TaskMgrError::from(e),
                     })?;
                 status_str.parse()?
