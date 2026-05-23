@@ -124,7 +124,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": true,
       "notes": "Single-source-of-truth: resolve_effective_runner (engine.rs:346) is the ONLY selection helper, called from both sites (learnings 3055/3089). IterationContext holds runner_overrides/model_overrides (loop_engine/CLAUDE.md ~115); do NOT add review_model there — read params.project_config. Wave precompute happens on the main thread before slot spawn (learning 2983). If you must add a field to SlotContext/bundle, update all struct literals incl. tests/prompt_slot.rs (learning 2986) — but mutating the existing resolved_model field needs no new field. Token-equality provider detection: learning 2958.",
-      "passes": false,
+      "passes": true,
       "priority": 2,
       "qualityDimensions": [
         "Runner selection, --model flag, and prompt-baked model are all consistent for a review task (no drift)",
@@ -209,7 +209,7 @@
       "id": "FEAT-004",
       "modifiesBehavior": false,
       "notes": "Repo source `.claude/commands/tasks.md` == the deployed `prd-tasks.md` (different filenames, content drift between copies — match by section header/rubric text). gen-docs targets .claude/commands/{tasks.md,plan-tasks.md} (src/bin/gen-docs.rs:32). Doc-key consistency matters (learning 1947 — keep the config key spelled `reviewModel` everywhere).",
-      "passes": false,
+      "passes": true,
       "priority": 4,
       "qualityDimensions": [
         "MODELS:BEGIN/END block untouched in all four files",
