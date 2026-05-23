@@ -536,7 +536,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": false,
       "notes": "Final pass before REVIEW-001. If REFACTOR-xxx tasks are spawned, they must complete before REVIEW-001 can claim. Use `/simplify` on small touchpoints — don't file a task just to dedent a closure.",
-      "passes": false,
+      "passes": true,
       "priority": 70,
       "qualityDimensions": [
         "Findings are concrete (file:line + proposed change), not vague ('this could be cleaner')",

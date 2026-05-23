@@ -24,12 +24,11 @@ use crate::models::RunStatus;
 // sites now import `claim_slot_task` / `process_slot_result` /
 // `slot_failure_result` directly from `slot`; the only remaining engine
 // consumer of `claim_slot_task` is the inline wave/recovery test modules, so
-// its re-export is gated `#[cfg(test)]` to avoid an unused alias in the
-// non-test build, and `process_slot_result` / `slot_failure_result` are no
-// longer re-exported here at all.
-#[cfg(test)]
-#[allow(deprecated)]
-pub(super) use crate::loop_engine::slot::claim_slot_task;
+// its re-export was gated `#[cfg(test)]` to avoid an unused alias in the
+// non-test build. After the test-relocation refactor (PRD 02, FEAT-006),
+// the only remaining consumer of `claim_slot_task` in tests is `slot.rs`
+// itself (via `use super::*`), so the engine re-export is no longer needed.
+// `process_slot_result` / `slot_failure_result` are not re-exported here.
 pub use crate::loop_engine::slot::run_slot_iteration;
 
 // The sequential per-task iteration body was carved into `iteration.rs` (PRD
@@ -60,14 +59,10 @@ pub use crate::loop_engine::recovery::{
 // integration tests rely on stay valid (FR-008). `run_loop` calls
 // `apply_merge_fail_reset_and_halt_check`, `read_prd_implicit_overlap_files`,
 // and `reset_task_to_todo` by bare name, so those are re-exported `pub(super)`
-// unconditionally; `build_slot_contexts`, `apply_post_merge_reconcile`, and the
-// `SYNTHETIC_DEADLOCK_SLOT` sentinel are only referenced by the inline test
-// modules, so their re-exports are gated `#[cfg(test)]` to avoid unused aliases
-// in the non-test build.
-#[cfg(test)]
-pub(super) use crate::loop_engine::wave_scheduler::{
-    SYNTHETIC_DEADLOCK_SLOT, apply_post_merge_reconcile, build_slot_contexts,
-};
+// unconditionally. After the test-relocation refactor (PRD 02, FEAT-006),
+// `build_slot_contexts`, `apply_post_merge_reconcile`, and `SYNTHETIC_DEADLOCK_SLOT`
+// are only referenced by wave_scheduler.rs's own test module (via `use super::*`),
+// so no engine.rs re-export is needed for them.
 pub(super) use crate::loop_engine::wave_scheduler::{
     apply_merge_fail_reset_and_halt_check, read_prd_implicit_overlap_files, reset_task_to_todo,
 };
@@ -894,4 +889,293 @@ pub fn apply_status_updates(
         results.push((update.task_id.clone(), update.status, outcome.applied));
     }
     results
+}
+
+#[cfg(test)]
+#[allow(deprecated)]
+mod tests {
+    use super::*;
+    use crate::loop_engine::model::{HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL};
+    use crate::loop_engine::runner::RunnerKind;
+
+    // --- FEAT-005: resolve_effective_runner + IterationContext fields ---
+    //
+    // Regression guards for the single-source effective_runner formula
+    // (PRD §2.5). The default-empty IterationContext + no Grok model case
+    // MUST resolve to `RunnerKind::Claude` so today's pure-Claude behavior
+    // is preserved byte-for-byte. An explicit `runner_overrides` entry
+    // wins over the model-derived provider — that's how FEAT-007 / FEAT-008
+    // pin a task to Grok once a fallback fires.
+
+    #[test]
+    fn feat_005_default_empty_ctx_with_no_model_resolves_to_claude() {
+        let ctx = IterationContext::new(8);
+        assert_eq!(
+            resolve_effective_runner(&ctx, "ANY-TASK-001", None),
+            RunnerKind::Claude,
+            "default-empty IterationContext with effective_model=None MUST \
+             default to ClaudeRunner — preserves pre-FEAT-005 behavior",
+        );
+    }
+
+    #[test]
+    fn feat_005_default_empty_ctx_with_claude_model_resolves_to_claude() {
+        let ctx = IterationContext::new(8);
+        for model in &[OPUS_MODEL, SONNET_MODEL, HAIKU_MODEL] {
+            assert_eq!(
+                resolve_effective_runner(&ctx, "TASK-001", Some(model)),
+                RunnerKind::Claude,
+                "Claude model {model} with empty runner_overrides MUST resolve to Claude",
+            );
+        }
+    }
+
+    #[test]
+    fn feat_005_default_empty_ctx_with_grok_model_resolves_to_grok() {
+        let ctx = IterationContext::new(8);
+        // Token-equality on `-` splits — `grok-4-fast` has token `grok`.
+        assert_eq!(
+            resolve_effective_runner(&ctx, "TASK-001", Some("grok-4-fast")),
+            RunnerKind::Grok,
+            "Grok model with empty runner_overrides MUST resolve to Grok via \
+             provider_for_model token-equality",
+        );
+        // Groq Inc. (different vendor) MUST NOT mis-route — substring match
+        // would catch `groq-llama-3` because `grok` is a substring of `groq`;
+        // token-equality correctly rejects it.
+        assert_eq!(
+            resolve_effective_runner(&ctx, "TASK-001", Some("groq-llama-3")),
+            RunnerKind::Claude,
+            "Groq Inc. model (different vendor) MUST NOT mis-route to Grok",
+        );
+    }
+
+    #[test]
+    fn feat_005_runner_override_wins_over_model_derived_provider() {
+        let mut ctx = IterationContext::new(8);
+        ctx.runner_overrides
+            .insert("TASK-PINNED".to_string(), RunnerKind::Grok);
+        // Model says Claude (Opus), but the override pins to Grok — override wins.
+        assert_eq!(
+            resolve_effective_runner(&ctx, "TASK-PINNED", Some(OPUS_MODEL)),
+            RunnerKind::Grok,
+            "explicit runner_overrides entry MUST win over the model-derived \
+             provider — that's how FEAT-007/FEAT-008 pin a task post-fallback",
+        );
+        // A different task with no override falls through to the model's provider.
+        assert_eq!(
+            resolve_effective_runner(&ctx, "TASK-OTHER", Some(OPUS_MODEL)),
+            RunnerKind::Claude,
+            "other tasks without overrides MUST still resolve via the model",
+        );
+    }
+
+    #[test]
+    fn feat_005_iteration_context_new_initializes_runner_fields_empty() {
+        let ctx = IterationContext::new(8);
+        assert!(
+            ctx.runner_overrides.is_empty(),
+            "fresh IterationContext.runner_overrides MUST be empty — regression \
+             guard against accidental seeded entries that would silently route \
+             tasks through a non-Claude runner",
+        );
+        assert!(
+            ctx.overflow_original_task_model.is_empty(),
+            "fresh IterationContext.overflow_original_task_model MUST be empty",
+        );
+    }
+
+    // --- FEAT-002: apply_review_model_override ---
+    //
+    // Pure-function tests for the predicate used at both dispatch sites
+    // (sequential `run_iteration` + wave `run_wave_iteration`). Failure here
+    // means review-class routing fired on a non-review task, or vice versa.
+
+    #[test]
+    fn feat_002_review_override_fires_for_review_class_ids() {
+        for id in &[
+            "CODE-REVIEW-1",
+            "CODE-REVIEW-007",
+            "MILESTONE-FINAL",
+            "REVIEW-001",
+            // Prefixed (production shape) — strips ^[0-9a-f]{8}- before matching.
+            "8d71d1f7-CODE-REVIEW-1",
+            "8d71d1f7-MILESTONE-FINAL",
+            "8d71d1f7-REVIEW-001",
+        ] {
+            assert_eq!(
+                apply_review_model_override(Some("grok-4"), id),
+                Some("grok-4".to_string()),
+                "review-class id {id} MUST receive the reviewModel override",
+            );
+        }
+    }
+
+    #[test]
+    fn feat_002_review_override_skips_non_review_ids() {
+        for id in &[
+            "FEAT-001",
+            "VERIFY-001",
+            "MILESTONE-1",
+            "MILESTONE-2",
+            "REFACTOR-001",
+            "REFACTOR-REVIEW-FINAL",
+            // Prefixed non-review ids must also be skipped — the `is_review_class`
+            // strip-then-match keeps REFACTOR-REVIEW-FINAL out of the REVIEW-* path.
+            "8d71d1f7-FEAT-001",
+            "8d71d1f7-VERIFY-001",
+            "8d71d1f7-MILESTONE-1",
+            "8d71d1f7-REFACTOR-REVIEW-FINAL",
+        ] {
+            assert_eq!(
+                apply_review_model_override(Some("grok-4"), id),
+                None,
+                "non-review id {id} MUST NOT receive the reviewModel override",
+            );
+        }
+    }
+
+    #[test]
+    fn feat_002_review_override_returns_none_when_review_model_unset() {
+        // Absent / empty / whitespace-only — review tasks stay on whatever
+        // model was already baked in (typically Opus).
+        for review_model in &[None, Some(""), Some("   "), Some("\t\n")] {
+            assert_eq!(
+                apply_review_model_override(*review_model, "CODE-REVIEW-1"),
+                None,
+                "unset/empty reviewModel ({review_model:?}) MUST NOT override review-class tasks",
+            );
+        }
+    }
+
+    #[test]
+    fn feat_002_review_override_trims_whitespace() {
+        // Outer whitespace is trimmed so a `"reviewModel": "  grok-4  "` config
+        // doesn't ship a model id with surprise whitespace to the runner.
+        assert_eq!(
+            apply_review_model_override(Some("  grok-4  "), "CODE-REVIEW-1"),
+            Some("grok-4".to_string()),
+        );
+    }
+
+    #[test]
+    fn feat_002_review_override_passes_through_any_provider() {
+        // The helper itself does not classify provider — it only routes
+        // review-class tasks. A Claude id, an unknown id, or Grok id all
+        // propagate identically; provider classification happens later in
+        // `resolve_effective_runner` via `provider_for_model`.
+        assert_eq!(
+            apply_review_model_override(Some(OPUS_MODEL), "REVIEW-001"),
+            Some(OPUS_MODEL.to_string()),
+        );
+        assert_eq!(
+            apply_review_model_override(Some("gpt-4"), "REVIEW-001"),
+            Some("gpt-4".to_string()),
+        );
+        assert_eq!(
+            apply_review_model_override(Some("grok-4-fast"), "REVIEW-001"),
+            Some("grok-4-fast".to_string()),
+        );
+    }
+
+    #[test]
+    fn feat_002_review_override_into_resolver_yields_grok_runner() {
+        // End-to-end shape: when the override fires for a review task with a
+        // Grok model id, feeding the result into `resolve_effective_runner`
+        // selects `RunnerKind::Grok`. This is the contract the sequential
+        // dispatch site relies on to keep selection + `--model` consistent.
+        let ctx = IterationContext::new(8);
+        let task_id = "8d71d1f7-CODE-REVIEW-1";
+        let effective_model = apply_review_model_override(Some("grok-4"), task_id);
+        assert_eq!(effective_model.as_deref(), Some("grok-4"));
+        assert_eq!(
+            resolve_effective_runner(&ctx, task_id, effective_model.as_deref()),
+            RunnerKind::Grok,
+        );
+    }
+
+    #[test]
+    fn feat_002_no_override_leaves_resolver_on_claude_for_review_tasks() {
+        // Negative path: reviewModel unset → effective_model is unchanged at
+        // the baked-in Opus, and the resolver returns Claude. This locks in
+        // the "no behavior change when reviewModel is absent" guarantee.
+        let ctx = IterationContext::new(8);
+        let task_id = "8d71d1f7-CODE-REVIEW-1";
+        let override_model = apply_review_model_override(None, task_id);
+        assert_eq!(override_model, None);
+        // Caller keeps the baked-in model — here, Opus.
+        let effective_model = override_model.or(Some(OPUS_MODEL.to_string()));
+        assert_eq!(
+            resolve_effective_runner(&ctx, task_id, effective_model.as_deref()),
+            RunnerKind::Claude,
+        );
+    }
+
+    // --- LoopResult Default tests ---
+
+    #[test]
+    fn test_loop_result_default_is_zero() {
+        let r = LoopResult::default();
+        assert_eq!(r.exit_code, 0);
+        assert!(r.worktree_path.is_none());
+        assert!(r.branch_name.is_none());
+        assert!(!r.was_stopped);
+        assert_eq!(r.tasks_completed, 0);
+    }
+
+    #[test]
+    fn test_loop_result_partial_construction_via_default() {
+        let r = LoopResult {
+            exit_code: 130,
+            ..Default::default()
+        };
+        assert_eq!(r.exit_code, 130);
+        assert!(r.worktree_path.is_none());
+        assert!(r.branch_name.is_none());
+        assert!(!r.was_stopped);
+        assert_eq!(r.tasks_completed, 0);
+    }
+
+    // --- IterationContext tests ---
+
+    #[test]
+    fn test_iteration_context_new() {
+        let ctx = IterationContext::new(5);
+        assert!(ctx.last_commit.is_none());
+        assert!(ctx.last_files.is_empty());
+        assert!(ctx.session_guidance.is_empty());
+        assert!(ctx.reorder_hint.is_none());
+        assert_eq!(ctx.reorder_count, 0);
+        assert!(
+            ctx.crashed_last_iteration.is_empty(),
+            "TEST-INIT-004 contract: per-task crash map starts empty"
+        );
+    }
+
+    // --- IterationResult tests ---
+
+    #[test]
+    fn test_iteration_result_fields() {
+        let result = IterationResult {
+            outcome: IterationOutcome::Completed,
+            task_id: Some("FEAT-001".to_string()),
+            files_modified: vec!["src/lib.rs".to_string()],
+            should_stop: false,
+            output: String::new(),
+            effective_model: None,
+            effective_effort: None,
+            key_decisions_count: 0,
+            conversation: None,
+            shown_learning_ids: Vec::new(),
+        };
+        assert_eq!(result.task_id, Some("FEAT-001".to_string()));
+        assert!(!result.should_stop);
+    }
+
+    // --- MAX_CONSECUTIVE_REORDERS constant ---
+
+    #[test]
+    fn test_max_consecutive_reorders_is_2() {
+        assert_eq!(MAX_CONSECUTIVE_REORDERS, 2);
+    }
 }

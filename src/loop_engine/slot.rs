@@ -591,3 +591,288 @@ pub(super) fn process_slot_result(
         agg.wave_should_stop = true;
     }
 }
+
+#[cfg(test)]
+#[allow(deprecated)]
+mod tests {
+    use super::*;
+    use crate::loop_engine::config::PermissionMode;
+    use crate::loop_engine::engine::{SlotContext, SlotIterationParams};
+    use crate::loop_engine::model::OPUS_MODEL;
+    use crate::loop_engine::prompt::slot::{
+        SlotPromptBundle, SlotPromptParams, build_prompt as build_slot_prompt_bundle,
+    };
+    use crate::loop_engine::runner::RunnerKind;
+    use crate::loop_engine::signals::SignalFlag;
+    use crate::loop_engine::test_utils::{insert_task, setup_test_db};
+    use crate::models::Task;
+    use std::path::Path;
+
+    /// Build a minimal SlotIterationParams wired to a test DB.
+    /// `signal_flag` is shared so tests can observe/trip it across slots.
+    fn make_slot_params(db_dir: &Path, signal_flag: SignalFlag) -> SlotIterationParams {
+        SlotIterationParams {
+            db_dir: db_dir.to_path_buf(),
+            permission_mode: PermissionMode::Dangerous,
+            signal_flag,
+            default_model: None,
+            verbose: false,
+            iteration: 1,
+            max_iterations: 1,
+            elapsed_secs: 0,
+            task_prefix: None,
+        }
+    }
+
+    /// Build a SlotPromptParams pointing at a temp project root + base prompt.
+    fn make_prompt_params(
+        project_root: &Path,
+        base_prompt_path: std::path::PathBuf,
+    ) -> SlotPromptParams<'static> {
+        SlotPromptParams {
+            project_root: project_root.to_path_buf(),
+            base_prompt_path,
+            permission_mode: PermissionMode::Dangerous,
+            steering_path: None,
+            session_guidance: "",
+        }
+    }
+
+    /// Synthesize a `SlotPromptBundle` directly without invoking
+    /// `build_prompt`. Useful for tests that don't need the full
+    /// learnings/source-context pipeline.
+    fn dummy_bundle(task_id: &str) -> SlotPromptBundle {
+        SlotPromptBundle {
+            prompt: format!("# slot prompt for {task_id}\n"),
+            task_id: task_id.to_string(),
+            task_files: Vec::new(),
+            shown_learning_ids: Vec::new(),
+            resolved_model: None,
+            difficulty: None,
+            section_sizes: Vec::new(),
+            dropped_sections: Vec::new(),
+        }
+    }
+
+    fn make_slot(
+        slot_index: usize,
+        working_root: std::path::PathBuf,
+        prompt_bundle: SlotPromptBundle,
+    ) -> SlotContext {
+        SlotContext {
+            slot_index,
+            working_root,
+            prompt_bundle,
+            effective_runner: RunnerKind::Claude,
+        }
+    }
+
+    // --- Struct field contracts (AC 1-3) ---
+
+    #[test]
+    fn test_slot_context_fields() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let bundle = dummy_bundle("FEAT-1");
+        let ctx = make_slot(2, tmp.path().to_path_buf(), bundle);
+        assert_eq!(ctx.slot_index, 2);
+        assert_eq!(ctx.working_root, tmp.path());
+        assert_eq!(ctx.prompt_bundle.task_id, "FEAT-1");
+    }
+
+    #[test]
+    fn test_slot_result_fields() {
+        use crate::loop_engine::config::IterationOutcome;
+        use crate::loop_engine::engine::{IterationResult, SlotResult};
+        let sr = SlotResult {
+            slot_index: 1,
+            iteration_result: IterationResult {
+                outcome: IterationOutcome::Completed,
+                task_id: Some("FEAT-1".to_string()),
+                files_modified: vec!["a.rs".to_string()],
+                should_stop: false,
+                output: String::new(),
+                effective_model: None,
+                effective_effort: None,
+                key_decisions_count: 0,
+                conversation: None,
+                shown_learning_ids: Vec::new(),
+            },
+            claim_succeeded: true,
+            shown_learning_ids: vec![42, 77],
+            prompt_for_overflow: None,
+            section_sizes: Vec::new(),
+            dropped_sections: Vec::new(),
+            task_difficulty: None,
+            effective_runner: RunnerKind::Claude,
+        };
+        assert_eq!(sr.slot_index, 1);
+        assert!(matches!(
+            sr.iteration_result.outcome,
+            IterationOutcome::Completed
+        ));
+        // FEAT-002 AC: SlotResult exposes shown_learning_ids at the top
+        // level so the main thread can record bandit feedback without
+        // re-reading the bundle (which has been moved into the worker).
+        assert_eq!(sr.shown_learning_ids, vec![42, 77]);
+    }
+
+    // --- run_slot_iteration: early exit on pre-signaled flag (AC 8) ---
+
+    #[test]
+    fn test_run_slot_iteration_honors_pre_set_signal_flag() {
+        let (temp, _conn) = setup_test_db();
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        let signal = SignalFlag::new();
+        signal.set(); // pre-signal — slot must bail before spawning Claude
+        let params = make_slot_params(temp.path(), signal);
+
+        let slot = make_slot(0, tmp.path().to_path_buf(), dummy_bundle("FEAT-1"));
+        let result = run_slot_iteration(&slot, &params).expect("run_slot_iteration");
+        assert_eq!(result.slot_index, 0);
+        assert!(matches!(
+            result.iteration_result.outcome,
+            IterationOutcome::Empty
+        ));
+        assert!(result.iteration_result.should_stop);
+        assert_eq!(result.iteration_result.task_id.as_deref(), Some("FEAT-1"),);
+    }
+
+    // --- prompt::slot::build_prompt: includes task JSON + completion ---
+
+    #[test]
+    fn test_slot_bundle_contains_task_and_completion_sections() {
+        let (_temp, conn) = setup_test_db();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path().join("base.md");
+        std::fs::write(&base, "BASE_PROMPT_CONTENT").unwrap();
+
+        let mut task = Task::new("FEAT-42", "Do the thing");
+        task.description = Some("Detailed desc".to_string());
+        task.difficulty = Some("high".to_string());
+
+        let prompt_params = make_prompt_params(tmp.path(), base);
+        let bundle = build_slot_prompt_bundle(&conn, &task, &prompt_params);
+        let prompt = &bundle.prompt;
+        assert!(prompt.contains("FEAT-42"), "missing task id");
+        assert!(prompt.contains("Do the thing"), "missing title");
+        assert!(prompt.contains("Detailed desc"), "missing description");
+        assert!(prompt.contains("\"difficulty\""), "missing difficulty");
+        assert!(
+            prompt.contains("<completed>FEAT-42</completed>"),
+            "missing completion tag instruction",
+        );
+        assert!(
+            prompt.contains("BASE_PROMPT_CONTENT"),
+            "missing base prompt content",
+        );
+        assert_eq!(bundle.difficulty.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn test_slot_bundle_tolerates_missing_base_prompt() {
+        let (_temp, conn) = setup_test_db();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let task = Task::new("FEAT-1", "t");
+        // base_prompt_path does not exist — must not panic
+        let prompt_params = make_prompt_params(tmp.path(), tmp.path().join("does-not-exist.md"));
+        let bundle = build_slot_prompt_bundle(&conn, &task, &prompt_params);
+        assert!(bundle.prompt.contains("FEAT-1"));
+    }
+
+    // --- claim_slot_task ---
+
+    #[test]
+    fn test_claim_slot_task_updates_todo_to_in_progress() {
+        let (_tmp, mut conn) = setup_test_db();
+        insert_task(&conn, "FEAT-1", "t", "todo", 10);
+        assert!(claim_slot_task(&mut conn, "FEAT-1"));
+        let status: String = conn
+            .query_row("SELECT status FROM tasks WHERE id = 'FEAT-1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(status, "in_progress");
+    }
+
+    #[test]
+    fn test_claim_slot_task_idempotent_on_already_in_progress() {
+        let (_tmp, mut conn) = setup_test_db();
+        insert_task(&conn, "FEAT-1", "t", "in_progress", 10);
+        // UPDATE matches because WHERE clause accepts in_progress too
+        assert!(claim_slot_task(&mut conn, "FEAT-1"));
+    }
+
+    #[test]
+    fn test_claim_slot_task_rejects_done_task() {
+        let (_tmp, mut conn) = setup_test_db();
+        insert_task(&conn, "FEAT-1", "t", "done", 10);
+        assert!(!claim_slot_task(&mut conn, "FEAT-1"));
+    }
+
+    // --- SlotIterationParams cloneability (Arc + clone into threads) ---
+
+    #[test]
+    fn test_slot_iteration_params_is_clone() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let params = SlotIterationParams {
+            db_dir: tmp.path().to_path_buf(),
+            permission_mode: PermissionMode::Dangerous,
+            signal_flag: SignalFlag::new(),
+            default_model: Some(OPUS_MODEL.to_string()),
+            verbose: true,
+            iteration: 7,
+            max_iterations: 100,
+            elapsed_secs: 42,
+            task_prefix: None,
+        };
+        let cloned = params.clone();
+        assert_eq!(cloned.db_dir, params.db_dir);
+        assert_eq!(cloned.verbose, params.verbose);
+        assert_eq!(cloned.default_model.as_deref(), Some(OPUS_MODEL));
+    }
+
+    // --- AC 7: claim_slot_task / try_claim predicate semantics
+    //     (moved from recovery_primitives in orchestrator.rs) ---
+
+    #[test]
+    fn try_claim_succeeds_on_todo() {
+        let (_tmp, mut conn) = setup_test_db();
+        insert_task(&conn, "FEAT-1", "t", "todo", 10);
+        assert!(claim_slot_task(&mut conn, "FEAT-1"));
+
+        let status: String = conn
+            .query_row("SELECT status FROM tasks WHERE id = 'FEAT-1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(status, "in_progress");
+    }
+
+    #[test]
+    fn try_claim_idempotent_on_in_progress() {
+        let (_tmp, mut conn) = setup_test_db();
+        insert_task(&conn, "FEAT-1", "t", "in_progress", 10);
+        assert!(
+            claim_slot_task(&mut conn, "FEAT-1"),
+            "in_progress is in the WHERE set — re-claim is idempotent",
+        );
+    }
+
+    #[test]
+    fn try_claim_rejects_blocked() {
+        let (_tmp, mut conn) = setup_test_db();
+        insert_task(&conn, "FEAT-1", "t", "blocked", 10);
+        assert!(
+            !claim_slot_task(&mut conn, "FEAT-1"),
+            "blocked is outside the WHERE set — slot must skip",
+        );
+
+        let status: String = conn
+            .query_row("SELECT status FROM tasks WHERE id = 'FEAT-1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(status, "blocked", "row must not change on failed claim");
+    }
+}

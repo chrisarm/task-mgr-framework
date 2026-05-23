@@ -765,3 +765,71 @@ pub fn run_iteration(
         shown_learning_ids,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::loop_engine::signals::SignalFlag;
+
+    // --- Signal flag propagation from Claude exit code ---
+
+    #[test]
+    fn test_signal_flag_set_on_exit_code_130() {
+        let flag = SignalFlag::new();
+        assert!(!flag.is_signaled());
+
+        // Simulate what run_iteration does when Claude exits with 130 (SIGINT)
+        let exit_code = 130;
+        let completion_killed = false;
+        if matches!(exit_code, 130 | 143) && !completion_killed {
+            flag.set();
+        }
+        assert!(flag.is_signaled(), "Exit code 130 should set signal flag");
+    }
+
+    #[test]
+    fn test_signal_flag_set_on_exit_code_143() {
+        let flag = SignalFlag::new();
+        assert!(!flag.is_signaled());
+
+        let exit_code = 143;
+        let completion_killed = false;
+        if matches!(exit_code, 130 | 143) && !completion_killed {
+            flag.set();
+        }
+        assert!(flag.is_signaled(), "Exit code 143 should set signal flag");
+    }
+
+    #[test]
+    fn test_signal_flag_not_set_on_normal_exit_codes() {
+        for exit_code in [0, 1, 127, 137, 139] {
+            let flag = SignalFlag::new();
+            let completion_killed = false;
+            if matches!(exit_code, 130 | 143) && !completion_killed {
+                flag.set();
+            }
+            assert!(
+                !flag.is_signaled(),
+                "Exit code {} should not set signal flag",
+                exit_code
+            );
+        }
+    }
+
+    /// Regression: post-completion grace kill sends SIGTERM (exit 143), but
+    /// that's an internal finalizer — it must NOT propagate to the parent's
+    /// signal flag, or the batch runner ends the whole loop + chained PRDs
+    /// after every `<completed>` tag.
+    #[test]
+    fn test_signal_flag_not_set_on_completion_killed_143() {
+        let flag = SignalFlag::new();
+        let exit_code = 143;
+        let completion_killed = true;
+        if matches!(exit_code, 130 | 143) && !completion_killed {
+            flag.set();
+        }
+        assert!(
+            !flag.is_signaled(),
+            "exit 143 from post-completion grace kill must not set signal flag"
+        );
+    }
+}

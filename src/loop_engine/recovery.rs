@@ -1389,4 +1389,293 @@ mod tests {
             "model in DB must be unchanged at 1 failure"
         );
     }
+
+    // --- Category C recovery primitive unit tests (moved from orchestrator.rs) ---
+    //
+    // Shadow tests for the future `TaskLifecycle` service surface. Each
+    // future verb is mirrored by a thin in-module wrapper whose SQL matches
+    // today's legacy site byte-for-byte (the inline bulk-recovery UPDATE at
+    // `engine.rs:2407` / `engine.rs:3258`, `auto_block_task` at
+    // `engine.rs:5145`, and `reset_task_to_todo` at `engine.rs:1642`). The
+    // FEAT-006 migration replaces the wrappers with `TaskLifecycle::xxx`
+    // calls; the tests themselves stay identical and become the safety
+    // harness for that swap.
+
+    use crate::db::prefix::prefix_and;
+    use crate::loop_engine::test_utils::insert_task;
+    use rusqlite::{Connection, params};
+
+    /// Future `TaskLifecycle::recover_in_progress_for_prefix`.
+    ///
+    /// Today: inline SQL at engine.rs:2407 (mid-loop sweep) and
+    /// engine.rs:3258 (startup Step 6.6). Both share this exact shape.
+    fn recover_in_progress_for_prefix(
+        conn: &Connection,
+        prefix: Option<&str>,
+    ) -> rusqlite::Result<usize> {
+        let (clause, param) = prefix_and(prefix);
+        let sql = format!(
+            "UPDATE tasks SET status = 'todo', started_at = NULL \
+             WHERE status = 'in_progress' {clause}"
+        );
+        let ps: Vec<&dyn rusqlite::types::ToSql> = match &param {
+            Some(p) => vec![p as &dyn rusqlite::types::ToSql],
+            None => vec![],
+        };
+        conn.execute(&sql, ps.as_slice())
+    }
+
+    /// Future `TaskLifecycle::auto_block_after_failures(id, err, iter)`.
+    ///
+    /// Today: `auto_block_task` writes unconditionally; the future verb
+    /// gates on `status='in_progress'` and returns `applied: bool` so
+    /// terminal rows are a clean no-op. The wrapper pre-checks status
+    /// to encode that contract today; post-migration the gate moves
+    /// into the service body.
+    fn auto_block_after_failures(
+        conn: &Connection,
+        task_id: &str,
+        err: &str,
+        iteration: i64,
+    ) -> rusqlite::Result<bool> {
+        let status: String =
+            conn.query_row("SELECT status FROM tasks WHERE id = ?", [task_id], |r| {
+                r.get(0)
+            })?;
+        if status != "in_progress" {
+            return Ok(false);
+        }
+        let rows = conn.execute(
+            "UPDATE tasks SET status = 'blocked', last_error = ?, \
+             blocked_at_iteration = ?, updated_at = datetime('now') \
+             WHERE id = ?",
+            params![err, iteration, task_id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Future `TaskLifecycle::resurrect_for_iteration(prefix, ids)`.
+    ///
+    /// Today: per-id reset (cf. `reset_task_to_todo` at engine.rs:1642).
+    /// The future verb takes an explicit id slice and an optional prefix
+    /// scope guard so cross-PRD ids are rejected at the boundary.
+    fn resurrect_for_iteration(
+        conn: &Connection,
+        prefix: Option<&str>,
+        ids: &[&str],
+    ) -> rusqlite::Result<usize> {
+        let mut count = 0;
+        for id in ids {
+            if let Some(pfx) = prefix
+                && !id.starts_with(pfx)
+            {
+                continue;
+            }
+            count += conn.execute(
+                "UPDATE tasks SET status = 'todo', started_at = NULL, \
+                 updated_at = datetime('now') WHERE id = ?",
+                [id],
+            )?;
+        }
+        Ok(count)
+    }
+
+    // --- AC 1, 2, 3: recover_in_progress_for_prefix ---
+
+    #[test]
+    fn recover_in_progress_unscoped_reverts_all_in_progress_to_todo() {
+        let (_tmp, conn) = setup_test_db();
+        insert_task(&conn, "FEAT-1", "t", "in_progress", 10);
+        insert_task(&conn, "FIX-2", "t", "in_progress", 10);
+        insert_task(&conn, "FEAT-3", "t", "done", 10);
+        conn.execute(
+            "UPDATE tasks SET started_at = datetime('now') WHERE status = 'in_progress'",
+            [],
+        )
+        .unwrap();
+
+        let count = recover_in_progress_for_prefix(&conn, None).unwrap();
+        assert_eq!(count, 2, "both in_progress rows must be reset");
+
+        for id in ["FEAT-1", "FIX-2"] {
+            let (status, started): (String, Option<String>) = conn
+                .query_row(
+                    "SELECT status, started_at FROM tasks WHERE id = ?",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(status, "todo", "{id} must be reset to todo");
+            assert!(started.is_none(), "{id} started_at must be cleared");
+        }
+        // Terminal row untouched.
+        let done: String = conn
+            .query_row("SELECT status FROM tasks WHERE id = 'FEAT-3'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(done, "done", "terminal row must not be touched");
+    }
+
+    #[test]
+    fn recover_in_progress_prefix_scoped_only_touches_matching_rows() {
+        let (_tmp, conn) = setup_test_db();
+        insert_task(&conn, "FEAT-1", "t", "in_progress", 10);
+        insert_task(&conn, "FEAT-2", "t", "in_progress", 10);
+        insert_task(&conn, "FIX-1", "t", "in_progress", 10);
+
+        // `prefix_and` convention: bare prefix without trailing dash;
+        // the helper appends `-%` to produce the LIKE pattern. Concurrent
+        // loops on different PRDs MUST NOT reset each other's rows.
+        let count = recover_in_progress_for_prefix(&conn, Some("FEAT")).unwrap();
+        assert_eq!(count, 2, "only FEAT- rows in scope");
+
+        let fix_status: String = conn
+            .query_row("SELECT status FROM tasks WHERE id = 'FIX-1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            fix_status, "in_progress",
+            "prefix scope MUST NOT leak across PRD boundaries",
+        );
+    }
+
+    #[test]
+    fn recover_in_progress_empty_result_returns_zero() {
+        let (_tmp, conn) = setup_test_db();
+        insert_task(&conn, "FEAT-1", "t", "todo", 10);
+        insert_task(&conn, "FEAT-2", "t", "done", 10);
+
+        let count = recover_in_progress_for_prefix(&conn, None).unwrap();
+        assert_eq!(
+            count, 0,
+            "no in_progress rows — no-op (autocommit; no transaction overhead)",
+        );
+
+        // No row should have changed.
+        let mut stmt = conn
+            .prepare("SELECT id, status FROM tasks ORDER BY id")
+            .unwrap();
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("FEAT-1".to_string(), "todo".to_string()),
+                ("FEAT-2".to_string(), "done".to_string()),
+            ],
+        );
+    }
+
+    // --- AC 4, 5: auto_block_after_failures ---
+
+    #[test]
+    fn auto_block_after_failures_sets_blocked_when_in_progress() {
+        let (_tmp, conn) = setup_test_db();
+        insert_task(&conn, "FEAT-1", "t", "in_progress", 10);
+
+        let applied =
+            auto_block_after_failures(&conn, "FEAT-1", "max retries exceeded", 42).unwrap();
+        assert!(applied, "in_progress→blocked transition must apply");
+
+        let (status, last_err, blocked_iter): (String, String, i64) = conn
+            .query_row(
+                "SELECT status, last_error, blocked_at_iteration \
+                 FROM tasks WHERE id = 'FEAT-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "blocked");
+        assert_eq!(
+            last_err, "max retries exceeded",
+            "free-form err must be stored verbatim",
+        );
+        assert_eq!(blocked_iter, 42, "iteration recorded for decay-tracking",);
+    }
+
+    #[test]
+    fn auto_block_after_failures_is_noop_on_done_task() {
+        let (_tmp, conn) = setup_test_db();
+        insert_task(&conn, "FEAT-1", "t", "done", 10);
+
+        let applied = auto_block_after_failures(&conn, "FEAT-1", "err", 7).unwrap();
+        assert!(!applied, "terminal Done must NOT be re-blocked");
+
+        let (status, last_err): (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, last_error FROM tasks WHERE id = 'FEAT-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "done", "row untouched");
+        assert!(
+            last_err.is_none(),
+            "no stderr emission AND no last_error mutation on no-op path",
+        );
+    }
+
+    // --- AC 6: resurrect_for_iteration ---
+
+    #[test]
+    fn resurrect_for_iteration_flips_listed_ids_to_todo() {
+        let (_tmp, conn) = setup_test_db();
+        insert_task(&conn, "FEAT-1", "t", "in_progress", 10);
+        insert_task(&conn, "FEAT-2", "t", "blocked", 10);
+        insert_task(&conn, "FEAT-3", "t", "done", 10);
+        conn.execute(
+            "UPDATE tasks SET started_at = datetime('now') WHERE id IN ('FEAT-1','FEAT-2')",
+            [],
+        )
+        .unwrap();
+
+        let count = resurrect_for_iteration(&conn, Some("FEAT-"), &["FEAT-1", "FEAT-2"]).unwrap();
+        assert_eq!(count, 2);
+
+        for id in ["FEAT-1", "FEAT-2"] {
+            let (status, started): (String, Option<String>) = conn
+                .query_row(
+                    "SELECT status, started_at FROM tasks WHERE id = ?",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(status, "todo", "{id}");
+            assert!(started.is_none(), "{id} started_at must be cleared");
+        }
+
+        // Out-of-list row untouched.
+        let unchanged: String = conn
+            .query_row("SELECT status FROM tasks WHERE id = 'FEAT-3'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(unchanged, "done");
+    }
+
+    #[test]
+    fn resurrect_for_iteration_prefix_filters_out_cross_prd_ids() {
+        let (_tmp, conn) = setup_test_db();
+        insert_task(&conn, "FEAT-1", "t", "in_progress", 10);
+        insert_task(&conn, "FIX-1", "t", "in_progress", 10);
+
+        // FIX-1 is in the list but the FEAT- prefix guard must skip it.
+        let count = resurrect_for_iteration(&conn, Some("FEAT-"), &["FEAT-1", "FIX-1"]).unwrap();
+        assert_eq!(count, 1, "only FEAT-1 reset");
+
+        let fix_status: String = conn
+            .query_row("SELECT status FROM tasks WHERE id = 'FIX-1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            fix_status, "in_progress",
+            "cross-PRD id must be skipped at the boundary",
+        );
+    }
 }
