@@ -172,6 +172,13 @@ pub struct ProjectConfig {
     /// applied for any omitted optional fields). Default: `None`.
     #[serde(default)]
     pub fallback_runner: Option<FallbackRunnerConfig>,
+
+    /// Optional model to route review-class tasks to (`CODE-REVIEW-*`,
+    /// `MILESTONE-FINAL`, `REVIEW-*`). When set, these tasks are dispatched
+    /// using this model instead of the default Claude model. Typically a Grok
+    /// model id (e.g. `"grok-4"`). Absent key or explicit `null` → `None`.
+    #[serde(default)]
+    pub review_model: Option<String>,
 }
 
 impl Default for ProjectConfig {
@@ -195,6 +202,7 @@ impl Default for ProjectConfig {
             auto_review: default_auto_review(),
             auto_review_min_tasks: default_auto_review_min_tasks(),
             fallback_runner: None,
+            review_model: None,
         }
     }
 }
@@ -840,6 +848,54 @@ mod tests {
         fs::write(dir.path().join("config.json"), "{}").unwrap();
         let config = read_project_config(dir.path());
         assert_eq!(config.auto_review_min_tasks, 3);
+    }
+
+    #[test]
+    fn test_review_model_absent_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.json"), "{}").unwrap();
+        let config = read_project_config(dir.path());
+        assert!(config.review_model.is_none());
+    }
+
+    #[test]
+    fn test_review_model_default_impl_is_none() {
+        assert!(ProjectConfig::default().review_model.is_none());
+    }
+
+    #[test]
+    fn test_review_model_deserializes_from_json() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{"reviewModel": "grok-4"}"#,
+        )
+        .unwrap();
+        let config = read_project_config(dir.path());
+        assert_eq!(config.review_model.as_deref(), Some("grok-4"));
+    }
+
+    #[test]
+    fn test_review_model_missing_file_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = read_project_config(dir.path());
+        assert!(config.review_model.is_none());
+    }
+
+    #[test]
+    fn test_review_model_snake_case_not_accepted() {
+        // Wire name is camelCase; snake_case must not set the field.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{"review_model": "grok-4"}"#,
+        )
+        .unwrap();
+        let config = read_project_config(dir.path());
+        assert!(
+            config.review_model.is_none(),
+            "snake_case key must not set review_model"
+        );
     }
 
     #[test]
