@@ -1186,11 +1186,12 @@ fn claim_failed_slot_does_not_pollute_crash_map() {
 // long-term enforcement mechanism the FR-006 assertion provides; the prose
 // comment can drift, this cannot.
 //
-// The helpers are named for their POST-CARVE homes. Today both bodies live in
-// `engine.rs` (`run_iteration` ~L4131 sequential, `process_slot_result` ~L1547
-// wave); as the carve FEAT tasks move them into `iteration.rs` and `slot.rs`,
-// update the references in these comments — the mechanism is unaffected by the
-// move because it pins the *type*, not a source location.
+// The helpers are named for their POST-CARVE homes. The wave body now lives in
+// `slot.rs` (`slot::process_slot_result`, carved in FEAT-001); the sequential
+// body still lives in `engine.rs` (`run_iteration`) until its own carve task
+// moves it into `iteration.rs`. Update the references in these comments as the
+// remaining carve tasks land — the mechanism is unaffected by the move because
+// it pins the *type*, not a source location.
 
 /// Sequential call site — `iteration::run_iteration` post-carve, today
 /// `engine.rs::run_iteration`.
@@ -1222,8 +1223,8 @@ fn sequential_call_site_destructures_full_params(params: ProcessingParams<'_>) {
     } = params;
 }
 
-/// Wave call site — `slot::process_slot_result` post-carve, today
-/// `engine.rs::process_slot_result`.
+/// Wave call site — `slot::process_slot_result` (carved out of `engine.rs`
+/// in FEAT-001; the body now lives in `src/loop_engine/slot.rs`).
 fn wave_call_site_destructures_full_params(params: ProcessingParams<'_>) {
     // Exhaustive, `..`-free destructure — kept byte-identical to the
     // sequential helper above so the two call sites cannot drift.

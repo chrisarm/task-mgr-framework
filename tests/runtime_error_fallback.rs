@@ -351,26 +351,28 @@ fn grok_promotion_preserves_consecutive_failures_count() {
 /// `IterationContext` is not thread-safe).
 ///
 /// We grep the source file for the function body span between
-/// `pub fn run_slot_iteration(` and the next top-level `pub fn` /
-/// `fn run_parallel_wave`. Any occurrence of `escalate_task_model_if_needed`
+/// `pub fn run_slot_iteration(` and the next top-level helper
+/// (`fn claim_slot_task`). Any occurrence of `escalate_task_model_if_needed`
 /// within that span is a wiring bug.
+///
+/// Post-FEAT-001 carve: `run_slot_iteration` lives in `slot.rs`, immediately
+/// followed by `claim_slot_task` (the next top-level `fn`).
 #[test]
 fn run_slot_iteration_does_not_call_escalate_task_model_if_needed() {
-    let source = std::fs::read_to_string("src/loop_engine/engine.rs")
-        .expect("could not read src/loop_engine/engine.rs from tests/ cwd");
+    let source = std::fs::read_to_string("src/loop_engine/slot.rs")
+        .expect("could not read src/loop_engine/slot.rs from tests/ cwd");
 
     let start = source
         .find("pub fn run_slot_iteration(")
-        .expect("expected `pub fn run_slot_iteration(` to be defined in engine.rs");
+        .expect("expected `pub fn run_slot_iteration(` to be defined in slot.rs");
 
-    // The function body ends at the next top-level `pub fn` or `fn` declaration
-    // following slot_failure_result (a private helper that sits between
-    // run_slot_iteration and run_parallel_wave). We scan for any `\nfn ` or
-    // `\npub fn ` after the body opens.
+    // The function body ends at the next top-level `fn` declaration
+    // (`claim_slot_task`, which sits immediately after `run_slot_iteration`
+    // in slot.rs). We scan for that anchor after the body opens.
     let after_open = &source[start..];
     let body_close = after_open
-        .find("\npub fn run_parallel_wave(")
-        .expect("expected `pub fn run_parallel_wave(` after `run_slot_iteration` body");
+        .find("\npub(super) fn claim_slot_task(")
+        .expect("expected `fn claim_slot_task(` after `run_slot_iteration` body");
     let body = &after_open[..body_close];
 
     assert!(
@@ -392,16 +394,16 @@ fn run_slot_iteration_does_not_call_escalate_task_model_if_needed() {
 /// thread instead of routing through the main-thread aggregation step.
 #[test]
 fn run_slot_iteration_does_not_construct_iteration_context() {
-    let source = std::fs::read_to_string("src/loop_engine/engine.rs")
-        .expect("could not read src/loop_engine/engine.rs from tests/ cwd");
+    let source = std::fs::read_to_string("src/loop_engine/slot.rs")
+        .expect("could not read src/loop_engine/slot.rs from tests/ cwd");
 
     let start = source
         .find("pub fn run_slot_iteration(")
-        .expect("expected `pub fn run_slot_iteration(` to be defined in engine.rs");
+        .expect("expected `pub fn run_slot_iteration(` to be defined in slot.rs");
     let after_open = &source[start..];
     let body_close = after_open
-        .find("\npub fn run_parallel_wave(")
-        .expect("expected `pub fn run_parallel_wave(` after `run_slot_iteration`");
+        .find("\npub(super) fn claim_slot_task(")
+        .expect("expected `fn claim_slot_task(` after `run_slot_iteration`");
     let body = &after_open[..body_close];
 
     assert!(

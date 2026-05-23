@@ -195,17 +195,17 @@ fn runner_overrides_is_empty_before_post_aggregation_and_populated_after() {
 /// contract for the RuntimeError fallback hook.
 #[test]
 fn run_slot_iteration_does_not_call_handle_task_failure() {
-    let source = std::fs::read_to_string("src/loop_engine/engine.rs")
-        .expect("could not read src/loop_engine/engine.rs");
+    let source = std::fs::read_to_string("src/loop_engine/slot.rs")
+        .expect("could not read src/loop_engine/slot.rs");
 
     let start = source
         .find("pub fn run_slot_iteration(")
-        .expect("`pub fn run_slot_iteration(` must be defined in engine.rs");
+        .expect("`pub fn run_slot_iteration(` must be defined in slot.rs");
 
     let after_start = &source[start..];
     let body_end = after_start
-        .find("\npub fn run_parallel_wave(")
-        .expect("`pub fn run_parallel_wave(` must follow `run_slot_iteration` body");
+        .find("\npub(super) fn claim_slot_task(")
+        .expect("`fn claim_slot_task(` must follow `run_slot_iteration` body");
     let body = &after_start[..body_end];
 
     assert!(
