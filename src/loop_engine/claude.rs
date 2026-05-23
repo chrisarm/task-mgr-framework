@@ -194,6 +194,7 @@ pub(crate) fn spawn_claude(
     permission_mode: &PermissionMode,
     opts: SpawnOpts<'_>,
 ) -> TaskMgrResult<ClaudeResult> {
+    // kind-correct: wrapper pins provider identity — the entire purpose of spawn_claude is to guarantee Claude as the dispatch target
     runner::dispatch(RunnerKind::Claude, prompt, permission_mode, opts)
 }
 

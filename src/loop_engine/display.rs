@@ -235,6 +235,7 @@ pub fn format_iteration_banner_with_recovery(
     } else {
         String::new()
     };
+    // kind-correct: UI annotation of provider identity for operator visibility — not a capability check
     let grok_suffix = if effective_runner == crate::loop_engine::runner::RunnerKind::Grok {
         " (via grok)"
     } else {

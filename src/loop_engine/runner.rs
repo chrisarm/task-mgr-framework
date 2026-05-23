@@ -192,10 +192,22 @@ pub struct RunnerOpts<'a> {
     /// to the correct PRD. All non-loop callers (curate, learnings, merge
     /// resolver, etc.) pass `None`, leaving the variable unset in the child.
     pub active_prefix: Option<&'a str>,
+    /// When `true`, signal that the caller wants per-session ai-title artifact
+    /// cleanup for this invocation. Used as the opt-in field that drives the
+    /// [`RunnerCapability::TitleArtifactCleanup`] enforcement gate in `dispatch`:
+    /// if set to `true` on a runner that returns `false` for
+    /// `supports(TitleArtifactCleanup)` (e.g. [`GrokRunner`]), dispatch returns
+    /// [`TaskMgrError::UnsupportedRunnerCapability`] before spawning.
+    ///
+    /// When `true` on a supported runner ([`ClaudeRunner`]), dispatch drives
+    /// `cleanup_session` post-spawn (FEAT-006). Callers that do not need
+    /// the cleanup workaround (e.g. non-loop callers) leave this `false`
+    /// (the default), and cleanup is skipped.
+    pub cleanup_title_artifact: bool,
     /// Fallback runner CLI binary path resolved from `FallbackRunnerConfig.cli_binary`.
-    /// Only consumed by [`GrokRunner`]: used as the second link in the binary
+    /// Only consumed by `GrokRunner`: used as the second link in the binary
     /// resolution chain (`$GROK_BINARY` → `fallback_cli_binary` → `"grok"` on
-    /// PATH). [`ClaudeRunner`] ignores it. `None` falls through to the PATH
+    /// PATH). `ClaudeRunner` ignores it. `None` falls through to the PATH
     /// default; `Some(p)` is invoked verbatim (no PATH re-resolution).
     pub fallback_cli_binary: Option<&'a str>,
 }
@@ -208,6 +220,55 @@ pub struct RunnerOpts<'a> {
 pub enum RunnerKind {
     Claude,
     Grok,
+}
+
+/// Typed capability surface used by `dispatch` to refuse a spawn whose
+/// [`RunnerOpts`] sets a field encoding a capability the chosen runner
+/// does not support — before any subprocess is launched.
+///
+/// (a) **Surface contract**: each variant maps 1:1 to a `RunnerOpts` field
+/// whose presence (non-default value) implies the caller wants behavior
+/// the runner may or may not deliver. The mapping from variant to
+/// `RunnerOpts` field lives in a single `checks` registry table on the
+/// `dispatch` side (FEAT-003), never duplicated across runner impls.
+///
+/// (b) **`#[non_exhaustive]` rationale**: capabilities are an open set —
+/// future runners (Gemini, local llama.cpp, …) will surface new flags
+/// (`ThinkingTokens`, `PermissionMode`, `SessionId`, …) as `RunnerOpts`
+/// grows. Marking the enum non-exhaustive means external crates cannot
+/// pattern-match without a wildcard, leaving us free to add variants
+/// without a major-version bump. Internal `LlmRunner` impls intentionally
+/// match exhaustively (see (c)) — `#[non_exhaustive]` does NOT change
+/// in-crate match semantics.
+///
+/// (c) **Exhaustive-match-in-production-impls convention**: every
+/// production [`LlmRunner::supports`] impl MUST use an exhaustive match
+/// (NO `_` wildcard arm). Adding a new variant then forces a per-runner
+/// compile error so the capability decision is made deliberately — never
+/// silently defaulted. This is the forcing function that makes the
+/// capability surface a contract instead of a hint; a wildcard arm here
+/// defeats the entire mechanism.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum RunnerCapability {
+    /// Runner accepts an `--effort` (or equivalent) flag for reasoning depth.
+    /// Maps to [`RunnerOpts::effort`].
+    Effort,
+    /// Runner emits stream-json (or `streaming-json`) output when requested.
+    /// Maps to [`RunnerOpts::stream_json`].
+    StreamJson,
+    /// Runner honors PTY allocation for stdout line-buffering workarounds.
+    /// Maps to [`RunnerOpts::use_pty`]. Claude-specific today (Node.js
+    /// line-buffering); Grok uses plain pipes.
+    Pty,
+    /// Runner accepts a disallowed-tools list. Maps to
+    /// [`RunnerOpts::disallowed_tools`].
+    DisallowedTools,
+    /// Runner needs to inject `--session-id` and clean up the ai-title jsonl
+    /// artifact after the subprocess exits. Claude-specific workaround for the
+    /// 2.1.110 session-leak; Grok has no equivalent artifact. Maps to
+    /// [`RunnerOpts::cleanup_title_artifact`].
+    TitleArtifactCleanup,
 }
 
 /// Common interface implemented by every concrete LLM runner.
@@ -225,6 +286,28 @@ pub(crate) trait LlmRunner: Send + Sync {
         permission_mode: &PermissionMode,
         opts: RunnerOpts<'_>,
     ) -> TaskMgrResult<RunnerResult>;
+
+    /// Declare whether this runner supports a given capability.
+    ///
+    /// Used by [`dispatch`] (FEAT-003) to refuse calls that set a
+    /// [`RunnerOpts`] field encoding an unsupported capability **before**
+    /// any subprocess is spawned — fail-closed at the boundary instead of
+    /// silently dropping the flag in the runner body.
+    ///
+    /// The default returns `false` for every capability: an
+    /// implementation that forgets to override `supports` is treated as
+    /// "supports nothing", so every capability-driven call against it
+    /// will be rejected by dispatch. Choosing the safe direction here
+    /// means a future runner added without thinking about capabilities
+    /// fails loudly at the spawn boundary instead of silently no-op'ing
+    /// on flags the operator depended on.
+    ///
+    /// Production impls MUST override this with an **exhaustive** match
+    /// (no `_` wildcard arm) — see the
+    /// [`RunnerCapability`] rustdoc, paragraph (c).
+    fn supports(&self, _cap: RunnerCapability) -> bool {
+        false
+    }
 
     /// Delete the per-session artifact (file or directory) that this runner's
     /// CLI wrote to disk for the given `(session_id, cwd)` tuple.
@@ -360,6 +443,20 @@ fn pick_newest_by_mtime(grok_dir: &Path, ids: &[Uuid]) -> Option<Uuid> {
 pub(crate) struct ClaudeRunner;
 
 impl LlmRunner for ClaudeRunner {
+    // EXHAUSTIVE match (no `_` arm) is the forcing function — a new
+    // `RunnerCapability` variant must cause a per-runner compile error so
+    // the support decision is made deliberately. See `RunnerCapability`
+    // rustdoc paragraph (c).
+    fn supports(&self, cap: RunnerCapability) -> bool {
+        match cap {
+            RunnerCapability::Effort => true,
+            RunnerCapability::StreamJson => true,
+            RunnerCapability::Pty => true,
+            RunnerCapability::DisallowedTools => true,
+            RunnerCapability::TitleArtifactCleanup => true,
+        }
+    }
+
     /// Spawn Claude with the given prompt and collect its output.
     ///
     /// The subprocess runs `<binary> <base-flags> <permission-flags> [-model m] -p <prompt>`.
@@ -401,7 +498,10 @@ impl LlmRunner for ClaudeRunner {
             slot_label,
             active_prefix,
             // Grok-only knob; Claude resolves its binary purely via $CLAUDE_BINARY.
+            // cleanup_title_artifact is a capability-gate signal enforced at dispatch;
+            // spawn body does not read it. Use `..` to elide all remaining fields.
             fallback_cli_binary: _,
+            ..
         } = opts;
         let binary = std::env::var("CLAUDE_BINARY").unwrap_or_else(|_| "claude".to_string());
         let base: &[&str] = if stream_json {
@@ -571,6 +671,10 @@ impl LlmRunner for ClaudeRunner {
 /// - `--dangerously-skip-permissions` → `--permission-mode bypassPermissions`
 /// - `--output-format stream-json` → `--output-format streaming-json`
 ///   (different spelling)
+/// - `cleanup_title_artifact: true` is rejected at dispatch with
+///   [`TaskMgrError::UnsupportedRunnerCapability`] — grok has no
+///   ai-title-jsonl leak and the `TitleArtifactCleanup` capability is
+///   `false` on [`GrokRunner`].
 ///
 /// Session capture: `spawn` snapshots `~/.grok/sessions/<encoded-cwd>/`
 /// immediately before and after the child exits (pre/post diff). Entries
@@ -593,6 +697,20 @@ impl LlmRunner for ClaudeRunner {
 pub(crate) struct GrokRunner;
 
 impl LlmRunner for GrokRunner {
+    // EXHAUSTIVE match (no `_` arm) per the `RunnerCapability` convention.
+    // `Pty=false`: grok uses plain pipes; the Node.js line-buffering
+    // workaround does not apply.
+    // `TitleArtifactCleanup=false`: grok has no ai-title-jsonl leak.
+    fn supports(&self, cap: RunnerCapability) -> bool {
+        match cap {
+            RunnerCapability::Effort => true,
+            RunnerCapability::StreamJson => true,
+            RunnerCapability::Pty => false,
+            RunnerCapability::DisallowedTools => true,
+            RunnerCapability::TitleArtifactCleanup => false,
+        }
+    }
+
     fn spawn(
         &self,
         prompt: &str,
@@ -608,13 +726,13 @@ impl LlmRunner for GrokRunner {
             effort,
             disallowed_tools,
             db_dir,
-            // PTY workaround is Claude-specific (Node.js line-buffering).
-            // Out of scope for v1; grok uses plain pipes.
-            use_pty: _,
             target_task_id,
             slot_label,
             active_prefix,
             fallback_cli_binary,
+            // Capabilities the runner does not support are enforced at dispatch;
+            // this destructure consumes only the fields Grok actively uses.
+            ..
         } = opts;
 
         // Resolve cwd and HOME for the session-dir snapshot. HOME absence
@@ -1046,15 +1164,107 @@ fn read_plain_stdout(
     buf
 }
 
-/// Route a runner invocation to the correct backend, then synchronously clean
-/// up any per-session artifact the runner wrote to disk.
+/// Canonical &'static str label for a [`RunnerCapability`] variant.
+///
+/// Used as the `capability_name` field of
+/// [`TaskMgrError::UnsupportedRunnerCapability`]. Exhaustive match: a new
+/// variant added to `RunnerCapability` forces a compile error here so the
+/// label is never silently `"unknown"`.
+fn capability_name(cap: RunnerCapability) -> &'static str {
+    match cap {
+        RunnerCapability::Effort => "Effort",
+        RunnerCapability::StreamJson => "StreamJson",
+        RunnerCapability::Pty => "Pty",
+        RunnerCapability::DisallowedTools => "DisallowedTools",
+        RunnerCapability::TitleArtifactCleanup => "TitleArtifactCleanup",
+    }
+}
+
+/// Function-pointer predicate that returns `true` when an opts field
+/// encodes a non-default, non-whitespace request for the paired capability.
+type CapabilityFieldCheck = for<'a> fn(&RunnerOpts<'a>) -> bool;
+
+/// Single source of truth mapping each [`RunnerCapability`] variant to the
+/// [`RunnerOpts`] field whose presence asks the runner to honor that
+/// capability, plus the field's snake_case name for error reporting.
+///
+/// Every enforced variant has exactly one row. The completeness-guard test
+/// [`checks_table_covers_every_capability_variant`] iterates all variants
+/// and asserts each appears here — a new variant added without a matching
+/// row fails the test at unit-test time, before the silent-no-op
+/// regression can reach production.
+///
+/// Empty / whitespace-only `Option<&str>` values are treated as "no
+/// opinion" (`trim().is_empty()`) — matching the same convention used by
+/// [`push_optional_flag`]. Only a meaningful value triggers enforcement.
+const CHECKS: &[(RunnerCapability, CapabilityFieldCheck, &str)] = &[
+    (RunnerCapability::Pty, |o| o.use_pty, "use_pty"),
+    (
+        RunnerCapability::StreamJson,
+        |o| o.stream_json,
+        "stream_json",
+    ),
+    (
+        RunnerCapability::Effort,
+        |o| o.effort.is_some_and(|e| !e.trim().is_empty()),
+        "effort",
+    ),
+    (
+        RunnerCapability::DisallowedTools,
+        |o| o.disallowed_tools.is_some_and(|d| !d.trim().is_empty()),
+        "disallowed_tools",
+    ),
+    (
+        RunnerCapability::TitleArtifactCleanup,
+        |o| o.cleanup_title_artifact,
+        "cleanup_title_artifact",
+    ),
+];
+
+/// Refuse a dispatch whose [`RunnerOpts`] sets a capability-driven field
+/// the chosen runner does not support, before any subprocess is spawned.
+///
+/// Walks [`CHECKS`] in order; the first row whose `field_is_set` predicate
+/// fires AND for which `runner.supports(cap)` is `false` returns
+/// [`TaskMgrError::UnsupportedRunnerCapability`] carrying the runner kind,
+/// canonical capability label, and the opts field name.
+///
+/// `runner` is `&dyn LlmRunner` purely for the duration of this call so a
+/// single body can be runner-polymorphic; the hot spawn path in
+/// [`dispatch`] remains static-dispatch on [`RunnerKind`].
+fn enforce_capabilities(
+    runner: &dyn LlmRunner,
+    kind: RunnerKind,
+    opts: &RunnerOpts<'_>,
+) -> TaskMgrResult<()> {
+    for (cap, is_set, field_name) in CHECKS {
+        if is_set(opts) && !runner.supports(*cap) {
+            return Err(TaskMgrError::UnsupportedRunnerCapability {
+                runner_kind: kind,
+                capability_name: capability_name(*cap),
+                field_name,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Route a runner invocation to the correct backend, enforcing capability
+/// constraints pre-spawn and cleaning up per-session artifacts post-spawn.
 ///
 /// `RunnerKind::Claude` → [`ClaudeRunner::spawn`]; `RunnerKind::Grok` →
-/// [`GrokRunner::spawn`]. After spawn returns, [`LlmRunner::cleanup_session`]
-/// is called for the `(session_id, cwd)` tuple captured by the spawn —
-/// provided `RunnerResult::session_id` is `Some`. Cleanup runs on both
-/// clean-exit and non-zero-exit spawns. The return value is always the spawn's
-/// original `RunnerResult` / `Err`, never modified by cleanup.
+/// [`GrokRunner::spawn`].
+///
+/// **Pre-spawn**: `enforce_capabilities` walks the `CHECKS` registry. Any
+/// `RunnerOpts` field encoding a capability the chosen runner does not support
+/// returns [`TaskMgrError::UnsupportedRunnerCapability`] before any subprocess
+/// is launched (fail-closed). See `enforce_capabilities` and `CHECKS`.
+///
+/// **Post-spawn**: after spawn returns, [`LlmRunner::cleanup_session`] is
+/// called for the `(session_id, cwd)` tuple when `RunnerResult::session_id`
+/// is `Some`. Cleanup runs on both clean-exit and non-zero-exit spawns. The
+/// return value is always the spawn's original `RunnerResult` / `Err`,
+/// never modified by cleanup.
 ///
 /// `cwd` is `opts.working_dir` when `Some`; falls back to
 /// `std::env::current_dir()`, then `PathBuf::default()` if that fails.
@@ -1063,7 +1273,8 @@ fn read_plain_stdout(
 ///
 /// Returns whatever the underlying backend returns. Grok adds one provider-
 /// specific error variant ([`TaskMgrError::GrokAuthFailure`]); Claude has no
-/// equivalent.
+/// equivalent. Either backend may surface
+/// [`TaskMgrError::UnsupportedRunnerCapability`] from the pre-spawn check.
 ///
 /// # Best-effort limitation (PRD §6)
 ///
@@ -1080,14 +1291,23 @@ pub fn dispatch(
     permission_mode: &PermissionMode,
     opts: RunnerOpts<'_>,
 ) -> TaskMgrResult<RunnerResult> {
+    // Resolve cwd once for post-spawn cleanup (FEAT-006).
+    // The brief &dyn LlmRunner borrow inside enforce_capabilities keeps capability enforcement
+    // runner-polymorphic without putting Box<dyn LlmRunner> on the hot path.
     let cwd: PathBuf = opts
         .working_dir
         .map(|p| p.to_path_buf())
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_default();
     let result = match kind {
-        RunnerKind::Claude => ClaudeRunner.spawn(prompt, permission_mode, opts),
-        RunnerKind::Grok => GrokRunner.spawn(prompt, permission_mode, opts),
+        RunnerKind::Claude => {
+            enforce_capabilities(&ClaudeRunner, kind, &opts)?;
+            ClaudeRunner.spawn(prompt, permission_mode, opts)
+        }
+        RunnerKind::Grok => {
+            enforce_capabilities(&GrokRunner, kind, &opts)?;
+            GrokRunner.spawn(prompt, permission_mode, opts)
+        }
     };
     if let Ok(ref r) = result
         && let Some(sid) = r.session_id
@@ -1129,6 +1349,235 @@ mod tests {
     #[allow(dead_code)]
     fn _assert_claude_result_is_runner_result(r: ClaudeResult) -> RunnerResult {
         r
+    }
+
+    /// AC: every (runner × capability) pair matches the declared support
+    /// matrix. 2 runners × 4 capabilities = 8 assertions.
+    ///
+    /// The expected table is written inline (not derived from
+    /// `supports()`) so a copy-paste flip of any bit in either production
+    /// impl produces a test failure that names the offending pair.
+    #[test]
+    fn supports_matrix_matches_declared_capability_table() {
+        use RunnerCapability::*;
+        let expectations: &[(&str, &dyn LlmRunner, RunnerCapability, bool)] = &[
+            ("claude", &ClaudeRunner, Effort, true),
+            ("claude", &ClaudeRunner, StreamJson, true),
+            ("claude", &ClaudeRunner, Pty, true),
+            ("claude", &ClaudeRunner, DisallowedTools, true),
+            ("claude", &ClaudeRunner, TitleArtifactCleanup, true),
+            ("grok", &GrokRunner, Effort, true),
+            ("grok", &GrokRunner, StreamJson, true),
+            ("grok", &GrokRunner, Pty, false),
+            ("grok", &GrokRunner, DisallowedTools, true),
+            ("grok", &GrokRunner, TitleArtifactCleanup, false),
+        ];
+        for (name, runner, cap, expected) in expectations {
+            assert_eq!(
+                runner.supports(*cap),
+                *expected,
+                "{name}.supports({cap:?}) expected {expected}",
+            );
+        }
+    }
+
+    /// AC#4: enforcement completeness guard. Every `RunnerCapability` variant
+    /// MUST appear in [`CHECKS`]; otherwise its field silently no-ops at
+    /// dispatch and FEAT-003's contract is violated.
+    ///
+    /// `all_variants` is hand-rolled (no `strum` dep). The companion
+    /// `assert_exhaustive` match has NO wildcard arm — a new variant added
+    /// without updating this list fails to compile, which in turn fails the
+    /// runtime "every variant in CHECKS" assertion below.
+    #[test]
+    fn checks_table_covers_every_capability_variant() {
+        use RunnerCapability::*;
+        let all_variants: &[RunnerCapability] = &[
+            Effort,
+            StreamJson,
+            Pty,
+            DisallowedTools,
+            TitleArtifactCleanup,
+        ];
+        fn assert_exhaustive(cap: RunnerCapability) {
+            match cap {
+                Effort | StreamJson | Pty | DisallowedTools | TitleArtifactCleanup => {}
+            }
+        }
+        for v in all_variants {
+            assert_exhaustive(*v);
+            assert!(
+                CHECKS.iter().any(|(c, _, _)| c == v),
+                "RunnerCapability::{v:?} missing from CHECKS registry — \
+                 add a row in runner.rs::CHECKS or the dispatch guard \
+                 will silently ignore its RunnerOpts field"
+            );
+        }
+        assert_eq!(
+            CHECKS.len(),
+            all_variants.len(),
+            "CHECKS must contain exactly one row per variant; \
+             duplicate or stale rows mean enforcement order matters in ways \
+             the surface contract doesn't promise"
+        );
+    }
+
+    /// AC#6: `capability_name` returns the canonical label per variant.
+    /// Failure here means [`TaskMgrError::UnsupportedRunnerCapability`]'s
+    /// `capability_name` field carries the wrong string for operators.
+    #[test]
+    fn capability_name_returns_canonical_labels() {
+        assert_eq!(capability_name(RunnerCapability::Effort), "Effort");
+        assert_eq!(capability_name(RunnerCapability::StreamJson), "StreamJson");
+        assert_eq!(capability_name(RunnerCapability::Pty), "Pty");
+        assert_eq!(
+            capability_name(RunnerCapability::DisallowedTools),
+            "DisallowedTools"
+        );
+    }
+
+    /// AC#7 (Grok × use_pty: true) → Err(UnsupportedRunnerCapability {…}).
+    /// Asserts the specific error variant AND every static-string field so
+    /// a regression that flipped capability_name or field_name would fail
+    /// here, not just produce a vague Err.
+    #[test]
+    fn enforce_capabilities_grok_use_pty_rejected() {
+        let opts = RunnerOpts {
+            use_pty: true,
+            ..RunnerOpts::default()
+        };
+        let err = enforce_capabilities(&GrokRunner, RunnerKind::Grok, &opts)
+            .expect_err("Grok must refuse use_pty: true");
+        match err {
+            TaskMgrError::UnsupportedRunnerCapability {
+                runner_kind,
+                capability_name,
+                field_name,
+            } => {
+                assert_eq!(runner_kind, RunnerKind::Grok);
+                assert_eq!(capability_name, "Pty");
+                assert_eq!(field_name, "use_pty");
+            }
+            other => panic!("expected UnsupportedRunnerCapability, got {other:?}"),
+        }
+    }
+
+    /// AC#7 (Claude × use_pty: true) → Ok. Claude supports PTY; the field
+    /// being set is fine.
+    #[test]
+    fn enforce_capabilities_claude_use_pty_accepted() {
+        let opts = RunnerOpts {
+            use_pty: true,
+            ..RunnerOpts::default()
+        };
+        enforce_capabilities(&ClaudeRunner, RunnerKind::Claude, &opts)
+            .expect("Claude must accept use_pty: true");
+    }
+
+    /// AC#7 (both × RunnerOpts::default()) → Ok. No capability-driven
+    /// field is set, so no row in CHECKS fires.
+    #[test]
+    fn enforce_capabilities_default_opts_always_ok() {
+        enforce_capabilities(&ClaudeRunner, RunnerKind::Claude, &RunnerOpts::default())
+            .expect("Claude must accept RunnerOpts::default()");
+        enforce_capabilities(&GrokRunner, RunnerKind::Grok, &RunnerOpts::default())
+            .expect("Grok must accept RunnerOpts::default()");
+    }
+
+    /// AC#7 (Claude × stream_json: true) and (Grok × stream_json: true) → Ok.
+    /// Both runners declare `StreamJson` support.
+    #[test]
+    fn enforce_capabilities_stream_json_both_ok() {
+        let opts = RunnerOpts {
+            stream_json: true,
+            ..RunnerOpts::default()
+        };
+        enforce_capabilities(&ClaudeRunner, RunnerKind::Claude, &opts)
+            .expect("Claude must accept stream_json: true");
+        enforce_capabilities(&GrokRunner, RunnerKind::Grok, &opts)
+            .expect("Grok must accept stream_json: true");
+    }
+
+    /// AC#5 + AC#7: `Some("")` is treated as "no opinion" by the
+    /// `trim().is_empty()` predicate; both runners accept it regardless of
+    /// declared support.
+    #[test]
+    fn enforce_capabilities_effort_empty_value_is_no_opinion() {
+        let opts = RunnerOpts {
+            effort: Some(""),
+            ..RunnerOpts::default()
+        };
+        enforce_capabilities(&ClaudeRunner, RunnerKind::Claude, &opts)
+            .expect("empty effort must be treated as unset");
+        enforce_capabilities(&GrokRunner, RunnerKind::Grok, &opts)
+            .expect("empty effort must be treated as unset");
+    }
+
+    /// AC#5 + AC#7: whitespace-only effort is also "no opinion". Same
+    /// convention as [`push_optional_flag`] — a stray space from a config
+    /// file must not trip enforcement.
+    #[test]
+    fn enforce_capabilities_effort_whitespace_is_no_opinion() {
+        let opts = RunnerOpts {
+            effort: Some("  "),
+            ..RunnerOpts::default()
+        };
+        enforce_capabilities(&ClaudeRunner, RunnerKind::Claude, &opts)
+            .expect("whitespace-only effort must be treated as unset");
+        enforce_capabilities(&GrokRunner, RunnerKind::Grok, &opts)
+            .expect("whitespace-only effort must be treated as unset");
+    }
+
+    /// AC#5 + AC#7: same "no opinion" treatment for `disallowed_tools`
+    /// (the other Option<&str> field in the registry).
+    #[test]
+    fn enforce_capabilities_disallowed_tools_empty_is_no_opinion() {
+        let opts = RunnerOpts {
+            disallowed_tools: Some(""),
+            ..RunnerOpts::default()
+        };
+        enforce_capabilities(&ClaudeRunner, RunnerKind::Claude, &opts)
+            .expect("empty disallowed_tools must be treated as unset");
+        enforce_capabilities(&GrokRunner, RunnerKind::Grok, &opts)
+            .expect("empty disallowed_tools must be treated as unset");
+    }
+
+    /// AC#1: `dispatch` calls `enforce_capabilities` BEFORE the spawn
+    /// match. We assert this by setting `use_pty: true` on a Grok dispatch
+    /// with no `GROK_BINARY` configured — if enforcement ran AFTER spawn we
+    /// would see an `IoErrorWithContext` from the missing binary; instead we
+    /// must see `UnsupportedRunnerCapability` because the check fires first.
+    ///
+    /// No mutex needed: the Err path returns before any env read.
+    #[test]
+    fn dispatch_grok_use_pty_returns_unsupported_capability_before_spawn() {
+        let perm = scoped_coding();
+        let err = dispatch(
+            RunnerKind::Grok,
+            "probe",
+            &perm,
+            RunnerOpts {
+                use_pty: true,
+                ..RunnerOpts::default()
+            },
+        )
+        .expect_err("dispatch must reject Grok + use_pty before spawning");
+        match err {
+            TaskMgrError::UnsupportedRunnerCapability {
+                runner_kind,
+                capability_name,
+                field_name,
+            } => {
+                assert_eq!(runner_kind, RunnerKind::Grok);
+                assert_eq!(capability_name, "Pty");
+                assert_eq!(field_name, "use_pty");
+            }
+            other => panic!(
+                "enforcement must run before spawn; got {other:?} \
+                 (an IoErrorWithContext here would mean dispatch reached \
+                 the spawn match before the capability check)"
+            ),
+        }
     }
 
     fn scoped_coding() -> PermissionMode {
@@ -1265,6 +1714,36 @@ mod tests {
             "expected piped prompt to round-trip into mock stdout, got {:?}",
             result.output,
         );
+    }
+
+    /// TEST-INIT-002 — cleanup_title_artifact: true is rejected at dispatch for
+    /// Grok with `UnsupportedRunnerCapability`. Grok has no ai-title-jsonl leak;
+    /// `TitleArtifactCleanup` is `false` on `GrokRunner`. No subprocess should
+    /// be launched — dispatch must return Err before spawning.
+    #[test]
+    fn dispatch_grok_rejects_cleanup_title_artifact() {
+        let perm = scoped_coding();
+        let result = dispatch(
+            RunnerKind::Grok,
+            "cleanup-probe",
+            &perm,
+            RunnerOpts {
+                cleanup_title_artifact: true,
+                ..RunnerOpts::default()
+            },
+        );
+        match result {
+            Err(TaskMgrError::UnsupportedRunnerCapability {
+                runner_kind,
+                capability_name,
+                field_name,
+            }) => {
+                assert_eq!(runner_kind, RunnerKind::Grok);
+                assert_eq!(capability_name, "TitleArtifactCleanup");
+                assert_eq!(field_name, "cleanup_title_artifact");
+            }
+            other => panic!("expected UnsupportedRunnerCapability, got {other:?}"),
+        }
     }
 
     /// TEST-INIT-002 — GrokRunner discovers session id from pre/post dir diff.
@@ -1495,6 +1974,31 @@ mod tests {
         );
 
         unsafe { std::env::remove_var("GROK_BINARY") };
+    }
+
+    /// Test double for capability-gate unit tests.
+    ///
+    /// Callers set `supports_fn` to any closure-compatible `fn(RunnerCapability) -> bool`
+    /// so each test can construct an arbitrary capability matrix without touching
+    /// a production runner. `spawn` is unreachable in capability-gate tests;
+    /// it exists only to satisfy `LlmRunner`.
+    struct CapabilityFakeRunner {
+        pub supports_fn: fn(RunnerCapability) -> bool,
+    }
+
+    impl LlmRunner for CapabilityFakeRunner {
+        fn supports(&self, cap: RunnerCapability) -> bool {
+            (self.supports_fn)(cap)
+        }
+
+        fn spawn(
+            &self,
+            _prompt: &str,
+            _permission_mode: &PermissionMode,
+            _opts: RunnerOpts<'_>,
+        ) -> TaskMgrResult<RunnerResult> {
+            unreachable!("CapabilityFakeRunner exists only for capability-gate tests; spawn is never called")
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -2335,6 +2839,95 @@ mod tests {
             grok.is_ok(),
             "GrokRunner::cleanup_session must accept an absolute resolved cwd, got {grok:?}",
         );
+    }
+
+    /// AC: a FakeRunner that supports no capabilities refuses every
+    /// capability-driven RunnerOpts field (Pty, StreamJson, Effort,
+    /// DisallowedTools) via enforce_capabilities.
+    #[test]
+    fn fake_runner_all_false_refuses_every_capability_driven_field() {
+        let runner = CapabilityFakeRunner {
+            supports_fn: |_| false,
+        };
+        let cases: &[(&str, RunnerOpts<'_>)] = &[
+            (
+                "use_pty",
+                RunnerOpts {
+                    use_pty: true,
+                    ..RunnerOpts::default()
+                },
+            ),
+            (
+                "stream_json",
+                RunnerOpts {
+                    stream_json: true,
+                    ..RunnerOpts::default()
+                },
+            ),
+            (
+                "effort",
+                RunnerOpts {
+                    effort: Some("high"),
+                    ..RunnerOpts::default()
+                },
+            ),
+            (
+                "disallowed_tools",
+                RunnerOpts {
+                    disallowed_tools: Some("BashTool"),
+                    ..RunnerOpts::default()
+                },
+            ),
+        ];
+        for (field, opts) in cases {
+            let err = enforce_capabilities(&runner, RunnerKind::Claude, opts)
+                .expect_err(&format!("expected Err for field {field}"));
+            assert!(
+                matches!(err, TaskMgrError::UnsupportedRunnerCapability { .. }),
+                "expected UnsupportedRunnerCapability for field {field}, got {err:?}"
+            );
+        }
+    }
+
+    /// AC: a FakeRunner that supports only StreamJson accepts stream_json: true
+    /// but refuses use_pty: true, demonstrating per-capability control.
+    #[test]
+    fn fake_runner_stream_json_only_accepts_stream_json_refuses_pty() {
+        let runner = CapabilityFakeRunner {
+            supports_fn: |cap| matches!(cap, RunnerCapability::StreamJson),
+        };
+
+        enforce_capabilities(
+            &runner,
+            RunnerKind::Claude,
+            &RunnerOpts {
+                stream_json: true,
+                ..RunnerOpts::default()
+            },
+        )
+        .expect("StreamJson-capable runner must accept stream_json: true");
+
+        let err = enforce_capabilities(
+            &runner,
+            RunnerKind::Claude,
+            &RunnerOpts {
+                use_pty: true,
+                ..RunnerOpts::default()
+            },
+        )
+        .expect_err("StreamJson-only runner must refuse use_pty: true");
+        match err {
+            TaskMgrError::UnsupportedRunnerCapability {
+                runner_kind,
+                capability_name,
+                field_name,
+            } => {
+                assert_eq!(runner_kind, RunnerKind::Claude);
+                assert_eq!(capability_name, "Pty");
+                assert_eq!(field_name, "use_pty");
+            }
+            other => panic!("expected UnsupportedRunnerCapability, got {other:?}"),
+        }
     }
 
     /// AC: existing spawn_claude_echo (claude.rs:1221) compiles and behaves

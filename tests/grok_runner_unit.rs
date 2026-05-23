@@ -14,7 +14,14 @@
 //!    stdout captured to `RunnerResult::output`, stderr inherited. Mirrors
 //!    `ClaudeRunner` for the parts that don't differ between CLIs.
 //!
-//! 2. **`PermissionMode::Dangerous`** emits a single permission-bypass flag.
+//! 2. **`cleanup_title_artifact: true` is rejected**: the option exists on
+//!    `RunnerOpts` for Claude's ai-title-jsonl workaround (Claude 2.1.110).
+//!    Grok has no equivalent artifact; `TitleArtifactCleanup` is `false` on
+//!    `GrokRunner`. Setting `cleanup_title_artifact: true` returns
+//!    `TaskMgrError::UnsupportedRunnerCapability` before any subprocess
+//!    launches.
+//!
+//! 3. **`PermissionMode::Dangerous`** emits a single permission-bypass flag.
 //!    The choice between `--permission-mode bypassPermissions` and
 //!    `--always-approve` is FEAT-003's call; this scaffold pins the test
 //!    against `--permission-mode bypassPermissions` (the Claude-side
@@ -44,6 +51,7 @@ use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::sync::Mutex;
 
+use task_mgr::error::TaskMgrError;
 use task_mgr::loop_engine::config::{CODING_ALLOWED_TOOLS, PermissionMode};
 use task_mgr::loop_engine::runner::{RunnerKind, RunnerOpts, dispatch};
 
@@ -159,6 +167,38 @@ fn grok_runner_returns_echoed_stdout_via_mock_binary() {
         "expected piped prompt to round-trip into mock stdout, got {:?}",
         r.output,
     );
+}
+
+// ── AC 10: cleanup_title_artifact: true is rejected at dispatch ───────────────
+
+/// AC 10: `cleanup_title_artifact: true` must be rejected by `dispatch` with
+/// `UnsupportedRunnerCapability` for `RunnerKind::Grok`. Grok has no
+/// ai-title-jsonl leak; `TitleArtifactCleanup` is `false` on `GrokRunner`.
+/// No subprocess must be launched — the error fires before the spawn match.
+#[test]
+fn grok_runner_rejects_cleanup_title_artifact() {
+    let perm = scoped_coding();
+    let result = dispatch(
+        RunnerKind::Grok,
+        "cleanup-probe",
+        &perm,
+        RunnerOpts {
+            cleanup_title_artifact: true,
+            ..RunnerOpts::default()
+        },
+    );
+    match result {
+        Err(TaskMgrError::UnsupportedRunnerCapability {
+            runner_kind,
+            capability_name,
+            field_name,
+        }) => {
+            assert_eq!(runner_kind, RunnerKind::Grok);
+            assert_eq!(capability_name, "TitleArtifactCleanup");
+            assert_eq!(field_name, "cleanup_title_artifact");
+        }
+        other => panic!("expected UnsupportedRunnerCapability, got {other:?}"),
+    }
 }
 
 // ── AC 11: PermissionMode::Dangerous emits the documented bypass flag ─────────

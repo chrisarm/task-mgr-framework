@@ -353,6 +353,7 @@ pub fn resolve_effective_runner(
     ctx.runner_overrides
         .get(task_id)
         .copied()
+        // kind-correct: identity translation — maps Provider enum to RunnerKind, two representations of the same provider concept
         .unwrap_or_else(|| match model::provider_for_model(effective_model) {
             model::Provider::Grok => RunnerKind::Grok,
             model::Provider::Claude => RunnerKind::Claude,
@@ -839,7 +840,7 @@ fn slot_failure_result(
         section_sizes: Vec::new(),
         dropped_sections: Vec::new(),
         task_difficulty: None,
-        effective_runner: RunnerKind::Claude,
+        effective_runner: RunnerKind::Claude, // kind-correct: sentinel default; main-thread enrichment overwrites with resolved provider before slot spawn
     }
 }
 
@@ -1341,7 +1342,7 @@ fn build_slot_contexts(
                 // thread spawns. Test fixtures that call `build_slot_contexts`
                 // directly (without the enrichment step) inherit Claude —
                 // the default-empty regression behavior.
-                effective_runner: RunnerKind::Claude,
+                effective_runner: RunnerKind::Claude, // kind-correct: sentinel default; same pattern as SlotPromptBundle — provider identity, not capability
             }
         })
         .collect()
@@ -4959,6 +4960,7 @@ pub(crate) fn apply_pending_promotion(ctx: &mut IterationContext, p: &PendingPro
         .entry(p.task_id.clone())
         .or_insert_with(|| p.pre_promotion_model.clone());
     let already_promoted = ctx.runner_overrides.contains_key(&p.task_id);
+    // kind-correct: writes the promoted provider identity into the override map — the VALUE is the provider, not a capability flag
     ctx.runner_overrides
         .insert(p.task_id.clone(), RunnerKind::Grok);
     ctx.model_overrides
@@ -5034,6 +5036,7 @@ pub(crate) fn escalate_task_model_if_needed_inner(
         return Ok((escalated, None));
     }
     let effective_runner = resolve_effective_runner(ctx, task_id, current_model.as_deref());
+    // kind-correct: fires from Claude only because Grok is the fallback target — provider identity, not capability
     if effective_runner != RunnerKind::Claude {
         return Ok((escalated, None));
     }

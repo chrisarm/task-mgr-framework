@@ -417,6 +417,7 @@ pub fn handle_prompt_too_long(
         RecoveryAction::To1mModel {
             new_model: m1m.to_string(),
         }
+    // kind-correct: rung 4 gate — only Claude-identity tasks are eligible for fallback promotion; a task already on Grok skips to rung 5 (Blocked)
     } else if effective_runner == RunnerKind::Claude
         && let Some(cfg) = project_config.fallback_runner.as_ref()
         && cfg.enabled
@@ -523,6 +524,7 @@ pub fn handle_prompt_too_long(
         dropped_sections: prompt_result.dropped_sections.clone(),
         recovery: action.clone(),
         dump_path: dump_path.to_string_lossy().into_owned(),
+        // kind-correct: stringifies provider identity for JSONL diagnostic output — pure serialization
         runner: Some(
             match effective_runner {
                 RunnerKind::Claude => "claude",
