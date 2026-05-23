@@ -2399,7 +2399,10 @@ fn recover_progress_only_slot(
         Err(e) => return ProgressRecovery::Failed(format!("git add spawn: {}", e)),
     }
 
-    let commit_msg = format!("chore(loop): commit slot {} progress before union sync", slot);
+    let commit_msg = format!(
+        "chore(loop): commit slot {} progress before union sync",
+        slot
+    );
     let commit = Command::new("git")
         .args(["commit", "--no-verify", "-m", &commit_msg])
         .current_dir(slot_path)
@@ -4646,7 +4649,11 @@ detached
             "slot's uncommitted progress lost: {}",
             prog
         );
-        assert!(!prog.contains("<<<<<<<"), "conflict markers leaked: {}", prog);
+        assert!(
+            !prog.contains("<<<<<<<"),
+            "conflict markers leaked: {}",
+            prog
+        );
 
         // Working tree is clean after recovery.
         let status = run_git_ok(&paths[1], &["status", "--porcelain"]);

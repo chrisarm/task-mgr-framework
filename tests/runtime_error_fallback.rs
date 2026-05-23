@@ -590,17 +590,18 @@ fn promotion_fires_at_opus_1m_and_threshold() {
 /// a test failure rather than as a rare correctness regression.
 #[test]
 fn handle_task_failure_defers_promotion_ctx_writes_until_after_commit() {
-    let source = std::fs::read_to_string("src/loop_engine/engine.rs")
-        .expect("could not read src/loop_engine/engine.rs from tests/ cwd");
+    // Post-FEAT-002 carve: `handle_task_failure` lives in `recovery.rs`.
+    let source = std::fs::read_to_string("src/loop_engine/recovery.rs")
+        .expect("could not read src/loop_engine/recovery.rs from tests/ cwd");
 
     let start = source
         .find("pub fn handle_task_failure(")
-        .expect("expected `pub fn handle_task_failure(` to be defined in engine.rs");
+        .expect("expected `pub fn handle_task_failure(` to be defined in recovery.rs");
     // The next top-level definition after handle_task_failure marks the
     // function body end. Use a search past the opening `{` to find the next
     // `\nfn ` or `\npub fn ` or `\npub(crate) fn ` declaration.
     let after_open = &source[start..];
-    let body_end_rel = ["\nfn ", "\npub fn ", "\npub(crate) fn "]
+    let body_end_rel = ["\nfn ", "\npub fn ", "\npub(crate) fn ", "\npub(super) fn "]
         .iter()
         .filter_map(|marker| {
             after_open[marker.len()..]
