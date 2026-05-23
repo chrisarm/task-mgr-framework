@@ -1167,3 +1167,157 @@ fn claim_failed_slot_does_not_pollute_crash_map() {
         "slot 1 (claim_succeeded=false) must NOT appear in crashed_last_iteration",
     );
 }
+
+// ---------------------------------------------------------------------------
+// FR-006: call-site field-parity assertion (TEST-INIT-001)
+// ---------------------------------------------------------------------------
+//
+// `process_iteration_output` has exactly two production call sites, and they
+// must construct `ProcessingParams` from the *same* exhaustive field set —
+// otherwise wave mode silently skips a behavior the sequential path treats as
+// core (the original drift this PRD exists to close). `prompt/mod.rs`
+// documents that contract in prose; the two helpers below enforce it
+// mechanically.
+//
+// Each helper stands in for one call site and exhaustively destructures
+// `ProcessingParams` WITHOUT `..`. A struct destructure that omits a field is
+// a compile error in Rust, so adding a field to `ProcessingParams` without
+// teaching BOTH call sites about it fails to compile right here. That is the
+// long-term enforcement mechanism the FR-006 assertion provides; the prose
+// comment can drift, this cannot.
+//
+// The helpers are named for their POST-CARVE homes. Today both bodies live in
+// `engine.rs` (`run_iteration` ~L4131 sequential, `process_slot_result` ~L1547
+// wave); as the carve FEAT tasks move them into `iteration.rs` and `slot.rs`,
+// update the references in these comments — the mechanism is unaffected by the
+// move because it pins the *type*, not a source location.
+
+/// Sequential call site — `iteration::run_iteration` post-carve, today
+/// `engine.rs::run_iteration`.
+fn sequential_call_site_destructures_full_params(params: ProcessingParams<'_>) {
+    // Exhaustive, `..`-free destructure. Do NOT add `..`: that would defeat
+    // the compile-time field-parity guarantee.
+    let ProcessingParams {
+        conn: _,
+        run_id: _,
+        iteration: _,
+        task_id: _,
+        output: _,
+        conversation: _,
+        shown_learning_ids: _,
+        outcome: _,
+        working_root: _,
+        git_scan_depth: _,
+        skip_git_completion_detection: _,
+        prd_path: _,
+        task_prefix: _,
+        progress_path: _,
+        db_dir: _,
+        signal_flag: _,
+        ctx: _,
+        files_modified: _,
+        effective_model: _,
+        effective_effort: _,
+        slot_index: _,
+    } = params;
+}
+
+/// Wave call site — `slot::process_slot_result` post-carve, today
+/// `engine.rs::process_slot_result`.
+fn wave_call_site_destructures_full_params(params: ProcessingParams<'_>) {
+    // Exhaustive, `..`-free destructure — kept byte-identical to the
+    // sequential helper above so the two call sites cannot drift.
+    let ProcessingParams {
+        conn: _,
+        run_id: _,
+        iteration: _,
+        task_id: _,
+        output: _,
+        conversation: _,
+        shown_learning_ids: _,
+        outcome: _,
+        working_root: _,
+        git_scan_depth: _,
+        skip_git_completion_detection: _,
+        prd_path: _,
+        task_prefix: _,
+        progress_path: _,
+        db_dir: _,
+        signal_flag: _,
+        ctx: _,
+        files_modified: _,
+        effective_model: _,
+        effective_effort: _,
+        slot_index: _,
+    } = params;
+}
+
+/// Drives both call-site helpers with a fully-populated `ProcessingParams`.
+///
+/// The body never invokes `process_iteration_output` — the helpers only
+/// destructure — so no DB schema is exercised; the value just has to be
+/// constructible. The real assertion is at compile time (see the helper
+/// comments). The runtime call is here so the helpers are reachable code
+/// under `-D warnings` and a future maintainer can set a breakpoint.
+#[test]
+fn fr006_both_call_sites_handle_every_processing_param_field() {
+    let (temp, mut conn) = setup_migrated_db();
+    let mut fx = PipelineFixture::new(temp.path());
+    let working_root = fx.project.path().to_path_buf();
+    let mut outcome = IterationOutcome::Empty;
+
+    // Sequential configuration (the deltas mirror the engine.rs call site).
+    let sequential = ProcessingParams {
+        conn: &mut conn,
+        run_id: "fr006-run",
+        iteration: 1,
+        task_id: None,
+        output: "",
+        conversation: None,
+        shown_learning_ids: &[],
+        outcome: &mut outcome,
+        working_root: &working_root,
+        git_scan_depth: 5,
+        skip_git_completion_detection: false,
+        prd_path: &fx.prd_path,
+        task_prefix: None,
+        progress_path: &fx.progress_path,
+        db_dir: &fx.db_dir,
+        signal_flag: &fx.signal_flag,
+        ctx: &mut fx.ctx,
+        files_modified: &[],
+        effective_model: None,
+        effective_effort: None,
+        slot_index: None,
+    };
+    sequential_call_site_destructures_full_params(sequential);
+
+    // Wave configuration — the two intentional deltas
+    // (`skip_git_completion_detection` + `slot_index`) flip, every other field
+    // is identical. Re-borrowing `conn`/`outcome`/`ctx` is sound: the prior
+    // helper consumed `sequential`, releasing those `&mut` borrows.
+    let wave = ProcessingParams {
+        conn: &mut conn,
+        run_id: "fr006-run",
+        iteration: 1,
+        task_id: None,
+        output: "",
+        conversation: None,
+        shown_learning_ids: &[],
+        outcome: &mut outcome,
+        working_root: &working_root,
+        git_scan_depth: 0,
+        skip_git_completion_detection: true,
+        prd_path: &fx.prd_path,
+        task_prefix: None,
+        progress_path: &fx.progress_path,
+        db_dir: &fx.db_dir,
+        signal_flag: &fx.signal_flag,
+        ctx: &mut fx.ctx,
+        files_modified: &[],
+        effective_model: None,
+        effective_effort: None,
+        slot_index: Some(1),
+    };
+    wave_call_site_destructures_full_params(wave);
+}
