@@ -1,0 +1,987 @@
+{
+  "branchName": "feat/runner-trait-hygiene",
+  "description": "Phase 1 of the 5-phase LlmRunner hygiene roadmap. Adds cleanup_session as a trait method with no-op default, implements it on ClaudeRunner (delete ~/.claude/projects/<encoded>/<uuid>.jsonl) and GrokRunner (remove_dir_all ~/.grok/sessions/<encoded>/<uuid>/, never touch prompt_history.jsonl). Promotes cleanup_title_artifact_sync to runner.rs as cleanup_claude_session_artifact (returns Result). Adds session_id: Option<Uuid> to RunnerResult. Wires dispatch to call cleanup_session unconditionally post-spawn for every iteration, with one-banner-per-process rate-limit on errors. Removes the opt-in cleanup_title_artifact: bool field from RunnerOpts and all 11 call sites. Adds FakeRunner test seam + tests/runner_cleanup.rs integration tests. Places WORKAROUND() comment markers so future upstream-fix removal is a one-grep operation.",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "Rust: No warnings in `cargo check` output",
+      "Rust: No warnings in `cargo clippy -- -D warnings` output",
+      "Rust: Scoped tests for touched files pass with `cargo test`",
+      "Rust: `cargo fmt --check` passes",
+      "No new .unwrap() or .expect() in production code paths (existing #[cfg(test)] allow continues)",
+      "All eprintln! warnings include enough context to identify the failed operation (provider, path, error kind)",
+      "No detached threads, no tokio::spawn, no async cleanup — sync only",
+      "Comments explain WHY (non-obvious constraint), never narrate WHAT — the WORKAROUND(...) markers carry the explanation"
+    ],
+    "description": "These criteria apply to ALL implementation tasks"
+  },
+  "mergeStrategy": "Merge to main after MILESTONE-FINAL passes. Squash optional.",
+  "model": "claude-sonnet-4-6",
+  "priorityPhilosophy": {
+    "description": "Hierarchy of what matters most when implementing tasks",
+    "hierarchy": [
+      "1. PLAN — Anticipate cleanup edge cases (NotFound silent, PermissionDenied banner, missing working_dir, parallel slots, mtime tiebreaker)",
+      "2. PHASE 2 FOUNDATION — cleanup_session is the first capability-aware trait method; the FakeRunner seam will be reused by Phases 2-5 of the hygiene roadmap; explicit-call shape soaks before Phase 5 RAII layers on top",
+      "3. FUNCTIONING CODE — pragmatic, reliable, wired in per PRD",
+      "4. CORRECTNESS — Compiles, type-checks, scoped tests pass deterministically",
+      "5. CODE QUALITY — Clean code, qualityDimensions satisfied, no warnings",
+      "6. POLISH — Docs, formatting, CLAUDE.md cleanup_session subsection"
+    ],
+    "principles": [
+      "Cleanup is a trait method, not an opt-in flag — removing the degree of freedom is the fix",
+      "Cleanup targets only the exact (session_id, cwd) tuple — never enumerate-and-sweep",
+      "NotFound on artifact path is silent success — future-proof against upstream fix",
+      "Grok's per-cwd prompt_history.jsonl is NEVER deleted — accumulates by design",
+      "Cleanup runs unconditionally post-spawn — even on spawn failure, because the artifact may still have been written",
+      "CLEANUP_WARN_ONCE rate-limits to one banner per process — operator stderr stays readable",
+      "WORKAROUND(<provider>-<short-issue>) markers must exist exactly where each cleanup lives so future upstream-fix removal is a one-grep operation",
+      "Sync cleanup only — no detached threads, no tokio::spawn, no async cleanup (detached threads don't survive parent CLI exit per learning [2674])",
+      "Boundary with coherence-refactoring effort: cleanup_session hook stays single-purpose; engine field-removal leaves clean seams; runner.rs is a peer of future TaskLifecycle, not a parent"
+    ]
+  },
+  "prohibitedOutcomes": [
+    "Tests that only assert 'no crash' or check type without verifying content",
+    "Tests that hand-build HashMaps as RunnerOpts mock state — use the real RunnerOpts struct so wrong field names fail at compile time",
+    "Enumerate-and-sweep cleanup (read_dir + glob) — must delete ONLY the (session_id, cwd) tuple this spawn created, never the shared dir",
+    "Deleting Grok's per-cwd ~/.grok/sessions/<encoded>/prompt_history.jsonl — that file accumulates across sessions by design",
+    "Adding status, lifecycle, reconciliation, or <task-status> logic inside the dispatch post-spawn cleanup hook — task lifecycle belongs to the coherence-refactoring effort; this PRD's hook stays single-purpose",
+    "Tidying adjacent code in engine.rs at the field-removal sites (lines 656, 2587) — the coherence Phase 1 carve owns those seams; this PRD only deletes the cleanup_title_artifact: true line",
+    "Reimplementing dash-encoding for the Claude artifact path — reuse encoded_cwd_dir at claude.rs:51",
+    ".unwrap() in any cleanup path — use match or ? on Result; errors propagate to dispatch which handles the banner",
+    "Detached threads / tokio::spawn / async cleanup — sync only; detached threads don't survive parent CLI exit (learning [2674])",
+    "Banner spam — every cleanup error must be gated by CLEANUP_WARN_ONCE (single AtomicBool::swap with Relaxed ordering)",
+    "Generating the taskPrefix manually in the JSON — task-mgr init auto-generates it; setting it by hand can cause prefix collisions",
+    "Refactoring other RunnerOpts fields (db_dir, signal_flag, timeout) under cover of this PRD — they encode genuine per-caller policy and are out of scope"
+  ],
+  "project": "task-mgr",
+  "requires": [],
+  "reviewGuidelines": {
+    "priorityGuidelines": {
+      "critical": "1-10: Blocks further work, fix immediately",
+      "high": "11-20: Fix before phase completion",
+      "low": "51-99: Defer to hardening phase",
+      "medium": "21-50: Fix in current phase if time permits"
+    }
+  },
+  "taskPrefix": "8cc50ff5",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "grep -rn 'cleanup_title_artifact' src/ tests/ produces a complete enumeration that matches PRD §6 line numbers (or notes the deltas)",
+        "Verify src/loop_engine/runner.rs:166 still declares pub cleanup_title_artifact: bool, runner.rs:222 declares the LlmRunner trait, runner.rs:102 declares RunnerResult, runner.rs:877 declares dispatch",
+        "Verify src/loop_engine/runner.rs:327 contains cleanup_title_artifact.then(|| { Uuid::new_v4() }) gate (per PRD §6: NOT in claude.rs)",
+        "Verify src/loop_engine/runner.rs:422 contains the inline cleanup_title_artifact_sync(uuid, working_dir) call (per PRD §6: NOT in claude.rs)",
+        "Verify src/loop_engine/claude.rs:51 declares encoded_cwd_dir (to be reused for Claude artifact path; do NOT re-implement)",
+        "Verify src/loop_engine/claude.rs:739 declares static CLEANUP_WARN_ONCE: AtomicBool with file-private visibility",
+        "Verify src/loop_engine/claude.rs:756 declares pub(crate) fn cleanup_title_artifact_sync (the helper to promote)",
+        "Confirm urlencoding crate availability for Grok percent-encoding — if not in Cargo.toml, flag that FEAT-002 needs to add it",
+        "Write Consumer Impact Table to tasks/progress-<prefix>.txt with one row per cited site (file:line, usage, impact, mitigation) — flag any deltas vs PRD §6"
+      ],
+      "dependsOn": [],
+      "description": "PRD §6 'Consumers of Changed Behavior' lists 17 specific file:line sites that will be modified by Phase 1 (8 production cleanup_title_artifact:true call sites, 3 test sites in grok_runner_unit.rs, 6 test sites in claude.rs lines 2948-3138, the inline UUID gate at runner.rs:327, and the inline cleanup call at runner.rs:422). This task re-greps current main and confirms (or flags drift in) every line citation, then writes a Consumer Impact Table to the progress file. No code changes.",
+      "estimatedEffort": "low",
+      "id": "ANALYSIS-001",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "Read actual code; never infer line numbers from PRD alone. The PRD was written 2026-05-19 and main may have drifted by a line or two due to merges. The architect's review already populated the Consumer Impact Table in PRD §6 — this task verifies it's still accurate, doesn't reinvent it.\n\nLearning [810]: grep for struct field locations across all construction sites — verify completeness across both src/ and tests/.\nLearning [1581]: adding a new spawn_claude param requires updating many mechanical sites — this is the inverse (removal); same discipline applies.",
+      "passes": true,
+      "priority": 0,
+      "qualityDimensions": [
+        "Read every cited file:line in the PRD §6 table — never infer from variable names",
+        "Output is a Consumer Impact Table in the progress file with concrete file:line citations and impact (OK / BREAKS / NEEDS_REVIEW)",
+        "Flag any drift between PRD line numbers and current main — the implementing FEATs will need updated coordinates"
+      ],
+      "requiresHuman": false,
+      "taskType": "analysis",
+      "title": "Verify Consumer Impact Table matches current source state",
+      "touchesFiles": [
+        "src/loop_engine/runner.rs",
+        "src/loop_engine/claude.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/prd_reconcile.rs",
+        "src/commands/curate/enrich.rs",
+        "src/commands/curate/mod.rs",
+        "src/loop_engine/progress.rs",
+        "src/loop_engine/merge_resolver.rs",
+        "src/learnings/ingestion/mod.rs",
+        "tests/grok_runner_unit.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Test: default LlmRunner::cleanup_session impl returns Ok(()) for a stub runner that does NOT override the method (uses a #[cfg(test)] FakeNoOpRunner)",
+        "Test: grok_encoded_session_dir(Path::new('/home/user/repo'), Path::new('/home/user')) returns <home>/.grok/sessions/%2Fhome%2Fuser%2Frepo/",
+        "Test: grok_encoded_session_dir trailing-slash input normalizes the same as no-slash input",
+        "Test: cleanup_claude_session_artifact returns Ok(()) when the target file exists and is removed",
+        "Test: cleanup_claude_session_artifact returns Ok(()) when the target file does NOT exist (NotFound is silent success)",
+        "Test: cleanup_claude_session_artifact returns Err(TaskMgrError::IoError-like variant) on PermissionDenied (use a read-only parent dir)",
+        "Test: cleanup_claude_session_artifact only touches the deterministic UUID-named jsonl; bystander jsonl files in the same encoded_cwd_dir are preserved",
+        "Test fixtures derive paths from real Path / PathBuf — never invented string-typed maps; structural assertion: PathBuf::from(grok_encoded_session_dir(...)).is_absolute()",
+        "Test file compiles (may be #[ignore] until the impls land in FEAT tasks)"
+      ],
+      "dependsOn": [
+        "ANALYSIS-001"
+      ],
+      "description": "TDD foundation for FEAT-001/-002/-003. Adds unit tests in runner.rs::tests covering: (a) LlmRunner default cleanup_session no-op impl returns Ok(()); (b) grok_encoded_session_dir produces the observed on-disk path (%-percent-encoded cwd under <home>/.grok/sessions/); (c) cleanup_claude_session_artifact (promoted helper) returns Ok(()) on success and on NotFound, returns Err(IoError) on other IO errors.",
+      "edgeCases": [
+        "NotFound on artifact path (artifact never written) → Ok(()) silently, no banner emitted",
+        "PermissionDenied (read-only mount) → Err returned; banner is dispatch's responsibility, not the helper's",
+        "Worktree path with whitespace (e.g. /tmp/my dir) → encoding produces a deterministic path; helpers handle the literal"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "HOME env var unset",
+          "expectedBehavior": "Helper short-circuits returning Ok(()) (best-effort; matches existing cleanup_title_artifact_sync line 757-760 behavior pre-promotion)"
+        }
+      ],
+      "id": "TEST-INIT-001",
+      "invariants": [
+        "Promoted helper signature returns Result<(), TaskMgrError> — NEVER () (PRD FR-002)",
+        "grok_encoded_session_dir is a pure function: same input → same output, no FS reads"
+      ],
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "TDD: tests first. Tests live in src/loop_engine/runner.rs::tests module (alongside the existing CLAUDE_BINARY_MUTEX / GROK_BINARY_MUTEX pattern). For the PermissionDenied case, follow the existing pattern at src/loop_engine/claude.rs:3121-3138 (uses tempdir + fake $HOME).\n\nKnown-bad discriminator: a test that PASSES with a stub returning Ok(()) but FAILS the actual contract — assert the FILE WAS REMOVED post-call, not just that Ok was returned.\n\nLearning [2919]: integration test mirrors unit test shape for consistency. Learning [2939]: multi-step visibility widening — the promoted helper will be runner.rs-private; the tests must live in the same file to access it.",
+      "passes": true,
+      "priority": 1,
+      "qualityDimensions": [
+        "Use real Path / PathBuf — never hand-built string maps that match the wrong key format",
+        "Each test asserts a specific BEHAVIOR (file removed, Err returned, bystander preserved) — never just 'no panic'",
+        "Round-trip tests for encoding helpers verify against the actual on-disk separator (%2F for Grok, - for Claude)"
+      ],
+      "requiresHuman": false,
+      "taskType": "test",
+      "title": "Initial tests: cleanup_session trait default + grok_encoded_session_dir round-trip + promoted helper",
+      "touchesFiles": [
+        "src/loop_engine/runner.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Test: ClaudeRunner::cleanup_session(uuid, cwd) deletes <home>/.claude/projects/<dash-encoded-cwd>/<uuid>.jsonl when present",
+        "Test: ClaudeRunner::cleanup_session is idempotent — second call returns Ok(()) (NotFound silent)",
+        "Test: ClaudeRunner::cleanup_session preserves unrelated jsonl files in the same encoded_cwd_dir",
+        "Test: GrokRunner::cleanup_session(uuid, cwd) recursively deletes <home>/.grok/sessions/<percent-encoded-cwd>/<uuid>/ when present",
+        "Test: GrokRunner::cleanup_session preserves prompt_history.jsonl at <home>/.grok/sessions/<percent-encoded-cwd>/prompt_history.jsonl",
+        "Test: GrokRunner::cleanup_session preserves OTHER session uuid subdirectories under the same encoded_cwd_dir",
+        "Test: GrokRunner::cleanup_session is idempotent — second call returns Ok(()) (NotFound silent)",
+        "Test: both impls handle working_dir = current_dir fallback when caller passes the path-resolved cwd (sanity check against the dispatch wiring contract in FEAT-006)",
+        "Test fixtures use fake $HOME via tempdir (follows existing pattern at claude.rs:3121-3138)",
+        "Test file compiles (#[ignore] is acceptable until FEAT-005 + FEAT-006 land)"
+      ],
+      "dependsOn": [
+        "ANALYSIS-001"
+      ],
+      "description": "TDD foundation for FEAT-005 (Grok session_id capture) and FEAT-006 (the cleanup_session impls on both runners). Adds unit tests in runner.rs::tests asserting that each concrete impl correctly deletes its provider-specific artifact shape and preserves bystanders.",
+      "edgeCases": [
+        "Two concurrent Grok sessions in the same cwd (handled at FEAT-004 via mtime tiebreaker; the cleanup test only needs to verify the targeted uuid is deleted)",
+        "Empty encoded_cwd_dir (only the target file exists, nothing else) — cleanup succeeds, then the parent dir is empty but NOT removed (we never rmdir the encoded dir)",
+        "Worktree path with whitespace → encoding produces a deterministic path; remove_file / remove_dir_all handle the literal path"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Cleanup called with a uuid for a session that doesn't exist on disk",
+          "expectedBehavior": "Returns Ok(()) silently (NotFound is success)"
+        }
+      ],
+      "id": "TEST-INIT-002",
+      "invariants": [
+        "Both impls delete EXACTLY ONE filesystem entry (one file for Claude, one dir for Grok) — never enumerate-and-sweep",
+        "Grok's prompt_history.jsonl is NEVER deleted under any cleanup_session call"
+      ],
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "Tests live in src/loop_engine/runner.rs::tests. For prompt_history.jsonl preservation, create the file BEFORE calling cleanup_session, then assert it still exists after. For 'preserves other session uuid subdirectories', create two uuid-named subdirs, clean up only one, assert the other still exists.\n\nLearning [2847]: deterministic UUID for safe cleanup in shared dirs — the deletion targets the (session_id, cwd) tuple ONLY, never enumerate-and-sweep. Learning [1617]: do NOT reuse cleanup_ghost_sessions for ~/.claude/projects/ cleanup — different directory, different bug class. Learning [2674]: detached threads don't survive parent CLI exit; cleanup is sync only.",
+      "passes": true,
+      "priority": 2,
+      "qualityDimensions": [
+        "Bystander preservation is the most important property — the test that asserts 'unrelated jsonl files survive' is the only thing protecting interactive Claude sessions during long loop runs",
+        "Grok's prompt_history.jsonl preservation test is contractual — accidentally deleting it loses cross-session conversation history",
+        "Idempotency tests use the same session_id twice in a row; second call must succeed silently"
+      ],
+      "requiresHuman": false,
+      "taskType": "test",
+      "title": "Initial tests: ClaudeRunner::cleanup_session + GrokRunner::cleanup_session behaviors",
+      "touchesFiles": [
+        "src/loop_engine/runner.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Test: dispatch returns the spawn's RunnerResult unchanged when cleanup_session returns Ok(())",
+        "Test: dispatch returns the spawn's RunnerResult unchanged when cleanup_session returns Err — error is logged to stderr, not propagated",
+        "Test: a single dispatch call with cleanup Err emits exactly one '[cleanup warn] <provider>: <summary> (<path>)' banner line to stderr",
+        "Test: two dispatch calls with cleanup Err emit only ONE banner line total (CLEANUP_WARN_ONCE rate-limit — second call is silent)",
+        "Test: dispatch calls cleanup_session even when spawn returns Err (a spawn that errors may still have produced an artifact)",
+        "Test: dispatch skips cleanup_session when RunnerResult.session_id is None (e.g., GrokRunner couldn't capture a uuid from pre/post dir diff)",
+        "Test: cwd passed to cleanup_session matches opts.working_dir when Some, falls back to std::env::current_dir() when None",
+        "Test: provider tag in banner reads 'claude' or 'grok' (sourced from RunnerKind, not hardcoded)",
+        "Tests use stderr capture (e.g., gag crate or process_redirect) or a #[cfg(test)] hook on CLEANUP_WARN_ONCE so the rate-limit assertion is deterministic",
+        "Test file compiles (#[ignore] is acceptable until FEAT-006 + FEAT-008 land)"
+      ],
+      "dependsOn": [
+        "ANALYSIS-001"
+      ],
+      "description": "TDD foundation for FEAT-006 (dispatch post-spawn cleanup) and FEAT-008 (FakeRunner test seam). Outlines the integration test contract for tests/runner_cleanup.rs: dispatch calls cleanup_session unconditionally post-spawn, regardless of spawn success/failure; banner is gated by CLEANUP_WARN_ONCE; spawn result is never modified by cleanup outcome.",
+      "edgeCases": [
+        "RunnerResult.session_id = None (Grok spawn failed before any artifact was created) → dispatch skips cleanup_session for this iteration",
+        "spawn returns Err AND cleanup_session returns Err → dispatch returns the spawn Err; cleanup error is logged via banner",
+        "Two consecutive dispatch calls with cleanup Err → only the FIRST emits a banner (CLEANUP_WARN_ONCE)",
+        "RunnerOpts.working_dir = None → dispatch uses std::env::current_dir() as cwd for cleanup_session (mirroring claude.rs:1154 fallback)",
+        "cleanup_session returns Err with PermissionDenied (read-only ~/.claude or ~/.grok mount) → banner format includes provider tag, full path, and error kind (e.g. '[cleanup warn] claude: permission denied (/fake/home/.claude/projects/.../uuid.jsonl)') — assert via stderr capture that all three fields are present"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "cleanup_session returns Err with a banner-relevant path",
+          "expectedBehavior": "Banner emitted (once), then dispatch returns the spawn result unchanged"
+        }
+      ],
+      "id": "TEST-INIT-003",
+      "invariants": [
+        "cleanup_session is called once per spawn (success or failure), provided session_id.is_some()",
+        "CLEANUP_WARN_ONCE is a single AtomicBool gate; subsequent failures stay silent until process restart",
+        "dispatch's return value is determined solely by the spawn outcome — never by cleanup"
+      ],
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "Tests live in the NEW tests/runner_cleanup.rs file. Per learning [2919], mirror the shape of tests/runner_trait_dispatch.rs (existing integration test). Per learning [909] (general project convention), integration tests duplicate setup helpers rather than reaching into pub(crate) — keep test-only fixtures local.\n\nCLEANUP_WARN_ONCE deterministic reset: since static AtomicBool persists across tests in the same process, either (a) serialize banner-tests via a Mutex so the warn-once gate is observed cleanly, or (b) expose a #[cfg(test)] reset helper. Decide during implementation; (a) is simpler.\n\nCoherence-boundary check: dispatch's post-spawn hook stays single-purpose — these tests must NOT assert any status / lifecycle / reconciliation behavior alongside cleanup; if a future test wants to assert that, it belongs in the coherence-refactoring effort's test suite, not here.",
+      "passes": true,
+      "priority": 3,
+      "qualityDimensions": [
+        "Banner is rate-limited to one per process — test must assert exactly one stderr line across two failure calls",
+        "Spawn result is the source of truth — cleanup outcome NEVER modifies dispatch's return value",
+        "Cleanup runs unconditionally post-spawn — both success and failure spawn paths must call cleanup_session",
+        "session_id = None short-circuits cleanup — dispatch must NOT panic or call cleanup_session with a placeholder uuid"
+      ],
+      "requiresHuman": false,
+      "taskType": "test",
+      "title": "Initial tests: dispatch post-spawn cleanup wiring (FakeRunner integration shape)",
+      "touchesFiles": [
+        "tests/runner_cleanup.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "src/loop_engine/runner.rs declares fn cleanup_claude_session_artifact(session_id: Uuid, cwd: Option<&Path>) -> Result<(), TaskMgrError>",
+        "Return type is Result<(), TaskMgrError> — NotFound returns Ok(()), other IO errors return Err",
+        "The helper has a WORKAROUND(claude-code-2.1.110-session-stub) comment marker explaining WHY the cleanup exists",
+        "CLEANUP_WARN_ONCE is reachable from runner.rs (either pub(crate) at claude.rs:739 or moved into runner.rs)",
+        "Old fn cleanup_title_artifact_sync at claude.rs:756 is DELETED (no compatibility shim)",
+        "Inline caller at runner.rs:422 (was cleanup_title_artifact_sync(uuid, working_dir)) now reads cleanup_claude_session_artifact(uuid, working_dir).unwrap_or_else(|e| <log via CLEANUP_WARN_ONCE banner>) OR just cleanup_claude_session_artifact(uuid, working_dir).ok() — pick whichever matches what FEAT-006 expects from dispatch (preview: FEAT-006 will replace this entire site, so keep it minimal)",
+        "Test imports at claude.rs:3020, :3087, :3121, :3138 updated to reach the new runner.rs symbol (or moved alongside the helper into runner.rs::tests)",
+        "TEST-INIT-001 tests for the promoted helper pass",
+        "grep -rn 'cleanup_title_artifact_sync' src/ tests/ returns 0 hits (full rename, no shim)",
+        "cargo check + cargo clippy -- -D warnings + cargo fmt --check pass"
+      ],
+      "dependsOn": [
+        "TEST-INIT-001"
+      ],
+      "description": "Move src/loop_engine/claude.rs:756 (cleanup_title_artifact_sync, returns ()) to src/loop_engine/runner.rs as a module-private fn cleanup_claude_session_artifact(session_id: Uuid, cwd: Option<&Path>) -> Result<(), TaskMgrError>. Change the return type so dispatch can route errors to the banner. Lift CLEANUP_WARN_ONCE (claude.rs:739) to pub(crate) OR move it into runner.rs alongside the helper (implementer's call — both work; pick the cleaner diff). Update the sole inline caller at src/loop_engine/runner.rs:422 (rename + handle Result). Update the four claude.rs test imports (claude.rs:3020, :3087, :3121, :3138) to reach the new runner.rs location. Add WORKAROUND(claude-code-2.1.110-session-stub) comment marker on the new helper. Keep encoded_cwd_dir at claude.rs:51 unchanged — reuse via use crate::loop_engine::claude::encoded_cwd_dir.",
+      "estimatedEffort": "medium",
+      "id": "FEAT-001",
+      "modifiesBehavior": false,
+      "notes": "The helper's existing body (claude.rs:756-785) is correct — copy verbatim, then change return type. NotFound → Ok(()), other Err → Err(TaskMgrError::IoErrorWithContext { ... }). The banner-emission code at lines 773-783 moves into dispatch (FEAT-006), so this helper just returns Err and lets the caller decide.\n\nLearning [2939]: multi-step visibility widening for internal refactoring — promoting the helper changes visibility from file-private to runner.rs-private. Learning [2736]: rename refactor — update all sites and verify completeness via grep.\n\nDecision required: CLEANUP_WARN_ONCE location. Two options: (a) leave at claude.rs:739 with pub(crate); (b) move to runner.rs alongside the helper. Pick whichever produces a smaller, cleaner diff. The PRD §7 Open Question explicitly leaves this to the implementer.",
+      "passes": true,
+      "priority": 6,
+      "qualityDimensions": [
+        "Reuse encoded_cwd_dir at claude.rs:51 — do not re-implement dash-encoding",
+        "NotFound is silent success — preserved bit-for-bit from the existing helper at claude.rs:771",
+        "WORKAROUND(claude-code-2.1.110-session-stub) marker present so future upstream-fix removal is a one-grep operation",
+        "Tests at claude.rs:3020/3087/3121/3138 must continue to pass after the import-path update (per PRD FR-002 Validation)"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Promote cleanup_title_artifact_sync to runner.rs as cleanup_claude_session_artifact",
+      "touchesFiles": [
+        "src/loop_engine/runner.rs",
+        "src/loop_engine/claude.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "LlmRunner trait gains fn cleanup_session(&self, session_id: Uuid, cwd: &Path) -> Result<(), TaskMgrError> with a no-op default impl returning Ok(())",
+        "Rustdoc on cleanup_session documents: target identification (the (session_id, cwd) tuple), idempotency, NotFound-is-success, dispatch-side banner-on-error contract",
+        "pub(crate) fn grok_encoded_session_dir(cwd: &Path, home: &Path) -> PathBuf added to runner.rs",
+        "Encoding uses urlencoding::encode on the absolute cwd string (e.g., /home/user/repo → %2Fhome%2Fuser%2Frepo)",
+        "Cargo.toml lists urlencoding under [dependencies] (add it if not present)",
+        "TEST-INIT-001 round-trip tests for grok_encoded_session_dir pass",
+        "TEST-INIT-001 default cleanup_session test passes",
+        "cargo check + cargo clippy -- -D warnings + cargo fmt --check pass"
+      ],
+      "dependsOn": [
+        "TEST-INIT-001"
+      ],
+      "description": "Two small additive changes in src/loop_engine/runner.rs. (1) Extend the LlmRunner trait at line 222 with `fn cleanup_session(&self, session_id: Uuid, cwd: &Path) -> Result<(), TaskMgrError> { Ok(()) }` — no-op default impl so providers with no headless artifact (future cloud-API runners) need zero cleanup code. Add rustdoc documenting target identification, idempotency, NotFound-as-success, and the dispatch-side banner contract. (2) Add `pub(crate) fn grok_encoded_session_dir(cwd: &Path, home: &Path) -> PathBuf` returning `<home>/.grok/sessions/<urlencoding::encode(absolute cwd)>/`. Add urlencoding to Cargo.toml dependencies if not already present.",
+      "estimatedEffort": "low",
+      "id": "FEAT-002",
+      "modifiesBehavior": false,
+      "notes": "Trait method placement: insert immediately after fn spawn in the trait body. Document on the trait itself, not on each impl — the default impl carries the contract.\n\nurlencoding: PRD §6 'Dependencies' says 'urlencoding crate is already in use elsewhere; reuse it'. Verify via grep -rn 'urlencoding::' src/ — if absent, add to Cargo.toml [dependencies] with a recent version (1.x).\n\nLearning [2956]: RunnerKind enum dispatch keeps allocation-free; the no-op default impl does NOT introduce dynamic dispatch overhead — the trait method is resolved statically per impl.",
+      "passes": true,
+      "priority": 7,
+      "qualityDimensions": [
+        "No-op default impl returns Ok(()) — future cloud-API runners inherit this for free",
+        "grok_encoded_session_dir is a pure function: same input → same output, no FS reads, no allocations beyond the returned PathBuf",
+        "Rustdoc explains the contract (target identification, idempotency, NotFound semantics) — the contract is the only thing future Phase 2-5 impls will read"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Add cleanup_session to LlmRunner trait + grok_encoded_session_dir helper",
+      "touchesFiles": [
+        "src/loop_engine/runner.rs",
+        "Cargo.toml"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "RunnerResult struct at runner.rs:102 gains pub session_id: Option<Uuid> field",
+        "ClaudeRunner::spawn unconditionally generates Uuid::new_v4(), pushes --session-id <uuid> before -p, and populates RunnerResult.session_id with Some(uuid)",
+        "The cleanup_title_artifact.then(|| { ... }) gate at runner.rs:327 is REMOVED — UUID generation is unconditional",
+        "ClaudeRunner KEEPS the inline cleanup_claude_session_artifact(uuid, working_dir) call at runner.rs:422 for now (transitional; removed in FEAT-006 when dispatch wires it)",
+        "GrokRunner::spawn populates RunnerResult.session_id = None (placeholder until FEAT-004 implements pre/post-spawn dir diff capture)",
+        "Test alias _assert_claude_result_is_runner_result at runner.rs:907 updated for the new field",
+        "Any other RunnerResult { ... } field-by-name construction site flagged by cargo check is updated with session_id: None (or the appropriate Option<Uuid>)",
+        "Existing tests at claude.rs:2948 (test_cleanup_title_artifact_false_omits_session_id) will START FAILING because Claude now always injects --session-id — leave it failing; FEAT-007 deletes/retargets it",
+        "cargo check + cargo fmt --check pass; cargo test --lib loop_engine::runner passes the new behaviors",
+        "Behavior change documented in progress file: from now on, ClaudeRunner ALWAYS emits --session-id and ALWAYS creates an artifact; cleanup is still happening via the inline call until FEAT-006 moves it to dispatch"
+      ],
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/loop_engine/runner.rs",
+            "impact": "BREAKS",
+            "line": 425,
+            "mitigation": "Add session_id: Some(cleanup_session_id) (cleanup_session_id is the now-unconditional Uuid generated above)",
+            "usage": "ClaudeRunner constructs RunnerResult { ... } at end of spawn"
+          },
+          {
+            "file": "src/loop_engine/runner.rs",
+            "impact": "BREAKS",
+            "line": 599,
+            "mitigation": "Add session_id: None (capture lands in FEAT-004)",
+            "usage": "GrokRunner constructs RunnerResult { ... } at end of spawn"
+          },
+          {
+            "file": "src/loop_engine/runner.rs",
+            "impact": "BREAKS",
+            "line": 907,
+            "mitigation": "Update for the new field — compile-only assertion, low effort",
+            "usage": "_assert_claude_result_is_runner_result test alias"
+          },
+          {
+            "file": "src/loop_engine/claude.rs",
+            "impact": "BREAKS",
+            "line": 2948,
+            "mitigation": "Leave failing here; FEAT-007 deletes the test",
+            "usage": "test_cleanup_title_artifact_false_omits_session_id asserts NO --session-id is present when flag is false"
+          }
+        ],
+        "semanticDistinctions": [
+          {
+            "context": "Sites that previously set cleanup_title_artifact: true (5 sites)",
+            "currentBehavior": "Generated UUID, emitted --session-id, scheduled cleanup",
+            "requiredBehavior": "Keep: still generates UUID, emits --session-id, cleanup still fires via inline call until FEAT-006"
+          },
+          {
+            "context": "Sites that left cleanup_title_artifact at default false (3 sites: engine.rs:656/2587, prd_reconcile.rs:672)",
+            "currentBehavior": "No UUID, no --session-id, no cleanup; Claude wrote artifact with random uuid that was never cleaned",
+            "requiredBehavior": "Now generates UUID, emits --session-id, cleanup fires via inline call until FEAT-006 moves it to dispatch — this is the bug-class fix"
+          }
+        ]
+      },
+      "dependsOn": [
+        "FEAT-002"
+      ],
+      "description": "Extend pub struct RunnerResult at src/loop_engine/runner.rs:102 with a new field session_id: Option<Uuid>. Update both production construction sites: ClaudeRunner at runner.rs:425 populates Some(uuid) by removing the cleanup_title_artifact.then(||) gate at line 327 — generate Uuid::new_v4() unconditionally and inject --session-id (this is the new always-inject contract; the cleanup that follows it is wired in FEAT-006). GrokRunner at runner.rs:599 populates None for now (Grok capture lands in FEAT-004). Update the test alias _assert_claude_result_is_runner_result at runner.rs:907 for the new field. Search-and-fix every other field-by-name RunnerResult { ... } site (cargo check enforces).",
+      "estimatedEffort": "medium",
+      "id": "FEAT-003",
+      "modifiesBehavior": true,
+      "notes": "Behavior change disclosure: removing the .then(||) gate means Claude always emits --session-id. Previously, the 3 'broken' sites (engine.rs:656, engine.rs:2587, prd_reconcile.rs:672) did NOT emit it and thus didn't create the ai-title artifact in a predictable location. Now they always create one. The inline cleanup at runner.rs:422 still fires for everyone, so the net effect is: all 8 production sites now leak-then-cleanup deterministically (rather than 3 sites leaking with random session ids). This is the intermediate state until FEAT-006 wires unconditional cleanup through dispatch.\n\nLearning [2061]: comprehensive struct field refactoring with zero regressions — same approach here. Learning [795]: replace_all misses instances with different indentation — DO NOT use blind replace_all; let cargo check find every site, then edit each by hand. Learning [658]: adding a field to a struct with single construction site is low-risk — RunnerResult has two prod sites + one test alias, so still low-risk.\n\nWhy test 2948 is expected to fail here, not in FEAT-007: that test asserts 'cleanup_title_artifact=false must NOT add --session-id'. After this task, the assertion is wrong. FEAT-007 (the field-removal sweep) deletes this test cleanly. Acceptable transitional state.",
+      "passes": true,
+      "priority": 8,
+      "qualityDimensions": [
+        "Follow the existing pattern at runner.rs:425 + :599 for RunnerResult field-by-name construction",
+        "Use cargo check as the enforcement mechanism — every construction site fails to compile until updated",
+        "Inline cleanup call at runner.rs:422 is preserved for transitional safety (no leak window between FEAT-003 and FEAT-006)"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Add session_id: Option<Uuid> to RunnerResult; Claude generates UUID unconditionally",
+      "touchesFiles": [
+        "src/loop_engine/runner.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "GrokRunner::spawn captures a pre-spawn HashSet<String> of entry names in <home>/.grok/sessions/<encoded>/",
+        "Post-child-wait, GrokRunner::spawn captures a second HashSet<String> and computes the difference",
+        "Difference is filtered through Uuid::parse_str — non-uuid entries (e.g. 'prompt_history.jsonl') are skipped",
+        "Zero new uuid entries → RunnerResult.session_id = None",
+        "Exactly one new uuid entry → RunnerResult.session_id = Some(that uuid)",
+        "Multiple new uuid entries → pick the entry whose mtime is closest to spawn-end (last-write-wins); document this heuristic in rustdoc on GrokRunner::spawn",
+        "Missing <home>/.grok/sessions/<encoded>/ before spawn (first-ever Grok run for this cwd) → snapshot is empty; capture works the same",
+        "TEST-INIT-002 'GrokRunner discovers session id from pre/post dir diff' test passes",
+        "cargo check + cargo clippy -- -D warnings + cargo fmt --check pass; cargo test --lib loop_engine::runner passes"
+      ],
+      "dependsOn": [
+        "FEAT-003"
+      ],
+      "description": "Inside GrokRunner::spawn (src/loop_engine/runner.rs:471+), snapshot the entry names in <home>/.grok/sessions/<percent-encoded-cwd>/ as a HashSet<String> BEFORE invoking the child. After child wait, list again and compute the difference. The new entry is this iteration's session id; parse via Uuid::parse_str (skip non-uuid entries like prompt_history.jsonl). Populate RunnerResult.session_id = Some(uuid). Handle edge cases: zero new entries → None; multiple new entries → pick by mtime closest to spawn-end (last-write-wins).",
+      "edgeCases": [
+        "Grok session-id discovery finds zero new entries (spawn failed before grok wrote anything) → session_id = None",
+        "Grok session-id discovery finds two new entries (concurrent user opened interactive grok in same cwd) → pick by mtime closest to spawn-end",
+        "Missing <home>/.grok/sessions/<encoded>/ pre-spawn (first run for this cwd) → empty 'before' snapshot, normal capture",
+        "HOME env var unset → snapshot skipped, session_id = None (best-effort)"
+      ],
+      "estimatedEffort": "medium",
+      "id": "FEAT-004",
+      "modifiesBehavior": false,
+      "notes": "Implementation sketch (per PRD §6 Data Flow Contracts):\n```rust\nlet grok_dir = grok_encoded_session_dir(&cwd, &home);\nlet before: HashSet<String> = std::fs::read_dir(&grok_dir)\n    .map(|d| d.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).collect())\n    .unwrap_or_default();\n// ... spawn child, wait ...\nlet after: HashSet<String> = std::fs::read_dir(&grok_dir)\n    .map(|d| d.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).collect())\n    .unwrap_or_default();\nlet new_ids: Vec<Uuid> = after.difference(&before).filter_map(|s| Uuid::parse_str(s).ok()).collect();\nlet session_id = match new_ids.len() {\n    0 => None,\n    1 => Some(new_ids[0]),\n    _ => /* mtime tiebreaker */ pick_newest_by_mtime(&grok_dir, &new_ids),\n};\n```\n\nLearning [2891]: extract common subprocess scaffolding immediately when adding the second agent implementation — but for THIS PRD only, do not refactor; just add the capture inline in GrokRunner::spawn.\n\nWorking_dir resolution: GrokRunner already has access to working_dir via the destructure. Resolve to PathBuf via `let cwd = working_dir.map(PathBuf::from).or_else(|| std::env::current_dir().ok()).unwrap_or_default();` BEFORE the snapshot. HOME resolution: `let home = std::env::var('HOME').map(PathBuf::from).ok();` — if HOME is unset, skip the snapshot and return session_id = None (best-effort, matches Claude helper's HOME-absent behavior).\n\nPRD §7 Open Question: place the parallel-slot concurrency integration test in tests/runner_cleanup.rs (preferred per PRD).",
+      "passes": true,
+      "priority": 9,
+      "qualityDimensions": [
+        "Single read_dir per snapshot — milliseconds even with hundreds of historical sessions (perf requirement)",
+        "Filter via Uuid::parse_str — never assume all entries are uuid-named (prompt_history.jsonl exists)",
+        "mtime tiebreaker documented in GrokRunner::spawn rustdoc — concurrent interactive grok in the same cwd is a real hazard",
+        "best-effort: missing HOME or read_dir failure produces session_id = None, never panics"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Grok session_id capture via pre/post-spawn dir diff",
+      "touchesFiles": [
+        "src/loop_engine/runner.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "impl LlmRunner for ClaudeRunner gains fn cleanup_session(&self, session_id: Uuid, cwd: &Path) -> Result<(), TaskMgrError>",
+        "ClaudeRunner::cleanup_session body is one line: delegates to cleanup_claude_session_artifact(session_id, Some(cwd))",
+        "impl LlmRunner for GrokRunner gains fn cleanup_session(&self, session_id: Uuid, cwd: &Path) -> Result<(), TaskMgrError>",
+        "GrokRunner::cleanup_session computes <home>/.grok/sessions/<percent-encoded-cwd>/<uuid>/ via grok_encoded_session_dir and calls std::fs::remove_dir_all",
+        "GrokRunner::cleanup_session NotFound is silent success (Ok(())); other IO errors return Err(TaskMgrError::IoErrorWithContext { ... })",
+        "GrokRunner::cleanup_session NEVER deletes or modifies <home>/.grok/sessions/<encoded>/prompt_history.jsonl (target path is the uuid subdir only)",
+        "GrokRunner::cleanup_session has a WORKAROUND(grok-cli-no-persistence-off) comment marker explaining WHY the cleanup exists",
+        "grep -rn 'WORKAROUND(claude-code-2.1.110-session-stub)\\|WORKAROUND(grok-cli-no-persistence-off)' src/ returns exactly 2 hits (one per provider)",
+        "TEST-INIT-002 tests pass for both impls",
+        "cargo check + cargo clippy -- -D warnings + cargo fmt --check pass"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002"
+      ],
+      "description": "Add the concrete impls to the existing impl LlmRunner for ClaudeRunner (runner.rs:242+) and impl LlmRunner for GrokRunner (runner.rs:471+). ClaudeRunner::cleanup_session delegates to the promoted cleanup_claude_session_artifact helper (FEAT-001). GrokRunner::cleanup_session computes grok_encoded_session_dir(cwd, home).join(session_id.to_string()) and calls std::fs::remove_dir_all. NotFound on either is silent success; other IO errors return Err. NEVER touch prompt_history.jsonl. Add WORKAROUND(grok-cli-no-persistence-off) comment marker on the GrokRunner cleanup site.",
+      "estimatedEffort": "medium",
+      "id": "FEAT-005",
+      "modifiesBehavior": false,
+      "notes": "ClaudeRunner impl is one-line delegation — the helper does all the work. GrokRunner impl is ~10 lines: resolve HOME, build path, match remove_dir_all result.\n\nHOME resolution for Grok: pattern matches the existing cleanup_claude_session_artifact helper's HOME-absent behavior — if HOME is unset, return Ok(()) (best-effort skip, not Err). This is consistent with the 'best-effort cleanup must not fail the parent operation' principle (learning [1614]).\n\nLearning [2847]: deterministic UUID for safe cleanup in shared directories — the deletion targets the (session_id, cwd) tuple ONLY. Do NOT enumerate <home>/.grok/sessions/<encoded>/ and delete entries — that would race with concurrent interactive grok sessions.",
+      "passes": true,
+      "priority": 10,
+      "qualityDimensions": [
+        "Cleanup deletes ONLY the exact (session_id, cwd) tuple — never enumerate-and-sweep",
+        "Grok's per-cwd prompt_history.jsonl is NEVER deleted (cleanup is scoped to the uuid subdirectory only)",
+        "WORKAROUND() markers exist exactly where each cleanup lives — future upstream-fix removal is greppable",
+        "NotFound-as-silent-success preserved for both providers — future-proof against upstream fix"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Implement ClaudeRunner::cleanup_session and GrokRunner::cleanup_session",
+      "touchesFiles": [
+        "src/loop_engine/runner.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "dispatch at runner.rs:877 calls runner.cleanup_session(session_id, &cwd) after spawn returns, when result.session_id.is_some()",
+        "cwd is derived from opts.working_dir (PathBuf::from) OR std::env::current_dir() fallback when working_dir is None",
+        "Cleanup runs even when spawn returns Err (a spawn failure may still have produced an artifact) — OR the dispatch rustdoc explicitly documents that Err-path Claude artifacts are not cleaned because the UUID is not surfaced in the error variant (acceptable best-effort limitation per PRD §6)",
+        "On cleanup_session Err: emit '[cleanup warn] <provider>: <summary> (<path>)' to stderr via eprintln!, gated by CLEANUP_WARN_ONCE swap (first error in process prints; subsequent errors stay silent)",
+        "Provider tag in banner reads 'claude' or 'grok' (sourced from RunnerKind, NOT hardcoded)",
+        "dispatch returns the spawn's original RunnerResult / Err unchanged — cleanup outcome NEVER modifies it",
+        "The inline cleanup_claude_session_artifact(uuid, working_dir) call at runner.rs:422 inside ClaudeRunner::spawn is REMOVED in the same commit",
+        "After this task, ClaudeRunner::spawn no longer performs cleanup — that's dispatch's job",
+        "TEST-INIT-003 tests pass (banner emitted once, dispatch result unchanged, cleanup runs on success AND failure spawns, session_id = None skips cleanup)",
+        "cargo check + cargo clippy -- -D warnings + cargo fmt --check pass",
+        "cargo test --test runner_cleanup passes (integration test from FEAT-009)"
+      ],
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/loop_engine/runner.rs",
+            "impact": "BREAKS",
+            "line": 422,
+            "mitigation": "Remove the inline call — cleanup is now dispatch's job. Without this removal, cleanup fires TWICE per Claude iteration (once inline, once in dispatch); the second call gets NotFound (silent), so it would still work but be wasteful + violates 'cleanup belongs to the dispatch boundary' principle.",
+            "usage": "Inline cleanup_claude_session_artifact(uuid, working_dir) call inside ClaudeRunner::spawn after child.wait()"
+          },
+          {
+            "file": "src/loop_engine/runner.rs",
+            "impact": "NEEDS_REVIEW",
+            "line": 877,
+            "mitigation": "Add post-spawn cleanup_session call when session_id.is_some(); error-banner gated by CLEANUP_WARN_ONCE; return value unchanged",
+            "usage": "dispatch free fn — current behavior is pass-through (match kind, call spawn, return result)"
+          }
+        ],
+        "semanticDistinctions": [
+          {
+            "context": "Claude iterations (always have session_id post-FEAT-003)",
+            "currentBehavior": "Inline cleanup at runner.rs:422 deletes the artifact synchronously after child.wait()",
+            "requiredBehavior": "Cleanup moves to dispatch — same FS operation, just called from a different stack frame. Net behavior identical (file is deleted post-child)."
+          },
+          {
+            "context": "Grok iterations (have session_id only when capture succeeds)",
+            "currentBehavior": "No cleanup at all — every iteration leaks a session dir",
+            "requiredBehavior": "Dispatch calls GrokRunner::cleanup_session when session_id.is_some() — bug-class fix for Grok"
+          }
+        ]
+      },
+      "dependsOn": [
+        "FEAT-005",
+        "ANALYSIS-001",
+        "TEST-INIT-003"
+      ],
+      "description": "Modify pub fn dispatch at src/loop_engine/runner.rs:877 so that after runner.spawn(...) returns, it calls runner.cleanup_session(session_id, cwd) if result.session_id.is_some(). Source cwd from opts.working_dir; fallback to std::env::current_dir() when None. Cleanup runs regardless of spawn success/failure. On Err from cleanup_session: emit '[cleanup warn] <provider>: <summary> (<path>)' via eprintln!, gated by CLEANUP_WARN_ONCE. Provider tag from RunnerKind::Display (or inline match). Cleanup failure NEVER changes dispatch's return value. **In the same commit, REMOVE the inline cleanup_claude_session_artifact(uuid, working_dir) call at runner.rs:422 inside ClaudeRunner::spawn** — cleanup is now the dispatch boundary's job, not the runner's. NOTE: This is the modifiesBehavior task — ANALYSIS-001 must have produced the Consumer Impact Table.",
+      "estimatedEffort": "medium",
+      "id": "FEAT-006",
+      "modifiesBehavior": true,
+      "notes": "modifiesBehavior gate: ANALYSIS-001 must have produced the Consumer Impact Table in the progress file. Read it BEFORE implementing. The architect's review (PRD §6) is the canonical version.\n\nCoherence-refactoring boundary (CRITICAL): the post-spawn cleanup hook in dispatch stays SINGLE-PURPOSE. Do NOT add status, lifecycle, reconciliation, or <task-status> logic here. Task lifecycle is the coherence-refactoring effort's job. If a future temptation arises to layer something on top, raise an Open Question rather than resolving unilaterally.\n\nImplementation sketch:\n```rust\npub fn dispatch(kind, prompt, permission_mode, opts) -> TaskMgrResult<RunnerResult> {\n    let cwd: PathBuf = opts.working_dir.map(|p| p.to_path_buf())\n        .or_else(|| std::env::current_dir().ok())\n        .unwrap_or_default();\n    let runner_for_cleanup = kind;  // copy the enum discriminant for cleanup dispatch\n    let result = match kind {\n        RunnerKind::Claude => ClaudeRunner.spawn(prompt, permission_mode, opts),\n        RunnerKind::Grok => GrokRunner.spawn(prompt, permission_mode, opts),\n    };\n    if let Ok(ref r) = result\n        && let Some(sid) = r.session_id\n    {\n        let cleanup_result = match runner_for_cleanup {\n            RunnerKind::Claude => ClaudeRunner.cleanup_session(sid, &cwd),\n            RunnerKind::Grok => GrokRunner.cleanup_session(sid, &cwd),\n        };\n        if let Err(e) = cleanup_result\n            && !CLEANUP_WARN_ONCE.swap(true, Ordering::Relaxed)\n        {\n            eprintln!(\"[cleanup warn] {}: {} ({})\", provider_tag(runner_for_cleanup), e, cwd.display());\n        }\n    }\n    // ALSO run cleanup on the Err path — see PRD §FR-006: spawn failure may still produce artifact.\n    // Pattern: extract the session_id from the Err variant if it has one (Claude generates uuid before spawn fails); for Grok, session_id is captured post-wait so the Err path has no session_id to clean.\n    result\n}\n```\n\nNote: ClaudeRunner generates uuid before child spawn (line 327-332 area, post-FEAT-003). On spawn failure, that uuid exists in scope but isn't in any RunnerResult (because the result is Err). Two options: (a) accept that Err-path Claude artifacts leak (small bug; happens only on spawn failure which is rare); (b) extend the spawn error variant to carry session_id. Pick (a) for this PRD — PRD §6 says 'cleanup runs even on spawn failure' but acknowledges this is best-effort. Document the limitation in dispatch rustdoc.\n\nLearning [1614]: best-effort cleanup must not fail the parent operation — the banner-and-continue pattern.",
+      "passes": true,
+      "priority": 11,
+      "qualityDimensions": [
+        "Cleanup runs unconditionally for headless runs — session_id.is_some() is the gate, not a config flag",
+        "CLEANUP_WARN_ONCE swap is wait-free (single AtomicBool::swap with Relaxed ordering)",
+        "Cleanup failure NEVER changes dispatch's return value",
+        "Provider tag sourced from RunnerKind — adding a third provider in Phase 2-5 only needs to add the cleanup arm + a new tag, not modify the banner format",
+        "No .unwrap() in the post-spawn cleanup path — use match or if-let on Result",
+        "dispatch hook is single-purpose: cleanup only, no lifecycle/status/reconciliation (coherence-refactoring boundary)"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Wire dispatch to call cleanup_session unconditionally post-spawn; remove inline cleanup call",
+      "touchesFiles": [
+        "src/loop_engine/runner.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "src/loop_engine/runner.rs:166 no longer declares pub cleanup_title_artifact: bool",
+        "src/loop_engine/runner.rs:279 (ClaudeRunner destructure) no longer mentions cleanup_title_artifact",
+        "src/loop_engine/runner.rs:489 (GrokRunner destructure) no longer mentions cleanup_title_artifact: _",
+        "Rustdoc example at runner.rs:137 no longer mentions cleanup_title_artifact",
+        "All 8 production call sites have cleanup_title_artifact: true removed (no replacement; field doesn't exist)",
+        "tests/grok_runner_unit.rs: 3 silent-ignore tests + rustdoc references deleted; replacement test grok_runner_cleanup_session_deletes_session_directory added exercising the new contract via real fixture",
+        "src/loop_engine/claude.rs: test_cleanup_title_artifact_false_omits_session_id at line 2948 DELETED",
+        "src/loop_engine/claude.rs: test_cleanup_title_artifact_true_adds_valid_uuid_v4_session_id at line 2959 RENAMED to test_spawn_claude_always_injects_session_id; the body no longer sets the flag; the --session-id-present assertion still applies",
+        "grep -rn 'cleanup_title_artifact' src/ tests/ returns 0 hits (success metric per PRD §2)",
+        "Single bisectable commit: field deletion at runner.rs:166 + all 11 production/test call-site removals + claude.rs:2948 test deletion + claude.rs:2959 test rename land together (PRD §7 'tactical-patch removal sequencing': single bisectable point, not a separate 'undo the patch' commit)",
+        "cargo check + cargo clippy -- -D warnings + cargo fmt --check pass on the WHOLE workspace",
+        "All tests pass: cargo test --lib loop_engine + cargo test --test grok_runner_unit + cargo test --test grok_runner_integration + cargo test --test runner_cleanup + cargo test --test runner_trait_dispatch"
+      ],
+      "dependsOn": [
+        "FEAT-006"
+      ],
+      "description": "Field-removal sweep. (1) Delete pub cleanup_title_artifact: bool at src/loop_engine/runner.rs:166. (2) Remove the destructure binding at runner.rs:279 (ClaudeRunner) and runner.rs:489 (GrokRunner). (3) Delete the rustdoc example at runner.rs:137 that includes the field. (4) Drop the field literal at all 8 production call sites: src/loop_engine/engine.rs:656, engine.rs:2587, src/loop_engine/prd_reconcile.rs:672, src/commands/curate/enrich.rs:247, src/commands/curate/mod.rs:638, src/loop_engine/progress.rs:328, src/loop_engine/merge_resolver.rs:260, src/learnings/ingestion/mod.rs:115. (5) Update tests/grok_runner_unit.rs: delete the 3 silent-ignore test sites at lines 172-209 and 280, delete rustdoc references at lines 17 and 22, add ONE new replacement test grok_runner_cleanup_session_deletes_session_directory exercising the new contract. (6) Update src/loop_engine/claude.rs tests: DELETE test_cleanup_title_artifact_false_omits_session_id (line 2948); RENAME test_cleanup_title_artifact_true_adds_valid_uuid_v4_session_id (line 2959) → test_spawn_claude_always_injects_session_id and drop the flag from the body. Keep tests at claude.rs:3020, :3087, :3121, :3138 (they target the helper; FEAT-001 already updated their imports).",
+      "estimatedEffort": "high",
+      "id": "FEAT-007",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "This is the big mechanical sweep. ~10 files, ~14 edits. Single commit so the bisect anchor is clean.\n\nLearning [795] (CRITICAL): replace_all misses instances with different indentation — DO NOT use blind replace_all across the workspace. Edit each site individually after grep enumerates them. Use cargo check as the enforcement loop: removing the field at runner.rs:166 makes every call site fail to compile; walk through each error, edit by hand, recompile, repeat until green.\n\nLearning [2736]: rename refactor — update all sites and verify completeness. The grep -rn at the end is the safety net.\n\nReplacement test for grok_runner_unit.rs: use a tempdir fake $HOME, create <fake_home>/.grok/sessions/<encoded>/<uuid>/some_file.json, call GrokRunner.cleanup_session(uuid, cwd), assert the <uuid>/ dir is gone but the encoded_cwd_dir itself still exists. Mirror the shape of the deleted test for consistency (learning [2919]).\n\nDocumentation update required (per PRD §6 Documentation): in tasks/prd-grok-fallback-runner.md:284, drop the 'Grok runner silently ignores the flag' line. Also handles in tasks/grok-fallback-runner.json — but DON'T edit that file directly (it's the source of truth for the loop engine); use sed-like edits only on the markdown PRD.\n\nPRD §7 Open Question 'Tactical patch on main removal sequencing': YES, the 3 sites at engine.rs:656/2587 and prd_reconcile.rs:672 carrying the tactical patch are removed as part of THIS task. Single bisectable commit.",
+      "passes": true,
+      "priority": 12,
+      "qualityDimensions": [
+        "grep -rn 'cleanup_title_artifact' src/ tests/ → 0 hits is the success gate",
+        "Single commit so bisect can isolate any regression to the sweep",
+        "Replacement test in grok_runner_unit.rs exercises the new contract, not just the absence of the old contract",
+        "Coherence-refactoring boundary: at engine.rs:656/:2587, drop only the cleanup_title_artifact line — do NOT tidy adjacent SpawnOpts/RunnerOpts construction. Clean seam left for the coherence Phase 1 carve."
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Remove cleanup_title_artifact field + sweep all 11 production/test call sites",
+      "touchesFiles": [
+        "src/loop_engine/runner.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/prd_reconcile.rs",
+        "src/commands/curate/enrich.rs",
+        "src/commands/curate/mod.rs",
+        "src/loop_engine/progress.rs",
+        "src/loop_engine/merge_resolver.rs",
+        "src/learnings/ingestion/mod.rs",
+        "tests/grok_runner_unit.rs",
+        "src/loop_engine/claude.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "#[cfg(test)] mod with pub(super) struct FakeRunner declared in src/loop_engine/runner.rs",
+        "FakeRunner constructor accepts: a pre-built RunnerResult template, an Option<Box<dyn Fn(&Path) + Send + Sync>> artifact-creation closure, an Arc<Mutex<Vec<(Uuid, PathBuf)>>> cleanup recorder",
+        "FakeRunner::spawn invokes the artifact-creation closure (if any) BEFORE returning the templated RunnerResult — simulating side effects from the real CLI",
+        "FakeRunner::cleanup_session pushes (session_id, cwd.to_path_buf()) onto the recorder Vec, then runs a configurable inner result (Ok or Err — make this part of construction)",
+        "FakeRunner is reusable across runner.rs::tests AND tests/runner_cleanup.rs (re-export via pub(crate) or duplicate per learning [909])",
+        "Doc comment on FakeRunner explains the seam is #[cfg(test)] only — NOT a production dry-run mode (PRD non-goals §5)",
+        "cargo check + cargo clippy -- -D warnings + cargo fmt --check pass"
+      ],
+      "dependsOn": [
+        "FEAT-002"
+      ],
+      "description": "Add a #[cfg(test)] FakeRunner struct in src/loop_engine/runner.rs that impls LlmRunner. Constructor takes (a) configurable spawn output (RunnerResult fields settable per construction), (b) a configurable artifact-creation closure that runs inside spawn (simulating Claude's <uuid>.jsonl write or Grok's directory write), (c) a recordable cleanup-invocation Arc<Mutex<Vec<(Uuid, PathBuf)>>> so tests can assert cleanup_session was called with the expected arguments.",
+      "estimatedEffort": "medium",
+      "id": "FEAT-008",
+      "modifiesBehavior": false,
+      "notes": "Two visibility shapes are workable: (a) pub(crate) in runner.rs::tests-or-similar so tests/runner_cleanup.rs can import via crate::loop_engine::runner::FakeRunner; (b) duplicate FakeRunner in tests/common/ per learning [909] (integration tests duplicate setup helpers rather than reaching into pub(crate)). PRD FR-008 doesn't pick — pick (a) here since the seam is single-purpose and Phase 2-5 will reuse it.\n\nFor the artifact-creation closure: typical use is fake-Claude writing a single uuid.jsonl file, or fake-Grok writing a uuid directory containing 4-5 JSON files. The closure receives &Path (the cwd) and must compute the encoded_cwd_dir path itself — exactly how the real CLI would.\n\nLearning [2891]: extract common subprocess scaffolding when adding the second agent implementation — applies to test infrastructure too, not just production code.",
+      "passes": true,
+      "priority": 13,
+      "qualityDimensions": [
+        "FakeRunner is #[cfg(test)] only — no production dry-run mode (PRD non-goal)",
+        "Recorder is Arc<Mutex<Vec<...>>> for thread-safe assertion across slot-style parallel tests",
+        "Artifact-creation closure is opt-in via Option<...> — tests that don't need side effects don't pay the cost",
+        "Constructor accepts Result-typed inner cleanup_session outcomes so tests can simulate cleanup failures"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Add FakeRunner test seam under #[cfg(test)]",
+      "touchesFiles": [
+        "src/loop_engine/runner.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "tests/runner_cleanup.rs file exists with #[test] fns",
+        "Test 1 (Claude shape): fake-Claude artifact present after spawn, absent after dispatch returns Ok",
+        "Test 2 (Grok shape): fake-Grok artifact directory present after spawn, absent after dispatch returns Ok",
+        "Test 3 (banner): single dispatch call with cleanup Err emits exactly ONE '[cleanup warn]' line to stderr; spawn result unchanged",
+        "Test 4 (rate-limit): two consecutive dispatch calls with cleanup Err emit exactly ONE banner line total (CLEANUP_WARN_ONCE)",
+        "Test 5 (parallel slots, optional but preferred per PRD §7): two FakeRunners running in different cwds produce DISJOINT encoded session dirs — neither test's cleanup touches the other's artifact",
+        "Test fixtures use tempdir for fake $HOME / cwd — never real $HOME",
+        "Tests mirror the shape of tests/runner_trait_dispatch.rs (learning [2919]) — same setup helpers, same assertion style",
+        "cargo test --test runner_cleanup passes",
+        "cargo check + cargo clippy -- -D warnings + cargo fmt --check pass"
+      ],
+      "dependsOn": [
+        "FEAT-006",
+        "FEAT-008"
+      ],
+      "description": "Create the NEW tests/runner_cleanup.rs integration test file. Three tests minimum: (a) fake-Claude single-file artifact — drives dispatch with a FakeRunner whose artifact-creation closure writes a fake <uuid>.jsonl; asserts file exists post-spawn, absent post-dispatch; (b) fake-Grok directory artifact — same shape with a directory artifact; (c) cleanup-failure banner — FakeRunner returns Err from cleanup_session; assert dispatch returns the spawn result unchanged and the banner is emitted exactly once (CLEANUP_WARN_ONCE). Plus optional (d) parallel-slot disjoint dir test (per PRD §7 Open Question — preferred location).",
+      "edgeCases": [
+        "Test isolation: CLEANUP_WARN_ONCE state persists across tests; serialize or reset",
+        "Parallel slots: two FakeRunners in different cwds → disjoint encoded session dirs; their cleanups never interfere",
+        "Cleanup Err path: dispatch returns the original spawn result, NOT an error wrapping the cleanup failure"
+      ],
+      "estimatedEffort": "medium",
+      "id": "FEAT-009",
+      "modifiesBehavior": false,
+      "notes": "CLEANUP_WARN_ONCE state is process-global and persists across tests. Two options:\n(a) Serialize banner-tests via a Mutex so they run sequentially and observe the warn-once gate cleanly.\n(b) Expose a #[cfg(test)] reset helper (e.g., pub(crate) fn reset_cleanup_warn_once_for_test()) and call it at the start of each banner test.\nPRD §7 leaves this to the implementer. Pick (a) (simpler) unless the test-order coupling becomes painful.\n\nLearning [909] (general convention): integration tests duplicate setup helpers rather than reaching into pub(crate). Apply by importing FakeRunner from crate::loop_engine::runner::FakeRunner (which is pub(crate)) but writing test-specific helpers inline.\n\nStderr capture: use the gag crate if available, or set up a custom Write target via a test fixture. Avoid spawning a subprocess just to capture stderr.\n\nParallel-slot test placement: PRD §7 Open Question 'GrokRunner concurrency under parallel slots' resolves to 'preferred location: tests/runner_cleanup.rs'. Include this test here.",
+      "passes": true,
+      "priority": 14,
+      "qualityDimensions": [
+        "Tests drive dispatch end-to-end through FakeRunner — never call cleanup_session directly (defeats the integration test purpose)",
+        "tempdir-based fake $HOME / cwd — never touch the real ~/.claude/ or ~/.grok/",
+        "Mirror tests/runner_trait_dispatch.rs structure for consistency (learning [2919])",
+        "Banner assertion captures stderr deterministically — CLEANUP_WARN_ONCE state is reset or serialized between tests"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Add tests/runner_cleanup.rs integration test",
+      "touchesFiles": [
+        "tests/runner_cleanup.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Read FEAT-001 through FEAT-009 commits and diff",
+        "grep -rn '\\.unwrap()\\|\\.expect(' src/loop_engine/runner.rs in the diff → no new occurrences in production code paths",
+        "grep -rn 'WORKAROUND(claude-code-2.1.110-session-stub)\\|WORKAROUND(grok-cli-no-persistence-off)' src/ → exactly 2 hits",
+        "Verify ClaudeRunner::cleanup_session NotFound returns Ok(()) via reading the impl",
+        "Verify GrokRunner::cleanup_session NotFound returns Ok(()) via reading the impl",
+        "Verify GrokRunner::cleanup_session targets <home>/.grok/sessions/<encoded>/<uuid>/ ONLY — not the encoded_cwd_dir parent",
+        "Verify dispatch post-spawn hook contains ONLY cleanup_session call + banner gating — no status/lifecycle/reconciliation logic",
+        "Verify CLEANUP_WARN_ONCE gates the banner (single AtomicBool::swap with Relaxed ordering)",
+        "Verify dispatch return value is determined solely by spawn outcome — cleanup outcome never modifies it",
+        "Verify all new symbols (cleanup_session, cleanup_claude_session_artifact, grok_encoded_session_dir, FakeRunner, RunnerResult.session_id) have callers in production OR are #[cfg(test)] gated — no orphan-warning",
+        "For each issue found: spawn a CODE-FIX-xxx or WIRE-FIX-xxx task via `echo '{...}' | task-mgr add --stdin --depended-on-by MILESTONE-1`",
+        "If no issues found: emit '<task-status>CODE-REVIEW-1:done</task-status>' with one-line 'No issues found' progress note"
+      ],
+      "dependsOn": [
+        "FEAT-007",
+        "FEAT-009"
+      ],
+      "description": "Review FEAT-001 through FEAT-009 for correctness, security, idiom compliance, and reachability. Focus areas: (1) no .unwrap()/.expect() in production cleanup paths; (2) NotFound is silent success in both impls; (3) Grok's prompt_history.jsonl is NEVER deleted; (4) dispatch hook stays single-purpose (no status/lifecycle/reconciliation seepage — coherence-refactoring boundary); (5) WORKAROUND(claude-code-2.1.110-session-stub) + WORKAROUND(grok-cli-no-persistence-off) markers present and accurate; (6) qualityDimensions for each task satisfied; (7) wiring reachability — dispatch is the only call site for cleanup_session in production, no orphan unused-import warnings on new symbols.",
+      "estimatedEffort": "medium",
+      "id": "CODE-REVIEW-1",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "Use the rust-python-code-reviewer agent. For each issue spawn one task:\n```sh\necho '{\n  \"id\": \"CODE-FIX-001\",\n  \"title\": \"Fix: <specific issue>\",\n  \"description\": \"From CODE-REVIEW-1: <details>\",\n  \"rootCause\": \"<file:line + issue>\",\n  \"exactFix\": \"<specific change>\",\n  \"verifyCommand\": \"<shell command>\",\n  \"acceptanceCriteria\": [\"Issue resolved\", \"No new warnings\"],\n  \"priority\": 14,\n  \"touchesFiles\": [\"affected/file.rs\"]\n}' | task-mgr add --stdin --depended-on-by MILESTONE-1\n```\n\nDocument findings in tasks/progress-<prefix>.txt. Commit any task additions with `chore: CODE-REVIEW-1 - Add CODE-FIX tasks`.",
+      "passes": true,
+      "priority": 17,
+      "qualityDimensions": [
+        "Verify the coherence-refactoring boundary rules in dispatch — no status/lifecycle/reconciliation logic crept in",
+        "Verify WORKAROUND markers are exactly where each cleanup lives so future upstream-fix removal is greppable",
+        "Verify all new public-ish symbols (pub(crate) in runner.rs) are reachable from production or #[cfg(test)] gated"
+      ],
+      "requiresHuman": false,
+      "taskType": "review",
+      "title": "Code review: cleanup_session contract, error handling, wiring reachability, WORKAROUND markers",
+      "touchesFiles": [
+        "src/loop_engine/runner.rs",
+        "src/loop_engine/claude.rs",
+        "tests/runner_cleanup.rs",
+        "tests/grok_runner_unit.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "All dependsOn tasks pass: ANALYSIS-001, TEST-INIT-001..3, FEAT-001..9, CODE-REVIEW-1, all spawned CODE-FIX/WIRE-FIX tasks",
+        "cargo fmt --check passes (no diff)",
+        "cargo check passes with zero warnings",
+        "cargo clippy -- -D warnings passes",
+        "cargo test (full workspace, unscoped) passes",
+        "cargo run --bin gen-docs -- --check passes",
+        "grep -rn 'cleanup_title_artifact' src/ tests/ → 0 hits (PRD Success Metric 'Zero residual flag')",
+        "grep -rn 'WORKAROUND(claude-code-2.1.110-session-stub)\\|WORKAROUND(grok-cli-no-persistence-off)' src/ → 2 hits (PRD Success Metric 'Greppable workarounds')",
+        "For any pre-existing test failure: trivial → fix in milestone commit; non-trivial → spawn FIX-xxx via task-mgr add --stdin --depended-on-by MILESTONE-1, output <promise>BLOCKED</promise> with task ID",
+        "Milestone marks done only when full gate is green"
+      ],
+      "dependsOn": [
+        "CODE-REVIEW-1"
+      ],
+      "description": "Run the full unscoped quality gate (cargo fmt --check, cargo check, cargo clippy -- -D warnings, cargo test) on a clean checkout. Verify cargo run --bin gen-docs -- --check passes (model constants doc sync). Verify the PRD Success Metrics: grep -rn 'cleanup_title_artifact' src/ tests/ returns 0 hits; grep -rn 'WORKAROUND(claude-code-2.1.110-session-stub)\\|WORKAROUND(grok-cli-no-persistence-off)' src/ returns 2 hits. Fix every failure inline (including pre-existing ones below the ~12-failure threshold).",
+      "estimatedEffort": "medium",
+      "id": "MILESTONE-1",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "Run full suite ONCE per milestone (not per iteration). Per CLAUDE.md tool usage protocol, pipe all test/build commands to a temp file and grep for results in the same command:\n```bash\ncargo test 2>&1 | tee /tmp/test-results.txt | tail -3 && grep -E 'FAILED|error\\[' /tmp/test-results.txt | head -10\ncargo clippy -- -D warnings 2>&1 | tee /tmp/clippy.txt | tail -3 && grep '^error' /tmp/clippy.txt | head -10\n```\n\nPre-existing failures: PRD does not name any specific known-failing tests pre-Phase-1. If ~12 unrelated failures surface, escape hatch is to spawn FIX tasks and BLOCKED — but typical case is full-green.",
+      "passes": true,
+      "priority": 20,
+      "qualityDimensions": [
+        "Trunk-green is the invariant this gate exists to protect",
+        "Both PRD Success Metrics (zero residual flag, greppable workarounds) verified at the gate",
+        "Pre-existing failures within scope; punted only above the ~12-failure threshold via spawned FIX-xxx tasks"
+      ],
+      "requiresHuman": false,
+      "taskType": "milestone",
+      "timeoutSecs": 1800,
+      "title": "Phase 1 implementation gate: full quality suite green",
+      "touchesFiles": [
+        "src/loop_engine/runner.rs",
+        "src/loop_engine/claude.rs",
+        "tests/runner_cleanup.rs",
+        "tests/grok_runner_unit.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Test in tests/runner_cleanup.rs uses std::thread::spawn or rayon to run two FakeRunner spawn closures concurrently",
+        "Both FakeRunners use distinct fake-cwds (e.g., /tmp/dir-a, /tmp/dir-b inside a tempdir)",
+        "After both spawns return, both artifacts exist in their respective encoded session dirs",
+        "After dispatch returns for both, each artifact is gone from its own dir AND the other's artifact is untouched",
+        "Test uses Arc<Mutex<...>> recorder to verify cleanup_session was called with the correct (session_id, cwd) for each runner",
+        "cargo test --test runner_cleanup parallel_slot_disjoint_session_dirs passes",
+        "cargo check + cargo clippy -- -D warnings + cargo fmt --check pass"
+      ],
+      "dependsOn": [
+        "MILESTONE-1"
+      ],
+      "description": "Add a hardening test exercising the PRD §2.5 'Parallel slots running concurrently' edge case AND PRD §6 Risk #1 'Grok pre/post-spawn dir diff races with concurrent interactive grok'. Place in tests/runner_cleanup.rs. Two FakeRunners in distinct (fake-)cwds run their spawn closures simultaneously; assert their encoded session dirs are disjoint AND their cleanups touch only their own (session_id, cwd) tuple.",
+      "edgeCases": [
+        "Two slots running in the same cwd (synthetic — production guarantees distinct worktree cwds) → out of scope; PRD asserts disjoint cwds by construction",
+        "Race between snapshot pre-spawn and a concurrent interactive grok writing a new uuid → mtime tiebreaker (covered separately in FEAT-004 unit tests)"
+      ],
+      "estimatedEffort": "medium",
+      "id": "TEST-001",
+      "modifiesBehavior": false,
+      "notes": "PRD §6 Risk #1 mitigation says 'Parallel-slot integration test asserts disjoint cwds produce disjoint encoded session dirs'. This is that test.\n\nIf FEAT-009 already included this as 'test 5' (optional but preferred), this task can be a no-op completion (`<task-status>TEST-001:done</task-status>` with progress note 'covered by FEAT-009 test 5'). Otherwise add it here.\n\nLearning [2728]: per-task HashMap<String, T> pattern — apply to the recorder shape (Arc<Mutex<Vec<(Uuid, PathBuf)>>>).",
+      "passes": true,
+      "priority": 25,
+      "qualityDimensions": [
+        "Concurrency test uses real std::thread::spawn — not sequential simulation",
+        "Disjoint-dir assertion is the property under test, not just 'no crash'",
+        "Recorder Mutex<Vec<...>> asserts the exact (session_id, cwd) pairs cleanup_session received"
+      ],
+      "requiresHuman": false,
+      "taskType": "test",
+      "title": "Hardening test: concurrent Grok session capture under parallel slots",
+      "touchesFiles": [
+        "tests/runner_cleanup.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "All dependsOn tasks pass: MILESTONE-1, TEST-001, all spawned IMPL-FIX tasks",
+        "cargo fmt --check + cargo check + cargo clippy -- -D warnings + cargo test (full workspace) pass",
+        "cargo run --bin gen-docs -- --check passes",
+        "PRD Success Metrics still hold: grep 'cleanup_title_artifact' → 0 hits; grep 'WORKAROUND(...)' → 2 hits"
+      ],
+      "dependsOn": [
+        "TEST-001"
+      ],
+      "description": "Re-run the full unscoped quality gate after TEST-001 and any IMPL-FIX tasks land. Same scope as MILESTONE-1.",
+      "estimatedEffort": "medium",
+      "id": "MILESTONE-2",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "Same protocol as MILESTONE-1. If failures surface, fix inline or spawn FIX-xxx tasks via task-mgr add --stdin --depended-on-by MILESTONE-2.",
+      "passes": true,
+      "priority": 50,
+      "qualityDimensions": [
+        "Trunk-green is the invariant; pre-existing failures are in scope unless > ~12 unrelated"
+      ],
+      "requiresHuman": false,
+      "taskType": "milestone",
+      "timeoutSecs": 1800,
+      "title": "Hardening test gate: full quality suite green after hardening tests",
+      "touchesFiles": [
+        "src/loop_engine/runner.rs",
+        "tests/runner_cleanup.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Read each of the 8 production call sites and document the working_dir value passed (Some(path) vs None)",
+        "For sites passing Some(path): the path is a worktree path (or canonical cwd) — never an interior subpath",
+        "For sites passing None: confirm dispatch fallback to std::env::current_dir() correctly resolves to the parent process cwd",
+        "Verify ClaudeRunner::cleanup_session(uuid, cwd) → encoded_cwd_dir(cwd, home) → <home>/.claude/projects/<dash-encoded-cwd>/<uuid>.jsonl produces the actual on-disk path Claude wrote",
+        "Verify GrokRunner::cleanup_session(uuid, cwd) → grok_encoded_session_dir(cwd, home) → <home>/.grok/sessions/<percent-encoded-cwd>/<uuid>/ produces the actual on-disk path Grok wrote",
+        "Write data-flow trace to tasks/progress-<prefix>.txt with file:line for each handoff",
+        "No new code in this task — verification only"
+      ],
+      "dependsOn": [
+        "MILESTONE-2"
+      ],
+      "description": "Trace the cwd data path from caller → RunnerOpts.working_dir → dispatch → cleanup_session(cwd) → encoded_cwd_dir / grok_encoded_session_dir → remove_file / remove_dir_all. Verify the cwd value flows correctly from each production call site (engine.rs:656/2587, prd_reconcile.rs:672, curate/enrich.rs:247, curate/mod.rs:638, progress.rs:328, merge_resolver.rs:260, ingestion/mod.rs:115) through to the encoded artifact path. Confirm working_dir = None fallback to std::env::current_dir() matches the pre-promotion cleanup_title_artifact_sync behavior at claude.rs:1154.",
+      "estimatedEffort": "medium",
+      "id": "INT-001",
+      "modifiesBehavior": false,
+      "notes": "This is the PRD's 'cross-boundary integration verification' — single distinct path (cwd → encoded artifact path) traced across module boundaries (caller's module → loop_engine::runner → claude::encoded_cwd_dir or runner::grok_encoded_session_dir → std::fs).\n\nDocument the trace in the progress file with the same structure used for Consumer Impact Tables: site, value passed, expected encoded path, verification command. If anything looks wrong, spawn a WIRE-FIX task.\n\nLearning [810]: grep for struct field locations across all construction sites — apply to working_dir flow.",
+      "passes": true,
+      "priority": 55,
+      "qualityDimensions": [
+        "Verification only — no code changes here; spawn WIRE-FIX tasks if discrepancies surface",
+        "Trace covers ALL 8 production sites — partial coverage misses the leak class this PRD exists to fix"
+      ],
+      "requiresHuman": false,
+      "taskType": "verification",
+      "title": "Integration verification: cwd flow across module boundaries",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/prd_reconcile.rs",
+        "src/commands/curate/enrich.rs",
+        "src/commands/curate/mod.rs",
+        "src/loop_engine/progress.rs",
+        "src/loop_engine/merge_resolver.rs",
+        "src/learnings/ingestion/mod.rs",
+        "src/loop_engine/runner.rs",
+        "src/loop_engine/claude.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Read all FEAT-001..9 code + tests in one pass",
+        "Spawn REFACTOR-N-xxx tasks for any DRY/complexity/clarity issues found",
+        "Verify FakeRunner is reusable for Phase 2-5 (capability discovery, error taxonomy, args builder, RunnerSession RAII) — if not, spawn REFACTOR task to adjust its shape",
+        "Verify cleanup_session impls are minimal — no shared scaffolding extracted prematurely (per the Phase 2 Foundation note in PRD §6: explicit-call shape soaks before RAII is layered on top)",
+        "For each issue found: spawn REFACTOR-N-xxx via task-mgr add --stdin --depended-on-by MILESTONE-FINAL",
+        "If no issues found: emit '<task-status>REFACTOR-REVIEW-FINAL:done</task-status>' with one-line 'No issues found'"
+      ],
+      "dependsOn": [
+        "INT-001"
+      ],
+      "description": "Full-context review of all code + tests added by Phase 1. Look for DRY violations, complexity creep, coupling concerns, clarity issues, pattern adherence. Particular attention to: (a) any shared scaffolding between ClaudeRunner::cleanup_session and GrokRunner::cleanup_session that should be extracted now vs deferred to Phase 2-5; (b) test setup duplication between tests/runner_cleanup.rs and tests/runner_trait_dispatch.rs (per learning [909], duplication is OK across integration tests); (c) the dispatch hook readability — is the post-spawn block obviously single-purpose? (d) FakeRunner ergonomics — would Phase 2-5 want different constructor shapes?",
+      "estimatedEffort": "medium",
+      "id": "REFACTOR-REVIEW-FINAL",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "Use rust-python-code-reviewer agent. Be RESTRAINED about extracting shared scaffolding — Phase 2-5 will reshape the trait surface anyway; prematurely DRYing cleanup_session impls now adds churn cost without benefit. If a refactor is genuinely valuable (e.g., the dispatch hook is hard to read), spawn the task; otherwise pass.\n\nLearning [2891]: extract common subprocess scaffolding immediately when adding the second agent implementation — applies to spawn scaffolding, NOT necessarily cleanup. Cleanup impls are tiny (1 line for Claude, ~10 for Grok); DRY pressure is low.",
+      "passes": true,
+      "priority": 70,
+      "qualityDimensions": [
+        "Restrained extraction — Phase 2-5 will reshape the surface; don't pre-DRY",
+        "FakeRunner ergonomics review with Phase 2-5 reuse in mind",
+        "Dispatch hook readability: the single-purpose cleanup is obvious at a glance"
+      ],
+      "requiresHuman": false,
+      "taskType": "review",
+      "title": "Final full-context refactor pass",
+      "touchesFiles": [
+        "src/loop_engine/runner.rs",
+        "tests/runner_cleanup.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "src/loop_engine/CLAUDE.md has a cleanup_session subsection (<10 lines) under existing runner-related notes",
+        "src/loop_engine/runner.rs LlmRunner trait rustdoc includes the cleanup_session contract paragraph (target identification, idempotency, NotFound-as-success, dispatch-side banner)",
+        "tasks/prd-grok-fallback-runner.md updated (line ~284): 'Grok runner silently ignores the flag' replaced with a pointer to this PRD's cleanup_session contract (PRD §6 Documentation table mandates this edit)",
+        "grep -n 'silently ignore' tasks/prd-grok-fallback-runner.md returns 0 hits after the edit",
+        "task-mgr learn --outcome workaround --title 'Cleanup as a trait method, called unconditionally by dispatch' --content '<superseding text for [1626]>' --tags runner,trait,cleanup,workaround --confidence high — recorded so future PRDs touching session artifacts find the new pattern",
+        "task-mgr invalidate-learning 1626 (or curate it via the supersession mechanism)",
+        "grep -rn 'cleanup_title_artifact' src/ tests/ docs/ CLAUDE.md → 0 hits (verifies docs are scrubbed too)",
+        "grep -rn 'cleanup_session\\|cleanup_claude_session_artifact\\|grok_encoded_session_dir\\|FakeRunner\\|RunnerResult.*session_id' src/ tests/ → every new symbol has at least one caller in production or #[cfg(test)]",
+        "grep -rn '\\.unwrap()\\|\\.expect(' src/loop_engine/runner.rs in the diff scope → no new occurrences in production code paths",
+        "Coherence-refactoring stakeholder review: confirm the dispatch hook stays single-purpose (no status/lifecycle/reconciliation crept in)",
+        "Write final verification summary to tasks/progress-<prefix>.txt"
+      ],
+      "dependsOn": [
+        "REFACTOR-REVIEW-FINAL"
+      ],
+      "description": "Authoritative final check before MILESTONE-FINAL. Verifies all PRD §6 Documentation items: docs/designs/runner-trait-hygiene.md exists (already created); src/loop_engine/CLAUDE.md gains a brief subsection (<10 lines) on the cleanup_session contract; LlmRunner trait rustdoc updated with the cleanup_session paragraph; tasks/prd-grok-fallback-runner.md:284 'Grok runner silently ignores the flag' line dropped; tasks/long-term-learnings.md superseded entry recorded for [1626] via `task-mgr learn`. Grep-verified reachability for all new public functions. No .unwrap() in production. Test fixtures use real struct field names.",
+      "estimatedEffort": "medium",
+      "id": "VERIFY-001",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "Documentation update required for src/loop_engine/CLAUDE.md — add a brief subsection like:\n```\n### Session artifact cleanup\n\nEvery LlmRunner impl provides `cleanup_session(session_id, cwd)`; dispatch calls it unconditionally post-spawn when `session_id.is_some()`. NotFound is silent success. Errors emit one banner per process (CLEANUP_WARN_ONCE) and never modify the spawn return value. WORKAROUND(claude-code-2.1.110-session-stub) and WORKAROUND(grok-cli-no-persistence-off) markers point at the cleanup sites — future upstream fixes are a one-grep removal.\n```\n\nLearning supersession via task-mgr learn:\n```sh\ntask-mgr learn --task-id $PREFIX-VERIFY-001 --outcome workaround --title 'Cleanup as a trait method, called unconditionally by dispatch' --content 'Per-provider session-artifact cleanup belongs to the LlmRunner trait, not an opt-in flag on RunnerOpts. dispatch calls runner.cleanup_session(session_id, cwd) when session_id.is_some(), regardless of spawn success. Supersedes [1626] (opt-in cleanup_title_artifact flag pattern).' --tags runner,trait,cleanup,workaround --confidence high\n```\n\nPRD §7 stakeholder review timing: confirm the coherence-refactoring effort's reviewer has seen the diff; document the hand-off (or 'no overlap conflicts found') in the progress file. Open Question can be marked [x] resolved.",
+      "passes": true,
+      "priority": 90,
+      "qualityDimensions": [
+        "Documentation updates land in CLAUDE.md, trait rustdoc, and the prior PRD — three sources future devs will read",
+        "task-mgr learn records the new pattern so future PRDs touching session artifacts find it via recall",
+        "Reachability grep confirms every new symbol is wired in, no orphan dead-code warnings",
+        "Coherence-refactoring stakeholder review confirms dispatch hook stays single-purpose"
+      ],
+      "requiresHuman": false,
+      "taskType": "verification",
+      "timeoutSecs": 1800,
+      "title": "Final validation: docs, learnings, CLAUDE.md updates, PRD ergonomics",
+      "touchesFiles": [
+        "src/loop_engine/CLAUDE.md",
+        "src/loop_engine/runner.rs",
+        "tasks/prd-grok-fallback-runner.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "All dependsOn tasks pass: VERIFY-001 and all REFACTOR-N-xxx spawned by REFACTOR-REVIEW-FINAL",
+        "cargo fmt --check + cargo check + cargo clippy -- -D warnings + cargo test (full workspace) pass",
+        "cargo run --bin gen-docs -- --check passes",
+        "PRD Success Metric 'Zero residual flag': grep -rn 'cleanup_title_artifact' src/ tests/ → 0 hits",
+        "PRD Success Metric 'Greppable workarounds': grep -rn 'WORKAROUND(claude-code-2.1.110-session-stub)\\|WORKAROUND(grok-cli-no-persistence-off)' src/ → 2 hits",
+        "PRD Success Metric 'No regression': cargo test --lib loop_engine + cargo test --test runner_trait_dispatch + cargo test --test grok_runner_unit + cargo test --test grok_runner_integration all green",
+        "PRD Success Metric 'Zero new leaks' (empirical, must be acknowledged): the post-merge synthetic loop run is OUT OF SCOPE for this milestone (it's a post-merge operator check); flag this as 'not gateable here — operator verifies post-merge'",
+        "PR ready to open against main"
+      ],
+      "dependsOn": [
+        "VERIFY-001"
+      ],
+      "description": "Final full quality gate. All FEAT, TEST, INT, REFACTOR, and VERIFY tasks must be done. Run full suite once more; verify both PRD Success Metrics; confirm zero regression on existing test suite.",
+      "estimatedEffort": "medium",
+      "id": "MILESTONE-FINAL",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "PRD §2 Success Metric 'Zero new leaks' is a post-merge empirical check — operator runs `find ~/.claude/projects/<encoded-cwd>/ -name '*.jsonl' -newer <run-start>` after a synthetic loop run. NOT something this milestone can verify in CI; flag it as such in the progress file.\n\nPer protocol, if final-gate failures surface: trivial → fix inline; non-trivial → spawn FIX-xxx and BLOCKED.",
+      "passes": false,
+      "priority": 99,
+      "qualityDimensions": [
+        "Both PRD Success Metrics verified at the final gate",
+        "Zero-regression check against the existing runner test suite",
+        "Post-merge 'Zero new leaks' is operator-verified and flagged here as out-of-scope for CI"
+      ],
+      "requiresHuman": false,
+      "taskType": "milestone",
+      "timeoutSecs": 1800,
+      "title": "Final quality gate: ready for merge",
+      "touchesFiles": [
+        "src/loop_engine/runner.rs",
+        "src/loop_engine/claude.rs",
+        "tests/runner_cleanup.rs"
+      ]
+    }
+  ],
+  "version": "1.0"
+}

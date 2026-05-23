@@ -14,15 +14,7 @@
 //!    stdout captured to `RunnerResult::output`, stderr inherited. Mirrors
 //!    `ClaudeRunner` for the parts that don't differ between CLIs.
 //!
-//! 2. **`cleanup_title_artifact` is silently ignored**: the option exists on
-//!    `RunnerOpts` for Claude's ai-title-jsonl workaround (Claude 2.1.110).
-//!    Grok has no equivalent artifact, so the GrokRunner must NOT pass
-//!    `--session-id` or any related flag — and must NOT fail if the option
-//!    is true. Verified by checking that the printed argv from the mock
-//!    contains no `--session-id` token even when `cleanup_title_artifact:
-//!    true`.
-//!
-//! 3. **`PermissionMode::Dangerous`** emits a single permission-bypass flag.
+//! 2. **`PermissionMode::Dangerous`** emits a single permission-bypass flag.
 //!    The choice between `--permission-mode bypassPermissions` and
 //!    `--always-approve` is FEAT-003's call; this scaffold pins the test
 //!    against `--permission-mode bypassPermissions` (the Claude-side
@@ -169,47 +161,6 @@ fn grok_runner_returns_echoed_stdout_via_mock_binary() {
     );
 }
 
-// ── AC 10: cleanup_title_artifact is silently ignored ─────────────────────────
-
-/// AC 10: `cleanup_title_artifact: true` must NOT produce a `--session-id`
-/// flag on the grok command line. The option exists on `RunnerOpts` for
-/// Claude's ai-title-jsonl workaround; Grok has no equivalent artifact, so
-/// the runner must accept the option without complaint and omit the flag.
-///
-/// Verified by inspecting the echoed argv lines from the mock: no `argv:
-/// --session-id` line should appear regardless of the opt-in.
-#[test]
-fn grok_runner_silently_ignores_cleanup_title_artifact() {
-    let marker = "GROK_RUNNER_CLEANUP_MARKER_5BA153A7";
-    let script = make_argv_echo_script("cleanup_ignored", marker);
-    let perm = scoped_coding();
-
-    let result = dispatch_grok_with_mock(
-        &script,
-        "cleanup-probe",
-        &perm,
-        RunnerOpts {
-            cleanup_title_artifact: true,
-            ..RunnerOpts::default()
-        },
-    );
-    // script auto-removed by ScriptGuard
-    let r = result.expect("dispatch(Grok) returned Err");
-    assert_eq!(r.exit_code, 0, "expected clean exit, got {r:?}");
-    assert!(
-        !r.output.contains("argv: --session-id"),
-        "GrokRunner must NOT emit --session-id even when cleanup_title_artifact=true; \
-         the option is a Claude-only workaround. Got argv:\n{}",
-        r.output,
-    );
-    // Also confirm the runner didn't silently drop the prompt — it should still
-    // execute the binary and round-trip stdin.
-    assert!(
-        r.output.contains("PROMPT: cleanup-probe"),
-        "prompt must still round-trip even when cleanup_title_artifact is set",
-    );
-}
-
 // ── AC 11: PermissionMode::Dangerous emits the documented bypass flag ─────────
 
 /// AC 11: `PermissionMode::Dangerous` produces a single permission-bypass
@@ -276,9 +227,127 @@ fn grok_runner_dispatch_variant_is_reachable() {
 #[test]
 fn grok_runner_test_file_compiles() {
     // Touching the symbols the rest of the file depends on is enough.
-    let _opts = RunnerOpts {
-        cleanup_title_artifact: true,
-        ..RunnerOpts::default()
-    };
+    let _opts = RunnerOpts::default();
     assert_eq!(EXPECTED_DANGEROUS_FLAG, "--permission-mode");
+}
+
+// ── Replacement for the deleted silent-ignore test ────────────────────────────
+
+/// Serialize HOME mutations within this integration-test binary. HOME is
+/// process-global; concurrent mutation across tests in this file would race.
+/// Lock order with [`GROK_BINARY_MUTEX`]: HOME first, then GROK_BINARY.
+static HOME_MUTEX: Mutex<()> = Mutex::new(());
+
+/// Compute the Grok session dir mirroring
+/// `runner::grok_encoded_session_dir` (which is `pub(crate)` and so not
+/// reachable from integration tests). The encoding is well-defined: trim
+/// trailing slash, percent-encode, join under `<HOME>/.grok/sessions/`.
+fn expected_grok_session_dir(cwd: &std::path::Path, home: &std::path::Path) -> std::path::PathBuf {
+    let cwd_str = cwd.to_string_lossy();
+    let trimmed = cwd_str.trim_end_matches('/');
+    let encoded = urlencoding::encode(trimmed).into_owned();
+    home.join(".grok").join("sessions").join(encoded)
+}
+
+/// Mock grok that simulates Grok CLI persistence: creates a fixed UUID
+/// subdir under `$GROK_TEST_SESSION_DIR/` with a session.json file, then
+/// exits 0. Used by the post-spawn cleanup integration test below.
+fn make_session_creating_script(name: &str, uuid_str: &str) -> ScriptGuard {
+    let path = std::env::temp_dir().join(format!("task_mgr_grok_{name}.sh"));
+    {
+        let mut f = std::fs::File::create(&path).expect("create grok mock");
+        writeln!(f, "#!/bin/sh").unwrap();
+        writeln!(f, r#"mkdir -p "$GROK_TEST_SESSION_DIR/{uuid_str}""#).unwrap();
+        writeln!(
+            f,
+            r#"echo '{{}}' > "$GROK_TEST_SESSION_DIR/{uuid_str}/session.json""#
+        )
+        .unwrap();
+        writeln!(f, r#"cat > /dev/null"#).unwrap();
+        writeln!(f, "exit 0").unwrap();
+    }
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod grok mock");
+    ScriptGuard(path)
+}
+
+/// End-to-end verification that `dispatch(RunnerKind::Grok, ...)` invokes
+/// `GrokRunner::cleanup_session` after the child exits, and that the
+/// implementation removes the per-session directory at
+/// `<HOME>/.grok/sessions/<encoded-cwd>/<uuid>/`. Cleanup is the runner's
+/// responsibility (FEAT-002 trait + FEAT-005 impl + FEAT-006 dispatch
+/// wiring) — no per-call opt-in flag.
+#[test]
+fn grok_runner_cleanup_session_deletes_session_directory() {
+    let _home_guard = HOME_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _bin_guard = GROK_BINARY_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let fake_home = tmp.path().to_path_buf();
+    let fake_cwd = fake_home.join("workspace");
+    std::fs::create_dir_all(&fake_cwd).unwrap();
+
+    let session_dir = expected_grok_session_dir(&fake_cwd, &fake_home);
+    std::fs::create_dir_all(&session_dir).unwrap();
+
+    let uuid_str = "11111111-2222-4333-8444-555555555555";
+    let target_subdir = session_dir.join(uuid_str);
+
+    let script = make_session_creating_script("cleanup_session_e2e", uuid_str);
+
+    let prior_home = std::env::var_os("HOME");
+    let prior_session = std::env::var_os("GROK_TEST_SESSION_DIR");
+    // SAFETY: env mutations are process-global; serialized via HOME_MUTEX
+    // and GROK_BINARY_MUTEX (acquired above in that order).
+    unsafe {
+        std::env::set_var("HOME", &fake_home);
+        std::env::set_var("GROK_TEST_SESSION_DIR", &session_dir);
+        std::env::set_var("GROK_BINARY", script.as_os_str());
+    }
+
+    let perm = scoped_coding();
+    let result = task_mgr::loop_engine::runner::dispatch(
+        RunnerKind::Grok,
+        "cleanup-session-probe",
+        &perm,
+        RunnerOpts {
+            working_dir: Some(&fake_cwd),
+            ..RunnerOpts::default()
+        },
+    );
+
+    // Restore env before any assertions so a panic doesn't leak state.
+    unsafe {
+        std::env::remove_var("GROK_BINARY");
+        match prior_session {
+            Some(v) => std::env::set_var("GROK_TEST_SESSION_DIR", v),
+            None => std::env::remove_var("GROK_TEST_SESSION_DIR"),
+        }
+        match prior_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    let r = result.expect("dispatch(Grok) returned Err");
+    assert_eq!(r.exit_code, 0, "expected clean exit, got {r:?}");
+    // FEAT-004: pre/post dir diff captured the new UUID.
+    assert!(
+        r.session_id.is_some(),
+        "expected session_id to be captured from pre/post dir diff, got None",
+    );
+    // FEAT-005 + FEAT-006: dispatch invoked cleanup_session, which removed
+    // the per-session directory.
+    assert!(
+        !target_subdir.exists(),
+        "session subdir {:?} must be removed by post-spawn cleanup",
+        target_subdir,
+    );
+    // Defense-in-depth: the parent session dir must survive (cleanup must
+    // never widen to delete prompt_history.jsonl's parent).
+    assert!(
+        session_dir.exists(),
+        "encoded-cwd parent dir {:?} must NOT be removed (prompt_history.jsonl lives here)",
+        session_dir,
+    );
 }

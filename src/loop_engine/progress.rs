@@ -323,9 +323,6 @@ fn try_haiku_summary(
         crate::loop_engine::claude::SpawnOpts {
             model: Some(HAIKU_MODEL),
             db_dir,
-            // Text-only metadata pass — same leak profile as curate; clean up
-            // the ai-title jsonl after the child exits.
-            cleanup_title_artifact: true,
             // Bounded so a rate-limited or stalled summary can't hang the
             // loop. On timeout we fall through to the heuristic fallback.
             timeout: Some(timeout),

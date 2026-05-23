@@ -218,6 +218,20 @@ violation is loud (panic in a downstream layer) or whose cost is
 real (e.g., O(n) over a large collection). The drift sentinel is
 cheap and the failure is silent — use `assert!`.
 
+### Session artifact cleanup
+
+Every `LlmRunner` impl provides `cleanup_session(session_id, cwd)`; `dispatch`
+calls it unconditionally post-spawn when `RunnerResult.session_id.is_some()`.
+`NotFound` is silent success — the artifact may never have been written or may
+already be gone. Other errors emit one banner per process gated by
+`CLEANUP_WARN_ONCE` (`AtomicBool::swap(true, Relaxed)`) and never modify the
+spawn return value. Implementations derive the path deterministically from
+`(session_id, cwd)` and remove ONLY that path — never enumerate-and-sweep,
+never touch shared per-cwd dirs (e.g. Grok's `prompt_history.jsonl`).
+`WORKAROUND(claude-code-2.1.110-session-stub)` and
+`WORKAROUND(grok-cli-no-persistence-off)` markers tag the cleanup sites so
+future upstream fixes are a one-grep removal.
+
 ## Iteration pipeline (shared)
 
 Sequential (`run_iteration`) and parallel-wave (`run_slot_iteration` +

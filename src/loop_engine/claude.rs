@@ -15,10 +15,8 @@
 /// `RunnerOpts` / `RunnerResult` so all 10 existing call sites compile unchanged.
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
-
-use uuid::Uuid;
 
 use crate::error::TaskMgrResult;
 use crate::loop_engine::config::PermissionMode;
@@ -75,7 +73,6 @@ pub type ClaudeResult = RunnerResult;
 /// spawn_claude(&prompt, &permission_mode, SpawnOpts {
 ///     model: Some(HAIKU_MODEL),
 ///     db_dir: Some(db_dir),
-///     cleanup_title_artifact: true,
 ///     ..SpawnOpts::default()
 /// })
 /// ```
@@ -187,12 +184,6 @@ pub(crate) fn is_pty_read_eof(e: &std::io::Error) -> bool {
 ///
 /// When `opts.signal_flag` is `Some`, a watchdog thread polls the flag every 200ms.
 /// On signal detection: sends SIGTERM to child, waits up to 3s, then SIGKILL.
-///
-/// When `opts.cleanup_title_artifact` is `true`, a known UUID is injected via
-/// `--session-id` (before `-p`) and the corresponding `ai-title` jsonl file
-/// is removed synchronously after the child process exits. The deletion is
-/// best-effort and only targets the exact UUID-derived path, so unrelated
-/// session files are never touched.
 ///
 /// # Errors
 ///
@@ -731,59 +722,6 @@ pub(crate) fn cleanup_ghost_sessions() {
     }
 }
 
-/// Warn-once guard for `cleanup_title_artifact_sync` non-`NotFound` errors.
-/// Prevents a misconfigured `~/.claude/` mount from spraying one stderr line
-/// per spawn across a 50-batch curate run. The first error is printed in full
-/// (with path and error kind) so diagnosis is still possible; subsequent
-/// errors in the same process are silent.
-static CLEANUP_WARN_ONCE: AtomicBool = AtomicBool::new(false);
-
-/// Delete the ai-title jsonl that Claude wrote for the given session UUID.
-///
-/// Called synchronously after the child process exits, so the file is
-/// guaranteed to be present (or never written). The target path is
-/// computed deterministically from the cwd via `encoded_cwd_dir`; the
-/// projects directory is never enumerated, so unrelated session files
-/// (interactive sessions, concurrent curate batches, loop iterations)
-/// cannot be touched.
-///
-/// Best-effort: if HOME is unset or cwd resolution fails, we skip.
-/// `NotFound` from `remove_file` is silently ignored (the artifact may
-/// never have been written, e.g. if a future Claude release finally
-/// honors `--no-session-persistence`). The first non-`NotFound` error in
-/// a process is logged to stderr (rate-limited via `CLEANUP_WARN_ONCE`)
-/// so environmental misconfiguration surfaces without flooding output.
-pub(crate) fn cleanup_title_artifact_sync(session_id: Uuid, working_dir: Option<&Path>) {
-    let home = match std::env::var("HOME") {
-        Ok(h) if !h.is_empty() => PathBuf::from(h),
-        _ => return,
-    };
-    let cwd = match working_dir {
-        Some(p) => p.to_path_buf(),
-        None => match std::env::current_dir() {
-            Ok(p) => p,
-            Err(_) => return,
-        },
-    };
-    let target = encoded_cwd_dir(&cwd, &home).join(format!("{}.jsonl", session_id));
-    match std::fs::remove_file(&target) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            // swap returns the OLD value; only the first caller sees `false`
-            // and prints. All subsequent errors in this process stay silent.
-            if !CLEANUP_WARN_ONCE.swap(true, Ordering::Relaxed) {
-                eprintln!(
-                    "[curate cleanup] failed to delete ai-title artifact {}: {} \
-                     (further cleanup errors suppressed for this process)",
-                    target.display(),
-                    e
-                );
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -870,6 +808,7 @@ mod tests {
             timed_out: false,
             completion_killed: false,
             permission_denials: vec![],
+            session_id: None,
         };
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.output, "Hello world\n");
@@ -888,6 +827,7 @@ mod tests {
             timed_out: false,
             completion_killed: false,
             permission_denials: vec![],
+            session_id: None,
         };
         assert_eq!(result.exit_code, 137);
         assert!(result.output.is_empty());
@@ -936,6 +876,7 @@ mod tests {
             timed_out: false,
             completion_killed: false,
             permission_denials: vec![],
+            session_id: None,
         })
     }
 
@@ -1076,6 +1017,7 @@ mod tests {
             timed_out: false,
             completion_killed: false,
             permission_denials: vec![],
+            session_id: None,
         })
     }
 
@@ -1501,24 +1443,42 @@ mod tests {
         }
     }
 
-    /// AC: None model produces identical args to pre-Phase-2 behavior.
-    /// Exact string comparison to verify no extra args are added.
+    /// AC: None model adds no `--model` flag; remaining argv shape stays
+    /// stable. FEAT-003 unconditionally injects `--session-id <uuid>` before
+    /// `-p`, so the assertion compares the prefix (everything up to the
+    /// random UUID) and the trailing `-p <prompt>` separately.
     #[test]
-    fn test_spawn_claude_none_model_identical_to_pre_phase2() {
+    fn test_spawn_claude_none_model_omits_model_flag() {
         let result = spawn_claude_echo("my prompt text", None, None, false, &scoped_coding());
 
         let res = result.expect("echo should succeed");
         let output = res.output.trim();
 
-        // stream_json=false: exactly these args, no more
-        let expected = format!(
-            "--print --no-session-persistence --permission-mode dontAsk --allowedTools {} -p my prompt text",
+        let prefix = format!(
+            "--print --no-session-persistence --permission-mode dontAsk --allowedTools {} --session-id ",
             CODING_ALLOWED_TOOLS
         );
-        assert_eq!(
-            output, expected,
-            "None model with stream_json=false must produce exactly these args"
+        assert!(
+            output.starts_with(&prefix),
+            "expected argv to start with {prefix:?}, got: {output:?}"
         );
+        let suffix = " -p my prompt text";
+        assert!(
+            output.ends_with(suffix),
+            "expected argv to end with {suffix:?}, got: {output:?}"
+        );
+        assert!(
+            !output.contains("--model"),
+            "None model must not emit --model, got: {output:?}"
+        );
+
+        // The token between `--session-id` and `-p` must be a valid v4 UUID.
+        let sid_idx = output.find("--session-id ").expect("--session-id present");
+        let after = &output[sid_idx + "--session-id ".len()..];
+        let uuid_token = after.split_whitespace().next().expect("uuid token");
+        let parsed = uuid::Uuid::parse_str(uuid_token)
+            .unwrap_or_else(|e| panic!("UUID {uuid_token:?} must parse: {e}"));
+        assert_eq!(parsed.get_version(), Some(uuid::Version::Random));
     }
 
     /// Edge case: whitespace-only model string treated as None.
@@ -2945,18 +2905,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cleanup_title_artifact_false_omits_session_id() {
-        let result = spawn_claude_echo("p", None, None, false, &scoped_coding())
-            .expect("spawn should succeed");
-        assert!(
-            !result.output.contains("--session-id"),
-            "cleanup_title_artifact=false must NOT add --session-id; got: {}",
-            result.output
-        );
-    }
-
-    #[test]
-    fn test_cleanup_title_artifact_true_adds_valid_uuid_v4_session_id() {
+    fn test_spawn_claude_always_injects_session_id() {
         let _guard = CLAUDE_BINARY_MUTEX
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -2967,7 +2916,6 @@ mod tests {
             &PermissionMode::Dangerous,
             SpawnOpts {
                 model: Some(SONNET_MODEL),
-                cleanup_title_artifact: true,
                 ..SpawnOpts::default()
             },
         );
@@ -2979,7 +2927,7 @@ mod tests {
         let sid_idx = tokens
             .iter()
             .position(|t| t == "--session-id")
-            .expect("--session-id must be present when cleanup_title_artifact=true");
+            .expect("--session-id must always be present (FEAT-003: unconditional injection)");
         let p_idx = tokens
             .iter()
             .position(|t| t == "-p")
@@ -3078,13 +3026,12 @@ mod tests {
         }
     }
 
-    /// End-to-end: drive `cleanup_title_artifact_sync` directly against a
-    /// temp HOME. Proves the actual helper (not a reimplementation) deletes
-    /// the UUID-matched file and leaves an unrelated sibling alone. Future
-    /// changes to the path-encoding logic or the `remove_file` call will
-    /// break this test, which is the point.
+    /// End-to-end: drive `cleanup_claude_session_artifact` (now in runner.rs)
+    /// against a temp HOME. Proves the promoted helper deletes the UUID-matched
+    /// file and leaves an unrelated sibling alone. Future changes to the
+    /// path-encoding logic or the `remove_file` call will break this test.
     #[test]
-    fn test_cleanup_title_artifact_sync_deletes_target_preserves_bystander() {
+    fn test_cleanup_deletes_target_preserves_bystander() {
         let _guard = HOME_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
 
         let tmp = tempfile::TempDir::new().unwrap();
@@ -3104,27 +3051,29 @@ mod tests {
         std::fs::write(&target_path, "to-be-deleted").unwrap();
 
         let _home = HomeGuard::set(&fake_home);
-        cleanup_title_artifact_sync(target_uuid, Some(&fake_cwd));
+        crate::loop_engine::runner::cleanup_claude_session_artifact(target_uuid, Some(&fake_cwd))
+            .expect("cleanup should succeed on an existing, readable file");
 
         assert!(
             !target_path.exists(),
-            "cleanup_title_artifact_sync should have removed the UUID-matched target"
+            "cleanup_claude_session_artifact should have removed the UUID-matched target"
         );
         assert!(
             bystander.exists(),
-            "cleanup_title_artifact_sync must not touch a .jsonl with a different UUID"
+            "cleanup_claude_session_artifact must not touch a .jsonl with a different UUID"
         );
     }
 
-    /// HOME unset: helper must return silently without panicking or erroring.
+    /// HOME unset: helper must return `Ok(())` without panicking.
     #[test]
-    fn test_cleanup_title_artifact_sync_skips_when_home_unset() {
+    fn test_cleanup_skips_when_home_unset() {
         let _guard = HOME_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let previous = std::env::var_os("HOME");
         unsafe { std::env::remove_var("HOME") };
 
-        // Should be a no-op, no panic.
-        cleanup_title_artifact_sync(uuid::Uuid::new_v4(), None);
+        // Should be a no-op Ok, no panic.
+        crate::loop_engine::runner::cleanup_claude_session_artifact(uuid::Uuid::new_v4(), None)
+            .expect("HOME unset must be a silent no-op Ok");
 
         if let Some(v) = previous {
             unsafe { std::env::set_var("HOME", v) }
@@ -3132,10 +3081,9 @@ mod tests {
     }
 
     /// Target file never written (Claude crashed before writing ai-title):
-    /// `NotFound` must be swallowed, no panic, no stderr noise tested here
-    /// (we only assert the call returns normally).
+    /// `NotFound` must collapse to `Ok(())`, no panic.
     #[test]
-    fn test_cleanup_title_artifact_sync_missing_target_is_silent() {
+    fn test_cleanup_missing_target_is_silent() {
         let _guard = HOME_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
 
         let tmp = tempfile::TempDir::new().unwrap();
@@ -3145,8 +3093,11 @@ mod tests {
         // Deliberately do NOT create the projects dir or any target file.
 
         let _home = HomeGuard::set(&fake_home);
-        cleanup_title_artifact_sync(uuid::Uuid::new_v4(), Some(&fake_cwd));
-        // Test passes if we reach here without panic.
+        crate::loop_engine::runner::cleanup_claude_session_artifact(
+            uuid::Uuid::new_v4(),
+            Some(&fake_cwd),
+        )
+        .expect("missing target should be silent Ok, not Err");
     }
 
     // --- emit_prefixed_lines / write_prefixed_lines ---

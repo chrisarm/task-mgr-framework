@@ -59,6 +59,9 @@ tempfile = "3"
 regex = "1"
 hostname = "0.4.2"
 
+# URL percent-encoding (Grok session directory path construction)
+urlencoding = "2"
+
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
