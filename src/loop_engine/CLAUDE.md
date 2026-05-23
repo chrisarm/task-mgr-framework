@@ -497,10 +497,27 @@ problem" into "produce a failure record" must always emit at least
 one record, even if the upstream parsers all rejected the input** —
 otherwise downstream "is_empty" checks invert the safety guarantee.
 
+## Status mutations — use TaskLifecycle
+
+All `tasks.status` writes inside `loop_engine/` go through `TaskLifecycle`
+verbs. Do **not** add raw `UPDATE tasks SET status …` SQL here.
+
+| Context | Verb | Constructor |
+|---|---|---|
+| Loop `<task-status>` tag dispatch | `apply()` | `TaskLifecycle::with_run(conn, run_id).with_prd_sync(path, prefix)` |
+| Slot pre-claim (wave) | `try_claim()` | same connection, no run context needed |
+| Stuck in-progress reset (stale sweep, slot release) | `recover_in_progress_for_prefix()` | `TaskLifecycle::with_run(conn, run_id)` |
+| Consecutive-failure auto-block | `auto_block_after_failures()` | `TaskLifecycle::with_run(conn, run_id)` |
+| Overflow rung reset / provider promote | `resurrect_for_iteration()` | `TaskLifecycle::with_run(conn, run_id)` |
+
+For the full site→verb audit table and source-allowance matrix see
+[`src/lifecycle/CLAUDE.md`](../lifecycle/CLAUDE.md).
+
 ## Touchpoints
 
 | Concern | File | Symbol |
 | --- | --- | --- |
+| Status mutation SSoT | `src/lifecycle/mod.rs` | `TaskLifecycle`, six public verbs |
 | Slot path threading | `src/loop_engine/worktree.rs` | `merge_slot_branches_with_resolver` |
 | Halt threshold contract | `src/loop_engine/engine.rs` | `apply_merge_fail_reset_and_halt_check` |
 | Failed-merge struct | `src/loop_engine/engine.rs` | `FailedMerge`, `SYNTHETIC_DEADLOCK_SLOT` |

@@ -1339,7 +1339,7 @@ mod decay_tests {
 
     #[test]
     fn test_apply_decay_with_zero_threshold() {
-        let (_dir, conn) = setup_test_db();
+        let (_dir, mut conn) = setup_test_db();
         insert_test_task(&conn, "US-001", "Blocked Task", "blocked", 10);
 
         // Set the task as blocked at iteration 0
@@ -1357,7 +1357,7 @@ mod decay_tests {
         .unwrap();
 
         // With threshold 0, nothing should decay
-        let decayed = apply_decay(&conn, 0, false, None).unwrap();
+        let decayed = apply_decay(&mut conn, 0, false, None).unwrap();
         assert!(decayed.is_empty());
 
         // Verify task is still blocked
@@ -1371,7 +1371,7 @@ mod decay_tests {
 
     #[test]
     fn test_apply_decay_resets_blocked_task() {
-        let (_dir, conn) = setup_test_db();
+        let (_dir, mut conn) = setup_test_db();
         insert_test_task(&conn, "US-001", "Blocked Task", "blocked", 10);
 
         // Set the task as blocked at iteration 5
@@ -1389,7 +1389,7 @@ mod decay_tests {
         .unwrap();
 
         // Should decay the task
-        let decayed = apply_decay(&conn, 32, false, None).unwrap();
+        let decayed = apply_decay(&mut conn, 32, false, None).unwrap();
         assert_eq!(decayed.len(), 1);
         assert_eq!(decayed[0].0, "US-001");
         assert_eq!(decayed[0].1, "blocked");
@@ -1415,7 +1415,7 @@ mod decay_tests {
 
     #[test]
     fn test_apply_decay_resets_skipped_task() {
-        let (_dir, conn) = setup_test_db();
+        let (_dir, mut conn) = setup_test_db();
         insert_test_task(&conn, "US-002", "Skipped Task", "skipped", 10);
 
         // Set the task as skipped at iteration 10
@@ -1433,7 +1433,7 @@ mod decay_tests {
         .unwrap();
 
         // Should decay the task
-        let decayed = apply_decay(&conn, 32, false, None).unwrap();
+        let decayed = apply_decay(&mut conn, 32, false, None).unwrap();
         assert_eq!(decayed.len(), 1);
         assert_eq!(decayed[0].0, "US-002");
         assert_eq!(decayed[0].1, "skipped");
@@ -1449,7 +1449,7 @@ mod decay_tests {
 
     #[test]
     fn test_apply_decay_does_not_reset_irrelevant_tasks() {
-        let (_dir, conn) = setup_test_db();
+        let (_dir, mut conn) = setup_test_db();
         insert_test_task(&conn, "US-003", "Irrelevant Task", "irrelevant", 10);
 
         // Even if the task was blocked at iteration 0 and we set a very high iteration,
@@ -1460,7 +1460,7 @@ mod decay_tests {
         )
         .unwrap();
 
-        let decayed = apply_decay(&conn, 32, false, None).unwrap();
+        let decayed = apply_decay(&mut conn, 32, false, None).unwrap();
         assert!(decayed.is_empty());
 
         // Verify task is still irrelevant
@@ -1474,7 +1474,7 @@ mod decay_tests {
 
     #[test]
     fn test_apply_decay_does_not_reset_tasks_within_threshold() {
-        let (_dir, conn) = setup_test_db();
+        let (_dir, mut conn) = setup_test_db();
         insert_test_task(&conn, "US-004", "Recent Blocked", "blocked", 10);
 
         // Set the task as blocked at iteration 30
@@ -1491,7 +1491,7 @@ mod decay_tests {
         )
         .unwrap();
 
-        let decayed = apply_decay(&conn, 32, false, None).unwrap();
+        let decayed = apply_decay(&mut conn, 32, false, None).unwrap();
         assert!(decayed.is_empty());
 
         // Verify task is still blocked
@@ -1505,7 +1505,7 @@ mod decay_tests {
 
     #[test]
     fn test_apply_decay_adds_audit_note() {
-        let (_dir, conn) = setup_test_db();
+        let (_dir, mut conn) = setup_test_db();
         // Create task with existing notes
         conn.execute(
             "INSERT INTO tasks (id, title, status, priority, notes, blocked_at_iteration) VALUES ('US-005', 'Task with Notes', 'blocked', 10, 'Original notes', 0)",
@@ -1520,7 +1520,7 @@ mod decay_tests {
         )
         .unwrap();
 
-        apply_decay(&conn, 32, false, None).unwrap();
+        apply_decay(&mut conn, 32, false, None).unwrap();
 
         // Verify notes contain audit message
         let notes: String = conn
@@ -1783,7 +1783,7 @@ mod mixed_prd_selection_tests {
 
     #[test]
     fn test_decay_only_affects_p1_tasks() {
-        let (_tmp, conn) = setup_mixed_prd_db();
+        let (_tmp, mut conn) = setup_mixed_prd_db();
 
         insert_prd_task(&conn, "P2-US-BLOCKED", "blocked", 99);
 
@@ -1803,7 +1803,7 @@ mod mixed_prd_selection_tests {
         )
         .unwrap();
 
-        let decayed = apply_decay(&conn, 5, false, Some("P1")).unwrap();
+        let decayed = apply_decay(&mut conn, 5, false, Some("P1")).unwrap();
         let decayed_ids: Vec<&str> = decayed.iter().map(|(id, _)| id.as_str()).collect();
 
         assert!(decayed_ids.contains(&"P1-US-006"), "P1-US-006 should decay");

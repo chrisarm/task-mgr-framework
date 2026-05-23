@@ -1,6 +1,6 @@
 [package]
 name = "task-mgr"
-version = "0.1.3"
+version = "0.2.0-a"
 edition = "2024"
 description = "A standalone CLI tool for managing AI agent loop tasks with SQLite as working state"
 license = "MIT"
@@ -66,3 +66,14 @@ rstest = "0.24"
 # Used by reranker HTTP tests.
 mockito = "1"
 static_assertions = "1"
+# Byte-visible snapshot tests (PRD JSON sync stderr contract).
+expect-test = "1"
+
+# Stderr-capture test runs with `harness = false` because the default libtest
+# harness intercepts `eprintln!` via thread-local OUTPUT_CAPTURE, which would
+# defeat libc::dup2-based stderr capture. With the custom main, FD 2 reaches
+# our tempfile directly.
+[[test]]
+name = "lifecycle_stderr_contract"
+path = "tests/lifecycle_stderr_contract.rs"
+harness = false

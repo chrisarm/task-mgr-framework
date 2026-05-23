@@ -58,7 +58,9 @@ use crate::commands::complete as complete_cmd;
 use crate::db::schema::key_decisions as key_decisions_db;
 use crate::loop_engine::config::IterationOutcome;
 use crate::loop_engine::detection;
-use crate::loop_engine::engine::{IterationContext, apply_status_updates};
+use crate::loop_engine::engine::IterationContext;
+#[allow(deprecated)]
+use crate::loop_engine::engine::apply_status_updates;
 use crate::loop_engine::feedback;
 use crate::loop_engine::git_reconcile::check_git_for_task_completion;
 use crate::loop_engine::output_parsing::{parse_completed_tasks, scan_output_for_completed_tasks};
@@ -247,6 +249,10 @@ pub fn process_iteration_output(params: ProcessingParams<'_>) -> ProcessingOutco
 
     // Step 3: side-band `<task-status>` dispatch.
     let status_updates = detection::extract_status_updates(output);
+    // FEAT-010: `apply_status_updates` is a deprecated shim around
+    // `TaskLifecycle::apply`; this call site is documented in the prompt
+    // ("Common Wiring Failures") and stays during the Phase 1 migration.
+    #[allow(deprecated)]
     let status_results: Vec<(String, detection::TaskStatusChange, bool)> =
         if status_updates.is_empty() {
             Vec::new()

@@ -16,6 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
+use crate::lifecycle::TaskLifecycle;
 use crate::loop_engine::model;
 use crate::loop_engine::project_config::ProjectConfig;
 use crate::loop_engine::prompt::PromptResult;
@@ -373,7 +374,7 @@ fn read_task_model_from_db(conn: &Connection, task_id: &str) -> rusqlite::Result
 #[allow(clippy::too_many_arguments)]
 pub fn handle_prompt_too_long(
     ctx: &mut crate::loop_engine::engine::IterationContext,
-    conn: &Connection,
+    conn: &mut Connection,
     task_id: &str,
     effort: Option<&str>,
     effective_model: Option<&str>,
@@ -456,24 +457,17 @@ pub fn handle_prompt_too_long(
     //   - Rungs 1-3          → status='todo' + clear started_at (model unchanged)
     match action {
         RecoveryAction::Blocked => {
-            let _ = conn.execute(
-                "UPDATE tasks SET status = 'blocked' WHERE id = ?1 AND status = 'in_progress'",
-                rusqlite::params![task_id],
+            let _ = TaskLifecycle::new(conn).auto_block_after_failures(
+                task_id,
+                "prompt too long",
+                i64::from(iteration),
             );
         }
         RecoveryAction::FallbackToProvider { ref model, .. } => {
-            let _ = conn.execute(
-                "UPDATE tasks SET model = ?1, status = 'todo', started_at = NULL \
-                 WHERE id = ?2 AND status = 'in_progress'",
-                rusqlite::params![model, task_id],
-            );
+            let _ = TaskLifecycle::new(conn).resurrect_with_model_override(task_id, model);
         }
         _ => {
-            let _ = conn.execute(
-                "UPDATE tasks SET status = 'todo', started_at = NULL \
-                 WHERE id = ?1 AND status = 'in_progress'",
-                rusqlite::params![task_id],
-            );
+            let _ = TaskLifecycle::new(conn).resurrect_for_iteration(None, &[task_id]);
         }
     }
 

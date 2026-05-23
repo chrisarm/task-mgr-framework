@@ -13,6 +13,7 @@
 
 Module-level CLAUDE.md files (auto-loaded when files in the module are read):
 
+- [`src/lifecycle/CLAUDE.md`](src/lifecycle/CLAUDE.md) — status mutation SSoT, six lifecycle verbs, five hard invariants, FR-006 site→verb mapping table
 - [`src/loop_engine/CLAUDE.md`](src/loop_engine/CLAUDE.md) — overflow recovery, auto-review, parallel slots, merge-back conflict resolution, shared iteration pipeline
 - [`src/commands/curate/CLAUDE.md`](src/commands/curate/CLAUDE.md) — Ollama embeddings, reranker, dedup dismissals, session cleanup
 - [`src/commands/next/CLAUDE.md`](src/commands/next/CLAUDE.md) — soft-dep guard for milestone scheduling

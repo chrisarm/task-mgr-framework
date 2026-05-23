@@ -1,157 +1,96 @@
-//! Skip command implementation.
-//!
-//! The skip command allows intentionally deferring one or more tasks without marking
-//! them as failed. This is semantically different from failing - skipping is a
-//! deliberate deferral, not an error.
+//! Skip command — defer tasks without marking them failed.
 
 use rusqlite::Connection;
 use serde::Serialize;
 
+use crate::lifecycle::{TaskLifecycle, TransitionChange, TransitionIntent, TransitionSource};
 use crate::models::TaskStatus;
 use crate::{TaskMgrError, TaskMgrResult};
 
 /// Result of skipping a single task.
 #[derive(Debug, Clone, Serialize)]
 pub struct TaskSkipResult {
-    /// The task that was skipped
     pub task_id: String,
-    /// Previous status before skipping
     pub previous_status: TaskStatus,
-    /// Reason for skipping
     pub reason: String,
-    /// Whether the task was already skipped
     pub was_already_skipped: bool,
 }
 
 /// Result of skipping multiple tasks.
 #[derive(Debug, Clone, Serialize)]
 pub struct SkipResult {
-    /// Results for each task
     pub tasks: Vec<TaskSkipResult>,
-    /// Number of tasks skipped
     pub skipped_count: usize,
-    /// Run ID if tracking was enabled
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
 }
 
 /// Skip one or more tasks with a reason.
 ///
-/// # Arguments
-/// * `conn` - Database connection (mutable for transaction support)
-/// * `task_ids` - IDs of tasks to skip
-/// * `reason` - Reason for skipping (stored in notes)
-/// * `run_id` - Optional run ID for tracking
-///
-/// # Returns
-/// * `Ok(SkipResult)` - Information about skipped tasks
-/// * `Err(TaskMgrError)` - If any task not found or invalid state
-///
-/// # Atomicity
-/// When multiple task IDs are provided, all operations are wrapped in a
-/// transaction. Either all tasks are skipped, or none are (on error).
+/// Pre-validates all tasks before any writes to preserve all-or-nothing semantics.
 pub fn skip(
     conn: &mut Connection,
     task_ids: &[String],
     reason: &str,
     run_id: Option<&str>,
 ) -> TaskMgrResult<SkipResult> {
-    // Wrap all operations in a transaction for atomicity
-    let tx = conn.transaction()?;
-
-    let mut results = Vec::with_capacity(task_ids.len());
-
-    for task_id in task_ids {
-        let result = skip_single_task(&tx, task_id, reason, run_id)?;
-        results.push(result);
+    for id in task_ids {
+        ensure_skippable(conn, id)?;
     }
 
-    // Commit the transaction - all changes are atomic
-    tx.commit()?;
+    let intents: Vec<TransitionIntent> = task_ids
+        .iter()
+        .map(|id| TransitionIntent {
+            task_id: id.clone(),
+            change: TransitionChange::Skipped,
+            source: TransitionSource::Operator,
+            reason: Some(reason.to_string()),
+            fail_status: None,
+            audit_note: None,
+        })
+        .collect();
 
-    let skipped_count = results.len();
+    let mut lc = match run_id {
+        Some(rid) => TaskLifecycle::with_run(conn, rid),
+        None => TaskLifecycle::new(conn),
+    };
+    let outcomes = lc.apply(&intents);
+
+    let tasks: Vec<TaskSkipResult> = outcomes
+        .into_iter()
+        .zip(task_ids.iter())
+        .map(|(o, id)| TaskSkipResult {
+            task_id: id.clone(),
+            previous_status: o.previous.unwrap_or(TaskStatus::InProgress),
+            reason: reason.to_string(),
+            was_already_skipped: o.previous == Some(TaskStatus::Skipped),
+        })
+        .collect();
 
     Ok(SkipResult {
-        tasks: results,
-        skipped_count,
+        skipped_count: tasks.len(),
+        tasks,
         run_id: run_id.map(String::from),
     })
 }
 
-/// Skip a single task.
-fn skip_single_task(
-    conn: &Connection,
-    task_id: &str,
-    reason: &str,
-    run_id: Option<&str>,
-) -> TaskMgrResult<TaskSkipResult> {
-    // Query current task status
-    let (previous_status, current_notes): (String, Option<String>) = conn
-        .query_row(
-            "SELECT status, notes FROM tasks WHERE id = ?",
-            [task_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
+/// Validate that a task exists and is not Done before writing.
+fn ensure_skippable(conn: &Connection, id: &str) -> TaskMgrResult<()> {
+    let s: String = conn
+        .query_row("SELECT status FROM tasks WHERE id = ?", [id], |r| r.get(0))
         .map_err(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => TaskMgrError::task_not_found(task_id),
-            _ => TaskMgrError::from(e),
+            rusqlite::Error::QueryReturnedNoRows => TaskMgrError::task_not_found(id),
+            _ => e.into(),
         })?;
-
-    let previous_status: TaskStatus = previous_status.parse()?;
-
-    // Validate that task is in a skippable state
-    if previous_status == TaskStatus::Done {
+    if s.parse::<TaskStatus>()? == TaskStatus::Done {
         return Err(TaskMgrError::invalid_state(
             "Task",
-            task_id,
+            id,
             "todo or in_progress",
             "done",
         ));
     }
-
-    // Check if already skipped
-    let was_already_skipped = previous_status == TaskStatus::Skipped;
-
-    // Update notes with skip reason (append to existing notes if present)
-    let new_notes = match current_notes {
-        Some(existing) if !existing.is_empty() => {
-            format!("{}\n\n[SKIPPED] {}", existing, reason)
-        }
-        _ => format!("[SKIPPED] {}", reason),
-    };
-
-    // Update task status to skipped (do NOT increment error_count)
-    conn.execute(
-        "UPDATE tasks SET status = 'skipped', notes = ?, updated_at = datetime('now') WHERE id = ?",
-        rusqlite::params![new_notes, task_id],
-    )?;
-
-    // If run_id provided, update run_tasks if exists
-    if let Some(run_id) = run_id {
-        // Check if there's an active run_tasks entry
-        let run_task_exists: bool = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM run_tasks WHERE run_id = ? AND task_id = ?)",
-                rusqlite::params![run_id, task_id],
-                |row| row.get(0),
-            )
-            .unwrap_or(false);
-
-        if run_task_exists {
-            conn.execute(
-                "UPDATE run_tasks SET status = 'skipped', notes = ?, ended_at = datetime('now') \
-                 WHERE run_id = ? AND task_id = ?",
-                rusqlite::params![reason, run_id, task_id],
-            )?;
-        }
-    }
-
-    Ok(TaskSkipResult {
-        task_id: task_id.to_string(),
-        previous_status,
-        reason: reason.to_string(),
-        was_already_skipped,
-    })
+    Ok(())
 }
 
 /// Format skip result as human-readable text.
@@ -160,7 +99,6 @@ pub fn format_text(result: &SkipResult) -> String {
     let mut output = String::new();
 
     if result.tasks.len() == 1 {
-        // Single task output
         let task = &result.tasks[0];
         if task.was_already_skipped {
             output.push_str(&format!(
@@ -174,7 +112,6 @@ pub fn format_text(result: &SkipResult) -> String {
             ));
         }
     } else {
-        // Multiple tasks output
         output.push_str(&format!("Skipped {} task(s).\n", result.skipped_count));
         for task in &result.tasks {
             output.push_str(&format!(
@@ -421,7 +358,7 @@ mod tests {
         // Should fail because US-012 doesn't exist
         assert!(result.is_err());
 
-        // US-011 should be rolled back to todo (transaction failed)
+        // US-011 remains todo — pre-validation fails on US-012 before any writes
         let status: String = conn
             .query_row("SELECT status FROM tasks WHERE id = 'US-011'", [], |row| {
                 row.get(0)

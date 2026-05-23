@@ -513,6 +513,7 @@ pub fn init(
                 )
                 .unwrap_or_default();
             if current_status != "done" {
+                // LIFECYCLE-EXCEPTION: bootstrap ingest — see tasks/prd-tasklifecycle-extraction.md and docs/designs/coherence-refactoring.md §"TaskLifecycle Scope Decision"
                 tx.execute(
                     "UPDATE tasks SET status = 'done', updated_at = datetime('now') WHERE id = ?",
                     [&story.id],

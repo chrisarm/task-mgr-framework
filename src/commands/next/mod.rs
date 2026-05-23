@@ -101,6 +101,8 @@ use crate::TaskMgrError;
 use crate::TaskMgrResult;
 use crate::db::open_and_migrate as open_connection;
 use crate::learnings::recall::{RecallParams, recall_learnings};
+use crate::lifecycle::TaskLifecycle;
+use crate::models::TaskStatus;
 
 // Re-export public types
 pub use decay::{DecayWarning, apply_decay, find_decay_warnings};
@@ -140,7 +142,7 @@ pub fn next(
     task_prefix: Option<&str>,
 ) -> TaskMgrResult<NextResult> {
     // Open connection once and reuse for all operations
-    let conn = open_connection(dir)?;
+    let mut conn = open_connection(dir)?;
 
     // Step 1: Run task selection
     let selection = select_next_task(&conn, after_files, task_prefix)?;
@@ -183,7 +185,7 @@ pub fn next(
 
     // Step 2: Claim task if requested
     let claim_metadata = if claim {
-        Some(claim_task(&conn, &scored_task.task.id, run_id)?)
+        Some(claim_task(&mut conn, &scored_task.task.id, run_id)?)
     } else {
         None
     };
@@ -208,7 +210,7 @@ pub fn next(
 
 /// Claim a task by setting status to in_progress.
 fn claim_task(
-    conn: &Connection,
+    conn: &mut Connection,
     task_id: &str,
     run_id: Option<&str>,
 ) -> TaskMgrResult<ClaimMetadata> {
@@ -238,21 +240,14 @@ fn claim_task(
         }
     }
 
-    // Update task status to in_progress with optimistic locking
-    // Only claim if task is still in 'todo' status to prevent race conditions
-    let rows_affected = conn.execute(
-        "UPDATE tasks SET status = 'in_progress', started_at = datetime('now'), updated_at = datetime('now') WHERE id = ?1 AND status = 'todo'",
-        [task_id],
-    )?;
-
-    // If no rows affected, task was already claimed by another process
-    if rows_affected == 0 {
-        // Check if task exists and what its current status is
+    // Claim via TaskLifecycle::try_claim (FR-005: conditional-WHERE predicate is explicit).
+    // Only transitions from 'todo' — prevents claiming a task already in_progress or terminal.
+    let claimed = TaskLifecycle::new(conn).try_claim(task_id, &[TaskStatus::Todo])?;
+    if !claimed {
         let current_status: Result<String, _> =
             conn.query_row("SELECT status FROM tasks WHERE id = ?1", [task_id], |row| {
                 row.get(0)
             });
-
         return match current_status {
             Ok(status) => Err(TaskMgrError::invalid_state(
                 "task", task_id, "todo", &status,

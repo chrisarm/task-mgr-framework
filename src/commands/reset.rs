@@ -1,122 +1,77 @@
-//! Reset command implementation.
-//!
-//! The reset command returns task(s) to todo status for re-running.
+//! Reset — return task(s) to todo for re-running. Routes through
+//! `TaskLifecycle::apply` (PRD §6 Category A).
 
 use rusqlite::Connection;
 use serde::Serialize;
 
+use crate::lifecycle::{TaskLifecycle, TransitionChange, TransitionIntent, TransitionSource};
 use crate::models::TaskStatus;
 use crate::{TaskMgrError, TaskMgrResult};
 
-/// Result of resetting a single task.
 #[derive(Debug, Clone, Serialize)]
 pub struct TaskResetResult {
-    /// The task that was reset
     pub task_id: String,
-    /// Previous status before reset
     pub previous_status: TaskStatus,
-    /// New status (always 'todo')
     pub new_status: TaskStatus,
-    /// Audit note added
     pub audit_note: String,
 }
 
-/// Result of the reset command.
 #[derive(Debug, Clone, Serialize)]
 pub struct ResetResult {
-    /// Number of tasks reset
     pub tasks_reset: usize,
-    /// Details about each task reset
     pub tasks: Vec<TaskResetResult>,
-    /// Whether this was a reset-all operation
     pub was_reset_all: bool,
 }
 
-/// Reset a single task to todo status.
-///
-/// # Arguments
-/// * `conn` - Database connection
-/// * `task_id` - ID of the task to reset
-///
-/// # Returns
-/// * `Ok(TaskResetResult)` - Information about the reset task
-/// * `Err(TaskMgrError)` - If task not found or already in todo status
-fn reset_single_task(conn: &Connection, task_id: &str) -> TaskMgrResult<TaskResetResult> {
-    // Query current task status, notes, and error_count
-    let (status_str, current_notes, error_count): (String, Option<String>, i64) = conn
-        .query_row(
-            "SELECT status, notes, error_count FROM tasks WHERE id = ?",
-            [task_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .map_err(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => TaskMgrError::task_not_found(task_id),
-            _ => TaskMgrError::from(e),
-        })?;
-
-    let previous_status: TaskStatus = status_str.parse()?;
-
-    // Check if task is already in todo status
-    if previous_status == TaskStatus::Todo {
-        return Err(TaskMgrError::invalid_state(
-            "Task",
-            task_id,
-            "non-todo status",
-            "todo",
-        ));
-    }
-
-    // Build audit note
-    let audit_note = format!("[RESET] Reset to todo from {} status", previous_status);
-    let new_notes = match &current_notes {
-        Some(existing) if !existing.is_empty() => format!("{}\n\n{}", existing, audit_note),
-        _ => audit_note.clone(),
+/// Reset one task via the lifecycle service. The helper rejects same-status
+/// (Todo) resets and increments `error_count`; failures are re-typed back
+/// to legacy `NotFound` / `InvalidState` errors.
+fn reset_via_lifecycle(conn: &mut Connection, task_id: &str) -> TaskMgrResult<TaskResetResult> {
+    let intent = TransitionIntent {
+        task_id: task_id.to_string(),
+        change: TransitionChange::Reset,
+        source: TransitionSource::Operator,
+        reason: None,
+        fail_status: None,
+        audit_note: None,
     };
-
-    // Update task: status to todo, clear started_at/completed_at/last_error, increment error_count
-    conn.execute(
-        "UPDATE tasks SET
-            status = ?,
-            started_at = NULL,
-            completed_at = NULL,
-            last_error = NULL,
-            error_count = ?,
-            notes = ?,
-            updated_at = datetime('now')
-        WHERE id = ?",
-        rusqlite::params![
-            TaskStatus::Todo.as_db_str(),
-            error_count + 1,
-            new_notes,
-            task_id
-        ],
-    )?;
-
+    let outcome = {
+        let mut lc = TaskLifecycle::new(conn);
+        lc.apply(&[intent]).remove(0)
+    };
+    if !outcome.applied {
+        return Err(match outcome.previous {
+            None => TaskMgrError::task_not_found(task_id),
+            Some(TaskStatus::Todo) => {
+                TaskMgrError::invalid_state("Task", task_id, "non-todo status", "todo")
+            }
+            _ => {
+                let msg = match &outcome.reason {
+                    Some(crate::lifecycle::TransitionRejectReason::DispatchFailed(m)) => m.clone(),
+                    _ => "unknown lifecycle dispatch failure".to_string(),
+                };
+                TaskMgrError::lock_error_with_hint(
+                    format!("reset dispatch failed for {task_id}: {msg}"),
+                    "internal lifecycle dispatch error; check earlier stderr for details",
+                )
+            }
+        });
+    }
+    let previous_status = outcome.previous.unwrap_or(TaskStatus::Done);
     Ok(TaskResetResult {
         task_id: task_id.to_string(),
         previous_status,
         new_status: TaskStatus::Todo,
-        audit_note,
+        audit_note: format!("[RESET] Reset to todo from {previous_status} status"),
     })
 }
 
-/// Reset multiple tasks by their IDs.
-///
-/// # Arguments
-/// * `conn` - Database connection
-/// * `task_ids` - IDs of tasks to reset
-///
-/// # Returns
-/// * `Ok(ResetResult)` - Summary of reset operations
-/// * `Err(TaskMgrError)` - On first error encountered
-pub fn reset_tasks(conn: &Connection, task_ids: &[String]) -> TaskMgrResult<ResetResult> {
-    let mut tasks = Vec::new();
-
-    for task_id in task_ids {
-        let result = reset_single_task(conn, task_id)?;
-        tasks.push(result);
-    }
-
+/// Reset multiple tasks by their IDs. The first error short-circuits.
+pub fn reset_tasks(conn: &mut Connection, task_ids: &[String]) -> TaskMgrResult<ResetResult> {
+    let tasks = task_ids
+        .iter()
+        .map(|id| reset_via_lifecycle(conn, id))
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(ResetResult {
         tasks_reset: tasks.len(),
         tasks,
@@ -124,37 +79,20 @@ pub fn reset_tasks(conn: &Connection, task_ids: &[String]) -> TaskMgrResult<Rese
     })
 }
 
-/// Reset all non-todo tasks to todo status.
-///
-/// # Arguments
-/// * `conn` - Database connection
-///
-/// # Returns
-/// * `Ok(ResetResult)` - Summary of reset operations
-pub fn reset_all_tasks(conn: &Connection) -> TaskMgrResult<ResetResult> {
-    // Find all non-todo tasks
-    let mut stmt = conn.prepare(
-        "SELECT id FROM tasks WHERE status != 'todo' AND archived_at IS NULL ORDER BY priority ASC",
-    )?;
-
-    let task_ids: Vec<String> = stmt
-        .query_map([], |row| row.get(0))?
+/// Reset all non-todo tasks. Reads the candidate ID set first, then
+/// delegates each row through the lifecycle service.
+pub fn reset_all_tasks(conn: &mut Connection) -> TaskMgrResult<ResetResult> {
+    let ids: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT id FROM tasks WHERE status != 'todo' AND archived_at IS NULL ORDER BY priority ASC",
+        )?;
+        stmt.query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let tasks = ids
+        .iter()
+        .map(|id| reset_via_lifecycle(conn, id))
         .collect::<Result<Vec<_>, _>>()?;
-
-    if task_ids.is_empty() {
-        return Ok(ResetResult {
-            tasks_reset: 0,
-            tasks: Vec::new(),
-            was_reset_all: true,
-        });
-    }
-
-    let mut tasks = Vec::new();
-    for task_id in &task_ids {
-        let result = reset_single_task(conn, task_id)?;
-        tasks.push(result);
-    }
-
     Ok(ResetResult {
         tasks_reset: tasks.len(),
         tasks,
@@ -162,54 +100,36 @@ pub fn reset_all_tasks(conn: &Connection) -> TaskMgrResult<ResetResult> {
     })
 }
 
-/// Count non-todo tasks (for confirmation prompt).
-///
-/// # Arguments
-/// * `conn` - Database connection
-///
-/// # Returns
-/// * `Ok(usize)` - Number of non-todo tasks
 pub fn count_resettable_tasks(conn: &Connection) -> TaskMgrResult<usize> {
     let count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM tasks WHERE status != 'todo' AND archived_at IS NULL",
         [],
         |row| row.get(0),
     )?;
-
     Ok(count as usize)
 }
 
-/// Format reset result as human-readable text.
 #[must_use]
 pub fn format_text(result: &ResetResult) -> String {
     if result.tasks_reset == 0 {
-        if result.was_reset_all {
-            return "No tasks to reset (all tasks are already in todo status).\n".to_string();
+        return if result.was_reset_all {
+            "No tasks to reset (all tasks are already in todo status).\n".to_string()
         } else {
-            return "No tasks were reset.\n".to_string();
-        }
+            "No tasks were reset.\n".to_string()
+        };
     }
-
-    let mut output = String::new();
-
-    if result.was_reset_all {
-        output.push_str(&format!(
-            "Reset {} task(s) to todo status:\n",
-            result.tasks_reset
-        ));
+    let mut output = if result.was_reset_all {
+        format!("Reset {} task(s) to todo status:\n", result.tasks_reset)
     } else {
-        output.push_str(&format!("Reset {} task(s):\n", result.tasks_reset));
-    }
-
+        format!("Reset {} task(s):\n", result.tasks_reset)
+    };
     for task in &result.tasks {
         output.push_str(&format!(
             "  {} (was {}) → todo\n",
             task.task_id, task.previous_status
         ));
     }
-
     output.push_str("\nAll reset tasks are now available for selection.\n");
-
     output
 }
 
@@ -239,10 +159,10 @@ mod tests {
 
     #[test]
     fn test_reset_done_task() {
-        let (_dir, conn) = setup_test_db();
+        let (_dir, mut conn) = setup_test_db();
         insert_test_task(&conn, "US-001", "done", 0);
 
-        let result = reset_single_task(&conn, "US-001").unwrap();
+        let result = reset_via_lifecycle(&mut conn, "US-001").unwrap();
 
         assert_eq!(result.task_id, "US-001");
         assert_eq!(result.previous_status, TaskStatus::Done);
@@ -264,7 +184,7 @@ mod tests {
 
     #[test]
     fn test_reset_blocked_task() {
-        let (_dir, conn) = setup_test_db();
+        let (_dir, mut conn) = setup_test_db();
         insert_test_task(&conn, "US-002", "blocked", 2);
 
         // Set some values that should be cleared
@@ -274,7 +194,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = reset_single_task(&conn, "US-002").unwrap();
+        let result = reset_via_lifecycle(&mut conn, "US-002").unwrap();
 
         assert_eq!(result.previous_status, TaskStatus::Blocked);
         assert_eq!(result.new_status, TaskStatus::Todo);
@@ -300,10 +220,10 @@ mod tests {
 
     #[test]
     fn test_reset_in_progress_task() {
-        let (_dir, conn) = setup_test_db();
+        let (_dir, mut conn) = setup_test_db();
         insert_test_task(&conn, "US-003", "in_progress", 0);
 
-        let result = reset_single_task(&conn, "US-003").unwrap();
+        let result = reset_via_lifecycle(&mut conn, "US-003").unwrap();
 
         assert_eq!(result.previous_status, TaskStatus::InProgress);
         assert_eq!(result.new_status, TaskStatus::Todo);
@@ -311,10 +231,10 @@ mod tests {
 
     #[test]
     fn test_reset_skipped_task() {
-        let (_dir, conn) = setup_test_db();
+        let (_dir, mut conn) = setup_test_db();
         insert_test_task(&conn, "US-004", "skipped", 1);
 
-        let result = reset_single_task(&conn, "US-004").unwrap();
+        let result = reset_via_lifecycle(&mut conn, "US-004").unwrap();
 
         assert_eq!(result.previous_status, TaskStatus::Skipped);
         assert_eq!(result.new_status, TaskStatus::Todo);
@@ -322,10 +242,10 @@ mod tests {
 
     #[test]
     fn test_reset_irrelevant_task() {
-        let (_dir, conn) = setup_test_db();
+        let (_dir, mut conn) = setup_test_db();
         insert_test_task(&conn, "US-005", "irrelevant", 0);
 
-        let result = reset_single_task(&conn, "US-005").unwrap();
+        let result = reset_via_lifecycle(&mut conn, "US-005").unwrap();
 
         assert_eq!(result.previous_status, TaskStatus::Irrelevant);
         assert_eq!(result.new_status, TaskStatus::Todo);
@@ -333,10 +253,10 @@ mod tests {
 
     #[test]
     fn test_reset_todo_task_fails() {
-        let (_dir, conn) = setup_test_db();
+        let (_dir, mut conn) = setup_test_db();
         insert_test_task(&conn, "US-006", "todo", 0);
 
-        let result = reset_single_task(&conn, "US-006");
+        let result = reset_via_lifecycle(&mut conn, "US-006");
 
         assert!(result.is_err());
         match result {
@@ -352,9 +272,9 @@ mod tests {
 
     #[test]
     fn test_reset_nonexistent_task_fails() {
-        let (_dir, conn) = setup_test_db();
+        let (_dir, mut conn) = setup_test_db();
 
-        let result = reset_single_task(&conn, "NONEXISTENT");
+        let result = reset_via_lifecycle(&mut conn, "NONEXISTENT");
 
         assert!(result.is_err());
         match result {
@@ -365,14 +285,14 @@ mod tests {
 
     #[test]
     fn test_reset_preserves_existing_notes() {
-        let (_dir, conn) = setup_test_db();
+        let (_dir, mut conn) = setup_test_db();
         conn.execute(
             "INSERT INTO tasks (id, title, status, priority, notes, error_count) VALUES ('US-007', 'Test', 'done', 10, 'Existing notes', 0)",
             [],
         )
         .unwrap();
 
-        reset_single_task(&conn, "US-007").unwrap();
+        reset_via_lifecycle(&mut conn, "US-007").unwrap();
 
         let notes: String = conn
             .query_row("SELECT notes FROM tasks WHERE id = 'US-007'", [], |row| {
@@ -387,7 +307,7 @@ mod tests {
 
     #[test]
     fn test_reset_multiple_tasks() {
-        let (_dir, conn) = setup_test_db();
+        let (_dir, mut conn) = setup_test_db();
         insert_test_task(&conn, "US-010", "done", 0);
         insert_test_task(&conn, "US-011", "blocked", 1);
         insert_test_task(&conn, "US-012", "skipped", 0);
@@ -397,7 +317,7 @@ mod tests {
             "US-011".to_string(),
             "US-012".to_string(),
         ];
-        let result = reset_tasks(&conn, &task_ids).unwrap();
+        let result = reset_tasks(&mut conn, &task_ids).unwrap();
 
         assert_eq!(result.tasks_reset, 3);
         assert_eq!(result.tasks.len(), 3);
@@ -416,12 +336,12 @@ mod tests {
 
     #[test]
     fn test_reset_tasks_stops_on_error() {
-        let (_dir, conn) = setup_test_db();
+        let (_dir, mut conn) = setup_test_db();
         insert_test_task(&conn, "US-020", "done", 0);
         // US-021 doesn't exist, should fail
 
         let task_ids = vec!["US-020".to_string(), "US-021".to_string()];
-        let result = reset_tasks(&conn, &task_ids);
+        let result = reset_tasks(&mut conn, &task_ids);
 
         // First task should succeed, but overall should fail
         assert!(result.is_err());
@@ -439,12 +359,12 @@ mod tests {
 
     #[test]
     fn test_reset_all_tasks() {
-        let (_dir, conn) = setup_test_db();
+        let (_dir, mut conn) = setup_test_db();
         insert_test_task(&conn, "US-030", "done", 0);
         insert_test_task(&conn, "US-031", "blocked", 0);
         insert_test_task(&conn, "US-032", "todo", 0); // Should not be reset
 
-        let result = reset_all_tasks(&conn).unwrap();
+        let result = reset_all_tasks(&mut conn).unwrap();
 
         assert_eq!(result.tasks_reset, 2);
         assert!(result.was_reset_all);
@@ -462,11 +382,11 @@ mod tests {
 
     #[test]
     fn test_reset_all_when_all_todo() {
-        let (_dir, conn) = setup_test_db();
+        let (_dir, mut conn) = setup_test_db();
         insert_test_task(&conn, "US-040", "todo", 0);
         insert_test_task(&conn, "US-041", "todo", 0);
 
-        let result = reset_all_tasks(&conn).unwrap();
+        let result = reset_all_tasks(&mut conn).unwrap();
 
         assert_eq!(result.tasks_reset, 0);
         assert!(result.was_reset_all);

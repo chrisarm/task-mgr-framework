@@ -47,7 +47,10 @@ fn make_conn_with_tasks(task_ids: &[&str]) -> Connection {
             id TEXT PRIMARY KEY,
             title TEXT NOT NULL DEFAULT '',
             status TEXT NOT NULL DEFAULT 'todo',
-            started_at TEXT
+            started_at TEXT,
+            last_error TEXT,
+            blocked_at_iteration INTEGER,
+            updated_at TEXT
         )"#,
         [],
     )
@@ -123,7 +126,7 @@ fn four_slot_task_ids() -> [&'static str; 4] {
 fn slot_2_prompt_too_long_invokes_handler_with_slot_2_task_id() {
     let tmp = TempDir::new().expect("tempdir");
     let task_ids = four_slot_task_ids();
-    let conn = make_conn_with_tasks(&task_ids);
+    let mut conn = make_conn_with_tasks(&task_ids);
     let mut ctx = IterationContext::new(10);
 
     // The synthetic per-slot outcomes a wave dispatcher would observe.
@@ -150,7 +153,7 @@ fn slot_2_prompt_too_long_invokes_handler_with_slot_2_task_id() {
         if matches!(outcome, IterationOutcome::Crash(CrashType::PromptTooLong)) {
             let action = overflow::handle_prompt_too_long(
                 &mut ctx,
-                &conn,
+                &mut conn,
                 task_ids[slot_idx],
                 Some("xhigh"),
                 Some(SONNET_MODEL),
@@ -202,7 +205,7 @@ fn slot_2_prompt_too_long_invokes_handler_with_slot_2_task_id() {
 fn slot_2_recovery_keying_excludes_sibling_slot_task_ids() {
     let tmp = TempDir::new().expect("tempdir");
     let task_ids = four_slot_task_ids();
-    let conn = make_conn_with_tasks(&task_ids);
+    let mut conn = make_conn_with_tasks(&task_ids);
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_ids[2]);
 
@@ -210,7 +213,7 @@ fn slot_2_recovery_keying_excludes_sibling_slot_task_ids() {
     // effort_overrides AND model_overrides keying.
     let _r1 = overflow::handle_prompt_too_long(
         &mut ctx,
-        &conn,
+        &mut conn,
         task_ids[2],
         Some("xhigh"),
         Some(SONNET_MODEL),
@@ -230,7 +233,7 @@ fn slot_2_recovery_keying_excludes_sibling_slot_task_ids() {
     .unwrap();
     let _r2 = overflow::handle_prompt_too_long(
         &mut ctx,
-        &conn,
+        &mut conn,
         task_ids[2],
         Some("high"),
         Some(SONNET_MODEL),
@@ -316,13 +319,13 @@ fn slot_2_recovery_keying_excludes_sibling_slot_task_ids() {
 fn slot_index_present_in_jsonl_for_wave_event() {
     let tmp = TempDir::new().expect("tempdir");
     let task_ids = four_slot_task_ids();
-    let conn = make_conn_with_tasks(&task_ids);
+    let mut conn = make_conn_with_tasks(&task_ids);
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_ids[2]);
 
     let _ = overflow::handle_prompt_too_long(
         &mut ctx,
-        &conn,
+        &mut conn,
         task_ids[2],
         Some("xhigh"),
         Some(SONNET_MODEL),
@@ -370,14 +373,14 @@ fn slot_index_present_in_jsonl_for_wave_event() {
 fn slot_index_omitted_for_sequential_jsonl_event() {
     let tmp = TempDir::new().expect("tempdir");
     let task_id = "SEQ-OVERFLOW-001";
-    let conn = make_conn_with_tasks(&[task_id]);
+    let mut conn = make_conn_with_tasks(&[task_id]);
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_id);
 
     // Sequential overflow path — no slot context.
     let _ = overflow::handle_prompt_too_long(
         &mut ctx,
-        &conn,
+        &mut conn,
         task_id,
         Some("xhigh"),
         Some(SONNET_MODEL),
@@ -413,13 +416,13 @@ fn slot_index_omitted_for_sequential_jsonl_event() {
 fn sequential_prompt_too_long_unchanged() {
     let tmp = TempDir::new().expect("tempdir");
     let task_id = "SEQ-UNCHANGED-001";
-    let conn = make_conn_with_tasks(&[task_id]);
+    let mut conn = make_conn_with_tasks(&[task_id]);
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_id);
 
     let action = overflow::handle_prompt_too_long(
         &mut ctx,
-        &conn,
+        &mut conn,
         task_id,
         Some("xhigh"),
         Some(SONNET_MODEL),

@@ -1,211 +1,122 @@
-//! Status transition logic for the fail command.
-//!
-//! This module handles the core logic for transitioning tasks to failure states
-//! (blocked, skipped, irrelevant) including validation and database updates.
+//! Status transition logic for the fail command. Pre-validates the matrix
+//! transition (when `!force`), then routes the status mutation through
+//! `TaskLifecycle::apply` (TransitionChange::Failed). The lifecycle service
+//! owns the SQL, error_count increment, decay-iteration tracking, and
+//! per-status notes prefix; this module owns CLI-side validation hints.
 
 use rusqlite::Connection;
 
 use crate::cli::FailStatus;
+use crate::lifecycle::matrix;
+use crate::lifecycle::{TaskLifecycle, TransitionChange, TransitionIntent, TransitionSource};
 use crate::models::TaskStatus;
 use crate::{TaskMgrError, TaskMgrResult};
 
 use super::output::TaskFailResult;
 
 /// Fail a single task, updating its status and tracking information.
-///
-/// # Arguments
-/// * `conn` - Database connection
-/// * `task_id` - ID of the task to fail
-/// * `error` - Optional error message
-/// * `status` - Target failure status
-/// * `run_id` - Optional run ID for tracking
-/// * `force` - If true, skip transition validation
-///
-/// # Returns
-/// Result with task failure information or error.
 pub fn fail_single_task(
-    conn: &Connection,
+    conn: &mut Connection,
     task_id: &str,
     error: Option<&str>,
     status: FailStatus,
     run_id: Option<&str>,
     force: bool,
 ) -> TaskMgrResult<TaskFailResult> {
-    // Query current task status and error count
-    let (previous_status_str, current_error_count, current_notes): (String, i32, Option<String>) =
-        conn.query_row(
-            "SELECT status, error_count, notes FROM tasks WHERE id = ?",
+    let (previous_status_str, current_error_count): (String, i32) = conn
+        .query_row(
+            "SELECT status, error_count FROM tasks WHERE id = ?",
             [task_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map_err(|e| match e {
             rusqlite::Error::QueryReturnedNoRows => TaskMgrError::task_not_found(task_id),
             _ => TaskMgrError::from(e),
         })?;
-
     let previous_status: TaskStatus = previous_status_str.parse()?;
-
-    // Map FailStatus to TaskStatus
     let new_status = match status {
         FailStatus::Blocked => TaskStatus::Blocked,
         FailStatus::Skipped => TaskStatus::Skipped,
         FailStatus::Irrelevant => TaskStatus::Irrelevant,
     };
-
-    // Validate status transition
     validate_transition(task_id, previous_status, new_status, force)?;
 
-    // Increment error count
-    let new_error_count = current_error_count + 1;
-
-    // Build notes update with error prefix
-    let new_notes = build_notes(&current_notes, error, status);
-
-    // Get the current global iteration for decay tracking
-    let current_iteration: i64 = conn
-        .query_row(
-            "SELECT iteration_counter FROM global_state WHERE id = 1",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-
-    // Determine which iteration column to set based on target status
-    // Note: Irrelevant tasks don't decay, so we don't track their iteration
-    let (blocked_at, skipped_at) = match status {
-        FailStatus::Blocked => (Some(current_iteration), None::<i64>),
-        FailStatus::Skipped => (None::<i64>, Some(current_iteration)),
-        FailStatus::Irrelevant => (None::<i64>, None::<i64>), // Irrelevant tasks don't decay
+    let intent = TransitionIntent {
+        task_id: task_id.to_string(),
+        change: TransitionChange::Failed,
+        source: TransitionSource::Operator,
+        reason: error.map(String::from),
+        fail_status: Some(status),
+        audit_note: None,
     };
-
-    // Update task status, error count, last_error, and decay tracking columns
-    conn.execute(
-        "UPDATE tasks SET status = ?, error_count = ?, last_error = ?, notes = ?, \
-         blocked_at_iteration = COALESCE(?, blocked_at_iteration), \
-         skipped_at_iteration = COALESCE(?, skipped_at_iteration), \
-         updated_at = datetime('now') WHERE id = ?",
-        rusqlite::params![
-            new_status.to_string(),
-            new_error_count,
-            error,
-            new_notes,
-            blocked_at,
-            skipped_at,
-            task_id
-        ],
-    )?;
-
-    // If run_id provided, update run_tasks if exists
-    if let Some(rid) = run_id {
-        update_run_task(conn, rid, task_id, status, error)?;
+    let outcomes = {
+        let mut lc = match run_id {
+            Some(rid) => TaskLifecycle::with_run(conn, rid),
+            None => TaskLifecycle::new(conn),
+        };
+        lc.apply(&[intent])
+    };
+    let outcome = &outcomes[0];
+    if !outcome.applied
+        && let Some(crate::lifecycle::TransitionRejectReason::DispatchFailed(msg)) = &outcome.reason
+    {
+        return Err(TaskMgrError::lock_error_with_hint(
+            format!("fail dispatch failed for {task_id}: {msg}"),
+            "internal lifecycle dispatch error; check earlier stderr for details",
+        ));
     }
-
-    // Generate next steps hint based on status
-    let next_steps = generate_next_steps(status);
 
     Ok(TaskFailResult {
         task_id: task_id.to_string(),
         previous_status,
         new_status,
         error: error.map(String::from),
-        error_count: new_error_count,
-        next_steps,
+        error_count: current_error_count + 1,
+        next_steps: generate_next_steps(status),
     })
 }
 
-/// Validate that the status transition is allowed.
+/// Validate that the matrix transition is allowed. Lives at the CLI layer
+/// (rather than inside `TaskLifecycle::apply`) because the hint text
+/// references CLI affordances (`task-mgr next --claim`, `--force`).
 fn validate_transition(
     task_id: &str,
     previous_status: TaskStatus,
     new_status: TaskStatus,
     force: bool,
 ) -> TaskMgrResult<()> {
-    let can_transition = previous_status.can_transition_to(new_status);
-
-    // If invalid transition and not forcing, return error
-    if !can_transition && !force {
-        let valid_transitions = previous_status.valid_transitions();
-        let status_name = new_status.as_db_str();
-        let hint = if valid_transitions.is_empty() {
-            format!(
-                "Task '{}' is in '{}' status which is a terminal state. No transitions allowed.",
-                task_id, previous_status
-            )
-        } else if previous_status == TaskStatus::Todo {
-            format!(
-                "Task '{}' is in 'todo' status. Use 'task-mgr next --claim {}' to claim it first, then mark as {}. Or use --force to override.",
-                task_id, task_id, status_name
-            )
-        } else {
-            format!(
-                "Task '{}' is in '{}' status. Valid transitions: {}. Use --force to override.",
-                task_id,
-                previous_status,
-                valid_transitions.join(", ")
-            )
-        };
-        return Err(TaskMgrError::invalid_transition(
-            task_id,
-            previous_status.to_string(),
-            status_name,
-            hint,
-        ));
-    }
-
-    Ok(())
-}
-
-/// Build the updated notes field with status prefix.
-fn build_notes(current_notes: &Option<String>, error: Option<&str>, status: FailStatus) -> String {
-    let status_prefix = match status {
-        FailStatus::Blocked => "[BLOCKED]",
-        FailStatus::Skipped => "[SKIPPED]",
-        FailStatus::Irrelevant => "[IRRELEVANT]",
-    };
-
-    match (current_notes, error) {
-        (Some(existing), Some(err)) if !existing.is_empty() => {
-            format!("{}\n\n{} {}", existing, status_prefix, err)
-        }
-        (Some(existing), None) if !existing.is_empty() => {
-            format!("{}\n\n{}", existing, status_prefix)
-        }
-        (_, Some(err)) => format!("{} {}", status_prefix, err),
-        (_, None) => status_prefix.to_string(),
-    }
-}
-
-/// Update run_task entry if it exists.
-fn update_run_task(
-    conn: &Connection,
-    run_id: &str,
-    task_id: &str,
-    status: FailStatus,
-    error: Option<&str>,
-) -> TaskMgrResult<()> {
-    let run_task_exists: bool = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM run_tasks WHERE run_id = ? AND task_id = ?)",
-            rusqlite::params![run_id, task_id],
-            |row| row.get(0),
+    if force
+        || matrix::validate(
+            previous_status,
+            new_status,
+            matrix::TransitionSource::Operator,
         )
-        .unwrap_or(false);
-
-    if run_task_exists {
-        // Map to run_tasks status - use 'failed' for blocked, 'skipped' for skipped/irrelevant
-        let run_task_status = match status {
-            FailStatus::Blocked => "failed",
-            FailStatus::Skipped | FailStatus::Irrelevant => "skipped",
-        };
-
-        conn.execute(
-            "UPDATE run_tasks SET status = ?, notes = ?, ended_at = datetime('now') \
-             WHERE run_id = ? AND task_id = ?",
-            rusqlite::params![run_task_status, error.unwrap_or(""), run_id, task_id],
-        )?;
+        .is_ok()
+    {
+        return Ok(());
     }
-
-    Ok(())
+    let valid_transitions = previous_status.valid_transitions();
+    let status_name = new_status.as_db_str();
+    let hint = if valid_transitions.is_empty() {
+        format!(
+            "Task '{task_id}' is in '{previous_status}' status which is a terminal state. No transitions allowed."
+        )
+    } else if previous_status == TaskStatus::Todo {
+        format!(
+            "Task '{task_id}' is in 'todo' status. Use 'task-mgr next --claim {task_id}' to claim it first, then mark as {status_name}. Or use --force to override."
+        )
+    } else {
+        format!(
+            "Task '{task_id}' is in '{previous_status}' status. Valid transitions: {}. Use --force to override.",
+            valid_transitions.join(", ")
+        )
+    };
+    Err(TaskMgrError::invalid_transition(
+        task_id,
+        previous_status.to_string(),
+        status_name,
+        hint,
+    ))
 }
 
 /// Generate next steps hint based on failure status.
