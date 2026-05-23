@@ -377,7 +377,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": false,
       "notes": "Sequential iteration is the simpler of the two execution paths. Symbol set is smaller than wave_scheduler. The biggest risk is the order-before-resolve constraint for check_override_invalidation — read the existing code carefully before moving.",
-      "passes": false,
+      "passes": true,
       "priority": 7,
       "qualityDimensions": [
         "Byte-identical observable behavior on the sequential dogfood scenario",
@@ -419,7 +419,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": false,
       "notes": "Largest single function by line count (run_loop ~1300 lines). This extraction is mostly a copy-paste because run_loop is already a self-contained outer body. The risk is the surrounding helpers (signal_handler, on_run_completed, etc.) — confirm each is referenced only from run_loop's body before assuming it's exclusively orchestrator territory. If a helper is called from iteration.rs or wave_scheduler.rs, it stays in engine.rs (or moves to recovery.rs).",
-      "passes": false,
+      "passes": true,
       "priority": 8,
       "qualityDimensions": [
         "Public surface stability: `crate::loop_engine::run_loop` remains importable from the same path (via `pub use orchestrator::run_loop` in mod.rs)",
@@ -456,7 +456,7 @@
       "id": "FEAT-006",
       "modifiesBehavior": false,
       "notes": "This is the cleanup task after the carve. Run cargo doc to confirm rustdocs are valid. CLAUDE.md edits are the slowest part — there are ~40 Touchpoints rows and ~10 narrative references.",
-      "passes": false,
+      "passes": true,
       "priority": 9,
       "qualityDimensions": [
         "CLAUDE.md changes are line-level surgical, never wholesale rewrites — preserve the existing narrative's voice and ordering",
@@ -499,7 +499,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": false,
       "notes": "Use the rust-python-code-reviewer agent: `Agent(subagent_type='rust-python-code-reviewer', prompt='Review FEAT-001..006 of the engine orchestration carve. Focus: defense-layer preservation, public-surface stability, visibility ladder hygiene, no new dynamic dispatch, LIFECYCLE-EXCEPTION grep stays green.')`. Spawn each finding as CODE-FIX-xxx / WIRE-FIX-xxx with task-mgr add --stdin --depended-on-by REVIEW-001.",
-      "passes": false,
+      "passes": true,
       "priority": 13,
       "qualityDimensions": [
         "Review is reading + grepping, NOT implementing — fixes go into spawned CODE-FIX/WIRE-FIX tasks",
@@ -567,7 +567,8 @@
         "If any pre-existing test failure exists in the full suite that predates this PRD: fix inline (≤12 failures) OR spawn a single FIX-xxx task via task-mgr add --stdin --depended-on-by REVIEW-001 and BLOCKED until resolved (> 12 unrelated failures only)"
       ],
       "dependsOn": [
-        "REFACTOR-REVIEW-FINAL"
+        "REFACTOR-REVIEW-FINAL",
+        "REFACTOR-001"
       ],
       "description": "The PRD's exit criterion. Run: (1) Full unscoped quality gate (cargo fmt --check, cargo check, cargo clippy -D warnings, cargo test — entire workspace). (2) Dogfood gate: 10 iterations across 2 distinct PRDs (one sequential, one 2-slot wave) on the refactored code; diff the stderr capture and DB-final-state snapshot against the ANALYSIS-001 baselines. Any divergence is a hard fail. (3) Verify engine.rs is < 1500 lines (PRD success metric). (4) Verify all FR-008 public surface items resolve from their original import paths. Fix every failure, including pre-existing failures in the full suite (per the milestone protocol; trunk-green is the invariant).",
       "estimatedEffort": "high",
@@ -587,6 +588,30 @@
       "timeoutSecs": 3600,
       "title": "Final gate: full quality suite + dogfood gate (10 iterations × 2 PRDs)",
       "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": [
+        "Each nested test submodule relocated to the sibling module whose production symbols it exercises (slot tests->slot.rs, wave/merge/deadlock tests->wave_scheduler.rs, recovery/crash/escalation tests->recovery.rs, iteration tests->iteration.rs, engine-retained-symbol tests->engine.rs)",
+        "run_loop/lifecycle tests and shared run_loop scaffolding (insert_dual_prd_tasks, run_with_prefix, write_minimal_prd, seed_task_with_status) remain in orchestrator.rs",
+        "Total test count unchanged; no test logic/assertion altered (relocation only)",
+        "Source-grep integration tests (review_model_routing.rs, iteration_pipeline_parity.rs) still pass; any filename-based grep assertions updated to the new home",
+        "Global acceptance criteria green: cargo fmt --check, cargo check --all-targets, cargo clippy -D warnings, cargo test loop_engine; LIFECYCLE-EXCEPTION grep lint green",
+        "orchestrator.rs production code unchanged (diff touches only the test module boundary)"
+      ],
+      "description": "FEAT-005 moved engine.rs's entire inline `#[cfg(test)] mod tests` wholesale into orchestrator.rs to hit the <1500-line engine.rs metric and avoid splitting shared test helpers mid-carve. Result: orchestrator.rs is 5735 lines, ~3950 of which is a test module whose 102 tests mostly exercise OTHER modules' symbols (wave ~24, slot ~23, recovery cluster ~18, iteration ~11). A developer changing recovery.rs won't find its tests in recovery.rs. The test module is already organized into nested submodules by subject with subject-local helpers (make_slot/dummy_bundle for slot; make_wave_params/build_wave_params for wave; auto_block_after_failures/resurrect_for_iteration for recovery), so the split boundaries already exist. Redistribute each nested submodule into the owning sibling module's own `#[cfg(test)] mod tests`. Keep run_loop-specific tests AND the genuinely-shared run_loop scaffolding (insert_dual_prd_tasks, run_with_prefix, write_minimal_prd, seed_task_with_status) in orchestrator.rs. Tests for engine-retained symbols (apply_status_updates, resolve_effective_runner, IterationContext/data types) should move to engine.rs's test module. HIDDEN COUPLING: integration tests grep source files by filename (tests/review_model_routing.rs, tests/iteration_pipeline_parity.rs) — after relocating a test, verify any source-grep assertions still target the correct file, or update them. This is a pure test-relocation refactor: no production code or test logic changes, only test location. Verify byte-identical test BEHAVIOR (same assertions, same count) before/after.",
+      "estimatedEffort": "medium",
+      "id": "d4e04fae-REFACTOR-001",
+      "notes": "Spawned by d4e04fae-REFACTOR-REVIEW-FINAL. Pure test relocation — carve the test module along its existing nested-submodule seams. Do NOT 'improve' helpers or tests while moving. Watch the file-grep coupling in tests/.",
+      "passes": false,
+      "priority": 78,
+      "title": "Redistribute orchestrator.rs test module to owning sibling modules",
+      "touchesFiles": [
+        "src/loop_engine/orchestrator.rs",
+        "src/loop_engine/iteration.rs",
+        "src/loop_engine/wave_scheduler.rs",
+        "src/loop_engine/slot.rs",
+        "src/loop_engine/recovery.rs"
+      ]
     }
   ],
   "version": "1.0"
