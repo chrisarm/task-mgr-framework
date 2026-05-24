@@ -617,41 +617,32 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
     // Assembly: concatenate in display order
     // ============================================================
     // Display order: steering → guidance → hint → tools → source → deps → synergy →
-    //                task → learnings → completion → escalation → reorder instr → base prompt
-    let mut prompt = String::with_capacity(TOTAL_PROMPT_BUDGET);
-    let mut section_sizes: Vec<(&'static str, usize)> = Vec::new();
-    prompt.push_str(&steering_section);
-    section_sizes.push(("steering", steering_section.len()));
-    prompt.push_str(&guidance_section);
-    section_sizes.push(("session_guidance", guidance_section.len()));
-    prompt.push_str(&hint_section);
-    section_sizes.push(("reorder_hint", hint_section.len()));
-    prompt.push_str(&tool_awareness_section);
-    section_sizes.push(("tool_awareness", tool_awareness_section.len()));
-    prompt.push_str(&source_section);
-    section_sizes.push(("source", source_section.len()));
-    prompt.push_str(&dep_section);
-    section_sizes.push(("dependencies", dep_section.len()));
-    prompt.push_str(&synergy_section);
-    section_sizes.push(("synergy", synergy_section.len()));
-    prompt.push_str(&sibling_section);
-    section_sizes.push(("siblings", sibling_section.len()));
-    prompt.push_str(task_section);
-    section_sizes.push(("task", task_section.len()));
-    prompt.push_str(task_ops);
-    section_sizes.push(("task_ops", task_ops.len()));
-    prompt.push_str(&learnings_section);
-    section_sizes.push(("learnings", learnings_section.len()));
-    prompt.push_str(completion_section);
-    section_sizes.push(("completion", completion_section.len()));
-    prompt.push_str(escalation_section);
-    section_sizes.push(("escalation", escalation_section.len()));
-    prompt.push_str(reorder_instr_section);
-    section_sizes.push(("reorder_instr", reorder_instr_section.len()));
-    prompt.push_str(&key_decision_section);
-    section_sizes.push(("key_decision", key_decision_section.len()));
-    prompt.push_str(base_prompt_section);
-    section_sizes.push(("base_prompt", base_prompt_section.len()));
+    //                siblings → task → task_ops → learnings → completion → escalation →
+    //                reorder instr → key_decision → base prompt
+    let prompt = format!(
+        "{steering_section}{guidance_section}{hint_section}{tool_awareness_section}\
+         {source_section}{dep_section}{synergy_section}{sibling_section}\
+         {task_section}{task_ops}{learnings_section}{completion_section}\
+         {escalation_section}{reorder_instr_section}{key_decision_section}{base_prompt_section}"
+    );
+    let section_sizes: Vec<(&'static str, usize)> = vec![
+        ("steering", steering_section.len()),
+        ("session_guidance", guidance_section.len()),
+        ("reorder_hint", hint_section.len()),
+        ("tool_awareness", tool_awareness_section.len()),
+        ("source", source_section.len()),
+        ("dependencies", dep_section.len()),
+        ("synergy", synergy_section.len()),
+        ("siblings", sibling_section.len()),
+        ("task", task_section.len()),
+        ("task_ops", task_ops.len()),
+        ("learnings", learnings_section.len()),
+        ("completion", completion_section.len()),
+        ("escalation", escalation_section.len()),
+        ("reorder_instr", reorder_instr_section.len()),
+        ("key_decision", key_decision_section.len()),
+        ("base_prompt", base_prompt_section.len()),
+    ];
 
     Ok(Some(PromptResult {
         prompt,
