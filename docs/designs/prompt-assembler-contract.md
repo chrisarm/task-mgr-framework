@@ -83,11 +83,22 @@ pub struct PromptContext<'a> {
     pub permission_mode: &'a PermissionMode,
     pub steering_path: Option<&'a Path>,
     pub session_guidance: &'a str,
+    pub run_id: Option<&'a str>,
+    pub task_prefix: Option<&'a str>,
     // sequential-only inputs as Option<…>; slot leaves them None:
     pub reorder_hint: Option<&'a str>,
-    pub sibling_prds: Option<&'a [SiblingPrd]>,
-    pub synergy_cluster: Option<&'a SynergyCluster>,
+    pub batch_sibling_prds: Option<&'a [PathBuf]>,   // real input to build_sibling_prd_section
 }
+
+// NOTE (corrected after the md-to-json PRD review, 2026-05-23): an earlier draft
+// of this struct named phantom types `SiblingPrd` / `SynergyCluster` that do not
+// exist in the crate. The real signatures are:
+//   build_sibling_prd_section(conn, task_id, task_prefix, batch_sibling_prds: &[PathBuf])
+//   build_synergy_section(conn, task_id, run_id)  // currently a permanent no-op:
+//                                                  // returns String::new() (synergy
+//                                                  // relationships were dropped in favour
+//                                                  // of runtime file-overlap detection).
+// The synergy section migrates as a dead-but-present section behind a parity test.
 
 pub enum SectionKind { Critical, Trimmable { budget: usize } }
 
@@ -114,9 +125,25 @@ pub fn assemble(ctx: &PromptContext, roster: &[SectionSpec], total_budget: usize
 - **Single render site per section.** A section's text is produced in exactly
   one `render` fn; both paths reach it only via the roster. No section text is
   inlined in `sequential.rs`/`slot.rs` after migration.
-- **Roster = display order.** `assemble` emits sections in roster order,
-  regardless of render phase. Criticals are rendered first (budget gate) but
-  emitted in their roster position.
+- **Roster = display order, PER PATH.** `assemble` emits sections in roster
+  order, regardless of render phase. Criticals are rendered first (budget gate)
+  but emitted in their roster position. **Each path supplies its OWN ordered
+  `Vec<SectionSpec>`** — the slot roster is a set-SUBSET of the sequential roster
+  but is *independently ordered* (today slot emits `task` first, sequential emits
+  it mid-list; they do NOT share a relative order). The parity unit is therefore
+  the **per-section rendered text** (`Rendered.text == legacy builder output`)
+  PLUS **whole-prompt bytes per path** (each path's `assemble()` output ==
+  that path's own legacy whole-prompt output, because each roster preserves its
+  own legacy order). There is no single global section order; do not try to make
+  one roster reproduce both paths' byte layouts.
+- **Critical-overflow translation (sequential).** `assemble` reports criticals
+  overflow uniformly via `dropped_sections == ["CRITICAL"]`. The sequential
+  `build_prompt` caller MUST translate that back into
+  `Err(TaskMgrError::PromptOverflow{..})` so `overflow::handle_prompt_too_long`'s
+  five-rung ladder is unchanged. The slot caller keeps today's sentinel-in-bundle
+  behavior. The two paths have different overflow CONTRACTS even though `assemble`
+  signals overflow the same way — the translation lives in each caller, not in
+  `assemble`.
 - **Critical-overflow sentinel preserved.** If criticals alone exceed
   `total_budget`, return `Assembled` with empty `prompt` and
   `dropped_sections == ["CRITICAL"]` (today's `CRITICAL_OVERFLOW_SENTINEL`).
