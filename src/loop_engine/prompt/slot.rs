@@ -24,11 +24,22 @@ use std::path::{Path, PathBuf};
 use rusqlite::Connection;
 
 use crate::loop_engine::config::PermissionMode;
+use crate::loop_engine::prompt::assembler::{PromptContext, SectionSpec, assemble};
 use crate::loop_engine::prompt::core;
-use crate::loop_engine::prompt_sections::dependencies::build_dependency_section;
+use crate::loop_engine::prompt_sections::dependencies::dependencies_spec;
 use crate::loop_engine::prompt_sections::task_ops::task_ops_section;
 use crate::loop_engine::prompt_sections::{truncate_to_budget, try_fit_section};
 use crate::models::Task;
+
+/// The slot path's ordered section roster (CONTRACT-001).
+///
+/// A set-subset of [`super::sequential::sequential_roster`] but independently
+/// ordered. Today only `dependencies` is migrated; the other sections remain
+/// inlined in [`build_prompt`] and join the roster at their slot display
+/// positions as the migration proceeds.
+pub fn slot_roster() -> Vec<SectionSpec> {
+    vec![dependencies_spec()]
+}
 
 /// Byte budget for the source-context section in slot prompts.
 const SOURCE_CONTEXT_BUDGET: usize = 2000;
@@ -277,13 +288,32 @@ pub fn build_prompt(
         &mut dropped_sections,
     );
 
-    let dep_section_raw = build_dependency_section(conn, &task.id);
-    let dep_section = try_fit_section(
-        dep_section_raw,
-        "dependencies",
-        &mut remaining,
-        &mut dropped_sections,
-    );
+    // Dependencies: migrated to the data-driven assembler (CONTRACT-001,
+    // FEAT-002). Assembled via the slot roster within the running budget; the
+    // surrounding sections stay inlined for now. The `&Connection` lives only
+    // in this main-thread `PromptContext`, which is dropped before the bundle
+    // crosses the worker boundary — no `&Connection` is ever stored in the
+    // `Send`-safe `SlotPromptBundle`.
+    let dep_ctx = PromptContext {
+        conn,
+        task,
+        task_files: &task_files,
+        project_root: &params.project_root,
+        base_prompt_path: &params.base_prompt_path,
+        permission_mode: &params.permission_mode,
+        steering_path: params.steering_path,
+        session_guidance: params.session_guidance,
+        run_id: None,
+        task_prefix: None,
+        reorder_hint: None,
+        batch_sibling_prds: None,
+    };
+    let dep_assembled = assemble(&dep_ctx, &slot_roster(), remaining);
+    // `assemble` fit the section within `remaining`, so the subtraction cannot
+    // underflow — identical bookkeeping to the legacy `try_fit_section` path.
+    let dep_section = dep_assembled.prompt;
+    remaining -= dep_section.len();
+    dropped_sections.extend(dep_assembled.dropped_sections);
 
     let steering_section_raw = params
         .steering_path

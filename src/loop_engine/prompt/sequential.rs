@@ -22,8 +22,11 @@ use crate::commands::next;
 use crate::error::{TaskMgrError, TaskMgrResult};
 use crate::loop_engine::config::PermissionMode;
 use crate::loop_engine::context;
+use crate::loop_engine::prompt::assembler::{PromptContext, SectionSpec, assemble};
 use crate::loop_engine::prompt::core;
+#[cfg(test)]
 use crate::loop_engine::prompt_sections::dependencies::build_dependency_section;
+use crate::loop_engine::prompt_sections::dependencies::dependencies_spec;
 use crate::loop_engine::prompt_sections::escalation::build_escalation_section;
 use crate::loop_engine::prompt_sections::learnings::{
     build_learnings_section, record_shown_learnings,
@@ -34,6 +37,20 @@ use crate::loop_engine::prompt_sections::synergy::{
 };
 use crate::loop_engine::prompt_sections::task_ops::task_ops_section;
 use crate::loop_engine::prompt_sections::{truncate_to_budget, try_fit_section};
+use crate::models::Task;
+
+/// The sequential path's ordered section roster (CONTRACT-001).
+///
+/// Each entry is rendered via [`assemble`] in display order. Today only the
+/// `dependencies` section is migrated; the remaining sections are still inlined
+/// in [`build_prompt`] and will be appended here at their display positions as
+/// the migration proceeds. This roster is independent from
+/// [`super::slot::slot_roster`] — the two paths share render fns but order their
+/// sections differently (slot emits `task` first, sequential mid-list), so each
+/// path owns its own `Vec<SectionSpec>`.
+pub fn sequential_roster() -> Vec<SectionSpec> {
+    vec![dependencies_spec()]
+}
 
 /// Byte budget for enriched task context in the prompt.
 const TASK_CONTEXT_BUDGET: usize = 4000;
@@ -285,13 +302,35 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
         &mut dropped_sections,
     );
 
-    let dep_section = build_dependency_section(params.conn, &task_output.id);
-    let dep_section = try_fit_section(
-        dep_section,
-        "Dependency Summaries",
-        &mut remaining,
-        &mut dropped_sections,
-    );
+    // Dependencies: migrated to the data-driven assembler (CONTRACT-001,
+    // FEAT-002). A single-section roster is assembled within the running
+    // budget; the surrounding sections remain inlined until later migration
+    // steps move them onto the roster too. `dep_ctx_task` is a lightweight
+    // carrier so the assembler's `&Task`-based [`PromptContext`] can be built
+    // from the `NextTaskOutput` this path selects — the dependencies render fn
+    // reads only `task.id`.
+    let dep_ctx_task = Task::new(task_output.id.as_str(), task_output.title.as_str());
+    let dep_ctx = PromptContext {
+        conn: params.conn,
+        task: &dep_ctx_task,
+        task_files: &task_output.files,
+        project_root: params.project_root,
+        base_prompt_path: params.base_prompt_path,
+        permission_mode: params.permission_mode,
+        steering_path: params.steering_path,
+        session_guidance: params.session_guidance,
+        run_id: params.run_id,
+        task_prefix: params.task_prefix,
+        reorder_hint: params.reorder_hint,
+        batch_sibling_prds: Some(params.batch_sibling_prds),
+    };
+    let dep_assembled = assemble(&dep_ctx, &sequential_roster(), remaining);
+    // `assemble` already fit the section within `remaining`, so the emitted
+    // bytes never exceed it (subtraction cannot underflow). This mirrors the
+    // legacy `try_fit_section` budget bookkeeping exactly.
+    let dep_section = dep_assembled.prompt;
+    remaining -= dep_section.len();
+    dropped_sections.extend(dep_assembled.dropped_sections);
 
     let synergy_section = build_synergy_section(params.conn, &task_output.id, params.run_id);
     let synergy_section = try_fit_section(
