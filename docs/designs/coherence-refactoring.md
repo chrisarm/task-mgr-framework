@@ -91,17 +91,24 @@ Carve the 9k-line `engine.rs` along the seams that already partially exist:
 
 The goal is that cross-cutting concerns (new monitoring, new recovery hook, new progress event) have one obvious registration or call site instead of "search the 9k-line file for the three places this also has to happen."
 
-### 3. Data-Driven Prompt Construction
+### 3. Data-Driven Prompt Construction ✅ COMPLETE (Phase 2 / FEAT-002 through FEAT-007, landed 2026-05-24)
 
-The current shape is `prompt/core.rs` (shared section helpers) plus two compositions in `prompt/sequential.rs` and `prompt/slot.rs`. The hazard is the *manual wiring rule*, not three forked builders. The fix is incremental:
+Both `prompt/sequential.rs` and `prompt/slot.rs` now consume sections through a
+single shared `prompt/assembler.rs` (approach C: fn-pointer `SectionSpec` table +
+one `assemble()` function). Each path supplies its own ordered `Vec<SectionSpec>`
+roster; the slot roster is a set-subset of the sequential roster but is
+independently ordered.
 
-- Introduce a single `PromptAssembler` (or `PromptBuilder` trait) + registry of sections in `prompt_sections/`.
-- `prompt_sections/` modules implement a small `PromptSection` trait (or are listed in one registration table).
-- Both sequential and slot execution paths use the same assembler.
-- Adding a new section (or modifying an existing one) is a single-site change + a registration line.
-- The current human-enforced rule ("new sections MUST also be wired through `slot`," documented in `prompt/mod.rs`) becomes a mechanical or test-enforced property.
+The hand-enforced rule ("new sections MUST also be wired through `slot` — there is
+no second source of truth") that previously lived in `prompt/mod.rs` and
+`src/loop_engine/CLAUDE.md` has been retired. A roster-completeness test in
+`tests/prompt_assembler_parity.rs` now asserts every known section name appears in
+`sequential_roster()`, failing with the missing name rather than a generic count
+mismatch — recovering exhaustiveness as a CI property.
 
-Because `core.rs` already factors most helpers, this is more a *registration table* change than a rewrite — pilot one section through the assembler first, then bulk-migrate.
+The migration was done section-by-section behind byte-parity tests (each section's
+`assemble()` output == the live legacy builder output). The authoritative interface
+contract is `docs/designs/prompt-assembler-contract.md` (§CONTRACT-001).
 
 ### 4. Strengthen Learnings Retrieval Abstraction
 

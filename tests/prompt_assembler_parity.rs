@@ -1338,6 +1338,59 @@ fn sequential_reorder_instr_render_matches_legacy() {
     assert!(assembled.dropped_sections.is_empty());
 }
 
+// ============================================================
+// Roster-completeness test (FEAT-007)
+// ============================================================
+//
+// The enumerated set of section names that MUST appear in the sequential
+// roster. This is the canonical "what sections does the sequential prompt
+// have?" known-set — NOT a hardcoded count. Adding a new section requires:
+//   1. A `*_spec()` constructor and `SectionSpec` in the appropriate module.
+//   2. An entry in `sequential_roster()` in `prompt/sequential.rs`.
+//   3. An entry here.
+// The test below catches step 2 or 3 being missed; it names the missing
+// section rather than reporting a generic count mismatch.
+const SEQUENTIAL_KNOWN_SECTIONS: &[&str] = &[
+    "steering",
+    "session_guidance",
+    "reorder_hint",
+    "tool_awareness",
+    "source",
+    "dependencies",
+    "synergy",
+    "siblings",
+    "task",
+    "task_ops",
+    "learnings",
+    "completion",
+    "escalation",
+    "reorder_instr",
+    "key_decision",
+    "base_prompt",
+];
+
+/// Roster-completeness test: every name in [`SEQUENTIAL_KNOWN_SECTIONS`] must
+/// appear in the sequential roster returned by [`sequential_roster`].
+///
+/// Fails naming the first missing section, not with a generic count mismatch.
+/// This replaces the hand-enforced "any new section added to the sequential
+/// prompt must also be wired into slot — there is no second source of truth"
+/// rule that previously lived in `prompt/mod.rs` and
+/// `src/loop_engine/CLAUDE.md`. The mechanical check is now a test-time gate.
+#[test]
+fn sequential_roster_contains_all_known_sections() {
+    let roster = sequential_roster();
+    let roster_names: Vec<&str> = roster.iter().map(|s| s.name).collect();
+    for expected in SEQUENTIAL_KNOWN_SECTIONS {
+        assert!(
+            roster_names.contains(expected),
+            "sequential_roster() is missing the {:?} section — add it to \
+             `sequential_roster()` or remove it from `SEQUENTIAL_KNOWN_SECTIONS`",
+            expected,
+        );
+    }
+}
+
 /// Clone a `PromptContext` by copying its (all-`Copy`-or-shared-ref) fields.
 /// Used to vary a single field (e.g. `resolved_model`) in a test without
 /// re-typing every field.

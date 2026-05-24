@@ -255,9 +255,11 @@ place; both call sites pick it up).
 three-builder layout (`core` / `sequential` / `slot`) plus the main-thread
 bundle rule — slot prompts must be built on the main thread before
 `thread::spawn` because `rusqlite::Connection` is `!Send`. A compile-time
-`Send` assertion on `SlotPromptBundle` enforces this; sections added to the
-sequential prompt MUST also be wired through the wave builder so the two
-paths cannot drift again.
+`Send` assertion on `SlotPromptBundle` enforces this. Both paths consume
+sections through the shared assembler (`prompt/assembler.rs`); a
+roster-completeness test in `tests/prompt_assembler_parity.rs` enforces that
+every known section appears in the sequential roster (the hand-enforced wiring
+rule has been retired).
 
 **Out of scope for the pipeline** (kept at the call sites): wrapper-commit,
 external-git reconciliation, post-merge-back slot completion reconciliation
