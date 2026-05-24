@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::Connection;
 
 use crate::loop_engine::config::PermissionMode;
+pub use crate::loop_engine::prompt::assembler::CRITICAL_OVERFLOW_SENTINEL;
 use crate::loop_engine::prompt::assembler::{
     PromptContext, Rendered, SectionKind, SectionSpec, assemble_criticals, fit_trimmable,
 };
@@ -172,12 +173,6 @@ const BASE_PROMPT_BUDGET: usize = 16_000;
 /// and consumes a wasted wave slot before the per-slot overflow ladder
 /// rescues it.
 const TOTAL_PROMPT_BUDGET: usize = 80_000;
-
-/// Sentinel name pushed into `SlotPromptBundle.dropped_sections` when the
-/// critical-section total alone exceeds `TOTAL_PROMPT_BUDGET`. Callers
-/// should treat a bundle with this entry as too large to attempt and skip
-/// the slot rather than dispatch a malformed prompt.
-pub const CRITICAL_OVERFLOW_SENTINEL: &str = "CRITICAL";
 
 /// Parameters required to assemble a slot-mode prompt on the main thread.
 ///
