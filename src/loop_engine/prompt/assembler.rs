@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 
+use crate::commands::next::output::NextTaskOutput;
 use crate::loop_engine::config::PermissionMode;
 use crate::loop_engine::prompt_sections::try_fit_section;
 use crate::models::Task;
@@ -59,6 +60,12 @@ pub struct PromptContext<'a> {
     /// Sequential-only: sibling PRD paths for `build_sibling_prd_section`.
     /// Slot leaves this `None`.
     pub batch_sibling_prds: Option<&'a [PathBuf]>,
+    /// Sequential-only: the selected task as a [`NextTaskOutput`], the source
+    /// for the sequential task-envelope render (which formats it via
+    /// `core::format_next_task_json` and truncates to `TASK_CONTEXT_BUDGET`).
+    /// The slot path renders the envelope from [`Self::task`] + [`Self::task_files`]
+    /// instead and leaves this `None`.
+    pub next_task_output: Option<&'a NextTaskOutput>,
 }
 
 /// How a section participates in budget accounting.
@@ -86,7 +93,10 @@ pub struct Rendered {
 /// One entry in a path's roster: a stable name, its budget kind, and the
 /// render fn. The render fn is a plain `fn` pointer (no captures) so a
 /// `SectionSpec` is `Send` for free — a roster may be referenced while
-/// building a `SlotPromptBundle`.
+/// building a `SlotPromptBundle`. `Copy` lets a builder derive sub-rosters
+/// (e.g. criticals-only) from a single declarative roster without re-listing
+/// specs.
+#[derive(Clone, Copy)]
 pub struct SectionSpec {
     /// Stable id; matches the keys used in [`Assembled::section_sizes`].
     pub name: &'static str,
@@ -108,6 +118,33 @@ pub struct Assembled {
     /// contribute nothing, so the UCB bandit is never credited for learnings
     /// the agent never saw).
     pub shown_learning_ids: Vec<i64>,
+}
+
+impl Assembled {
+    /// Borrow the rendered text of a single section by `name`, sliced out of
+    /// the concatenated [`Self::prompt`] using the [`Self::section_sizes`]
+    /// offsets. Returns `""` when the name is absent.
+    ///
+    /// Used by builders that are mid-migration: only a subset of sections is on
+    /// the roster, so the concatenated `prompt` cannot be spliced into the
+    /// final (interleaved) layout wholesale — each migrated section's bytes are
+    /// pulled out here and re-stitched at its legacy display position alongside
+    /// the still-inlined sections. Because `section_sizes` is built in lockstep
+    /// with `prompt` (same roster order), the cumulative offsets land exactly on
+    /// section boundaries, so the slice is always valid UTF-8. On a critical
+    /// overflow `prompt` is empty while `section_sizes` is populated; `.get`
+    /// then yields `""` rather than panicking.
+    #[must_use]
+    pub fn section_text(&self, name: &str) -> &str {
+        let mut offset = 0usize;
+        for (n, len) in &self.section_sizes {
+            if *n == name {
+                return self.prompt.get(offset..offset + len).unwrap_or("");
+            }
+            offset += len;
+        }
+        ""
+    }
 }
 
 // CONTRACT-001: `SectionSpec` must be `Send` so a roster can be referenced
@@ -138,9 +175,22 @@ pub fn assemble(ctx: &PromptContext, roster: &[SectionSpec], total_budget: usize
     }
 
     if critical_bytes > total_budget {
+        // Report the rendered critical sizes (trimmables, not yet rendered,
+        // record 0) so callers can attribute the overflow to specific sections
+        // in diagnostics dumps — the slot builder already surfaces this same
+        // breakdown in its sentinel bundle. `prompt` stays empty: an overflowed
+        // critical set is never dispatched, only translated by the caller.
+        let section_sizes = roster
+            .iter()
+            .enumerate()
+            .map(|(i, spec)| {
+                let size = rendered[i].as_ref().map_or(0, |r| r.text.len());
+                (spec.name, size)
+            })
+            .collect();
         return Assembled {
             prompt: String::new(),
-            section_sizes: Vec::new(),
+            section_sizes,
             dropped_sections: vec![CRITICAL_OVERFLOW_SENTINEL.to_string()],
             shown_learning_ids: Vec::new(),
         };
@@ -232,6 +282,7 @@ mod tests {
                 task_prefix: None,
                 reorder_hint: None,
                 batch_sibling_prds: None,
+                next_task_output: None,
             }
         }
     }
@@ -329,6 +380,43 @@ mod tests {
         assert_eq!(out.prompt, "");
         assert_eq!(out.dropped_sections, vec!["CRITICAL".to_string()]);
         assert!(out.shown_learning_ids.is_empty());
+        // The per-section breakdown is still reported on overflow so callers
+        // can attribute the overflow (and sum a faithful `critical_size`).
+        assert_eq!(
+            out.section_sizes,
+            vec![("a", 100), ("b", 100)],
+            "critical overflow must still report rendered section sizes"
+        );
+        // `section_text` must not panic against the empty overflow prompt.
+        assert_eq!(out.section_text("a"), "");
+    }
+
+    #[test]
+    fn section_text_slices_each_section_by_name() {
+        let tc = TestCtx::new();
+        let roster = [
+            SectionSpec {
+                name: "a",
+                kind: SectionKind::Critical,
+                render: render_a,
+            },
+            SectionSpec {
+                name: "b",
+                kind: SectionKind::Critical,
+                render: render_b,
+            },
+            SectionSpec {
+                name: "c",
+                kind: SectionKind::Critical,
+                render: render_c,
+            },
+        ];
+        let out = assemble(&tc.ctx(), &roster, 80_000);
+        assert_eq!(out.prompt, "ABC");
+        assert_eq!(out.section_text("a"), "A");
+        assert_eq!(out.section_text("b"), "B");
+        assert_eq!(out.section_text("c"), "C");
+        assert_eq!(out.section_text("missing"), "");
     }
 
     #[test]

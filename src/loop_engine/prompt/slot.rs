@@ -24,21 +24,89 @@ use std::path::{Path, PathBuf};
 use rusqlite::Connection;
 
 use crate::loop_engine::config::PermissionMode;
-use crate::loop_engine::prompt::assembler::{PromptContext, SectionSpec, assemble};
+use crate::loop_engine::prompt::assembler::{
+    PromptContext, Rendered, SectionKind, SectionSpec, assemble,
+};
 use crate::loop_engine::prompt::core;
 use crate::loop_engine::prompt_sections::dependencies::dependencies_spec;
-use crate::loop_engine::prompt_sections::task_ops::task_ops_section;
+use crate::loop_engine::prompt_sections::task_ops::task_ops_spec;
 use crate::loop_engine::prompt_sections::{truncate_to_budget, try_fit_section};
 use crate::models::Task;
 
 /// The slot path's ordered section roster (CONTRACT-001).
 ///
 /// A set-subset of [`super::sequential::sequential_roster`] but independently
-/// ordered. Today only `dependencies` is migrated; the other sections remain
-/// inlined in [`build_prompt`] and join the roster at their slot display
-/// positions as the migration proceeds.
+/// ordered in slot display order: the slot emits the task envelope FIRST,
+/// whereas sequential places it mid-list. The task/completion/base_prompt
+/// envelopes use slot-specific render fns (untruncated `format_task_json`, the
+/// `core::completion_instruction` variant, the no-trailing-newline base-prompt
+/// reader) that differ byte-for-byte from sequential's. `task_ops` and
+/// `dependencies` are the only specs shared verbatim across both paths.
+///
+/// As in the sequential path, [`build_prompt`] does not call [`assemble`] once
+/// over this whole roster during the incremental migration — the critical
+/// subset is gated together while the trimmable subset (`dependencies`) is fit
+/// only after the still-inlined `learnings`/`source` trimmables. It derives
+/// criticals-only and trimmables-only sub-rosters from this single source.
 pub fn slot_roster() -> Vec<SectionSpec> {
-    vec![dependencies_spec()]
+    vec![
+        SectionSpec {
+            name: "task",
+            kind: SectionKind::Critical,
+            render: render_task_section,
+        },
+        task_ops_spec(),
+        dependencies_spec(),
+        SectionSpec {
+            name: "completion",
+            kind: SectionKind::Critical,
+            render: render_completion_section,
+        },
+        SectionSpec {
+            name: "base_prompt",
+            kind: SectionKind::Critical,
+            render: render_base_prompt_section,
+        },
+    ]
+}
+
+/// Render the slot task envelope (`## Current Task` JSON block) from the
+/// `&Task` + preloaded `task_files` carried in [`PromptContext`]. Distinct from
+/// the sequential envelope: the slot variant uses `core::format_task_json` and
+/// does NOT truncate.
+fn render_task_section(ctx: &PromptContext<'_>, _kind: SectionKind) -> Rendered {
+    Rendered {
+        text: build_task_section(ctx.task, ctx.task_files),
+        ..Default::default()
+    }
+}
+
+/// Build the slot `## Current Task` section from a `&Task` + its files. Single
+/// legacy site for the slot envelope bytes — [`render_task_section`] and the
+/// parity test both wrap it.
+pub fn build_task_section(task: &Task, files: &[String]) -> String {
+    let task_json = core::format_task_json(task, files);
+    format!("## Current Task\n\n```json\n{task_json}\n```\n\n")
+}
+
+/// Render the slot completion-instruction section via
+/// [`core::completion_instruction`] (the slot variant — no non-code note,
+/// title in the commit message).
+fn render_completion_section(ctx: &PromptContext<'_>, _kind: SectionKind) -> Rendered {
+    Rendered {
+        text: core::completion_instruction(&ctx.task.id, &ctx.task.title),
+        ..Default::default()
+    }
+}
+
+/// Render the slot base-prompt template section from
+/// [`PromptContext::base_prompt_path`] via [`load_base_prompt`] (no
+/// trailing-newline fixup, unlike the sequential reader).
+fn render_base_prompt_section(ctx: &PromptContext<'_>, _kind: SectionKind) -> Rendered {
+    Rendered {
+        text: load_base_prompt(ctx.base_prompt_path),
+        ..Default::default()
+    }
 }
 
 /// Byte budget for the source-context section in slot prompts.
@@ -159,7 +227,10 @@ fn load_task_files(conn: &Connection, task_id: &str) -> Vec<String> {
 }
 
 /// Read and truncate the base prompt template. Returns `""` on IO failure.
-fn load_base_prompt(base_prompt_path: &std::path::Path) -> String {
+///
+/// Single legacy site for the slot base-prompt bytes — [`render_base_prompt_section`]
+/// and the parity test both wrap it.
+pub fn load_base_prompt(base_prompt_path: &std::path::Path) -> String {
     match fs::read_to_string(base_prompt_path) {
         Ok(content) => truncate_to_budget(&content, BASE_PROMPT_BUDGET),
         Err(e) => {
@@ -207,23 +278,56 @@ pub fn build_prompt(
         .filter(|m| !m.is_empty())
         .map(str::to_owned);
 
+    // The `&Connection` lives only in this main-thread `PromptContext`, which is
+    // dropped before the bundle crosses the worker boundary — no `&Connection`
+    // is ever stored in the `Send`-safe `SlotPromptBundle`. Reused for both the
+    // Phase 1 critical assemble and the Phase 2 deps assemble.
+    let ctx = PromptContext {
+        conn,
+        task,
+        task_files: &task_files,
+        project_root: &params.project_root,
+        base_prompt_path: &params.base_prompt_path,
+        permission_mode: &params.permission_mode,
+        steering_path: params.steering_path,
+        session_guidance: params.session_guidance,
+        run_id: None,
+        task_prefix: None,
+        reorder_hint: None,
+        batch_sibling_prds: None,
+        next_task_output: None,
+    };
+
+    let roster = slot_roster();
+
     // ============================================================
-    // Phase 1: critical sections — must always be present.
+    // Phase 1: critical sections — gated together against the budget.
     // ============================================================
+    //
+    // The migrated criticals (task, task_ops, completion, base_prompt) render
+    // through `assemble` over the criticals-only sub-roster. The slot path has
+    // NO inlined criticals, so the full `TOTAL_PROMPT_BUDGET` is the gate.
+    // `assemble` signals overflow uniformly via
+    // `dropped_sections == [CRITICAL_OVERFLOW_SENTINEL]`; unlike the sequential
+    // caller (which maps it to `Err`), the slot caller keeps its
+    // sentinel-in-bundle behavior so the wave scheduler skips the slot.
+    let critical_roster: Vec<SectionSpec> = roster
+        .iter()
+        .copied()
+        .filter(|s| matches!(s.kind, SectionKind::Critical))
+        .collect();
+    let critical_assembled = assemble(&ctx, &critical_roster, TOTAL_PROMPT_BUDGET);
 
-    let task_json = core::format_task_json(task, &task_files);
-    let task_section = format!("## Current Task\n\n```json\n{task_json}\n```\n\n");
-
-    let task_ops = task_ops_section().to_string();
-
-    let completion_section = core::completion_instruction(&task.id, &task.title);
-
-    let base_prompt = load_base_prompt(&params.base_prompt_path);
-
-    let critical_total =
-        task_section.len() + task_ops.len() + completion_section.len() + base_prompt.len();
-
-    if critical_total > TOTAL_PROMPT_BUDGET {
+    if critical_assembled
+        .dropped_sections
+        .iter()
+        .any(|s| s == CRITICAL_OVERFLOW_SENTINEL)
+    {
+        let critical_total: usize = critical_assembled
+            .section_sizes
+            .iter()
+            .map(|(_, n)| n)
+            .sum();
         eprintln!(
             "Warning: slot prompt critical sections ({} bytes) exceed TOTAL_PROMPT_BUDGET ({}) \
              for task {} — slot should be skipped",
@@ -236,21 +340,24 @@ pub fn build_prompt(
             shown_learning_ids: Vec::new(),
             resolved_model,
             difficulty: task.difficulty.clone(),
-            section_sizes: vec![
-                ("task", task_section.len()),
-                ("task_ops", task_ops.len()),
-                ("completion", completion_section.len()),
-                ("base_prompt", base_prompt.len()),
-            ],
+            // `assemble` populates `section_sizes` on overflow (criticals in
+            // roster order), the same breakdown the legacy sentinel reported.
+            section_sizes: critical_assembled.section_sizes,
             dropped_sections: vec![CRITICAL_OVERFLOW_SENTINEL.to_string()],
         };
     }
+
+    // Pull each migrated critical's bytes out for interleaved stitching below.
+    let task_section = critical_assembled.section_text("task");
+    let task_ops = critical_assembled.section_text("task_ops");
+    let completion_section = critical_assembled.section_text("completion");
+    let base_prompt = critical_assembled.section_text("base_prompt");
 
     // ============================================================
     // Phase 2: trimmable sections — fit into the remaining budget.
     // ============================================================
 
-    let mut remaining = TOTAL_PROMPT_BUDGET - critical_total;
+    let mut remaining = TOTAL_PROMPT_BUDGET - critical_assembled.prompt.len();
     let mut dropped_sections: Vec<String> = Vec::new();
 
     // Priority order (highest first):
@@ -288,27 +395,16 @@ pub fn build_prompt(
         &mut dropped_sections,
     );
 
-    // Dependencies: migrated to the data-driven assembler (CONTRACT-001,
-    // FEAT-002). Assembled via the slot roster within the running budget; the
-    // surrounding sections stay inlined for now. The `&Connection` lives only
-    // in this main-thread `PromptContext`, which is dropped before the bundle
-    // crosses the worker boundary — no `&Connection` is ever stored in the
-    // `Send`-safe `SlotPromptBundle`.
-    let dep_ctx = PromptContext {
-        conn,
-        task,
-        task_files: &task_files,
-        project_root: &params.project_root,
-        base_prompt_path: &params.base_prompt_path,
-        permission_mode: &params.permission_mode,
-        steering_path: params.steering_path,
-        session_guidance: params.session_guidance,
-        run_id: None,
-        task_prefix: None,
-        reorder_hint: None,
-        batch_sibling_prds: None,
-    };
-    let dep_assembled = assemble(&dep_ctx, &slot_roster(), remaining);
+    // Dependencies: the only migrated trimmable (CONTRACT-001, FEAT-002).
+    // Assembled via the trimmable subset of the roster within the running
+    // budget, AFTER learnings + source have consumed their share; the
+    // surrounding sections stay inlined for now. Reuses the `ctx` built above.
+    let trimmable_roster: Vec<SectionSpec> = roster
+        .iter()
+        .copied()
+        .filter(|s| matches!(s.kind, SectionKind::Trimmable { .. }))
+        .collect();
+    let dep_assembled = assemble(&ctx, &trimmable_roster, remaining);
     // `assemble` fit the section within `remaining`, so the subtraction cannot
     // underflow — identical bookkeeping to the legacy `try_fit_section` path.
     let dep_section = dep_assembled.prompt;

@@ -3,6 +3,36 @@
 //! This is non-negotiable hard-rule content. It must appear above learnings
 //! and synergy sections so the agent reads the rules before context-sensitive material.
 
+use crate::loop_engine::prompt::assembler::{PromptContext, Rendered, SectionKind, SectionSpec};
+
+/// Stable section identifier for the task-lifecycle-rules section. Matches the
+/// `section_sizes` key both prompt builders use for this section.
+pub const TASK_OPS_SECTION: &str = "task_ops";
+
+/// Render the task-lifecycle-rules section for the data-driven assembler
+/// (CONTRACT-001). This is the **single render site** for the section, shared
+/// verbatim by both paths' rosters — the content is identical static text with
+/// no per-path or per-context variation, so the [`SectionKind`] argument is
+/// deliberately ignored.
+pub fn render_task_ops(_ctx: &PromptContext<'_>, _kind: SectionKind) -> Rendered {
+    Rendered {
+        text: task_ops_section().to_string(),
+        ..Default::default()
+    }
+}
+
+/// Build the task-ops [`SectionSpec`] (critical — never dropped by budget).
+///
+/// Shared by both prompt paths; each roster places the returned spec at its own
+/// legacy display position.
+pub fn task_ops_spec() -> SectionSpec {
+    SectionSpec {
+        name: TASK_OPS_SECTION,
+        kind: SectionKind::Critical,
+        render: render_task_ops,
+    }
+}
+
 /// The exact markdown section text to inject.
 ///
 /// Tells the loop agent: never edit tasks/*.json directly; use <task-status> tags
@@ -42,6 +72,45 @@ pub(crate) fn task_ops_section() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Parity: the data-driven render fn must emit byte-identical text to the
+    /// legacy `task_ops_section()` helper it wraps — the single shared critical
+    /// across both prompt paths.
+    #[test]
+    fn render_task_ops_matches_legacy_section() {
+        use crate::loop_engine::config::PermissionMode;
+        use crate::models::Task;
+        use rusqlite::Connection;
+        use std::path::Path;
+
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        let task = Task::new("T-1", "title");
+        let mode = PermissionMode::Dangerous;
+        let ctx = PromptContext {
+            conn: &conn,
+            task: &task,
+            task_files: &[],
+            project_root: Path::new("/tmp"),
+            base_prompt_path: Path::new("/tmp/prompt.md"),
+            permission_mode: &mode,
+            steering_path: None,
+            session_guidance: "",
+            run_id: None,
+            task_prefix: None,
+            reorder_hint: None,
+            batch_sibling_prds: None,
+            next_task_output: None,
+        };
+
+        let spec = task_ops_spec();
+        let rendered = (spec.render)(&ctx, spec.kind);
+        assert_eq!(
+            rendered.text,
+            task_ops_section().to_string(),
+            "render_task_ops must be byte-identical to task_ops_section()"
+        );
+        assert!(matches!(spec.kind, SectionKind::Critical));
+    }
 
     #[test]
     fn test_section_contains_critical_phrases() {

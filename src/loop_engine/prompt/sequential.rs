@@ -19,10 +19,13 @@ use std::path::{Path, PathBuf};
 use rusqlite::Connection;
 
 use crate::commands::next;
+use crate::commands::next::output::NextTaskOutput;
 use crate::error::{TaskMgrError, TaskMgrResult};
 use crate::loop_engine::config::PermissionMode;
 use crate::loop_engine::context;
-use crate::loop_engine::prompt::assembler::{PromptContext, SectionSpec, assemble};
+use crate::loop_engine::prompt::assembler::{
+    CRITICAL_OVERFLOW_SENTINEL, PromptContext, Rendered, SectionKind, SectionSpec, assemble,
+};
 use crate::loop_engine::prompt::core;
 #[cfg(test)]
 use crate::loop_engine::prompt_sections::dependencies::build_dependency_section;
@@ -35,21 +38,123 @@ use crate::loop_engine::prompt_sections::siblings::build_sibling_prd_section;
 use crate::loop_engine::prompt_sections::synergy::{
     build_synergy_section, resolve_synergy_cluster,
 };
-use crate::loop_engine::prompt_sections::task_ops::task_ops_section;
+use crate::loop_engine::prompt_sections::task_ops::task_ops_spec;
 use crate::loop_engine::prompt_sections::{truncate_to_budget, try_fit_section};
 use crate::models::Task;
 
 /// The sequential path's ordered section roster (CONTRACT-001).
 ///
-/// Each entry is rendered via [`assemble`] in display order. Today only the
-/// `dependencies` section is migrated; the remaining sections are still inlined
-/// in [`build_prompt`] and will be appended here at their display positions as
-/// the migration proceeds. This roster is independent from
-/// [`super::slot::slot_roster`] — the two paths share render fns but order their
-/// sections differently (slot emits `task` first, sequential mid-list), so each
-/// path owns its own `Vec<SectionSpec>`.
+/// Entries are listed in display order. The migrated sections so far are
+/// `dependencies` (trimmable) and the critical envelope `task` / `task_ops` /
+/// `completion` / `base_prompt`; the still-inlined sections in [`build_prompt`]
+/// join here at their display positions as the migration proceeds. This roster
+/// is independent from [`super::slot::slot_roster`] — the two paths share some
+/// render fns but order their sections differently (slot emits `task` first,
+/// sequential mid-list), and the task/completion/base_prompt envelopes use
+/// sequential-specific render fns (NextTaskOutput JSON truncated to
+/// `TASK_CONTEXT_BUDGET`, the `[Title]`/non-code completion variant, and the
+/// trailing-newline base-prompt reader) that differ byte-for-byte from slot's.
+///
+/// [`build_prompt`] does not call [`assemble`] once over this whole roster
+/// during the incremental migration: the critical subset is gated together
+/// (see the `CRITICAL` overflow translation) while the trimmable subset
+/// (`dependencies`) is fit only after the still-inlined `learnings`/`source`
+/// trimmables have consumed budget. It therefore derives criticals-only and
+/// trimmables-only sub-rosters from this single declarative source.
 pub fn sequential_roster() -> Vec<SectionSpec> {
-    vec![dependencies_spec()]
+    vec![
+        dependencies_spec(),
+        SectionSpec {
+            name: "task",
+            kind: SectionKind::Critical,
+            render: render_task_section,
+        },
+        task_ops_spec(),
+        SectionSpec {
+            name: "completion",
+            kind: SectionKind::Critical,
+            render: render_completion_section,
+        },
+        SectionSpec {
+            name: "base_prompt",
+            kind: SectionKind::Critical,
+            render: render_base_prompt_section,
+        },
+    ]
+}
+
+/// Render the sequential task envelope (`## Current Task` JSON block) from the
+/// [`NextTaskOutput`] carried in [`PromptContext::next_task_output`].
+///
+/// This render fn is only ever reached through [`sequential_roster`], which is
+/// only assembled inside [`build_prompt`] where `next_task_output` is always
+/// `Some` — the `expect` documents that invariant. The slot path renders the
+/// envelope from a `&Task` via its own render fn and never installs this one.
+fn render_task_section(ctx: &PromptContext<'_>, _kind: SectionKind) -> Rendered {
+    let task_output = ctx
+        .next_task_output
+        .expect("sequential roster requires PromptContext::next_task_output to be Some");
+    Rendered {
+        text: build_task_section(task_output),
+        ..Default::default()
+    }
+}
+
+/// Build the sequential `## Current Task` section from a [`NextTaskOutput`],
+/// truncating the JSON to [`TASK_CONTEXT_BUDGET`]. The single legacy site for
+/// this section's bytes — both [`render_task_section`] and the parity test wrap
+/// this helper so they cannot drift.
+pub fn build_task_section(task_output: &NextTaskOutput) -> String {
+    let task_json = core::format_next_task_json(task_output);
+    let truncated_json = truncate_to_budget(&task_json, TASK_CONTEXT_BUDGET);
+    format!("## Current Task\n\n```json\n{}\n```\n\n", truncated_json)
+}
+
+/// Render the sequential completion-instruction section from the task id and
+/// whether the task touches any files (the no-files note differs).
+fn render_completion_section(ctx: &PromptContext<'_>, _kind: SectionKind) -> Rendered {
+    Rendered {
+        text: build_completion_section(&ctx.task.id, ctx.task_files.is_empty()),
+        ..Default::default()
+    }
+}
+
+/// Build the sequential completion-instruction section. Distinct from
+/// [`core::completion_instruction`] (used by the slot path): the sequential
+/// variant prepends a non-code-task note when the task touches no files and
+/// uses the `[Title]` placeholder commit message. Single legacy site for the
+/// bytes — [`render_completion_section`] and the parity test both wrap it.
+pub fn build_completion_section(task_id: &str, has_no_files: bool) -> String {
+    let non_code_note = if has_no_files {
+        "This task has no `touchesFiles` — it is a verification, milestone, or polish task.\n\n"
+    } else {
+        ""
+    };
+    format!(
+        "## Completing This Task\n\n\
+         {non_code_note}\
+         When all acceptance criteria pass:\n\
+         1. Commit with message: `feat: {task_id}-completed - [Title]`\n\
+            If completing multiple tasks: `feat: ID1-completed, ID2-completed - [Title]`\n\
+         2. Output `<completed>{task_id}</completed>` (using the full task ID shown above).\n\
+         3. Stop immediately. Do NOT wait on background tasks, `Monitor` streams, \
+            polling loops, or `run_in_background` commands after emitting `<completed>`. \
+            If any background process is still running, kill it (`KillShell`, SIGTERM) \
+            and exit this turn. The loop treats `<completed>` as terminal — anything \
+            you wait for afterward is wasted wall-clock until the base timeout kills \
+            the subprocess.\n\n\
+         The loop will automatically mark the task done and update the PRD.\n\
+         Do NOT run `task-mgr done` manually.\n\n",
+    )
+}
+
+/// Render the sequential base-prompt template section from
+/// [`PromptContext::base_prompt_path`].
+fn render_base_prompt_section(ctx: &PromptContext<'_>, _kind: SectionKind) -> Rendered {
+    Rendered {
+        text: build_base_prompt_section(ctx.base_prompt_path),
+        ..Default::default()
+    }
 }
 
 /// Byte budget for enriched task context in the prompt.
@@ -195,70 +300,90 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
         crate::loop_engine::model::effort_for_difficulty(cluster_difficulty.as_deref());
 
     // ============================================================
-    // Phase 1: Build critical sections into separate Strings
+    // Phase 1: critical sections — gated together against the budget.
     // ============================================================
+    //
+    // The migrated criticals (task, task_ops, completion, base_prompt) render
+    // through `assemble` over the criticals-only sub-roster. The two still-
+    // inlined criticals (escalation policy, reorder instruction) are rendered
+    // here and their bytes subtracted from the budget handed to `assemble`, so
+    // the overflow gate fires on the SUM of all criticals exactly as the legacy
+    // `critical_total > TOTAL_PROMPT_BUDGET` check did. `assemble` signals
+    // overflow uniformly via `dropped_sections == [CRITICAL_OVERFLOW_SENTINEL]`;
+    // this caller MUST translate that back into `Err(PromptOverflow)` so
+    // `overflow::handle_prompt_too_long`'s five-rung ladder is unchanged.
 
-    // Critical: Task JSON
-    let task_json = core::format_next_task_json(task_output);
-    let truncated_json = truncate_to_budget(&task_json, TASK_CONTEXT_BUDGET);
-    let task_section = format!("## Current Task\n\n```json\n{}\n```\n\n", truncated_json);
-
-    // Critical: Universal completion instruction for ALL tasks
-    let completion_section = {
-        let non_code_note = if task_output.files.is_empty() {
-            "This task has no `touchesFiles` — it is a verification, milestone, or polish task.\n\n"
-        } else {
-            ""
-        };
-        format!(
-            "## Completing This Task\n\n\
-             {non_code_note}\
-             When all acceptance criteria pass:\n\
-             1. Commit with message: `feat: {task_id}-completed - [Title]`\n\
-                If completing multiple tasks: `feat: ID1-completed, ID2-completed - [Title]`\n\
-             2. Output `<completed>{task_id}</completed>` (using the full task ID shown above).\n\
-             3. Stop immediately. Do NOT wait on background tasks, `Monitor` streams, \
-                polling loops, or `run_in_background` commands after emitting `<completed>`. \
-                If any background process is still running, kill it (`KillShell`, SIGTERM) \
-                and exit this turn. The loop treats `<completed>` as terminal — anything \
-                you wait for afterward is wasted wall-clock until the base timeout kills \
-                the subprocess.\n\n\
-             The loop will automatically mark the task done and update the PRD.\n\
-             Do NOT run `task-mgr done` manually.\n\n",
-            task_id = task_output.id,
-        )
-    };
-
-    // Critical: Escalation policy
+    // Still-inlined criticals (escalation + reorder instruction).
     let escalation_section =
         build_escalation_section(params.base_prompt_path, resolved_model.as_deref());
-
-    // Critical: Task lifecycle rules — non-negotiable, always injected
-    let task_ops = task_ops_section().to_string();
-
-    // Critical: Reorder instruction
     let reorder_instr_section =
         "If you have a strong reason to work on a different eligible task, \
          output `<reorder>TASK-ID</reorder>`.\n\n"
             .to_string();
+    let inlined_critical_bytes = escalation_section.len() + reorder_instr_section.len();
 
-    // Critical: Base prompt template
-    let base_prompt_section = build_base_prompt_section(params.base_prompt_path);
+    // A lightweight `Task` carrier lets the assembler's `&Task`-based
+    // `PromptContext` be built from the `NextTaskOutput` this path selects: the
+    // sequential render fns read only `task.id` (completion) while the task
+    // envelope reads `next_task_output`. Reused for the deps assemble in Phase 2.
+    let ctx_task = Task::new(task_output.id.as_str(), task_output.title.as_str());
+    let ctx = PromptContext {
+        conn: params.conn,
+        task: &ctx_task,
+        task_files: &task_output.files,
+        project_root: params.project_root,
+        base_prompt_path: params.base_prompt_path,
+        permission_mode: params.permission_mode,
+        steering_path: params.steering_path,
+        session_guidance: params.session_guidance,
+        run_id: params.run_id,
+        task_prefix: params.task_prefix,
+        reorder_hint: params.reorder_hint,
+        batch_sibling_prds: Some(params.batch_sibling_prds),
+        next_task_output: Some(task_output),
+    };
 
-    let critical_total = task_section.len()
-        + task_ops.len()
-        + completion_section.len()
-        + escalation_section.len()
-        + reorder_instr_section.len()
-        + base_prompt_section.len();
+    let roster = sequential_roster();
+    let critical_roster: Vec<SectionSpec> = roster
+        .iter()
+        .copied()
+        .filter(|s| matches!(s.kind, SectionKind::Critical))
+        .collect();
+    let critical_assembled = assemble(
+        &ctx,
+        &critical_roster,
+        TOTAL_PROMPT_BUDGET.saturating_sub(inlined_critical_bytes),
+    );
 
-    if critical_total > TOTAL_PROMPT_BUDGET {
+    if critical_assembled
+        .dropped_sections
+        .iter()
+        .any(|s| s == CRITICAL_OVERFLOW_SENTINEL)
+    {
+        // Translate the uniform CRITICAL signal back into the legacy error so
+        // the overflow ladder still engages. `section_sizes` is populated even
+        // on overflow, so the reported `critical_size` is faithful.
+        let critical_size = inlined_critical_bytes
+            + critical_assembled
+                .section_sizes
+                .iter()
+                .map(|(_, n)| *n)
+                .sum::<usize>();
         return Err(TaskMgrError::PromptOverflow {
-            critical_size: critical_total,
+            critical_size,
             budget: TOTAL_PROMPT_BUDGET,
             task_id: task_output.id.clone(),
         });
     }
+
+    // Pull each migrated critical's bytes out for interleaved stitching below;
+    // they emit at their own (non-contiguous) legacy display positions.
+    let task_section = critical_assembled.section_text("task");
+    let task_ops = critical_assembled.section_text("task_ops");
+    let completion_section = critical_assembled.section_text("completion");
+    let base_prompt_section = critical_assembled.section_text("base_prompt");
+
+    let critical_total = inlined_critical_bytes + critical_assembled.prompt.len();
 
     // Step 3: Record shown learnings AFTER the overflow check.
     // If Phase 1 overflows we return Err above — we must not record learnings
@@ -302,29 +427,17 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
         &mut dropped_sections,
     );
 
-    // Dependencies: migrated to the data-driven assembler (CONTRACT-001,
-    // FEAT-002). A single-section roster is assembled within the running
-    // budget; the surrounding sections remain inlined until later migration
-    // steps move them onto the roster too. `dep_ctx_task` is a lightweight
-    // carrier so the assembler's `&Task`-based [`PromptContext`] can be built
-    // from the `NextTaskOutput` this path selects — the dependencies render fn
-    // reads only `task.id`.
-    let dep_ctx_task = Task::new(task_output.id.as_str(), task_output.title.as_str());
-    let dep_ctx = PromptContext {
-        conn: params.conn,
-        task: &dep_ctx_task,
-        task_files: &task_output.files,
-        project_root: params.project_root,
-        base_prompt_path: params.base_prompt_path,
-        permission_mode: params.permission_mode,
-        steering_path: params.steering_path,
-        session_guidance: params.session_guidance,
-        run_id: params.run_id,
-        task_prefix: params.task_prefix,
-        reorder_hint: params.reorder_hint,
-        batch_sibling_prds: Some(params.batch_sibling_prds),
-    };
-    let dep_assembled = assemble(&dep_ctx, &sequential_roster(), remaining);
+    // Dependencies: the only migrated trimmable (CONTRACT-001, FEAT-002). Fit
+    // via the trimmable subset of the roster within the running budget, AFTER
+    // learnings + source have consumed their share (their fit order is
+    // unchanged) — so deps cannot be folded into the Phase 1 critical assemble.
+    // Reuses the `ctx` built in Phase 1.
+    let trimmable_roster: Vec<SectionSpec> = roster
+        .iter()
+        .copied()
+        .filter(|s| matches!(s.kind, SectionKind::Trimmable { .. }))
+        .collect();
+    let dep_assembled = assemble(&ctx, &trimmable_roster, remaining);
     // `assemble` already fit the section within `remaining`, so the emitted
     // bytes never exceed it (subtraction cannot underflow). This mirrors the
     // legacy `try_fit_section` budget bookkeeping exactly.
@@ -427,13 +540,13 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
     section_sizes.push(("synergy", synergy_section.len()));
     prompt.push_str(&sibling_section);
     section_sizes.push(("siblings", sibling_section.len()));
-    prompt.push_str(&task_section);
+    prompt.push_str(task_section);
     section_sizes.push(("task", task_section.len()));
-    prompt.push_str(&task_ops);
+    prompt.push_str(task_ops);
     section_sizes.push(("task_ops", task_ops.len()));
     prompt.push_str(&learnings_section);
     section_sizes.push(("learnings", learnings_section.len()));
-    prompt.push_str(&completion_section);
+    prompt.push_str(completion_section);
     section_sizes.push(("completion", completion_section.len()));
     prompt.push_str(&escalation_section);
     section_sizes.push(("escalation", escalation_section.len()));
@@ -441,7 +554,7 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
     section_sizes.push(("reorder_instr", reorder_instr_section.len()));
     prompt.push_str(&key_decision_section);
     section_sizes.push(("key_decision", key_decision_section.len()));
-    prompt.push_str(&base_prompt_section);
+    prompt.push_str(base_prompt_section);
     section_sizes.push(("base_prompt", base_prompt_section.len()));
 
     Ok(Some(PromptResult {
@@ -503,7 +616,12 @@ fn append_synergy_context(
 }
 
 /// Build a base prompt section string from the template file.
-fn build_base_prompt_section(base_prompt_path: &Path) -> String {
+///
+/// Distinct from the slot path's `load_base_prompt`: this variant warns on an
+/// empty file and ensures a trailing newline. Single legacy site for the
+/// sequential base-prompt bytes — [`render_base_prompt_section`] and the parity
+/// test both wrap it.
+pub fn build_base_prompt_section(base_prompt_path: &Path) -> String {
     match fs::read_to_string(base_prompt_path) {
         Ok(content) if !content.trim().is_empty() => {
             let mut content = truncate_to_budget(&content, BASE_PROMPT_BUDGET);
@@ -3032,6 +3150,53 @@ pub enum ApiError {
         assert!(msg.contains("80000"));
         assert!(msg.contains("OVER-001"));
         assert!(msg.contains("Reduce base prompt.md size or split the task"));
+    }
+
+    /// End-to-end forced overflow: when the critical sections together exceed
+    /// `TOTAL_PROMPT_BUDGET`, `assemble` reports `dropped == ["CRITICAL"]` and
+    /// `build_prompt` MUST translate that into `Err(PromptOverflow)` — the
+    /// signal `overflow::handle_prompt_too_long`'s five-rung ladder consumes.
+    /// Returning the empty-prompt sentinel WITHOUT translating (the known-bad)
+    /// would silently break the ladder; this test is the discriminator.
+    ///
+    /// The escalation policy section is an inlined critical with no truncation,
+    /// so a >80 KB template (with a non-Opus model that triggers escalation)
+    /// drives the inlined critical bytes past the budget, leaving zero room for
+    /// the migrated criticals and forcing the CRITICAL signal through the real
+    /// assemble path.
+    #[test]
+    fn test_sequential_criticals_over_budget_returns_prompt_overflow() {
+        let (temp_dir, conn) = setup_test_db();
+
+        insert_task(&conn, "OVER-001", "Sonnet task", "todo", 5);
+        conn.execute(
+            "UPDATE tasks SET model = ?1 WHERE id = 'OVER-001'",
+            params![SONNET_MODEL],
+        )
+        .unwrap();
+
+        let base_prompt_path = create_base_prompt(temp_dir.path());
+        create_escalation_template(temp_dir.path(), &"E".repeat(90_000));
+
+        let params = build_params(temp_dir.path(), &conn, &base_prompt_path);
+        let err = build_prompt(&params).expect_err("criticals over budget must return Err");
+
+        match err {
+            TaskMgrError::PromptOverflow {
+                critical_size,
+                budget,
+                task_id,
+            } => {
+                assert_eq!(budget, TOTAL_PROMPT_BUDGET, "budget reports the total cap");
+                assert!(
+                    critical_size > budget,
+                    "critical_size ({critical_size}) must exceed budget ({budget}) — \
+                     it sums the inlined escalation bytes with the migrated criticals"
+                );
+                assert_eq!(task_id, "OVER-001");
+            }
+            other => panic!("expected PromptOverflow, got {other:?}"),
+        }
     }
 
     #[test]

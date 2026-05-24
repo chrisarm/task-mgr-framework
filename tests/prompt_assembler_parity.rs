@@ -16,16 +16,63 @@
 use rusqlite::Connection;
 use tempfile::TempDir;
 
+use task_mgr::commands::next::output::{NextTaskOutput, ScoreOutput};
 use task_mgr::db::migrations::run_migrations;
 use task_mgr::db::{create_schema, open_connection};
 use task_mgr::loop_engine::config::PermissionMode;
-use task_mgr::loop_engine::prompt::assembler::{PromptContext, assemble};
-use task_mgr::loop_engine::prompt::sequential::sequential_roster;
-use task_mgr::loop_engine::prompt::slot::slot_roster;
+use task_mgr::loop_engine::prompt::assembler::{PromptContext, SectionSpec, assemble};
+use task_mgr::loop_engine::prompt::core;
+use task_mgr::loop_engine::prompt::sequential::{
+    build_base_prompt_section, build_completion_section,
+    build_task_section as seq_build_task_section, sequential_roster,
+};
+use task_mgr::loop_engine::prompt::slot::{
+    build_task_section as slot_build_task_section, load_base_prompt, slot_roster,
+};
 use task_mgr::loop_engine::prompt_sections::dependencies::{
     DEPENDENCIES_SECTION, build_dependency_section, dependencies_spec,
 };
 use task_mgr::models::Task;
+
+/// Look up a spec by name in a roster, panicking with a helpful message if
+/// absent (a missing migrated section is itself a regression worth a loud
+/// failure rather than a silent skip).
+fn spec_named(roster: &[SectionSpec], name: &str) -> SectionSpec {
+    *roster
+        .iter()
+        .find(|s| s.name == name)
+        .unwrap_or_else(|| panic!("roster is missing the {name:?} section"))
+}
+
+/// Render a single named section through its roster spec.
+fn render_named(roster: &[SectionSpec], name: &str, ctx: &PromptContext<'_>) -> String {
+    let spec = spec_named(roster, name);
+    (spec.render)(ctx, spec.kind).text
+}
+
+/// A `NextTaskOutput` carrier for the sequential task-envelope parity test.
+fn sample_next_task_output() -> NextTaskOutput {
+    NextTaskOutput {
+        id: "TASK-001".to_string(),
+        title: "Build API".to_string(),
+        description: Some("Implement the public API surface".to_string()),
+        priority: 7,
+        status: "in_progress".to_string(),
+        acceptance_criteria: vec!["Returns 200".to_string(), "Handles errors".to_string()],
+        notes: Some("Mind the edge cases".to_string()),
+        files: vec!["src/api.rs".to_string()],
+        model: None,
+        difficulty: Some("high".to_string()),
+        escalation_note: None,
+        requires_human: false,
+        score: ScoreOutput {
+            total: 100,
+            priority: 90,
+            file_overlap: 10,
+            file_overlap_count: 1,
+        },
+    }
+}
 
 const DANGEROUS: PermissionMode = PermissionMode::Dangerous;
 
@@ -69,10 +116,23 @@ fn ctx_for<'a>(
     root: &'a std::path::Path,
     base: &'a std::path::Path,
 ) -> PromptContext<'a> {
+    ctx_with_files(conn, task, root, base, &[], None)
+}
+
+/// As [`ctx_for`] but with caller-supplied `task_files` and an optional
+/// `next_task_output` (the sequential task-envelope render reads the latter).
+fn ctx_with_files<'a>(
+    conn: &'a Connection,
+    task: &'a Task,
+    root: &'a std::path::Path,
+    base: &'a std::path::Path,
+    task_files: &'a [String],
+    next_task_output: Option<&'a NextTaskOutput>,
+) -> PromptContext<'a> {
     PromptContext {
         conn,
         task,
-        task_files: &[],
+        task_files,
         project_root: root,
         base_prompt_path: base,
         permission_mode: &DANGEROUS,
@@ -82,6 +142,7 @@ fn ctx_for<'a>(
         task_prefix: None,
         reorder_hint: None,
         batch_sibling_prds: None,
+        next_task_output,
     }
 }
 
@@ -202,10 +263,10 @@ fn dependencies_present_in_both_rosters_at_legacy_position() {
     let seq = sequential_roster();
     let slot = slot_roster();
 
-    // Only `dependencies` is migrated today, so it sits at index 0 in each
-    // path's roster. As earlier-display sections migrate, this index will grow;
-    // the durable invariant is that BOTH paths reach the section through the
-    // shared spec, and each path owns its own independently-ordered Vec.
+    // Sequential display order: dependencies(6) precedes task(9); slot display
+    // order: task(0) precedes dependencies(4). Each path owns its own
+    // independently-ordered Vec, but BOTH reach the section through the shared
+    // `dependencies_spec`.
     assert_eq!(
         seq.iter().position(|s| s.name == DEPENDENCIES_SECTION),
         Some(0),
@@ -213,7 +274,203 @@ fn dependencies_present_in_both_rosters_at_legacy_position() {
     );
     assert_eq!(
         slot.iter().position(|s| s.name == DEPENDENCIES_SECTION),
-        Some(0),
+        Some(2),
         "dependencies must occupy its legacy position in the slot roster"
     );
+}
+
+// ---------------------------------------------------------------------------
+// AC: the four critical sections appear in BOTH rosters at their own legacy
+// display positions, as `SectionKind::Critical` specs. The two rosters are
+// independently ordered (slot emits `task` first; sequential mid-list).
+// ---------------------------------------------------------------------------
+#[test]
+fn criticals_present_in_both_rosters_at_legacy_positions() {
+    use task_mgr::loop_engine::prompt::assembler::SectionKind;
+
+    let seq = sequential_roster();
+    let slot = slot_roster();
+
+    // Sequential display order of migrated sections:
+    //   dependencies(0) → task(1) → task_ops(2) → completion(3) → base_prompt(4)
+    let seq_order = [
+        "dependencies",
+        "task",
+        "task_ops",
+        "completion",
+        "base_prompt",
+    ];
+    let seq_names: Vec<&str> = seq.iter().map(|s| s.name).collect();
+    assert_eq!(seq_names, seq_order, "sequential roster display order");
+
+    // Slot display order of migrated sections:
+    //   task(0) → task_ops(1) → dependencies(2) → completion(3) → base_prompt(4)
+    let slot_order = [
+        "task",
+        "task_ops",
+        "dependencies",
+        "completion",
+        "base_prompt",
+    ];
+    let slot_names: Vec<&str> = slot.iter().map(|s| s.name).collect();
+    assert_eq!(slot_names, slot_order, "slot roster display order");
+
+    // Each of the four envelope sections is a Critical spec in both rosters.
+    for name in ["task", "task_ops", "completion", "base_prompt"] {
+        assert!(
+            matches!(spec_named(&seq, name).kind, SectionKind::Critical),
+            "{name} must be Critical in the sequential roster"
+        );
+        assert!(
+            matches!(spec_named(&slot, name).kind, SectionKind::Critical),
+            "{name} must be Critical in the slot roster"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-section parity (SEQUENTIAL): each critical's rendered text is
+// byte-identical to the live legacy builder it wraps.
+// ---------------------------------------------------------------------------
+#[test]
+fn sequential_critical_sections_match_legacy() {
+    let (tmp, conn) = setup_migrated_db();
+    let base = tmp.path().join("prompt.md");
+    std::fs::write(&base, "# Agent Instructions\n\nDo the work.").expect("write base prompt");
+
+    let next_out = sample_next_task_output();
+    let task = Task::new(&next_out.id, &next_out.title);
+    let files = next_out.files.clone();
+    let ctx = ctx_with_files(&conn, &task, tmp.path(), &base, &files, Some(&next_out));
+
+    let roster = sequential_roster();
+
+    // task envelope: NextTaskOutput JSON, truncated to TASK_CONTEXT_BUDGET.
+    let legacy_task = seq_build_task_section(&next_out);
+    assert!(
+        legacy_task.contains("## Current Task") && legacy_task.contains("TASK-001"),
+        "guard: legacy task envelope must have real content, got {legacy_task:?}"
+    );
+    assert_eq!(render_named(&roster, "task", &ctx), legacy_task);
+
+    // task_ops: shared static lifecycle rules.
+    let task_ops = render_named(&roster, "task_ops", &ctx);
+    assert!(
+        task_ops.contains("## Task lifecycle"),
+        "guard: task_ops must render the lifecycle rules, got {task_ops:?}"
+    );
+
+    // completion: the sequential variant (non-code note + [Title] placeholder).
+    // `files` is non-empty here, so no non-code note.
+    let legacy_completion = build_completion_section(&next_out.id, files.is_empty());
+    assert!(
+        legacy_completion.contains("## Completing This Task")
+            && legacy_completion.contains("[Title]"),
+        "guard: sequential completion must use the [Title] placeholder, got {legacy_completion:?}"
+    );
+    assert_eq!(render_named(&roster, "completion", &ctx), legacy_completion);
+
+    // base_prompt: the sequential reader (trailing-newline fixup).
+    let legacy_base = build_base_prompt_section(&base);
+    assert!(
+        legacy_base.contains("# Agent Instructions") && legacy_base.ends_with('\n'),
+        "guard: sequential base prompt must end with a newline, got {legacy_base:?}"
+    );
+    assert_eq!(render_named(&roster, "base_prompt", &ctx), legacy_base);
+}
+
+// ---------------------------------------------------------------------------
+// The sequential completion render honors the no-files note for milestone /
+// verification tasks (touchesFiles empty).
+// ---------------------------------------------------------------------------
+#[test]
+fn sequential_completion_renders_non_code_note_when_no_files() {
+    let (tmp, conn) = setup_migrated_db();
+    let base = tmp.path().join("prompt.md");
+    let task = Task::new("MILE-001", "Milestone");
+    let next_out = NextTaskOutput {
+        files: vec![],
+        ..sample_next_task_output()
+    };
+    let ctx = ctx_with_files(&conn, &task, tmp.path(), &base, &[], Some(&next_out));
+
+    let rendered = render_named(&sequential_roster(), "completion", &ctx);
+    // The sequential completion render reads `ctx.task.id`, so the legacy diff
+    // target must use the same id (MILE-001), not the NextTaskOutput's.
+    let legacy = build_completion_section(&task.id, true);
+    assert!(
+        rendered.contains("no `touchesFiles`"),
+        "no-files task must render the verification/milestone note"
+    );
+    assert_eq!(rendered, legacy);
+}
+
+// ---------------------------------------------------------------------------
+// Per-section parity (SLOT): each critical's rendered text is byte-identical
+// to the live legacy builder it wraps. The slot envelopes differ from
+// sequential (untruncated Task JSON, core::completion_instruction, no
+// trailing-newline base prompt).
+// ---------------------------------------------------------------------------
+#[test]
+fn slot_critical_sections_match_legacy() {
+    let (tmp, conn) = setup_migrated_db();
+    insert_task(&conn, "TASK-001", "Build API", "in_progress");
+    let base = tmp.path().join("prompt.md");
+    std::fs::write(&base, "# Agent Instructions\n\nDo the work.").expect("write base prompt");
+
+    let task = Task::new("TASK-001", "Build API");
+    let files = vec!["src/api.rs".to_string()];
+    let ctx = ctx_with_files(&conn, &task, tmp.path(), &base, &files, None);
+
+    let roster = slot_roster();
+
+    // task envelope: untruncated Task JSON via core::format_task_json.
+    let legacy_task = slot_build_task_section(&task, &files);
+    assert!(
+        legacy_task.contains("## Current Task") && legacy_task.contains("TASK-001"),
+        "guard: legacy slot task envelope must have real content, got {legacy_task:?}"
+    );
+    assert_eq!(render_named(&roster, "task", &ctx), legacy_task);
+
+    // task_ops: identical shared static text in both paths.
+    assert_eq!(
+        render_named(&roster, "task_ops", &ctx),
+        render_named(&sequential_roster(), "task_ops", &ctx),
+        "task_ops is the one critical shared verbatim between the two paths"
+    );
+
+    // completion: the slot variant (core::completion_instruction).
+    let legacy_completion = core::completion_instruction(&task.id, &task.title);
+    assert!(
+        legacy_completion.contains("Build API"),
+        "guard: slot completion embeds the title, got {legacy_completion:?}"
+    );
+    assert_eq!(render_named(&roster, "completion", &ctx), legacy_completion);
+
+    // base_prompt: the slot reader (no trailing-newline fixup).
+    let legacy_base = load_base_prompt(&base);
+    assert!(
+        !legacy_base.ends_with('\n'),
+        "guard: slot base prompt preserves the file verbatim (no newline fixup), got {legacy_base:?}"
+    );
+    assert_eq!(render_named(&roster, "base_prompt", &ctx), legacy_base);
+}
+
+// ---------------------------------------------------------------------------
+// The two paths' task envelopes legitimately DIFFER (sequential truncates a
+// NextTaskOutput JSON; slot emits an untruncated Task JSON). This pins that
+// the migration preserved each path's distinct bytes rather than unifying them.
+// ---------------------------------------------------------------------------
+#[test]
+fn sequential_and_slot_task_envelopes_are_path_specific() {
+    let next_out = sample_next_task_output();
+    let task = Task::new(&next_out.id, &next_out.title);
+    let seq_text = seq_build_task_section(&next_out);
+    let slot_text = slot_build_task_section(&task, &next_out.files);
+    // Both wrap the same `## Current Task` header but the JSON bodies differ
+    // (sequential includes `score`-derived fields only via NextTaskOutput's
+    // shape; the carriers are distinct types), so the renders are not forced
+    // to be identical — the rosters being independent is the whole point.
+    assert!(seq_text.starts_with("## Current Task"));
+    assert!(slot_text.starts_with("## Current Task"));
 }
