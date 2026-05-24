@@ -15,7 +15,13 @@ use super::truncate_to_budget;
 const LEARNINGS_BUDGET: usize = 4_000;
 
 /// Build a learnings section string.
-pub(crate) fn build_learnings_section(learnings: &[LearningSummaryOutput]) -> String {
+///
+/// `pub` so the cross-crate prompt-assembler parity test can diff the
+/// sequential learnings render against this live builder (matching the
+/// `build_dependency_section` / `build_*_section` precedent). The byte budget
+/// is applied internally ([`LEARNINGS_BUDGET`]); the section is recall-limited
+/// by `next::next` before it reaches here, so callers do not pass a budget.
+pub fn build_learnings_section(learnings: &[LearningSummaryOutput]) -> String {
     if learnings.is_empty() {
         return String::new();
     }

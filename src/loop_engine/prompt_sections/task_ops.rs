@@ -100,6 +100,7 @@ mod tests {
             reorder_hint: None,
             batch_sibling_prds: None,
             next_task_output: None,
+            recalled_learnings: None,
         };
 
         let spec = task_ops_spec();

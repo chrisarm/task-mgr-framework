@@ -70,6 +70,7 @@ pub fn sequential_roster() -> Vec<SectionSpec> {
             render: render_task_section,
         },
         task_ops_spec(),
+        learnings_spec(),
         SectionSpec {
             name: "completion",
             kind: SectionKind::Critical,
@@ -81,6 +82,36 @@ pub fn sequential_roster() -> Vec<SectionSpec> {
             render: render_base_prompt_section,
         },
     ]
+}
+
+/// Build the sequential learnings [`SectionSpec`] (trimmable, no independent
+/// cap on [`SectionKind`]).
+///
+/// Distinct from the slot learnings spec: the sequential render formats the
+/// learnings `next::next` already recalled (carried in
+/// [`PromptContext::recalled_learnings`]) via [`build_learnings_section`],
+/// which applies its OWN internal byte cap. The section is therefore
+/// recall-limit-driven, not budget-driven, so the spec carries `usize::MAX`
+/// and the render fn ignores [`SectionKind`] (mirroring [`dependencies_spec`]).
+fn learnings_spec() -> SectionSpec {
+    SectionSpec {
+        name: "learnings",
+        kind: SectionKind::Trimmable { budget: usize::MAX },
+        render: render_learnings_section,
+    }
+}
+
+/// Render the sequential learnings section from the UCB-recalled learnings in
+/// [`PromptContext::recalled_learnings`]. The recalled IDs are surfaced as the
+/// section's side output so [`assemble`] owns the clear-on-drop invariant: the
+/// IDs reach `PromptResult.shown_learning_ids` iff the section actually fit.
+/// `None`/empty recalls render an empty section with no IDs.
+fn render_learnings_section(ctx: &PromptContext<'_>, _kind: SectionKind) -> Rendered {
+    let learnings = ctx.recalled_learnings.unwrap_or(&[]);
+    Rendered {
+        text: build_learnings_section(learnings),
+        shown_learning_ids: learnings.iter().map(|l| l.id).collect(),
+    }
 }
 
 /// Render the sequential task envelope (`## Current Task` JSON block) from the
@@ -341,6 +372,7 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
         reorder_hint: params.reorder_hint,
         batch_sibling_prds: Some(params.batch_sibling_prds),
         next_task_output: Some(task_output),
+        recalled_learnings: Some(&next_result.learnings),
     };
 
     let roster = sequential_roster();
@@ -385,10 +417,18 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
 
     let critical_total = inlined_critical_bytes + critical_assembled.prompt.len();
 
-    // Step 3: Record shown learnings AFTER the overflow check.
+    // Step 3: Record shown-event rows AFTER the overflow check.
     // If Phase 1 overflows we return Err above — we must not record learnings
-    // as "shown" when the prompt was never sent to Claude (would skew UCB bandit).
-    let shown_learning_ids = record_shown_learnings(
+    // as "shown" when the prompt was never sent to Claude (would skew UCB
+    // bandit). This is the UCB exploration-count side effect; the side-output
+    // `shown_learning_ids` Vec (the outcome-feedback signal) is taken instead
+    // from the assembled learnings section below, so it is cleared if learnings
+    // is dropped under budget — `assemble` owns that invariant (FEAT-004).
+    // In the sequential path criticals + the ≤4 KB learnings section sit far
+    // below TOTAL_PROMPT_BUDGET (80 KB), so learnings is never actually dropped
+    // here and the recorded set coincides with the side-output Vec; the
+    // centralized clear matters only for the slot path's tight-budget waves.
+    record_shown_learnings(
         params.conn,
         &next_result.learnings,
         i64::from(params.iteration),
@@ -403,16 +443,22 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
     // Priority order (highest first):
     // 1. Learnings, 2. Source Context, 3. Dependency Summaries,
     // 4. Synergy Context, 5. Steering, 6. Session Guidance, 7. Reorder Hint
+    //
+    // `learnings` and `dependencies` are migrated trimmables; each is assembled
+    // SOLO at its own fit position (the still-inlined `source` sits between them
+    // in fit order, so a single multi-spec assemble would reorder them).
 
     let mut dropped_sections: Vec<String> = Vec::new();
 
-    let learnings_section = build_learnings_section(&next_result.learnings);
-    let learnings_section = try_fit_section(
-        learnings_section,
-        "Learnings",
-        &mut remaining,
-        &mut dropped_sections,
-    );
+    // Learnings (trimmable, fit FIRST). `assemble` is the SOLE owner of the
+    // shown_learning_ids clear-on-drop, so `shown_learning_ids` is empty iff the
+    // section was dropped — no per-builder `.clear()` here (FEAT-004).
+    let learnings = learnings_spec();
+    let learnings_assembled = assemble(&ctx, std::slice::from_ref(&learnings), remaining);
+    let learnings_section = learnings_assembled.prompt;
+    remaining -= learnings_section.len();
+    dropped_sections.extend(learnings_assembled.dropped_sections);
+    let shown_learning_ids = learnings_assembled.shown_learning_ids;
 
     let source_ctx = context::scan_source_context(
         &task_output.files,
@@ -427,17 +473,11 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
         &mut dropped_sections,
     );
 
-    // Dependencies: the only migrated trimmable (CONTRACT-001, FEAT-002). Fit
-    // via the trimmable subset of the roster within the running budget, AFTER
-    // learnings + source have consumed their share (their fit order is
-    // unchanged) — so deps cannot be folded into the Phase 1 critical assemble.
-    // Reuses the `ctx` built in Phase 1.
-    let trimmable_roster: Vec<SectionSpec> = roster
-        .iter()
-        .copied()
-        .filter(|s| matches!(s.kind, SectionKind::Trimmable { .. }))
-        .collect();
-    let dep_assembled = assemble(&ctx, &trimmable_roster, remaining);
+    // Dependencies (trimmable, fit AFTER learnings + source). Assembled solo at
+    // its own fit position via the shared `dependencies_spec`; the surrounding
+    // sections stay inlined for now. Reuses the `ctx` built in Phase 1.
+    let dependencies = dependencies_spec();
+    let dep_assembled = assemble(&ctx, std::slice::from_ref(&dependencies), remaining);
     // `assemble` already fit the section within `remaining`, so the emitted
     // bytes never exceed it (subtraction cannot underflow). This mirrors the
     // legacy `try_fit_section` budget bookkeeping exactly.

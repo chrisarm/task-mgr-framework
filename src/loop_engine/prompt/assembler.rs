@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 
-use crate::commands::next::output::NextTaskOutput;
+use crate::commands::next::output::{LearningSummaryOutput, NextTaskOutput};
 use crate::loop_engine::config::PermissionMode;
 use crate::loop_engine::prompt_sections::try_fit_section;
 use crate::models::Task;
@@ -66,6 +66,13 @@ pub struct PromptContext<'a> {
     /// The slot path renders the envelope from [`Self::task`] + [`Self::task_files`]
     /// instead and leaves this `None`.
     pub next_task_output: Option<&'a NextTaskOutput>,
+    /// Sequential-only: the UCB-recalled learnings selected by `next::next`,
+    /// the source for the sequential learnings render (formatted via
+    /// `prompt_sections::learnings::build_learnings_section`, recall-limit-driven
+    /// rather than budget-driven). The slot path recalls its own learnings
+    /// inside `core::build_learnings_block` from [`Self::conn`] + [`Self::task`]
+    /// and leaves this `None`.
+    pub recalled_learnings: Option<&'a [LearningSummaryOutput]>,
 }
 
 /// How a section participates in budget accounting.
@@ -283,6 +290,7 @@ mod tests {
                 reorder_hint: None,
                 batch_sibling_prds: None,
                 next_task_output: None,
+                recalled_learnings: None,
             }
         }
     }

@@ -45,9 +45,11 @@ use crate::models::Task;
 ///
 /// As in the sequential path, [`build_prompt`] does not call [`assemble`] once
 /// over this whole roster during the incremental migration — the critical
-/// subset is gated together while the trimmable subset (`dependencies`) is fit
-/// only after the still-inlined `learnings`/`source` trimmables. It derives
-/// criticals-only and trimmables-only sub-rosters from this single source.
+/// subset is gated together while each migrated trimmable (`learnings`,
+/// `dependencies`) is assembled solo at its own fit position, around the
+/// still-inlined `source`/`steering`/… trimmables. It derives a criticals-only
+/// sub-roster from this single source and reaches each trimmable spec via
+/// [`learnings_spec`] / [`dependencies_spec`].
 pub fn slot_roster() -> Vec<SectionSpec> {
     vec![
         SectionSpec {
@@ -56,6 +58,7 @@ pub fn slot_roster() -> Vec<SectionSpec> {
             render: render_task_section,
         },
         task_ops_spec(),
+        learnings_spec(),
         dependencies_spec(),
         SectionSpec {
             name: "completion",
@@ -68,6 +71,42 @@ pub fn slot_roster() -> Vec<SectionSpec> {
             render: render_base_prompt_section,
         },
     ]
+}
+
+/// Build the slot learnings [`SectionSpec`] (trimmable, capped at
+/// [`LEARNINGS_BUDGET`]).
+///
+/// Distinct from the sequential learnings spec: the slot variant recalls its
+/// own learnings from the DB via [`core::build_learnings_block`] (the
+/// `recall-limit + 4 KB truncate` path), whereas the sequential render reads
+/// the learnings `next::next` already selected. Both rosters place this section
+/// at their own legacy display position; neither shares a render fn here.
+fn learnings_spec() -> SectionSpec {
+    SectionSpec {
+        name: "learnings",
+        kind: SectionKind::Trimmable {
+            budget: LEARNINGS_BUDGET,
+        },
+        render: render_learnings_section,
+    }
+}
+
+/// Render the slot learnings section via [`core::build_learnings_block`],
+/// surfacing the recalled learning IDs as the section's side output so
+/// [`assemble`] owns the clear-on-drop invariant (the IDs are dropped from
+/// `Assembled.shown_learning_ids` iff the section doesn't fit). The per-section
+/// budget rides on [`SectionKind::Trimmable`]; a `Critical` kind is unreachable
+/// for this spec but is mapped to "no cap" defensively.
+fn render_learnings_section(ctx: &PromptContext<'_>, kind: SectionKind) -> Rendered {
+    let budget = match kind {
+        SectionKind::Trimmable { budget } => budget,
+        SectionKind::Critical => usize::MAX,
+    };
+    let (text, shown_learning_ids) = core::build_learnings_block(ctx.conn, ctx.task, budget);
+    Rendered {
+        text,
+        shown_learning_ids,
+    }
 }
 
 /// Render the slot task envelope (`## Current Task` JSON block) from the
@@ -261,10 +300,11 @@ pub fn load_base_prompt(base_prompt_path: &std::path::Path) -> String {
 ///   `TOTAL_PROMPT_BUDGET`, return a sentinel bundle with empty `prompt`
 ///   and [`CRITICAL_OVERFLOW_SENTINEL`] in `dropped_sections`.
 /// - **Phase 2**: fill the remaining budget with trimmable sections in
-///   priority order via [`try_fit_section`]; record any drops in
-///   `dropped_sections`. When `"learnings"` is dropped, `shown_learning_ids`
-///   is cleared so the UCB bandit isn't credited with learnings the agent
-///   never saw.
+///   priority order; the migrated `learnings` and `dependencies` trimmables
+///   are each assembled solo via [`assemble`], the rest via [`try_fit_section`].
+///   Drops are recorded in `dropped_sections`. When `"learnings"` is dropped,
+///   [`assemble`] (the sole owner of this invariant) leaves `shown_learning_ids`
+///   empty so the UCB bandit isn't credited with learnings the agent never saw.
 pub fn build_prompt(
     conn: &Connection,
     task: &Task,
@@ -296,6 +336,7 @@ pub fn build_prompt(
         reorder_hint: None,
         batch_sibling_prds: None,
         next_task_output: None,
+        recalled_learnings: None,
     };
 
     let roster = slot_roster();
@@ -364,27 +405,23 @@ pub fn build_prompt(
     //   1. learnings, 2. source, 3. dependencies, 4. steering,
     //   5. session_guidance, 6. tool_awareness, 7. key_decision
     //
-    // Learnings sit at the top because the bandit feedback gating
-    // (`shown_learning_ids` cleared when "learnings" drops) only fires when
-    // the section actually didn't fit; keeping it first maximizes the
-    // chance the agent sees recalled context.
+    // Learnings and dependencies are migrated trimmables; each is assembled
+    // SOLO at its own fit position (they are separated in fit order by the
+    // still-inlined `source`, so a single multi-spec assemble would reorder
+    // them). Learnings sits first because its `shown_learning_ids` clear-on-drop
+    // (now owned entirely by `assemble`) only matters when the section didn't
+    // fit; keeping it first maximizes the chance the agent sees recalled context.
 
-    let (learnings_section_raw, mut shown_learning_ids) =
-        core::build_learnings_block(conn, task, LEARNINGS_BUDGET);
-    let learnings_section = try_fit_section(
-        learnings_section_raw,
-        "learnings",
-        &mut remaining,
-        &mut dropped_sections,
-    );
-    if learnings_section.is_empty() && dropped_sections.last().is_some_and(|s| s == "learnings") {
-        // Drop bandit feedback when the learnings block didn't fit — the
-        // agent never saw these recall results, so crediting them would
-        // skew UCB scoring. Empty-input case (no recall results) leaves
-        // shown_learning_ids untouched (already empty) since try_fit_section
-        // does not push the section name on empty input.
-        shown_learning_ids.clear();
-    }
+    // Learnings (trimmable, fit FIRST). `assemble` is the SOLE owner of the
+    // shown_learning_ids clear-on-drop: the IDs survive iff the section fit, so
+    // the bandit is never credited with learnings the agent never saw — no
+    // per-builder `.clear()` here (FEAT-004 centralization).
+    let learnings = learnings_spec();
+    let learnings_assembled = assemble(&ctx, std::slice::from_ref(&learnings), remaining);
+    let learnings_section = learnings_assembled.prompt;
+    remaining -= learnings_section.len();
+    dropped_sections.extend(learnings_assembled.dropped_sections);
+    let shown_learning_ids = learnings_assembled.shown_learning_ids;
 
     let source_section_raw =
         core::build_source_context_block(&task_files, SOURCE_CONTEXT_BUDGET, &params.project_root);
@@ -395,16 +432,11 @@ pub fn build_prompt(
         &mut dropped_sections,
     );
 
-    // Dependencies: the only migrated trimmable (CONTRACT-001, FEAT-002).
-    // Assembled via the trimmable subset of the roster within the running
-    // budget, AFTER learnings + source have consumed their share; the
-    // surrounding sections stay inlined for now. Reuses the `ctx` built above.
-    let trimmable_roster: Vec<SectionSpec> = roster
-        .iter()
-        .copied()
-        .filter(|s| matches!(s.kind, SectionKind::Trimmable { .. }))
-        .collect();
-    let dep_assembled = assemble(&ctx, &trimmable_roster, remaining);
+    // Dependencies (trimmable, fit AFTER learnings + source). Assembled solo at
+    // its own fit position via the shared `dependencies_spec`; the surrounding
+    // sections stay inlined for now. Reuses the `ctx` built above.
+    let dependencies = dependencies_spec();
+    let dep_assembled = assemble(&ctx, std::slice::from_ref(&dependencies), remaining);
     // `assemble` fit the section within `remaining`, so the subtraction cannot
     // underflow — identical bookkeeping to the legacy `try_fit_section` path.
     let dep_section = dep_assembled.prompt;

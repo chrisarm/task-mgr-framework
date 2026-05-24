@@ -16,9 +16,10 @@
 use rusqlite::Connection;
 use tempfile::TempDir;
 
-use task_mgr::commands::next::output::{NextTaskOutput, ScoreOutput};
+use task_mgr::commands::next::output::{LearningSummaryOutput, NextTaskOutput, ScoreOutput};
 use task_mgr::db::migrations::run_migrations;
 use task_mgr::db::{create_schema, open_connection};
+use task_mgr::learnings::crud::{RecordLearningParams, record_learning};
 use task_mgr::loop_engine::config::PermissionMode;
 use task_mgr::loop_engine::prompt::assembler::{PromptContext, SectionSpec, assemble};
 use task_mgr::loop_engine::prompt::core;
@@ -32,7 +33,8 @@ use task_mgr::loop_engine::prompt::slot::{
 use task_mgr::loop_engine::prompt_sections::dependencies::{
     DEPENDENCIES_SECTION, build_dependency_section, dependencies_spec,
 };
-use task_mgr::models::Task;
+use task_mgr::loop_engine::prompt_sections::learnings::build_learnings_section;
+use task_mgr::models::{Confidence, LearningOutcome, Task};
 
 /// Look up a spec by name in a roster, panicking with a helpful message if
 /// absent (a missing migrated section is itself a regression worth a loud
@@ -143,6 +145,7 @@ fn ctx_with_files<'a>(
         reorder_hint: None,
         batch_sibling_prds: None,
         next_task_output,
+        recalled_learnings: None,
     }
 }
 
@@ -263,10 +266,10 @@ fn dependencies_present_in_both_rosters_at_legacy_position() {
     let seq = sequential_roster();
     let slot = slot_roster();
 
-    // Sequential display order: dependencies(6) precedes task(9); slot display
-    // order: task(0) precedes dependencies(4). Each path owns its own
-    // independently-ordered Vec, but BOTH reach the section through the shared
-    // `dependencies_spec`.
+    // Sequential display order: dependencies(0) precedes task; slot display
+    // order: task(0) precedes dependencies(3, after the inserted learnings).
+    // Each path owns its own independently-ordered Vec, but BOTH reach the
+    // section through the shared `dependencies_spec`.
     assert_eq!(
         seq.iter().position(|s| s.name == DEPENDENCIES_SECTION),
         Some(0),
@@ -274,7 +277,7 @@ fn dependencies_present_in_both_rosters_at_legacy_position() {
     );
     assert_eq!(
         slot.iter().position(|s| s.name == DEPENDENCIES_SECTION),
-        Some(2),
+        Some(3),
         "dependencies must occupy its legacy position in the slot roster"
     );
 }
@@ -292,11 +295,13 @@ fn criticals_present_in_both_rosters_at_legacy_positions() {
     let slot = slot_roster();
 
     // Sequential display order of migrated sections:
-    //   dependencies(0) → task(1) → task_ops(2) → completion(3) → base_prompt(4)
+    //   dependencies(0) → task(1) → task_ops(2) → learnings(3) → completion(4)
+    //   → base_prompt(5)
     let seq_order = [
         "dependencies",
         "task",
         "task_ops",
+        "learnings",
         "completion",
         "base_prompt",
     ];
@@ -304,10 +309,12 @@ fn criticals_present_in_both_rosters_at_legacy_positions() {
     assert_eq!(seq_names, seq_order, "sequential roster display order");
 
     // Slot display order of migrated sections:
-    //   task(0) → task_ops(1) → dependencies(2) → completion(3) → base_prompt(4)
+    //   task(0) → task_ops(1) → learnings(2) → dependencies(3) → completion(4)
+    //   → base_prompt(5)
     let slot_order = [
         "task",
         "task_ops",
+        "learnings",
         "dependencies",
         "completion",
         "base_prompt",
@@ -473,4 +480,191 @@ fn sequential_and_slot_task_envelopes_are_path_specific() {
     // to be identical — the rosters being independent is the whole point.
     assert!(seq_text.starts_with("## Current Task"));
     assert!(slot_text.starts_with("## Current Task"));
+}
+
+// ---------------------------------------------------------------------------
+// FEAT-004 — Learnings parity (SEQUENTIAL): the render formats the learnings
+// `next::next` already recalled (carried in PromptContext::recalled_learnings),
+// so it is recall-limit-driven. Rendered.text and assemble() output are
+// byte-identical to the live `build_learnings_section` builder, and the
+// recalled IDs ride through as the section side output.
+// ---------------------------------------------------------------------------
+#[test]
+fn sequential_learnings_render_matches_legacy() {
+    let (tmp, conn) = setup_migrated_db();
+    insert_task(&conn, "TASK-001", "Build API", "todo");
+    let base = tmp.path().join("prompt.md");
+    let task = Task::new("TASK-001", "Build API");
+
+    // Two learnings constructed directly (the sequential render reads these
+    // from the context, NOT from a fresh DB recall). Diff target is the LIVE
+    // legacy builder, never a frozen literal.
+    let recalled = vec![
+        LearningSummaryOutput {
+            id: 11,
+            title: "Use the assembler".to_string(),
+            outcome: "pattern".to_string(),
+            confidence: "high".to_string(),
+            content: Some("Route every section through assemble()".to_string()),
+            applies_to_files: Some(vec!["src/loop_engine/prompt/assembler.rs".to_string()]),
+            applies_to_task_types: Some(vec!["FEAT-".to_string()]),
+        },
+        LearningSummaryOutput {
+            id: 22,
+            title: "Centralize the clear".to_string(),
+            outcome: "failure".to_string(),
+            confidence: "medium".to_string(),
+            content: None,
+            applies_to_files: None,
+            applies_to_task_types: None,
+        },
+    ];
+    let legacy = build_learnings_section(&recalled);
+    assert!(
+        legacy.contains("## Relevant Learnings") && legacy.contains("Use the assembler"),
+        "guard: legacy learnings builder must produce real content, got {legacy:?}"
+    );
+
+    let ctx = PromptContext {
+        conn: &conn,
+        task: &task,
+        task_files: &[],
+        project_root: tmp.path(),
+        base_prompt_path: &base,
+        permission_mode: &DANGEROUS,
+        steering_path: None,
+        session_guidance: "",
+        run_id: None,
+        task_prefix: None,
+        reorder_hint: None,
+        batch_sibling_prds: None,
+        next_task_output: None,
+        recalled_learnings: Some(&recalled),
+    };
+
+    let roster = sequential_roster();
+    let spec = spec_named(&roster, "learnings");
+    let rendered = (spec.render)(&ctx, spec.kind);
+    assert_eq!(
+        rendered.text, legacy,
+        "sequential learnings text must equal the live builder"
+    );
+    assert_eq!(
+        rendered.shown_learning_ids,
+        vec![11, 22],
+        "the recalled IDs must ride through as the section side output"
+    );
+
+    // End-to-end via assemble(): the IDs survive because the section fits.
+    let assembled = assemble(&ctx, std::slice::from_ref(&spec), BUDGET);
+    assert_eq!(assembled.prompt, legacy);
+    assert_eq!(assembled.shown_learning_ids, vec![11, 22]);
+    assert!(assembled.dropped_sections.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// FEAT-004 — Centralized invariant (SEQUENTIAL spec): when the real sequential
+// learnings spec is dropped under budget pressure, assemble() — the SOLE owner
+// of the clear — leaves shown_learning_ids empty. Proves the sequential path
+// routes its side output through assemble() rather than a per-builder clear.
+// ---------------------------------------------------------------------------
+#[test]
+fn sequential_learnings_dropped_clears_shown_ids() {
+    let (tmp, conn) = setup_migrated_db();
+    let base = tmp.path().join("prompt.md");
+    let task = Task::new("TASK-001", "Build API");
+
+    let recalled = vec![LearningSummaryOutput {
+        id: 11,
+        title: "Some learning".to_string(),
+        outcome: "pattern".to_string(),
+        confidence: "high".to_string(),
+        content: Some("x".repeat(200)),
+        applies_to_files: None,
+        applies_to_task_types: None,
+    }];
+
+    let ctx = PromptContext {
+        conn: &conn,
+        task: &task,
+        task_files: &[],
+        project_root: tmp.path(),
+        base_prompt_path: &base,
+        permission_mode: &DANGEROUS,
+        steering_path: None,
+        session_guidance: "",
+        run_id: None,
+        task_prefix: None,
+        reorder_hint: None,
+        batch_sibling_prds: None,
+        next_task_output: None,
+        recalled_learnings: Some(&recalled),
+    };
+
+    let spec = spec_named(&sequential_roster(), "learnings");
+    // A 10-byte total budget cannot fit the ~200-byte learnings section.
+    let assembled = assemble(&ctx, std::slice::from_ref(&spec), 10);
+    assert_eq!(assembled.dropped_sections, vec!["learnings".to_string()]);
+    assert!(
+        assembled.shown_learning_ids.is_empty(),
+        "dropped sequential learnings must not credit the bandit"
+    );
+    assert_eq!(assembled.prompt, "");
+}
+
+// ---------------------------------------------------------------------------
+// FEAT-004 — Learnings parity (SLOT): the render recalls from the DB via
+// core::build_learnings_block with LEARNINGS_BUDGET=4000. Rendered.text and the
+// surfaced IDs are byte-identical to that live builder for a recallable
+// learning.
+// ---------------------------------------------------------------------------
+#[test]
+fn slot_learnings_render_matches_legacy() {
+    let (tmp, conn) = setup_migrated_db();
+    insert_task(&conn, "TASK-001", "Build API", "in_progress");
+
+    // A learning recallable for TASK-001 via its task-type prefix.
+    let learn = RecordLearningParams {
+        outcome: LearningOutcome::Pattern,
+        title: "slot learnings parity".into(),
+        content: "Route slot learnings through assemble()".into(),
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: None,
+        applies_to_files: Some(vec!["src/loop_engine/prompt/slot.rs".into()]),
+        applies_to_task_types: Some(vec!["TASK-".into()]),
+        applies_to_errors: None,
+        tags: None,
+        confidence: Confidence::High,
+    };
+    record_learning(&conn, learn).expect("record_learning");
+
+    let base = tmp.path().join("prompt.md");
+    let task = Task::new("TASK-001", "Build API");
+    let ctx = ctx_for(&conn, &task, tmp.path(), &base);
+
+    // The slot spec carries LEARNINGS_BUDGET=4000; the live builder uses the
+    // same budget so the diff is exact. Never a frozen literal.
+    let (legacy_text, legacy_ids) = core::build_learnings_block(&conn, &task, 4_000);
+    assert!(
+        legacy_text.contains("## Relevant Learnings"),
+        "guard: a recallable learning must produce real slot learnings content, got {legacy_text:?}"
+    );
+    assert!(
+        !legacy_ids.is_empty(),
+        "guard: the recalled learning must surface an id"
+    );
+
+    let roster = slot_roster();
+    let spec = spec_named(&roster, "learnings");
+    let rendered = (spec.render)(&ctx, spec.kind);
+    assert_eq!(
+        rendered.text, legacy_text,
+        "slot learnings text must equal the live builder (LEARNINGS_BUDGET=4000)"
+    );
+    assert_eq!(
+        rendered.shown_learning_ids, legacy_ids,
+        "slot learnings must surface the same recalled IDs as the live builder"
+    );
 }
