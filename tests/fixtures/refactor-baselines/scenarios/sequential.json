@@ -1,0 +1,89 @@
+{
+  "version": "1.0",
+  "project": "carve-baseline-sequential",
+  "branchName": "carve-baseline/sequential",
+  "description": "Sequential dogfood scenario for the engine.rs carve. Six tasks in a strict dependency chain so the loop runs run_iteration once per task with no wave scheduling. Exercises the outer run_loop + sequential run_iteration + per-task completion pipeline.",
+  "priorityPhilosophy": { "description": "Strict order", "hierarchy": ["1. Chain order"] },
+  "globalAcceptanceCriteria": { "description": "All pass", "criteria": ["All tasks complete in order"] },
+  "reviewGuidelines": { "priorityGuidelines": { "critical": "1-10" } },
+  "userStories": [
+    {
+      "id": "SEQ-001",
+      "title": "First sequential task",
+      "description": "Head of the chain.",
+      "acceptanceCriteria": ["Completes"],
+      "priority": 1,
+      "passes": false,
+      "touchesFiles": ["src/seq_a.rs"],
+      "dependsOn": [],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": []
+    },
+    {
+      "id": "SEQ-002",
+      "title": "Second sequential task",
+      "description": "Depends on SEQ-001.",
+      "acceptanceCriteria": ["Completes"],
+      "priority": 2,
+      "passes": false,
+      "touchesFiles": ["src/seq_b.rs"],
+      "dependsOn": ["SEQ-001"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": []
+    },
+    {
+      "id": "SEQ-003",
+      "title": "Third sequential task",
+      "description": "Depends on SEQ-002.",
+      "acceptanceCriteria": ["Completes"],
+      "priority": 3,
+      "passes": false,
+      "touchesFiles": ["src/seq_c.rs"],
+      "dependsOn": ["SEQ-002"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": []
+    },
+    {
+      "id": "SEQ-004",
+      "title": "Fourth sequential task",
+      "description": "Depends on SEQ-003.",
+      "acceptanceCriteria": ["Completes"],
+      "priority": 4,
+      "passes": false,
+      "touchesFiles": ["src/seq_d.rs"],
+      "dependsOn": ["SEQ-003"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": []
+    },
+    {
+      "id": "SEQ-005",
+      "title": "Fifth sequential task",
+      "description": "Depends on SEQ-004.",
+      "acceptanceCriteria": ["Completes"],
+      "priority": 5,
+      "passes": false,
+      "touchesFiles": ["src/seq_e.rs"],
+      "dependsOn": ["SEQ-004"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": []
+    },
+    {
+      "id": "SEQ-006",
+      "title": "Sixth sequential task",
+      "description": "Depends on SEQ-005.",
+      "acceptanceCriteria": ["Completes"],
+      "priority": 6,
+      "passes": false,
+      "touchesFiles": ["src/seq_f.rs"],
+      "dependsOn": ["SEQ-005"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": []
+    }
+  ]
+}

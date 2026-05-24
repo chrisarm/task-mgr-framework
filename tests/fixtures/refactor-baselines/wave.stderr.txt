@@ -1,0 +1,57 @@
+
+
+Copied tasks/wave-prompt.md to worktree
+Copied tasks/wave.json to worktree
+Created worktree at <WORK>
+Created worktree at <WORK>
+Creating worktree for 'carve-baseline/wave' at <WORK>
+Creating worktree for 'carve-baseline/wave-slot-1' at <WORK>
+PRD file changed, re-importing tasks...
+PRD file changed, re-importing tasks...
+Parallel mode active: 2 slots (1 ephemeral branches)
+Task <SHA>-WAVE-001 completed (detected from <completed> tag)
+Task <SHA>-WAVE-002 completed (detected from <completed> tag)
+Task <SHA>-WAVE-003 completed (detected from <completed> tag)
+Task <SHA>-WAVE-004 completed (detected from <completed> tag)
+Task <SHA>-WAVE-005 completed (detected from <completed> tag)
+Using existing worktree for 'carve-baseline/wave' at <WORK>
+Warning: 1 uncommitted change(s) detected. Continuing in --yes mode.
+Warning: could not read source file: src/wave_a.rs
+Warning: could not read source file: src/wave_b.rs
+Warning: could not read source file: src/wave_c.rs
+Warning: could not read source file: src/wave_d.rs
+Warning: could not read source file: src/wave_e.rs
+Warning: worktree '<WORK>' has uncommitted changes — not removed.
+[auto-review] stdout is not a TTY (CI / redirected); run `claude "/review-loop tasks/wave.json"` manually
+[slot 0] MOCK completing <SHA>-WAVE-001
+[slot 0] MOCK completing <SHA>-WAVE-003
+[slot 0] MOCK completing <SHA>-WAVE-005
+[slot 0] ═══ Iteration 1/9 ═══ Task: <SHA>-WAVE-001 ═══ Model: (default) ═══ Effort: (default) ═══ Elapsed: <DURATION> ═══
+[slot 0] ═══ Iteration 2/9 ═══ Task: <SHA>-WAVE-003 ═══ Model: (default) ═══ Effort: (default) ═══ Elapsed: <DURATION> ═══
+[slot 0] ═══ Iteration 3/9 ═══ Task: <SHA>-WAVE-005 ═══ Model: (default) ═══ Effort: (default) ═══ Elapsed: <DURATION> ═══
+[slot 1] MOCK completing <SHA>-WAVE-002
+[slot 1] MOCK completing <SHA>-WAVE-004
+[slot 1] ═══ Iteration 1/9 ═══ Task: <SHA>-WAVE-002 ═══ Model: (default) ═══ Effort: (default) ═══ Elapsed: <DURATION> ═══
+[slot 1] ═══ Iteration 2/9 ═══ Task: <SHA>-WAVE-004 ═══ Model: (default) ═══ Effort: (default) ═══ Elapsed: <DURATION> ═══
+warning: skipping removal of dirty worktree at <WORK> (uncommitted changes)
+║          AUTONOMOUS AGENT LOOP END           ║
+║         AUTONOMOUS AGENT LOOP START          ║
+║  Branch: carve-baseline/wave                 ║
+║  DB: .task-mgr/tasks.db                      ║
+║  Exit reason: all tasks complete             ║
+║  Iterations: 3                               ║
+║  Max iterations: 9                           ║
+║  PRD: wave                                   ║
+║  PRD: wave                                   ║
+║  Pause: touch tasks/.pause-<SHA> to pause ║
+║  Stop: touch tasks/.stop-<SHA> to stop    ║
+║  Tasks completed: 5                          ║
+║  Total time: <DURATION>                              ║
+║  Worktree: <WORK>
+╔══════════════════════════════════════════════╗
+╔══════════════════════════════════════════════╗
+╚══════════════════════════════════════════════╝
+╚══════════════════════════════════════════════╝
+╠══════════════════════════════════════════════╣
+╠══════════════════════════════════════════════╣
+╠══════════════════════════════════════════════╣

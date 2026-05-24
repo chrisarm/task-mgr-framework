@@ -1,0 +1,76 @@
+{
+  "version": "1.0",
+  "project": "carve-baseline-wave",
+  "branchName": "carve-baseline/wave",
+  "description": "2-slot wave dogfood scenario for the engine.rs carve. Five independent tasks (no inter-deps, disjoint touchesFiles) so the loop fills both parallel slots across three waves (the final wave runs a single slot, exercising the partial-fill path). Exercises run_wave_iteration + ensure_slot_worktrees (slot-0 path threading, defense layer #1) + run_slot_iteration + process_slot_result + merge-back.",
+  "priorityPhilosophy": { "description": "Parallel", "hierarchy": ["1. Independent"] },
+  "globalAcceptanceCriteria": { "description": "All pass", "criteria": ["All tasks complete across waves"] },
+  "reviewGuidelines": { "priorityGuidelines": { "critical": "1-10" } },
+  "userStories": [
+    {
+      "id": "WAVE-001",
+      "title": "Independent wave task A",
+      "description": "Disjoint files, no deps.",
+      "acceptanceCriteria": ["Completes"],
+      "priority": 1,
+      "passes": false,
+      "touchesFiles": ["src/wave_a.rs"],
+      "dependsOn": [],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": []
+    },
+    {
+      "id": "WAVE-002",
+      "title": "Independent wave task B",
+      "description": "Disjoint files, no deps.",
+      "acceptanceCriteria": ["Completes"],
+      "priority": 2,
+      "passes": false,
+      "touchesFiles": ["src/wave_b.rs"],
+      "dependsOn": [],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": []
+    },
+    {
+      "id": "WAVE-003",
+      "title": "Independent wave task C",
+      "description": "Disjoint files, no deps.",
+      "acceptanceCriteria": ["Completes"],
+      "priority": 3,
+      "passes": false,
+      "touchesFiles": ["src/wave_c.rs"],
+      "dependsOn": [],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": []
+    },
+    {
+      "id": "WAVE-004",
+      "title": "Independent wave task D",
+      "description": "Disjoint files, no deps.",
+      "acceptanceCriteria": ["Completes"],
+      "priority": 4,
+      "passes": false,
+      "touchesFiles": ["src/wave_d.rs"],
+      "dependsOn": [],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": []
+    },
+    {
+      "id": "WAVE-005",
+      "title": "Independent wave task E",
+      "description": "Disjoint files, no deps.",
+      "acceptanceCriteria": ["Completes"],
+      "priority": 5,
+      "passes": false,
+      "touchesFiles": ["src/wave_e.rs"],
+      "dependsOn": [],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": []
+    }
+  ]
+}

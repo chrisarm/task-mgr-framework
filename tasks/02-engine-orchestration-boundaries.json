@@ -113,7 +113,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": false,
       "notes": "Pick PRDs that exercise the relevant defenses: sequential = curate-session-cleanup.json (mostly sequential, exercises overflow ladder); wave = parallel-task-execution.json (exercises slot-0 path threading, halt threshold, ephemeral overlay). If those PRDs are unavailable, pick equivalents. The RunnerKind audit is shared with prd-01-runner-capability-enforcement.md FR-005; either PRD's owner can produce it first; the other consumes it.",
-      "passes": false,
+      "passes": true,
       "priority": 1,
       "qualityDimensions": [
         "Baselines are deterministic — re-running on main produces a byte-identical capture (modulo intentionally-normalized timestamps / run-ids)",
@@ -163,7 +163,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": false,
       "notes": "Phase 2 foundation: this assertion is the long-term enforcement mechanism. The PRD's biggest risk (wave/sequential divergence as fields drift) is closed by this test. Spend the time to make it robust — manual verification that adding a field breaks compile is the acceptance test for the test itself.",
-      "passes": false,
+      "passes": true,
       "priority": 2,
       "qualityDimensions": [
         "The test must actually fail to compile (not run-time fail) when ProcessingParams drifts — the whole point is compile-time enforcement",
@@ -212,7 +212,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": false,
       "notes": "See src/loop_engine/CLAUDE.md `## Parallel-slot scheduling` section for the canonical defense-layer list (1-5). Touch the test files only to verify their existence and current pass status; do not modify them in this task. Any gap-fill TEST-xxx spawned here is its own task.",
-      "passes": false,
+      "passes": true,
       "priority": 3,
       "qualityDimensions": [
         "Inventory is exhaustive — if you cannot find a test for defense layer N, flag the gap explicitly rather than silently moving on",
@@ -252,7 +252,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": false,
       "notes": "First extraction. slot.rs imports recovery functions from their current engine.rs locations; those `use crate::loop_engine::engine::{check_override_invalidation, ...}` lines update to `use crate::loop_engine::recovery::{...}` in FEAT-002 when recovery.rs lands. Bottom-up extraction order: slot.rs is the leaf consumer that wave_scheduler.rs (FEAT-003) will import; recovery.rs (FEAT-002) is the cross-cutting helper. Architect-rec order: slot before recovery so the second extraction (recovery) exercises the cross-module call shape with a real consumer (slot.rs).",
-      "passes": false,
+      "passes": true,
       "priority": 4,
       "qualityDimensions": [
         "Byte-identical observable behavior on a 2-slot wave-mode dogfood scenario",
@@ -294,7 +294,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": false,
       "notes": "Approach A per PRD §6. Approach B (leave recovery in engine.rs) was rejected because future recovery primitives compound the refactor cost. Tests for this cluster live in engine.rs today — they move in the SAME commit as the code, no exceptions. The slot.rs import-update is included in this task's commit because slot.rs is the first cross-module consumer of recovery functions; iteration.rs and wave_scheduler.rs come in later FEATs and will import recovery directly from the new location.",
-      "passes": false,
+      "passes": true,
       "priority": 5,
       "qualityDimensions": [
         "Byte-identical observable behavior on the dogfood-baseline scenarios — REVIEW-001's diff will catch any drift",
@@ -338,7 +338,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": false,
       "notes": "Largest extraction by line count (~1800). Approach: move symbols in dependency-order within wave_scheduler.rs (build_* helpers first, then handle_*, then the orchestration entry points). Each step is a separate cargo check; do not let the half-extracted state survive across iterations. The test for defense layer #1 (slot-path threading) is NEW in this extraction — it's a regression test the existing code lacks; add it as the first thing inside wave_scheduler.rs.",
-      "passes": false,
+      "passes": true,
       "priority": 6,
       "qualityDimensions": [
         "All five defense-layer regression tests stay green throughout (run scoped suite after every step of the extraction)",
@@ -377,7 +377,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": false,
       "notes": "Sequential iteration is the simpler of the two execution paths. Symbol set is smaller than wave_scheduler. The biggest risk is the order-before-resolve constraint for check_override_invalidation — read the existing code carefully before moving.",
-      "passes": false,
+      "passes": true,
       "priority": 7,
       "qualityDimensions": [
         "Byte-identical observable behavior on the sequential dogfood scenario",
@@ -419,7 +419,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": false,
       "notes": "Largest single function by line count (run_loop ~1300 lines). This extraction is mostly a copy-paste because run_loop is already a self-contained outer body. The risk is the surrounding helpers (signal_handler, on_run_completed, etc.) — confirm each is referenced only from run_loop's body before assuming it's exclusively orchestrator territory. If a helper is called from iteration.rs or wave_scheduler.rs, it stays in engine.rs (or moves to recovery.rs).",
-      "passes": false,
+      "passes": true,
       "priority": 8,
       "qualityDimensions": [
         "Public surface stability: `crate::loop_engine::run_loop` remains importable from the same path (via `pub use orchestrator::run_loop` in mod.rs)",
@@ -456,7 +456,7 @@
       "id": "FEAT-006",
       "modifiesBehavior": false,
       "notes": "This is the cleanup task after the carve. Run cargo doc to confirm rustdocs are valid. CLAUDE.md edits are the slowest part — there are ~40 Touchpoints rows and ~10 narrative references.",
-      "passes": false,
+      "passes": true,
       "priority": 9,
       "qualityDimensions": [
         "CLAUDE.md changes are line-level surgical, never wholesale rewrites — preserve the existing narrative's voice and ordering",
@@ -499,7 +499,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": false,
       "notes": "Use the rust-python-code-reviewer agent: `Agent(subagent_type='rust-python-code-reviewer', prompt='Review FEAT-001..006 of the engine orchestration carve. Focus: defense-layer preservation, public-surface stability, visibility ladder hygiene, no new dynamic dispatch, LIFECYCLE-EXCEPTION grep stays green.')`. Spawn each finding as CODE-FIX-xxx / WIRE-FIX-xxx with task-mgr add --stdin --depended-on-by REVIEW-001.",
-      "passes": false,
+      "passes": true,
       "priority": 13,
       "qualityDimensions": [
         "Review is reading + grepping, NOT implementing — fixes go into spawned CODE-FIX/WIRE-FIX tasks",
@@ -536,7 +536,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": false,
       "notes": "Final pass before REVIEW-001. If REFACTOR-xxx tasks are spawned, they must complete before REVIEW-001 can claim. Use `/simplify` on small touchpoints — don't file a task just to dedent a closure.",
-      "passes": false,
+      "passes": true,
       "priority": 70,
       "qualityDimensions": [
         "Findings are concrete (file:line + proposed change), not vague ('this could be cleaner')",
@@ -567,7 +567,8 @@
         "If any pre-existing test failure exists in the full suite that predates this PRD: fix inline (≤12 failures) OR spawn a single FIX-xxx task via task-mgr add --stdin --depended-on-by REVIEW-001 and BLOCKED until resolved (> 12 unrelated failures only)"
       ],
       "dependsOn": [
-        "REFACTOR-REVIEW-FINAL"
+        "REFACTOR-REVIEW-FINAL",
+        "REFACTOR-001"
       ],
       "description": "The PRD's exit criterion. Run: (1) Full unscoped quality gate (cargo fmt --check, cargo check, cargo clippy -D warnings, cargo test — entire workspace). (2) Dogfood gate: 10 iterations across 2 distinct PRDs (one sequential, one 2-slot wave) on the refactored code; diff the stderr capture and DB-final-state snapshot against the ANALYSIS-001 baselines. Any divergence is a hard fail. (3) Verify engine.rs is < 1500 lines (PRD success metric). (4) Verify all FR-008 public surface items resolve from their original import paths. Fix every failure, including pre-existing failures in the full suite (per the milestone protocol; trunk-green is the invariant).",
       "estimatedEffort": "high",
@@ -587,6 +588,30 @@
       "timeoutSecs": 3600,
       "title": "Final gate: full quality suite + dogfood gate (10 iterations × 2 PRDs)",
       "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": [
+        "Each nested test submodule relocated to the sibling module whose production symbols it exercises (slot tests->slot.rs, wave/merge/deadlock tests->wave_scheduler.rs, recovery/crash/escalation tests->recovery.rs, iteration tests->iteration.rs, engine-retained-symbol tests->engine.rs)",
+        "run_loop/lifecycle tests and shared run_loop scaffolding (insert_dual_prd_tasks, run_with_prefix, write_minimal_prd, seed_task_with_status) remain in orchestrator.rs",
+        "Total test count unchanged; no test logic/assertion altered (relocation only)",
+        "Source-grep integration tests (review_model_routing.rs, iteration_pipeline_parity.rs) still pass; any filename-based grep assertions updated to the new home",
+        "Global acceptance criteria green: cargo fmt --check, cargo check --all-targets, cargo clippy -D warnings, cargo test loop_engine; LIFECYCLE-EXCEPTION grep lint green",
+        "orchestrator.rs production code unchanged (diff touches only the test module boundary)"
+      ],
+      "description": "FEAT-005 moved engine.rs's entire inline `#[cfg(test)] mod tests` wholesale into orchestrator.rs to hit the <1500-line engine.rs metric and avoid splitting shared test helpers mid-carve. Result: orchestrator.rs is 5735 lines, ~3950 of which is a test module whose 102 tests mostly exercise OTHER modules' symbols (wave ~24, slot ~23, recovery cluster ~18, iteration ~11). A developer changing recovery.rs won't find its tests in recovery.rs. The test module is already organized into nested submodules by subject with subject-local helpers (make_slot/dummy_bundle for slot; make_wave_params/build_wave_params for wave; auto_block_after_failures/resurrect_for_iteration for recovery), so the split boundaries already exist. Redistribute each nested submodule into the owning sibling module's own `#[cfg(test)] mod tests`. Keep run_loop-specific tests AND the genuinely-shared run_loop scaffolding (insert_dual_prd_tasks, run_with_prefix, write_minimal_prd, seed_task_with_status) in orchestrator.rs. Tests for engine-retained symbols (apply_status_updates, resolve_effective_runner, IterationContext/data types) should move to engine.rs's test module. HIDDEN COUPLING: integration tests grep source files by filename (tests/review_model_routing.rs, tests/iteration_pipeline_parity.rs) — after relocating a test, verify any source-grep assertions still target the correct file, or update them. This is a pure test-relocation refactor: no production code or test logic changes, only test location. Verify byte-identical test BEHAVIOR (same assertions, same count) before/after.",
+      "estimatedEffort": "medium",
+      "id": "d4e04fae-REFACTOR-001",
+      "notes": "Spawned by d4e04fae-REFACTOR-REVIEW-FINAL. Pure test relocation — carve the test module along its existing nested-submodule seams. Do NOT 'improve' helpers or tests while moving. Watch the file-grep coupling in tests/.",
+      "passes": false,
+      "priority": 78,
+      "title": "Redistribute orchestrator.rs test module to owning sibling modules",
+      "touchesFiles": [
+        "src/loop_engine/orchestrator.rs",
+        "src/loop_engine/iteration.rs",
+        "src/loop_engine/wave_scheduler.rs",
+        "src/loop_engine/slot.rs",
+        "src/loop_engine/recovery.rs"
+      ]
     }
   ],
   "version": "1.0"

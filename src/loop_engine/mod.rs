@@ -17,11 +17,13 @@ pub mod env;
 pub mod feedback;
 pub mod git_reconcile;
 pub mod guidance;
+pub(crate) mod iteration;
 pub mod iteration_pipeline;
 pub(crate) mod merge_resolver;
 pub mod model;
 pub mod monitor;
 pub mod oauth;
+pub(crate) mod orchestrator;
 pub mod output_parsing;
 pub mod overflow;
 pub mod prd_reconcile;
@@ -29,8 +31,10 @@ pub mod progress;
 pub mod project_config;
 pub mod prompt;
 pub mod prompt_sections;
+pub(crate) mod recovery;
 pub mod runner;
 pub mod signals;
+pub(crate) mod slot;
 pub mod stale;
 pub mod status;
 pub mod status_display;
@@ -38,10 +42,16 @@ pub mod status_queries;
 pub mod usage;
 pub mod user_config;
 pub mod watchdog;
+pub(crate) mod wave_scheduler;
 pub mod worktree;
 
 #[cfg(test)]
 pub(crate) mod test_utils;
+
+// `run_loop` is the canonical public entry point for the autonomous loop; it
+// lives in `orchestrator.rs` (PRD 02, FEAT-005). Re-exported here so callers
+// can use `loop_engine::run_loop` directly.
+pub use orchestrator::run_loop;
 
 // Signal and state file name constants used across loop_engine modules.
 // Centralised here to prevent typo bugs and ensure consistent naming.
