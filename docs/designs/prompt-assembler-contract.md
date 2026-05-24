@@ -168,6 +168,13 @@ pub fn assemble(ctx: &PromptContext, roster: &[SectionSpec], total_budget: usize
 - Threads budget via `PromptContext` instead of `SectionKind` → every trimmable
   shares one budget field and the per-section budgets (`LEARNINGS_BUDGET=4000`,
   `SOURCE_CONTEXT_BUDGET=2000`) collapse.
+- Builds one shared roster for both paths and tries to make it reproduce both
+  byte layouts simultaneously → the slot and sequential paths have **different
+  section orders** (today slot emits `task` first; sequential emits it mid-list)
+  so a single roster produces an incorrect byte layout for at least one path.
+  Each path MUST supply its OWN independently ordered `Vec<SectionSpec>`; the
+  slot roster is a set-subset of the sequential roster but is *not* a positional
+  sub-sequence.
 
 ### Edge cases (from the spike + current code)
 - Empty `task_files` → source section empty (not an error).
@@ -176,12 +183,20 @@ pub fn assemble(ctx: &PromptContext, roster: &[SectionSpec], total_budget: usize
   `dropped_sections` (only non-empty-but-too-large drops count).
 
 ### Downstream impact (stories that will `dependOn` CONTRACT-001)
-- FEAT: assembler + `PromptContext` + `SectionSpec` skeleton in `assembler.rs`.
-- FEAT: pilot-migrate `dependencies` through the assembler in BOTH paths + parity test.
-- FEAT: bulk-migrate remaining `core`/`prompt_sections` sections (task, task_ops,
-  completion, learnings, source, steering, session_guidance, tool_awareness,
-  key_decision).
-- FEAT: migrate sequential-only sections (synergy, escalation, siblings, reorder).
-- FEAT: delete the hand-enforced wiring rule from `prompt/mod.rs`; add the
-  roster-completeness test.
-- REVIEW milestone.
+- **FEAT-001**: assembler + `PromptContext` + `SectionSpec` skeleton in
+  `assembler.rs` (engine, types, `assemble()` loop, isolated unit tests).
+- **FEAT-002**: pilot-migrate `dependencies` through the assembler in BOTH paths
+  + byte-parity test; establishes the per-path roster pattern.
+- **FEAT-003**: migrate the critical sections shared by both paths (task,
+  task_ops, completion, base_prompt) + sequential overflow translation
+  (`dropped == ["CRITICAL"]` → `Err(TaskMgrError::PromptOverflow)`).
+- **FEAT-004**: migrate the `learnings` section (Trimmable) + centralize
+  `shown_learning_ids` side-output (remove duplicated clears from builders).
+- **FEAT-005**: migrate the remaining shared trimmables (source/source-context,
+  steering, session_guidance, tool_awareness, key_decision).
+- **FEAT-006**: migrate sequential-only sections (synergy, escalation, siblings,
+  reorder-hint); confirms slot roster ⊂ sequential roster as a SET.
+- **FEAT-007**: delete the hand-enforced wiring rule from `prompt/mod.rs` AND
+  from `src/loop_engine/CLAUDE.md`; add roster-completeness test; mark Item 3
+  done in `docs/designs/coherence-refactoring.md` §3.
+- REFACTOR-001 / REVIEW-001 milestones.
