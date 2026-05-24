@@ -341,12 +341,8 @@ pub const SOURCE_CONTEXT_BUDGET: usize = 2000;
 /// [`SectionKind::Trimmable`] budget. `Critical` is unreachable for this spec
 /// but maps to "no cap" defensively.
 fn render_source_section(ctx: &PromptContext<'_>, kind: SectionKind) -> Rendered {
-    let budget = match kind {
-        SectionKind::Trimmable { budget } => budget,
-        SectionKind::Critical => usize::MAX,
-    };
     Rendered {
-        text: build_source_context_block(ctx.task_files, budget, ctx.project_root),
+        text: build_source_context_block(ctx.task_files, kind.budget_or_max(), ctx.project_root),
         ..Default::default()
     }
 }

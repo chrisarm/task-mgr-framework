@@ -23,7 +23,8 @@ use crate::commands::next::output::NextTaskOutput;
 use crate::error::{TaskMgrError, TaskMgrResult};
 use crate::loop_engine::config::PermissionMode;
 use crate::loop_engine::prompt::assembler::{
-    CRITICAL_OVERFLOW_SENTINEL, PromptContext, Rendered, SectionKind, SectionSpec, assemble,
+    CRITICAL_OVERFLOW_SENTINEL, PromptContext, Rendered, SectionKind, SectionSpec,
+    assemble_criticals, fit_trimmable,
 };
 use crate::loop_engine::prompt::core;
 #[cfg(test)]
@@ -455,12 +456,7 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
     };
 
     let roster = sequential_roster();
-    let critical_roster: Vec<SectionSpec> = roster
-        .iter()
-        .copied()
-        .filter(|s| matches!(s.kind, SectionKind::Critical))
-        .collect();
-    let critical_assembled = assemble(&ctx, &critical_roster, TOTAL_PROMPT_BUDGET);
+    let critical_assembled = assemble_criticals(&ctx, &roster, TOTAL_PROMPT_BUDGET);
 
     if critical_assembled
         .dropped_sections
@@ -526,98 +522,96 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
 
     let mut dropped_sections: Vec<String> = Vec::new();
 
-    // Learnings (trimmable, fit FIRST). `assemble` is the SOLE owner of the
-    // shown_learning_ids clear-on-drop, so `shown_learning_ids` is empty iff the
-    // section was dropped — no per-builder `.clear()` here (FEAT-004).
-    let learnings = learnings_spec();
-    let learnings_assembled = assemble(&ctx, std::slice::from_ref(&learnings), remaining);
-    let learnings_section = learnings_assembled.prompt;
-    remaining -= learnings_section.len();
-    dropped_sections.extend(learnings_assembled.dropped_sections);
-    let shown_learning_ids = learnings_assembled.shown_learning_ids;
+    // Learnings (trimmable, fit FIRST). `fit_trimmable` / `assemble` is the SOLE
+    // owner of the shown_learning_ids clear-on-drop, so `shown_learning_ids` is
+    // empty iff the section was dropped — no per-builder `.clear()` here
+    // (FEAT-004).
+    let learnings_rendered = fit_trimmable(
+        &ctx,
+        learnings_spec(),
+        &mut remaining,
+        &mut dropped_sections,
+    );
+    let learnings_section = learnings_rendered.text;
+    let shown_learning_ids = learnings_rendered.shown_learning_ids;
 
-    // Source context (trimmable, fit AFTER learnings). Assembled solo at its
-    // fit position via the shared `core::source_spec` (the section's 2000-byte
+    // Source context (trimmable, fit AFTER learnings). The section's 2000-byte
     // internal cap rides on its `SectionKind::Trimmable` budget, distinct from
-    // the learnings budget). Reuses the `ctx` built in Phase 1.
-    let source = core::source_spec();
-    let source_assembled = assemble(&ctx, std::slice::from_ref(&source), remaining);
-    let source_section = source_assembled.prompt;
-    remaining -= source_section.len();
-    dropped_sections.extend(source_assembled.dropped_sections);
+    // the learnings budget.
+    let source_section = fit_trimmable(
+        &ctx,
+        core::source_spec(),
+        &mut remaining,
+        &mut dropped_sections,
+    )
+    .text;
 
-    // Dependencies (trimmable, fit AFTER learnings + source). Assembled solo at
-    // its own fit position via the shared `dependencies_spec`; the surrounding
-    // sections stay inlined for now. Reuses the `ctx` built in Phase 1.
-    let dependencies = dependencies_spec();
-    let dep_assembled = assemble(&ctx, std::slice::from_ref(&dependencies), remaining);
-    // `assemble` already fit the section within `remaining`, so the emitted
-    // bytes never exceed it (subtraction cannot underflow). This mirrors the
-    // legacy `try_fit_section` budget bookkeeping exactly.
-    let dep_section = dep_assembled.prompt;
-    remaining -= dep_section.len();
-    dropped_sections.extend(dep_assembled.dropped_sections);
+    // Dependencies (trimmable, fit AFTER learnings + source).
+    let dep_section = fit_trimmable(
+        &ctx,
+        dependencies_spec(),
+        &mut remaining,
+        &mut dropped_sections,
+    )
+    .text;
 
-    // Synergy (trimmable, fit AFTER dependencies). Solo-assembled via the
-    // sequential-only `synergy_spec`; the render wraps the permanent no-op
-    // `build_synergy_section`, so this is always empty (parity = empty string)
-    // and never consumes budget or appears in `dropped_sections`.
-    let synergy = synergy_spec();
-    let synergy_assembled = assemble(&ctx, std::slice::from_ref(&synergy), remaining);
-    let synergy_section = synergy_assembled.prompt;
-    remaining -= synergy_section.len();
-    dropped_sections.extend(synergy_assembled.dropped_sections);
+    // Synergy (trimmable, fit AFTER dependencies). The render wraps the permanent
+    // no-op `build_synergy_section`, so this is always empty (parity = empty
+    // string) and never consumes budget or appears in `dropped_sections`.
+    let synergy_section =
+        fit_trimmable(&ctx, synergy_spec(), &mut remaining, &mut dropped_sections).text;
 
-    // Siblings (trimmable, fit AFTER synergy). Solo-assembled via the
-    // sequential-only `siblings_spec`; reads `ctx.batch_sibling_prds` +
+    // Siblings (trimmable, fit AFTER synergy). Reads `ctx.batch_sibling_prds` +
     // `ctx.task_prefix`. Empty for non-milestone tasks or single-PRD mode.
-    let siblings = siblings_spec();
-    let sibling_assembled = assemble(&ctx, std::slice::from_ref(&siblings), remaining);
-    let sibling_section = sibling_assembled.prompt;
-    remaining -= sibling_section.len();
-    dropped_sections.extend(sibling_assembled.dropped_sections);
+    let sibling_section =
+        fit_trimmable(&ctx, siblings_spec(), &mut remaining, &mut dropped_sections).text;
 
-    // Steering (trimmable). Assembled solo at its fit position via the shared
-    // `core::steering_spec`; reads `ctx.steering_path`.
-    let steering = core::steering_spec();
-    let steering_assembled = assemble(&ctx, std::slice::from_ref(&steering), remaining);
-    let steering_section = steering_assembled.prompt;
-    remaining -= steering_section.len();
-    dropped_sections.extend(steering_assembled.dropped_sections);
+    // Steering (trimmable). Reads `ctx.steering_path`.
+    let steering_section = fit_trimmable(
+        &ctx,
+        core::steering_spec(),
+        &mut remaining,
+        &mut dropped_sections,
+    )
+    .text;
 
-    // Session guidance (trimmable). Solo-assembled via `core::session_guidance_spec`;
-    // reads `ctx.session_guidance`.
-    let guidance = core::session_guidance_spec();
-    let guidance_assembled = assemble(&ctx, std::slice::from_ref(&guidance), remaining);
-    let guidance_section = guidance_assembled.prompt;
-    remaining -= guidance_section.len();
-    dropped_sections.extend(guidance_assembled.dropped_sections);
+    // Session guidance (trimmable). Reads `ctx.session_guidance`.
+    let guidance_section = fit_trimmable(
+        &ctx,
+        core::session_guidance_spec(),
+        &mut remaining,
+        &mut dropped_sections,
+    )
+    .text;
 
-    // Reorder hint (trimmable, fit AFTER session_guidance). Solo-assembled via
-    // the sequential-only `reorder_hint_spec`; reads `ctx.reorder_hint`. Empty
-    // when no reorder was requested last iteration (`None`).
-    let hint = reorder_hint_spec();
-    let hint_assembled = assemble(&ctx, std::slice::from_ref(&hint), remaining);
-    let hint_section = hint_assembled.prompt;
-    remaining -= hint_section.len();
-    dropped_sections.extend(hint_assembled.dropped_sections);
+    // Reorder hint (trimmable, fit AFTER session_guidance). Reads
+    // `ctx.reorder_hint`. Empty when no reorder was requested (`None`).
+    let hint_section = fit_trimmable(
+        &ctx,
+        reorder_hint_spec(),
+        &mut remaining,
+        &mut dropped_sections,
+    )
+    .text;
 
-    // Key decision points (trimmable). Solo-assembled via `core::key_decision_spec`;
-    // reads `ctx.task.id`.
-    let key_decision = core::key_decision_spec();
-    let key_decision_assembled = assemble(&ctx, std::slice::from_ref(&key_decision), remaining);
-    let key_decision_section = key_decision_assembled.prompt;
-    remaining -= key_decision_section.len();
-    dropped_sections.extend(key_decision_assembled.dropped_sections);
+    // Key decision points (trimmable). Reads `ctx.task.id`.
+    let key_decision_section = fit_trimmable(
+        &ctx,
+        core::key_decision_spec(),
+        &mut remaining,
+        &mut dropped_sections,
+    )
+    .text;
 
-    // Tool awareness (trimmable, fit LAST in budget-priority order). Solo-assembled
-    // via `core::tool_awareness_spec`; reads `ctx.permission_mode`. No further
-    // section consumes `remaining` after this, so we deliberately do not
-    // decrement it (a trailing `remaining -=` would be a dead assignment).
-    let tool_awareness = core::tool_awareness_spec();
-    let tool_awareness_assembled = assemble(&ctx, std::slice::from_ref(&tool_awareness), remaining);
-    let tool_awareness_section = tool_awareness_assembled.prompt;
-    dropped_sections.extend(tool_awareness_assembled.dropped_sections);
+    // Tool awareness (trimmable, fit LAST in budget-priority order). Reads
+    // `ctx.permission_mode`.
+    let tool_awareness_section = fit_trimmable(
+        &ctx,
+        core::tool_awareness_spec(),
+        &mut remaining,
+        &mut dropped_sections,
+    )
+    .text;
 
     // ============================================================
     // Assembly: concatenate in display order

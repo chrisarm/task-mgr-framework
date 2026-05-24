@@ -93,6 +93,18 @@ pub enum SectionKind {
     Trimmable { budget: usize },
 }
 
+impl SectionKind {
+    /// Return the per-section byte cap, or `usize::MAX` (uncapped) for
+    /// `Critical`. Render fns that read their budget from `kind` use this
+    /// instead of a naked `match` arm.
+    pub(crate) fn budget_or_max(self) -> usize {
+        match self {
+            SectionKind::Trimmable { budget } => budget,
+            SectionKind::Critical => usize::MAX,
+        }
+    }
+}
+
 /// Output of a single render fn: the section text plus any learning IDs the
 /// section surfaced (side output, centralized so `shown_learning_ids` can be
 /// cleared in exactly one place when a learnings section is dropped).
@@ -246,6 +258,60 @@ pub fn assemble(ctx: &PromptContext, roster: &[SectionSpec], total_budget: usize
         section_sizes,
         dropped_sections,
         shown_learning_ids,
+    }
+}
+
+/// Filter `roster` to its [`SectionKind::Critical`] entries and call
+/// [`assemble`] within `budget`.
+///
+/// Removes the verbatim filter-then-collect pair duplicated across the
+/// sequential and slot prompt paths. The returned [`Assembled`] is identical
+/// to what a manual filter + [`assemble`] call would produce; callers still
+/// translate [`CRITICAL_OVERFLOW_SENTINEL`] per their own overflow contract.
+pub(crate) fn assemble_criticals(
+    ctx: &PromptContext,
+    roster: &[SectionSpec],
+    budget: usize,
+) -> Assembled {
+    let critical_roster: Vec<SectionSpec> = roster
+        .iter()
+        .copied()
+        .filter(|s| matches!(s.kind, SectionKind::Critical))
+        .collect();
+    assemble(ctx, &critical_roster, budget)
+}
+
+/// Fit one trimmable `spec` into `*remaining`, decrement `*remaining` by the
+/// fitted byte count, extend `dropped` with any dropped-section names, and
+/// return the rendered text plus side output as a [`Rendered`].
+///
+/// Collapses the 4–5 line boilerplate repeated for every trimmable across both
+/// prompt paths:
+/// ```text
+/// let s = X_spec();
+/// let a = assemble(ctx, slice::from_ref(&s), *remaining);
+/// let sec = a.prompt;
+/// *remaining -= sec.len();
+/// dropped.extend(a.dropped_sections);
+/// ```
+/// The last trimmable in each path can use this helper too — the final
+/// `*remaining -= …` is a dead write but behaviour is preserved.
+///
+/// Side output: [`Rendered::shown_learning_ids`] is non-empty only for the
+/// learnings spec; callers that need the IDs read them from the returned
+/// [`Rendered`].
+pub(crate) fn fit_trimmable(
+    ctx: &PromptContext,
+    spec: SectionSpec,
+    remaining: &mut usize,
+    dropped: &mut Vec<String>,
+) -> Rendered {
+    let a = assemble(ctx, std::slice::from_ref(&spec), *remaining);
+    *remaining -= a.prompt.len();
+    dropped.extend(a.dropped_sections);
+    Rendered {
+        text: a.prompt,
+        shown_learning_ids: a.shown_learning_ids,
     }
 }
 
