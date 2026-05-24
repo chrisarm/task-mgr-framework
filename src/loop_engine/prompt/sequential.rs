@@ -29,28 +29,31 @@ use crate::loop_engine::prompt::core;
 #[cfg(test)]
 use crate::loop_engine::prompt_sections::dependencies::build_dependency_section;
 use crate::loop_engine::prompt_sections::dependencies::dependencies_spec;
-use crate::loop_engine::prompt_sections::escalation::build_escalation_section;
+use crate::loop_engine::prompt_sections::escalation::escalation_spec;
 use crate::loop_engine::prompt_sections::learnings::{
     build_learnings_section, record_shown_learnings,
 };
-use crate::loop_engine::prompt_sections::siblings::build_sibling_prd_section;
-use crate::loop_engine::prompt_sections::synergy::{
-    build_synergy_section, resolve_synergy_cluster,
-};
+use crate::loop_engine::prompt_sections::siblings::siblings_spec;
+#[cfg(test)]
+use crate::loop_engine::prompt_sections::synergy::build_synergy_section;
+use crate::loop_engine::prompt_sections::synergy::{resolve_synergy_cluster, synergy_spec};
 use crate::loop_engine::prompt_sections::task_ops::task_ops_spec;
-use crate::loop_engine::prompt_sections::{truncate_to_budget, try_fit_section};
+use crate::loop_engine::prompt_sections::truncate_to_budget;
+#[cfg(test)]
+use crate::loop_engine::prompt_sections::try_fit_section;
 use crate::models::Task;
 
 /// The sequential path's ordered section roster (CONTRACT-001).
 ///
-/// Entries are listed in display order. After FEAT-005 every section SHARED
-/// with the slot path flows through the assembler: the critical envelope
-/// (`task` / `task_ops` / `completion` / `base_prompt`) plus the trimmables
-/// `steering` / `session_guidance` / `tool_awareness` / `source` /
-/// `dependencies` / `learnings` / `key_decision`. Only the sequential-ONLY
-/// sections (`reorder_hint`, `synergy`, `siblings`, `escalation`,
-/// `reorder_instr`) remain inlined in [`build_prompt`] — they join the roster
-/// in FEAT-006.
+/// Entries are listed in display order. After FEAT-006 EVERY section the
+/// sequential path emits is on this roster: the critical envelope (`task` /
+/// `task_ops` / `completion` / `escalation` / `reorder_instr` / `base_prompt`)
+/// plus the trimmables `steering` / `session_guidance` / `reorder_hint` /
+/// `tool_awareness` / `source` / `dependencies` / `synergy` / `siblings` /
+/// `learnings` / `key_decision`. The sequential-ONLY sections (`reorder_hint`,
+/// `synergy`, `siblings`, `escalation`, `reorder_instr`) are present here but
+/// absent from [`super::slot::slot_roster`], proving the slot roster is a
+/// set-subset of this one (independently ordered).
 ///
 /// This roster is independent from [`super::slot::slot_roster`] — the two paths
 /// share most render fns but order their sections differently (slot emits
@@ -63,17 +66,19 @@ use crate::models::Task;
 /// during the incremental migration: the critical subset is gated together
 /// (see the `CRITICAL` overflow translation) while each migrated trimmable is
 /// assembled SOLO at its own FIT position (which differs from display order
-/// because sequential's budget-priority order interleaves the still-inlined
-/// `synergy`/`siblings`/`reorder_hint` trimmables). It therefore derives a
-/// criticals-only sub-roster from this single declarative source and reaches
-/// each trimmable spec through its `*_spec` constructor.
+/// because sequential's budget-priority order interleaves the trimmables). It
+/// therefore derives a criticals-only sub-roster from this single declarative
+/// source and reaches each trimmable spec through its `*_spec` constructor.
 pub fn sequential_roster() -> Vec<SectionSpec> {
     vec![
         core::steering_spec(),
         core::session_guidance_spec(),
+        reorder_hint_spec(),
         core::tool_awareness_spec(),
         core::source_spec(),
         dependencies_spec(),
+        synergy_spec(),
+        siblings_spec(),
         SectionSpec {
             name: "task",
             kind: SectionKind::Critical,
@@ -86,6 +91,8 @@ pub fn sequential_roster() -> Vec<SectionSpec> {
             kind: SectionKind::Critical,
             render: render_completion_section,
         },
+        escalation_spec(),
+        reorder_instr_spec(),
         core::key_decision_spec(),
         SectionSpec {
             name: "base_prompt",
@@ -93,6 +100,72 @@ pub fn sequential_roster() -> Vec<SectionSpec> {
             render: render_base_prompt_section,
         },
     ]
+}
+
+/// Stable section id for the reorder-hint section (sequential-only).
+const REORDER_HINT_SECTION: &str = "reorder_hint";
+/// Stable section id for the reorder-instruction section (sequential-only).
+const REORDER_INSTR_SECTION: &str = "reorder_instr";
+
+/// Build the reorder-hint section from an optional reorder target id, or the
+/// empty string when no hint was carried. Single legacy site for the bytes —
+/// [`render_reorder_hint_section`] and the parity test both wrap it.
+pub fn build_reorder_hint_section(reorder_hint: Option<&str>) -> String {
+    reorder_hint
+        .map(|hint| {
+            format!(
+                "## Reorder Hint\n\nThe previous iteration requested reorder to task: `{}`\n\n",
+                hint,
+            )
+        })
+        .unwrap_or_default()
+}
+
+/// The constant reorder-instruction text (sequential-only). Single legacy site
+/// for the bytes — [`render_reorder_instr_section`] and the parity test both
+/// wrap it.
+pub fn build_reorder_instr_section() -> String {
+    "If you have a strong reason to work on a different eligible task, \
+     output `<reorder>TASK-ID</reorder>`.\n\n"
+        .to_string()
+}
+
+/// Render the reorder-hint section from [`PromptContext::reorder_hint`]
+/// (sequential-only). Renders empty when the hint is `None`.
+fn render_reorder_hint_section(ctx: &PromptContext<'_>, _kind: SectionKind) -> Rendered {
+    Rendered {
+        text: build_reorder_hint_section(ctx.reorder_hint),
+        ..Default::default()
+    }
+}
+
+/// Build the reorder-hint [`SectionSpec`] (trimmable, no independent cap).
+/// Present in the sequential roster only.
+fn reorder_hint_spec() -> SectionSpec {
+    SectionSpec {
+        name: REORDER_HINT_SECTION,
+        kind: SectionKind::Trimmable { budget: usize::MAX },
+        render: render_reorder_hint_section,
+    }
+}
+
+/// Render the constant reorder-instruction section (sequential-only). A
+/// CRITICAL section: its bytes count toward the budget gate, never trimmed.
+fn render_reorder_instr_section(_ctx: &PromptContext<'_>, _kind: SectionKind) -> Rendered {
+    Rendered {
+        text: build_reorder_instr_section(),
+        ..Default::default()
+    }
+}
+
+/// Build the reorder-instruction [`SectionSpec`] (critical). Present in the
+/// sequential roster only.
+fn reorder_instr_spec() -> SectionSpec {
+    SectionSpec {
+        name: REORDER_INSTR_SECTION,
+        kind: SectionKind::Critical,
+        render: render_reorder_instr_section,
+    }
 }
 
 /// Build the sequential learnings [`SectionSpec`] (trimmable, no independent
@@ -346,24 +419,15 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
     // Phase 1: critical sections — gated together against the budget.
     // ============================================================
     //
-    // The migrated criticals (task, task_ops, completion, base_prompt) render
-    // through `assemble` over the criticals-only sub-roster. The two still-
-    // inlined criticals (escalation policy, reorder instruction) are rendered
-    // here and their bytes subtracted from the budget handed to `assemble`, so
-    // the overflow gate fires on the SUM of all criticals exactly as the legacy
-    // `critical_total > TOTAL_PROMPT_BUDGET` check did. `assemble` signals
-    // overflow uniformly via `dropped_sections == [CRITICAL_OVERFLOW_SENTINEL]`;
-    // this caller MUST translate that back into `Err(PromptOverflow)` so
+    // After FEAT-006 every critical (task, task_ops, completion, escalation,
+    // reorder_instr, base_prompt) renders through `assemble` over the
+    // criticals-only sub-roster, gated against the FULL `TOTAL_PROMPT_BUDGET`.
+    // No critical is inlined any more, so the overflow gate fires on the SUM of
+    // all criticals exactly as the legacy `critical_total > TOTAL_PROMPT_BUDGET`
+    // check did. `assemble` signals overflow uniformly via
+    // `dropped_sections == [CRITICAL_OVERFLOW_SENTINEL]`; this caller MUST
+    // translate that back into `Err(PromptOverflow)` so
     // `overflow::handle_prompt_too_long`'s five-rung ladder is unchanged.
-
-    // Still-inlined criticals (escalation + reorder instruction).
-    let escalation_section =
-        build_escalation_section(params.base_prompt_path, resolved_model.as_deref());
-    let reorder_instr_section =
-        "If you have a strong reason to work on a different eligible task, \
-         output `<reorder>TASK-ID</reorder>`.\n\n"
-            .to_string();
-    let inlined_critical_bytes = escalation_section.len() + reorder_instr_section.len();
 
     // A lightweight `Task` carrier lets the assembler's `&Task`-based
     // `PromptContext` be built from the `NextTaskOutput` this path selects: the
@@ -383,6 +447,9 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
         task_prefix: params.task_prefix,
         reorder_hint: params.reorder_hint,
         batch_sibling_prds: Some(params.batch_sibling_prds),
+        // The escalation render reads this — the policy section is omitted for
+        // the Opus tier. Must be set before the critical assemble below.
+        resolved_model: resolved_model.as_deref(),
         next_task_output: Some(task_output),
         recalled_learnings: Some(&next_result.learnings),
     };
@@ -393,11 +460,7 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
         .copied()
         .filter(|s| matches!(s.kind, SectionKind::Critical))
         .collect();
-    let critical_assembled = assemble(
-        &ctx,
-        &critical_roster,
-        TOTAL_PROMPT_BUDGET.saturating_sub(inlined_critical_bytes),
-    );
+    let critical_assembled = assemble(&ctx, &critical_roster, TOTAL_PROMPT_BUDGET);
 
     if critical_assembled
         .dropped_sections
@@ -407,12 +470,11 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
         // Translate the uniform CRITICAL signal back into the legacy error so
         // the overflow ladder still engages. `section_sizes` is populated even
         // on overflow, so the reported `critical_size` is faithful.
-        let critical_size = inlined_critical_bytes
-            + critical_assembled
-                .section_sizes
-                .iter()
-                .map(|(_, n)| *n)
-                .sum::<usize>();
+        let critical_size = critical_assembled
+            .section_sizes
+            .iter()
+            .map(|(_, n)| *n)
+            .sum::<usize>();
         return Err(TaskMgrError::PromptOverflow {
             critical_size,
             budget: TOTAL_PROMPT_BUDGET,
@@ -425,9 +487,11 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
     let task_section = critical_assembled.section_text("task");
     let task_ops = critical_assembled.section_text("task_ops");
     let completion_section = critical_assembled.section_text("completion");
+    let escalation_section = critical_assembled.section_text("escalation");
+    let reorder_instr_section = critical_assembled.section_text("reorder_instr");
     let base_prompt_section = critical_assembled.section_text("base_prompt");
 
-    let critical_total = inlined_critical_bytes + critical_assembled.prompt.len();
+    let critical_total = critical_assembled.prompt.len();
 
     // Step 3: Record shown-event rows AFTER the overflow check.
     // If Phase 1 overflows we return Err above — we must not record learnings
@@ -494,26 +558,24 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
     remaining -= dep_section.len();
     dropped_sections.extend(dep_assembled.dropped_sections);
 
-    let synergy_section = build_synergy_section(params.conn, &task_output.id, params.run_id);
-    let synergy_section = try_fit_section(
-        synergy_section,
-        "Synergy Context",
-        &mut remaining,
-        &mut dropped_sections,
-    );
+    // Synergy (trimmable, fit AFTER dependencies). Solo-assembled via the
+    // sequential-only `synergy_spec`; the render wraps the permanent no-op
+    // `build_synergy_section`, so this is always empty (parity = empty string)
+    // and never consumes budget or appears in `dropped_sections`.
+    let synergy = synergy_spec();
+    let synergy_assembled = assemble(&ctx, std::slice::from_ref(&synergy), remaining);
+    let synergy_section = synergy_assembled.prompt;
+    remaining -= synergy_section.len();
+    dropped_sections.extend(synergy_assembled.dropped_sections);
 
-    let sibling_section = build_sibling_prd_section(
-        params.conn,
-        &task_output.id,
-        params.task_prefix,
-        params.batch_sibling_prds,
-    );
-    let sibling_section = try_fit_section(
-        sibling_section,
-        "Sibling PRD Tasks",
-        &mut remaining,
-        &mut dropped_sections,
-    );
+    // Siblings (trimmable, fit AFTER synergy). Solo-assembled via the
+    // sequential-only `siblings_spec`; reads `ctx.batch_sibling_prds` +
+    // `ctx.task_prefix`. Empty for non-milestone tasks or single-PRD mode.
+    let siblings = siblings_spec();
+    let sibling_assembled = assemble(&ctx, std::slice::from_ref(&siblings), remaining);
+    let sibling_section = sibling_assembled.prompt;
+    remaining -= sibling_section.len();
+    dropped_sections.extend(sibling_assembled.dropped_sections);
 
     // Steering (trimmable). Assembled solo at its fit position via the shared
     // `core::steering_spec`; reads `ctx.steering_path`.
@@ -531,21 +593,14 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
     remaining -= guidance_section.len();
     dropped_sections.extend(guidance_assembled.dropped_sections);
 
-    let hint_section = params
-        .reorder_hint
-        .map(|hint| {
-            format!(
-                "## Reorder Hint\n\nThe previous iteration requested reorder to task: `{}`\n\n",
-                hint,
-            )
-        })
-        .unwrap_or_default();
-    let hint_section = try_fit_section(
-        hint_section,
-        "Reorder Hint",
-        &mut remaining,
-        &mut dropped_sections,
-    );
+    // Reorder hint (trimmable, fit AFTER session_guidance). Solo-assembled via
+    // the sequential-only `reorder_hint_spec`; reads `ctx.reorder_hint`. Empty
+    // when no reorder was requested last iteration (`None`).
+    let hint = reorder_hint_spec();
+    let hint_assembled = assemble(&ctx, std::slice::from_ref(&hint), remaining);
+    let hint_section = hint_assembled.prompt;
+    remaining -= hint_section.len();
+    dropped_sections.extend(hint_assembled.dropped_sections);
 
     // Key decision points (trimmable). Solo-assembled via `core::key_decision_spec`;
     // reads `ctx.task.id`.
@@ -595,9 +650,9 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
     section_sizes.push(("learnings", learnings_section.len()));
     prompt.push_str(completion_section);
     section_sizes.push(("completion", completion_section.len()));
-    prompt.push_str(&escalation_section);
+    prompt.push_str(escalation_section);
     section_sizes.push(("escalation", escalation_section.len()));
-    prompt.push_str(&reorder_instr_section);
+    prompt.push_str(reorder_instr_section);
     section_sizes.push(("reorder_instr", reorder_instr_section.len()));
     prompt.push_str(&key_decision_section);
     section_sizes.push(("key_decision", key_decision_section.len()));

@@ -12,6 +12,11 @@ use rusqlite::Connection;
 
 use crate::commands::init::parse::{PrdFile, PrdUserStory};
 use crate::db::prefix::prefix_and_col;
+use crate::loop_engine::prompt::assembler::{PromptContext, Rendered, SectionKind, SectionSpec};
+
+/// Stable section identifier for the sibling-PRD section. Matches the
+/// `section_sizes` key the sequential builder already uses for this section.
+pub const SIBLINGS_SECTION: &str = "siblings";
 
 /// Maximum number of file-relevant tasks to show per sibling PRD.
 const MAX_RELEVANT: usize = 5;
@@ -38,7 +43,7 @@ struct SiblingPrdSummary {
 /// - The task is not a MILESTONE
 /// - There are no sibling PRDs (single-PRD mode)
 /// - No sibling PRDs have remaining tasks
-pub(crate) fn build_sibling_prd_section(
+pub fn build_sibling_prd_section(
     conn: &Connection,
     task_id: &str,
     task_prefix: Option<&str>,
@@ -67,6 +72,34 @@ pub(crate) fn build_sibling_prd_section(
     }
 
     format_sibling_section(&summaries, &completed_files)
+}
+
+/// Render the sibling-PRD section for the data-driven assembler (CONTRACT-001).
+/// Sequential-only — the slot roster omits it (wave slots are disjoint by
+/// design). This is the **single render site** for the section; it wraps
+/// [`build_sibling_prd_section`], reading the batch sibling PRD paths from
+/// [`PromptContext::batch_sibling_prds`] (empty slice when single-PRD mode, so
+/// the section renders empty). The [`SectionKind`] budget is ignored — the
+/// builder applies its own per-PRD truncation, never an external byte cap.
+pub fn render_sibling_prd_section(ctx: &PromptContext<'_>, _kind: SectionKind) -> Rendered {
+    let sibling_prd_paths = ctx.batch_sibling_prds.unwrap_or(&[]);
+    Rendered {
+        text: build_sibling_prd_section(ctx.conn, &ctx.task.id, ctx.task_prefix, sibling_prd_paths),
+        ..Default::default()
+    }
+}
+
+/// Build the siblings [`SectionSpec`] (trimmable, no independent cap).
+///
+/// Present in the sequential roster only. The `budget` is `usize::MAX` because
+/// the section has no external cap — `assemble` gates it against the remaining
+/// total budget and the render fn ignores the budget entirely.
+pub fn siblings_spec() -> SectionSpec {
+    SectionSpec {
+        name: SIBLINGS_SECTION,
+        kind: SectionKind::Trimmable { budget: usize::MAX },
+        render: render_sibling_prd_section,
+    }
 }
 
 /// Query distinct file paths from tasks marked as done, optionally scoped by prefix.

@@ -346,6 +346,7 @@ pub fn build_prompt(
         task_prefix: None,
         reorder_hint: None,
         batch_sibling_prds: None,
+        resolved_model: None,
         next_task_output: None,
         recalled_learnings: None,
     };

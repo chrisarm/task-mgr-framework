@@ -13,6 +13,8 @@
 //! mirroring the approach in `tests/prompt_slot.rs` (the `pub(crate)`
 //! `loop_engine::test_utils` helpers are not visible here).
 
+use std::path::PathBuf;
+
 use rusqlite::Connection;
 use tempfile::TempDir;
 
@@ -21,11 +23,12 @@ use task_mgr::db::migrations::run_migrations;
 use task_mgr::db::{create_schema, open_connection};
 use task_mgr::learnings::crud::{RecordLearningParams, record_learning};
 use task_mgr::loop_engine::config::PermissionMode;
+use task_mgr::loop_engine::model::{OPUS_MODEL, SONNET_MODEL};
 use task_mgr::loop_engine::prompt::assembler::{PromptContext, SectionSpec, assemble};
 use task_mgr::loop_engine::prompt::core;
 use task_mgr::loop_engine::prompt::sequential::{
-    build_base_prompt_section, build_completion_section,
-    build_task_section as seq_build_task_section, sequential_roster,
+    build_base_prompt_section, build_completion_section, build_reorder_hint_section,
+    build_reorder_instr_section, build_task_section as seq_build_task_section, sequential_roster,
 };
 use task_mgr::loop_engine::prompt::slot::{
     build_task_section as slot_build_task_section, load_base_prompt, slot_roster,
@@ -33,7 +36,16 @@ use task_mgr::loop_engine::prompt::slot::{
 use task_mgr::loop_engine::prompt_sections::dependencies::{
     DEPENDENCIES_SECTION, build_dependency_section, dependencies_spec,
 };
+use task_mgr::loop_engine::prompt_sections::escalation::{
+    ESCALATION_SECTION, build_escalation_section, escalation_spec,
+};
 use task_mgr::loop_engine::prompt_sections::learnings::build_learnings_section;
+use task_mgr::loop_engine::prompt_sections::siblings::{
+    SIBLINGS_SECTION, build_sibling_prd_section, siblings_spec,
+};
+use task_mgr::loop_engine::prompt_sections::synergy::{
+    SYNERGY_SECTION, build_synergy_section, synergy_spec,
+};
 use task_mgr::models::{Confidence, LearningOutcome, Task};
 
 /// Look up a spec by name in a roster, panicking with a helpful message if
@@ -144,6 +156,7 @@ fn ctx_with_files<'a>(
         task_prefix: None,
         reorder_hint: None,
         batch_sibling_prds: None,
+        resolved_model: None,
         next_task_output,
         recalled_learnings: None,
     }
@@ -266,14 +279,16 @@ fn dependencies_present_in_both_rosters_at_legacy_position() {
     let seq = sequential_roster();
     let slot = slot_roster();
 
-    // After FEAT-005 both rosters carry the migrated shared trimmables, so
-    // dependencies sits at index 4 in each (sequential: after steering /
-    // session_guidance / tool_awareness / source; slot: after task / task_ops /
-    // learnings / source). Each path owns its own independently-ordered Vec, but
-    // BOTH reach the section through the shared `dependencies_spec`.
+    // After FEAT-006 the sequential roster also carries `reorder_hint` (before
+    // tool_awareness), pushing dependencies to index 5 (after steering /
+    // session_guidance / reorder_hint / tool_awareness / source). The slot
+    // roster has no sequential-only sections, so dependencies stays at index 4
+    // (after task / task_ops / learnings / source). Each path owns its own
+    // independently-ordered Vec, but BOTH reach the section through the shared
+    // `dependencies_spec`.
     assert_eq!(
         seq.iter().position(|s| s.name == DEPENDENCIES_SECTION),
-        Some(4),
+        Some(5),
         "dependencies must occupy its legacy position in the sequential roster"
     );
     assert_eq!(
@@ -295,20 +310,27 @@ fn criticals_present_in_both_rosters_at_legacy_positions() {
     let seq = sequential_roster();
     let slot = slot_roster();
 
-    // Sequential display order (FEAT-005 — every shared section migrated; only
-    // the sequential-only sections remain inlined in build_prompt):
-    //   steering → session_guidance → tool_awareness → source → dependencies →
-    //   task → task_ops → learnings → completion → key_decision → base_prompt
+    // Sequential display order (FEAT-006 — EVERY section the path emits is on
+    // the roster, including the sequential-only reorder_hint / synergy /
+    // siblings / escalation / reorder_instr):
+    //   steering → session_guidance → reorder_hint → tool_awareness → source →
+    //   dependencies → synergy → siblings → task → task_ops → learnings →
+    //   completion → escalation → reorder_instr → key_decision → base_prompt
     let seq_order = [
         "steering",
         "session_guidance",
+        "reorder_hint",
         "tool_awareness",
         "source",
         "dependencies",
+        "synergy",
+        "siblings",
         "task",
         "task_ops",
         "learnings",
         "completion",
+        "escalation",
+        "reorder_instr",
         "key_decision",
         "base_prompt",
     ];
@@ -551,6 +573,7 @@ fn sequential_learnings_render_matches_legacy() {
         task_prefix: None,
         reorder_hint: None,
         batch_sibling_prds: None,
+        resolved_model: None,
         next_task_output: None,
         recalled_learnings: Some(&recalled),
     };
@@ -610,6 +633,7 @@ fn sequential_learnings_dropped_clears_shown_ids() {
         task_prefix: None,
         reorder_hint: None,
         batch_sibling_prds: None,
+        resolved_model: None,
         next_task_output: None,
         recalled_learnings: Some(&recalled),
     };
@@ -730,6 +754,7 @@ fn shared_trimmable_ctx<'a>(
         task_prefix: None,
         reorder_hint: None,
         batch_sibling_prds: None,
+        resolved_model: None,
         next_task_output: None,
         recalled_learnings: None,
     }
@@ -953,6 +978,7 @@ fn missing_steering_and_empty_source_render_empty_no_panic() {
         task_prefix: None,
         reorder_hint: None,
         batch_sibling_prds: None,
+        resolved_model: None,
         next_task_output: None,
         recalled_learnings: None,
     };
@@ -977,4 +1003,360 @@ fn missing_steering_and_empty_source_render_empty_no_panic() {
     // None steering path also renders empty (no panic).
     let ctx_none = ctx_for(&conn, &task, tmp.path(), &base);
     assert_eq!(render_named(&roster, "steering", &ctx_none), "");
+}
+
+// ===========================================================================
+// FEAT-006 — the sequential-ONLY sections: synergy, escalation, siblings,
+// reorder_hint, reorder_instr. Each is a SectionSpec present in the sequential
+// roster and ABSENT from the slot roster (proving slot ⊂ sequential as a SET).
+// Parity is asserted per section against the LIVE legacy builder, never a
+// frozen literal (synergy parity == empty string by design).
+// ===========================================================================
+
+/// Write a sibling PRD JSON file with the given user stories into `dir`,
+/// returning its path. Mirrors the shape `siblings.rs` parses (`PrdFile`).
+fn write_sibling_prd(dir: &std::path::Path, name: &str, stories: serde_json::Value) -> PathBuf {
+    let prd = serde_json::json!({ "project": "sibling-project", "userStories": stories });
+    let path = dir.join(name);
+    std::fs::write(&path, prd.to_string()).expect("write sibling prd");
+    path
+}
+
+// ---------------------------------------------------------------------------
+// AC: the five sequential-only specs sit at their legacy positions in the
+// sequential roster and are ABSENT from the slot roster (assert on the slot
+// roster construction directly).
+// ---------------------------------------------------------------------------
+#[test]
+fn sequential_only_sections_present_in_seq_roster_absent_from_slot() {
+    let seq = sequential_roster();
+    let slot = slot_roster();
+
+    // Present in the sequential roster at the legacy display positions.
+    let pos = |name: &str| seq.iter().position(|s| s.name == name);
+    assert_eq!(pos("reorder_hint"), Some(2), "reorder_hint legacy position");
+    assert_eq!(pos(SYNERGY_SECTION), Some(6), "synergy legacy position");
+    assert_eq!(pos(SIBLINGS_SECTION), Some(7), "siblings legacy position");
+    assert_eq!(
+        pos(ESCALATION_SECTION),
+        Some(12),
+        "escalation legacy position"
+    );
+    assert_eq!(
+        pos("reorder_instr"),
+        Some(13),
+        "reorder_instr legacy position"
+    );
+
+    // Absent from the slot roster — wave slots drop these by design, so the
+    // slot roster is a strict set-subset of the sequential roster.
+    for name in [
+        "reorder_hint",
+        SYNERGY_SECTION,
+        SIBLINGS_SECTION,
+        ESCALATION_SECTION,
+        "reorder_instr",
+    ] {
+        assert!(
+            !slot.iter().any(|s| s.name == name),
+            "{name} must NOT appear in the slot roster"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Synergy: a permanent no-op. Rendered text and assemble() output are
+// byte-identical to the live builder — which is the empty string.
+// ---------------------------------------------------------------------------
+#[test]
+fn sequential_synergy_render_matches_legacy_empty() {
+    let (tmp, conn) = setup_migrated_db();
+    insert_task(&conn, "TASK-001", "Build API", "todo");
+    let base = tmp.path().join("prompt.md");
+    let task = Task::new("TASK-001", "Build API");
+    let ctx = ctx_for(&conn, &task, tmp.path(), &base);
+
+    // Diff target is the LIVE builder (the no-op), never a literal.
+    let legacy = build_synergy_section(&conn, "TASK-001", None);
+    assert_eq!(legacy, "", "guard: synergy is a permanent no-op (empty)");
+
+    let spec = synergy_spec();
+    let rendered = (spec.render)(&ctx, spec.kind);
+    assert_eq!(
+        rendered.text, legacy,
+        "synergy Rendered.text must equal the live no-op builder"
+    );
+    assert_eq!(
+        render_named(&sequential_roster(), SYNERGY_SECTION, &ctx),
+        legacy
+    );
+
+    let assembled = assemble(&ctx, std::slice::from_ref(&spec), BUDGET);
+    assert_eq!(
+        assembled.prompt, legacy,
+        "synergy assemble() output == empty"
+    );
+    assert!(
+        assembled.dropped_sections.is_empty(),
+        "an empty no-op section is not a dropped section"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Siblings: a MILESTONE task in batch mode renders remaining sibling tasks.
+// Rendered text and assemble() output are byte-identical to the live builder.
+// ---------------------------------------------------------------------------
+#[test]
+fn sequential_siblings_render_matches_legacy() {
+    let (tmp, conn) = setup_migrated_db();
+    insert_task(&conn, "MILESTONE-001", "Wrap up phase", "todo");
+    let base = tmp.path().join("prompt.md");
+    let sibling = write_sibling_prd(
+        tmp.path(),
+        "sibling.json",
+        serde_json::json!([{
+            "id": "SIB-001",
+            "title": "Downstream consumer",
+            "priority": 10,
+            "passes": false,
+            "touchesFiles": ["src/consumer.rs"],
+        }]),
+    );
+    let prds = [sibling];
+
+    // Diff target is the LIVE builder with the same args the render uses.
+    let legacy = build_sibling_prd_section(&conn, "MILESTONE-001", None, &prds);
+    assert!(
+        legacy.contains("## Sibling PRD Tasks") && legacy.contains("SIB-001"),
+        "guard: legacy siblings builder must produce real content, got {legacy:?}"
+    );
+
+    let task = Task::new("MILESTONE-001", "Wrap up phase");
+    let ctx = PromptContext {
+        conn: &conn,
+        task: &task,
+        task_files: &[],
+        project_root: tmp.path(),
+        base_prompt_path: &base,
+        permission_mode: &DANGEROUS,
+        steering_path: None,
+        session_guidance: "",
+        run_id: None,
+        task_prefix: None,
+        reorder_hint: None,
+        batch_sibling_prds: Some(&prds),
+        resolved_model: None,
+        next_task_output: None,
+        recalled_learnings: None,
+    };
+
+    let spec = siblings_spec();
+    let rendered = (spec.render)(&ctx, spec.kind);
+    assert_eq!(
+        rendered.text, legacy,
+        "siblings Rendered.text must equal the live builder"
+    );
+    assert_eq!(
+        render_named(&sequential_roster(), SIBLINGS_SECTION, &ctx),
+        legacy
+    );
+
+    let assembled = assemble(&ctx, std::slice::from_ref(&spec), BUDGET);
+    assert_eq!(
+        assembled.prompt, legacy,
+        "siblings assemble() output == legacy"
+    );
+    assert!(assembled.dropped_sections.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Edge: no batch sibling PRDs → the siblings section is empty (not "dropped"),
+// matching the legacy builder for an empty path list. Same for a non-milestone
+// task even with PRDs present.
+// ---------------------------------------------------------------------------
+#[test]
+fn sequential_siblings_empty_when_no_batch_prds() {
+    let (tmp, conn) = setup_migrated_db();
+    insert_task(&conn, "MILESTONE-001", "Wrap up", "todo");
+    let base = tmp.path().join("prompt.md");
+    let task = Task::new("MILESTONE-001", "Wrap up");
+
+    // batch_sibling_prds defaults to None in ctx_for → render passes &[].
+    let ctx = ctx_for(&conn, &task, tmp.path(), &base);
+    let legacy = build_sibling_prd_section(&conn, "MILESTONE-001", None, &[]);
+    assert_eq!(legacy, "", "guard: empty PRD list yields an empty section");
+
+    let spec = siblings_spec();
+    assert_eq!((spec.render)(&ctx, spec.kind).text, legacy);
+    let assembled = assemble(&ctx, std::slice::from_ref(&spec), BUDGET);
+    assert_eq!(assembled.prompt, "");
+    assert!(
+        assembled.dropped_sections.is_empty(),
+        "an empty siblings section is not a dropped section"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Escalation (CRITICAL): for a non-Opus model with a template on disk, the
+// rendered text and assemble() output equal the live builder. For Opus the
+// section disappears.
+// ---------------------------------------------------------------------------
+#[test]
+fn sequential_escalation_render_matches_legacy() {
+    let (tmp, conn) = setup_migrated_db();
+    let base = tmp.path().join("prompt.md");
+    std::fs::write(&base, "# Agent Instructions\n").expect("write base");
+    // Template resolves at base.parent()/scripts/escalation-policy.md.
+    let scripts = tmp.path().join("scripts");
+    std::fs::create_dir_all(&scripts).expect("scripts dir");
+    std::fs::write(
+        scripts.join("escalation-policy.md"),
+        "When stuck, escalate to opus.",
+    )
+    .expect("write template");
+
+    let task = Task::new("TASK-001", "Build API");
+
+    // Non-Opus resolved model → section present. Diff against the live builder.
+    let legacy = build_escalation_section(&base, Some(SONNET_MODEL));
+    assert!(
+        legacy.contains("## Model Escalation Policy") && legacy.contains("escalate to opus"),
+        "guard: non-opus escalation must render the template, got {legacy:?}"
+    );
+
+    let ctx_sonnet = PromptContext {
+        conn: &conn,
+        task: &task,
+        task_files: &[],
+        project_root: tmp.path(),
+        base_prompt_path: &base,
+        permission_mode: &DANGEROUS,
+        steering_path: None,
+        session_guidance: "",
+        run_id: None,
+        task_prefix: None,
+        reorder_hint: None,
+        batch_sibling_prds: None,
+        resolved_model: Some(SONNET_MODEL),
+        next_task_output: None,
+        recalled_learnings: None,
+    };
+    let spec = escalation_spec();
+    assert_eq!((spec.render)(&ctx_sonnet, spec.kind).text, legacy);
+    assert_eq!(
+        render_named(&sequential_roster(), ESCALATION_SECTION, &ctx_sonnet),
+        legacy
+    );
+    // Critical single-spec assemble reproduces the section byte-for-byte.
+    let assembled = assemble(&ctx_sonnet, std::slice::from_ref(&spec), BUDGET);
+    assert_eq!(assembled.prompt, legacy);
+    assert!(assembled.dropped_sections.is_empty());
+
+    // Opus tier → the section disappears (parity with the live builder).
+    let opus_legacy = build_escalation_section(&base, Some(OPUS_MODEL));
+    assert_eq!(opus_legacy, "", "guard: opus omits the escalation policy");
+    let ctx_opus = PromptContext {
+        resolved_model: Some(OPUS_MODEL),
+        ..clone_ctx(&ctx_sonnet)
+    };
+    assert_eq!((spec.render)(&ctx_opus, spec.kind).text, opus_legacy);
+}
+
+// ---------------------------------------------------------------------------
+// Reorder hint: present when a hint id is carried, empty when None. Both match
+// the live builder byte-for-byte.
+// ---------------------------------------------------------------------------
+#[test]
+fn sequential_reorder_hint_render_matches_legacy() {
+    let (tmp, conn) = setup_migrated_db();
+    let base = tmp.path().join("prompt.md");
+    let task = Task::new("TASK-001", "Build API");
+
+    // With a hint.
+    let legacy_some = build_reorder_hint_section(Some("OTHER-002"));
+    assert!(
+        legacy_some.contains("## Reorder Hint") && legacy_some.contains("OTHER-002"),
+        "guard: a reorder hint must render real content, got {legacy_some:?}"
+    );
+    let ctx_some = PromptContext {
+        conn: &conn,
+        task: &task,
+        task_files: &[],
+        project_root: tmp.path(),
+        base_prompt_path: &base,
+        permission_mode: &DANGEROUS,
+        steering_path: None,
+        session_guidance: "",
+        run_id: None,
+        task_prefix: None,
+        reorder_hint: Some("OTHER-002"),
+        batch_sibling_prds: None,
+        resolved_model: None,
+        next_task_output: None,
+        recalled_learnings: None,
+    };
+    assert_eq!(
+        render_named(&sequential_roster(), "reorder_hint", &ctx_some),
+        legacy_some
+    );
+
+    // No hint → empty section, not a dropped section.
+    let legacy_none = build_reorder_hint_section(None);
+    assert_eq!(legacy_none, "", "guard: no hint yields an empty section");
+    let ctx_none = ctx_for(&conn, &task, tmp.path(), &base);
+    let spec = spec_named(&sequential_roster(), "reorder_hint");
+    assert_eq!((spec.render)(&ctx_none, spec.kind).text, legacy_none);
+    let assembled = assemble(&ctx_none, std::slice::from_ref(&spec), BUDGET);
+    assert_eq!(assembled.prompt, "");
+    assert!(assembled.dropped_sections.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Reorder instruction (CRITICAL): a constant section. Rendered text and
+// assemble() output equal the live builder.
+// ---------------------------------------------------------------------------
+#[test]
+fn sequential_reorder_instr_render_matches_legacy() {
+    let (tmp, conn) = setup_migrated_db();
+    let base = tmp.path().join("prompt.md");
+    let task = Task::new("TASK-001", "Build API");
+    let ctx = ctx_for(&conn, &task, tmp.path(), &base);
+
+    let legacy = build_reorder_instr_section();
+    assert!(
+        legacy.contains("<reorder>TASK-ID</reorder>"),
+        "guard: reorder instruction must carry the example tag, got {legacy:?}"
+    );
+    let spec = spec_named(&sequential_roster(), "reorder_instr");
+    assert_eq!((spec.render)(&ctx, spec.kind).text, legacy);
+    assert_eq!(
+        render_named(&sequential_roster(), "reorder_instr", &ctx),
+        legacy
+    );
+    let assembled = assemble(&ctx, std::slice::from_ref(&spec), BUDGET);
+    assert_eq!(assembled.prompt, legacy);
+    assert!(assembled.dropped_sections.is_empty());
+}
+
+/// Clone a `PromptContext` by copying its (all-`Copy`-or-shared-ref) fields.
+/// Used to vary a single field (e.g. `resolved_model`) in a test without
+/// re-typing every field.
+fn clone_ctx<'a>(ctx: &PromptContext<'a>) -> PromptContext<'a> {
+    PromptContext {
+        conn: ctx.conn,
+        task: ctx.task,
+        task_files: ctx.task_files,
+        project_root: ctx.project_root,
+        base_prompt_path: ctx.base_prompt_path,
+        permission_mode: ctx.permission_mode,
+        steering_path: ctx.steering_path,
+        session_guidance: ctx.session_guidance,
+        run_id: ctx.run_id,
+        task_prefix: ctx.task_prefix,
+        reorder_hint: ctx.reorder_hint,
+        batch_sibling_prds: ctx.batch_sibling_prds,
+        resolved_model: ctx.resolved_model,
+        next_task_output: ctx.next_task_output,
+        recalled_learnings: ctx.recalled_learnings,
+    }
 }

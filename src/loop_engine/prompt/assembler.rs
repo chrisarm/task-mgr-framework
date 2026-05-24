@@ -60,6 +60,11 @@ pub struct PromptContext<'a> {
     /// Sequential-only: sibling PRD paths for `build_sibling_prd_section`.
     /// Slot leaves this `None`.
     pub batch_sibling_prds: Option<&'a [PathBuf]>,
+    /// Sequential-only: the resolved model id for this iteration, the input to
+    /// `build_escalation_section` (the escalation policy section is omitted when
+    /// the model resolves to the Opus tier). Slot leaves this `None` — wave
+    /// slots drop the escalation section entirely.
+    pub resolved_model: Option<&'a str>,
     /// Sequential-only: the selected task as a [`NextTaskOutput`], the source
     /// for the sequential task-envelope render (which formats it via
     /// `core::format_next_task_json` and truncates to `TASK_CONTEXT_BUDGET`).
@@ -289,6 +294,7 @@ mod tests {
                 task_prefix: None,
                 reorder_hint: None,
                 batch_sibling_prds: None,
+                resolved_model: None,
                 next_task_output: None,
                 recalled_learnings: None,
             }
