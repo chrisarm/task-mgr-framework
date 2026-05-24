@@ -1,7 +1,7 @@
 //! Sequential prompt builder for the autonomous agent loop.
 //!
 //! Calls `next::next()` to select a task, then builds an enriched prompt with:
-//! - Source context from touchesFiles (via `context::scan_source_context`)
+//! - Source context from touchesFiles (via the shared `core::source_spec`)
 //! - Dependency completion summaries
 //! - Synergy task diffs
 //! - UCB-ranked learnings (with shown IDs tracked for feedback loop)
@@ -22,7 +22,6 @@ use crate::commands::next;
 use crate::commands::next::output::NextTaskOutput;
 use crate::error::{TaskMgrError, TaskMgrResult};
 use crate::loop_engine::config::PermissionMode;
-use crate::loop_engine::context;
 use crate::loop_engine::prompt::assembler::{
     CRITICAL_OVERFLOW_SENTINEL, PromptContext, Rendered, SectionKind, SectionSpec, assemble,
 };
@@ -44,25 +43,36 @@ use crate::models::Task;
 
 /// The sequential path's ordered section roster (CONTRACT-001).
 ///
-/// Entries are listed in display order. The migrated sections so far are
-/// `dependencies` (trimmable) and the critical envelope `task` / `task_ops` /
-/// `completion` / `base_prompt`; the still-inlined sections in [`build_prompt`]
-/// join here at their display positions as the migration proceeds. This roster
-/// is independent from [`super::slot::slot_roster`] — the two paths share some
-/// render fns but order their sections differently (slot emits `task` first,
-/// sequential mid-list), and the task/completion/base_prompt envelopes use
-/// sequential-specific render fns (NextTaskOutput JSON truncated to
-/// `TASK_CONTEXT_BUDGET`, the `[Title]`/non-code completion variant, and the
+/// Entries are listed in display order. After FEAT-005 every section SHARED
+/// with the slot path flows through the assembler: the critical envelope
+/// (`task` / `task_ops` / `completion` / `base_prompt`) plus the trimmables
+/// `steering` / `session_guidance` / `tool_awareness` / `source` /
+/// `dependencies` / `learnings` / `key_decision`. Only the sequential-ONLY
+/// sections (`reorder_hint`, `synergy`, `siblings`, `escalation`,
+/// `reorder_instr`) remain inlined in [`build_prompt`] — they join the roster
+/// in FEAT-006.
+///
+/// This roster is independent from [`super::slot::slot_roster`] — the two paths
+/// share most render fns but order their sections differently (slot emits
+/// `task` first, sequential mid-list), and the task/completion/base_prompt
+/// envelopes use sequential-specific render fns (NextTaskOutput JSON truncated
+/// to `TASK_CONTEXT_BUDGET`, the `[Title]`/non-code completion variant, and the
 /// trailing-newline base-prompt reader) that differ byte-for-byte from slot's.
 ///
 /// [`build_prompt`] does not call [`assemble`] once over this whole roster
 /// during the incremental migration: the critical subset is gated together
-/// (see the `CRITICAL` overflow translation) while the trimmable subset
-/// (`dependencies`) is fit only after the still-inlined `learnings`/`source`
-/// trimmables have consumed budget. It therefore derives criticals-only and
-/// trimmables-only sub-rosters from this single declarative source.
+/// (see the `CRITICAL` overflow translation) while each migrated trimmable is
+/// assembled SOLO at its own FIT position (which differs from display order
+/// because sequential's budget-priority order interleaves the still-inlined
+/// `synergy`/`siblings`/`reorder_hint` trimmables). It therefore derives a
+/// criticals-only sub-roster from this single declarative source and reaches
+/// each trimmable spec through its `*_spec` constructor.
 pub fn sequential_roster() -> Vec<SectionSpec> {
     vec![
+        core::steering_spec(),
+        core::session_guidance_spec(),
+        core::tool_awareness_spec(),
+        core::source_spec(),
         dependencies_spec(),
         SectionSpec {
             name: "task",
@@ -76,6 +86,7 @@ pub fn sequential_roster() -> Vec<SectionSpec> {
             kind: SectionKind::Critical,
             render: render_completion_section,
         },
+        core::key_decision_spec(),
         SectionSpec {
             name: "base_prompt",
             kind: SectionKind::Critical,
@@ -191,8 +202,9 @@ fn render_base_prompt_section(ctx: &PromptContext<'_>, _kind: SectionKind) -> Re
 /// Byte budget for enriched task context in the prompt.
 const TASK_CONTEXT_BUDGET: usize = 4000;
 
-/// Byte budget for source context from touchesFiles.
-const SOURCE_CONTEXT_BUDGET: usize = 2000;
+// The source-context byte budget now lives in `core::SOURCE_CONTEXT_BUDGET`
+// (FEAT-005) — the single source of truth carried on the shared
+// `core::source_spec` `SectionKind::Trimmable` budget.
 
 /// Total byte budget for the entire assembled prompt.
 /// Critical sections must fit within this budget; trimmable sections fill the remainder.
@@ -460,18 +472,15 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
     dropped_sections.extend(learnings_assembled.dropped_sections);
     let shown_learning_ids = learnings_assembled.shown_learning_ids;
 
-    let source_ctx = context::scan_source_context(
-        &task_output.files,
-        SOURCE_CONTEXT_BUDGET,
-        params.project_root,
-    );
-    let source_section = source_ctx.format_for_prompt();
-    let source_section = try_fit_section(
-        source_section,
-        "Source Context",
-        &mut remaining,
-        &mut dropped_sections,
-    );
+    // Source context (trimmable, fit AFTER learnings). Assembled solo at its
+    // fit position via the shared `core::source_spec` (the section's 2000-byte
+    // internal cap rides on its `SectionKind::Trimmable` budget, distinct from
+    // the learnings budget). Reuses the `ctx` built in Phase 1.
+    let source = core::source_spec();
+    let source_assembled = assemble(&ctx, std::slice::from_ref(&source), remaining);
+    let source_section = source_assembled.prompt;
+    remaining -= source_section.len();
+    dropped_sections.extend(source_assembled.dropped_sections);
 
     // Dependencies (trimmable, fit AFTER learnings + source). Assembled solo at
     // its own fit position via the shared `dependencies_spec`; the surrounding
@@ -506,24 +515,21 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
         &mut dropped_sections,
     );
 
-    let steering_section = params
-        .steering_path
-        .map(build_steering_section)
-        .unwrap_or_default();
-    let steering_section = try_fit_section(
-        steering_section,
-        "Steering",
-        &mut remaining,
-        &mut dropped_sections,
-    );
+    // Steering (trimmable). Assembled solo at its fit position via the shared
+    // `core::steering_spec`; reads `ctx.steering_path`.
+    let steering = core::steering_spec();
+    let steering_assembled = assemble(&ctx, std::slice::from_ref(&steering), remaining);
+    let steering_section = steering_assembled.prompt;
+    remaining -= steering_section.len();
+    dropped_sections.extend(steering_assembled.dropped_sections);
 
-    let guidance_section = core::build_session_guidance_block(params.session_guidance);
-    let guidance_section = try_fit_section(
-        guidance_section,
-        "Session Guidance",
-        &mut remaining,
-        &mut dropped_sections,
-    );
+    // Session guidance (trimmable). Solo-assembled via `core::session_guidance_spec`;
+    // reads `ctx.session_guidance`.
+    let guidance = core::session_guidance_spec();
+    let guidance_assembled = assemble(&ctx, std::slice::from_ref(&guidance), remaining);
+    let guidance_section = guidance_assembled.prompt;
+    remaining -= guidance_section.len();
+    dropped_sections.extend(guidance_assembled.dropped_sections);
 
     let hint_section = params
         .reorder_hint
@@ -541,21 +547,22 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
         &mut dropped_sections,
     );
 
-    let key_decision_section = core::build_key_decisions_block(&task_output.id);
-    let key_decision_section = try_fit_section(
-        key_decision_section,
-        "Key Decision Instructions",
-        &mut remaining,
-        &mut dropped_sections,
-    );
+    // Key decision points (trimmable). Solo-assembled via `core::key_decision_spec`;
+    // reads `ctx.task.id`.
+    let key_decision = core::key_decision_spec();
+    let key_decision_assembled = assemble(&ctx, std::slice::from_ref(&key_decision), remaining);
+    let key_decision_section = key_decision_assembled.prompt;
+    remaining -= key_decision_section.len();
+    dropped_sections.extend(key_decision_assembled.dropped_sections);
 
-    let tool_awareness_section = build_tool_awareness_section(params.permission_mode);
-    let tool_awareness_section = try_fit_section(
-        tool_awareness_section,
-        "Tool Awareness",
-        &mut remaining,
-        &mut dropped_sections,
-    );
+    // Tool awareness (trimmable, fit LAST in budget-priority order). Solo-assembled
+    // via `core::tool_awareness_spec`; reads `ctx.permission_mode`. No further
+    // section consumes `remaining` after this, so we deliberately do not
+    // decrement it (a trailing `remaining -=` would be a dead assignment).
+    let tool_awareness = core::tool_awareness_spec();
+    let tool_awareness_assembled = assemble(&ctx, std::slice::from_ref(&tool_awareness), remaining);
+    let tool_awareness_section = tool_awareness_assembled.prompt;
+    dropped_sections.extend(tool_awareness_assembled.dropped_sections);
 
     // ============================================================
     // Assembly: concatenate in display order
@@ -612,18 +619,21 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
 
 /// Build a tool-awareness section that tells the agent what tools it has.
 ///
-/// Thin delegate to [`core::build_tool_awareness_block`] — kept here as the
-/// historical name used by sequential's assembly path. Consolidating the
-/// implementation in `prompt::core` lets the slot builder share the exact
-/// same byte output.
+/// Thin delegate to [`core::build_tool_awareness_block`]. Since FEAT-005 the
+/// production path renders tool-awareness through `core::tool_awareness_spec`,
+/// so this wrapper survives only as the historical name the unit tests below
+/// exercise — hence `#[cfg(test)]`.
+#[cfg(test)]
 fn build_tool_awareness_section(permission_mode: &PermissionMode) -> String {
     core::build_tool_awareness_block(permission_mode)
 }
 
 /// Build a steering section string from the steering.md file.
 ///
-/// Thin delegate to [`core::build_steering_block`] — the slot builder shares
-/// the same helper so both paths render identical bytes for the same input.
+/// Thin delegate to [`core::build_steering_block`]. Since FEAT-005 the
+/// production path renders steering through `core::steering_spec`; this wrapper
+/// remains only for the unit tests below — hence `#[cfg(test)]`.
+#[cfg(test)]
 fn build_steering_section(steering_path: &Path) -> String {
     core::build_steering_block(steering_path)
 }

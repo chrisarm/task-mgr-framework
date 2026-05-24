@@ -266,18 +266,19 @@ fn dependencies_present_in_both_rosters_at_legacy_position() {
     let seq = sequential_roster();
     let slot = slot_roster();
 
-    // Sequential display order: dependencies(0) precedes task; slot display
-    // order: task(0) precedes dependencies(3, after the inserted learnings).
-    // Each path owns its own independently-ordered Vec, but BOTH reach the
-    // section through the shared `dependencies_spec`.
+    // After FEAT-005 both rosters carry the migrated shared trimmables, so
+    // dependencies sits at index 4 in each (sequential: after steering /
+    // session_guidance / tool_awareness / source; slot: after task / task_ops /
+    // learnings / source). Each path owns its own independently-ordered Vec, but
+    // BOTH reach the section through the shared `dependencies_spec`.
     assert_eq!(
         seq.iter().position(|s| s.name == DEPENDENCIES_SECTION),
-        Some(0),
+        Some(4),
         "dependencies must occupy its legacy position in the sequential roster"
     );
     assert_eq!(
         slot.iter().position(|s| s.name == DEPENDENCIES_SECTION),
-        Some(3),
+        Some(4),
         "dependencies must occupy its legacy position in the slot roster"
     );
 }
@@ -294,28 +295,40 @@ fn criticals_present_in_both_rosters_at_legacy_positions() {
     let seq = sequential_roster();
     let slot = slot_roster();
 
-    // Sequential display order of migrated sections:
-    //   dependencies(0) → task(1) → task_ops(2) → learnings(3) → completion(4)
-    //   → base_prompt(5)
+    // Sequential display order (FEAT-005 — every shared section migrated; only
+    // the sequential-only sections remain inlined in build_prompt):
+    //   steering → session_guidance → tool_awareness → source → dependencies →
+    //   task → task_ops → learnings → completion → key_decision → base_prompt
     let seq_order = [
+        "steering",
+        "session_guidance",
+        "tool_awareness",
+        "source",
         "dependencies",
         "task",
         "task_ops",
         "learnings",
         "completion",
+        "key_decision",
         "base_prompt",
     ];
     let seq_names: Vec<&str> = seq.iter().map(|s| s.name).collect();
     assert_eq!(seq_names, seq_order, "sequential roster display order");
 
-    // Slot display order of migrated sections:
-    //   task(0) → task_ops(1) → learnings(2) → dependencies(3) → completion(4)
-    //   → base_prompt(5)
+    // Slot display order (FEAT-005 — the slot path has no sequential-only
+    // sections, so this is the complete slot prompt layout):
+    //   task → task_ops → learnings → source → dependencies → steering →
+    //   session_guidance → tool_awareness → key_decision → completion → base_prompt
     let slot_order = [
         "task",
         "task_ops",
         "learnings",
+        "source",
         "dependencies",
+        "steering",
+        "session_guidance",
+        "tool_awareness",
+        "key_decision",
         "completion",
         "base_prompt",
     ];
@@ -667,4 +680,301 @@ fn slot_learnings_render_matches_legacy() {
         rendered.shown_learning_ids, legacy_ids,
         "slot learnings must surface the same recalled IDs as the live builder"
     );
+}
+
+// ===========================================================================
+// FEAT-005 — the remaining shared trimmables: source, steering,
+// session_guidance, tool_awareness, key_decision. Each is a SHARED SectionSpec
+// (one render site, wrapping a `core::build_*` helper), reached by both rosters
+// at its legacy display position. Parity is asserted per path against the LIVE
+// core helper, never a frozen literal.
+// ===========================================================================
+
+/// Materialize a project with a source file (`src/api.rs`) and a `steering.md`,
+/// returning the tempdir plus the relative `task_files` for the source render.
+fn project_with_source_and_steering() -> (TempDir, Vec<String>, std::path::PathBuf) {
+    let tmp = TempDir::new().expect("tempdir");
+    let src = tmp.path().join("src");
+    std::fs::create_dir_all(&src).expect("create src dir");
+    std::fs::write(
+        src.join("api.rs"),
+        "pub fn handle_request() {}\npub struct ApiHandler;\n",
+    )
+    .expect("write source file");
+    let steering = tmp.path().join("steering.md");
+    std::fs::write(&steering, "Focus on error handling.").expect("write steering");
+    (tmp, vec!["src/api.rs".to_string()], steering)
+}
+
+/// Build a fully-populated context for the shared-trimmable renders: a real
+/// source file, a steering path, non-empty guidance, and the Dangerous mode.
+fn shared_trimmable_ctx<'a>(
+    conn: &'a Connection,
+    task: &'a Task,
+    root: &'a std::path::Path,
+    base: &'a std::path::Path,
+    files: &'a [String],
+    steering: &'a std::path::Path,
+    guidance: &'a str,
+) -> PromptContext<'a> {
+    PromptContext {
+        conn,
+        task,
+        task_files: files,
+        project_root: root,
+        base_prompt_path: base,
+        permission_mode: &DANGEROUS,
+        steering_path: Some(steering),
+        session_guidance: guidance,
+        run_id: None,
+        task_prefix: None,
+        reorder_hint: None,
+        batch_sibling_prds: None,
+        next_task_output: None,
+        recalled_learnings: None,
+    }
+}
+
+/// Assert every shared trimmable rendered through `roster` is byte-identical to
+/// the live `core::build_*` helper it wraps. Shared by the sequential and slot
+/// per-path parity tests below (the specs are identical across rosters; this
+/// proves each path actually reaches them at its own position).
+fn assert_shared_trimmables_match_legacy(roster: &[SectionSpec], ctx: &PromptContext<'_>) {
+    let files = ctx.task_files;
+    let root = ctx.project_root;
+    let steering = ctx
+        .steering_path
+        .expect("test ctx supplies a steering path");
+
+    // source — diff against the live builder using the SAME 2000-byte budget.
+    let legacy_source = core::build_source_context_block(files, core::SOURCE_CONTEXT_BUDGET, root);
+    assert!(
+        legacy_source.contains("## Current Source Context")
+            && legacy_source.contains("handle_request"),
+        "guard: legacy source must have real content, got {legacy_source:?}"
+    );
+    assert_eq!(render_named(roster, "source", ctx), legacy_source);
+
+    // steering
+    let legacy_steering = core::build_steering_block(steering);
+    assert!(
+        legacy_steering.contains("## Steering")
+            && legacy_steering.contains("Focus on error handling."),
+        "guard: legacy steering must have real content, got {legacy_steering:?}"
+    );
+    assert_eq!(render_named(roster, "steering", ctx), legacy_steering);
+
+    // session_guidance
+    let legacy_guidance = core::build_session_guidance_block(ctx.session_guidance);
+    assert!(
+        legacy_guidance.contains("## Session Guidance"),
+        "guard: legacy session guidance must have real content, got {legacy_guidance:?}"
+    );
+    assert_eq!(
+        render_named(roster, "session_guidance", ctx),
+        legacy_guidance
+    );
+
+    // tool_awareness
+    let legacy_tool = core::build_tool_awareness_block(&DANGEROUS);
+    assert!(
+        legacy_tool.contains("## Available Tools"),
+        "guard: legacy tool awareness must have real content, got {legacy_tool:?}"
+    );
+    assert_eq!(render_named(roster, "tool_awareness", ctx), legacy_tool);
+
+    // key_decision
+    let legacy_key = core::build_key_decisions_block(&ctx.task.id);
+    assert!(
+        legacy_key.contains("## Key Decision Points"),
+        "guard: legacy key decision must have real content, got {legacy_key:?}"
+    );
+    assert_eq!(render_named(roster, "key_decision", ctx), legacy_key);
+}
+
+#[test]
+fn shared_trimmables_render_matches_legacy_sequential() {
+    let (tmp, files, steering) = project_with_source_and_steering();
+    let conn = setup_migrated_db().1; // independent in-memory-ish db; only used for ctx
+    let base = tmp.path().join("prompt.md");
+    let task = Task::new("TASK-001", "Build API");
+    let ctx = shared_trimmable_ctx(
+        &conn,
+        &task,
+        tmp.path(),
+        &base,
+        &files,
+        &steering,
+        "User said: prioritize tests",
+    );
+    assert_shared_trimmables_match_legacy(&sequential_roster(), &ctx);
+
+    // Sequential's source bytes were historically produced by
+    // `scan_source_context(..).format_for_prompt()` directly. Pin that the
+    // migration onto `build_source_context_block` preserved those exact bytes
+    // (the only divergence is suppressed stderr on a missing root, not output).
+    let direct = task_mgr::loop_engine::context::scan_source_context(
+        &files,
+        core::SOURCE_CONTEXT_BUDGET,
+        tmp.path(),
+    )
+    .format_for_prompt();
+    assert_eq!(
+        render_named(&sequential_roster(), "source", &ctx),
+        direct,
+        "migrated source must equal sequential's original scan_source_context bytes"
+    );
+}
+
+#[test]
+fn shared_trimmables_render_matches_legacy_slot() {
+    let (tmp, files, steering) = project_with_source_and_steering();
+    let conn = setup_migrated_db().1;
+    let base = tmp.path().join("prompt.md");
+    let task = Task::new("TASK-001", "Build API");
+    let ctx = shared_trimmable_ctx(
+        &conn,
+        &task,
+        tmp.path(),
+        &base,
+        &files,
+        &steering,
+        "User said: prioritize tests",
+    );
+    assert_shared_trimmables_match_legacy(&slot_roster(), &ctx);
+}
+
+// ---------------------------------------------------------------------------
+// CONTRACT / distinct-budget: the source cap (2000) and the slot learnings cap
+// (4000) ride on SEPARATE `SectionKind::Trimmable` budget fields. Collapsing
+// them into one shared field is the known-bad this test guards against — it
+// would pass a single-section parity test but fail here.
+// ---------------------------------------------------------------------------
+#[test]
+fn source_and_learnings_budgets_stay_distinct() {
+    use task_mgr::loop_engine::prompt::assembler::SectionKind;
+
+    let slot = slot_roster();
+    let budget_of = |name: &str| match spec_named(&slot, name).kind {
+        SectionKind::Trimmable { budget } => budget,
+        SectionKind::Critical => panic!("{name} should be a trimmable section"),
+    };
+
+    let source_budget = budget_of("source");
+    let learnings_budget = budget_of("learnings");
+
+    assert_eq!(
+        source_budget,
+        core::SOURCE_CONTEXT_BUDGET,
+        "source must carry SOURCE_CONTEXT_BUDGET on its SectionKind"
+    );
+    assert_eq!(
+        source_budget, 2000,
+        "SOURCE_CONTEXT_BUDGET must remain 2000"
+    );
+    assert_eq!(
+        learnings_budget, 4000,
+        "slot learnings must keep its independent 4000-byte cap"
+    );
+    assert_ne!(
+        source_budget, learnings_budget,
+        "the source and learnings caps must stay on distinct SectionKind fields, \
+         not collapse into one shared budget"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Distinct budget — behavioral: an oversize source section is capped by its OWN
+// 2000-byte budget, not the larger learnings cap. Diffs against the live
+// builder at the same budget.
+// ---------------------------------------------------------------------------
+#[test]
+fn source_section_capped_at_its_own_budget() {
+    let tmp = TempDir::new().expect("tempdir");
+    let src = tmp.path().join("src");
+    std::fs::create_dir_all(&src).expect("create src dir");
+    // ~500 public fns — far more than 2000 bytes of signatures.
+    let mut big = String::new();
+    for i in 0..500 {
+        big.push_str(&format!("pub fn generated_function_number_{i}() {{}}\n"));
+    }
+    std::fs::write(src.join("big.rs"), &big).expect("write big source");
+    let files = vec!["src/big.rs".to_string()];
+
+    let conn = setup_migrated_db().1;
+    let base = tmp.path().join("prompt.md");
+    let task = Task::new("TASK-001", "t");
+    let ctx = ctx_with_files(&conn, &task, tmp.path(), &base, &files, None);
+
+    let rendered = render_named(&sequential_roster(), "source", &ctx);
+    let legacy = core::build_source_context_block(&files, core::SOURCE_CONTEXT_BUDGET, tmp.path());
+    assert_eq!(
+        rendered, legacy,
+        "capped source must equal the live builder"
+    );
+    assert!(
+        rendered.contains("## Current Source Context"),
+        "the section must still render its header"
+    );
+    // Capped by the 2000 source budget, comfortably under the 4000 learnings cap.
+    assert!(
+        rendered.len() < 3000,
+        "source must be bounded by its own ~2000 budget, not the 4000 learnings cap; \
+         got {} bytes",
+        rendered.len()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Failure mode: a missing / absent steering file renders an empty section
+// (warn-and-continue), never a panic — matching pre-migration behavior. Empty
+// task_files likewise yields an empty source section, not an error.
+// ---------------------------------------------------------------------------
+#[test]
+fn missing_steering_and_empty_source_render_empty_no_panic() {
+    let tmp = TempDir::new().expect("tempdir");
+    let conn = setup_migrated_db().1;
+    let base = tmp.path().join("prompt.md");
+    let task = Task::new("TASK-001", "t");
+
+    // steering_path = Some(nonexistent file): build_steering_block reads-and-fails
+    // gracefully → "".
+    let missing_steering = tmp.path().join("does-not-exist-steering.md");
+    let ctx = PromptContext {
+        conn: &conn,
+        task: &task,
+        task_files: &[],
+        project_root: tmp.path(),
+        base_prompt_path: &base,
+        permission_mode: &DANGEROUS,
+        steering_path: Some(&missing_steering),
+        session_guidance: "",
+        run_id: None,
+        task_prefix: None,
+        reorder_hint: None,
+        batch_sibling_prds: None,
+        next_task_output: None,
+        recalled_learnings: None,
+    };
+
+    let roster = sequential_roster();
+    assert_eq!(
+        render_named(&roster, "steering", &ctx),
+        "",
+        "missing steering file must render an empty section"
+    );
+    assert_eq!(
+        render_named(&roster, "source", &ctx),
+        "",
+        "empty task_files must render an empty source section, not an error"
+    );
+    assert_eq!(
+        render_named(&roster, "session_guidance", &ctx),
+        "",
+        "empty session guidance must render an empty section"
+    );
+
+    // None steering path also renders empty (no panic).
+    let ctx_none = ctx_for(&conn, &task, tmp.path(), &base);
+    assert_eq!(render_named(&roster, "steering", &ctx_none), "");
 }

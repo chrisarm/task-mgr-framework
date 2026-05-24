@@ -30,7 +30,7 @@ use crate::loop_engine::prompt::assembler::{
 use crate::loop_engine::prompt::core;
 use crate::loop_engine::prompt_sections::dependencies::dependencies_spec;
 use crate::loop_engine::prompt_sections::task_ops::task_ops_spec;
-use crate::loop_engine::prompt_sections::{truncate_to_budget, try_fit_section};
+use crate::loop_engine::prompt_sections::truncate_to_budget;
 use crate::models::Task;
 
 /// The slot path's ordered section roster (CONTRACT-001).
@@ -40,16 +40,19 @@ use crate::models::Task;
 /// whereas sequential places it mid-list. The task/completion/base_prompt
 /// envelopes use slot-specific render fns (untruncated `format_task_json`, the
 /// `core::completion_instruction` variant, the no-trailing-newline base-prompt
-/// reader) that differ byte-for-byte from sequential's. `task_ops` and
-/// `dependencies` are the only specs shared verbatim across both paths.
+/// reader) that differ byte-for-byte from sequential's. `task_ops`,
+/// `dependencies`, and (since FEAT-005) `source` / `steering` /
+/// `session_guidance` / `tool_awareness` / `key_decision` are shared specs
+/// reached through their `*_spec` constructors.
 ///
-/// As in the sequential path, [`build_prompt`] does not call [`assemble`] once
-/// over this whole roster during the incremental migration — the critical
-/// subset is gated together while each migrated trimmable (`learnings`,
-/// `dependencies`) is assembled solo at its own fit position, around the
-/// still-inlined `source`/`steering`/… trimmables. It derives a criticals-only
-/// sub-roster from this single source and reaches each trimmable spec via
-/// [`learnings_spec`] / [`dependencies_spec`].
+/// After FEAT-005 every section the slot path emits is in this roster: the slot
+/// has NO sequential-only sections (synergy / siblings / reorder / escalation
+/// are dropped for disjoint wave slots by design). As in the sequential path,
+/// [`build_prompt`] does not yet call [`assemble`] once over this whole roster —
+/// the critical subset is gated together while each migrated trimmable is
+/// assembled solo at its own fit position. It derives a criticals-only
+/// sub-roster from this single source and reaches each trimmable spec via its
+/// `*_spec` constructor.
 pub fn slot_roster() -> Vec<SectionSpec> {
     vec![
         SectionSpec {
@@ -59,7 +62,12 @@ pub fn slot_roster() -> Vec<SectionSpec> {
         },
         task_ops_spec(),
         learnings_spec(),
+        core::source_spec(),
         dependencies_spec(),
+        core::steering_spec(),
+        core::session_guidance_spec(),
+        core::tool_awareness_spec(),
+        core::key_decision_spec(),
         SectionSpec {
             name: "completion",
             kind: SectionKind::Critical,
@@ -148,8 +156,10 @@ fn render_base_prompt_section(ctx: &PromptContext<'_>, _kind: SectionKind) -> Re
     }
 }
 
-/// Byte budget for the source-context section in slot prompts.
-const SOURCE_CONTEXT_BUDGET: usize = 2000;
+// The source-context byte budget now lives in `core::SOURCE_CONTEXT_BUDGET`
+// (FEAT-005) — the single source of truth carried on the shared
+// `core::source_spec` `SectionKind::Trimmable` budget, kept distinct from
+// LEARNINGS_BUDGET below so the two caps never collapse into one field.
 
 /// Byte budget for the learnings section in slot prompts.
 const LEARNINGS_BUDGET: usize = 4000;
@@ -300,8 +310,9 @@ pub fn load_base_prompt(base_prompt_path: &std::path::Path) -> String {
 ///   `TOTAL_PROMPT_BUDGET`, return a sentinel bundle with empty `prompt`
 ///   and [`CRITICAL_OVERFLOW_SENTINEL`] in `dropped_sections`.
 /// - **Phase 2**: fill the remaining budget with trimmable sections in
-///   priority order; the migrated `learnings` and `dependencies` trimmables
-///   are each assembled solo via [`assemble`], the rest via [`try_fit_section`].
+///   priority order. Since FEAT-005 every trimmable (`learnings`, `source`,
+///   `dependencies`, `steering`, `session_guidance`, `tool_awareness`,
+///   `key_decision`) is assembled solo via [`assemble`] at its fit position.
 ///   Drops are recorded in `dropped_sections`. When `"learnings"` is dropped,
 ///   [`assemble`] (the sole owner of this invariant) leaves `shown_learning_ids`
 ///   empty so the UCB bandit isn't credited with learnings the agent never saw.
@@ -423,18 +434,18 @@ pub fn build_prompt(
     dropped_sections.extend(learnings_assembled.dropped_sections);
     let shown_learning_ids = learnings_assembled.shown_learning_ids;
 
-    let source_section_raw =
-        core::build_source_context_block(&task_files, SOURCE_CONTEXT_BUDGET, &params.project_root);
-    let source_section = try_fit_section(
-        source_section_raw,
-        "source",
-        &mut remaining,
-        &mut dropped_sections,
-    );
+    // Source context (trimmable, fit AFTER learnings). Solo-assembled via the
+    // shared `core::source_spec`; its 2000-byte internal cap rides on the
+    // spec's `SectionKind::Trimmable` budget, distinct from LEARNINGS_BUDGET.
+    let source = core::source_spec();
+    let source_assembled = assemble(&ctx, std::slice::from_ref(&source), remaining);
+    let source_section = source_assembled.prompt;
+    remaining -= source_section.len();
+    dropped_sections.extend(source_assembled.dropped_sections);
 
     // Dependencies (trimmable, fit AFTER learnings + source). Assembled solo at
-    // its own fit position via the shared `dependencies_spec`; the surrounding
-    // sections stay inlined for now. Reuses the `ctx` built above.
+    // its own fit position via the shared `dependencies_spec`. Reuses the `ctx`
+    // built above.
     let dependencies = dependencies_spec();
     let dep_assembled = assemble(&ctx, std::slice::from_ref(&dependencies), remaining);
     // `assemble` fit the section within `remaining`, so the subtraction cannot
@@ -443,40 +454,35 @@ pub fn build_prompt(
     remaining -= dep_section.len();
     dropped_sections.extend(dep_assembled.dropped_sections);
 
-    let steering_section_raw = params
-        .steering_path
-        .map(core::build_steering_block)
-        .unwrap_or_default();
-    let steering_section = try_fit_section(
-        steering_section_raw,
-        "steering",
-        &mut remaining,
-        &mut dropped_sections,
-    );
+    // Steering (trimmable). Solo-assembled via `core::steering_spec`.
+    let steering = core::steering_spec();
+    let steering_assembled = assemble(&ctx, std::slice::from_ref(&steering), remaining);
+    let steering_section = steering_assembled.prompt;
+    remaining -= steering_section.len();
+    dropped_sections.extend(steering_assembled.dropped_sections);
 
-    let guidance_section_raw = core::build_session_guidance_block(params.session_guidance);
-    let guidance_section = try_fit_section(
-        guidance_section_raw,
-        "session_guidance",
-        &mut remaining,
-        &mut dropped_sections,
-    );
+    // Session guidance (trimmable). Solo-assembled via `core::session_guidance_spec`.
+    let guidance = core::session_guidance_spec();
+    let guidance_assembled = assemble(&ctx, std::slice::from_ref(&guidance), remaining);
+    let guidance_section = guidance_assembled.prompt;
+    remaining -= guidance_section.len();
+    dropped_sections.extend(guidance_assembled.dropped_sections);
 
-    let tool_section_raw = core::build_tool_awareness_block(&params.permission_mode);
-    let tool_section = try_fit_section(
-        tool_section_raw,
-        "tool_awareness",
-        &mut remaining,
-        &mut dropped_sections,
-    );
+    // Tool awareness (trimmable). Solo-assembled via `core::tool_awareness_spec`.
+    let tool_awareness = core::tool_awareness_spec();
+    let tool_assembled = assemble(&ctx, std::slice::from_ref(&tool_awareness), remaining);
+    let tool_section = tool_assembled.prompt;
+    remaining -= tool_section.len();
+    dropped_sections.extend(tool_assembled.dropped_sections);
 
-    let key_decisions_section_raw = core::build_key_decisions_block(&task.id);
-    let key_decisions_section = try_fit_section(
-        key_decisions_section_raw,
-        "key_decision",
-        &mut remaining,
-        &mut dropped_sections,
-    );
+    // Key decision points (trimmable, fit LAST). Solo-assembled via
+    // `core::key_decision_spec`. No further section consumes `remaining`, so we
+    // deliberately do not decrement it (a trailing `remaining -=` would be a
+    // dead assignment).
+    let key_decision = core::key_decision_spec();
+    let key_decisions_assembled = assemble(&ctx, std::slice::from_ref(&key_decision), remaining);
+    let key_decisions_section = key_decisions_assembled.prompt;
+    dropped_sections.extend(key_decisions_assembled.dropped_sections);
 
     // ============================================================
     // Assembly
