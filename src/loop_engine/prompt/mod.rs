@@ -30,6 +30,7 @@
 //! adding a non-`Send` field (e.g. `Rc`, `RefCell`, `Connection`) breaks
 //! the build by design.
 
+pub mod assembler;
 pub mod core;
 pub mod sequential;
 pub mod slot;
