@@ -140,11 +140,21 @@ Do NOT re-implement the prefix-matching logic anywhere else.
 | Claude → Grok | `fallbackRunner.enabled=true` | Claude overflow-ladder exhausted (rung 4) OR consecutive RuntimeErrors ≥ `fallbackRunner.runtimeErrorThreshold` |
 | Grok → Claude | `primaryRunner.claudeFallbackModel` set | Grok overflow-ladder exhausted (rung 4) OR consecutive RuntimeErrors ≥ `primaryRunner.runtimeErrorThreshold` |
 
-Both paths share the same idempotency guard: a task that already carries a
-cross-provider promotion override (in EITHER direction) is never promoted again
-— the overflow rung 4 arm skips it, and the RuntimeError hook checks
-`provider_for_model` against `claude_fallback_model`. A task can only cross
-the provider boundary ONCE per loop run (in-memory override; clears on restart).
+Both paths share the same idempotency guard, and it is the SAME mechanism at
+both sites: a single `ctx.runner_overrides.contains_key(task_id)` snapshot taken
+BEFORE the promotion branch. If an override already exists (in EITHER direction),
+the site bails to normal failure accounting (→ `auto_block_task`) instead of
+promoting. A task can only cross the provider boundary ONCE per loop run
+(in-memory override; clears on restart).
+
+> ⚠️ Footgun: do NOT gate idempotency on a re-derivation like
+> `provider_for_model(effective_model)` alone. Because a Grok→Claude promotion
+> sets `runner_overrides[id]=Claude`, the next failure would otherwise enter the
+> OPPOSITE (Claude→Grok) branch and flap providers every iteration (bounded only
+> by `max_retries`, each flip spawning a real CLI subprocess). The RuntimeError
+> escalation path shipped without this guard and ping-ponged; it now mirrors the
+> overflow rung-4 `was_already_promoted` snapshot. When you add a THIRD
+> cross-provider promotion site, replicate the `contains_key` guard there too.
 
 `claudeFallbackModel` absent → no Grok→Claude fallback. The Grok task
 dead-ends on `blocked` exactly as a Claude task without `fallbackRunner` does.
