@@ -321,3 +321,71 @@ fn end_to_end_primary_runner_matched_task_resolves_grok_runner() {
         "non-matched FEAT task MUST still resolve to Claude even when primaryRunner is configured",
     );
 }
+
+// ── Scenario 9 — byIdPrefix enforces a dash boundary (no false-positive) ─────
+
+/// A `byIdPrefix` key MUST only match at a dash-delimited segment boundary.
+/// `"REVIEW-"` matches `REVIEW-001` but MUST NOT match `REVIEWER-001` — a naive
+/// `starts_with` would wrongly route the unrelated `REVIEWER-*` task to Grok.
+#[test]
+fn by_id_prefix_does_not_false_match_longer_segment() {
+    let cfg = make_cfg(); // has byIdPrefix["REVIEW-"]
+    let result = resolve_task_model(&ModelResolutionContext {
+        task_id: Some("8d71d1f7-REVIEWER-001"),
+        task_type: None,
+        primary_runner: Some(&cfg),
+        project_default: Some(SONNET_MODEL),
+        ..Default::default()
+    });
+    assert_eq!(
+        result.as_deref(),
+        Some(SONNET_MODEL),
+        "key 'REVIEW-' MUST NOT match id body 'REVIEWER-001' — the prefix must \
+         end on a '-' boundary, so this task falls through to project_default",
+    );
+}
+
+// ── Scenario 10 — byIdPrefix key normalization (with/without trailing dash) ──
+
+/// A `byIdPrefix` key written WITHOUT a trailing dash (`"REVIEW"`) behaves
+/// identically to `"REVIEW-"`: it matches `REVIEW-001` (dash boundary enforced
+/// after normalization) and still rejects `REVIEWER-001`.
+#[test]
+fn by_id_prefix_key_without_trailing_dash_is_normalized() {
+    let grok_spec = RunnerSpec {
+        provider: "grok".to_string(),
+        model: GROK_MODEL.to_string(),
+    };
+    let mut by_id_prefix = HashMap::new();
+    by_id_prefix.insert("REVIEW".to_string(), grok_spec); // no trailing '-'
+    let cfg = PrimaryRunnerConfig {
+        by_id_prefix,
+        ..Default::default()
+    };
+
+    let matched = resolve_task_model(&ModelResolutionContext {
+        task_id: Some("8d71d1f7-REVIEW-001"),
+        task_type: None,
+        primary_runner: Some(&cfg),
+        project_default: Some(SONNET_MODEL),
+        ..Default::default()
+    });
+    assert_eq!(
+        matched.as_deref(),
+        Some(GROK_MODEL),
+        "key 'REVIEW' (no trailing dash) MUST still match 'REVIEW-001' after normalization",
+    );
+
+    let rejected = resolve_task_model(&ModelResolutionContext {
+        task_id: Some("8d71d1f7-REVIEWER-001"),
+        task_type: None,
+        primary_runner: Some(&cfg),
+        project_default: Some(SONNET_MODEL),
+        ..Default::default()
+    });
+    assert_eq!(
+        rejected.as_deref(),
+        Some(SONNET_MODEL),
+        "key 'REVIEW' MUST NOT false-match 'REVIEWER-001' — normalization adds the dash boundary",
+    );
+}

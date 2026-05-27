@@ -261,9 +261,14 @@ pub struct ModelResolutionContext<'a> {
 ///
 /// **Match priority** (highest → lowest):
 /// 1. `byTaskType` — exact, case-sensitive match on `task_type`
-/// 2. `byIdPrefix` — the task ID body (after stripping the 8-hex project
-///    prefix) starts with the map key, or the body contains `"-<key>"`.
-///    This mirrors `id_body_matches_prefix` in `commands::next::selection`.
+/// 2. `byIdPrefix` — the map key matches a dash-delimited segment at the
+///    start of the task ID body (after stripping the 8-hex project prefix).
+///    The key is normalized by trimming a trailing `-`, so `"REVIEW"` and
+///    `"REVIEW-"` behave identically, and a `-` boundary is required after
+///    the prefix — so `"REVIEW-"` matches `REVIEW-001` but NOT `REVIEWER-001`.
+///    Same dash-boundary semantics as `id_body_matches_prefix` in
+///    `commands::next::selection` (kept as a local matcher rather than reused,
+///    to avoid a `loop_engine` → `commands` layer dependency).
 ///
 /// When both maps produce a match, `byTaskType` wins even if the specs differ.
 /// `None` is returned only when neither map matches.
@@ -283,7 +288,11 @@ pub fn primary_runner_match<'a>(
     if let Some(id) = task_id {
         let body = strip_prd_prefix(id);
         for (prefix, spec) in &cfg.by_id_prefix {
-            if body.starts_with(prefix.as_str()) || body.contains(&format!("-{prefix}")) {
+            // Normalize the key (trim a trailing `-`) then require a `-`
+            // boundary after the prefix segment, so a key like "REVIEW" cannot
+            // false-match "REVIEWER-001".
+            let needle = format!("{}-", prefix.trim_end_matches('-'));
+            if body.starts_with(&needle) || body.contains(&format!("-{needle}")) {
                 return Some(spec);
             }
         }
