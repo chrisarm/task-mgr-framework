@@ -233,10 +233,18 @@ pub(crate) fn escalate_task_model_if_needed_inner(
     // the PRE-escalation model and dispatches one of two mirror branches:
     //   - Claude→Grok (FEAT-007) when the task is still on Claude.
     //   - Grok→Claude (FEAT-PRIMARY-003) when the task is on Grok.
-    // A task already promoted in either direction carries a `runner_overrides`
-    // entry, so `resolve_effective_runner` reports the promoted runner and the
-    // task cannot re-enter the SAME branch (idempotency) — it falls through to
-    // normal failure accounting → `auto_block_task` per `max_retries`.
+    //
+    // FEAT-PRIMARY-004 idempotency: a task that has ALREADY been promoted in
+    // either direction carries a `runner_overrides` entry. Promoting it again
+    // would flip it into the OPPOSITE branch (Grok→Claude then Claude→Grok …),
+    // producing an infinite Claude↔Grok ping-pong bounded only by max_retries.
+    // Mirror the `was_already_promoted` guard in `handle_prompt_too_long`
+    // (overflow.rs): once a task has pivoted providers once, no further
+    // cross-provider promotion fires — it falls through to normal failure
+    // accounting → `auto_block_task` per `max_retries`.
+    if ctx.runner_overrides.contains_key(task_id) {
+        return Ok((escalated, None));
+    }
     let effective_runner = resolve_effective_runner(ctx, task_id, current_model.as_deref());
     match effective_runner {
         // kind-correct: Claude is the source side; Grok is the fallback target — provider identity, not capability.

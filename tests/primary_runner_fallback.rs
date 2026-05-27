@@ -322,3 +322,66 @@ fn grok_auth_failure_does_not_increment_consecutive_failures_for_primary_task() 
         "handle_task_failure unconditionally increments — the call-site filter is the protection",
     );
 }
+
+// ── Test #12 — FEAT-PRIMARY-004 idempotency: no Claude↔Grok ping-pong ──────────
+
+/// Regression: a Grok-primary task that has ALREADY been inverse-promoted to
+/// Claude must NOT pivot back to Grok on subsequent failures, even when a
+/// Claude→Grok `fallbackRunner` is ALSO enabled and the inverse target is an
+/// Opus-tier model. Without the `runner_overrides`-snapshot idempotency guard
+/// in `escalate_task_model_if_needed_inner`, the first promotion sets the
+/// override to Claude, the next failure re-enters the OPPOSITE (Claude→Grok)
+/// branch, and `tasks.model` oscillates grok↔opus on every failure until
+/// max_retries. The guard pins the task to its first promotion target.
+#[test]
+fn already_promoted_grok_task_does_not_ping_pong_back_to_grok() {
+    use task_mgr::loop_engine::model::OPUS_MODEL;
+    use task_mgr::loop_engine::project_config::FallbackRunnerConfig;
+
+    let (_dir, mut conn) = setup_db();
+    // max_retries=5 (from insert_task) gives several escalation rounds before
+    // auto-block, so a ping-pong would manifest if the guard were absent.
+    insert_task(&conn, "GROK-PP-001", Some(GROK_MODEL), 0);
+
+    // BOTH directions configured: Claude→Grok fallback enabled AND Grok→Claude
+    // inverse with an Opus-tier fallback (so was_at_opus is true post-pivot).
+    let fb = FallbackRunnerConfig {
+        enabled: true,
+        provider: "grok".to_string(),
+        model: GROK_MODEL.to_string(),
+        cli_binary: None,
+        runtime_error_threshold: PRIMARY_THRESHOLD as u32,
+    };
+    let primary = primary_cfg_with_fallback(OPUS_MODEL);
+
+    let mut ctx = IterationContext::new(8);
+    let mut models = Vec::new();
+    for i in 0..6 {
+        handle_task_failure(
+            &mut conn,
+            "GROK-PP-001",
+            i,
+            &mut ctx,
+            Some(&fb),
+            Some(&primary),
+        )
+        .unwrap();
+        models.push(read_model(&conn, "GROK-PP-001"));
+    }
+
+    // The single legitimate promotion is grok→opus; after that tasks.model must
+    // stay on the Claude model. Any later grok reappearance is a ping-pong.
+    assert!(
+        models
+            .iter()
+            .skip(1)
+            .all(|m| m.as_deref() == Some(OPUS_MODEL)),
+        "after the first inverse promotion the model must stay on Claude, \
+         never flip back to Grok; got {models:?}",
+    );
+    assert_eq!(
+        ctx.runner_overrides.get("GROK-PP-001"),
+        Some(&RunnerKind::Claude),
+        "the promotion override must remain Claude — never re-promoted to Grok",
+    );
+}
