@@ -195,8 +195,14 @@ pub fn run_slot_iteration(
             slot_label: Some(&slot_label_buf),
             active_prefix: params.task_prefix.as_deref(),
             // Each iteration's ai-title metadata stub otherwise clutters the
-            // worktree's interactive resume picker. See claude.rs:119.
-            cleanup_title_artifact: true,
+            // worktree's interactive resume picker. See claude.rs:119. Only
+            // request it from a runner that emits the artifact — dispatch
+            // fail-closes on runners (e.g. Grok) that lack the capability.
+            // REGRESSION: do NOT hardcode `true` — Grok dispatch is rejected
+            // with UnsupportedRunnerCapability. Gate on the selected runner.
+            cleanup_title_artifact: slot
+                .effective_runner
+                .supports(runner::RunnerCapability::TitleArtifactCleanup),
             ..Default::default()
         },
     );

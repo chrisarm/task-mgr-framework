@@ -473,8 +473,13 @@ pub fn run_iteration(
             target_task_id: Some(&task_id),
             active_prefix: params.task_prefix,
             // Each iteration's ai-title metadata stub otherwise clutters the
-            // project's interactive resume picker. See claude.rs:119.
-            cleanup_title_artifact: true,
+            // project's interactive resume picker. See claude.rs:119. Only
+            // request it from a runner that emits the artifact — dispatch
+            // fail-closes on runners (e.g. Grok) that lack the capability.
+            // REGRESSION: do NOT hardcode `true` — Grok dispatch is rejected
+            // with UnsupportedRunnerCapability. Gate on the selected runner.
+            cleanup_title_artifact: effective_runner
+                .supports(runner::RunnerCapability::TitleArtifactCleanup),
             ..Default::default()
         },
     );

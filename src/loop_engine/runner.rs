@@ -222,6 +222,21 @@ pub enum RunnerKind {
     Grok,
 }
 
+impl RunnerKind {
+    /// Whether this backend supports `cap`, without constructing a trait
+    /// object. Delegates to the zero-sized runner `supports` impls so the
+    /// capability matrix stays single-sourced. Lets callers shape
+    /// [`RunnerOpts`] to the *selected* runner before [`dispatch`] (which
+    /// fail-closes on a capability the runner lacks) — e.g. only request
+    /// `cleanup_title_artifact` when the runner actually emits the artifact.
+    pub(crate) fn supports(self, cap: RunnerCapability) -> bool {
+        match self {
+            RunnerKind::Claude => ClaudeRunner.supports(cap),
+            RunnerKind::Grok => GrokRunner.supports(cap),
+        }
+    }
+}
+
 /// Typed capability surface used by `dispatch` to refuse a spawn whose
 /// [`RunnerOpts`] sets a field encoding a capability the chosen runner
 /// does not support — before any subprocess is launched.
@@ -653,9 +668,12 @@ impl LlmRunner for ClaudeRunner {
 
 /// Grok CLI runner.
 ///
-/// Wraps `<binary> <base-flags> <permission-flags> [-model m] [-effort e] -p`
-/// (prompt is piped via stdin, never as an argv entry — same convention as
-/// [`ClaudeRunner`] to dodge OS ARG_MAX limits on large prompts).
+/// Wraps `<binary> <base-flags> <permission-flags> [-model m] [-effort e]
+/// --prompt-file <tempfile>` with stdin set to `Stdio::null()`. Unlike
+/// [`ClaudeRunner`] (whose `--print`/`-p` reads stdin), grok's
+/// `-p/--single <PROMPT>` requires an inline value and ignores stdin, so the
+/// prompt is delivered through a temp file — which also dodges OS
+/// `MAX_ARG_STRLEN` (128 KiB) on large prompts. See `write_prompt_to_tempfile`.
 ///
 /// Binary resolution chain (PRD §2.5: "GrokRunner binary resolution is
 /// config-independent"):
@@ -670,7 +688,9 @@ impl LlmRunner for ClaudeRunner {
 /// - `--disallowedTools` → `--disallowed-tools`
 /// - `--dangerously-skip-permissions` → `--permission-mode bypassPermissions`
 /// - `--output-format stream-json` → `--output-format streaming-json`
-///   (different spelling)
+///   (different spelling; Claude's required `--verbose` companion is **not**
+///   passed — grok has no such flag)
+/// - prompt via stdin (`-p`/`--print`) → `--prompt-file <tempfile>`
 /// - `cleanup_title_artifact: true` is rejected at dispatch with
 ///   [`TaskMgrError::UnsupportedRunnerCapability`] — grok has no
 ///   ai-title-jsonl leak and the `TitleArtifactCleanup` capability is
@@ -756,9 +776,12 @@ impl LlmRunner for GrokRunner {
 
         let binary = resolve_grok_binary(fallback_cli_binary);
 
+        // NOTE: unlike Claude (which requires `--verbose` alongside
+        // `--output-format stream-json`), grok takes `--output-format
+        // streaming-json` standalone and rejects `--verbose` (its only
+        // near-match is `-v/--version`).
         let mut args: Vec<String> = if stream_json {
             vec![
-                "--verbose".to_string(),
                 "--output-format".to_string(),
                 "streaming-json".to_string(),
             ]
@@ -790,11 +813,24 @@ impl LlmRunner for GrokRunner {
         push_optional_flag(&mut args, "--disallowed-tools", disallowed_tools);
         push_optional_flag(&mut args, "--model", model);
         push_optional_flag(&mut args, "--effort", effort);
-        args.push("-p".to_string());
+
+        // Grok's `-p/--single <PROMPT>` requires the prompt as an inline arg
+        // value and does NOT read it from stdin (unlike Claude's `--print`,
+        // which does). Inline args are bounded by Linux MAX_ARG_STRLEN
+        // (128 KiB per arg), which a CODE-REVIEW prompt carrying a full diff
+        // can exceed (→ E2BIG), so route the prompt through `--prompt-file`
+        // instead. `prompt_file` is held until the child exits; its `Drop`
+        // unlinks the temp file (owned values drop at end of this scope,
+        // which is past `child.wait()` below).
+        let prompt_file = write_prompt_to_tempfile(prompt, &binary, "Grok")?;
+        args.push("--prompt-file".to_string());
+        args.push(prompt_file.path().to_string_lossy().into_owned());
 
         let mut cmd = Command::new(&binary);
         cmd.args(&args)
-            .stdin(Stdio::piped())
+            // No stdin: the prompt is delivered via `--prompt-file`. Null
+            // (not piped) so grok can't block reading a stdin we never write.
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             // Piped (not inherited) so we can sniff for auth-failure substrings
             // while still teeing each line to the parent stderr in real time.
@@ -803,7 +839,6 @@ impl LlmRunner for GrokRunner {
         apply_common_env(&mut cmd, db_dir, active_prefix, working_dir);
         let spawn_instant = Instant::now();
         let mut child = spawn_with_context(&mut cmd, &binary, "Grok")?;
-        write_prompt_to_stdin(&mut child, prompt, &binary, "Grok")?;
         let watchdog = spawn_watchdog(child.id(), signal_flag, timeout, target_task_id);
 
         let (stderr_buf, stderr_handle) = spawn_grok_stderr_sniffer(&mut child, slot_label);
@@ -1054,6 +1089,42 @@ fn spawn_with_context(
             }
         }
     })
+}
+
+/// Write `prompt` to a freshly-created temp file for runners that take the
+/// prompt via a path flag (Grok's `--prompt-file`) rather than stdin.
+///
+/// The returned [`tempfile::NamedTempFile`] MUST be kept alive until the child
+/// process has finished reading it — its `Drop` unlinks the file. Used instead
+/// of an inline `-p <prompt>` arg to stay clear of Linux `MAX_ARG_STRLEN`
+/// (128 KiB) on large prompts. Created mode `0600` (tempfile default): the
+/// prompt may carry a full diff / proprietary code, so it stays owner-only
+/// and never appears in argv (`/proc/<pid>/cmdline`).
+fn write_prompt_to_tempfile(
+    prompt: &str,
+    binary: &str,
+    provider_label: &str,
+) -> TaskMgrResult<tempfile::NamedTempFile> {
+    use std::io::Write;
+    let ctx = |operation: String| move |e: std::io::Error| TaskMgrError::IoErrorWithContext {
+        file_path: binary.to_string(),
+        operation,
+        source: e,
+    };
+    let mut file = tempfile::Builder::new()
+        .prefix("task-mgr-prompt-")
+        .suffix(".txt")
+        .tempfile()
+        .map_err(ctx(format!(
+            "creating temp prompt file for {provider_label} subprocess"
+        )))?;
+    file.write_all(prompt.as_bytes()).map_err(ctx(format!(
+        "writing prompt to temp file for {provider_label} subprocess"
+    )))?;
+    file.flush().map_err(ctx(format!(
+        "flushing temp prompt file for {provider_label} subprocess"
+    )))?;
+    Ok(file)
 }
 
 /// Write `prompt` to the child's stdin and close the pipe.
@@ -1649,6 +1720,10 @@ mod tests {
     /// Build a mock grok binary that emits a marker line plus the prompt.
     /// Mirrors [`make_marker_script`] but is named to make the call sites
     /// in Grok-specific tests self-documenting.
+    ///
+    /// Reads the prompt from the `--prompt-file <path>` arg (not stdin): the
+    /// real GrokRunner delivers the prompt via that flag with stdin set to
+    /// null, so a `cat`-from-stdin mock would see an empty prompt.
     fn make_grok_marker_script(name: &str, marker: &str) -> std::path::PathBuf {
         use std::io::Write as _;
         use std::os::unix::fs::PermissionsExt as _;
@@ -1656,7 +1731,13 @@ mod tests {
         {
             let mut f = std::fs::File::create(&path).unwrap();
             writeln!(f, "#!/bin/sh").unwrap();
-            writeln!(f, r#"PROMPT=$(cat)"#).unwrap();
+            writeln!(f, "PROMPT=''").unwrap();
+            writeln!(f, "while [ $# -gt 0 ]; do").unwrap();
+            writeln!(f, "  case \"$1\" in").unwrap();
+            writeln!(f, "    --prompt-file) PROMPT=$(cat \"$2\"); shift 2 ;;").unwrap();
+            writeln!(f, "    *) shift ;;").unwrap();
+            writeln!(f, "  esac").unwrap();
+            writeln!(f, "done").unwrap();
             writeln!(f, r#"echo "{marker} $PROMPT""#).unwrap();
         }
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1744,6 +1825,173 @@ mod tests {
             }
             other => panic!("expected UnsupportedRunnerCapability, got {other:?}"),
         }
+    }
+
+    /// `RunnerKind::supports` must agree with the zero-sized runner trait
+    /// impls for every capability — it exists so engine call sites can shape
+    /// `RunnerOpts` to the selected runner without a trait object, and a drift
+    /// between the two would silently re-introduce the dispatch-rejection bug.
+    #[test]
+    fn runner_kind_supports_matches_trait_impls() {
+        use RunnerCapability::*;
+        for cap in [Effort, StreamJson, Pty, DisallowedTools, TitleArtifactCleanup] {
+            assert_eq!(
+                RunnerKind::Claude.supports(cap),
+                ClaudeRunner.supports(cap),
+                "RunnerKind::Claude.supports({cap:?}) drifted from ClaudeRunner",
+            );
+            assert_eq!(
+                RunnerKind::Grok.supports(cap),
+                GrokRunner.supports(cap),
+                "RunnerKind::Grok.supports({cap:?}) drifted from GrokRunner",
+            );
+        }
+        // Spot-check the specific bit that caused the production crash.
+        assert!(!RunnerKind::Grok.supports(TitleArtifactCleanup));
+        assert!(RunnerKind::Claude.supports(TitleArtifactCleanup));
+    }
+
+    /// Mock grok that records its argv (one arg per line) to the file named
+    /// by `GROK_ARGV_OUT`, then prints a marker. Lets tests assert the exact
+    /// flags GrokRunner passes without coupling to spawn internals.
+    fn make_grok_argv_recorder() -> std::path::PathBuf {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = std::env::temp_dir().join("task_mgr_grok_argv_recorder.sh");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "#!/bin/sh").unwrap();
+            writeln!(f, r#": > "$GROK_ARGV_OUT""#).unwrap();
+            writeln!(
+                f,
+                r#"for a in "$@"; do printf '%s\n' "$a" >> "$GROK_ARGV_OUT"; done"#
+            )
+            .unwrap();
+            writeln!(f, r#"echo "ARGV_RECORDED""#).unwrap();
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// Run `dispatch(Grok)` against the argv-recorder mock and return the
+    /// recorded argv lines. Holds [`GROK_BINARY_MUTEX`]; cleans up env + files.
+    fn dispatch_grok_recording_argv(
+        prompt: &str,
+        perm: &PermissionMode,
+        stream_json: bool,
+    ) -> Vec<String> {
+        let _guard = GROK_BINARY_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let script = make_grok_argv_recorder();
+        let argv_out = std::env::temp_dir().join("task_mgr_grok_argv_out.txt");
+        unsafe { std::env::set_var("GROK_BINARY", script.to_str().unwrap()) };
+        unsafe { std::env::set_var("GROK_ARGV_OUT", argv_out.to_str().unwrap()) };
+        let result = dispatch(
+            RunnerKind::Grok,
+            prompt,
+            perm,
+            RunnerOpts {
+                stream_json,
+                ..RunnerOpts::default()
+            },
+        );
+        unsafe { std::env::remove_var("GROK_BINARY") };
+        unsafe { std::env::remove_var("GROK_ARGV_OUT") };
+        let argv = std::fs::read_to_string(&argv_out).unwrap_or_default();
+        let _ = std::fs::remove_file(&script);
+        let _ = std::fs::remove_file(&argv_out);
+        result.expect("dispatch(Grok) returned Err");
+        argv.lines().map(str::to_owned).collect()
+    }
+
+    /// Regression: GrokRunner must NOT pass Claude's `--verbose` flag (grok
+    /// rejects it — its only near-match is `-v/--version`), must request
+    /// streaming output via `--output-format streaming-json`, and must deliver
+    /// the prompt via `--prompt-file` (never a bare `-p`/`--single`, which
+    /// grok treats as a value-less flag and which would also blow
+    /// `MAX_ARG_STRLEN` on a large prompt).
+    #[test]
+    fn grok_stream_args_omit_verbose_and_deliver_prompt_via_file() {
+        let perm = scoped_coding();
+        let argv = dispatch_grok_recording_argv("probe-prompt", &perm, true);
+        assert!(
+            !argv.iter().any(|a| a == "--verbose"),
+            "grok must not receive --verbose, got {argv:?}",
+        );
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--output-format" && w[1] == "streaming-json"),
+            "stream_json mode must pass `--output-format streaming-json`, got {argv:?}",
+        );
+        assert!(
+            argv.iter().any(|a| a == "--prompt-file"),
+            "grok must deliver the prompt via --prompt-file, got {argv:?}",
+        );
+        assert!(
+            !argv.iter().any(|a| a == "-p" || a == "--single"),
+            "grok must not use a bare -p/--single prompt flag, got {argv:?}",
+        );
+    }
+
+    /// In plain (non-stream) mode grok omits the stream-format flags entirely,
+    /// but still delivers the prompt via `--prompt-file`.
+    #[test]
+    fn grok_plain_args_omit_stream_flags_but_keep_prompt_file() {
+        let perm = scoped_coding();
+        let argv = dispatch_grok_recording_argv("probe-prompt", &perm, false);
+        assert!(
+            !argv
+                .iter()
+                .any(|a| a == "--output-format" || a == "streaming-json" || a == "--verbose"),
+            "plain mode must omit stream-format flags, got {argv:?}",
+        );
+        assert!(
+            argv.iter().any(|a| a == "--prompt-file"),
+            "prompt is always delivered via --prompt-file, got {argv:?}",
+        );
+    }
+
+    /// A prompt larger than Linux `MAX_ARG_STRLEN` (128 KiB) must round-trip
+    /// intact. An inline `-p <prompt>` would fail with `E2BIG` here — this is
+    /// the regression that drove file-based delivery. The tail sentinel
+    /// confirms the *entire* prompt survived, not a truncated prefix.
+    #[test]
+    fn grok_delivers_oversized_prompt_via_prompt_file() {
+        let perm = scoped_coding();
+        let prompt = format!("{}TAIL_SENTINEL_OK", "x".repeat(200 * 1024));
+        let result = spawn_grok_echo(&prompt, &perm, false).expect("dispatch(Grok) returned Err");
+        assert_eq!(result.exit_code, 0, "expected clean exit, got {result:?}");
+        assert!(
+            result.output.contains("TAIL_SENTINEL_OK"),
+            "oversized prompt tail must survive the --prompt-file round-trip",
+        );
+    }
+
+    /// Regression for the engine call-site bug: both dispatch sites once
+    /// hardcoded `cleanup_title_artifact: true`, which `dispatch` rejects for
+    /// Grok. The fix gates the field on [`RunnerKind::supports`]. This asserts
+    /// the gated value resolves to `false` for Grok AND that dispatch then
+    /// proceeds to spawn rather than returning `UnsupportedRunnerCapability`.
+    #[test]
+    fn grok_dispatch_accepts_capability_gated_cleanup_title_artifact() {
+        let _guard = GROK_BINARY_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let gated = RunnerKind::Grok.supports(RunnerCapability::TitleArtifactCleanup);
+        assert!(!gated, "Grok must not advertise TitleArtifactCleanup");
+        let script = make_grok_marker_script("cleanup_gate", "GATE_OK");
+        unsafe { std::env::set_var("GROK_BINARY", script.to_str().unwrap()) };
+        let perm = scoped_coding();
+        let result = dispatch(
+            RunnerKind::Grok,
+            "gate-probe",
+            &perm,
+            RunnerOpts {
+                cleanup_title_artifact: gated,
+                ..RunnerOpts::default()
+            },
+        );
+        unsafe { std::env::remove_var("GROK_BINARY") };
+        let _ = std::fs::remove_file(&script);
+        let r = result.expect("dispatch(Grok) must not reject a capability-gated cleanup flag");
+        assert_eq!(r.exit_code, 0, "expected clean exit, got {r:?}");
     }
 
     /// TEST-INIT-002 — GrokRunner discovers session id from pre/post dir diff.
