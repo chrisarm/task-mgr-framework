@@ -1156,6 +1156,77 @@ pub fn run_wave_iteration(
         }
     }
 
+    // FEAT-014: account-global transient-backend backoff reaction. Sibling to
+    // the rate-limit reaction above — only reached when rate-limit returned
+    // `None` (rate-limit takes precedence). Folds all N slot outcomes into ONE
+    // reaction so the backoff wait fires exactly once per wave. Same B1/B2/B3
+    // contract as the rate-limit path:
+    //   - `WaitedAndRetry`: return early WITHOUT consuming the loop-bound
+    //     iteration (B2, `iteration_consumed: false`) and WITHOUT zeroing the
+    //     merge-fail streak (B3, `rate_limited_retry: true` makes the
+    //     orchestrator skip the FEAT-002 reset/halt check this wave). The reset
+    //     (B1) only touches `status='in_progress'` rows, so completed slots
+    //     stay `done`.
+    //   - `Stop`: `.stop` during the backoff → terminal exit 130.
+    //   - `Escalate` / `None`: fall through. On `Escalate` the transient
+    //     slot(s) reach the FEAT-007 retry-tracking loop below (TransientBackend
+    //     is NOT in its skip-set), so a prolonged outage feeds the crash/abort
+    //     path; on `None` (no transient slot this wave) the reaction has reset
+    //     the attempt counter and the wave proceeds normally.
+    {
+        let transient_items: Vec<reactions::account::OutputReactionItem<'_>> = wave_result
+            .outcomes
+            .iter()
+            .filter(|s| s.claim_succeeded)
+            .map(|s| reactions::account::OutputReactionItem {
+                task_id: s.iteration_result.task_id.as_deref(),
+                outcome: &s.iteration_result.outcome,
+                output: &s.iteration_result.output,
+            })
+            .collect();
+        let transient_params = reactions::account::TransientReactionParams {
+            tasks_dir: params.tasks_dir,
+            prefix: params.task_prefix.unwrap_or(""),
+            run_id: params.run_id,
+            max_attempts: reactions::account::TRANSIENT_MAX_ATTEMPTS,
+            base_wait_secs: reactions::account::TRANSIENT_BACKOFF_BASE_SECS,
+            max_wait_secs: reactions::account::TRANSIENT_BACKOFF_MAX_SECS,
+        };
+        match reactions::account::react_to_transient(
+            params.conn,
+            &transient_items,
+            &transient_params,
+            &mut ctx.transient_backend_attempts,
+        ) {
+            reactions::account::TransientReaction::None
+            | reactions::account::TransientReaction::Escalate => {}
+            reactions::account::TransientReaction::WaitedAndRetry => {
+                return WaveOutcome {
+                    tasks_completed: agg.tasks_completed,
+                    iteration_consumed: false,
+                    terminal: None,
+                    was_stopped: false,
+                    failed_merges: Vec::new(),
+                    rate_limited_retry: true,
+                };
+            }
+            reactions::account::TransientReaction::Stop => {
+                return WaveOutcome {
+                    tasks_completed: agg.tasks_completed,
+                    iteration_consumed: true,
+                    terminal: Some(WaveTerminal {
+                        exit_code: 130,
+                        reason: "stop signal during transient backend backoff".to_string(),
+                        run_status: None,
+                    }),
+                    was_stopped: true,
+                    failed_merges: Vec::new(),
+                    rate_limited_retry: false,
+                };
+            }
+        }
+    }
+
     // FEAT-007: post-wave retry tracking. Mirrors the sequential call site in
     // `run_loop` (engine.rs:~3992) so wave-mode RuntimeError slots feed the
     // `consecutive_failures` counter, the Claude-tier escalation ladder, AND

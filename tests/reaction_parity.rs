@@ -1607,3 +1607,419 @@ fn known_bad_overflow_skipping_rung1_fails_the_downgrade_assertion() {
         "...which violates the rung-1-first contract the real coordinator satisfies",
     );
 }
+
+// ===========================================================================
+// FEAT-014 — transient-backend reaction (`react_to_transient`) parity. Pins
+// the contract that the converged coordinator
+// `reactions::account::react_to_transient_inner` performs a BOUNDED
+// backoff-retry on `IterationOutcome::TransientBackend` (HTTP 5xx / overloaded),
+// reusing the rate-limit reset+wait scaffold: reset affected `in_progress`
+// task(s) to `todo`, wait EXACTLY ONCE per wave (honoring `retry_after_secs`
+// when present, else exponential `base*2^attempt` capped at `max`), report
+// `WaitedAndRetry`, escalate after the attempt cap, and `Stop` on `.stop`.
+//
+// Like TEST-INIT-001's rate-limit cases these are hermetic: the wait is
+// injected via the same `WaitFn` seam (a `WaitSpy`), and the bounded-attempt
+// counter is a plain `&mut u32` the test owns. Sequential (1-item) and wave
+// (N-item) shapes are exercised, plus a negative control.
+// ===========================================================================
+
+use task_mgr::loop_engine::reactions::account::{
+    TRANSIENT_BACKOFF_BASE_SECS, TRANSIENT_BACKOFF_MAX_SECS, TRANSIENT_MAX_ATTEMPTS,
+    TransientReaction, TransientReactionParams, react_to_transient_inner,
+};
+
+/// Standard transient params for a hermetic inner call, using the production
+/// constants for the cap + backoff curve.
+fn transient_params(tasks_dir: &Path) -> TransientReactionParams<'_> {
+    TransientReactionParams {
+        tasks_dir,
+        prefix: PREFIX,
+        run_id: RUN_ID,
+        max_attempts: TRANSIENT_MAX_ATTEMPTS,
+        base_wait_secs: TRANSIENT_BACKOFF_BASE_SECS,
+        max_wait_secs: TRANSIENT_BACKOFF_MAX_SECS,
+    }
+}
+
+/// An `IterationOutcome::TransientBackend` with no parsed `Retry-After`.
+fn transient_no_retry() -> IterationOutcome {
+    IterationOutcome::TransientBackend {
+        retry_after_secs: None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AC: Wait-once — a 3-slot wave with 2 TransientBackend items fires the
+// injected wait closure EXACTLY once (never once per transient slot).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn transient_wait_once_for_multi_transient_wave() {
+    disable_llm_extraction();
+    let (db_temp, mut conn) = setup_migrated_db();
+    insert_run(&conn);
+    insert_in_progress_task(&conn, "RP-TR-0");
+    insert_done_task(&conn, "RP-DONE-1");
+    insert_in_progress_task(&conn, "RP-TR-2");
+
+    let (tr, done) = (transient_no_retry(), IterationOutcome::Completed);
+    let items = [
+        OutputReactionItem {
+            task_id: Some("RP-TR-0"),
+            outcome: &tr,
+            output: "502 bad gateway",
+        },
+        OutputReactionItem {
+            task_id: Some("RP-DONE-1"),
+            outcome: &done,
+            output: "<completed>RP-DONE-1</completed>",
+        },
+        OutputReactionItem {
+            task_id: Some("RP-TR-2"),
+            outcome: &tr,
+            output: "502 bad gateway",
+        },
+    ];
+
+    let spy = WaitSpy::completing();
+    let wait = spy.closure();
+    let mut attempts: u32 = 0;
+    let reaction = react_to_transient_inner(
+        &mut conn,
+        &items,
+        &transient_params(db_temp.path()),
+        &mut attempts,
+        &wait as WaitFn,
+    );
+
+    assert_eq!(
+        spy.calls.get(),
+        1,
+        "the transient backoff must fire EXACTLY once per wave, not once per transient slot",
+    );
+    assert_eq!(reaction, TransientReaction::WaitedAndRetry);
+    assert_eq!(
+        attempts, 1,
+        "WaitedAndRetry must increment the attempt counter"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// AC: Mixed wave — one TransientBackend + one Completed leaves the completed
+// task `done` and resets only the transient task to `todo` (B1).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn transient_mixed_wave_resets_only_transient_and_preserves_completed() {
+    disable_llm_extraction();
+    let (db_temp, mut conn) = setup_migrated_db();
+    insert_run(&conn);
+    insert_in_progress_task(&conn, "RP-TR-1");
+    insert_done_task(&conn, "RP-DONE-1");
+
+    let (tr, done) = (transient_no_retry(), IterationOutcome::Completed);
+    let items = [
+        OutputReactionItem {
+            task_id: Some("RP-TR-1"),
+            outcome: &tr,
+            output: "503 service unavailable",
+        },
+        OutputReactionItem {
+            task_id: Some("RP-DONE-1"),
+            outcome: &done,
+            output: "<completed>RP-DONE-1</completed>",
+        },
+    ];
+
+    let spy = WaitSpy::completing();
+    let wait = spy.closure();
+    let mut attempts: u32 = 0;
+    let reaction = react_to_transient_inner(
+        &mut conn,
+        &items,
+        &transient_params(db_temp.path()),
+        &mut attempts,
+        &wait as WaitFn,
+    );
+
+    assert_eq!(reaction, TransientReaction::WaitedAndRetry);
+    assert_eq!(
+        task_status(&conn, "RP-DONE-1").as_deref(),
+        Some("done"),
+        "the completed task must remain `done` — the reset must not clobber it (B1)",
+    );
+    assert_eq!(
+        task_status(&conn, "RP-TR-1").as_deref(),
+        Some("todo"),
+        "the transient in_progress task must be reset to `todo` for retry",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// AC: honor retry_after_secs when present (overrides the exponential backoff).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn transient_honors_retry_after_secs() {
+    disable_llm_extraction();
+    let (db_temp, mut conn) = setup_migrated_db();
+    insert_run(&conn);
+    insert_in_progress_task(&conn, "RP-TR-1");
+
+    // attempt=0 would otherwise back off TRANSIENT_BACKOFF_BASE_SECS; the
+    // Retry-After must win.
+    let tr = IterationOutcome::TransientBackend {
+        retry_after_secs: Some(45),
+    };
+    let items = [OutputReactionItem {
+        task_id: Some("RP-TR-1"),
+        outcome: &tr,
+        output: "529 overloaded; Retry-After: 45",
+    }];
+
+    let spy = WaitSpy::completing();
+    let wait = spy.closure();
+    let mut attempts: u32 = 0;
+    react_to_transient_inner(
+        &mut conn,
+        &items,
+        &transient_params(db_temp.path()),
+        &mut attempts,
+        &wait as WaitFn,
+    );
+
+    assert_eq!(
+        spy.last_secs.get(),
+        Some(45),
+        "a present Retry-After must override the exponential backoff",
+    );
+    assert_ne!(
+        spy.last_secs.get(),
+        Some(TRANSIENT_BACKOFF_BASE_SECS),
+        "...and NOT use the exponential base",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// AC: exponential backoff base*2^attempt when no Retry-After — sequential
+// (1-item) and wave (N-item) shapes compute the SAME wait for the same attempt.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn transient_exponential_backoff_and_both_shapes_agree() {
+    disable_llm_extraction();
+
+    // Sequential shape: single transient item, attempt counter at 2.
+    let (seq_temp, mut seq_conn) = setup_migrated_db();
+    insert_run(&seq_conn);
+    insert_in_progress_task(&seq_conn, "RP-TR-1");
+    let tr = transient_no_retry();
+    let seq_items = [OutputReactionItem {
+        task_id: Some("RP-TR-1"),
+        outcome: &tr,
+        output: "bad gateway, no retry-after",
+    }];
+    let seq_spy = WaitSpy::completing();
+    let seq_wait = seq_spy.closure();
+    let mut seq_attempts: u32 = 2;
+    react_to_transient_inner(
+        &mut seq_conn,
+        &seq_items,
+        &transient_params(seq_temp.path()),
+        &mut seq_attempts,
+        &seq_wait as WaitFn,
+    );
+
+    // Wave shape: same transient item (attempt 2) plus a completed sibling.
+    let (wave_temp, mut wave_conn) = setup_migrated_db();
+    insert_run(&wave_conn);
+    insert_in_progress_task(&wave_conn, "RP-TR-1");
+    insert_done_task(&wave_conn, "RP-DONE-2");
+    let done = IterationOutcome::Completed;
+    let wave_items = [
+        OutputReactionItem {
+            task_id: Some("RP-TR-1"),
+            outcome: &tr,
+            output: "bad gateway, no retry-after",
+        },
+        OutputReactionItem {
+            task_id: Some("RP-DONE-2"),
+            outcome: &done,
+            output: "<completed>RP-DONE-2</completed>",
+        },
+    ];
+    let wave_spy = WaitSpy::completing();
+    let wave_wait = wave_spy.closure();
+    let mut wave_attempts: u32 = 2;
+    react_to_transient_inner(
+        &mut wave_conn,
+        &wave_items,
+        &transient_params(wave_temp.path()),
+        &mut wave_attempts,
+        &wave_wait as WaitFn,
+    );
+
+    // attempt 2 ⇒ base * 2^2 = base * 4 (well under the cap for the defaults).
+    let expected = TRANSIENT_BACKOFF_BASE_SECS * 4;
+    assert_eq!(
+        seq_spy.last_secs.get(),
+        Some(expected),
+        "attempt 2 must back off base*2^2",
+    );
+    assert_eq!(
+        seq_spy.last_secs.get(),
+        wave_spy.last_secs.get(),
+        "sequential (1-item) and wave (N-item) shapes must compute the SAME backoff",
+    );
+    assert_eq!(seq_spy.calls.get(), 1);
+    assert_eq!(wave_spy.calls.get(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// AC: bounded attempts — at the cap, the reaction Escalates (no wait, no
+// reset) so the caller falls through to the crash/abort path.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn transient_escalates_at_attempt_cap_without_waiting_or_resetting() {
+    disable_llm_extraction();
+    let (db_temp, mut conn) = setup_migrated_db();
+    insert_run(&conn);
+    insert_in_progress_task(&conn, "RP-TR-1");
+    let before = all_task_statuses(&conn);
+
+    let tr = transient_no_retry();
+    let items = [OutputReactionItem {
+        task_id: Some("RP-TR-1"),
+        outcome: &tr,
+        output: "502 bad gateway",
+    }];
+
+    let spy = WaitSpy::completing();
+    let wait = spy.closure();
+    // Counter already AT the cap.
+    let mut attempts: u32 = TRANSIENT_MAX_ATTEMPTS;
+    let reaction = react_to_transient_inner(
+        &mut conn,
+        &items,
+        &transient_params(db_temp.path()),
+        &mut attempts,
+        &wait as WaitFn,
+    );
+
+    assert_eq!(
+        reaction,
+        TransientReaction::Escalate,
+        "at the attempt cap the reaction must escalate, not keep waiting",
+    );
+    assert_eq!(spy.calls.get(), 0, "escalation must NOT wait");
+    assert_eq!(
+        all_task_statuses(&conn),
+        before,
+        "escalation must NOT reset the in_progress task — the crash path handles it",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// AC: Stop — injected `.stop` during the backoff → TransientReaction::Stop.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn transient_stop_signal_during_wait_returns_stop() {
+    disable_llm_extraction();
+    let (db_temp, mut conn) = setup_migrated_db();
+    insert_run(&conn);
+    insert_in_progress_task(&conn, "RP-TR-1");
+
+    let tr = transient_no_retry();
+    let items = [OutputReactionItem {
+        task_id: Some("RP-TR-1"),
+        outcome: &tr,
+        output: "504 gateway timeout",
+    }];
+
+    let spy = WaitSpy::stopping();
+    let wait = spy.closure();
+    let mut attempts: u32 = 0;
+    let reaction = react_to_transient_inner(
+        &mut conn,
+        &items,
+        &transient_params(db_temp.path()),
+        &mut attempts,
+        &wait as WaitFn,
+    );
+
+    assert_eq!(
+        spy.calls.get(),
+        1,
+        "the backoff wait must have been attempted once"
+    );
+    assert_eq!(
+        reaction,
+        TransientReaction::Stop,
+        "a backoff interrupted by `.stop` must return Stop",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// AC: Negative control — a slice with no TransientBackend returns
+// TransientReaction::None, resets the attempt counter, performs ZERO DB writes,
+// and never waits.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn no_transient_returns_none_resets_counter_and_writes_nothing() {
+    disable_llm_extraction();
+    let (db_temp, mut conn) = setup_migrated_db();
+    insert_run(&conn);
+    insert_in_progress_task(&conn, "RP-WORK-1");
+    insert_done_task(&conn, "RP-DONE-1");
+    let before = all_task_statuses(&conn);
+
+    let (completed, empty) = (IterationOutcome::Completed, IterationOutcome::Empty);
+    let items = [
+        OutputReactionItem {
+            task_id: Some("RP-DONE-1"),
+            outcome: &completed,
+            output: "<completed>RP-DONE-1</completed>",
+        },
+        OutputReactionItem {
+            task_id: Some("RP-WORK-1"),
+            outcome: &empty,
+            output: "still working, no backend error",
+        },
+    ];
+
+    let spy = WaitSpy::completing();
+    let wait = spy.closure();
+    // A non-zero counter from a prior outage must be reset by the None branch.
+    let mut attempts: u32 = 3;
+    let reaction = react_to_transient_inner(
+        &mut conn,
+        &items,
+        &transient_params(db_temp.path()),
+        &mut attempts,
+        &wait as WaitFn,
+    );
+
+    assert_eq!(
+        reaction,
+        TransientReaction::None,
+        "no TransientBackend item ⇒ TransientReaction::None",
+    );
+    assert_eq!(
+        attempts, 0,
+        "a non-transient wave breaks the streak — the attempt counter resets to 0",
+    );
+    assert_eq!(
+        spy.calls.get(),
+        0,
+        "no transient ⇒ the wait must NEVER fire"
+    );
+    assert_eq!(
+        all_task_statuses(&conn),
+        before,
+        "no transient ⇒ ZERO DB writes (in_progress task must NOT be reset)",
+    );
+}

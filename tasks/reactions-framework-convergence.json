@@ -511,7 +511,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": true,
       "notes": "Learning #2852: do not regress the bypass→shared-ladder evolution. Highest relocation risk (transactional promotion + dumps). Relocate behind the existing signature first; keep overflow.rs tests as the equivalence oracle. slot.rs gains #![deny(deprecated)] in CONTRACT-001 so its direct call must move here.",
-      "passes": false,
+      "passes": true,
       "priority": 8,
       "qualityDimensions": [
         "Behavior-preserving relocation: existing overflow tests are the oracle",

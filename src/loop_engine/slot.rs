@@ -245,6 +245,30 @@ pub fn run_slot_iteration(
                 },
             ));
         }
+        // FEAT-014: surface a Grok transient backend error (HTTP 5xx /
+        // overloaded on stderr) as `TransientBackend` on the slot result.
+        // Mirrors the GrokAuthFailure arm above; the converged
+        // `reactions::account::react_to_transient` fires once per wave in
+        // `run_wave_iteration` (the wave's convergence point with the Claude
+        // path, where `analyze_output` produces the same outcome). The
+        // aggregator never counts a `TransientBackend` slot as crashed.
+        Err(crate::error::TaskMgrError::TransientBackend { retry_after_secs }) => {
+            eprintln!(
+                "[slot {}] Transient backend error for task {} (retry_after_secs: {:?}); will back off and retry",
+                slot.slot_index, task_id, retry_after_secs
+            );
+            return Ok(slot_early_exit(
+                slot,
+                SlotEarlyExit {
+                    outcome: IterationOutcome::TransientBackend { retry_after_secs },
+                    files_modified: task_files,
+                    should_stop: false,
+                    output: String::new(),
+                    effective_model,
+                    effective_effort: effort,
+                },
+            ));
+        }
         Err(e) => return Err(e),
     };
 

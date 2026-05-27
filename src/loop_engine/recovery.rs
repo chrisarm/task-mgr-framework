@@ -614,6 +614,14 @@ pub(super) fn update_trackers(ctx: &mut IterationContext, outcome: &IterationOut
             // Rate limit — don't count as crash but don't reset either
             false
         }
+        IterationOutcome::TransientBackend { .. } => {
+            // FEAT-014: transient backend error — like RateLimit, don't count
+            // as a crash and don't reset. The converged
+            // `reactions::account::react_to_transient` owns the bounded
+            // backoff-retry; an escalation rewrites the outcome to Crash
+            // upstream (so this arm never sees the escalation case).
+            false
+        }
         IterationOutcome::Reorder(_) => {
             // Reorder — skip, not a real iteration result
             false

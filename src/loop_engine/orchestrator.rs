@@ -58,6 +58,7 @@ use crate::loop_engine::prd_reconcile::{
     self as prd_reconcile, hash_file, read_prd_metadata, reconcile_passes_with_db,
 };
 use crate::loop_engine::progress;
+use crate::loop_engine::reactions;
 use crate::loop_engine::signals::{self, SignalFlag, handle_human_review};
 use crate::loop_engine::status_queries::read_prd_hints;
 use crate::loop_engine::wave_scheduler::classify_drained_queue;
@@ -1266,9 +1267,64 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
             );
         }
 
-        // Track iteration count (skip reorders and rate limits)
+        // FEAT-014: sequential transient-backend reaction (account-global).
+        // The single sequential call site of `react_to_transient` — the
+        // convergence point for BOTH origins of a `TransientBackend` outcome:
+        // the Claude path (`analyze_output` inside `run_iteration`) and the Grok
+        // path (the `TaskMgrError::TransientBackend` early-return mapped in
+        // `iteration.rs`, which never reaches a `run_iteration`-internal
+        // reaction). Called unconditionally so a non-transient iteration resets
+        // the attempt counter via the reaction's `None` branch. Runs AFTER the
+        // pipeline + external-git reconcile (so a task completed out-of-band is
+        // not backed off) and BEFORE the budget/retry-tracking below.
+        //
+        // - `WaitedAndRetry`: the outcome stays `TransientBackend`, so the
+        //   budget match gives the iteration back and the retry-tracking guard
+        //   skips it — identical to `RateLimit` (B2/B3).
+        // - `Escalate`: the outcome is rewritten to `Crash(RuntimeError)` so it
+        //   falls through to the crash/abort path (budget consumed +
+        //   `handle_task_failure` runs).
+        // - `Stop`: `.stop` during the backoff → stop the loop (terminal exit).
+        let transient_reaction = {
+            let items = [reactions::account::OutputReactionItem {
+                task_id: result.task_id.as_deref(),
+                outcome: &result.outcome,
+                output: &result.output,
+            }];
+            let tparams = reactions::account::TransientReactionParams {
+                tasks_dir: paths.tasks_dir.as_path(),
+                prefix: task_prefix.as_deref().unwrap_or(""),
+                run_id: &run_id,
+                max_attempts: reactions::account::TRANSIENT_MAX_ATTEMPTS,
+                base_wait_secs: reactions::account::TRANSIENT_BACKOFF_BASE_SECS,
+                max_wait_secs: reactions::account::TRANSIENT_BACKOFF_MAX_SECS,
+            };
+            reactions::account::react_to_transient(
+                &mut conn,
+                &items,
+                &tparams,
+                &mut ctx.transient_backend_attempts,
+            )
+        };
+        match transient_reaction {
+            reactions::account::TransientReaction::None
+            | reactions::account::TransientReaction::WaitedAndRetry => {}
+            reactions::account::TransientReaction::Stop => {
+                result.should_stop = true;
+            }
+            reactions::account::TransientReaction::Escalate => {
+                result.outcome = IterationOutcome::Crash(config::CrashType::RuntimeError);
+            }
+        }
+
+        // Track iteration count (skip reorders, rate limits, and the
+        // transient-backend WaitedAndRetry — all give back the iteration so a
+        // persistently unavailable backend / rate-limited account doesn't burn
+        // its budget on waits).
         match result.outcome {
-            IterationOutcome::Reorder(_) | IterationOutcome::RateLimit => {
+            IterationOutcome::Reorder(_)
+            | IterationOutcome::RateLimit
+            | IterationOutcome::TransientBackend { .. } => {
                 // Don't count against iteration budget
                 iteration -= 1;
             }
@@ -1285,6 +1341,9 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
         // FEAT-007: also exclude Crash(GrokAuthFailure) — an xAI auth lapse is an operator
         // problem, not a task failure; incrementing here would push a healthy task toward
         // auto_block_task with a misleading reason.
+        // FEAT-014: exclude TransientBackend — a 5xx/overloaded WaitedAndRetry must not burn
+        // crash budget. (On escalation the reaction already rewrote the outcome to
+        // Crash(RuntimeError) above, which IS tracked here — the crash/abort path.)
         if let Some(ref task_id) = result.task_id
             && !matches!(
                 result.outcome,
@@ -1292,6 +1351,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                     | IterationOutcome::Empty
                     | IterationOutcome::Reorder(_)
                     | IterationOutcome::RateLimit
+                    | IterationOutcome::TransientBackend { .. }
                     | IterationOutcome::Crash(config::CrashType::GrokAuthFailure)
             )
             && let Err(e) = handle_task_failure(

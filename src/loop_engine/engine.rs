@@ -315,6 +315,17 @@ pub struct IterationContext {
     /// records that the DB column was NULL at snapshot time, distinct from
     /// the key being absent.
     pub overflow_original_task_model: std::collections::HashMap<String, Option<String>>,
+    /// Count of consecutive transient-backend backoff waits without progress
+    /// (FEAT-014). Account-global (a backend 5xx / overloaded response is a
+    /// shared-account condition, not per-task), so a single scalar — not a
+    /// per-task map. Read+written ONLY by the converged
+    /// `reactions::account::react_to_transient` (passed as `&mut u32`): reset
+    /// to 0 when a wave/iteration carries no `TransientBackend` outcome,
+    /// incremented on each `WaitedAndRetry`, and compared against
+    /// `TRANSIENT_MAX_ATTEMPTS` to decide when to escalate to the crash/abort
+    /// path. Loop-thread-local (the reaction runs on the main thread in both
+    /// paths), preserving the no-Mutex contract.
+    pub transient_backend_attempts: u32,
 }
 
 impl IterationContext {
@@ -338,6 +349,7 @@ impl IterationContext {
             consecutive_merge_fail_waves: 0,
             runner_overrides: std::collections::HashMap::new(),
             overflow_original_task_model: std::collections::HashMap::new(),
+            transient_backend_attempts: 0,
         }
     }
 }

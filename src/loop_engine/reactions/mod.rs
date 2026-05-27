@@ -34,6 +34,7 @@
 //! | [`pre_spawn::resolve_task_execution`] | `pre_spawn` | `recovery::check_override_invalidation`, `recovery::check_crash_escalation` |
 //! | [`account::account_usage_gate`] | `account` | `usage::check_and_wait` (pre-dispatch, once per wave) |
 //! | [`account::react_to_outputs`] | `account` | post-output rate-limit wait (`usage::{parse_reset_from_output, wait_for_usage_reset}`) |
+//! | [`account::react_to_transient`] | `account` | post-output transient-backend (HTTP 5xx / overloaded) bounded backoff-retry (FEAT-014) |
 //! | [`post_output::handle_overflow`] | `post_output` | `overflow::handle_prompt_too_long` |
 //! | [`post_completion::react_to_completions`] | `post_completion` | `orchestrator::trigger_human_reviews` |
 //!

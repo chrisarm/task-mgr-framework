@@ -481,7 +481,8 @@ pub enum CrashType {
 /// Outcome of a single loop iteration, determined by analyzing Claude's output.
 ///
 /// Priority order (highest to lowest):
-/// Completed > Blocked > Reorder > RateLimit > Crash > NoEligibleTasks > Empty
+/// Completed > Blocked > Reorder > RateLimit > TransientBackend > Crash >
+/// NoEligibleTasks > Empty
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IterationOutcome {
     /// All tasks completed successfully
@@ -492,6 +493,17 @@ pub enum IterationOutcome {
     Reorder(String),
     /// Rate limit detected (don't count against iteration budget)
     RateLimit,
+    /// A transient backend failure (HTTP 502/503/504, "Bad Gateway",
+    /// "Service Unavailable", Anthropic `overloaded_error` / HTTP 529) was
+    /// detected (FEAT-014). Like `RateLimit`, this does NOT count against the
+    /// iteration budget and does NOT burn crash budget — the converged
+    /// `reactions::account::react_to_transient` performs a bounded backoff-retry
+    /// instead. `retry_after_secs` carries the backend's `Retry-After` when
+    /// present; otherwise the reaction uses an exponential backoff.
+    TransientBackend {
+        /// Parsed `Retry-After` seconds, when the backend supplied one.
+        retry_after_secs: Option<u64>,
+    },
     /// Claude subprocess crashed
     Crash(CrashType),
     /// No eligible tasks to work on (queue empty or all blocked/done)

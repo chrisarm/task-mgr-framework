@@ -529,6 +529,32 @@ pub fn run_iteration(
                 shown_learning_ids: Vec::new(),
             });
         }
+        // FEAT-014: surface a Grok transient backend error (HTTP 5xx /
+        // overloaded on stderr) as `TransientBackend` instead of a crash.
+        // Mirrors the GrokAuthFailure arm above. The bounded backoff-retry
+        // reaction (`reactions::account::react_to_transient`) runs at the
+        // `run_loop` call site after this returns — the common convergence
+        // point with the Claude path (where `analyze_output` produces the same
+        // outcome). `retry_after_secs` rides on the outcome so the reaction
+        // honors the backend's `Retry-After` without re-parsing output.
+        Err(crate::error::TaskMgrError::TransientBackend { retry_after_secs }) => {
+            eprintln!(
+                "Transient backend error for task {} (retry_after_secs: {:?}); will back off and retry",
+                task_id, retry_after_secs
+            );
+            return Ok(IterationResult {
+                outcome: IterationOutcome::TransientBackend { retry_after_secs },
+                task_id: Some(task_id),
+                files_modified: task_files,
+                should_stop: false,
+                output: String::new(),
+                effective_model,
+                effective_effort: effort,
+                key_decisions_count: 0,
+                conversation: None,
+                shown_learning_ids: Vec::new(),
+            });
+        }
         Err(e) => return Err(e),
     };
 
