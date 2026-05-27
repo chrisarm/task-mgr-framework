@@ -725,7 +725,7 @@
       "id": "MILESTONE-1",
       "model": "claude-opus-4-7",
       "modifiesBehavior": false,
-      "passes": false,
+      "passes": true,
       "priority": 20,
       "qualityDimensions": [
         "Trunk green is the invariant; fix pre-existing failures too"
@@ -766,7 +766,7 @@
       ],
       "modifiesBehavior": false,
       "notes": "This is the regression that would have caught the production incident. Keep it hermetic via the injected wait seam.",
-      "passes": false,
+      "passes": true,
       "priority": 30,
       "qualityDimensions": [
         "End-to-end proof the bug is fixed; hermetic (no real sleep/API)"
