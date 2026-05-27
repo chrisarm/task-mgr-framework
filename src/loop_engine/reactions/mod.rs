@@ -45,14 +45,66 @@
 //! owning FEATs (FEAT-002/003/005/006/010/013). They carry `#[allow(dead_code)]`
 //! only until those FEATs call them from both paths.
 
-// `account`, `pre_spawn`, and `post_output` are `pub` (not `pub(crate)`) so
-// their converged coordinators are reachable from the integration parity
-// harness (`tests/reaction_parity.rs`), mirroring `pub mod iteration_pipeline`:
-// `account` for the post-output rate-limit reaction + usage gate (TEST-INIT-001/002),
-// `pre_spawn` for `resolve_task_execution` (TEST-INIT-002), `post_output` for
-// `handle_overflow` (TEST-INIT-003). The remaining coordinator submodule stays
-// crate-private until its owning FEAT needs integration-test reachability.
+// `account`, `pre_spawn`, `post_output`, and `post_completion` are `pub` (not
+// `pub(crate)`) so their converged coordinators are reachable from the
+// integration parity harness (`tests/reaction_parity.rs`), mirroring
+// `pub mod iteration_pipeline`: `account` for the post-output rate-limit
+// reaction + usage gate (TEST-INIT-001/002), `pre_spawn` for
+// `resolve_task_execution` (TEST-INIT-002), `post_output` for `handle_overflow`
+// (TEST-INIT-003), `post_completion` for `react_to_completions` (TEST-INIT-004).
 pub mod account;
-pub(crate) mod post_completion;
+pub mod post_completion;
 pub mod post_output;
 pub mod pre_spawn;
+
+// ---------------------------------------------------------------------------
+// Shared iteration-budget accounting (#13) — converged by FEAT-013.
+//
+// The loop bound is `orchestrator.rs:918` `while iteration < max_iterations`
+// with a top-of-pass increment (`:920`). A `RateLimit` / `Reorder` /
+// `TransientBackend` (WaitedAndRetry) outcome must give that increment back so
+// a persistently rate-limited / unavailable run does not burn its
+// `max_iterations` budget on waits — bounded termination then relies on the
+// `.stop`/signal check, NOT the iteration ceiling. The sequential path does
+// `iteration -= 1` (orchestrator.rs RateLimit arm) and the wave path does
+// `iteration = iteration.saturating_sub(1)` (the `iteration_consumed == false`
+// branch); FEAT-013 routes BOTH through this one helper so the two paths
+// cannot drift on the budget rule. The body below is a TDD scaffold
+// (`unimplemented!`): TEST-INIT-004 pins the contract via the ignored tests in
+// `tests/reaction_parity.rs`; FEAT-013 fills it in and un-ignores them.
+// ---------------------------------------------------------------------------
+
+/// Inputs to [`account_iteration_budget`]. Destructured exhaustively (no `..`).
+pub struct IterationBudgetParams<'a> {
+    /// The loop-bound iteration counter (`orchestrator.rs:918`
+    /// `while iteration < max_iterations`, incremented at the top of each pass).
+    pub iteration: &'a mut u32,
+    /// The `iterations_completed` stat reported at loop end.
+    pub iterations_completed: &'a mut u32,
+    /// `false` for a give-back outcome — `RateLimit` / `Reorder` /
+    /// `TransientBackend` (WaitedAndRetry) — `true` for every consuming outcome.
+    pub consumes_budget: bool,
+}
+
+/// Apply the iteration-budget rule for one completed iteration/wave, the single
+/// home for the sequential `iteration -= 1` and the wave give-back.
+///
+/// Contract (pinned by TEST-INIT-004; implemented by FEAT-013):
+/// - `consumes_budget == false` ⇒ give the loop-bound iteration back
+///   (`*iteration = iteration.saturating_sub(1)`); leave `iterations_completed`
+///   unchanged.
+/// - `consumes_budget == true` ⇒ advance `iterations_completed`; leave the
+///   loop-bound `iteration` (already incremented at the loop top) unchanged.
+#[allow(dead_code)] // wired into both paths by FEAT-013
+pub fn account_iteration_budget(params: IterationBudgetParams<'_>) {
+    let _ = params;
+    unimplemented!(
+        "FEAT-013: destructure IterationBudgetParams exhaustively; when \
+         consumes_budget is false give the loop-bound iteration back \
+         (*iteration = iteration.saturating_sub(1)) and leave \
+         iterations_completed unchanged; when true increment \
+         iterations_completed and leave iteration unchanged. One home for the \
+         sequential `iteration -= 1` and the wave give-back so the two paths \
+         cannot drift on the budget rule."
+    )
+}

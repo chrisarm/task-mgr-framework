@@ -2023,3 +2023,543 @@ fn no_transient_returns_none_resets_counter_and_writes_nothing() {
         "no transient ⇒ ZERO DB writes (in_progress task must NOT be reset)",
     );
 }
+
+// ===========================================================================
+// TEST-INIT-004 — human-review (#10) + budget accounting (#13) parity.
+//
+// Pins TWO contracts:
+//
+//   #10  `reactions::post_completion::react_to_completions_inner` fires the
+//        human-review seam EXACTLY once per `requires_human` completed task,
+//        for the SAME completed task on both the sequential (1 completed id)
+//        and the wave (N completed ids) shapes — INCLUDING on a partial
+//        WaitedAndRetry wave (a slot completed a requires_human task while a
+//        sibling slot is rate-limited; the intentional behavior addition). It
+//        is input-driven: only ids IN the provided `completed_ids` set are
+//        reviewed — it does NOT rediscover completions by timestamp, which is
+//        what preserves the intra-wave ordering (post-merge reconcile feeds the
+//        id set before the external-git shadow). FEAT-010 fills the body and
+//        removes the `#[ignore]` attributes.
+//
+//   #13  `reactions::account_iteration_budget` is the single home for the
+//        iteration-budget rule: a `RateLimit` / `WaitedAndRetry` (give-back)
+//        outcome does NOT consume the loop-bound `iteration` against
+//        `max_iterations` on EITHER path, and a consuming outcome advances the
+//        `iterations_completed` stat. A persistently rate-limited run stays
+//        bounded — it terminates on `.stop`/signal, never on the iteration
+//        ceiling (give-back pins the loop-bound counter). FEAT-013 fills the
+//        body.
+//
+// Hermetic, mirroring TEST-INIT-001/002/003: the human-review is injected as a
+// recording [`ReviewSpy`] closure (`ReviewFn`) so no stdin is read and no
+// Claude subprocess spawns; the budget cases are pure counter arithmetic. Two
+// LIVE known-bad discriminators (a DB-scan reviewer that ignores
+// `completed_ids`; a budget helper that skips only the stat) prove the ignored
+// assertions actually discriminate, and a LIVE harness-validity marker proves
+// the fixtures + new pub contract types wire up.
+//
+// Per-AC mapping:
+//   AC1 → react_to_completions_human_review_fires_on_both_shapes
+//   AC2 → react_to_completions_human_review_fires_on_partial_waited_and_retry_wave
+//   AC3 → react_to_completions_is_input_driven_not_timestamp_rediscovery
+//         + known_bad_db_scan_review_fires_for_out_of_set_task (LIVE)
+//   AC4 → budget_rate_limit_wave_does_not_consume_iteration_on_both_shapes
+//   AC5 → budget_persistent_rate_limit_terminates_on_stop_not_max_iterations
+//   AC6 → known_bad_budget_skipping_only_stat_fails_the_no_consumption_assertion (LIVE)
+// ===========================================================================
+
+use std::cell::RefCell;
+
+use task_mgr::loop_engine::reactions::post_completion::{
+    HumanReviewTask, PostCompletionParams, ReviewFn, react_to_completions_inner,
+};
+use task_mgr::loop_engine::reactions::{IterationBudgetParams, account_iteration_budget};
+
+/// Insert a `requires_human = 1`, `status = 'done'` task with a recent
+/// `completed_at` — the shape `query_human_review_tasks` selects today, and the
+/// row `react_to_completions` must review iff its id is in the completed set.
+fn insert_requires_human_done(
+    conn: &Connection,
+    task_id: &str,
+    notes: Option<&str>,
+    timeout: Option<u32>,
+) {
+    conn.execute(
+        "INSERT INTO tasks \
+         (id, title, status, priority, requires_human, notes, human_review_timeout, completed_at) \
+         VALUES (?1, ?2, 'done', 50, 1, ?3, ?4, '2099-01-01T12:00:00')",
+        rusqlite::params![task_id, format!("Review {task_id}"), notes, timeout],
+    )
+    .expect("insert requires_human done task row");
+}
+
+/// Spy implementing the injected human-review seam. `RefCell`-based (the seam is
+/// `Fn`, not `FnMut`) so a `&self` closure can record each reviewed task id.
+/// `had_feedback` is what the review reports — kept `false` in every test so the
+/// PRD-mutation path is never exercised (the cases stay hermetic).
+struct ReviewSpy {
+    reviewed: RefCell<Vec<String>>,
+    had_feedback: bool,
+}
+
+impl ReviewSpy {
+    fn no_feedback() -> Self {
+        Self {
+            reviewed: RefCell::new(Vec::new()),
+            had_feedback: false,
+        }
+    }
+
+    /// A `Fn(HumanReviewTask) -> bool` closure that records each invocation.
+    fn closure(&self) -> impl Fn(HumanReviewTask<'_>) -> bool + '_ {
+        move |task| {
+            self.reviewed.borrow_mut().push(task.task_id.to_string());
+            self.had_feedback
+        }
+    }
+
+    fn reviewed_ids(&self) -> Vec<String> {
+        self.reviewed.borrow().clone()
+    }
+}
+
+/// Standard post-completion params for a hermetic inner call. `working_root` and
+/// `prd_file` are throwaway paths (the injected review never commits or mutates
+/// the PRD because the spy reports no feedback).
+fn post_completion_params<'a>(
+    working_root: &'a Path,
+    prd_file: &'a Path,
+) -> PostCompletionParams<'a> {
+    PostCompletionParams {
+        run_id: RUN_ID,
+        iteration: 1,
+        working_root,
+        prd_file,
+        task_prefix: Some(PREFIX),
+        default_model: None,
+        permission_mode: &PERMISSION_MODE,
+        external_repo_path: None,
+        external_git_scan_depth: 50,
+        wrapper_commit: true,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AC1: human-review fires for the SAME completed requires_human task on both
+// the sequential (1 completed id) and wave (N completed ids) shapes; an
+// ordinary completion in the wave set is NOT reviewed.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "unblocked by FEAT-010: react_to_completions_inner body"]
+fn react_to_completions_human_review_fires_on_both_shapes() {
+    disable_llm_extraction();
+
+    // Sequential shape: a single completed id, which is requires_human.
+    let (seq_db, mut seq_conn) = setup_migrated_db();
+    insert_run(&seq_conn);
+    insert_requires_human_done(&seq_conn, "RP-HR-1", Some("confirm rate limit"), Some(900));
+    let seq_ids = vec!["RP-HR-1".to_string()];
+    let seq_spy = ReviewSpy::no_feedback();
+    let seq_review = seq_spy.closure();
+    let seq_tmp = TempDir::new().expect("tempdir");
+    let seq_prd = seq_tmp.path().join("prd.json");
+    react_to_completions_inner(
+        &mut seq_conn,
+        &seq_ids,
+        &post_completion_params(seq_db.path(), &seq_prd),
+        &seq_review as ReviewFn,
+    );
+
+    // Wave shape: N completed ids; only one is requires_human.
+    let (wave_db, mut wave_conn) = setup_migrated_db();
+    insert_run(&wave_conn);
+    insert_requires_human_done(&wave_conn, "RP-HR-1", Some("confirm rate limit"), Some(900));
+    insert_done_task(&wave_conn, "RP-DONE-2"); // ordinary completion, not requires_human
+    let wave_ids = vec!["RP-HR-1".to_string(), "RP-DONE-2".to_string()];
+    let wave_spy = ReviewSpy::no_feedback();
+    let wave_review = wave_spy.closure();
+    let wave_tmp = TempDir::new().expect("tempdir");
+    let wave_prd = wave_tmp.path().join("prd.json");
+    react_to_completions_inner(
+        &mut wave_conn,
+        &wave_ids,
+        &post_completion_params(wave_db.path(), &wave_prd),
+        &wave_review as ReviewFn,
+    );
+
+    assert_eq!(
+        seq_spy.reviewed_ids(),
+        vec!["RP-HR-1".to_string()],
+        "sequential: the single completed requires_human task is reviewed exactly once",
+    );
+    assert_eq!(
+        wave_spy.reviewed_ids(),
+        vec!["RP-HR-1".to_string()],
+        "wave: the same requires_human task is reviewed; the ordinary completion is NOT",
+    );
+    assert_eq!(
+        seq_spy.reviewed_ids(),
+        wave_spy.reviewed_ids(),
+        "both shapes agree on which completed tasks trigger human review",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// AC2: human-review fires on a partial WaitedAndRetry wave — a slot completed a
+// requires_human task (in the completed set) while a sibling slot is
+// rate-limited (in_progress, absent from the set). Intentional behavior
+// addition: the wave path gains the human-review trigger.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "unblocked by FEAT-010: react_to_completions_inner body"]
+fn react_to_completions_human_review_fires_on_partial_waited_and_retry_wave() {
+    disable_llm_extraction();
+    let (db, mut conn) = setup_migrated_db();
+    insert_run(&conn);
+    // Slot 0 completed a requires_human task; slot 1 rate-limited (the wave
+    // reported WaitedAndRetry for it, leaving it in_progress).
+    insert_requires_human_done(&conn, "RP-HR-DONE", None, None);
+    insert_in_progress_task(&conn, "RP-RATE-1");
+
+    // Only the completed slot's id is in the set; the rate-limited slot is not.
+    let completed_ids = vec!["RP-HR-DONE".to_string()];
+    let spy = ReviewSpy::no_feedback();
+    let review = spy.closure();
+    let tmp = TempDir::new().expect("tempdir");
+    let prd = tmp.path().join("prd.json");
+    react_to_completions_inner(
+        &mut conn,
+        &completed_ids,
+        &post_completion_params(db.path(), &prd),
+        &review as ReviewFn,
+    );
+
+    assert_eq!(
+        spy.reviewed_ids(),
+        vec!["RP-HR-DONE".to_string()],
+        "human-review fires for the completed requires_human task even on a partial \
+         WaitedAndRetry wave (intentional behavior addition)",
+    );
+    assert_eq!(
+        task_status(&conn, "RP-RATE-1").as_deref(),
+        Some("in_progress"),
+        "the rate-limited slot is untouched by the completion reaction",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// AC3: react_to_completions consumes the PROVIDED completed-id set — only ids
+// in the set are reviewed, even when the DB holds another requires_human/done
+// task with an equally-recent completed_at. This is what preserves the
+// intra-wave ordering (the caller feeds post-merge-reconcile ids before the
+// external-git shadow; the reaction never rediscovers by timestamp).
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "unblocked by FEAT-010: react_to_completions_inner body"]
+fn react_to_completions_is_input_driven_not_timestamp_rediscovery() {
+    disable_llm_extraction();
+    let (db, mut conn) = setup_migrated_db();
+    insert_run(&conn);
+    // TWO requires_human tasks, both done with a recent completed_at — a
+    // timestamp-rediscovery impl would review BOTH. Only one is in the set.
+    insert_requires_human_done(&conn, "RP-HR-IN", None, None);
+    insert_requires_human_done(&conn, "RP-HR-OUT", None, None);
+
+    let completed_ids = vec!["RP-HR-IN".to_string()];
+    let spy = ReviewSpy::no_feedback();
+    let review = spy.closure();
+    let tmp = TempDir::new().expect("tempdir");
+    let prd = tmp.path().join("prd.json");
+    react_to_completions_inner(
+        &mut conn,
+        &completed_ids,
+        &post_completion_params(db.path(), &prd),
+        &review as ReviewFn,
+    );
+
+    assert_eq!(
+        spy.reviewed_ids(),
+        vec!["RP-HR-IN".to_string()],
+        "only the requires_human task whose id is IN the provided completed set is \
+         reviewed — react_to_completions consumes the input set, it does NOT \
+         rediscover completions by timestamp",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// AC3 known-bad discriminator (RUNS LIVE). A naive selector that scans the DB
+// for every requires_human/done row — ignoring `completed_ids` — reviews the
+// out-of-set task too. The same spy the input-driven test asserts
+// `== ["RP-HR-IN"]` on would see `["RP-HR-IN", "RP-HR-OUT"]` here, so the
+// discriminator is real: a regression to timestamp/DB rediscovery fails AC3.
+// ---------------------------------------------------------------------------
+
+/// A deliberately-wrong selector: reviews EVERY requires_human/done row,
+/// ignoring the provided `completed_ids` set (a rediscovery regression).
+fn naive_review_by_db_scan(conn: &Connection, _completed_ids: &[String], review: ReviewFn<'_>) {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, title, notes, human_review_timeout FROM tasks \
+             WHERE requires_human = 1 AND status = 'done' ORDER BY id",
+        )
+        .expect("prepare");
+    let rows: Vec<(String, String, Option<String>, Option<u32>)> = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<i64>>(3)?
+                    .and_then(|v| u32::try_from(v).ok()),
+            ))
+        })
+        .expect("query")
+        .map(|r| r.expect("row"))
+        .collect();
+    for (id, title, notes, timeout) in &rows {
+        review(HumanReviewTask {
+            task_id: id,
+            title,
+            notes: notes.as_deref(),
+            timeout_secs: *timeout,
+        });
+    }
+}
+
+#[test]
+fn known_bad_db_scan_review_fires_for_out_of_set_task() {
+    disable_llm_extraction();
+    let (_db, conn) = setup_migrated_db();
+    insert_run(&conn);
+    insert_requires_human_done(&conn, "RP-HR-IN", None, None);
+    insert_requires_human_done(&conn, "RP-HR-OUT", None, None);
+
+    let completed_ids = vec!["RP-HR-IN".to_string()];
+    let spy = ReviewSpy::no_feedback();
+    let review = spy.closure();
+    naive_review_by_db_scan(&conn, &completed_ids, &review as ReviewFn);
+
+    assert_eq!(
+        spy.reviewed_ids(),
+        vec!["RP-HR-IN".to_string(), "RP-HR-OUT".to_string()],
+        "naive DB-scan reviews the out-of-set requires_human task too",
+    );
+    assert_ne!(
+        spy.reviewed_ids(),
+        vec!["RP-HR-IN".to_string()],
+        "...which violates the input-driven contract the real coordinator satisfies",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// AC4: a RateLimit/WaitedAndRetry (give-back) wave does NOT consume the
+// loop-bound iteration against max_iterations on EITHER path; both paths give
+// back identically through the one helper. A consuming outcome advances the
+// `iterations_completed` stat and leaves the loop-bound counter alone.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "unblocked by FEAT-013: account_iteration_budget body"]
+fn budget_rate_limit_wave_does_not_consume_iteration_on_both_shapes() {
+    // Sequential shape: the orchestrator RateLimit arm gives the loop-bound
+    // iteration back (`iteration -= 1`) and does NOT bump iterations_completed.
+    let mut seq_iter = 5u32;
+    let mut seq_completed = 2u32;
+    account_iteration_budget(IterationBudgetParams {
+        iteration: &mut seq_iter,
+        iterations_completed: &mut seq_completed,
+        consumes_budget: false,
+    });
+    assert_eq!(
+        seq_iter, 4,
+        "sequential give-back returns the loop-bound iteration"
+    );
+    assert_eq!(
+        seq_completed, 2,
+        "a give-back does NOT advance iterations_completed"
+    );
+
+    // Wave shape: the `iteration_consumed == false` branch must give back the
+    // SAME loop-bound iteration through the SAME helper.
+    let mut wave_iter = 5u32;
+    let mut wave_completed = 2u32;
+    account_iteration_budget(IterationBudgetParams {
+        iteration: &mut wave_iter,
+        iterations_completed: &mut wave_completed,
+        consumes_budget: false,
+    });
+    assert_eq!(
+        wave_iter, seq_iter,
+        "both shapes give back the loop-bound iteration identically"
+    );
+    assert_eq!(
+        wave_completed, seq_completed,
+        "both shapes leave the stat identical"
+    );
+
+    // A consuming outcome advances the stat and leaves the loop-bound counter
+    // (already incremented at the loop top) as-is.
+    let mut ok_iter = 5u32;
+    let mut ok_completed = 2u32;
+    account_iteration_budget(IterationBudgetParams {
+        iteration: &mut ok_iter,
+        iterations_completed: &mut ok_completed,
+        consumes_budget: true,
+    });
+    assert_eq!(
+        ok_iter, 5,
+        "a consuming outcome leaves the loop-bound iteration unchanged"
+    );
+    assert_eq!(
+        ok_completed, 3,
+        "a consuming outcome advances iterations_completed"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// AC5: a persistently rate-limited sequence stays bounded — it terminates on
+// `.stop`/signal, NOT on max_iterations. Every pass is a give-back, so the
+// loop-bound counter never advances toward the ceiling; the ONLY thing that
+// ends the loop is the stop check. (Models the orchestrator loop:
+// `while iteration < max { iteration += 1; ...; budget(give_back); if stop { break } }`.)
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "unblocked by FEAT-013: account_iteration_budget body"]
+fn budget_persistent_rate_limit_terminates_on_stop_not_max_iterations() {
+    let max_iterations = 3u32;
+    let stop_after = 7u32; // .stop arrives on the 7th pass — past max_iterations
+    let safety_cap = 1000u32; // would-be-infinite guard; the test fails if it is hit
+
+    let mut iteration = 0u32;
+    let mut iterations_completed = 0u32;
+    let mut passes = 0u32;
+    let mut stopped = false;
+
+    while iteration < max_iterations && passes < safety_cap {
+        iteration += 1; // 1-based top-of-pass increment
+        passes += 1;
+        account_iteration_budget(IterationBudgetParams {
+            iteration: &mut iteration,
+            iterations_completed: &mut iterations_completed,
+            consumes_budget: false, // persistently rate-limited
+        });
+        if passes >= stop_after {
+            stopped = true;
+            break; // .stop / signal observed during the wait
+        }
+    }
+
+    assert!(
+        stopped,
+        "a persistently rate-limited run terminates via .stop/signal"
+    );
+    assert!(
+        passes < safety_cap,
+        "termination is bounded — the safety cap was never hit"
+    );
+    assert_eq!(
+        passes, stop_after,
+        "the loop ran until the stop signal; max_iterations never bounded it",
+    );
+    assert_eq!(
+        iteration, 0,
+        "give-back pinned the loop-bound counter at 0 — the iteration ceiling never fired",
+    );
+    assert_eq!(
+        iterations_completed, 0,
+        "no give-back pass advanced the completed stat",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// AC6 known-bad discriminator (RUNS LIVE). A budget helper that correctly skips
+// the `iterations_completed` stat on a give-back but FORGETS to return the
+// loop-bound iteration leaves it consumed (the B2 bug FEAT-013 generalizes).
+// The no-consumption test asserts `iteration == 4`; this stub leaves it at 5,
+// so it WOULD fail that assertion — the discriminator is real.
+// ---------------------------------------------------------------------------
+
+/// A deliberately-wrong helper: skips the stat bump on a give-back (correct) but
+/// never gives the loop-bound iteration back (BUG).
+fn naive_budget_skips_only_stat(params: IterationBudgetParams<'_>) {
+    let IterationBudgetParams {
+        iteration,
+        iterations_completed,
+        consumes_budget,
+    } = params;
+    if consumes_budget {
+        *iterations_completed += 1;
+    }
+    // BUG: the give-back path never does `*iteration = iteration.saturating_sub(1)`.
+    let _ = iteration;
+}
+
+#[test]
+fn known_bad_budget_skipping_only_stat_fails_the_no_consumption_assertion() {
+    let mut iteration = 5u32;
+    let mut iterations_completed = 2u32;
+    naive_budget_skips_only_stat(IterationBudgetParams {
+        iteration: &mut iteration,
+        iterations_completed: &mut iterations_completed,
+        consumes_budget: false,
+    });
+
+    assert_eq!(
+        iteration, 5,
+        "stat-only stub consumes the loop-bound iteration (no give-back)",
+    );
+    assert_ne!(
+        iteration, 4,
+        "...which violates the no-consumption contract the real helper satisfies",
+    );
+    assert_eq!(
+        iterations_completed, 2,
+        "the stat is correctly left unchanged on a give-back",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Harness-validity compile-marker (RUNS LIVE). Proves the TEST-INIT-004
+// fixtures + new pub contract types wire up: a migrated DB stands up, a
+// requires_human/done row inserts, both param structs are constructible (the
+// budget one with live `&mut` borrows), and the review seam closure builds.
+// Does NOT call the unimplemented coordinator/helper.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn completion_and_budget_harness_compiles_and_setup_works() {
+    disable_llm_extraction();
+    let (db, conn) = setup_migrated_db();
+    insert_run(&conn);
+    insert_requires_human_done(&conn, "RP-HR-MARK", Some("note"), Some(600));
+    insert_done_task(&conn, "RP-DONE-MARK");
+
+    // Post-completion params + review seam are constructible from the harness.
+    let tmp = TempDir::new().expect("tempdir");
+    let prd = tmp.path().join("prd.json");
+    let _p = post_completion_params(db.path(), &prd);
+    let spy = ReviewSpy::no_feedback();
+    let _review = spy.closure();
+    let _task = HumanReviewTask {
+        task_id: "RP-HR-MARK",
+        title: "Review",
+        notes: Some("note"),
+        timeout_secs: Some(600),
+    };
+
+    // Budget params are constructible with live `&mut` borrows.
+    let mut iteration = 1u32;
+    let mut iterations_completed = 0u32;
+    let _bp = IterationBudgetParams {
+        iteration: &mut iteration,
+        iterations_completed: &mut iterations_completed,
+        consumes_budget: true,
+    };
+
+    assert_eq!(task_status(&conn, "RP-HR-MARK").as_deref(), Some("done"));
+    assert_eq!(task_status(&conn, "RP-DONE-MARK").as_deref(), Some("done"));
+}
