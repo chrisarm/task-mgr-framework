@@ -8,6 +8,11 @@ use std::fs;
 use std::path::Path;
 
 use crate::loop_engine::model;
+use crate::loop_engine::prompt::assembler::{PromptContext, Rendered, SectionKind, SectionSpec};
+
+/// Stable section identifier for the escalation-policy section. Matches the
+/// `section_sizes` key the sequential builder already uses for this section.
+pub const ESCALATION_SECTION: &str = "escalation";
 
 /// Load the escalation policy template from the scripts directory.
 ///
@@ -35,10 +40,7 @@ pub(crate) fn load_escalation_template(base_prompt_path: &Path) -> Option<String
 }
 
 /// Build an escalation policy section string.
-pub(crate) fn build_escalation_section(
-    base_prompt_path: &Path,
-    resolved_model: Option<&str>,
-) -> String {
+pub fn build_escalation_section(base_prompt_path: &Path, resolved_model: Option<&str>) -> String {
     if model::model_tier(resolved_model) == model::ModelTier::Opus {
         return String::new();
     }
@@ -46,6 +48,33 @@ pub(crate) fn build_escalation_section(
     match load_escalation_template(base_prompt_path) {
         Some(contents) => format!("## Model Escalation Policy\n\n{}\n\n---\n\n", contents),
         None => String::new(),
+    }
+}
+
+/// Render the escalation-policy section for the data-driven assembler
+/// (CONTRACT-001). Sequential-only — the slot roster omits it (wave slots drop
+/// escalation by design). This is the **single render site**; it wraps
+/// [`build_escalation_section`], reading the resolved model from
+/// [`PromptContext::resolved_model`] (the policy is omitted for the Opus tier).
+/// A CRITICAL section: it is gated with the other criticals against the total
+/// budget, never trimmed. The [`SectionKind`] argument is therefore ignored.
+pub fn render_escalation_section(ctx: &PromptContext<'_>, _kind: SectionKind) -> Rendered {
+    Rendered {
+        text: build_escalation_section(ctx.base_prompt_path, ctx.resolved_model),
+        ..Default::default()
+    }
+}
+
+/// Build the escalation [`SectionSpec`] (critical).
+///
+/// Present in the sequential roster only. Critical because the escalation
+/// policy is part of the non-trimmable critical envelope in the sequential
+/// budget gate (its bytes counted toward the overflow check pre-migration).
+pub fn escalation_spec() -> SectionSpec {
+    SectionSpec {
+        name: ESCALATION_SECTION,
+        kind: SectionKind::Critical,
+        render: render_escalation_section,
     }
 }
 

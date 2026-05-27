@@ -42,12 +42,17 @@ pub enum RecoveryAction {
     To1mModel {
         new_model: String,
     },
-    /// Rung 4 (FEAT-006): the Claude ladder is exhausted and the fallback
-    /// runner config is enabled — promote the task to the fallback provider
-    /// (Grok today). Fires only when `project_config.fallback_runner` is
-    /// `Some(cfg)` with `cfg.enabled = true` AND the effective runner is
-    /// still `RunnerKind::Claude` (idempotency guard — a task already on
-    /// Grok falls through to `Blocked`).
+    /// Rung 4 (FEAT-006 + FEAT-PRIMARY-004): the current provider's ladder is
+    /// exhausted — pivot the task to the opposite provider. Direction follows
+    /// the effective runner (see [`select_fallback_target`]):
+    ///   - **Claude → Grok** when `fallback_runner` is `Some(cfg)` with
+    ///     `cfg.enabled = true`.
+    ///   - **Grok → Claude** when `primary_runner` is `Some(pr)` with
+    ///     `pr.claude_fallback_model.is_some()`.
+    ///
+    /// Single idempotency guard: a task already carrying a promotion override
+    /// (in either direction) skips this rung and falls through to `Blocked`,
+    /// so it never bounces back to the runner it came from.
     FallbackToProvider {
         provider: String,
         model: String,
@@ -330,6 +335,45 @@ pub fn rotate_dumps_keep_n(dir: &Path, sanitized_task_id: &str, keep: usize) -> 
     Ok(())
 }
 
+/// Select the rung-4 fallback target for the given effective runner, or
+/// `None` when no cross-provider promotion is configured for that direction.
+///
+/// Two mirror directions (PRD §2.5, FEAT-006 + FEAT-PRIMARY-004):
+///   - **Claude → Grok**: fires when `fallback_runner` is `Some(cfg)` with
+///     `cfg.enabled = true`. Target = `cfg.model`, provider = `cfg.provider`.
+///   - **Grok → Claude**: fires when `primary_runner` is `Some(pr)` with
+///     `pr.claude_fallback_model = Some(model)`. Target = that model,
+///     provider = `"claude"`.
+///
+/// Returns `(provider, model, target_runner)` so the caller writes a single
+/// `RecoveryAction::FallbackToProvider` plus matching `runner_overrides` /
+/// `model_overrides` entries without branching on direction itself. The
+/// idempotency guard (a task already carrying a promotion override skips
+/// rung 4 entirely) is enforced by the caller, not here.
+fn select_fallback_target(
+    effective_runner: RunnerKind,
+    project_config: &ProjectConfig,
+) -> Option<(String, String, RunnerKind)> {
+    match effective_runner {
+        RunnerKind::Claude => {
+            let cfg = project_config.fallback_runner.as_ref()?;
+            if !cfg.enabled {
+                return None;
+            }
+            Some((cfg.provider.clone(), cfg.model.clone(), RunnerKind::Grok))
+        }
+        RunnerKind::Grok => {
+            let primary = project_config.primary_runner.as_ref()?;
+            let claude_model = primary.claude_fallback_model.as_ref()?;
+            Some((
+                "claude".to_string(),
+                claude_model.clone(),
+                RunnerKind::Claude,
+            ))
+        }
+    }
+}
+
 /// Read the current `tasks.model` column for a task, returning `Ok(None)` when
 /// the column is NULL and `Err` only on a connectivity / schema failure.
 /// Used by [`handle_prompt_too_long`] to capture the pre-fallback model into
@@ -417,19 +461,23 @@ pub fn handle_prompt_too_long(
         RecoveryAction::To1mModel {
             new_model: m1m.to_string(),
         }
-    // kind-correct: rung 4 gate — only Claude-identity tasks are eligible for fallback promotion; a task already on Grok skips to rung 5 (Blocked)
-    } else if effective_runner == RunnerKind::Claude
-        && let Some(cfg) = project_config.fallback_runner.as_ref()
-        && cfg.enabled
+    // kind-correct: rung 4 gate — a task NOT yet promoted is eligible for a
+    // cross-provider pivot whose direction follows `effective_runner`
+    // (Claude→Grok via fallback_runner, Grok→Claude via primary_runner). The
+    // single `!was_already_promoted` predicate is the idempotency guard: a
+    // task already carrying a promotion override (in EITHER direction) skips
+    // rung 4 and falls through to rung 5 (Blocked), so it never bounces back
+    // to the runner it came from.
+    } else if !was_already_promoted
+        && let Some((provider, model, target_runner)) =
+            select_fallback_target(effective_runner, project_config)
     {
+        // kind-correct: writes the promoted provider identity into the override map — the VALUE is the provider, not a capability flag
         ctx.runner_overrides
-            .insert(task_id.to_string(), RunnerKind::Grok);
+            .insert(task_id.to_string(), target_runner);
         ctx.model_overrides
-            .insert(task_id.to_string(), cfg.model.clone());
-        RecoveryAction::FallbackToProvider {
-            provider: cfg.provider.clone(),
-            model: cfg.model.clone(),
-        }
+            .insert(task_id.to_string(), model.clone());
+        RecoveryAction::FallbackToProvider { provider, model }
     } else {
         RecoveryAction::Blocked
     };
@@ -453,8 +501,10 @@ pub fn handle_prompt_too_long(
 
     // Step 3: update DB.
     //   - Blocked            → status='blocked' (started_at preserved for audit)
-    //   - FallbackToProvider → status='todo' + clear started_at + set tasks.model = cfg.model
-    //                          so `resolve_task_model` picks the Grok model on next iteration.
+    //   - FallbackToProvider → status='todo' + clear started_at + set tasks.model
+    //                          to the cross-provider target (Grok model for
+    //                          Claude→Grok, Claude model for Grok→Claude) so
+    //                          `resolve_task_model` picks it up next iteration.
     //   - Rungs 1-3          → status='todo' + clear started_at (model unchanged)
     match action {
         RecoveryAction::Blocked => {

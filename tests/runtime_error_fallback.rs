@@ -29,10 +29,10 @@ use task_mgr::loop_engine::project_config::FallbackRunnerConfig;
 use task_mgr::loop_engine::runner::RunnerKind;
 
 /// Grok model id used in this file's tests. The default in
-/// `FallbackRunnerConfig::default()` is `"grok-4-fast"`, but the AC-#1 / AC-#5
+/// `FallbackRunnerConfig::default()` is `"grok-build"`, but the AC-#1 / AC-#5
 /// promotion tests construct an explicit config, so we pin the value here and
 /// thread it through.
-const GROK_DEFAULT_MODEL: &str = "grok-4-fast";
+const GROK_DEFAULT_MODEL: &str = "grok-build";
 
 /// Expected promotion threshold under the FEAT-007 contract. PRD §3 US-004
 /// pins the default at 2 consecutive failures (same gate as Claude-tier
@@ -103,6 +103,7 @@ fn promotion_fires_at_opus_and_threshold_with_fallback_enabled() {
         FALLBACK_THRESHOLD,
         &mut ctx,
         Some(&cfg),
+        None,
     )
     .unwrap();
 
@@ -145,7 +146,8 @@ fn no_promotion_when_consecutive_failures_below_threshold() {
     insert_task(&conn, "BELOW-001", Some(OPUS_MODEL), 0);
 
     let mut ctx = IterationContext::new(8);
-    let result = escalate_task_model_if_needed(&conn, "BELOW-001", 1, &mut ctx, None).unwrap();
+    let result =
+        escalate_task_model_if_needed(&conn, "BELOW-001", 1, &mut ctx, None, None).unwrap();
     assert_eq!(
         result, None,
         "consecutive_failures=1 must not trigger escalation OR promotion",
@@ -181,6 +183,7 @@ fn sonnet_at_threshold_escalates_to_opus_first_not_grok() {
         FALLBACK_THRESHOLD,
         &mut ctx,
         Some(&cfg),
+        None,
     )
     .unwrap();
     assert_eq!(
@@ -229,6 +232,7 @@ fn fallback_disabled_keeps_existing_opus_ceiling_byte_for_byte() {
         FALLBACK_THRESHOLD,
         &mut ctx,
         Some(&cfg),
+        None,
     )
     .unwrap();
     // Pin today's exact return: Some(OPUS_MODEL) — the Opus self-loop in
@@ -276,8 +280,15 @@ fn escalate_task_model_does_not_mutate_consecutive_failures_column() {
     let before = read_consecutive_failures(&conn, "COUNTER-001");
 
     let mut ctx = IterationContext::new(8);
-    let _ = escalate_task_model_if_needed(&conn, "COUNTER-001", FALLBACK_THRESHOLD, &mut ctx, None)
-        .unwrap();
+    let _ = escalate_task_model_if_needed(
+        &conn,
+        "COUNTER-001",
+        FALLBACK_THRESHOLD,
+        &mut ctx,
+        None,
+        None,
+    )
+    .unwrap();
 
     let after = read_consecutive_failures(&conn, "COUNTER-001");
     assert_eq!(
@@ -320,6 +331,7 @@ fn grok_promotion_preserves_consecutive_failures_count() {
         FALLBACK_THRESHOLD,
         &mut ctx,
         Some(&cfg),
+        None,
     )
     .unwrap();
 
@@ -463,7 +475,7 @@ fn grok_auth_failure_does_not_increment_consecutive_failures() {
     // sibling assertion catches it: a direct call DOES increment, so the only
     // thing keeping the counter stable is the caller's filter.
     let mut ctx = IterationContext::new(8);
-    handle_task_failure(&mut conn, "AUTH-FAIL-001", 1, &mut ctx, None).unwrap();
+    handle_task_failure(&mut conn, "AUTH-FAIL-001", 1, &mut ctx, None, None).unwrap();
     let after_unfiltered_call = read_consecutive_failures(&conn, "AUTH-FAIL-001");
     assert_eq!(
         after_unfiltered_call,
@@ -503,6 +515,7 @@ fn task_already_at_grok_is_idempotent_no_second_promotion() {
         FALLBACK_THRESHOLD,
         &mut ctx,
         Some(&cfg),
+        None,
     )
     .unwrap();
     assert_eq!(
@@ -551,6 +564,7 @@ fn promotion_fires_at_opus_1m_and_threshold() {
         FALLBACK_THRESHOLD,
         &mut ctx,
         Some(&cfg),
+        None,
     )
     .unwrap();
 

@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::Path;
 
 use crate::error::{TaskMgrError, TaskMgrResult};
@@ -21,7 +22,7 @@ pub struct FallbackRunnerConfig {
     #[serde(default = "default_fallback_provider")]
     pub provider: String,
 
-    /// Grok model ID passed as `--model`. Default: `"grok-4-fast"`.
+    /// Grok model ID passed as `--model`. Default: `"grok-build"`.
     #[serde(default = "default_fallback_model")]
     pub model: String,
 
@@ -44,6 +45,57 @@ impl Default for FallbackRunnerConfig {
             model: default_fallback_model(),
             cli_binary: None,
             runtime_error_threshold: default_fallback_runtime_error_threshold(),
+        }
+    }
+}
+
+/// A provider + model pair used as a routing target in `PrimaryRunnerConfig`.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RunnerSpec {
+    /// Provider name (e.g. `"grok"`, `"claude"`).
+    pub provider: String,
+    /// Model identifier passed to the provider CLI (e.g. `"grok-4"`).
+    pub model: String,
+}
+
+/// Per-task-type and per-id-prefix routing for the primary runner.
+///
+/// Routes specific task types (e.g. `"review"`, `"milestone"`) or ID prefixes
+/// (e.g. `"REVIEW-"`, `"MILESTONE-"`) to a non-default runner, while all other
+/// tasks continue to use the default Claude model/runner.
+///
+/// Phase 1: schema + serde only — resolution-chain wiring comes in a later phase.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrimaryRunnerConfig {
+    /// Claude model to fall back to when a task routed via `primaryRunner`
+    /// experiences a `RuntimeError`. `None` → use the project/task default
+    /// Claude model.
+    #[serde(default)]
+    pub claude_fallback_model: Option<String>,
+
+    /// Number of consecutive `RuntimeError` rounds before falling back to
+    /// Claude. Default: `2`.
+    #[serde(default = "default_primary_runtime_error_threshold")]
+    pub runtime_error_threshold: u32,
+
+    /// Task-type → `RunnerSpec` routing map. Absent key → empty map.
+    #[serde(default)]
+    pub by_task_type: HashMap<String, RunnerSpec>,
+
+    /// Task-ID-prefix → `RunnerSpec` routing map. Absent key → empty map.
+    #[serde(default)]
+    pub by_id_prefix: HashMap<String, RunnerSpec>,
+}
+
+impl Default for PrimaryRunnerConfig {
+    fn default() -> Self {
+        Self {
+            claude_fallback_model: None,
+            runtime_error_threshold: default_primary_runtime_error_threshold(),
+            by_task_type: HashMap::new(),
+            by_id_prefix: HashMap::new(),
         }
     }
 }
@@ -179,6 +231,12 @@ pub struct ProjectConfig {
     /// model id (e.g. `"grok-4"`). Absent key or explicit `null` → `None`.
     #[serde(default)]
     pub review_model: Option<String>,
+
+    /// Primary runner routing configuration. Absent key → `None`; explicit
+    /// `null` → `None`; explicit object → `Some` (with per-field defaults
+    /// applied for any omitted optional fields). Default: `None`.
+    #[serde(default)]
+    pub primary_runner: Option<PrimaryRunnerConfig>,
 }
 
 impl Default for ProjectConfig {
@@ -203,6 +261,7 @@ impl Default for ProjectConfig {
             auto_review_min_tasks: default_auto_review_min_tasks(),
             fallback_runner: None,
             review_model: None,
+            primary_runner: None,
         }
     }
 }
@@ -267,11 +326,16 @@ fn default_fallback_provider() -> String {
 
 /// Default model ID for the Grok fallback runner (PRD §6).
 fn default_fallback_model() -> String {
-    "grok-4-fast".to_string()
+    "grok-build".to_string()
 }
 
 /// Default consecutive-RuntimeError threshold before Grok fallback fires (PRD §3 US-005).
 fn default_fallback_runtime_error_threshold() -> u32 {
+    2
+}
+
+/// Default consecutive-RuntimeError threshold before primary-runner falls back to Claude.
+fn default_primary_runtime_error_threshold() -> u32 {
     2
 }
 
@@ -1014,5 +1078,141 @@ mod tests {
         // "groq-llama-3" must NOT be classified as Grok (token-equality rule).
         // Probe must succeed even if grok binary is absent.
         assert!(check_review_model_binary(Some("groq-llama-3"), None).is_ok());
+    }
+
+    // ---- PrimaryRunnerConfig serde round-trip tests ----
+
+    #[test]
+    fn test_primary_runner_absent_is_none() {
+        // Missing `primaryRunner` key → `None`.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.json"), "{}").unwrap();
+        let config = read_project_config(dir.path());
+        assert!(config.primary_runner.is_none());
+    }
+
+    #[test]
+    fn test_primary_runner_explicit_null_is_none() {
+        // Explicit JSON `null` → `None` (matches FallbackRunnerConfig behavior).
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.json"), r#"{"primaryRunner": null}"#).unwrap();
+        let config = read_project_config(dir.path());
+        assert!(config.primary_runner.is_none());
+    }
+
+    #[test]
+    fn test_primary_runner_present_empty_maps() {
+        // Object present but no map entries → `Some` with empty maps and defaults.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.json"), r#"{"primaryRunner": {}}"#).unwrap();
+        let config = read_project_config(dir.path());
+        let pr = config.primary_runner.expect("should be Some");
+        assert!(pr.claude_fallback_model.is_none());
+        assert_eq!(pr.runtime_error_threshold, 2);
+        assert!(pr.by_task_type.is_empty());
+        assert!(pr.by_id_prefix.is_empty());
+    }
+
+    #[test]
+    fn test_primary_runner_present_populated() {
+        use crate::loop_engine::model::SONNET_MODEL;
+        // Fully populated primaryRunner round-trips correctly.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            format!(
+                r#"{{
+                "primaryRunner": {{
+                    "claudeFallbackModel": "{SONNET_MODEL}",
+                    "runtimeErrorThreshold": 3,
+                    "byTaskType": {{
+                        "review":    {{ "provider": "grok", "model": "grok-4" }},
+                        "milestone": {{ "provider": "grok", "model": "grok-4" }}
+                    }},
+                    "byIdPrefix": {{
+                        "REVIEW-":    {{ "provider": "grok", "model": "grok-4" }},
+                        "MILESTONE-": {{ "provider": "grok", "model": "grok-4" }}
+                    }}
+                }}
+            }}"#
+            ),
+        )
+        .unwrap();
+        let config = read_project_config(dir.path());
+        let pr = config.primary_runner.expect("should be Some");
+        assert_eq!(pr.claude_fallback_model.as_deref(), Some(SONNET_MODEL));
+        assert_eq!(pr.runtime_error_threshold, 3);
+
+        let review_spec = pr.by_task_type.get("review").expect("review key missing");
+        assert_eq!(review_spec.provider, "grok");
+        assert_eq!(review_spec.model, "grok-4");
+
+        let milestone_spec = pr
+            .by_task_type
+            .get("milestone")
+            .expect("milestone key missing");
+        assert_eq!(milestone_spec.provider, "grok");
+        assert_eq!(milestone_spec.model, "grok-4");
+
+        let rev_prefix_spec = pr.by_id_prefix.get("REVIEW-").expect("REVIEW- key missing");
+        assert_eq!(rev_prefix_spec.provider, "grok");
+        assert_eq!(rev_prefix_spec.model, "grok-4");
+
+        let ms_prefix_spec = pr
+            .by_id_prefix
+            .get("MILESTONE-")
+            .expect("MILESTONE- key missing");
+        assert_eq!(ms_prefix_spec.provider, "grok");
+        assert_eq!(ms_prefix_spec.model, "grok-4");
+    }
+
+    #[test]
+    fn test_primary_runner_partial_uses_defaults() {
+        // Partial object: only byTaskType set → claudeFallbackModel is None,
+        // runtimeErrorThreshold is 2, byIdPrefix is empty.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{
+                "primaryRunner": {
+                    "byTaskType": {
+                        "review": { "provider": "grok", "model": "grok-4-fast" }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let config = read_project_config(dir.path());
+        let pr = config.primary_runner.expect("should be Some");
+        assert!(
+            pr.claude_fallback_model.is_none(),
+            "claudeFallbackModel absent → None"
+        );
+        assert_eq!(pr.runtime_error_threshold, 2, "default threshold is 2");
+        assert!(pr.by_id_prefix.is_empty(), "byIdPrefix absent → empty map");
+        let spec = pr.by_task_type.get("review").expect("review key missing");
+        assert_eq!(spec.model, "grok-4-fast");
+    }
+
+    #[test]
+    fn test_primary_runner_absent_does_not_affect_existing_config() {
+        // Ensures that adding `primary_runner` to ProjectConfig doesn't break
+        // existing round-trips for other fields when primaryRunner is absent.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{"version": 1, "additionalAllowedTools": ["Bash(docker:*)"], "mergeFailHaltThreshold": 3}"#,
+        )
+        .unwrap();
+        let config = read_project_config(dir.path());
+        assert!(config.primary_runner.is_none());
+        assert_eq!(config.version, 1);
+        assert_eq!(config.additional_allowed_tools, vec!["Bash(docker:*)"]);
+        assert_eq!(config.merge_fail_halt_threshold, 3);
+    }
+
+    #[test]
+    fn test_primary_runner_default_impl_is_none() {
+        assert!(ProjectConfig::default().primary_runner.is_none());
     }
 }

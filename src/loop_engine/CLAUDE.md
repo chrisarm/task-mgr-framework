@@ -71,6 +71,94 @@ wrapper to prove the TTY gate still fires. When adding a new
 launch-boundary guard, add it inside `maybe_fire_inner` and test it via
 the inner — never via the outer.
 
+## primaryRunner config and routing
+
+`primaryRunner` in `.task-mgr/config.json` routes specific task types or ID
+prefixes to a non-default runner (Grok today) BEFORE the `difficulty=high →
+Opus` escalation. All other tasks continue on the default Claude runner. This
+is the mirror of `fallbackRunner` — instead of promoting a stuck Claude task to
+Grok as a last resort, `primaryRunner` routes designated task classes to Grok
+as the FIRST choice.
+
+### Config block
+
+```json
+{
+  "primaryRunner": {
+    "claudeFallbackModel": "<a Claude model id — e.g. the SONNET_MODEL constant in src/loop_engine/model.rs>",
+    "runtimeErrorThreshold": 2,
+    "byTaskType": {
+      "review":    { "provider": "grok", "model": "grok-4-fast" },
+      "milestone": { "provider": "grok", "model": "grok-4-fast" }
+    },
+    "byIdPrefix": {
+      "REVIEW-":    { "provider": "grok", "model": "grok-4" },
+      "MILESTONE-": { "provider": "grok", "model": "grok-4" }
+    }
+  }
+}
+```
+
+Field defaults: `claudeFallbackModel=null`, `runtimeErrorThreshold=2`,
+`byTaskType={}`, `byIdPrefix={}`. Absent or `null` → `primary_runner = None`
+in `ProjectConfig`; loop behavior is byte-identical to a pure-Claude run.
+
+### Routing precedence (`resolve_task_model`)
+
+```
+explicit task model   (tasks.model DB column / model_overrides override)
+  → primaryRunner match  (byTaskType wins over byIdPrefix when both match)
+    → difficulty=high   (forces OPUS_MODEL)
+      → prd default     (prd_metadata.default_model)
+        → project default (.task-mgr/config.json defaultModel)
+          → user default  ($XDG_CONFIG_HOME/task-mgr/config.json defaultModel)
+            → None
+```
+
+Rung 2 (`primaryRunner`) is skipped entirely when `primary_runner = None` —
+making the resolution chain byte-identical to the pre-primary-runner build.
+
+**Match priority** inside `byTaskType` / `byIdPrefix` (both must be checked
+for EVERY task):
+
+1. `byTaskType` — exact, case-sensitive match on the semantic task type
+   (e.g. `"review"`, `"milestone"`).
+2. `byIdPrefix` — the task ID body (after stripping the 8-hex project prefix)
+   starts with the map key, OR the body contains `"-<key>"`.
+
+When both produce a match, `byTaskType` wins.
+
+**SSoT**: `model::primary_runner_match` is the single implementation.
+Do NOT re-implement the prefix-matching logic anywhere else.
+
+### Symmetric Claude↔Grok fallback contract
+
+`fallbackRunner` and `primaryRunner` form a symmetric pair:
+
+| Direction | Config key | When it fires |
+|---|---|---|
+| Claude → Grok | `fallbackRunner.enabled=true` | Claude overflow-ladder exhausted (rung 4) OR consecutive RuntimeErrors ≥ `fallbackRunner.runtimeErrorThreshold` |
+| Grok → Claude | `primaryRunner.claudeFallbackModel` set | Grok overflow-ladder exhausted (rung 4) OR consecutive RuntimeErrors ≥ `primaryRunner.runtimeErrorThreshold` |
+
+Both paths share the same idempotency guard, and it is the SAME mechanism at
+both sites: a single `ctx.runner_overrides.contains_key(task_id)` snapshot taken
+BEFORE the promotion branch. If an override already exists (in EITHER direction),
+the site bails to normal failure accounting (→ `auto_block_task`) instead of
+promoting. A task can only cross the provider boundary ONCE per loop run
+(in-memory override; clears on restart).
+
+> ⚠️ Footgun: do NOT gate idempotency on a re-derivation like
+> `provider_for_model(effective_model)` alone. Because a Grok→Claude promotion
+> sets `runner_overrides[id]=Claude`, the next failure would otherwise enter the
+> OPPOSITE (Claude→Grok) branch and flap providers every iteration (bounded only
+> by `max_retries`, each flip spawning a real CLI subprocess). The RuntimeError
+> escalation path shipped without this guard and ping-ponged; it now mirrors the
+> overflow rung-4 `was_already_promoted` snapshot. When you add a THIRD
+> cross-provider promotion site, replicate the `contains_key` guard there too.
+
+`claudeFallbackModel` absent → no Grok→Claude fallback. The Grok task
+dead-ends on `blocked` exactly as a Claude task without `fallbackRunner` does.
+
 ## Overflow recovery and diagnostics
 
 When the Claude CLI subprocess returns "Prompt is too long", the loop engine
@@ -81,29 +169,36 @@ called from the `PromptTooLong` arm of `run_iteration` in
 
 **The ladder** (in order; first rung whose precondition is met wins):
 
-1. **Downgrade effort** — `model::downgrade_effort` (`xhigh → high`). Effort
-   never drops below `high` (see `escalate_below_opus` rustdoc on the high-effort
-   floor invariant).
-2. **Escalate model below Opus** — `model::escalate_below_opus`
-   (`haiku → sonnet`, `sonnet → opus`). Closes the Sonnet-default gap that
-   used to immediately block the loop on iteration 1.
-3. **Escalate to 1M-context Opus** — `model::to_1m_model` (`opus → opus[1m]`).
-4. **Fall back to provider (`FallbackToProvider`)** — fires only when
-   `project_config.fallback_runner` is `Some(cfg)` with `cfg.enabled = true`
-   AND the effective runner is still `RunnerKind::Claude`. Promotes the task
-   to the fallback provider (Grok today) by writing `cfg.model` to the
-   `tasks.model` DB column AND inserting matching entries into
-   `ctx.runner_overrides` / `ctx.model_overrides`. Idempotency guard: a task
-   already on Grok skips this rung and falls through to rung 5. The DB UPDATE
-   AND the override-map inserts MUST run together — otherwise
-   `resolve_task_model` on the next iteration silently shadows the override.
-5. **Block** — task status set to `blocked`; no further recovery attempts.
+| Rung | Action | Claude runner | Grok runner |
+|---|---|---|---|
+| 1 | Downgrade effort (`xhigh → high`) | ✓ | ✓ |
+| 2 | Escalate model below Opus (`haiku → sonnet`, `sonnet → opus`) | ✓ | — |
+| 3 | Escalate to 1M-context Opus (`opus → opus[1m]`) | ✓ | — |
+| 4 | **FallbackToProvider** — cross-provider pivot | → Grok via `fallbackRunner` | → Claude via `primaryRunner.claudeFallbackModel` |
+| 5 | Block (no further recovery) | ✓ | ✓ |
 
-Rungs 1-4 reset the task status to `todo` (and clear `started_at`) so the next
+Rung 2 and 3 are Claude-only: Grok does not support the `--effort` flag or
+the 1M-context variant in the same way, so Grok tasks skip straight from rung 1
+to rung 4 when they hit a prompt-too-long ceiling.
+
+**Rung 4 detail — `FallbackToProvider`**: fires only when:
+- The effective runner is `RunnerKind::Claude` AND `fallback_runner` is
+  `Some(cfg)` with `cfg.enabled = true` (Claude → Grok), **OR**
+- The effective runner is `RunnerKind::Grok` AND `primary_runner` is
+  `Some(pr)` with `pr.claude_fallback_model.is_some()` (Grok → Claude).
+
+In both cases, the rung writes the target model to the `tasks.model` DB column
+AND inserts matching entries into `ctx.runner_overrides` / `ctx.model_overrides`
+atomically. Idempotency guard: a task already carrying a promotion override
+(in either direction) skips this rung and falls through to rung 5. The DB
+UPDATE AND the override-map inserts MUST run together — otherwise
+`resolve_task_model` on the next iteration silently shadows the override.
+
+Rungs 1–4 reset the task status to `todo` (and clear `started_at`) so the next
 iteration retries with the override applied; rung 5 sets `blocked`. Behavior
 is byte-identical to the pre-Grok 4-rung ladder when `fallbackRunner` is
-absent or `enabled: false` — rung 4 is unreachable in that configuration and
-the path collapses to rungs 1-3 → blocked.
+absent or `enabled: false` — rung 4 is unreachable from the Claude direction
+in that configuration, and the path collapses to rungs 1–3 → blocked.
 
 **Operator escape valve — `check_override_invalidation`**: at the top of
 every iteration (before `resolve_effective_runner`),
@@ -255,9 +350,11 @@ place; both call sites pick it up).
 three-builder layout (`core` / `sequential` / `slot`) plus the main-thread
 bundle rule — slot prompts must be built on the main thread before
 `thread::spawn` because `rusqlite::Connection` is `!Send`. A compile-time
-`Send` assertion on `SlotPromptBundle` enforces this; sections added to the
-sequential prompt MUST also be wired through the wave builder so the two
-paths cannot drift again.
+`Send` assertion on `SlotPromptBundle` enforces this. Both paths consume
+sections through the shared assembler (`prompt/assembler.rs`); a
+roster-completeness test in `tests/prompt_assembler_parity.rs` enforces that
+every known section appears in the sequential roster (the hand-enforced wiring
+rule has been retired).
 
 **Out of scope for the pipeline** (kept at the call sites): wrapper-commit,
 external-git reconciliation, post-merge-back slot completion reconciliation
@@ -643,6 +740,8 @@ For the full site→verb audit table and source-allowance matrix see
 | Operator escape valve | `src/loop_engine/recovery.rs` | `check_override_invalidation` |
 | Overflow original model snapshot | `src/loop_engine/engine.rs` | `IterationContext::overflow_original_task_model` |
 | Fallback runner config | `src/loop_engine/project_config.rs` | `FallbackRunnerConfig`, `check_fallback_runner_binary` |
+| Primary runner config + routing | `src/loop_engine/project_config.rs` | `PrimaryRunnerConfig`, `RunnerSpec` |
+| Primary runner model routing | `src/loop_engine/model.rs` | `primary_runner_match`, `resolve_task_model`, `ModelResolutionContext` |
 | Auto-review launch boundary | `src/loop_engine/auto_review.rs` | `maybe_fire`, `maybe_fire_inner`, `ProcessLauncher` |
 | Shared post-Claude pipeline | `src/loop_engine/iteration_pipeline.rs` | `process_iteration_output` |
 | Merge resolver | `src/loop_engine/merge_resolver.rs` | `ClaudeMergeResolver`, `MergeResolver` trait |

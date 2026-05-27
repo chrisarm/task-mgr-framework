@@ -1283,6 +1283,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                 iteration as i64,
                 &mut ctx,
                 project_config.fallback_runner.as_ref(),
+                project_config.primary_runner.as_ref(),
             )
         {
             eprintln!("Warning: failed to start retry tracking transaction: {}", e);

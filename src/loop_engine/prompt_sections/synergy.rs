@@ -11,17 +11,43 @@
 use rusqlite::Connection;
 
 use crate::loop_engine::model;
+use crate::loop_engine::prompt::assembler::{PromptContext, Rendered, SectionKind, SectionSpec};
+
+/// Stable section identifier for the synergy section. Matches the
+/// `section_sizes` key the sequential builder already uses for this section.
+pub const SYNERGY_SECTION: &str = "synergy";
 
 /// No-op: synergy context sections were removed along with synergy relationships.
 ///
 /// Always returns an empty string. Parameters are kept to preserve the call-site
 /// signature in `prompt.rs`.
-pub(crate) fn build_synergy_section(
-    _conn: &Connection,
-    _task_id: &str,
-    _run_id: Option<&str>,
-) -> String {
+pub fn build_synergy_section(_conn: &Connection, _task_id: &str, _run_id: Option<&str>) -> String {
     String::new()
+}
+
+/// Render the synergy section for the data-driven assembler (CONTRACT-001).
+/// Sequential-only — the slot roster omits it (wave slots are disjoint by
+/// design). This is the **single render site** for the section; it wraps the
+/// permanent no-op [`build_synergy_section`], so the rendered text is always
+/// empty. The [`SectionKind`] budget is ignored (the section has no cap).
+pub fn render_synergy_section(ctx: &PromptContext<'_>, _kind: SectionKind) -> Rendered {
+    Rendered {
+        text: build_synergy_section(ctx.conn, &ctx.task.id, ctx.run_id),
+        ..Default::default()
+    }
+}
+
+/// Build the synergy [`SectionSpec`] (trimmable, no independent cap).
+///
+/// Present in the sequential roster only. The `budget` is `usize::MAX` because
+/// the no-op never emits text — `assemble` gates it against the remaining total
+/// budget and the render fn ignores the budget entirely.
+pub fn synergy_spec() -> SectionSpec {
+    SectionSpec {
+        name: SYNERGY_SECTION,
+        kind: SectionKind::Trimmable { budget: usize::MAX },
+        render: render_synergy_section,
+    }
 }
 
 /// Resolve the iteration's model and difficulty from the **primary task only**.
@@ -33,10 +59,16 @@ pub(crate) fn build_synergy_section(
 /// through `model::resolve_task_model` so `difficulty=high → opus` and the
 /// `prd_default` / project / user default chain continue to work.
 ///
+/// `task_id` is threaded into the resolution context for `byIdPrefix` matching
+/// in the primary runner config (rung 2 of `resolve_task_model`). `task_type`
+/// and `primary_runner` propagate via the `defaults` spread — callers that
+/// populate those fields in `defaults` (e.g. `sequential::build_prompt`)
+/// automatically benefit from primary-runner routing without a signature change.
+///
 /// Signature preserved so call sites in `prompt.rs` do not change.
 pub(crate) fn resolve_synergy_cluster(
     _conn: &Connection,
-    _task_id: &str,
+    task_id: &str,
     primary_model: Option<&str>,
     primary_difficulty: Option<&str>,
     defaults: &model::ModelResolutionContext<'_>,
@@ -44,6 +76,7 @@ pub(crate) fn resolve_synergy_cluster(
     let resolved_model = model::resolve_task_model(&model::ModelResolutionContext {
         task_model: primary_model,
         difficulty: primary_difficulty,
+        task_id: Some(task_id),
         ..*defaults
     })
     .filter(|m| !m.trim().is_empty());

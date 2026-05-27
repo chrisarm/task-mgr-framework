@@ -24,14 +24,140 @@ use std::path::{Path, PathBuf};
 use rusqlite::Connection;
 
 use crate::loop_engine::config::PermissionMode;
+pub use crate::loop_engine::prompt::assembler::CRITICAL_OVERFLOW_SENTINEL;
+use crate::loop_engine::prompt::assembler::{
+    PromptContext, Rendered, SectionKind, SectionSpec, assemble_criticals, fit_trimmable,
+};
 use crate::loop_engine::prompt::core;
-use crate::loop_engine::prompt_sections::dependencies::build_dependency_section;
-use crate::loop_engine::prompt_sections::task_ops::task_ops_section;
-use crate::loop_engine::prompt_sections::{truncate_to_budget, try_fit_section};
+use crate::loop_engine::prompt_sections::dependencies::dependencies_spec;
+use crate::loop_engine::prompt_sections::task_ops::task_ops_spec;
+use crate::loop_engine::prompt_sections::truncate_to_budget;
 use crate::models::Task;
 
-/// Byte budget for the source-context section in slot prompts.
-const SOURCE_CONTEXT_BUDGET: usize = 2000;
+/// The slot path's ordered section roster (CONTRACT-001).
+///
+/// A set-subset of [`super::sequential::sequential_roster`] but independently
+/// ordered in slot display order: the slot emits the task envelope FIRST,
+/// whereas sequential places it mid-list. The task/completion/base_prompt
+/// envelopes use slot-specific render fns (untruncated `format_task_json`, the
+/// `core::completion_instruction` variant, the no-trailing-newline base-prompt
+/// reader) that differ byte-for-byte from sequential's. `task_ops`,
+/// `dependencies`, and (since FEAT-005) `source` / `steering` /
+/// `session_guidance` / `tool_awareness` / `key_decision` are shared specs
+/// reached through their `*_spec` constructors.
+///
+/// After FEAT-005 every section the slot path emits is in this roster: the slot
+/// has NO sequential-only sections (synergy / siblings / reorder / escalation
+/// are dropped for disjoint wave slots by design). As in the sequential path,
+/// [`build_prompt`] does not yet call [`assemble`] once over this whole roster —
+/// the critical subset is gated together while each migrated trimmable is
+/// assembled solo at its own fit position. It derives a criticals-only
+/// sub-roster from this single source and reaches each trimmable spec via its
+/// `*_spec` constructor.
+pub fn slot_roster() -> Vec<SectionSpec> {
+    vec![
+        SectionSpec {
+            name: "task",
+            kind: SectionKind::Critical,
+            render: render_task_section,
+        },
+        task_ops_spec(),
+        learnings_spec(),
+        core::source_spec(),
+        dependencies_spec(),
+        core::steering_spec(),
+        core::session_guidance_spec(),
+        core::tool_awareness_spec(),
+        core::key_decision_spec(),
+        SectionSpec {
+            name: "completion",
+            kind: SectionKind::Critical,
+            render: render_completion_section,
+        },
+        SectionSpec {
+            name: "base_prompt",
+            kind: SectionKind::Critical,
+            render: render_base_prompt_section,
+        },
+    ]
+}
+
+/// Build the slot learnings [`SectionSpec`] (trimmable, capped at
+/// [`LEARNINGS_BUDGET`]).
+///
+/// Distinct from the sequential learnings spec: the slot variant recalls its
+/// own learnings from the DB via [`core::build_learnings_block`] (the
+/// `recall-limit + 4 KB truncate` path), whereas the sequential render reads
+/// the learnings `next::next` already selected. Both rosters place this section
+/// at their own legacy display position; neither shares a render fn here.
+fn learnings_spec() -> SectionSpec {
+    SectionSpec {
+        name: "learnings",
+        kind: SectionKind::Trimmable {
+            budget: LEARNINGS_BUDGET,
+        },
+        render: render_learnings_section,
+    }
+}
+
+/// Render the slot learnings section via [`core::build_learnings_block`],
+/// surfacing the recalled learning IDs as the section's side output so
+/// [`assemble`] owns the clear-on-drop invariant (the IDs are dropped from
+/// `Assembled.shown_learning_ids` iff the section doesn't fit). The per-section
+/// budget rides on [`SectionKind::Trimmable`]; a `Critical` kind is unreachable
+/// for this spec but is mapped to "no cap" defensively.
+fn render_learnings_section(ctx: &PromptContext<'_>, kind: SectionKind) -> Rendered {
+    let (text, shown_learning_ids) =
+        core::build_learnings_block(ctx.conn, ctx.task, kind.budget_or_max());
+    Rendered {
+        text,
+        shown_learning_ids,
+    }
+}
+
+/// Render the slot task envelope (`## Current Task` JSON block) from the
+/// `&Task` + preloaded `task_files` carried in [`PromptContext`]. Distinct from
+/// the sequential envelope: the slot variant uses `core::format_task_json` and
+/// does NOT truncate.
+fn render_task_section(ctx: &PromptContext<'_>, _kind: SectionKind) -> Rendered {
+    Rendered {
+        text: build_task_section(ctx.task, ctx.task_files),
+        ..Default::default()
+    }
+}
+
+/// Build the slot `## Current Task` section from a `&Task` + its files. Single
+/// legacy site for the slot envelope bytes — [`render_task_section`] and the
+/// parity test both wrap it.
+pub fn build_task_section(task: &Task, files: &[String]) -> String {
+    let task_json = core::format_task_json(task, files);
+    format!("## Current Task\n\n```json\n{task_json}\n```\n\n")
+}
+
+/// Render the slot completion-instruction section via
+/// [`core::completion_instruction`] (the slot variant — no non-code note,
+/// title in the commit message).
+fn render_completion_section(ctx: &PromptContext<'_>, _kind: SectionKind) -> Rendered {
+    Rendered {
+        text: core::completion_instruction(&ctx.task.id, &ctx.task.title),
+        ..Default::default()
+    }
+}
+
+/// Render the slot base-prompt template section from
+/// [`PromptContext::base_prompt_path`] via [`load_base_prompt`] (no
+/// trailing-newline fixup, unlike the sequential reader).
+fn render_base_prompt_section(ctx: &PromptContext<'_>, _kind: SectionKind) -> Rendered {
+    Rendered {
+        text: load_base_prompt(ctx.base_prompt_path),
+        ..Default::default()
+    }
+}
+
+// The source-context byte budget now lives in `core::SOURCE_CONTEXT_BUDGET`
+// (FEAT-005) — the single source of truth carried on the shared
+// `core::source_spec` `SectionKind::Trimmable` budget, kept distinct from
+// LEARNINGS_BUDGET below so the two caps never collapse into one field.
 
 /// Byte budget for the learnings section in slot prompts.
 const LEARNINGS_BUDGET: usize = 4000;
@@ -47,12 +173,6 @@ const BASE_PROMPT_BUDGET: usize = 16_000;
 /// and consumes a wasted wave slot before the per-slot overflow ladder
 /// rescues it.
 const TOTAL_PROMPT_BUDGET: usize = 80_000;
-
-/// Sentinel name pushed into `SlotPromptBundle.dropped_sections` when the
-/// critical-section total alone exceeds `TOTAL_PROMPT_BUDGET`. Callers
-/// should treat a bundle with this entry as too large to attempt and skip
-/// the slot rather than dispatch a malformed prompt.
-pub const CRITICAL_OVERFLOW_SENTINEL: &str = "CRITICAL";
 
 /// Parameters required to assemble a slot-mode prompt on the main thread.
 ///
@@ -148,7 +268,10 @@ fn load_task_files(conn: &Connection, task_id: &str) -> Vec<String> {
 }
 
 /// Read and truncate the base prompt template. Returns `""` on IO failure.
-fn load_base_prompt(base_prompt_path: &std::path::Path) -> String {
+///
+/// Single legacy site for the slot base-prompt bytes — [`render_base_prompt_section`]
+/// and the parity test both wrap it.
+pub fn load_base_prompt(base_prompt_path: &std::path::Path) -> String {
     match fs::read_to_string(base_prompt_path) {
         Ok(content) => truncate_to_budget(&content, BASE_PROMPT_BUDGET),
         Err(e) => {
@@ -179,10 +302,12 @@ fn load_base_prompt(base_prompt_path: &std::path::Path) -> String {
 ///   `TOTAL_PROMPT_BUDGET`, return a sentinel bundle with empty `prompt`
 ///   and [`CRITICAL_OVERFLOW_SENTINEL`] in `dropped_sections`.
 /// - **Phase 2**: fill the remaining budget with trimmable sections in
-///   priority order via [`try_fit_section`]; record any drops in
-///   `dropped_sections`. When `"learnings"` is dropped, `shown_learning_ids`
-///   is cleared so the UCB bandit isn't credited with learnings the agent
-///   never saw.
+///   priority order. Since FEAT-005 every trimmable (`learnings`, `source`,
+///   `dependencies`, `steering`, `session_guidance`, `tool_awareness`,
+///   `key_decision`) is assembled solo via [`assemble`] at its fit position.
+///   Drops are recorded in `dropped_sections`. When `"learnings"` is dropped,
+///   [`assemble`] (the sole owner of this invariant) leaves `shown_learning_ids`
+///   empty so the UCB bandit isn't credited with learnings the agent never saw.
 pub fn build_prompt(
     conn: &Connection,
     task: &Task,
@@ -196,23 +321,53 @@ pub fn build_prompt(
         .filter(|m| !m.is_empty())
         .map(str::to_owned);
 
+    // The `&Connection` lives only in this main-thread `PromptContext`, which is
+    // dropped before the bundle crosses the worker boundary — no `&Connection`
+    // is ever stored in the `Send`-safe `SlotPromptBundle`. Reused for both the
+    // Phase 1 critical assemble and the Phase 2 deps assemble.
+    let ctx = PromptContext {
+        conn,
+        task,
+        task_files: &task_files,
+        project_root: &params.project_root,
+        base_prompt_path: &params.base_prompt_path,
+        permission_mode: &params.permission_mode,
+        steering_path: params.steering_path,
+        session_guidance: params.session_guidance,
+        run_id: None,
+        task_prefix: None,
+        reorder_hint: None,
+        batch_sibling_prds: None,
+        resolved_model: None,
+        next_task_output: None,
+        recalled_learnings: None,
+    };
+
+    let roster = slot_roster();
+
     // ============================================================
-    // Phase 1: critical sections — must always be present.
+    // Phase 1: critical sections — gated together against the budget.
     // ============================================================
+    //
+    // The migrated criticals (task, task_ops, completion, base_prompt) render
+    // through `assemble` over the criticals-only sub-roster. The slot path has
+    // NO inlined criticals, so the full `TOTAL_PROMPT_BUDGET` is the gate.
+    // `assemble` signals overflow uniformly via
+    // `dropped_sections == [CRITICAL_OVERFLOW_SENTINEL]`; unlike the sequential
+    // caller (which maps it to `Err`), the slot caller keeps its
+    // sentinel-in-bundle behavior so the wave scheduler skips the slot.
+    let critical_assembled = assemble_criticals(&ctx, &roster, TOTAL_PROMPT_BUDGET);
 
-    let task_json = core::format_task_json(task, &task_files);
-    let task_section = format!("## Current Task\n\n```json\n{task_json}\n```\n\n");
-
-    let task_ops = task_ops_section().to_string();
-
-    let completion_section = core::completion_instruction(&task.id, &task.title);
-
-    let base_prompt = load_base_prompt(&params.base_prompt_path);
-
-    let critical_total =
-        task_section.len() + task_ops.len() + completion_section.len() + base_prompt.len();
-
-    if critical_total > TOTAL_PROMPT_BUDGET {
+    if critical_assembled
+        .dropped_sections
+        .iter()
+        .any(|s| s == CRITICAL_OVERFLOW_SENTINEL)
+    {
+        let critical_total: usize = critical_assembled
+            .section_sizes
+            .iter()
+            .map(|(_, n)| n)
+            .sum();
         eprintln!(
             "Warning: slot prompt critical sections ({} bytes) exceed TOTAL_PROMPT_BUDGET ({}) \
              for task {} — slot should be skipped",
@@ -225,100 +380,105 @@ pub fn build_prompt(
             shown_learning_ids: Vec::new(),
             resolved_model,
             difficulty: task.difficulty.clone(),
-            section_sizes: vec![
-                ("task", task_section.len()),
-                ("task_ops", task_ops.len()),
-                ("completion", completion_section.len()),
-                ("base_prompt", base_prompt.len()),
-            ],
+            // `assemble` populates `section_sizes` on overflow (criticals in
+            // roster order), the same breakdown the legacy sentinel reported.
+            section_sizes: critical_assembled.section_sizes,
             dropped_sections: vec![CRITICAL_OVERFLOW_SENTINEL.to_string()],
         };
     }
+
+    // Pull each migrated critical's bytes out for interleaved stitching below.
+    let task_section = critical_assembled.section_text("task");
+    let task_ops = critical_assembled.section_text("task_ops");
+    let completion_section = critical_assembled.section_text("completion");
+    let base_prompt = critical_assembled.section_text("base_prompt");
 
     // ============================================================
     // Phase 2: trimmable sections — fit into the remaining budget.
     // ============================================================
 
-    let mut remaining = TOTAL_PROMPT_BUDGET - critical_total;
+    let mut remaining = TOTAL_PROMPT_BUDGET - critical_assembled.prompt.len();
     let mut dropped_sections: Vec<String> = Vec::new();
 
     // Priority order (highest first):
     //   1. learnings, 2. source, 3. dependencies, 4. steering,
     //   5. session_guidance, 6. tool_awareness, 7. key_decision
     //
-    // Learnings sit at the top because the bandit feedback gating
-    // (`shown_learning_ids` cleared when "learnings" drops) only fires when
-    // the section actually didn't fit; keeping it first maximizes the
-    // chance the agent sees recalled context.
+    // Learnings and dependencies are migrated trimmables; each is assembled
+    // SOLO at its own fit position (they are separated in fit order by the
+    // still-inlined `source`, so a single multi-spec assemble would reorder
+    // them). Learnings sits first because its `shown_learning_ids` clear-on-drop
+    // (now owned entirely by `assemble`) only matters when the section didn't
+    // fit; keeping it first maximizes the chance the agent sees recalled context.
 
-    let (learnings_section_raw, mut shown_learning_ids) =
-        core::build_learnings_block(conn, task, LEARNINGS_BUDGET);
-    let learnings_section = try_fit_section(
-        learnings_section_raw,
-        "learnings",
+    // Learnings (trimmable, fit FIRST). `fit_trimmable` / `assemble` is the SOLE
+    // owner of the shown_learning_ids clear-on-drop: the IDs survive iff the
+    // section fit, so the bandit is never credited with learnings the agent never
+    // saw — no per-builder `.clear()` here (FEAT-004 centralization).
+    let learnings_rendered = fit_trimmable(
+        &ctx,
+        learnings_spec(),
         &mut remaining,
         &mut dropped_sections,
     );
-    if learnings_section.is_empty() && dropped_sections.last().is_some_and(|s| s == "learnings") {
-        // Drop bandit feedback when the learnings block didn't fit — the
-        // agent never saw these recall results, so crediting them would
-        // skew UCB scoring. Empty-input case (no recall results) leaves
-        // shown_learning_ids untouched (already empty) since try_fit_section
-        // does not push the section name on empty input.
-        shown_learning_ids.clear();
-    }
+    let learnings_section = learnings_rendered.text;
+    let shown_learning_ids = learnings_rendered.shown_learning_ids;
 
-    let source_section_raw =
-        core::build_source_context_block(&task_files, SOURCE_CONTEXT_BUDGET, &params.project_root);
-    let source_section = try_fit_section(
-        source_section_raw,
-        "source",
+    // Source context (trimmable, fit AFTER learnings). Its 2000-byte internal cap
+    // rides on the spec's `SectionKind::Trimmable` budget, distinct from
+    // LEARNINGS_BUDGET.
+    let source_section = fit_trimmable(
+        &ctx,
+        core::source_spec(),
         &mut remaining,
         &mut dropped_sections,
-    );
+    )
+    .text;
 
-    let dep_section_raw = build_dependency_section(conn, &task.id);
-    let dep_section = try_fit_section(
-        dep_section_raw,
-        "dependencies",
+    // Dependencies (trimmable, fit AFTER learnings + source).
+    let dep_section = fit_trimmable(
+        &ctx,
+        dependencies_spec(),
         &mut remaining,
         &mut dropped_sections,
-    );
+    )
+    .text;
 
-    let steering_section_raw = params
-        .steering_path
-        .map(core::build_steering_block)
-        .unwrap_or_default();
-    let steering_section = try_fit_section(
-        steering_section_raw,
-        "steering",
+    // Steering (trimmable).
+    let steering_section = fit_trimmable(
+        &ctx,
+        core::steering_spec(),
         &mut remaining,
         &mut dropped_sections,
-    );
+    )
+    .text;
 
-    let guidance_section_raw = core::build_session_guidance_block(params.session_guidance);
-    let guidance_section = try_fit_section(
-        guidance_section_raw,
-        "session_guidance",
+    // Session guidance (trimmable).
+    let guidance_section = fit_trimmable(
+        &ctx,
+        core::session_guidance_spec(),
         &mut remaining,
         &mut dropped_sections,
-    );
+    )
+    .text;
 
-    let tool_section_raw = core::build_tool_awareness_block(&params.permission_mode);
-    let tool_section = try_fit_section(
-        tool_section_raw,
-        "tool_awareness",
+    // Tool awareness (trimmable).
+    let tool_section = fit_trimmable(
+        &ctx,
+        core::tool_awareness_spec(),
         &mut remaining,
         &mut dropped_sections,
-    );
+    )
+    .text;
 
-    let key_decisions_section_raw = core::build_key_decisions_block(&task.id);
-    let key_decisions_section = try_fit_section(
-        key_decisions_section_raw,
-        "key_decision",
+    // Key decision points (trimmable, fit LAST).
+    let key_decisions_section = fit_trimmable(
+        &ctx,
+        core::key_decision_spec(),
         &mut remaining,
         &mut dropped_sections,
-    );
+    )
+    .text;
 
     // ============================================================
     // Assembly

@@ -26,6 +26,7 @@ use crate::commands::next::output::{LearningSummaryOutput, NextTaskOutput};
 use crate::learnings::recall::{RecallParams, recall_learnings};
 use crate::loop_engine::config::PermissionMode;
 use crate::loop_engine::context::scan_source_context;
+use crate::loop_engine::prompt::assembler::{PromptContext, Rendered, SectionKind, SectionSpec};
 use crate::loop_engine::prompt_sections::learnings::build_learnings_section;
 use crate::loop_engine::prompt_sections::truncate_to_budget;
 use crate::models::Task;
@@ -303,4 +304,131 @@ pub fn build_key_decisions_block(task_id: &str) -> String {
          ```\n\n\
          Only emit this for genuine architectural forks. Skip trivial implementation details.\n\n"
     )
+}
+
+// ===========================================================================
+// CONTRACT-001 shared section specs (FEAT-005)
+//
+// The five sections below are rendered identically by both the sequential and
+// slot paths (each wraps a `build_*_block` helper above with no per-path
+// variation), so each gets ONE shared `SectionSpec` — the single render site
+// for the section's bytes. Each path's roster places the returned spec at its
+// own legacy display position.
+// ===========================================================================
+
+/// Stable section identifier for the source-context section.
+pub const SOURCE_SECTION: &str = "source";
+/// Stable section identifier for the steering section.
+pub const STEERING_SECTION: &str = "steering";
+/// Stable section identifier for the session-guidance section.
+pub const SESSION_GUIDANCE_SECTION: &str = "session_guidance";
+/// Stable section identifier for the tool-awareness section.
+pub const TOOL_AWARENESS_SECTION: &str = "tool_awareness";
+/// Stable section identifier for the key-decision-points section.
+pub const KEY_DECISION_SECTION: &str = "key_decision";
+
+/// Byte budget for the source-context section, shared by both prompt paths.
+///
+/// This is the single source of truth for the 2000-byte cap that the
+/// sequential and slot builders each previously held as a private
+/// `SOURCE_CONTEXT_BUDGET` const. It rides on the source spec's
+/// [`SectionKind::Trimmable`] budget — deliberately kept distinct from the
+/// slot learnings budget so a source overflow never shrinks the learnings cap
+/// (and vice versa).
+pub const SOURCE_CONTEXT_BUDGET: usize = 2000;
+
+/// Render the source-context section, reading its per-section byte cap from the
+/// [`SectionKind::Trimmable`] budget. `Critical` is unreachable for this spec
+/// but maps to "no cap" defensively.
+fn render_source_section(ctx: &PromptContext<'_>, kind: SectionKind) -> Rendered {
+    Rendered {
+        text: build_source_context_block(ctx.task_files, kind.budget_or_max(), ctx.project_root),
+        ..Default::default()
+    }
+}
+
+/// Build the source-context [`SectionSpec`] (trimmable, capped at
+/// [`SOURCE_CONTEXT_BUDGET`]). Shared by both prompt paths.
+pub fn source_spec() -> SectionSpec {
+    SectionSpec {
+        name: SOURCE_SECTION,
+        kind: SectionKind::Trimmable {
+            budget: SOURCE_CONTEXT_BUDGET,
+        },
+        render: render_source_section,
+    }
+}
+
+/// Render the steering section from [`PromptContext::steering_path`]. `None`
+/// (no project `steering.md`) renders an empty section.
+fn render_steering_section(ctx: &PromptContext<'_>, _kind: SectionKind) -> Rendered {
+    Rendered {
+        text: ctx
+            .steering_path
+            .map(build_steering_block)
+            .unwrap_or_default(),
+        ..Default::default()
+    }
+}
+
+/// Build the steering [`SectionSpec`] (trimmable, no independent cap — the
+/// section either fits whole into the remaining total budget or is dropped).
+pub fn steering_spec() -> SectionSpec {
+    SectionSpec {
+        name: STEERING_SECTION,
+        kind: SectionKind::Trimmable { budget: usize::MAX },
+        render: render_steering_section,
+    }
+}
+
+/// Render the session-guidance section from [`PromptContext::session_guidance`].
+/// An empty guidance string renders an empty section.
+fn render_session_guidance_section(ctx: &PromptContext<'_>, _kind: SectionKind) -> Rendered {
+    Rendered {
+        text: build_session_guidance_block(ctx.session_guidance),
+        ..Default::default()
+    }
+}
+
+/// Build the session-guidance [`SectionSpec`] (trimmable, no independent cap).
+pub fn session_guidance_spec() -> SectionSpec {
+    SectionSpec {
+        name: SESSION_GUIDANCE_SECTION,
+        kind: SectionKind::Trimmable { budget: usize::MAX },
+        render: render_session_guidance_section,
+    }
+}
+
+/// Render the tool-awareness section from [`PromptContext::permission_mode`].
+fn render_tool_awareness_section(ctx: &PromptContext<'_>, _kind: SectionKind) -> Rendered {
+    Rendered {
+        text: build_tool_awareness_block(ctx.permission_mode),
+        ..Default::default()
+    }
+}
+
+/// Build the tool-awareness [`SectionSpec`] (trimmable, no independent cap).
+pub fn tool_awareness_spec() -> SectionSpec {
+    SectionSpec {
+        name: TOOL_AWARENESS_SECTION,
+        kind: SectionKind::Trimmable { budget: usize::MAX },
+        render: render_tool_awareness_section,
+    }
+}
+
+/// Render the key-decision-points section from the task id.
+fn render_key_decision_section(ctx: &PromptContext<'_>, _kind: SectionKind) -> Rendered {
+    Rendered {
+        text: build_key_decisions_block(&ctx.task.id),
+        ..Default::default()
+    }
+}
+
+/// Build the key-decision-points [`SectionSpec`] (trimmable, no independent cap).
+pub fn key_decision_spec() -> SectionSpec {
+    SectionSpec {
+        name: KEY_DECISION_SECTION,
+        kind: SectionKind::Trimmable { budget: usize::MAX },
+        render: render_key_decision_section,
+    }
 }
