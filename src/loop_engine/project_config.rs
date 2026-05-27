@@ -21,7 +21,7 @@ pub struct FallbackRunnerConfig {
     #[serde(default = "default_fallback_provider")]
     pub provider: String,
 
-    /// Grok model ID passed as `--model`. Default: `"grok-4-fast"`.
+    /// Grok model ID passed as `--model`. Default: `"grok-build"`.
     #[serde(default = "default_fallback_model")]
     pub model: String,
 
@@ -267,7 +267,7 @@ fn default_fallback_provider() -> String {
 
 /// Default model ID for the Grok fallback runner (PRD §6).
 fn default_fallback_model() -> String {
-    "grok-4-fast".to_string()
+    "grok-build".to_string()
 }
 
 /// Default consecutive-RuntimeError threshold before Grok fallback fires (PRD §3 US-005).

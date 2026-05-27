@@ -26,7 +26,7 @@ fn write_config(json: &str) -> (TempDir, ProjectConfig) {
     (dir, cfg)
 }
 
-const GROK_DEFAULT_MODEL: &str = "grok-4-fast";
+const GROK_DEFAULT_MODEL: &str = "grok-build";
 const GROK_DEFAULT_PROVIDER: &str = "grok";
 const RUNTIME_ERROR_THRESHOLD_DEFAULT: u32 = 2;
 
@@ -105,11 +105,11 @@ fn fallback_runner_missing_runtime_error_threshold_defaults_to_two() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// AC #5 — partial object (missing model) → default 'grok-4-fast'
+// AC #5 — partial object (missing model) → default 'grok-build'
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn fallback_runner_missing_model_defaults_to_grok_4_fast() {
+fn fallback_runner_missing_model_defaults_to_grok_build() {
     let (_dir, cfg) = write_config(
         r#"{
         "fallbackRunner": {
@@ -120,7 +120,7 @@ fn fallback_runner_missing_model_defaults_to_grok_4_fast() {
     let fr = cfg.fallback_runner.expect("fallback_runner deserialized");
     assert_eq!(
         fr.model, GROK_DEFAULT_MODEL,
-        "missing `model` must use the named-default fn (= \"grok-4-fast\"), \
+        "missing `model` must use the named-default fn (= \"grok-build\"), \
          NOT String::default() (= \"\")",
     );
     assert_eq!(
@@ -384,7 +384,7 @@ fn startup_check_rejects_non_executable_cli_binary() {
 #[test]
 fn test_file_compiles_marker() {
     let _: ProjectConfig = ProjectConfig::default();
-    assert_eq!(GROK_DEFAULT_MODEL, "grok-4-fast");
+    assert_eq!(GROK_DEFAULT_MODEL, "grok-build");
     assert_eq!(GROK_DEFAULT_PROVIDER, "grok");
     assert_eq!(RUNTIME_ERROR_THRESHOLD_DEFAULT, 2);
 }

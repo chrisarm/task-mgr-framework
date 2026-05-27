@@ -29,10 +29,10 @@ use task_mgr::loop_engine::project_config::FallbackRunnerConfig;
 use task_mgr::loop_engine::runner::RunnerKind;
 
 /// Grok model id used in this file's tests. The default in
-/// `FallbackRunnerConfig::default()` is `"grok-4-fast"`, but the AC-#1 / AC-#5
+/// `FallbackRunnerConfig::default()` is `"grok-build"`, but the AC-#1 / AC-#5
 /// promotion tests construct an explicit config, so we pin the value here and
 /// thread it through.
-const GROK_DEFAULT_MODEL: &str = "grok-4-fast";
+const GROK_DEFAULT_MODEL: &str = "grok-build";
 
 /// Expected promotion threshold under the FEAT-007 contract. PRD §3 US-004
 /// pins the default at 2 consecutive failures (same gate as Claude-tier

@@ -93,18 +93,23 @@ fn scoped_coding() -> PermissionMode {
 }
 
 /// Mock grok binary: echoes the marker string + every argv element on its
-/// own stdout line, then echoes the prompt read from stdin. The marker is
-/// the known-bad discriminator — a stub `dispatch(Grok, ...)` returning
-/// `Ok(default())` would produce an empty `output` field and fail the
-/// `contains(marker)` assertion.
+/// own stdout line, then echoes the prompt read from the `--prompt-file`
+/// arg. The marker is the known-bad discriminator — a stub
+/// `dispatch(Grok, ...)` returning `Ok(default())` would produce an empty
+/// `output` field and fail the `contains(marker)` assertion.
+///
+/// GrokRunner delivers the prompt via `--prompt-file <path>` with stdin set
+/// to null (grok's `-p/--single` takes an inline value and ignores stdin), so
+/// the mock reads the file rather than `cat`-ing stdin.
 ///
 /// Output shape (one per line):
 /// ```text
 /// MARKER
 /// argv: --some-flag
 /// argv: some-value
-/// argv: -p
-/// PROMPT: <stdin contents>
+/// argv: --prompt-file
+/// argv: /tmp/task-mgr-prompt-XXXX.txt
+/// PROMPT: <prompt-file contents>
 /// ```
 ///
 /// Tests can then assert on substring presence/absence to verify flag
@@ -115,8 +120,14 @@ fn make_argv_echo_script(name: &str, marker: &str) -> ScriptGuard {
         let mut f = std::fs::File::create(&path).expect("create grok mock");
         writeln!(f, "#!/bin/sh").unwrap();
         writeln!(f, r#"echo "{marker}""#).unwrap();
+        writeln!(f, "PROMPT=''").unwrap();
         writeln!(f, r#"for a in "$@"; do echo "argv: $a"; done"#).unwrap();
-        writeln!(f, r#"PROMPT=$(cat)"#).unwrap();
+        writeln!(f, "while [ $# -gt 0 ]; do").unwrap();
+        writeln!(f, "  case \"$1\" in").unwrap();
+        writeln!(f, "    --prompt-file) PROMPT=$(cat \"$2\"); shift 2 ;;").unwrap();
+        writeln!(f, "    *) shift ;;").unwrap();
+        writeln!(f, "  esac").unwrap();
+        writeln!(f, "done").unwrap();
         writeln!(f, r#"echo "PROMPT: $PROMPT""#).unwrap();
     }
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))

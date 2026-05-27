@@ -28,7 +28,7 @@ use task_mgr::loop_engine::runner::RunnerKind;
 /// Grok model id expected after promotion. Matches `FallbackRunnerConfig::default`
 /// behaviour exercised by `runtime_error_fallback.rs`; pinned here so a rename
 /// propagates to compile errors across both files.
-const GROK_DEFAULT_MODEL: &str = "grok-4-fast";
+const GROK_DEFAULT_MODEL: &str = "grok-build";
 
 /// Number of consecutive failures at which the Grok promotion branch fires.
 /// Must match `FALLBACK_THRESHOLD` in `runtime_error_fallback.rs` (both

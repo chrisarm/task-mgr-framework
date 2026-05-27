@@ -11,7 +11,7 @@
 //!     rung 4 and lands on `Blocked` (no re-promote, no second tasks.model
 //!     UPDATE).
 //!   * `RecoveryAction::FallbackToProvider` serde shape:
-//!     `{"action":"fallback_to_provider","provider":"grok","model":"grok-4-fast"}`.
+//!     `{"action":"fallback_to_provider","provider":"grok","model":"grok-build"}`.
 
 use std::path::Path;
 
@@ -28,7 +28,7 @@ use task_mgr::loop_engine::runner::RunnerKind;
 /// PRD-mandated default Grok model id for the fallback rung. Pinned to the
 /// literal because `model.rs` does not yet expose a `GROK_DEFAULT_MODEL`
 /// constant — FEAT-002 will add it.
-const GROK_DEFAULT_MODEL: &str = "grok-4-fast";
+const GROK_DEFAULT_MODEL: &str = "grok-build";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -384,5 +384,5 @@ fn user_message_fallback_to_provider_exact_string() {
 #[test]
 fn test_file_compiles_marker() {
     assert_eq!(OPUS_MODEL_1M, OPUS_MODEL_1M);
-    assert_eq!(GROK_DEFAULT_MODEL, "grok-4-fast");
+    assert_eq!(GROK_DEFAULT_MODEL, "grok-build");
 }
