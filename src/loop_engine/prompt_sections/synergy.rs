@@ -59,10 +59,16 @@ pub fn synergy_spec() -> SectionSpec {
 /// through `model::resolve_task_model` so `difficulty=high → opus` and the
 /// `prd_default` / project / user default chain continue to work.
 ///
+/// `task_id` is threaded into the resolution context for `byIdPrefix` matching
+/// in the primary runner config (rung 2 of `resolve_task_model`). `task_type`
+/// and `primary_runner` propagate via the `defaults` spread — callers that
+/// populate those fields in `defaults` (e.g. `sequential::build_prompt`)
+/// automatically benefit from primary-runner routing without a signature change.
+///
 /// Signature preserved so call sites in `prompt.rs` do not change.
 pub(crate) fn resolve_synergy_cluster(
     _conn: &Connection,
-    _task_id: &str,
+    task_id: &str,
     primary_model: Option<&str>,
     primary_difficulty: Option<&str>,
     defaults: &model::ModelResolutionContext<'_>,
@@ -70,6 +76,7 @@ pub(crate) fn resolve_synergy_cluster(
     let resolved_model = model::resolve_task_model(&model::ModelResolutionContext {
         task_model: primary_model,
         difficulty: primary_difficulty,
+        task_id: Some(task_id),
         ..*defaults
     })
     .filter(|m| !m.trim().is_empty());
