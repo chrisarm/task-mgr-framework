@@ -1,7 +1,3 @@
-// CONTRACT-001: overflow::handle_prompt_too_long is #[deprecated] (relocated to
-// reactions::post_output::handle_overflow). These tests drive the leaf directly;
-// allow the transition shim until FEAT-006 relocates the body.
-#![allow(deprecated)]
 //! Integration tests for the overflow rung 4 — `RecoveryAction::FallbackToProvider`.
 //!
 //! Coverage:
@@ -24,11 +20,12 @@ use tempfile::TempDir;
 
 use task_mgr::loop_engine::engine::IterationContext;
 use task_mgr::loop_engine::model::{OPUS_MODEL_1M, SONNET_MODEL};
-use task_mgr::loop_engine::overflow::{self, OverflowEvent, RecoveryAction};
+use task_mgr::loop_engine::overflow::{OverflowEvent, RecoveryAction};
 use task_mgr::loop_engine::project_config::{
     FallbackRunnerConfig, PrimaryRunnerConfig, ProjectConfig,
 };
 use task_mgr::loop_engine::prompt::PromptResult;
+use task_mgr::loop_engine::reactions::post_output::{HandleOverflowParams, handle_overflow};
 use task_mgr::loop_engine::runner::RunnerKind;
 
 /// PRD-mandated default Grok model id for the fallback rung. Pinned to the
@@ -132,20 +129,20 @@ fn fallback_disabled_walks_existing_four_rung_to_blocked() {
     let project_cfg = ProjectConfig::default();
     let model_before = task_model(&conn, task_id);
 
-    let action = overflow::handle_prompt_too_long(
-        &mut ctx,
-        &mut conn,
-        task_id,
-        Some("high"),
-        Some(OPUS_MODEL_1M),
-        &pr,
-        1,
-        Some("run-disabled"),
-        tmp.path(),
-        None,
-        RunnerKind::Claude,
-        &project_cfg,
-    );
+    let action = handle_overflow(HandleOverflowParams {
+        ctx: &mut ctx,
+        conn: &mut conn,
+        task_id: task_id,
+        effort: Some("high"),
+        effective_model: Some(OPUS_MODEL_1M),
+        prompt_result: &pr,
+        iteration: 1,
+        run_id: Some("run-disabled"),
+        base_dir: tmp.path(),
+        slot_index: None,
+        effective_runner: RunnerKind::Claude,
+        project_config: &project_cfg,
+    });
 
     assert!(
         matches!(action, RecoveryAction::Blocked),
@@ -196,20 +193,20 @@ fn fallback_absent_matches_disabled_byte_for_byte() {
     let pr = make_prompt_result(task_id);
     let project_cfg = ProjectConfig::default();
 
-    let action = overflow::handle_prompt_too_long(
-        &mut ctx,
-        &mut conn,
-        task_id,
-        Some("high"),
-        Some(OPUS_MODEL_1M),
-        &pr,
-        1,
-        None,
-        tmp.path(),
-        None,
-        RunnerKind::Claude,
-        &project_cfg,
-    );
+    let action = handle_overflow(HandleOverflowParams {
+        ctx: &mut ctx,
+        conn: &mut conn,
+        task_id: task_id,
+        effort: Some("high"),
+        effective_model: Some(OPUS_MODEL_1M),
+        prompt_result: &pr,
+        iteration: 1,
+        run_id: None,
+        base_dir: tmp.path(),
+        slot_index: None,
+        effective_runner: RunnerKind::Claude,
+        project_config: &project_cfg,
+    });
 
     assert!(
         matches!(action, RecoveryAction::Blocked),
@@ -232,20 +229,20 @@ fn fallback_enabled_claude_at_ceiling_promotes_to_grok() {
     let pr = make_prompt_result(task_id);
     let project_cfg = enabled_fallback_cfg();
 
-    let action = overflow::handle_prompt_too_long(
-        &mut ctx,
-        &mut conn,
-        task_id,
-        Some("high"),
-        Some(OPUS_MODEL_1M),
-        &pr,
-        1,
-        Some("run-promote"),
-        tmp.path(),
-        None,
-        RunnerKind::Claude,
-        &project_cfg,
-    );
+    let action = handle_overflow(HandleOverflowParams {
+        ctx: &mut ctx,
+        conn: &mut conn,
+        task_id: task_id,
+        effort: Some("high"),
+        effective_model: Some(OPUS_MODEL_1M),
+        prompt_result: &pr,
+        iteration: 1,
+        run_id: Some("run-promote"),
+        base_dir: tmp.path(),
+        slot_index: None,
+        effective_runner: RunnerKind::Claude,
+        project_config: &project_cfg,
+    });
 
     assert!(
         matches!(
@@ -307,20 +304,20 @@ fn fallback_enabled_task_already_on_grok_returns_blocked() {
     ctx.runner_overrides
         .insert(task_id.to_string(), RunnerKind::Grok);
 
-    let action = overflow::handle_prompt_too_long(
-        &mut ctx,
-        &mut conn,
-        task_id,
-        Some("high"),
-        Some(GROK_DEFAULT_MODEL),
-        &pr,
-        1,
-        None,
-        tmp.path(),
-        None,
-        RunnerKind::Grok,
-        &project_cfg,
-    );
+    let action = handle_overflow(HandleOverflowParams {
+        ctx: &mut ctx,
+        conn: &mut conn,
+        task_id: task_id,
+        effort: Some("high"),
+        effective_model: Some(GROK_DEFAULT_MODEL),
+        prompt_result: &pr,
+        iteration: 1,
+        run_id: None,
+        base_dir: tmp.path(),
+        slot_index: None,
+        effective_runner: RunnerKind::Grok,
+        project_config: &project_cfg,
+    });
 
     assert!(
         matches!(action, RecoveryAction::Blocked),
@@ -378,20 +375,20 @@ fn grok_primary_overflow_with_claude_fallback_promotes_to_claude() {
     let pr = make_prompt_result(task_id);
     let project_cfg = primary_runner_cfg(Some(SONNET_MODEL), false);
 
-    let action = overflow::handle_prompt_too_long(
-        &mut ctx,
-        &mut conn,
-        task_id,
-        Some("high"),
-        Some(GROK_DEFAULT_MODEL),
-        &pr,
-        1,
-        Some("run-inverse"),
-        tmp.path(),
-        None,
-        RunnerKind::Grok,
-        &project_cfg,
-    );
+    let action = handle_overflow(HandleOverflowParams {
+        ctx: &mut ctx,
+        conn: &mut conn,
+        task_id: task_id,
+        effort: Some("high"),
+        effective_model: Some(GROK_DEFAULT_MODEL),
+        prompt_result: &pr,
+        iteration: 1,
+        run_id: Some("run-inverse"),
+        base_dir: tmp.path(),
+        slot_index: None,
+        effective_runner: RunnerKind::Grok,
+        project_config: &project_cfg,
+    });
 
     assert!(
         matches!(
@@ -449,20 +446,20 @@ fn grok_primary_overflow_without_claude_fallback_blocks() {
     let pr = make_prompt_result(task_id);
     let project_cfg = primary_runner_cfg(None, false);
 
-    let action = overflow::handle_prompt_too_long(
-        &mut ctx,
-        &mut conn,
-        task_id,
-        Some("high"),
-        Some(GROK_DEFAULT_MODEL),
-        &pr,
-        1,
-        None,
-        tmp.path(),
-        None,
-        RunnerKind::Grok,
-        &project_cfg,
-    );
+    let action = handle_overflow(HandleOverflowParams {
+        ctx: &mut ctx,
+        conn: &mut conn,
+        task_id: task_id,
+        effort: Some("high"),
+        effective_model: Some(GROK_DEFAULT_MODEL),
+        prompt_result: &pr,
+        iteration: 1,
+        run_id: None,
+        base_dir: tmp.path(),
+        slot_index: None,
+        effective_runner: RunnerKind::Grok,
+        project_config: &project_cfg,
+    });
 
     assert!(
         matches!(action, RecoveryAction::Blocked),
@@ -492,20 +489,20 @@ fn claude_to_grok_byte_identical_when_primary_runner_none() {
     let project_cfg = enabled_fallback_cfg();
     assert!(project_cfg.primary_runner.is_none());
 
-    let action = overflow::handle_prompt_too_long(
-        &mut ctx,
-        &mut conn,
-        task_id,
-        Some("high"),
-        Some(OPUS_MODEL_1M),
-        &pr,
-        1,
-        Some("run-regress"),
-        tmp.path(),
-        None,
-        RunnerKind::Claude,
-        &project_cfg,
-    );
+    let action = handle_overflow(HandleOverflowParams {
+        ctx: &mut ctx,
+        conn: &mut conn,
+        task_id: task_id,
+        effort: Some("high"),
+        effective_model: Some(OPUS_MODEL_1M),
+        prompt_result: &pr,
+        iteration: 1,
+        run_id: Some("run-regress"),
+        base_dir: tmp.path(),
+        slot_index: None,
+        effective_runner: RunnerKind::Claude,
+        project_config: &project_cfg,
+    });
 
     assert!(
         matches!(
@@ -545,21 +542,21 @@ fn grok_to_claude_promoted_task_overflows_again_blocks() {
     ctx.model_overrides
         .insert(task_id.to_string(), OPUS_MODEL_1M.to_string());
 
-    let action = overflow::handle_prompt_too_long(
-        &mut ctx,
-        &mut conn,
-        task_id,
-        Some("high"),
-        Some(OPUS_MODEL_1M),
-        &pr,
-        1,
-        None,
-        tmp.path(),
-        None,
-        // Post-promotion the task runs on Claude.
+    let action = handle_overflow(HandleOverflowParams {
+        ctx: &mut ctx,
+        conn: &mut conn,
+        task_id: task_id,
+        effort: Some("high"),
+        effective_model: Some(OPUS_MODEL_1M),
+        prompt_result: &pr,
+        iteration: 1,
+        run_id: None,
+        base_dir: tmp.path(),
+        slot_index: None,
+        effective_runner: // Post-promotion the task runs on Claude.
         RunnerKind::Claude,
-        &project_cfg,
-    );
+        project_config: &project_cfg,
+    });
 
     assert!(
         matches!(action, RecoveryAction::Blocked),
@@ -591,20 +588,20 @@ fn claude_to_grok_promoted_task_with_primary_runner_blocks() {
     ctx.model_overrides
         .insert(task_id.to_string(), GROK_DEFAULT_MODEL.to_string());
 
-    let action = overflow::handle_prompt_too_long(
-        &mut ctx,
-        &mut conn,
-        task_id,
-        Some("high"),
-        Some(GROK_DEFAULT_MODEL),
-        &pr,
-        1,
-        None,
-        tmp.path(),
-        None,
-        RunnerKind::Grok,
-        &project_cfg,
-    );
+    let action = handle_overflow(HandleOverflowParams {
+        ctx: &mut ctx,
+        conn: &mut conn,
+        task_id: task_id,
+        effort: Some("high"),
+        effective_model: Some(GROK_DEFAULT_MODEL),
+        prompt_result: &pr,
+        iteration: 1,
+        run_id: None,
+        base_dir: tmp.path(),
+        slot_index: None,
+        effective_runner: RunnerKind::Grok,
+        project_config: &project_cfg,
+    });
 
     assert!(
         matches!(action, RecoveryAction::Blocked),

@@ -13,12 +13,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-
-use crate::loop_engine::project_config::ProjectConfig;
-use crate::loop_engine::prompt::PromptResult;
-use crate::loop_engine::runner::RunnerKind;
 
 /// Recovery action chosen by
 /// [`crate::loop_engine::reactions::post_output::handle_overflow`] for a given
@@ -334,61 +329,6 @@ pub fn rotate_dumps_keep_n(dir: &Path, sanitized_task_id: &str, keep: usize) -> 
     }
 
     Ok(())
-}
-
-/// Deprecated shim — the overflow recovery body was physically relocated to
-/// [`crate::loop_engine::reactions::post_output::handle_overflow`] (FEAT-005,
-/// CONTRACT-001 single-home reaction lock). This wrapper preserves the original
-/// twelve-argument signature so direct callers keep working — the
-/// `tests/overflow_*.rs` / `tests/grok_to_claude_fallback.rs` equivalence-oracle
-/// suites drive it under `#[allow(deprecated)]` — and simply forwards to the
-/// coordinator, which now owns the five-rung ladder, the ctx/DB mutations, the
-/// `FallbackToProvider` promotion, and the diagnostics bundle.
-///
-/// The three engine files (`iteration.rs`, `slot.rs`, `wave_scheduler.rs`)
-/// carry `#![deny(deprecated)]`, so a direct call to this shim from any of them
-/// is a compile error — they must route through `handle_overflow`.
-#[allow(clippy::too_many_arguments)]
-#[deprecated(
-    note = "route through reactions::post_output::handle_overflow — CONTRACT-001 single-home \
-            reaction lock; the engine files (iteration.rs/slot.rs/wave_scheduler.rs) carry \
-            #![deny(deprecated)] so a direct call there is a compile error"
-)]
-pub fn handle_prompt_too_long(
-    ctx: &mut crate::loop_engine::engine::IterationContext,
-    conn: &mut Connection,
-    task_id: &str,
-    effort: Option<&str>,
-    effective_model: Option<&str>,
-    prompt_result: &PromptResult,
-    iteration: u32,
-    run_id: Option<&str>,
-    base_dir: &Path,
-    slot_index: Option<usize>,
-    effective_runner: RunnerKind,
-    project_config: &ProjectConfig,
-) -> RecoveryAction {
-    // Forward verbatim to the relocated coordinator (FEAT-005). All recovery
-    // logic — the five-rung ladder, the ctx/DB mutations, the
-    // `FallbackToProvider` promotion, and the diagnostics bundle — now lives in
-    // `reactions::post_output::handle_overflow`. This shim only repackages the
-    // positional arguments into the coordinator's exhaustive param struct.
-    crate::loop_engine::reactions::post_output::handle_overflow(
-        crate::loop_engine::reactions::post_output::HandleOverflowParams {
-            ctx,
-            conn,
-            task_id,
-            effort,
-            effective_model,
-            prompt_result,
-            iteration,
-            run_id,
-            base_dir,
-            slot_index,
-            effective_runner,
-            project_config,
-        },
-    )
 }
 
 #[cfg(test)]

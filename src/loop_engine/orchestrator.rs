@@ -1867,7 +1867,7 @@ fn record_session_guidance(guidance: &SessionGuidance, progress_path: &Path, yes
 }
 
 #[cfg(test)]
-#[allow(deprecated)] // FEAT-010: tests exercise the deprecated apply_status_updates / auto_block_task shims directly.
+#[allow(deprecated)] // FEAT-010: tests exercise the deprecated apply_status_updates shim directly.
 mod tests {
     use super::*;
     use crate::loop_engine::detection;

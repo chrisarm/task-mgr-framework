@@ -1,7 +1,7 @@
 //! Tests for US-006 / FR-008 — operator escape valve via explicit
 //! `tasks.model` edits invalidating in-memory auto-recovery overrides.
 //!
-//! `check_override_invalidation(ctx, conn, task_id)` is called at the top of
+//! `invalidate_stale_overrides(ctx, conn, task_id)` is called at the top of
 //! every iteration BEFORE runner dispatch. For each task with an entry in
 //! `ctx.overflow_original_task_model`, it re-reads `tasks.model` from the DB.
 //! On any divergence it clears ALL SIX per-task override entries:
@@ -16,21 +16,16 @@
 //! A task NOT present in `overflow_original_task_model` is a no-op.
 //! A no-op edit (model unchanged from snapshot) is also a no-op.
 
-// FEAT-002 relocated `check_override_invalidation` to
-// `reactions::pre_spawn::invalidate_stale_overrides`; the `engine::` re-export
-// these tests use is now a `#[deprecated]` shim. They remain the equivalence
-// oracle for the relocated body, so allow the lint until CLEANUP-001 migrates
-// them to the new home.
-#![allow(deprecated)]
+// CLEANUP-001: migrated from `engine::check_override_invalidation` (deprecated
+// shim removed) to the real function at its new home.
 
 use rusqlite::Connection;
 use tempfile::TempDir;
 
 use task_mgr::db::{create_schema, open_connection, run_migrations};
-use task_mgr::loop_engine::engine::{
-    IterationContext, check_override_invalidation, resolve_effective_runner,
-};
+use task_mgr::loop_engine::engine::{IterationContext, resolve_effective_runner};
 use task_mgr::loop_engine::model::{HAIKU_MODEL, OPUS_MODEL};
+use task_mgr::loop_engine::reactions::pre_spawn::invalidate_stale_overrides;
 use task_mgr::loop_engine::runner::RunnerKind;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -120,7 +115,7 @@ fn invalidation_clears_all_six_override_entries() {
     // Operator edits the model column out-of-band.
     set_task_model(&conn, "INVAL-001", Some(HAIKU_MODEL));
 
-    check_override_invalidation(&mut ctx, &conn, "INVAL-001");
+    invalidate_stale_overrides(&mut ctx, &conn, "INVAL-001");
 
     assert_all_overrides_cleared(&ctx, "INVAL-001");
     // OTHER-002's overrides remain intact — the call is task-scoped.
@@ -141,7 +136,7 @@ fn post_invalidation_dispatch_uses_operator_model_via_claude() {
     seed_all_overrides_for_task(&mut ctx, "INVAL-DISP-001", OPUS_MODEL);
     set_task_model(&conn, "INVAL-DISP-001", Some(HAIKU_MODEL));
 
-    check_override_invalidation(&mut ctx, &conn, "INVAL-DISP-001");
+    invalidate_stale_overrides(&mut ctx, &conn, "INVAL-DISP-001");
 
     // After clearing, no runner_override exists; haiku is a Claude model.
     let runner = resolve_effective_runner(&ctx, "INVAL-DISP-001", Some(HAIKU_MODEL));
@@ -164,7 +159,7 @@ fn no_op_when_tasks_model_matches_snapshot() {
     seed_all_overrides_for_task(&mut ctx, "NOOP-001", OPUS_MODEL);
 
     // DB still has OPUS_MODEL — snapshot matches, no-op expected.
-    check_override_invalidation(&mut ctx, &conn, "NOOP-001");
+    invalidate_stale_overrides(&mut ctx, &conn, "NOOP-001");
 
     // All six maps untouched.
     assert_eq!(ctx.effort_overrides.get("NOOP-001"), Some(&"high"));
@@ -193,7 +188,7 @@ fn null_clearing_after_snapshot_fires_invalidation() {
     // Operator clears the model column.
     set_task_model(&conn, "INVAL-NULL-001", None);
 
-    check_override_invalidation(&mut ctx, &conn, "INVAL-NULL-001");
+    invalidate_stale_overrides(&mut ctx, &conn, "INVAL-NULL-001");
 
     assert_all_overrides_cleared(&ctx, "INVAL-NULL-001");
 }
@@ -217,7 +212,7 @@ fn invalidation_emits_notice_and_clears_state() {
     set_task_model(&conn, "STDERR-001", Some(HAIKU_MODEL));
 
     // The function returns normally (no panic, no Result::Err).
-    check_override_invalidation(&mut ctx, &conn, "STDERR-001");
+    invalidate_stale_overrides(&mut ctx, &conn, "STDERR-001");
 
     // Side effect proves the invalidation branch ran (not the no-op branch).
     assert_all_overrides_cleared(&ctx, "STDERR-001");
@@ -235,7 +230,7 @@ fn no_op_when_task_not_in_overflow_original_task_model() {
     let mut ctx = IterationContext::new(5);
     // Intentionally do NOT seed any overrides.
 
-    check_override_invalidation(&mut ctx, &conn, "ABSENT-001");
+    invalidate_stale_overrides(&mut ctx, &conn, "ABSENT-001");
 
     assert!(ctx.runner_overrides.is_empty());
     assert!(ctx.overflow_original_task_model.is_empty());
