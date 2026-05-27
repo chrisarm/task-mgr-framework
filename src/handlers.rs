@@ -148,7 +148,7 @@ pub fn output_result<T: serde::Serialize + TextFormattable>(result: &T, format: 
             output_json(result);
         }
         OutputFormat::Text => {
-            print!("{}", result.format_text());
+            write_stdout(&result.format_text());
         }
     }
 }
@@ -163,7 +163,7 @@ pub fn output_migrate_result(result: &MigrateResult, format: OutputFormat, actio
             output_json(result);
         }
         OutputFormat::Text => {
-            print!("{}", format_migrate_text(result, action));
+            write_stdout(&format_migrate_text(result, action));
         }
     }
 }
@@ -197,12 +197,66 @@ pub fn convert_run_end_status(status: crate::cli::RunEndStatus) -> RunStatus {
 /// cause issues in automated pipelines.
 pub fn output_json<T: serde::Serialize>(result: &T) {
     match serde_json::to_string_pretty(result) {
-        Ok(json) => println!("{}", json),
+        Ok(json) => write_stdout(&format!("{}\n", json)),
         Err(e) => {
             eprintln!("Error: failed to serialize result to JSON: {}", e);
             process::exit(1);
         }
     }
+}
+
+// ============================================================================
+// Panic-safe stdout writes
+// ============================================================================
+
+/// Clear `O_NONBLOCK` on `fd` if it is set.
+///
+/// A child process (Node/libuv `claude`) can flip our stdout's open file
+/// description to non-blocking via an inherited, aliased fd: `2>&1` makes our
+/// fd 1 and fd 2 share one OFD, the child inherits fd 2 and marks it
+/// `O_NONBLOCK`, and the flag lives on the shared OFD. A later large write on
+/// our stdout then returns `EAGAIN`. Clearing the flag up front lets the write
+/// block normally instead.
+fn clear_nonblocking(fd: libc::c_int) {
+    // SAFETY: F_GETFL / F_SETFL on a valid fd take no pointers and only read or
+    // write the fd's status flags; we clear a single bit and ignore the result.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 && (flags & libc::O_NONBLOCK) != 0 {
+            let _ = libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
+        }
+    }
+}
+
+/// Write all of `bytes` to `w` (backed by `fd`) without panicking.
+///
+/// Clears `O_NONBLOCK` on `fd` first so the write blocks instead of returning
+/// `EAGAIN` (see [`clear_nonblocking`]); swallows `BrokenPipe` (the reader went
+/// away — nothing useful to do); exits with code 1 on any other write error.
+///
+/// We deliberately do NOT catch `WouldBlock` and retry the buffer: `write_all`
+/// may have already flushed an unknown prefix before erroring, so re-writing
+/// `bytes` would duplicate output. The proactive flag clear avoids the need.
+fn write_all_blocking<W: io::Write>(fd: libc::c_int, w: &mut W, bytes: &[u8]) {
+    clear_nonblocking(fd);
+    match w.write_all(bytes).and_then(|_| w.flush()) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {}
+        Err(e) => {
+            eprintln!("Error: failed to write to stdout: {}", e);
+            process::exit(1);
+        }
+    }
+}
+
+/// Write `s` to stdout without panicking on a transient `EAGAIN`.
+fn write_stdout(s: &str) {
+    use std::os::fd::AsRawFd;
+
+    let stdout = io::stdout();
+    let mut lock = stdout.lock();
+    let fd = lock.as_raw_fd();
+    write_all_blocking(fd, &mut lock, s.as_bytes());
 }
 
 // ============================================================================
@@ -370,4 +424,120 @@ pub fn generate_completions(shell: Shell) {
     let completion_shell = convert_shell(shell);
     let mut cmd = Cli::command();
     generate(completion_shell, &mut cmd, "task-mgr", &mut io::stdout());
+}
+
+#[cfg(test)]
+mod stdout_write_tests {
+    use super::{clear_nonblocking, write_all_blocking};
+    use std::fs::File;
+    use std::io::{Read, Write};
+    use std::os::fd::FromRawFd;
+    use std::thread;
+
+    /// Create a pipe, returning (read_fd, write_fd). Linux default buffer is 64 KB.
+    fn make_pipe() -> (libc::c_int, libc::c_int) {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: pipe() writes two valid fds into the 2-element array we provide.
+        let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(rc, 0, "pipe() failed");
+        (fds[0], fds[1])
+    }
+
+    fn set_nonblocking(fd: libc::c_int) {
+        // SAFETY: F_GETFL/F_SETFL on a valid fd; we set a single status-flag bit.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            assert!(flags >= 0, "F_GETFL failed");
+            assert_eq!(libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK), 0);
+        }
+    }
+
+    fn nonblock_bit(fd: libc::c_int) -> libc::c_int {
+        // SAFETY: F_GETFL on a valid fd reads its status flags, takes no pointers.
+        unsafe { libc::fcntl(fd, libc::F_GETFL) & libc::O_NONBLOCK }
+    }
+
+    const PAYLOAD_LEN: usize = 128 * 1024; // > 64 KB pipe buffer
+
+    #[test]
+    fn clear_nonblocking_clears_the_flag() {
+        let (read_fd, write_fd) = make_pipe();
+        set_nonblocking(write_fd);
+        assert_ne!(nonblock_bit(write_fd), 0, "precondition: O_NONBLOCK set");
+
+        clear_nonblocking(write_fd);
+
+        assert_eq!(nonblock_bit(write_fd), 0, "O_NONBLOCK should be cleared");
+        // SAFETY: both fds are open and owned by this test; close once each.
+        unsafe {
+            libc::close(read_fd);
+            libc::close(write_fd);
+        }
+    }
+
+    #[test]
+    fn write_all_blocking_delivers_full_payload_over_nonblocking_pipe() {
+        let (read_fd, write_fd) = make_pipe();
+        set_nonblocking(write_fd);
+
+        // Reader thread owns the read end (closes it on drop) and drains until EOF.
+        let reader = thread::spawn(move || {
+            // SAFETY: read_fd is a fresh pipe fd moved into this thread; File owns it.
+            let mut rf = unsafe { File::from_raw_fd(read_fd) };
+            let mut buf = Vec::new();
+            rf.read_to_end(&mut buf).expect("reader failed");
+            buf.len()
+        });
+
+        // SAFETY: write_fd is a fresh pipe fd; File owns it and closes on drop.
+        let mut wf = unsafe { File::from_raw_fd(write_fd) };
+        let payload = vec![0xABu8; PAYLOAD_LEN];
+        write_all_blocking(write_fd, &mut wf, &payload);
+        drop(wf); // EOF for the reader
+
+        let total = reader.join().expect("reader thread panicked");
+        assert_eq!(total, PAYLOAD_LEN, "all bytes must be delivered");
+    }
+
+    #[test]
+    fn raw_write_all_wouldblock_recreates_the_bug() {
+        // Negative control: prove the regression mechanism. With O_NONBLOCK set and
+        // no reader draining, a raw write_all of a >64 KB payload must WouldBlock.
+        let (read_fd, write_fd) = make_pipe();
+        set_nonblocking(write_fd);
+
+        // SAFETY: write_fd is a fresh pipe fd; File owns it and closes on drop.
+        let mut wf = unsafe { File::from_raw_fd(write_fd) };
+        let payload = vec![0u8; PAYLOAD_LEN];
+        let err = wf
+            .write_all(&payload)
+            .expect_err("write_all should block-fail on a full non-blocking pipe");
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+
+        // SAFETY: read_fd is open and owned here; wf closes write_fd on drop.
+        unsafe { libc::close(read_fd) };
+    }
+
+    #[test]
+    fn write_all_blocking_swallows_broken_pipe() {
+        let (read_fd, write_fd) = make_pipe();
+        // Close the read end first so the write hits EPIPE -> BrokenPipe.
+        // (Rust's runtime ignores SIGPIPE, so this surfaces as an error, not a signal.)
+        // SAFETY: read_fd is open and owned by this test.
+        unsafe { libc::close(read_fd) };
+
+        // SAFETY: write_fd is a fresh pipe fd; File owns it and closes on drop.
+        let mut wf = unsafe { File::from_raw_fd(write_fd) };
+        // Returns quietly (no panic, no process::exit) — the test surviving proves it.
+        write_all_blocking(write_fd, &mut wf, &vec![0u8; 1024]);
+    }
+
+    #[test]
+    fn write_all_blocking_attempts_write_when_fgetfl_fails() {
+        // fd -1 makes clear_nonblocking's F_GETFL return -1; it must not panic and
+        // the write must still proceed against the provided writer.
+        let mut sink: Vec<u8> = Vec::new();
+        write_all_blocking(-1, &mut sink, b"hello");
+        assert_eq!(sink, b"hello");
+    }
 }
