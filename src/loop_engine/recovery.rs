@@ -504,8 +504,14 @@ pub fn handle_task_failure(
         // model would never be used.
         let mut pending_promotion: Option<PendingPromotion> = None;
         if !should_auto_block(new_count, max_retries) {
-            match escalate_task_model_if_needed_inner(&tx, task_id, new_count, ctx, cfg, primary_cfg)
-            {
+            match escalate_task_model_if_needed_inner(
+                &tx,
+                task_id,
+                new_count,
+                ctx,
+                cfg,
+                primary_cfg,
+            ) {
                 Ok((_model, promotion)) => {
                     pending_promotion = promotion;
                 }
@@ -1381,7 +1387,8 @@ mod tests {
         .unwrap();
 
         let mut ctx = IterationContext::new(8);
-        let result = escalate_task_model_if_needed(&conn, "T-001", 2, &mut ctx, None, None).unwrap();
+        let result =
+            escalate_task_model_if_needed(&conn, "T-001", 2, &mut ctx, None, None).unwrap();
         assert_eq!(
             result,
             Some(OPUS_MODEL.to_string()),
@@ -1410,7 +1417,8 @@ mod tests {
         .unwrap();
 
         let mut ctx = IterationContext::new(8);
-        let result = escalate_task_model_if_needed(&conn, "T-001", 2, &mut ctx, None, None).unwrap();
+        let result =
+            escalate_task_model_if_needed(&conn, "T-001", 2, &mut ctx, None, None).unwrap();
         assert_eq!(
             result,
             Some(OPUS_MODEL.to_string()),
@@ -1439,7 +1447,8 @@ mod tests {
         .unwrap();
 
         let mut ctx = IterationContext::new(8);
-        let result = escalate_task_model_if_needed(&conn, "T-001", 2, &mut ctx, None, None).unwrap();
+        let result =
+            escalate_task_model_if_needed(&conn, "T-001", 2, &mut ctx, None, None).unwrap();
         assert_eq!(
             result,
             Some(OPUS_MODEL.to_string()),
@@ -1468,7 +1477,8 @@ mod tests {
         .unwrap();
 
         let mut ctx = IterationContext::new(8);
-        let result = escalate_task_model_if_needed(&conn, "T-001", 1, &mut ctx, None, None).unwrap();
+        let result =
+            escalate_task_model_if_needed(&conn, "T-001", 1, &mut ctx, None, None).unwrap();
         assert_eq!(result, None, "no escalation at 1 failure (threshold is 2)");
         let model: Option<String> = conn
             .query_row("SELECT model FROM tasks WHERE id = 'T-001'", [], |r| {

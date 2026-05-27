@@ -781,10 +781,7 @@ impl LlmRunner for GrokRunner {
         // streaming-json` standalone and rejects `--verbose` (its only
         // near-match is `-v/--version`).
         let mut args: Vec<String> = if stream_json {
-            vec![
-                "--output-format".to_string(),
-                "streaming-json".to_string(),
-            ]
+            vec!["--output-format".to_string(), "streaming-json".to_string()]
         } else {
             Vec::new()
         };
@@ -1106,10 +1103,12 @@ fn write_prompt_to_tempfile(
     provider_label: &str,
 ) -> TaskMgrResult<tempfile::NamedTempFile> {
     use std::io::Write;
-    let ctx = |operation: String| move |e: std::io::Error| TaskMgrError::IoErrorWithContext {
-        file_path: binary.to_string(),
-        operation,
-        source: e,
+    let ctx = |operation: String| {
+        move |e: std::io::Error| TaskMgrError::IoErrorWithContext {
+            file_path: binary.to_string(),
+            operation,
+            source: e,
+        }
     };
     let mut file = tempfile::Builder::new()
         .prefix("task-mgr-prompt-")
@@ -1834,7 +1833,13 @@ mod tests {
     #[test]
     fn runner_kind_supports_matches_trait_impls() {
         use RunnerCapability::*;
-        for cap in [Effort, StreamJson, Pty, DisallowedTools, TitleArtifactCleanup] {
+        for cap in [
+            Effort,
+            StreamJson,
+            Pty,
+            DisallowedTools,
+            TitleArtifactCleanup,
+        ] {
             assert_eq!(
                 RunnerKind::Claude.supports(cap),
                 ClaudeRunner.supports(cap),

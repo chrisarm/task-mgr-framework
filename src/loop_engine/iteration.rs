@@ -55,11 +55,11 @@ use crate::loop_engine::recovery::{
     check_crash_escalation, check_override_invalidation, probe_rate_limit_lifted,
     prompt_overflow_result, update_trackers,
 };
-use crate::loop_engine::wave_scheduler::classify_drained_queue;
 use crate::loop_engine::runner;
 use crate::loop_engine::signals;
 use crate::loop_engine::usage::{self, UsageCheckResult};
 use crate::loop_engine::watchdog;
+use crate::loop_engine::wave_scheduler::classify_drained_queue;
 
 /// Run a single iteration of the agent loop.
 ///

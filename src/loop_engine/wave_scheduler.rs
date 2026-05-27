@@ -59,9 +59,9 @@ use crate::loop_engine::engine::{
 use crate::loop_engine::git_reconcile::{
     reconcile_external_git_completions, reconcile_merged_slot_completions,
 };
-use crate::loop_engine::prd_reconcile::reconcile_passes_with_db;
 use crate::loop_engine::merge_resolver;
 use crate::loop_engine::model;
+use crate::loop_engine::prd_reconcile::reconcile_passes_with_db;
 use crate::loop_engine::progress;
 use crate::loop_engine::prompt;
 use crate::loop_engine::recovery::{check_override_invalidation, handle_task_failure};
@@ -1814,7 +1814,10 @@ mod tests {
             &mut ctx,
         );
         let t = outcome.terminal.expect("terminal expected");
-        assert_eq!(t.exit_code, 1, "blocked/skipped must downgrade exit, got {t:?}");
+        assert_eq!(
+            t.exit_code, 1,
+            "blocked/skipped must downgrade exit, got {t:?}"
+        );
         assert!(t.reason.contains("blocked"), "got: {}", t.reason);
         assert!(t.reason.contains("skipped"), "got: {}", t.reason);
         assert!(matches!(t.run_status, Some(RunStatus::Aborted)));
