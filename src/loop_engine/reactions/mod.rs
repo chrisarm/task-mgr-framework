@@ -60,18 +60,16 @@ pub mod pre_spawn;
 // ---------------------------------------------------------------------------
 // Shared iteration-budget accounting (#13) — converged by FEAT-013.
 //
-// The loop bound is `orchestrator.rs:918` `while iteration < max_iterations`
-// with a top-of-pass increment (`:920`). A `RateLimit` / `Reorder` /
+// The loop bound is `orchestrator.rs:916` `while iteration < max_iterations`
+// with a top-of-pass increment (`:917`). A `RateLimit` / `Reorder` /
 // `TransientBackend` (WaitedAndRetry) outcome must give that increment back so
 // a persistently rate-limited / unavailable run does not burn its
 // `max_iterations` budget on waits — bounded termination then relies on the
-// `.stop`/signal check, NOT the iteration ceiling. The sequential path does
-// `iteration -= 1` (orchestrator.rs RateLimit arm) and the wave path does
+// `.stop`/signal check, NOT the iteration ceiling. The sequential path used to
+// do `iteration -= 1` (orchestrator.rs RateLimit arm) and the wave path
 // `iteration = iteration.saturating_sub(1)` (the `iteration_consumed == false`
 // branch); FEAT-013 routes BOTH through this one helper so the two paths
-// cannot drift on the budget rule. The body below is a TDD scaffold
-// (`unimplemented!`): TEST-INIT-004 pins the contract via the ignored tests in
-// `tests/reaction_parity.rs`; FEAT-013 fills it in and un-ignores them.
+// cannot drift on the budget rule.
 // ---------------------------------------------------------------------------
 
 /// Inputs to [`account_iteration_budget`]. Destructured exhaustively (no `..`).
@@ -95,16 +93,23 @@ pub struct IterationBudgetParams<'a> {
 ///   unchanged.
 /// - `consumes_budget == true` ⇒ advance `iterations_completed`; leave the
 ///   loop-bound `iteration` (already incremented at the loop top) unchanged.
-#[allow(dead_code)] // wired into both paths by FEAT-013
 pub fn account_iteration_budget(params: IterationBudgetParams<'_>) {
-    let _ = params;
-    unimplemented!(
-        "FEAT-013: destructure IterationBudgetParams exhaustively; when \
-         consumes_budget is false give the loop-bound iteration back \
-         (*iteration = iteration.saturating_sub(1)) and leave \
-         iterations_completed unchanged; when true increment \
-         iterations_completed and leave iteration unchanged. One home for the \
-         sequential `iteration -= 1` and the wave give-back so the two paths \
-         cannot drift on the budget rule."
-    )
+    // Exhaustive destructure (no `..`) — the CONTRACT-001 parity lock: a new
+    // budget field forces every accounting decision back through this body.
+    let IterationBudgetParams {
+        iteration,
+        iterations_completed,
+        consumes_budget,
+    } = params;
+    if consumes_budget {
+        // Consuming outcome: the loop-bound `iteration` was already advanced at
+        // the loop top; only the reported stat moves.
+        *iterations_completed += 1;
+    } else {
+        // Give-back outcome (RateLimit / Reorder / WaitedAndRetry): return the
+        // top-of-pass increment so a persistently unavailable backend doesn't
+        // burn its `max_iterations` budget on waits. `saturating_sub` is a
+        // floor guard — the loop top guarantees `*iteration >= 1` here.
+        *iteration = iteration.saturating_sub(1);
+    }
 }

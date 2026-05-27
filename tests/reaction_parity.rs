@@ -2358,7 +2358,6 @@ fn known_bad_db_scan_review_fires_for_out_of_set_task() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "unblocked by FEAT-013: account_iteration_budget body"]
 fn budget_rate_limit_wave_does_not_consume_iteration_on_both_shapes() {
     // Sequential shape: the orchestrator RateLimit arm gives the loop-bound
     // iteration back (`iteration -= 1`) and does NOT bump iterations_completed.
@@ -2424,7 +2423,6 @@ fn budget_rate_limit_wave_does_not_consume_iteration_on_both_shapes() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "unblocked by FEAT-013: account_iteration_budget body"]
 fn budget_persistent_rate_limit_terminates_on_stop_not_max_iterations() {
     let max_iterations = 3u32;
     let stop_after = 7u32; // .stop arrives on the 7th pass — past max_iterations

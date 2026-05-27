@@ -309,7 +309,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": false,
       "notes": "B2 confirmed: orchestrator.rs:918 `while iteration < max_iterations`, :919 increments at top, sequential :1256 `iteration -= 1`; wave branch must also give back the loop-bound iteration. react_to_completions is input-driven to preserve wave ordering (wave_scheduler.rs:1172 before :1196).",
-      "passes": false,
+      "passes": true,
       "priority": 5,
       "qualityDimensions": [
         "Budget no-consumption must be proven against the loop-bound counter, not just the stat",
@@ -549,7 +549,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": true,
       "notes": "Account-global: fire once per wave, not per slot (avoids N redundant API/DB checks). Reuse the injected-wait seam pattern for hermeticity. Opus because modifiesBehavior:true (rubric).",
-      "passes": false,
+      "passes": true,
       "priority": 9,
       "qualityDimensions": [
         "Gate fires once per wave (account-global), not per slot",
@@ -645,7 +645,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": true,
       "notes": "Behavior ADDITION to wave mode: requires_human tasks now spawn review sessions in wave; review may fire on a partial WaitedAndRetry wave (other ephemerals unmerged, session blocks) — document as intentional in CLAUDE.md. Input-driven to preserve ordering.",
-      "passes": false,
+      "passes": true,
       "priority": 11,
       "qualityDimensions": [
         "Input-driven (consumes completed-id set) to preserve wave intra-wave ordering",

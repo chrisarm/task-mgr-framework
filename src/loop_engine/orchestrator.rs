@@ -1017,16 +1017,18 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
             };
             let outcome = run_wave_iteration(wave_params, &mut ctx);
             tasks_completed += outcome.tasks_completed;
-            if outcome.iteration_consumed {
-                iterations_completed += 1;
-            } else {
-                // FEAT-006 B2: a non-consuming wave (the rate-limit retry) gives
-                // back the loop-bound iteration so a persistently rate-limited
-                // account doesn't burn its budget on waits. FEAT-013 will fold
-                // this give-back into a shared accounting helper alongside the
-                // sequential `iteration -= 1` (orchestrator.rs RateLimit arm).
-                iteration = iteration.saturating_sub(1);
-            }
+            // FEAT-013: the iteration-budget rule lives in one helper shared
+            // with the sequential path below. A non-consuming wave (the
+            // FEAT-006 B2 rate-limit retry) gives back the loop-bound iteration
+            // so a persistently rate-limited account doesn't burn its budget on
+            // waits; a consuming wave advances `iterations_completed`. Routing
+            // both branches through `account_iteration_budget` keeps the two
+            // execution paths from drifting on the rule.
+            reactions::account_iteration_budget(reactions::IterationBudgetParams {
+                iteration: &mut iteration,
+                iterations_completed: &mut iterations_completed,
+                consumes_budget: outcome.iteration_consumed,
+            });
             if outcome.was_stopped {
                 was_stopped = true;
             }
@@ -1298,21 +1300,20 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
         // Track iteration count (skip reorders, rate limits, and the
         // transient-backend WaitedAndRetry — all give back the iteration so a
         // persistently unavailable backend / rate-limited account doesn't burn
-        // its budget on waits).
-        match result.outcome {
+        // its budget on waits). FEAT-013: the budget rule itself lives in
+        // `account_iteration_budget`, shared with the wave path above so the
+        // give-back and the stat advance cannot drift between the two paths.
+        let consumes_budget = !matches!(
+            result.outcome,
             IterationOutcome::Reorder(_)
-            | IterationOutcome::RateLimit
-            | IterationOutcome::TransientBackend { .. } => {
-                // Don't count against iteration budget
-                iteration -= 1;
-            }
-            IterationOutcome::Completed => {
-                iterations_completed += 1;
-            }
-            _ => {
-                iterations_completed += 1;
-            }
-        }
+                | IterationOutcome::RateLimit
+                | IterationOutcome::TransientBackend { .. }
+        );
+        reactions::account_iteration_budget(reactions::IterationBudgetParams {
+            iteration: &mut iteration,
+            iterations_completed: &mut iterations_completed,
+            consumes_budget,
+        });
 
         // Retry tracking: increment consecutive_failures for non-Completed task failures.
         // Excluded: Empty (no task attempted), Reorder (not a failure), RateLimit (external).
