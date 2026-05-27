@@ -110,8 +110,8 @@ fn non_review_tasks_are_not_routed_when_review_model_is_set() {
              the predicate must be review-class-specific",
         );
         // And the baked Opus survives → Claude runner.
-        let effective_model =
-            apply_review_model_override(Some("grok-build"), task_id).or(Some(OPUS_MODEL.to_string()));
+        let effective_model = apply_review_model_override(Some("grok-build"), task_id)
+            .or(Some(OPUS_MODEL.to_string()));
         assert_eq!(
             resolve_effective_runner(&ctx, task_id, effective_model.as_deref()),
             RunnerKind::Claude,

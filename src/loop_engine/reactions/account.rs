@@ -13,26 +13,71 @@ use std::path::Path;
 use rusqlite::Connection;
 
 use crate::loop_engine::config::IterationOutcome;
-use crate::loop_engine::usage::{self, UsageCheckResult};
+use crate::loop_engine::usage::UsageCheckResult;
 
-/// Inputs to [`account_usage_gate`]. Destructured exhaustively (no `..`).
-#[allow(dead_code)] // constructed by FEAT-003/FEAT-006 wiring; scaffold under CONTRACT-001
-pub(crate) struct AccountUsageGateParams<'a> {
+/// Inputs to [`account_usage_gate`] / [`account_usage_gate_inner`].
+/// Destructured exhaustively (no `..`) by the FEAT-003 body — the single-home
+/// parity lock.
+///
+/// `account` is `pub` so this is reachable from the integration parity harness
+/// (`tests/reaction_parity.rs`).
+pub struct AccountUsageGateParams<'a> {
+    /// Usage-API percentage threshold above which the gate waits.
     pub threshold: u8,
+    /// Loop tasks dir — `.stop`-signal polling during the wait.
     pub tasks_dir: &'a Path,
+    /// Wait seconds to use when the reset timestamp can't be parsed.
     pub fallback_wait: u64,
 }
 
-/// Account-global usage gate. Fires the shared usage check + wait once.
-#[allow(dead_code)] // wired once-per-wave (and once-per-iteration sequentially) by FEAT-003/FEAT-006
-pub(crate) fn account_usage_gate(params: AccountUsageGateParams<'_>) -> UsageCheckResult {
-    let AccountUsageGateParams {
-        threshold,
-        tasks_dir,
-        fallback_wait,
-    } = params;
+/// Injected usage-gate seam (inner/outer split, mirrors
+/// `react_to_outputs`/`react_to_outputs_inner` and
+/// `auto_review::{maybe_fire, maybe_fire_inner}`).
+///
+/// Called **exactly once** per [`account_usage_gate_inner`] invocation with the
+/// destructured `(threshold, tasks_dir, fallback_wait)`. Production builds this
+/// from `usage::check_and_wait`; tests inject a counting closure so they are
+/// hermetic (no OAuth credentials, no usage API, no real `thread::sleep`). A
+/// type alias keeps `clippy::type_complexity` quiet.
+pub type UsageGateFn<'f> = &'f dyn Fn(u8, &Path, u64) -> UsageCheckResult;
 
-    usage::check_and_wait(threshold, tasks_dir, fallback_wait)
+/// Account-global usage gate (production entry point). Builds the real
+/// `usage::check_and_wait` gate closure and delegates to
+/// [`account_usage_gate_inner`].
+///
+/// This is an *account-global* reaction: it reflects shared API-account state,
+/// not per-task state, so the caller fires it **exactly once per wave** (and
+/// once per sequential iteration) — never once per slot.
+///
+/// **Scaffold under TEST-INIT-002** — body implemented by FEAT-003.
+#[allow(dead_code)] // wired once-per-wave (and once-per-iteration sequentially) by FEAT-003
+pub fn account_usage_gate(params: AccountUsageGateParams<'_>) -> UsageCheckResult {
+    let _ = params;
+    unimplemented!(
+        "FEAT-003: build the gate closure from usage::check_and_wait and \
+         delegate to account_usage_gate_inner"
+    )
+}
+
+/// Hermetic core of the account-global usage gate. Destructures the params
+/// exhaustively and fires `gate` **exactly once** with
+/// `(threshold, tasks_dir, fallback_wait)`, returning its [`UsageCheckResult`]
+/// unchanged. Same usage state ⇒ same decision, independent of which path
+/// (sequential or wave) invoked it.
+///
+/// **Scaffold under TEST-INIT-002** — body implemented by FEAT-003. The
+/// contract is pinned by the ignored tests in `tests/reaction_parity.rs`.
+#[allow(dead_code)] // invoked by account_usage_gate; pinned by TEST-INIT-002
+pub fn account_usage_gate_inner(
+    params: AccountUsageGateParams<'_>,
+    gate: UsageGateFn<'_>,
+) -> UsageCheckResult {
+    let _ = (params, gate);
+    unimplemented!(
+        "FEAT-003: destructure AccountUsageGateParams exhaustively; fire `gate` \
+         EXACTLY once with (threshold, tasks_dir, fallback_wait); return its \
+         UsageCheckResult unchanged"
+    )
 }
 
 // ---------------------------------------------------------------------------

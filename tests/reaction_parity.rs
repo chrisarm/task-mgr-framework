@@ -110,11 +110,9 @@ fn disable_llm_extraction() {
 
 /// Read a single task's status, or `None` if the row is absent.
 fn task_status(conn: &Connection, task_id: &str) -> Option<String> {
-    conn.query_row(
-        "SELECT status FROM tasks WHERE id = ?1",
-        [task_id],
-        |r| r.get::<_, String>(0),
-    )
+    conn.query_row("SELECT status FROM tasks WHERE id = ?1", [task_id], |r| {
+        r.get::<_, String>(0)
+    })
     .ok()
 }
 
@@ -224,8 +222,12 @@ fn wait_once_fires_wait_exactly_once_for_multi_rate_limit_wave() {
 
     let spy = WaitSpy::completing();
     let wait = spy.closure();
-    let reaction =
-        react_to_outputs_inner(&mut conn, &items, &params(db_temp.path(), 600), &wait as WaitFn);
+    let reaction = react_to_outputs_inner(
+        &mut conn,
+        &items,
+        &params(db_temp.path(), 600),
+        &wait as WaitFn,
+    );
 
     assert_eq!(
         spy.calls.get(),
@@ -270,8 +272,12 @@ fn mixed_wave_resets_only_rate_limited_task_and_preserves_completed() {
 
     let spy = WaitSpy::completing();
     let wait = spy.closure();
-    let reaction =
-        react_to_outputs_inner(&mut conn, &items, &params(db_temp.path(), 600), &wait as WaitFn);
+    let reaction = react_to_outputs_inner(
+        &mut conn,
+        &items,
+        &params(db_temp.path(), 600),
+        &wait as WaitFn,
+    );
 
     assert_eq!(reaction, AccountReaction::WaitedAndRetry);
     assert_eq!(
@@ -317,8 +323,12 @@ fn rate_limit_output_does_not_trigger_completions_or_learnings() {
 
     let spy = WaitSpy::completing();
     let wait = spy.closure();
-    let reaction =
-        react_to_outputs_inner(&mut conn, &items, &params(db_temp.path(), 600), &wait as WaitFn);
+    let reaction = react_to_outputs_inner(
+        &mut conn,
+        &items,
+        &params(db_temp.path(), 600),
+        &wait as WaitFn,
+    );
 
     assert_eq!(reaction, AccountReaction::WaitedAndRetry);
     assert_eq!(
@@ -439,15 +449,23 @@ fn no_rate_limit_returns_none_and_writes_nothing() {
 
     let spy = WaitSpy::completing();
     let wait = spy.closure();
-    let reaction =
-        react_to_outputs_inner(&mut conn, &items, &params(db_temp.path(), 600), &wait as WaitFn);
+    let reaction = react_to_outputs_inner(
+        &mut conn,
+        &items,
+        &params(db_temp.path(), 600),
+        &wait as WaitFn,
+    );
 
     assert_eq!(
         reaction,
         AccountReaction::None,
         "no RateLimit item ⇒ AccountReaction::None",
     );
-    assert_eq!(spy.calls.get(), 0, "no rate limit ⇒ the wait must NEVER fire");
+    assert_eq!(
+        spy.calls.get(),
+        0,
+        "no rate limit ⇒ the wait must NEVER fire"
+    );
     assert_eq!(
         all_task_statuses(&conn),
         before,
@@ -476,8 +494,12 @@ fn stop_signal_during_wait_returns_stop() {
 
     let spy = WaitSpy::stopping(); // wait reports interrupted-by-stop
     let wait = spy.closure();
-    let reaction =
-        react_to_outputs_inner(&mut conn, &items, &params(db_temp.path(), 600), &wait as WaitFn);
+    let reaction = react_to_outputs_inner(
+        &mut conn,
+        &items,
+        &params(db_temp.path(), 600),
+        &wait as WaitFn,
+    );
 
     assert_eq!(spy.calls.get(), 1, "the wait must have been attempted once");
     assert_eq!(
@@ -581,7 +603,422 @@ fn harness_fixtures_are_production_shaped_and_setup_works() {
 
     assert_eq!(items.len(), 2);
     assert!(matches!(items[0].outcome, IterationOutcome::RateLimit));
-    assert_eq!(task_status(&conn, "RP-RATE-1").as_deref(), Some("in_progress"));
+    assert_eq!(
+        task_status(&conn, "RP-RATE-1").as_deref(),
+        Some("in_progress")
+    );
     assert_eq!(task_status(&conn, "RP-DONE-1").as_deref(), Some("done"));
     assert_eq!(all_task_statuses(&conn).len(), 2);
+}
+
+// ===========================================================================
+// TEST-INIT-002 — pre-spawn `resolve_task_execution` + `account_usage_gate`
+// parity (#2 effort, #3 crash). Pins the contract for FEAT-002 (the
+// `resolve_task_execution` body) and FEAT-003 (the `account_usage_gate_inner`
+// body), which fill the `unimplemented!()` scaffolds and remove the `#[ignore]`
+// attributes below. The two LIVE cases (known-bad effort discriminator +
+// harness compile-marker) guard that the ignored assertions actually
+// discriminate and that the fixtures wire up.
+// ===========================================================================
+
+use task_mgr::loop_engine::engine::IterationContext;
+use task_mgr::loop_engine::model::{HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL};
+use task_mgr::loop_engine::reactions::account::{
+    AccountUsageGateParams, UsageGateFn, account_usage_gate_inner,
+};
+use task_mgr::loop_engine::reactions::pre_spawn::{
+    ResolveTaskExecutionParams, TaskExecutionPlan, resolve_task_execution,
+};
+use task_mgr::loop_engine::runner::RunnerKind;
+use task_mgr::loop_engine::usage::UsageCheckResult;
+
+/// Insert a task row carrying an explicit `model` column — the shape
+/// `check_override_invalidation` re-reads when comparing against its snapshot.
+fn insert_task_with_model(conn: &Connection, task_id: &str, model: Option<&str>) {
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, model, max_retries, consecutive_failures) \
+         VALUES (?1, ?2, 'in_progress', ?3, 5, 0)",
+        rusqlite::params![task_id, "Pre-spawn parity task", model],
+    )
+    .expect("insert task row with model");
+}
+
+/// Pre-populate every per-task auto-recovery channel for `task_id`, mirroring
+/// what the overflow ladder + RuntimeError fallback would write. `snapshot`
+/// is the `tasks.model` value captured when the first override was set — a
+/// later DB edit that diverges from it fires the operator escape valve.
+fn seed_all_overrides(ctx: &mut IterationContext, task_id: &str, snapshot: &str) {
+    ctx.effort_overrides.insert(task_id.to_string(), "high");
+    ctx.model_overrides
+        .insert(task_id.to_string(), OPUS_MODEL.to_string());
+    ctx.overflow_recovered.insert(task_id.to_string());
+    ctx.overflow_original_model
+        .insert(task_id.to_string(), snapshot.to_string());
+    ctx.runner_overrides
+        .insert(task_id.to_string(), RunnerKind::Grok);
+    ctx.overflow_original_task_model
+        .insert(task_id.to_string(), Some(snapshot.to_string()));
+}
+
+/// True iff NO per-task override channel still carries an entry for `task_id`.
+fn all_overrides_cleared(ctx: &IterationContext, task_id: &str) -> bool {
+    !ctx.effort_overrides.contains_key(task_id)
+        && !ctx.model_overrides.contains_key(task_id)
+        && !ctx.overflow_recovered.contains(task_id)
+        && !ctx.overflow_original_model.contains_key(task_id)
+        && !ctx.runner_overrides.contains_key(task_id)
+        && !ctx.overflow_original_task_model.contains_key(task_id)
+}
+
+/// Counting spy for the injected usage-gate seam. Records the call count and
+/// the `(threshold, fallback)` it was handed, so the test can prove those
+/// params flow through to the gate (not dropped). Returns a fixed decision —
+/// the coordinator must map it through unchanged.
+struct UsageGateSpy {
+    calls: Cell<u32>,
+    last_threshold: Cell<Option<u8>>,
+    last_fallback: Cell<Option<u64>>,
+}
+
+impl UsageGateSpy {
+    fn new() -> Self {
+        Self {
+            calls: Cell::new(0),
+            last_threshold: Cell::new(None),
+            last_fallback: Cell::new(None),
+        }
+    }
+
+    fn closure(&self) -> impl Fn(u8, &Path, u64) -> UsageCheckResult + '_ {
+        move |threshold, _dir, fallback| {
+            self.calls.set(self.calls.get() + 1);
+            self.last_threshold.set(Some(threshold));
+            self.last_fallback.set(Some(fallback));
+            UsageCheckResult::BelowThreshold
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AC #1: the sequential (1 call) and wave (per-slot) shapes fold through the
+// SAME coordinator, so identical (ctx, task, resolved_model, conn) inputs yield
+// an identical TaskExecutionPlan. Two independent (ctx, DB) pairs seeded
+// identically must compute equal plans.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "unblocked by FEAT-002: resolve_task_execution body"]
+fn resolve_task_execution_parity_seq_and_wave_agree() {
+    let task_id = "PS-PARITY-1";
+
+    let (seq_dir, seq_conn) = setup_migrated_db();
+    insert_task_with_model(&seq_conn, task_id, Some(SONNET_MODEL));
+    let mut seq_ctx = IterationContext::new(5);
+    seq_ctx
+        .crashed_last_iteration
+        .insert(task_id.to_string(), true);
+    seq_ctx.effort_overrides.insert(task_id.to_string(), "high");
+    let seq_plan = resolve_task_execution(ResolveTaskExecutionParams {
+        ctx: &mut seq_ctx,
+        conn: &seq_conn,
+        task_id,
+        resolved_model: Some(SONNET_MODEL),
+    });
+
+    let (wave_dir, wave_conn) = setup_migrated_db();
+    insert_task_with_model(&wave_conn, task_id, Some(SONNET_MODEL));
+    let mut wave_ctx = IterationContext::new(5);
+    wave_ctx
+        .crashed_last_iteration
+        .insert(task_id.to_string(), true);
+    wave_ctx
+        .effort_overrides
+        .insert(task_id.to_string(), "high");
+    let wave_plan = resolve_task_execution(ResolveTaskExecutionParams {
+        ctx: &mut wave_ctx,
+        conn: &wave_conn,
+        task_id,
+        resolved_model: Some(SONNET_MODEL),
+    });
+
+    assert_eq!(
+        seq_plan, wave_plan,
+        "sequential (1 call) and wave (per-slot) shapes must compute the SAME plan",
+    );
+    assert_eq!(
+        seq_plan,
+        TaskExecutionPlan {
+            model: Some(OPUS_MODEL.to_string()),
+            effort: Some("high"),
+            runner: RunnerKind::Claude,
+        },
+        "a crashed sonnet task with a high effort override escalates to opus on Claude",
+    );
+    drop((seq_dir, wave_dir));
+}
+
+// ---------------------------------------------------------------------------
+// AC #2: a prior overflow effort_override on ctx is reflected in the plan
+// (guards the audit-#6-effort channel). No crash ⇒ model stays None, but the
+// effort must still surface.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "unblocked by FEAT-002: resolve_task_execution body"]
+fn resolve_task_execution_surfaces_prior_effort_override() {
+    let task_id = "PS-EFFORT-1";
+    let (_dir, conn) = setup_migrated_db();
+    insert_task_with_model(&conn, task_id, Some(SONNET_MODEL));
+
+    let mut ctx = IterationContext::new(5);
+    ctx.effort_overrides.insert(task_id.to_string(), "high");
+    // Not crashed: model escalation must NOT fire.
+
+    let plan = resolve_task_execution(ResolveTaskExecutionParams {
+        ctx: &mut ctx,
+        conn: &conn,
+        task_id,
+        resolved_model: Some(SONNET_MODEL),
+    });
+
+    assert_eq!(
+        plan.effort,
+        Some("high"),
+        "a prior overflow effort_override MUST flow through into the plan",
+    );
+    assert_eq!(
+        plan.model, None,
+        "no crash ⇒ no model escalation (the plan keeps the resolved baseline)",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// AC #3: a task flagged crashed escalates the model on re-pick; a non-crashed
+// task does not. Two independent (ctx, DB) pairs isolate the cases.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "unblocked by FEAT-002: resolve_task_execution body"]
+fn resolve_task_execution_escalates_on_crash_not_otherwise() {
+    let task_id = "PS-CRASH-1";
+
+    // Crashed: sonnet escalates to opus.
+    let (_crash_dir, crash_conn) = setup_migrated_db();
+    insert_task_with_model(&crash_conn, task_id, Some(SONNET_MODEL));
+    let mut crash_ctx = IterationContext::new(5);
+    crash_ctx
+        .crashed_last_iteration
+        .insert(task_id.to_string(), true);
+    let crashed_plan = resolve_task_execution(ResolveTaskExecutionParams {
+        ctx: &mut crash_ctx,
+        conn: &crash_conn,
+        task_id,
+        resolved_model: Some(SONNET_MODEL),
+    });
+    assert_eq!(
+        crashed_plan.model,
+        Some(OPUS_MODEL.to_string()),
+        "a crashed sonnet task must escalate to opus on re-pick",
+    );
+
+    // Not crashed: no escalation.
+    let (_ok_dir, ok_conn) = setup_migrated_db();
+    insert_task_with_model(&ok_conn, task_id, Some(SONNET_MODEL));
+    let mut ok_ctx = IterationContext::new(5);
+    ok_ctx
+        .crashed_last_iteration
+        .insert(task_id.to_string(), false);
+    let ok_plan = resolve_task_execution(ResolveTaskExecutionParams {
+        ctx: &mut ok_ctx,
+        conn: &ok_conn,
+        task_id,
+        resolved_model: Some(SONNET_MODEL),
+    });
+    assert_eq!(
+        ok_plan.model, None,
+        "a non-crashed task must NOT escalate its model",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// AC #4: an out-of-band tasks.model edit clears the six per-task recovery
+// channels (operator escape valve), and the resulting plan resolves fresh —
+// the cleared effort override is gone and the stale Grok runner override no
+// longer shadows the operator's Claude model.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "unblocked by FEAT-002: resolve_task_execution body"]
+fn resolve_task_execution_invalidates_stale_overrides_on_operator_edit() {
+    let task_id = "PS-INVAL-1";
+    let (_dir, conn) = setup_migrated_db();
+    // Snapshot captured at opus; operator later edits the column to haiku.
+    insert_task_with_model(&conn, task_id, Some(OPUS_MODEL));
+
+    let mut ctx = IterationContext::new(5);
+    seed_all_overrides(&mut ctx, task_id, OPUS_MODEL);
+
+    // Operator edits tasks.model out-of-band — diverges from the snapshot.
+    conn.execute(
+        "UPDATE tasks SET model = ?1 WHERE id = ?2",
+        rusqlite::params![HAIKU_MODEL, task_id],
+    )
+    .expect("operator model edit");
+
+    let plan = resolve_task_execution(ResolveTaskExecutionParams {
+        ctx: &mut ctx,
+        conn: &conn,
+        task_id,
+        resolved_model: Some(HAIKU_MODEL),
+    });
+
+    assert!(
+        all_overrides_cleared(&ctx, task_id),
+        "an out-of-band tasks.model edit must clear all six per-task recovery channels",
+    );
+    assert_eq!(
+        plan.effort, None,
+        "the cleared effort override must NOT resurface in the fresh plan",
+    );
+    assert_eq!(
+        plan.runner,
+        RunnerKind::Claude,
+        "the cleared Grok runner override must not shadow the operator's haiku (Claude) model",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// AC #5: account_usage_gate returns the same GateDecision for the same usage
+// state on both shapes. Inject the same fixed gate decision via the seam on two
+// independent shapes; assert equal results and that each fired the gate exactly
+// once with the params handed in (proves the params flow through, not dropped).
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "unblocked by FEAT-003: account_usage_gate_inner body"]
+fn account_usage_gate_inner_same_decision_both_shapes() {
+    let seq_dir = TempDir::new().expect("tempdir");
+    let wave_dir = TempDir::new().expect("tempdir");
+
+    let seq_spy = UsageGateSpy::new();
+    let seq_gate = seq_spy.closure();
+    let seq_decision = account_usage_gate_inner(
+        AccountUsageGateParams {
+            threshold: 80,
+            tasks_dir: seq_dir.path(),
+            fallback_wait: 600,
+        },
+        &seq_gate as UsageGateFn,
+    );
+
+    let wave_spy = UsageGateSpy::new();
+    let wave_gate = wave_spy.closure();
+    let wave_decision = account_usage_gate_inner(
+        AccountUsageGateParams {
+            threshold: 80,
+            tasks_dir: wave_dir.path(),
+            fallback_wait: 600,
+        },
+        &wave_gate as UsageGateFn,
+    );
+
+    assert_eq!(
+        seq_decision, wave_decision,
+        "same usage state ⇒ same GateDecision on both shapes",
+    );
+    assert_eq!(seq_decision, UsageCheckResult::BelowThreshold);
+    assert_eq!(
+        seq_spy.calls.get(),
+        1,
+        "the usage gate must fire exactly once (sequential)"
+    );
+    assert_eq!(
+        wave_spy.calls.get(),
+        1,
+        "the usage gate must fire exactly once (wave)"
+    );
+    assert_eq!(
+        seq_spy.last_threshold.get(),
+        Some(80),
+        "the threshold param must flow through to the gate, not be dropped",
+    );
+    assert_eq!(seq_spy.last_fallback.get(), Some(600));
+}
+
+// ---------------------------------------------------------------------------
+// AC #6 (RUNS LIVE): known-bad discriminator. A naive plan-builder that DROPS
+// ctx.effort_overrides yields effort=None even when ctx carries a "high"
+// override — so it would FAIL the AC#2 assertion (which expects Some("high")).
+// This proves resolve_task_execution_surfaces_prior_effort_override is not a
+// vacuous test: a regression that forgets the effort channel is rejected.
+// ---------------------------------------------------------------------------
+
+/// A deliberately-wrong builder: ignores `ctx.effort_overrides` entirely.
+fn naive_plan_dropping_effort(ctx: &IterationContext, task_id: &str) -> TaskExecutionPlan {
+    let _ = (ctx, task_id); // BUG: never reads ctx.effort_overrides
+    TaskExecutionPlan {
+        model: None,
+        effort: None,
+        runner: RunnerKind::Claude,
+    }
+}
+
+#[test]
+fn known_bad_plan_dropping_effort_fails_the_effort_assertion() {
+    let task_id = "PS-EFFORT-DISC";
+    let mut ctx = IterationContext::new(5);
+    ctx.effort_overrides.insert(task_id.to_string(), "high");
+
+    let plan = naive_plan_dropping_effort(&ctx, task_id);
+
+    // The AC#2 test asserts `plan.effort == Some("high")`. The naive stub
+    // yields None despite the seeded override, so it WOULD fail that
+    // assertion — the discriminator is real.
+    assert_eq!(
+        plan.effort, None,
+        "naive stub drops the effort override (yields None)",
+    );
+    assert_ne!(
+        plan.effort,
+        Some("high"),
+        "...which violates the effort-flows-through contract the real coordinator must satisfy",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Harness-validity compile-marker (RUNS LIVE). Proves the TEST-INIT-002
+// fixtures + the new pub contract types wire up: a migrated DB stands up, a
+// task row with a model column inserts, an IterationContext seeds, and both
+// param structs are constructible. Does NOT call the unimplemented coordinators.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pre_spawn_and_gate_harness_compiles_and_setup_works() {
+    let task_id = "PS-MARK-1";
+    let (db_temp, conn) = setup_migrated_db();
+    insert_task_with_model(&conn, task_id, Some(SONNET_MODEL));
+
+    let mut ctx = IterationContext::new(5);
+    ctx.crashed_last_iteration.insert(task_id.to_string(), true);
+    ctx.effort_overrides.insert(task_id.to_string(), "high");
+
+    assert_eq!(ctx.crashed_last_iteration.get(task_id).copied(), Some(true),);
+    assert_eq!(ctx.effort_overrides.get(task_id).copied(), Some("high"));
+
+    // The usage-gate seam + params struct are constructible from the harness.
+    let spy = UsageGateSpy::new();
+    let _gate = spy.closure();
+    let _gate_params = AccountUsageGateParams {
+        threshold: 80,
+        tasks_dir: db_temp.path(),
+        fallback_wait: 600,
+    };
+
+    // The pre-spawn params struct is constructible (mutably borrows ctx last).
+    let _resolve_params = ResolveTaskExecutionParams {
+        ctx: &mut ctx,
+        conn: &conn,
+        task_id,
+        resolved_model: Some(SONNET_MODEL),
+    };
 }

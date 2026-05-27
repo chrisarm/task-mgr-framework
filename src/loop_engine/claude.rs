@@ -20,9 +20,9 @@ use std::path::{Path, PathBuf};
 use crate::error::TaskMgrResult;
 use crate::loop_engine::config::PermissionMode;
 use crate::loop_engine::runner::{self, RunnerKind, RunnerOpts, RunnerResult};
-use crate::loop_engine::stream::{Accumulator, StreamEvent, StreamFormat};
 #[cfg(test)]
 use crate::loop_engine::stream::accumulate;
+use crate::loop_engine::stream::{Accumulator, StreamEvent, StreamFormat};
 
 /// Maximum bytes for the formatted conversation in stream-json mode.
 /// Byte-based for O(1) checking; limits are approximate and mostly-ASCII content means bytes ≈ chars.
