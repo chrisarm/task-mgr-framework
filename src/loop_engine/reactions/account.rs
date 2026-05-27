@@ -101,10 +101,11 @@ pub fn account_usage_gate_inner(
 //
 // Both reactions are account-global (they reflect shared API account state,
 // not per-task state), which is why this coordinator lives in `account.rs`
-// alongside `account_usage_gate` — NOTE: the CONTRACT-001 `mod.rs` table
-// originally listed a `post_output::react_to_outputs` scaffold; FEAT-006 /
-// TEST-INIT-001 relocated the converged reaction here. The contract is pinned
-// by the parity tests in `tests/reaction_parity.rs` (all cases run live).
+// alongside `account_usage_gate`. FEAT-006 relocated the converged reaction
+// here (the CONTRACT-001 `mod.rs` table originally sketched it under
+// `post_output`) and both engine paths now route through it: sequential at
+// `iteration.rs:703`, wave at `wave_scheduler.rs:1170`. The contract is pinned
+// by the parity tests in `tests/reaction_parity.rs`.
 // ---------------------------------------------------------------------------
 
 /// Outcome of the once-per-wave account rate-limit reaction.

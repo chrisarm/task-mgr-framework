@@ -38,11 +38,14 @@
 //! | [`post_output::handle_overflow`] | `post_output` | `overflow::handle_prompt_too_long` |
 //! | [`post_completion::react_to_completions`] | `post_completion` | `orchestrator::trigger_human_reviews` |
 //!
-//! CONTRACT-001 establishes the boundary, the enforcement mechanism, and the
-//! typed coordinator signatures. All six coordinators are implemented and wired:
-//! both execution paths route through each one; none carry `#[allow(dead_code)]`
-//! or `unimplemented!()` stubs (FEATs 002/003/005/006/010/013 filled and wired
-//! each body).
+//! CONTRACT-001 established the boundary, the enforcement mechanism, and the
+//! typed coordinator signatures; the owning FEATs (FEAT-002/003/005/006/010/013)
+//! then filled the bodies and wired every coordinator into BOTH execution paths.
+//! All six converged reactions (the five above plus
+//! [`account_iteration_budget`]) are now fully wired — none carries
+//! `#[allow(dead_code)]`, and the per-coordinator rustdoc names the sequential
+//! and wave call sites. `tests/reaction_parity.rs` pins that the two path shapes
+//! compute identical results for identical inputs.
 
 // `account`, `pre_spawn`, `post_output`, and `post_completion` are `pub` (not
 // `pub(crate)`) so their converged coordinators are reachable from the

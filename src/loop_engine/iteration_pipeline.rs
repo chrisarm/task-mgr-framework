@@ -44,10 +44,25 @@
 //!
 //! # Out of scope
 //!
-//! These stay at the `run_loop` / `run_wave_iteration` call sites because
-//! they require the outer-loop context (working tree, signals, run config):
-//! wrapper-commit, external-git reconciliation, human-review trigger,
-//! rate-limit waits, pause-signal handling, slot merge resolution.
+//! Two kinds of post-Claude work stay out of this pipeline:
+//!
+//! 1. **Converged main-thread reactions** — wrapper-commit, external-git
+//!    reconciliation, human-review trigger (`reactions::post_completion::
+//!    react_to_completions`), the post-output rate-limit / transient-backend
+//!    waits (`reactions::account::{react_to_outputs, react_to_transient}`), the
+//!    pre-dispatch usage gate (`reactions::account::account_usage_gate`), the
+//!    overflow ladder (`reactions::post_output::handle_overflow`), and the
+//!    iteration-budget give-back (`reactions::account_iteration_budget`). These
+//!    are NOT inline at the call sites any more: the reactions framework owns
+//!    them in a single home that BOTH execution paths route through (see
+//!    `src/loop_engine/CLAUDE.md` → "Reaction framework (shared)"). They live
+//!    outside this pipeline because they need the outer-loop context (working
+//!    tree, account-global wait/budget state) the per-iteration pipeline does
+//!    not carry.
+//! 2. **Genuinely call-site-local glue** — pause-signal handling and slot
+//!    merge resolution stay inline at `run_loop` / `run_wave_iteration`; they
+//!    own working-tree state (signals, the slot-0 merge worktree) that is not a
+//!    per-iteration post-Claude concern.
 
 use std::collections::HashSet;
 use std::path::Path;
