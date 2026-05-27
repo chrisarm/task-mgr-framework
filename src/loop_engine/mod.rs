@@ -39,6 +39,7 @@ pub mod stale;
 pub mod status;
 pub mod status_display;
 pub mod status_queries;
+pub(crate) mod stream;
 pub mod usage;
 pub mod user_config;
 pub mod watchdog;

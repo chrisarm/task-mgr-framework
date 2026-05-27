@@ -27,10 +27,11 @@ use crate::error::{TaskMgrError, TaskMgrResult};
 #[cfg(unix)]
 use crate::loop_engine::claude::open_pty_for_child_output;
 use crate::loop_engine::claude::{
-    ACTIVE_PREFIX_ENV, emit_prefixed_lines, is_pty_read_eof, tee_stream_json,
+    ACTIVE_PREFIX_ENV, ClaudeStreamFormat, emit_prefixed_lines, is_pty_read_eof,
 };
 use crate::loop_engine::config::PermissionMode;
 use crate::loop_engine::signals::SignalFlag;
+use crate::loop_engine::stream::{GrokStreamFormat, drive_stream};
 use crate::loop_engine::watchdog::{TimeoutConfig, exit_code_from_status, watchdog_loop};
 
 /// Default fast-fail window for the Grok auth-failure sniff (3 seconds).
@@ -628,8 +629,9 @@ impl LlmRunner for ClaudeRunner {
         let reader = BufReader::new(reader_source);
 
         let (output, conversation, permission_denials) = if stream_json {
-            tee_stream_json(
+            drive_stream(
                 reader,
+                &ClaudeStreamFormat,
                 target_task_id,
                 &watchdog.completion_epoch,
                 slot_label,
@@ -864,8 +866,9 @@ impl LlmRunner for GrokRunner {
         );
 
         let (output, conversation, permission_denials) = if stream_json {
-            tee_stream_json(
+            drive_stream(
                 reader,
+                &GrokStreamFormat,
                 target_task_id,
                 &watchdog.completion_epoch,
                 slot_label,
