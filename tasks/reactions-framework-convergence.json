@@ -793,7 +793,7 @@
       "id": "MILESTONE-2",
       "model": "claude-opus-4-7",
       "modifiesBehavior": false,
-      "passes": false,
+      "passes": true,
       "priority": 50,
       "qualityDimensions": [
         "Trunk green including pre-existing failures"
@@ -823,7 +823,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": false,
       "notes": "Cross-boundary path spans slot.rs (worker) → wave_scheduler.rs/orchestrator.rs (main thread) → reactions::account → lifecycle/usage. This is the single distinct cross-boundary path for the headline behavior.",
-      "passes": false,
+      "passes": true,
       "priority": 55,
       "qualityDimensions": [
         "Every handoff wired; no silently-skipped step"
