@@ -416,6 +416,11 @@ fn read_task_model_from_db(conn: &Connection, task_id: &str) -> rusqlite::Result
 /// "single-predicate guard" — never re-derive via
 /// `runner_overrides.get(task)` OR `provider_for_model(model)`).
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "route through reactions::post_output::handle_overflow — CONTRACT-001 single-home \
+            reaction lock; the engine files (iteration.rs/slot.rs/wave_scheduler.rs) carry \
+            #![deny(deprecated)] so a direct call there is a compile error"
+)]
 pub fn handle_prompt_too_long(
     ctx: &mut crate::loop_engine::engine::IterationContext,
     conn: &mut Connection,

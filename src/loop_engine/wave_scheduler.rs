@@ -35,6 +35,14 @@
 //! `merge_slot_branches_with_resolver`; slot 0's path is NEVER recomputed via
 //! `compute_slot_worktree_path(_, branch, 0)`. See `src/loop_engine/CLAUDE.md`
 //! → "Parallel-slot scheduling".
+//!
+//! **Reaction single-home lock (CONTRACT-001)**: `#![deny(deprecated)]` makes a
+//! direct call to any relocated reaction leaf (marked `#[deprecated]`) a compile
+//! error here, forcing both execution paths through
+//! `crate::loop_engine::reactions::*`. Pre-existing `#[allow(deprecated)]` shims
+//! (e.g. `claim_slot_task`) keep working — an inner `#[allow]` overrides this
+//! module-level deny at that specific site.
+#![deny(deprecated)]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

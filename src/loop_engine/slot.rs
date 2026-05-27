@@ -22,6 +22,14 @@
 //! **Per-task recovery is NOT owned here**: auto-block, crash escalation, and
 //! model/provider promotion live in `recovery.rs` and are invoked by
 //! `wave_scheduler.rs` after it collects the `SlotResult` from this module.
+//!
+//! **Reaction single-home lock (CONTRACT-001)**: `#![deny(deprecated)]` makes a
+//! direct call to any relocated reaction leaf (marked `#[deprecated]`) a compile
+//! error here. The per-slot overflow reaction routes through
+//! `crate::loop_engine::reactions::post_output::handle_overflow`. Pre-existing
+//! `#[allow(deprecated)]` shims (e.g. the `claim_slot_task` lifecycle shim) keep
+//! working — an inner `#[allow]` is more specific than this module-level deny.
+#![deny(deprecated)]
 
 use std::sync::Arc;
 
@@ -40,7 +48,7 @@ use crate::loop_engine::engine::{
 use crate::loop_engine::iteration_pipeline;
 use crate::loop_engine::model;
 use crate::loop_engine::monitor;
-use crate::loop_engine::overflow;
+use crate::loop_engine::reactions;
 use crate::loop_engine::runner::{self, RunnerKind};
 use crate::loop_engine::watchdog;
 use crate::models::TaskStatus;
@@ -489,20 +497,24 @@ pub(super) fn process_slot_result(
             effective_runner,
             "effective_runner drift: process_slot_result re-derivation diverged from pre-dispatch value"
         );
-        let _ = overflow::handle_prompt_too_long(
-            ctx,
-            params.conn,
-            tid,
-            slot_result.iteration_result.effective_effort,
-            slot_result.iteration_result.effective_model.as_deref(),
-            &synthetic_prompt,
-            params.iteration,
-            Some(params.run_id),
-            params.db_dir,
-            Some(slot_idx),
-            effective_runner,
-            params.project_config,
-        );
+        // CONTRACT-001: route the per-slot overflow reaction through the shared
+        // coordinator (`slot_index: Some(slot_idx)`); the direct leaf call is
+        // denied here by `#![deny(deprecated)]`.
+        let _ =
+            reactions::post_output::handle_overflow(reactions::post_output::HandleOverflowParams {
+                ctx,
+                conn: params.conn,
+                task_id: tid,
+                effort: slot_result.iteration_result.effective_effort,
+                effective_model: slot_result.iteration_result.effective_model.as_deref(),
+                prompt_result: &synthetic_prompt,
+                iteration: params.iteration,
+                run_id: Some(params.run_id),
+                base_dir: params.db_dir,
+                slot_index: Some(slot_idx),
+                effective_runner,
+                project_config: params.project_config,
+            });
     }
 
     // Pipeline contract requires a `working_root` even when skip_git is on

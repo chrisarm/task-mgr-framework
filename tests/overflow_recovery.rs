@@ -1,3 +1,7 @@
+// CONTRACT-001: overflow::handle_prompt_too_long is #[deprecated] (relocated to
+// reactions::post_output::handle_overflow). These tests drive the leaf directly;
+// allow the transition shim until FEAT-006 relocates the body.
+#![allow(deprecated)]
 //! Integration tests for the four-rung prompt-overflow recovery ladder.
 //!
 //! These tests drive `overflow::handle_prompt_too_long` directly with synthetic

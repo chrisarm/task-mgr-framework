@@ -1,3 +1,7 @@
+// CONTRACT-001: overflow::handle_prompt_too_long is #[deprecated] (relocated to
+// reactions::post_output::handle_overflow). These tests drive the leaf directly;
+// allow the transition shim until FEAT-006 relocates the body.
+#![allow(deprecated)]
 //! Tests for per-slot prompt-overflow ladder dispatch (TEST-INIT-005).
 //!
 //! These tests pin down the contract FEAT-008 (Phase D) will deliver:

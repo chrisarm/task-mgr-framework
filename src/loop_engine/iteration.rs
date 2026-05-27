@@ -28,6 +28,13 @@
 //! hands its `IterationResult` to `iteration_pipeline::process_iteration_output`
 //! at the `run_loop` call site (the shared post-Claude pipeline is invoked
 //! after this function returns — see FR-006).
+//!
+//! **Reaction single-home lock (CONTRACT-001)**: `#![deny(deprecated)]` makes a
+//! direct call to any relocated reaction leaf (those marked `#[deprecated]` for
+//! the convergence) a compile error here. Post-Claude reactions must route
+//! through `crate::loop_engine::reactions::*` so both execution paths share one
+//! implementation — see `src/loop_engine/reactions/mod.rs`.
+#![deny(deprecated)]
 
 use std::sync::Arc;
 use std::thread;
@@ -48,9 +55,9 @@ use crate::loop_engine::engine::{
     apply_review_model_override, resolve_effective_runner,
 };
 use crate::loop_engine::monitor;
-use crate::loop_engine::overflow;
 use crate::loop_engine::prd_reconcile::reconcile_passes_with_db;
 use crate::loop_engine::prompt::{self, BuildPromptParams};
+use crate::loop_engine::reactions;
 use crate::loop_engine::recovery::{
     check_crash_escalation, check_override_invalidation, probe_rate_limit_lifted,
     prompt_overflow_result, update_trackers,
@@ -723,20 +730,23 @@ pub fn run_iteration(
         // FEAT-006/H3: use the primary effective_runner computed above (PRD §2.5
         // single-source rule — never re-derive). The outer binding from the
         // banner step is in scope here; shadowing it would be drift-prone.
-        let _ = overflow::handle_prompt_too_long(
-            ctx,
-            params.conn,
-            &task_id,
-            effort,
-            effective_model.as_deref(),
-            &prompt_result,
-            params.iteration,
-            Some(params.run_id),
-            params.db_dir,
-            None,
-            effective_runner,
-            params.project_config,
-        );
+        // CONTRACT-001: route through the shared coordinator (sequential folds 1
+        // result, `slot_index: None`); the direct leaf call is denied here.
+        let _ =
+            reactions::post_output::handle_overflow(reactions::post_output::HandleOverflowParams {
+                ctx,
+                conn: params.conn,
+                task_id: &task_id,
+                effort,
+                effective_model: effective_model.as_deref(),
+                prompt_result: &prompt_result,
+                iteration: params.iteration,
+                run_id: Some(params.run_id),
+                base_dir: params.db_dir,
+                slot_index: None,
+                effective_runner,
+                project_config: params.project_config,
+            });
     }
 
     // Step 9: Update trackers based on outcome
