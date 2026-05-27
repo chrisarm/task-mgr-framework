@@ -159,6 +159,126 @@ promoting. A task can only cross the provider boundary ONCE per loop run
 `claudeFallbackModel` absent → no Grok→Claude fallback. The Grok task
 dead-ends on `blocked` exactly as a Claude task without `fallbackRunner` does.
 
+## Reaction framework (shared)
+
+The loop engine has two execution paths — **sequential**
+(`iteration.rs::run_iteration` driven by `orchestrator.rs::run_loop`) and
+**parallel-wave** (`wave_scheduler.rs::run_wave_iteration` + `slot.rs`). Every
+main-thread *reaction* that is NOT path-specific — the work the main thread does
+before dispatching Claude and after Claude returns — lives in
+`src/loop_engine/reactions/` and is called by BOTH paths. The wave path folds
+its N slot results into one reaction; the sequential path folds its 1.
+
+This module exists because the same reaction was historically implemented at one
+path's call site and silently omitted or shaped differently in the other,
+producing a recurring parity-divergence bug class (the latest: rate-limit waits
+existed only in sequential, so wave mode never waited and false-aborted with "no
+eligible tasks after 3 consecutive stale iterations", resetting in-flight work).
+
+### The single-home contract (enforced at compile time)
+
+Two mechanisms keep a reaction from being copy-pasted back into one path:
+
+1. **`#[deprecated]` on the relocated leaf + `#![deny(deprecated)]` on the three
+   engine files** (`iteration.rs:41`, `wave_scheduler.rs:47`, `slot.rs:32`). A
+   direct call to a relocated leaf from any engine file fails `cargo build`; the
+   only legitimate caller is the coordinator, which marks its single call site
+   `#[allow(deprecated)]`. Re-inlining a relocated reaction is therefore a
+   compile error, not a code-review judgment call.
+2. **Exhaustive param-struct destructure (no `..`)** in every coordinator.
+   Adding a field to a coordinator's param struct is a compile error until every
+   coordinator body accounts for it — the parity divergence the framework exists
+   to prevent becomes a compile-time concern.
+
+### The converged coordinators (each called from BOTH paths)
+
+| # | Coordinator | Module | Sequential call site | Wave call site | Relocated leaf (`#[deprecated]` shim) |
+|---|---|---|---|---|---|
+| #2 | `pre_spawn::resolve_task_execution` | `pre_spawn` | `iteration.rs:387` | `wave_scheduler.rs:1058` (per slot) | `recovery::{check_override_invalidation, check_crash_escalation}` |
+| #3 | `account::account_usage_gate` | `account` | `iteration.rs:130` | `wave_scheduler.rs:249` (once/wave) | `usage::check_and_wait` |
+| #5 | `post_output::handle_overflow` | `post_output` | `iteration.rs:755` | `slot.rs:535` (per slot) | `overflow::handle_prompt_too_long` |
+| #6 | `account::react_to_outputs` | `account` | `iteration.rs:703` | `wave_scheduler.rs:1170` (once/wave) | `usage::{parse_reset_from_output, wait_for_usage_reset}` |
+| #10 | `post_completion::react_to_completions` | `post_completion` | `orchestrator.rs:1207` | `wave_scheduler.rs:1482` | `orchestrator::trigger_human_reviews` |
+| #13 | `account_iteration_budget` | `reactions` (mod) | `orchestrator.rs:1312` | `orchestrator.rs:1027` | (inline `iteration -= 1` / `saturating_sub`) |
+| — | `account::react_to_transient` (FEAT-014) | `account` | `orchestrator.rs:1282` | `wave_scheduler.rs:1236` | (new; no pre-existing leaf) |
+
+Account-global reactions (`account_usage_gate`, `react_to_outputs`,
+`react_to_transient`) fire **exactly once per wave**, never once per
+rate-limited slot — they reflect shared API-account state, not per-task state.
+The per-task reactions (`resolve_task_execution`, `handle_overflow`) fold one
+call per slot. Each coordinator pairs a production entry point with a hermetic
+`_inner` core that takes the side-effecting step (wait / review) as an injected
+seam, so `tests/reaction_parity.rs` can prove the sequential and wave shapes
+compute identical results without OAuth, stdin, subprocesses, or real sleeps.
+
+### Out of scope (NOT in the reactions framework)
+
+Only two kinds of post-Claude work are deliberately left at the
+`run_loop` / `run_wave_iteration` call sites:
+
+- **pause-signal handling** — owns the signal-flag / `.stop` polling the
+  per-iteration reactions do not carry.
+- **slot merge resolution** (`worktree::merge_slot_branches_with_resolver`,
+  `merge_resolver::ClaudeMergeResolver`) — requires the slot-0 merge worktree
+  state owned by `run_wave_iteration`, not a per-iteration post-Claude concern
+  (see "Slot merge-back conflict resolution").
+
+Everything else that used to be "call-site inline glue" — wrapper-commit,
+external-git reconciliation, human-review trigger, rate-limit / transient-backend
+waits, the usage gate, the overflow ladder, the iteration-budget give-back — is
+now a coordinator in the table above. `iteration_pipeline.rs`'s own "Out of
+scope" note mirrors this split.
+
+### Load-bearing invariants
+
+- **`handle_overflow` ordering.** On a `PromptTooLong` outcome the overflow
+  coordinator fires BEFORE the shared `iteration_pipeline::process_iteration_output`
+  runs for that iteration/slot, in both paths. Recovery state (the `todo`/`blocked`
+  DB reset + the ctx overrides) must be durable before the pipeline's
+  crash-tracking write observes the outcome — otherwise the pipeline could
+  account an overflowed-but-to-be-retried task as a terminal failure. Wave:
+  `slot.rs::process_slot_result` calls `handle_overflow` then
+  `process_iteration_output` a few lines later; sequential: `run_iteration`'s
+  Step 8.5 runs before `run_loop` invokes the pipeline. Full ordering in
+  "Overflow recovery and diagnostics".
+
+- **`iteration_consumed == false` gives the loop-bound iteration back.** A
+  `RateLimit` / `Reorder` / transient-backend `WaitedAndRetry` outcome routes
+  through `account_iteration_budget` with `consumes_budget = false`, which does
+  `*iteration = iteration.saturating_sub(1)` so a persistently rate-limited /
+  unavailable run does not burn its `max_iterations` budget on waits (bounded
+  termination then relies on the `.stop`/signal check, NOT the iteration
+  ceiling). The wave path threads this as `WaveOutcome.iteration_consumed`
+  (`orchestrator.rs:1030`); the sequential path computes `consumes_budget` from
+  the outcome class (`orchestrator.rs:1306`). Both route through the ONE helper
+  so the give-back rule cannot drift. A rate-limit retry wave additionally
+  returns BEFORE merge-back with empty `failed_merges` and must NOT run the
+  FEAT-002 reset/halt check (it would zero `consecutive_merge_fail_waves` and
+  wipe the cascade-halt defense) — `orchestrator.rs:1041` `continue`s past it on
+  `outcome.rate_limited_retry`.
+
+- **Human review can fire on a partial wave.** `react_to_completions` runs once
+  per wave at the post-merge-back step (after `apply_post_merge_reconcile`,
+  before the terminal checks), so it can fire on a **partial wave** — one
+  reaching the post-completion step with a sibling slot still `in_progress` or a
+  sibling's ephemeral branch unmerged. Because the reaction is **input-driven**
+  (it consumes the already-computed `completed_ids` set, never re-queries
+  "everything completed since an epoch"), it reviews ONLY the completed
+  `requires_human` ids and leaves every `in_progress` / unmerged sibling
+  untouched. This is deliberate — a completed CLARIFY should unblock its
+  dependents without waiting for the whole wave to drain. (The rate-limit /
+  transient `WaitedAndRetry` reactions early-return BEFORE merge-back, so a wave
+  that bails on a rate limit defers its completed tasks' reviews to a later wave;
+  that is the retry path's existing contract, not a regression — the wave never
+  reviewed at all pre-FEAT-010.) Detail in "Post-completion reactions
+  (converged)".
+
+- **The rate-limit reset filters on `status = 'in_progress'`.**
+  `react_to_outputs` / `react_to_transient` reset the affected tasks via
+  `TaskLifecycle::recover_in_progress_for_prefix`, whose `status = 'in_progress'`
+  guard means a slot that already completed THIS wave (flipped to `done` by
+  `process_slot_result`) is never clobbered.
+
 ## Overflow recovery and diagnostics
 
 When the Claude CLI subprocess returns "Prompt is too long", the loop engine
