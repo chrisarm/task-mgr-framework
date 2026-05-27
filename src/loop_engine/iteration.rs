@@ -59,8 +59,7 @@ use crate::loop_engine::prd_reconcile::reconcile_passes_with_db;
 use crate::loop_engine::prompt::{self, BuildPromptParams};
 use crate::loop_engine::reactions;
 use crate::loop_engine::recovery::{
-    check_crash_escalation, check_override_invalidation, probe_rate_limit_lifted,
-    prompt_overflow_result, update_trackers,
+    check_crash_escalation, check_override_invalidation, prompt_overflow_result, update_trackers,
 };
 use crate::loop_engine::runner;
 use crate::loop_engine::signals;
@@ -629,73 +628,44 @@ pub fn run_iteration(
     let outcome =
         detection::analyze_output(&claude_output, claude_result.exit_code, params.project_root);
 
-    // Step 7.5: On rate-limit detection, trigger usage wait and mark as non-counting
+    // Step 7.5: On rate-limit detection, run the converged account-global
+    // post-output reaction (`reactions::account::react_to_outputs`) — the single
+    // home both execution paths share. The sequential path folds its one output
+    // into a one-item slice; the wave path folds its N. `WaitedAndRetry` (or
+    // `None`) falls through with the outcome still `RateLimit` (`run_loop` marks
+    // it non-counting); `Stop` returns early with `should_stop` and empty output.
     if outcome == IterationOutcome::RateLimit {
-        eprintln!("Rate limit detected in output, checking usage API...");
-
-        let mut waited = false;
-
-        // Try the usage API first (if enabled)
-        if params.usage_params.enabled {
-            let check_result = usage::check_and_wait(
-                params.usage_params.threshold,
-                params.tasks_dir,
-                params.usage_params.fallback_wait,
-            );
-            match check_result {
-                UsageCheckResult::StopSignaled => {
-                    return Ok(IterationResult {
-                        outcome: IterationOutcome::RateLimit,
-                        task_id: Some(task_id),
-                        files_modified: task_files,
-                        should_stop: true,
-                        output: String::new(),
-                        effective_model: None,
-                        effective_effort: None,
-                        key_decisions_count: 0,
-                        conversation: None,
-                        shown_learning_ids: Vec::new(),
-                    });
-                }
-                UsageCheckResult::WaitedAndReset => {
-                    waited = true;
-                }
-                _ => {} // Skipped, BelowThreshold, ApiError — didn't actually wait
-            }
-        }
-
-        // Fallback: if the usage API didn't wait, parse reset time from output
-        if !waited {
-            let wait_secs = usage::parse_reset_from_output(&claude_output).unwrap_or(0);
-            eprintln!(
-                "Usage API did not wait (CLI session limit). Falling back to output-parsed reset time ({})...",
-                if wait_secs > 0 {
-                    display::format_duration(wait_secs)
-                } else {
-                    format!("fallback {}s", params.usage_params.fallback_wait)
-                }
-            );
-            let probe = || probe_rate_limit_lifted(params.permission_mode);
-            let completed = usage::wait_for_usage_reset(
-                wait_secs,
-                params.tasks_dir,
-                params.usage_params.fallback_wait,
-                Some(&probe),
-            );
-            if !completed {
-                return Ok(IterationResult {
-                    outcome: IterationOutcome::RateLimit,
-                    task_id: Some(task_id),
-                    files_modified: task_files,
-                    should_stop: true,
-                    output: String::new(),
-                    effective_model: None,
-                    effective_effort: None,
-                    key_decisions_count: 0,
-                    conversation: None,
-                    shown_learning_ids: Vec::new(),
-                });
-            }
+        eprintln!("Rate limit detected in output, running account reaction...");
+        let reaction = {
+            let items = [reactions::account::OutputReactionItem {
+                task_id: Some(task_id.as_str()),
+                outcome: &outcome,
+                output: &claude_output,
+            }];
+            let account_params = reactions::account::AccountReactionParams {
+                threshold: params.usage_params.threshold,
+                usage_enabled: params.usage_params.enabled,
+                tasks_dir: params.tasks_dir,
+                fallback_wait: params.usage_params.fallback_wait,
+                prefix: params.task_prefix.unwrap_or(""),
+                run_id: params.run_id,
+                permission_mode: params.permission_mode,
+            };
+            reactions::account::react_to_outputs(params.conn, &items, &account_params)
+        };
+        if reaction == reactions::account::AccountReaction::Stop {
+            return Ok(IterationResult {
+                outcome: IterationOutcome::RateLimit,
+                task_id: Some(task_id),
+                files_modified: task_files,
+                should_stop: true,
+                output: String::new(),
+                effective_model: None,
+                effective_effort: None,
+                key_decisions_count: 0,
+                conversation: None,
+                shown_learning_ids: Vec::new(),
+            });
         }
     }
 

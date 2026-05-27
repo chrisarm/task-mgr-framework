@@ -42,7 +42,7 @@ use tempfile::TempDir;
 
 use task_mgr::db::migrations::run_migrations;
 use task_mgr::db::{create_schema, open_connection};
-use task_mgr::loop_engine::config::IterationOutcome;
+use task_mgr::loop_engine::config::{IterationOutcome, PermissionMode};
 use task_mgr::loop_engine::reactions::account::{
     AccountReaction, AccountReactionParams, OutputReactionItem, WaitFn, react_to_outputs_inner,
 };
@@ -172,6 +172,11 @@ impl WaitSpy {
     }
 }
 
+/// `permission_mode` only feeds the production wait closure's early-lift probe;
+/// the hermetic inner tests inject the wait, so any value works. A `static`
+/// gives the `&'static PermissionMode` the params struct borrows.
+static PERMISSION_MODE: PermissionMode = PermissionMode::Dangerous;
+
 /// Standard params for a hermetic inner call. `tasks_dir` is a throwaway
 /// TempDir path (the injected wait never actually polls it).
 fn params<'a>(tasks_dir: &'a Path, fallback_wait: u64) -> AccountReactionParams<'a> {
@@ -182,6 +187,7 @@ fn params<'a>(tasks_dir: &'a Path, fallback_wait: u64) -> AccountReactionParams<
         fallback_wait,
         prefix: PREFIX,
         run_id: RUN_ID,
+        permission_mode: &PERMISSION_MODE,
     }
 }
 
@@ -191,7 +197,6 @@ fn params<'a>(tasks_dir: &'a Path, fallback_wait: u64) -> AccountReactionParams<
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "unblocked by FEAT-006: react_to_outputs_inner body"]
 fn wait_once_fires_wait_exactly_once_for_multi_rate_limit_wave() {
     disable_llm_extraction();
     let (db_temp, mut conn) = setup_migrated_db();
@@ -248,7 +253,6 @@ fn wait_once_fires_wait_exactly_once_for_multi_rate_limit_wave() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "unblocked by FEAT-006: react_to_outputs_inner body"]
 fn mixed_wave_resets_only_rate_limited_task_and_preserves_completed() {
     disable_llm_extraction();
     let (db_temp, mut conn) = setup_migrated_db();
@@ -299,7 +303,6 @@ fn mixed_wave_resets_only_rate_limited_task_and_preserves_completed() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "unblocked by FEAT-006: react_to_outputs_inner body"]
 fn rate_limit_output_does_not_trigger_completions_or_learnings() {
     disable_llm_extraction();
     let (db_temp, mut conn) = setup_migrated_db();
@@ -352,7 +355,6 @@ fn rate_limit_output_does_not_trigger_completions_or_learnings() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "unblocked by FEAT-006: react_to_outputs_inner body"]
 fn parse_fail_falls_back_to_fallback_wait_and_both_shapes_agree() {
     disable_llm_extraction();
     const FALLBACK: u64 = 1234;
@@ -423,7 +425,6 @@ fn parse_fail_falls_back_to_fallback_wait_and_both_shapes_agree() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "unblocked by FEAT-006: react_to_outputs_inner body"]
 fn no_rate_limit_returns_none_and_writes_nothing() {
     disable_llm_extraction();
     let (db_temp, mut conn) = setup_migrated_db();
@@ -478,7 +479,6 @@ fn no_rate_limit_returns_none_and_writes_nothing() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "unblocked by FEAT-006: react_to_outputs_inner body"]
 fn stop_signal_during_wait_returns_stop() {
     disable_llm_extraction();
     let (db_temp, mut conn) = setup_migrated_db();

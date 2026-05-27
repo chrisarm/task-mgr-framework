@@ -12,8 +12,10 @@ use std::path::Path;
 
 use rusqlite::Connection;
 
-use crate::loop_engine::config::IterationOutcome;
-use crate::loop_engine::usage::UsageCheckResult;
+use crate::lifecycle::TaskLifecycle;
+use crate::loop_engine::config::{IterationOutcome, PermissionMode};
+use crate::loop_engine::recovery::probe_rate_limit_lifted;
+use crate::loop_engine::usage::{self, UsageCheckResult};
 
 /// Inputs to [`account_usage_gate`] / [`account_usage_gate_inner`].
 /// Destructured exhaustively (no `..`) by the FEAT-003 body — the single-home
@@ -156,44 +158,111 @@ pub struct AccountReactionParams<'a> {
     /// Wait seconds to use when the reset timestamp can't be parsed.
     pub fallback_wait: u64,
     /// PRD prefix scoping the `in_progress` reset
-    /// (`TaskLifecycle::recover_in_progress_for_prefix`).
+    /// (`TaskLifecycle::recover_in_progress_for_prefix`). An empty string maps
+    /// to `None` (reset every `in_progress` row regardless of prefix).
     pub prefix: &'a str,
     /// Active run id for `TaskLifecycle::with_run`.
     pub run_id: &'a str,
+    /// Permission mode forwarded to the early-lift probe
+    /// (`probe_rate_limit_lifted`) in the production wait closure. Unused by
+    /// the hermetic [`react_to_outputs_inner`] (the wait is injected there).
+    pub permission_mode: &'a PermissionMode,
 }
 
 /// Post-output rate-limit reaction (production entry point). Builds the real
 /// usage-wait closure and delegates to [`react_to_outputs_inner`].
 ///
-/// **Scaffold under TEST-INIT-001** — body implemented by FEAT-006.
+/// The injected wait mirrors the pre-convergence sequential logic: try the
+/// usage API first (when `usage_enabled`), then fall back to the
+/// output-parsed reset wait with an early-lift probe.
 pub fn react_to_outputs(
     conn: &mut Connection,
     items: &[OutputReactionItem<'_>],
     params: &AccountReactionParams<'_>,
 ) -> AccountReaction {
-    let _ = (conn, items, params);
-    unimplemented!(
-        "FEAT-006: build the usage-wait closure (check_and_wait + \
-         wait_for_usage_reset/probe) and delegate to react_to_outputs_inner"
-    )
+    // Exhaustive destructure (no `..`) — the single-home parity lock. Adding a
+    // field to `AccountReactionParams` forces this coordinator to account for
+    // it. All fields are `Copy`, so the `&Struct { .. }` pattern copies each
+    // out by value while leaving `params` borrowed for the inner delegation.
+    let &AccountReactionParams {
+        threshold,
+        usage_enabled,
+        tasks_dir,
+        fallback_wait,
+        prefix: _,
+        run_id: _,
+        permission_mode,
+    } = params;
+
+    let wait = |wait_secs: u64| -> bool {
+        // Try the usage API first (when enabled). It computes its own wait
+        // internally, so the `wait_secs` arg is only consumed by the fallback.
+        if usage_enabled {
+            match usage::check_and_wait(threshold, tasks_dir, fallback_wait) {
+                UsageCheckResult::StopSignaled => return false,
+                UsageCheckResult::WaitedAndReset => return true,
+                // Skipped / BelowThreshold / ApiError — the API did not wait;
+                // fall through to the output-parsed reset wait.
+                _ => {}
+            }
+        }
+        let probe = || probe_rate_limit_lifted(permission_mode);
+        #[allow(deprecated)] // single legitimate caller of the relocated leaf
+        usage::wait_for_usage_reset(wait_secs, tasks_dir, fallback_wait, Some(&probe))
+    };
+
+    react_to_outputs_inner(conn, items, params, &wait)
 }
 
 /// Hermetic core of the post-output rate-limit reaction. Detects `RateLimit`
 /// across `items`, resets the affected `in_progress` task(s) to `todo`, and
 /// fires `wait` **exactly once**, then maps the result to an [`AccountReaction`].
 ///
-/// **Scaffold under TEST-INIT-001** — body implemented by FEAT-006. The
-/// contract is pinned by the ignored tests in `tests/reaction_parity.rs`.
+/// The contract is pinned by the parity tests in `tests/reaction_parity.rs`.
 pub fn react_to_outputs_inner(
     conn: &mut Connection,
     items: &[OutputReactionItem<'_>],
     params: &AccountReactionParams<'_>,
     wait: WaitFn<'_>,
 ) -> AccountReaction {
-    let _ = (conn, items, params, wait);
-    unimplemented!(
-        "FEAT-006: scan items for RateLimit; if none return None with ZERO DB \
-         writes; else reset in_progress via recover_in_progress_for_prefix and \
-         fire `wait` exactly once (Completed -> WaitedAndRetry, Stopped -> Stop)"
-    )
+    // No `RateLimit` item ⇒ nothing to do. ZERO DB writes, no wait.
+    let Some(first_rate_limited) = items
+        .iter()
+        .find(|item| *item.outcome == IterationOutcome::RateLimit)
+    else {
+        return AccountReaction::None;
+    };
+
+    // A rate/session limit hit the shared account mid-wave. Reset every
+    // `in_progress` row under this PRD prefix back to `todo` so the next
+    // wave/iteration re-runs them. The `status = 'in_progress'` guard inside
+    // `recover_in_progress_for_prefix` means slots that already completed THIS
+    // wave (flipped to `done` by `process_slot_result`) are never clobbered
+    // (FEAT-006 B1).
+    let prefix = if params.prefix.is_empty() {
+        None
+    } else {
+        Some(params.prefix)
+    };
+    if let Err(e) =
+        TaskLifecycle::with_run(conn, params.run_id).recover_in_progress_for_prefix(prefix)
+    {
+        eprintln!(
+            "Warning: failed to reset in_progress tasks after rate limit: {}",
+            e
+        );
+    }
+
+    // Compute the wait once from the FIRST rate-limited output, then fire the
+    // injected wait seam EXACTLY once for the whole wave — never once per
+    // rate-limited slot.
+    #[allow(deprecated)] // single legitimate caller of the relocated leaf
+    let wait_secs =
+        usage::parse_reset_from_output(first_rate_limited.output).unwrap_or(params.fallback_wait);
+
+    if wait(wait_secs) {
+        AccountReaction::WaitedAndRetry
+    } else {
+        AccountReaction::Stop
+    }
 }

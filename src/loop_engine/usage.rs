@@ -127,6 +127,9 @@ pub fn check_usage_api(access_token: &str) -> Option<UsageInfo> {
 ///
 /// The `wait_secs` parameter specifies how long to wait. It is capped at
 /// `MAX_WAIT_SECS` (5 hours).
+#[deprecated(
+    note = "post-output rate-limit wait converged into reactions::account::react_to_outputs (FEAT-006); the engine paths must route through that coordinator, not call this leaf directly"
+)]
 pub fn wait_for_usage_reset(
     wait_secs: u64,
     tasks_dir: &Path,
@@ -272,6 +275,8 @@ pub fn check_and_wait(threshold: u8, tasks_dir: &Path, fallback_wait: u64) -> Us
         .and_then(estimate_reset_seconds)
         .unwrap_or(0);
 
+    #[allow(deprecated)]
+    // pre-dispatch gate's own wait; convergence is FEAT-003's pre_spawn relocation
     let completed = wait_for_usage_reset(wait_secs, tasks_dir, fallback_wait, None);
 
     if completed {
@@ -285,6 +290,9 @@ pub fn check_and_wait(threshold: u8, tasks_dir: &Path, fallback_wait: u64) -> Us
 ///
 /// Extracts the time token after "resets " and computes seconds until that local time.
 /// Returns `None` if the pattern is not found, unparseable, or the time has already passed.
+#[deprecated(
+    note = "post-output rate-limit wait converged into reactions::account::react_to_outputs (FEAT-006); the engine paths must route through that coordinator, not call this leaf directly"
+)]
 pub fn parse_reset_from_output(output: &str) -> Option<u64> {
     let lower = output.to_lowercase();
     let idx = lower.find("resets ")?;
@@ -387,6 +395,7 @@ fn sanitize_api_error(error: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // these unit tests own the deprecated leaves' behavioral coverage
 mod tests {
     use super::*;
     use crate::loop_engine::STOP_FILE;

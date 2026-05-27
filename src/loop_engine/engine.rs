@@ -592,6 +592,11 @@ pub struct WaveIterationParams<'a> {
     /// and shared across the wave loop instead of being re-read per call site.
     /// Same restart-required semantics as `prd_implicit_overlap_files`.
     pub project_config: &'a project_config::ProjectConfig,
+    /// Usage API monitoring parameters. Threaded so the converged post-output
+    /// rate-limit reaction (`reactions::account::react_to_outputs`, FEAT-006)
+    /// can fire the usage wait once per wave — the wave path previously had no
+    /// rate-limit handling at all. Mirrors `IterationParams::usage_params`.
+    pub usage_params: &'a UsageParams,
 }
 
 /// Aggregated outcome of one parallel wave returned to `run_loop`.
@@ -645,6 +650,14 @@ pub struct WaveOutcome {
     /// `IterationContext::consecutive_merge_fail_waves`, and halt when the
     /// counter reaches `ProjectConfig::merge_fail_halt_threshold`.
     pub failed_merges: Vec<FailedMerge>,
+    /// True only on the FEAT-006 `WaitedAndRetry` early return: the wave hit a
+    /// rate limit, waited once, reset its `in_progress` tasks, and bailed out
+    /// BEFORE merge-back. The orchestrator must (B3) skip
+    /// `apply_merge_fail_reset_and_halt_check` for this wave — calling it with
+    /// the empty `failed_merges` this path carries would zero the cascade-halt
+    /// streak. Always `false` for every other exit (sequential runs, normal
+    /// waves, terminal stops).
+    pub rate_limited_retry: bool,
 }
 
 /// Wave-mode aggregator collected during per-slot post-processing.

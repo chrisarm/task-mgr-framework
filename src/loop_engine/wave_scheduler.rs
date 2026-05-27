@@ -72,6 +72,7 @@ use crate::loop_engine::model;
 use crate::loop_engine::prd_reconcile::reconcile_passes_with_db;
 use crate::loop_engine::progress;
 use crate::loop_engine::prompt;
+use crate::loop_engine::reactions;
 use crate::loop_engine::recovery::{check_override_invalidation, handle_task_failure};
 use crate::loop_engine::runner::RunnerKind;
 use crate::loop_engine::signals::{self, SignalFlag};
@@ -215,6 +216,7 @@ fn wave_preflight_check(
             }),
             was_stopped: false,
             failed_merges: Vec::new(),
+            rate_limited_retry: false,
         });
     }
     if signals::check_stop_signal(params.tasks_dir, params.task_prefix) {
@@ -229,6 +231,7 @@ fn wave_preflight_check(
             }),
             was_stopped: true,
             failed_merges: Vec::new(),
+            rate_limited_retry: false,
         });
     }
 
@@ -255,6 +258,7 @@ fn wave_preflight_check(
             }),
             was_stopped: false,
             failed_merges: Vec::new(),
+            rate_limited_retry: false,
         });
     }
     None
@@ -322,6 +326,7 @@ fn handle_no_eligible_tasks(
             }),
             was_stopped: false,
             failed_merges: Vec::new(),
+            rate_limited_retry: false,
         };
     }
 
@@ -342,6 +347,7 @@ fn handle_no_eligible_tasks(
             terminal: None,
             was_stopped: false,
             failed_merges: Vec::new(),
+            rate_limited_retry: false,
         };
     }
 
@@ -376,6 +382,7 @@ fn handle_no_eligible_tasks(
             }),
             was_stopped: false,
             failed_merges: Vec::new(),
+            rate_limited_retry: false,
         };
     }
     WaveOutcome {
@@ -384,6 +391,7 @@ fn handle_no_eligible_tasks(
         terminal: None,
         was_stopped: false,
         failed_merges: Vec::new(),
+        rate_limited_retry: false,
     }
 }
 
@@ -486,6 +494,7 @@ fn handle_ephemeral_deadlock(
         terminal: None,
         was_stopped: false,
         failed_merges,
+        rate_limited_retry: false,
     }
 }
 
@@ -1031,6 +1040,69 @@ pub fn run_wave_iteration(
         process_slot_result(slot_result, &mut params, ctx, &mut agg);
     }
 
+    // FEAT-006: account-global post-output rate-limit reaction. Folds all N
+    // slot outputs into ONE reaction so the usage wait fires exactly once per
+    // wave (never once per rate-limited slot). Runs AFTER `process_slot_result`
+    // — so completed slots are already `done` and the reset's
+    // `status='in_progress'` guard cannot clobber them (B1) — and BEFORE
+    // `handle_task_failure` / crash policy / merge-back. On `WaitedAndRetry` the
+    // wave returns early WITHOUT consuming the loop-bound iteration (B2,
+    // `iteration_consumed: false`) and WITHOUT zeroing the merge-fail streak
+    // (B3, `rate_limited_retry: true` makes the orchestrator skip the FEAT-002
+    // reset/halt check this wave). The completed-but-unmerged slots' ephemeral
+    // branches persist; next wave's `ephemeral_overlay` (built at the top of
+    // `run_wave_iteration`) re-discovers them, so deferred-merge affinity is
+    // preserved without extra work here.
+    {
+        let rate_limit_items: Vec<reactions::account::OutputReactionItem<'_>> = wave_result
+            .outcomes
+            .iter()
+            .filter(|s| s.claim_succeeded)
+            .map(|s| reactions::account::OutputReactionItem {
+                task_id: s.iteration_result.task_id.as_deref(),
+                outcome: &s.iteration_result.outcome,
+                output: &s.iteration_result.output,
+            })
+            .collect();
+        let account_params = reactions::account::AccountReactionParams {
+            threshold: params.usage_params.threshold,
+            usage_enabled: params.usage_params.enabled,
+            tasks_dir: params.tasks_dir,
+            fallback_wait: params.usage_params.fallback_wait,
+            prefix: params.task_prefix.unwrap_or(""),
+            run_id: params.run_id,
+            permission_mode: params.permission_mode,
+        };
+        match reactions::account::react_to_outputs(params.conn, &rate_limit_items, &account_params)
+        {
+            reactions::account::AccountReaction::None => {}
+            reactions::account::AccountReaction::WaitedAndRetry => {
+                return WaveOutcome {
+                    tasks_completed: agg.tasks_completed,
+                    iteration_consumed: false,
+                    terminal: None,
+                    was_stopped: false,
+                    failed_merges: Vec::new(),
+                    rate_limited_retry: true,
+                };
+            }
+            reactions::account::AccountReaction::Stop => {
+                return WaveOutcome {
+                    tasks_completed: agg.tasks_completed,
+                    iteration_consumed: true,
+                    terminal: Some(WaveTerminal {
+                        exit_code: 130,
+                        reason: "stop signal during rate-limit wait".to_string(),
+                        run_status: None,
+                    }),
+                    was_stopped: true,
+                    failed_merges: Vec::new(),
+                    rate_limited_retry: false,
+                };
+            }
+        }
+    }
+
     // FEAT-007: post-wave retry tracking. Mirrors the sequential call site in
     // `run_loop` (engine.rs:~3992) so wave-mode RuntimeError slots feed the
     // `consecutive_failures` counter, the Claude-tier escalation ladder, AND
@@ -1233,6 +1305,7 @@ pub fn run_wave_iteration(
             }),
             was_stopped: false,
             failed_merges,
+            rate_limited_retry: false,
         };
     }
     if ctx.crash_tracker.should_abort() {
@@ -1246,6 +1319,7 @@ pub fn run_wave_iteration(
             }),
             was_stopped: false,
             failed_merges,
+            rate_limited_retry: false,
         };
     }
 
@@ -1262,6 +1336,7 @@ pub fn run_wave_iteration(
             }),
             was_stopped: false,
             failed_merges,
+            rate_limited_retry: false,
         };
     }
 
@@ -1293,6 +1368,7 @@ pub fn run_wave_iteration(
         },
         was_stopped: false,
         failed_merges,
+        rate_limited_retry: false,
     }
 }
 
@@ -1419,6 +1495,16 @@ mod tests {
         }
     }
 
+    /// Disabled usage params shared by the wave-param test fixtures. `const`
+    /// so `&TEST_USAGE_PARAMS` is a `'static` reference the borrowed
+    /// `WaveIterationParams` field can hold without per-test plumbing.
+    const TEST_USAGE_PARAMS: crate::loop_engine::engine::UsageParams =
+        crate::loop_engine::engine::UsageParams {
+            enabled: false,
+            threshold: 92,
+            fallback_wait: 300,
+        };
+
     #[allow(clippy::too_many_arguments)]
     fn make_wave_params<'a>(
         conn: &'a mut Connection,
@@ -1463,6 +1549,7 @@ mod tests {
             session_guidance: "",
             prd_implicit_overlap_files,
             project_config,
+            usage_params: &TEST_USAGE_PARAMS,
         }
     }
 
@@ -1997,6 +2084,7 @@ mod tests {
                 session_guidance: "",
                 prd_implicit_overlap_files: &prd_implicit,
                 project_config: &project_cfg,
+                usage_params: &TEST_USAGE_PARAMS,
             },
             &mut ctx,
         );
@@ -2199,6 +2287,7 @@ mod tests {
                 session_guidance: "",
                 prd_implicit_overlap_files,
                 project_config,
+                usage_params: &TEST_USAGE_PARAMS,
             }
         }
 
@@ -2850,6 +2939,7 @@ mod tests {
             terminal: None,
             was_stopped: false,
             failed_merges: Vec::new(),
+            rate_limited_retry: false,
         };
         assert!(outcome.failed_merges.is_empty());
     }
@@ -2874,6 +2964,7 @@ mod tests {
                     task_id: Some("FEAT-002".into()),
                 },
             ],
+            rate_limited_retry: false,
         };
         assert_eq!(outcome.failed_merges.len(), 2);
         assert_eq!(outcome.failed_merges[0].slot, 1);
