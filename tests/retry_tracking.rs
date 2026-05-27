@@ -275,7 +275,7 @@ fn test_handle_task_failure_escalation_at_two_then_block_at_three() {
 
     // Failure 1
     let mut ctx = IterationContext::new(8);
-    handle_task_failure(&mut conn, "TASK-A", 1, &mut ctx, None).unwrap();
+    handle_task_failure(&mut conn, "TASK-A", 1, &mut ctx, None, None).unwrap();
     let (count, model, status, _) = read_task_state(&conn, "TASK-A");
     assert_eq!(count, 1, "failure 1: count must be 1");
     assert_eq!(
@@ -286,7 +286,7 @@ fn test_handle_task_failure_escalation_at_two_then_block_at_three() {
     assert_eq!(status, "in_progress", "failure 1: task must not be blocked");
 
     // Failure 2: escalation fires (count=2 >= threshold=2)
-    handle_task_failure(&mut conn, "TASK-A", 2, &mut ctx, None).unwrap();
+    handle_task_failure(&mut conn, "TASK-A", 2, &mut ctx, None, None).unwrap();
     let (count, model, status, _) = read_task_state(&conn, "TASK-A");
     assert_eq!(count, 2, "failure 2: count must be 2");
     assert_eq!(
@@ -300,7 +300,7 @@ fn test_handle_task_failure_escalation_at_two_then_block_at_three() {
     );
 
     // Failure 3: auto-block fires (count=3 >= max_retries=3), escalation skipped (would be wasted)
-    handle_task_failure(&mut conn, "TASK-A", 3, &mut ctx, None).unwrap();
+    handle_task_failure(&mut conn, "TASK-A", 3, &mut ctx, None, None).unwrap();
     let (count, model, status, last_error) = read_task_state(&conn, "TASK-A");
     assert_eq!(count, 3, "failure 3: count must be 3");
     assert_eq!(
@@ -322,7 +322,7 @@ fn test_handle_task_failure_max_retries_zero_never_blocks() {
 
     let mut ctx = IterationContext::new(8);
     for i in 0..5 {
-        handle_task_failure(&mut conn, "NEVER-BLOCK", i + 1, &mut ctx, None).unwrap();
+        handle_task_failure(&mut conn, "NEVER-BLOCK", i + 1, &mut ctx, None, None).unwrap();
     }
 
     let (count, _, status, _) = read_task_state(&conn, "NEVER-BLOCK");
@@ -343,7 +343,7 @@ fn test_handle_task_failure_max_retries_one_blocks_immediately() {
     insert_retry_task(&conn, "BLOCK-FAST", Some(SONNET_MODEL), 1, 0);
 
     let mut ctx = IterationContext::new(8);
-    handle_task_failure(&mut conn, "BLOCK-FAST", 1, &mut ctx, None).unwrap();
+    handle_task_failure(&mut conn, "BLOCK-FAST", 1, &mut ctx, None, None).unwrap();
 
     let (count, _, status, _) = read_task_state(&conn, "BLOCK-FAST");
     assert_eq!(
@@ -364,7 +364,7 @@ fn test_handle_task_failure_max_retries_two_blocks_on_second() {
 
     let mut ctx = IterationContext::new(8);
     // Failure 1: no block yet
-    handle_task_failure(&mut conn, "BLOCK-TWO", 1, &mut ctx, None).unwrap();
+    handle_task_failure(&mut conn, "BLOCK-TWO", 1, &mut ctx, None, None).unwrap();
     let (count, _, status, _) = read_task_state(&conn, "BLOCK-TWO");
     assert_eq!(count, 1, "failure 1: count must be 1");
     assert_eq!(
@@ -373,7 +373,7 @@ fn test_handle_task_failure_max_retries_two_blocks_on_second() {
     );
 
     // Failure 2: blocks (escalation skipped — would be wasted since auto-block fires too)
-    handle_task_failure(&mut conn, "BLOCK-TWO", 2, &mut ctx, None).unwrap();
+    handle_task_failure(&mut conn, "BLOCK-TWO", 2, &mut ctx, None, None).unwrap();
     let (count, _, status, _) = read_task_state(&conn, "BLOCK-TWO");
     assert_eq!(count, 2, "failure 2: count must be 2");
     assert_eq!(
@@ -393,7 +393,7 @@ fn test_model_escalation_haiku_to_sonnet_at_two_failures() {
     insert_retry_task(&conn, "HAIKU-T", Some(HAIKU_MODEL), 3, 0);
 
     let mut ctx = IterationContext::new(8);
-    let result = escalate_task_model_if_needed(&conn, "HAIKU-T", 2, &mut ctx, None).unwrap();
+    let result = escalate_task_model_if_needed(&conn, "HAIKU-T", 2, &mut ctx, None, None).unwrap();
     assert_eq!(
         result,
         Some(SONNET_MODEL.to_string()),
@@ -423,7 +423,7 @@ fn test_model_escalation_empty_and_whitespace_normalize_to_opus() {
         insert_retry_task(&conn, &id, Some(bad), 5, 0);
 
         let mut ctx = IterationContext::new(8);
-        let result = escalate_task_model_if_needed(&conn, &id, 2, &mut ctx, None).unwrap();
+        let result = escalate_task_model_if_needed(&conn, &id, 2, &mut ctx, None, None).unwrap();
         assert_eq!(
             result,
             Some(OPUS_MODEL.to_string()),
@@ -449,7 +449,7 @@ fn test_handle_task_failure_haiku_escalates_to_sonnet_at_two() {
 
     let mut ctx = IterationContext::new(8);
     // Failure 1: no escalation
-    handle_task_failure(&mut conn, "HAIKU-PIPE", 1, &mut ctx, None).unwrap();
+    handle_task_failure(&mut conn, "HAIKU-PIPE", 1, &mut ctx, None, None).unwrap();
     let (_, model, _, _) = read_task_state(&conn, "HAIKU-PIPE");
     assert_eq!(
         model.as_deref(),
@@ -458,7 +458,7 @@ fn test_handle_task_failure_haiku_escalates_to_sonnet_at_two() {
     );
 
     // Failure 2: escalates haiku → sonnet
-    handle_task_failure(&mut conn, "HAIKU-PIPE", 2, &mut ctx, None).unwrap();
+    handle_task_failure(&mut conn, "HAIKU-PIPE", 2, &mut ctx, None, None).unwrap();
     let (_, model, status, _) = read_task_state(&conn, "HAIKU-PIPE");
     assert_eq!(
         model.as_deref(),

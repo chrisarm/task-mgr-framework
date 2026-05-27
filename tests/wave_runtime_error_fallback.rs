@@ -131,7 +131,7 @@ fn post_wave_aggregation_fires_runtime_error_hook_for_crashing_slot_not_complete
         ) {
             continue;
         }
-        handle_task_failure(&mut conn, task_id, 1, &mut ctx, Some(&cfg)).unwrap();
+        handle_task_failure(&mut conn, task_id, 1, &mut ctx, Some(&cfg), None).unwrap();
     }
 
     assert_eq!(
@@ -172,7 +172,7 @@ fn runner_overrides_is_empty_before_post_aggregation_and_populated_after() {
     );
 
     // Simulate: post-wave aggregation calls handle_task_failure for the crashing slot.
-    handle_task_failure(&mut conn, task_id, 1, &mut ctx, Some(&cfg)).unwrap();
+    handle_task_failure(&mut conn, task_id, 1, &mut ctx, Some(&cfg), None).unwrap();
 
     // AFTER post-aggregation: mutation must now be visible on the main thread.
     assert_eq!(
@@ -245,7 +245,7 @@ fn wave_idempotency_second_runtime_error_on_grok_task_increments_counter_skips_p
     let failures_before = read_consecutive_failures(&conn, task_id);
 
     // Post-wave aggregation for the second Crash(RuntimeError) on the same task.
-    handle_task_failure(&mut conn, task_id, 2, &mut ctx, Some(&cfg)).unwrap();
+    handle_task_failure(&mut conn, task_id, 2, &mut ctx, Some(&cfg), None).unwrap();
 
     // Counter must have incremented (progressing toward max_retries auto-block).
     let failures_after = read_consecutive_failures(&conn, task_id);
@@ -374,7 +374,7 @@ fn wave_promotion_banner_dedup_second_path_skips_when_runner_overrides_already_s
 
     // The RuntimeError hook path: handle_task_failure increments to threshold
     // and calls escalate_task_model_if_needed.
-    handle_task_failure(&mut conn, task_id, 1, &mut ctx, Some(&cfg)).unwrap();
+    handle_task_failure(&mut conn, task_id, 1, &mut ctx, Some(&cfg), None).unwrap();
 
     // State must be consistent: one entry, correct value, no double-insert.
     assert_eq!(

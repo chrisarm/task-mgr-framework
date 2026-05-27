@@ -1055,6 +1055,7 @@ pub fn run_wave_iteration(
             params.iteration as i64,
             ctx,
             params.project_config.fallback_runner.as_ref(),
+            params.project_config.primary_runner.as_ref(),
         ) {
             eprintln!(
                 "Warning: failed to start retry tracking transaction for slot {} task {}: {}",
