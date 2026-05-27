@@ -243,23 +243,10 @@ pub fn react_to_outputs_inner(
 
     // A rate/session limit hit the shared account mid-wave. Reset every
     // `in_progress` row under this PRD prefix back to `todo` so the next
-    // wave/iteration re-runs them. The `status = 'in_progress'` guard inside
-    // `recover_in_progress_for_prefix` means slots that already completed THIS
-    // wave (flipped to `done` by `process_slot_result`) are never clobbered
-    // (FEAT-006 B1).
-    let prefix = if params.prefix.is_empty() {
-        None
-    } else {
-        Some(params.prefix)
-    };
-    if let Err(e) =
-        TaskLifecycle::with_run(conn, params.run_id).recover_in_progress_for_prefix(prefix)
-    {
-        eprintln!(
-            "Warning: failed to reset in_progress tasks after rate limit: {}",
-            e
-        );
-    }
+    // wave/iteration re-runs them. Slots that already completed THIS wave
+    // (flipped to `done` by `process_slot_result`) are never clobbered
+    // (FEAT-006 B1) — the `status = 'in_progress'` guard is inside the helper.
+    reset_in_progress_tasks(conn, params.run_id, params.prefix, "rate limit");
 
     // Compute the wait once from the FIRST rate-limited output, then fire the
     // injected wait seam EXACTLY once for the whole wave — never once per
@@ -352,6 +339,27 @@ pub struct TransientReactionParams<'a> {
     pub base_wait_secs: u64,
     /// Exponential-backoff cap seconds ([`TRANSIENT_BACKOFF_MAX_SECS`]).
     pub max_wait_secs: u64,
+}
+
+/// Resets every `in_progress` row under `prefix` back to `todo`, logging a
+/// warning on error. The `status = 'in_progress'` guard inside
+/// `recover_in_progress_for_prefix` means slots that already completed this
+/// wave (flipped to `done`) are never clobbered (B1). `context` is appended
+/// to the warning message to distinguish rate-limit from transient callers.
+fn reset_in_progress_tasks(conn: &mut Connection, run_id: &str, prefix: &str, context: &str) {
+    let prefix_opt = if prefix.is_empty() {
+        None
+    } else {
+        Some(prefix)
+    };
+    if let Err(e) =
+        TaskLifecycle::with_run(conn, run_id).recover_in_progress_for_prefix(prefix_opt)
+    {
+        eprintln!(
+            "Warning: failed to reset in_progress tasks after {}: {}",
+            context, e
+        );
+    }
 }
 
 /// Exponential backoff: `base * 2^attempt`, saturating and capped at `max`.
@@ -459,22 +467,15 @@ pub fn react_to_transient_inner(
 
     // A transient backend error hit the shared account mid-wave. Reset every
     // `in_progress` row under this PRD prefix back to `todo` so the next
-    // wave/iteration re-runs them. The `status = 'in_progress'` guard inside
-    // `recover_in_progress_for_prefix` means slots that already completed THIS
-    // wave (flipped to `done`) are never clobbered (B1).
-    let prefix = if params.prefix.is_empty() {
-        None
-    } else {
-        Some(params.prefix)
-    };
-    if let Err(e) =
-        TaskLifecycle::with_run(conn, params.run_id).recover_in_progress_for_prefix(prefix)
-    {
-        eprintln!(
-            "Warning: failed to reset in_progress tasks after transient backend error: {}",
-            e
-        );
-    }
+    // wave/iteration re-runs them. Slots that already completed THIS wave
+    // (flipped to `done`) are never clobbered (B1) — the `status =
+    // 'in_progress'` guard is inside the helper.
+    reset_in_progress_tasks(
+        conn,
+        params.run_id,
+        params.prefix,
+        "transient backend error",
+    );
 
     // Honor the backend's `Retry-After` (carried on the outcome) when present;
     // otherwise exponential `base * 2^attempt` capped at `max`. Computed from
