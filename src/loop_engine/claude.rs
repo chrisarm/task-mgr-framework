@@ -3147,6 +3147,11 @@ mod tests {
         let _guard = CLAUDE_BINARY_MUTEX
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        // Hold the crate-level env mutex so we don't race with add.rs tests that
+        // also observe TASK_MGR_ACTIVE_PREFIX.  Must outlive _env_guard (drops last).
+        let _prefix_lock = crate::ENV_PREFIX_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Ensure the env var is not set in the parent so it can't be inherited.
         let _env_guard = EnvVarGuard::unset("TASK_MGR_ACTIVE_PREFIX");
 
@@ -3188,6 +3193,9 @@ mod tests {
     #[test]
     fn test_default_spawn_opts_no_active_prefix_on_child() {
         let _guard = CLAUDE_BINARY_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _prefix_lock = crate::ENV_PREFIX_MUTEX
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let _env_guard = EnvVarGuard::unset("TASK_MGR_ACTIVE_PREFIX");

@@ -967,14 +967,6 @@ mod tests {
         conn
     }
 
-    /// Process-wide serialization for tests that observe `TASK_MGR_ACTIVE_PREFIX`.
-    ///
-    /// `resolve_active_prefix` reads the env var, so any test that calls
-    /// `add_with_conn` (which calls `resolve_active_prefix`) is sensitive to
-    /// concurrent env-var-mutating tests. Every such test acquires this
-    /// mutex via `isolate_env()`. Mitigates Learning [1685].
-    static ENV_PREFIX_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     const ACTIVE_PREFIX_ENV: &str = crate::loop_engine::claude::ACTIVE_PREFIX_ENV;
 
     /// RAII guard: saves and restores `TASK_MGR_ACTIVE_PREFIX` (or removes it)
@@ -1014,7 +1006,9 @@ mod tests {
         _env: EnvVarGuard,
     }
     fn isolate_env() -> EnvIsolation {
-        let lock = ENV_PREFIX_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let lock = crate::ENV_PREFIX_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let env = EnvVarGuard::unset(ACTIVE_PREFIX_ENV);
         EnvIsolation {
             _lock: lock,
