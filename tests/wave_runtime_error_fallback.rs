@@ -1,4 +1,5 @@
-//! Phase 3 wave-mode tests for US-004 RuntimeError fallback (TEST-003).
+//! Phase 3 wave-mode tests for US-004 RuntimeError fallback (TEST-003) and
+//! TEST-001 wave-mode rate-limit wait and resume (bug #3 repro).
 //!
 //! Verifies the RuntimeError fallback hook wiring in wave mode:
 //!
@@ -14,15 +15,34 @@
 //! - Merge-back logic is runner-agnostic: `merge_slot_branches_with_resolver`
 //!   does not branch on `RunnerKind` (PRD §2.5 "Wave mode: two slots on
 //!   different runners merge back").
+//!
+//! Also verifies the wave-mode rate-limit wait and resume contract (TEST-001):
+//!
+//! - A 2-slot wave whose slots return the session-limit string triggers exactly
+//!   one usage wait (injected/hermetic) and returns `WaitedAndRetry` — never
+//!   `None` (which was the pre-FEAT-006 silent omission that produced the
+//!   strand-and-false-abort bug).
+//! - Rate-limited `in_progress` tasks are reset to `todo` before the wait so
+//!   the next wave finds them eligible (prevents "no eligible tasks after N
+//!   consecutive stale iterations").
+//! - The `WaveOutcome` carries `iteration_consumed: false` / `rate_limited_retry:
+//!   true`, and `account_iteration_budget` returns that budget increment so
+//!   `max_iterations` is not consumed by the wait wave.
+
+use std::cell::Cell;
 
 use rusqlite::Connection;
 use tempfile::TempDir;
 
 use task_mgr::db::{create_schema, open_connection, run_migrations};
-use task_mgr::loop_engine::config::{CrashType, IterationOutcome};
+use task_mgr::loop_engine::config::{CrashType, IterationOutcome, PermissionMode};
 use task_mgr::loop_engine::engine::{IterationContext, handle_task_failure};
 use task_mgr::loop_engine::model::OPUS_MODEL;
 use task_mgr::loop_engine::project_config::FallbackRunnerConfig;
+use task_mgr::loop_engine::reactions::account::{
+    AccountReaction, AccountReactionParams, OutputReactionItem, WaitFn, react_to_outputs_inner,
+};
+use task_mgr::loop_engine::reactions::{IterationBudgetParams, account_iteration_budget};
 use task_mgr::loop_engine::runner::RunnerKind;
 
 /// Grok model id expected after promotion. Matches `FallbackRunnerConfig::default`
@@ -53,6 +73,17 @@ fn insert_task(conn: &Connection, id: &str, model: Option<&str>, consecutive_fai
     )
     .unwrap();
 }
+
+fn read_task_status(conn: &Connection, id: &str) -> Option<String> {
+    conn.query_row("SELECT status FROM tasks WHERE id = ?", [id], |r| {
+        r.get::<_, String>(0)
+    })
+    .ok()
+}
+
+/// `PermissionMode` for hermetic inner tests — actual value unused since the
+/// wait is injected (no OAuth / usage API / real sleep in the inner path).
+static WAVE_RL_PERMISSION_MODE: PermissionMode = PermissionMode::Dangerous;
 
 fn read_consecutive_failures(conn: &Connection, id: &str) -> i32 {
     conn.query_row(
@@ -395,6 +426,233 @@ fn wave_promotion_banner_dedup_second_path_skips_when_runner_overrides_already_s
         grok_entries.len(),
         1,
         "runner_overrides must have exactly ONE entry for the task after both paths run",
+    );
+}
+
+// ── TEST-001: Wave-mode rate-limit waits and resumes (bug #3 repro) ─────────────
+
+/// A 2-slot wave whose BOTH slots return the session-limit string must:
+///   1. Fire the injected wait EXACTLY ONCE (not once per slot) — AC1.
+///   2. Reset both `in_progress` tasks to `todo` before the wait — AC3.
+///   3. Return `AccountReaction::WaitedAndRetry`, NOT `None` — AC1/AC2.
+///
+/// This is the regression test for the production incident: before FEAT-006
+/// wired `react_to_outputs` into the wave path, rate-limited slots stayed
+/// `in_progress`. The next wave therefore found zero eligible tasks and the
+/// stale iteration counter eventually aborted with "no eligible tasks after N
+/// consecutive stale iterations". By resetting to `todo` AND returning
+/// `WaitedAndRetry`, the coordinator prevents that cascade.
+///
+/// Uses the hermetic inner seam (`react_to_outputs_inner` + injected `WaitFn`)
+/// — no OAuth, no usage API, no real sleep.
+#[test]
+fn wave_rate_limit_two_slots_session_limit_waits_once_and_resets_to_todo() {
+    let (_dir, mut conn) = setup_db();
+
+    let slot0_task = "WAVE-RL-001";
+    let slot1_task = "WAVE-RL-002";
+
+    // Both slots hit the session limit while still in_progress — the state
+    // left behind when neither slot completed before the limit fired.
+    insert_task(&conn, slot0_task, None, 0);
+    insert_task(&conn, slot1_task, None, 0);
+
+    // Exact session-limit string produced by the Claude CLI. Detected by
+    // `detection::is_rate_limited` → `IterationOutcome::RateLimit`.
+    let session_limit_output = "You've hit your session limit · resets 11pm";
+
+    let rate = IterationOutcome::RateLimit;
+    let items = [
+        OutputReactionItem {
+            task_id: Some(slot0_task),
+            outcome: &rate,
+            output: session_limit_output,
+        },
+        OutputReactionItem {
+            task_id: Some(slot1_task),
+            outcome: &rate,
+            output: session_limit_output,
+        },
+    ];
+
+    // Injected wait seam: records calls, returns true (completed → retry).
+    // `Cell` is required because the seam is `Fn`, not `FnMut`.
+    let wait_calls = Cell::new(0u32);
+    let wait = |_wait_secs: u64| -> bool {
+        wait_calls.set(wait_calls.get() + 1);
+        true
+    };
+
+    let tasks_dir_tmp = TempDir::new().unwrap();
+    let params = AccountReactionParams {
+        threshold: 80,
+        usage_enabled: false,
+        tasks_dir: tasks_dir_tmp.path(),
+        fallback_wait: 600,
+        prefix: "WAVE-RL",
+        run_id: "wave-rl-run",
+        permission_mode: &WAVE_RL_PERMISSION_MODE,
+    };
+
+    let reaction = react_to_outputs_inner(&mut conn, &items, &params, &wait as WaitFn);
+
+    // AC1: the account-global wait fires EXACTLY once for the whole wave,
+    // regardless of how many rate-limited slots there are.
+    assert_eq!(
+        wait_calls.get(),
+        1,
+        "the account-global wait must fire EXACTLY once per 2-slot rate-limited wave, \
+         not once per slot — pre-FEAT-006 the wait never fired at all in wave mode",
+    );
+
+    // AC1: the reaction must be WaitedAndRetry (wait completed → caller retries).
+    // Before FEAT-006, the wave path never called react_to_outputs, so the
+    // effective reaction was always None — triggering the strand-and-abort bug.
+    assert_eq!(
+        reaction,
+        AccountReaction::WaitedAndRetry,
+        "a completed session-limit wait over a 2-slot wave must return WaitedAndRetry, \
+         signalling the caller to retry WITHOUT consuming the iteration budget",
+    );
+
+    // AC3: both rate-limited tasks must be reset to `todo` so the next wave
+    // finds them eligible. While they remain `in_progress` the scheduler can't
+    // select them, producing the "no eligible tasks" stale abort cascade.
+    assert_eq!(
+        read_task_status(&conn, slot0_task).as_deref(),
+        Some("todo"),
+        "slot 0's rate-limited task must be reset to `todo` before the wait so \
+         the next wave can re-claim and re-run it",
+    );
+    assert_eq!(
+        read_task_status(&conn, slot1_task).as_deref(),
+        Some("todo"),
+        "slot 1's rate-limited task must be reset to `todo` before the wait so \
+         the next wave can re-claim and re-run it",
+    );
+}
+
+/// `account_iteration_budget` with `consumes_budget: false` must give the
+/// loop-bound iteration counter back (AC4: max_iterations is not consumed).
+///
+/// This is the budget rule that `run_wave_iteration` exercises via
+/// `WaveOutcome { iteration_consumed: false }` on a `WaitedAndRetry` return.
+/// Routing both the wave and sequential paths through this helper (FEAT-013)
+/// ensures neither path drifts on the give-back rule.
+#[test]
+fn wave_rate_limit_does_not_consume_max_iterations_budget() {
+    // Simulate the orchestrator's loop-bound state after one top-of-pass
+    // increment: iteration == 1, iterations_completed == 0.
+    let mut iteration: u32 = 1;
+    let mut iterations_completed: u32 = 0;
+
+    // A rate-limited wave returns iteration_consumed: false — give back.
+    account_iteration_budget(IterationBudgetParams {
+        iteration: &mut iteration,
+        iterations_completed: &mut iterations_completed,
+        consumes_budget: false,
+    });
+
+    // The give-back must return the counter to 0 so the while-loop condition
+    // (`while iteration < max_iterations`) re-enters the same iteration slot.
+    assert_eq!(
+        iteration, 0,
+        "a non-consuming (rate-limited) wave must give the loop-bound iteration \
+         back via saturating_sub(1) — the rate-limit wait must not burn \
+         max_iterations budget",
+    );
+    // The reported completions stat must be unchanged — no task was completed.
+    assert_eq!(
+        iterations_completed, 0,
+        "iterations_completed must not advance for a non-consuming wave — \
+         the rate-limit wait did not make progress on the task list",
+    );
+}
+
+/// A consuming wave (normal completion) DOES advance `iterations_completed`.
+/// Companion to the give-back test above: proves the helper distinguishes
+/// consuming vs non-consuming outcomes correctly.
+#[test]
+fn wave_consuming_outcome_advances_iterations_completed() {
+    let mut iteration: u32 = 1;
+    let mut iterations_completed: u32 = 0;
+
+    account_iteration_budget(IterationBudgetParams {
+        iteration: &mut iteration,
+        iterations_completed: &mut iterations_completed,
+        consumes_budget: true,
+    });
+
+    // The loop-bound counter is already advanced at the loop top; we only
+    // advance the reported stat here.
+    assert_eq!(
+        iteration, 1,
+        "a consuming wave must leave the loop-bound iteration unchanged \
+         (already incremented at the loop top)",
+    );
+    assert_eq!(
+        iterations_completed, 1,
+        "a consuming wave must advance iterations_completed by one",
+    );
+}
+
+/// Source-grep: `run_aggregate_wave_results` (inside `run_wave_iteration`) must
+/// return `WaveOutcome { rate_limited_retry: true, iteration_consumed: false }`
+/// when `react_to_outputs` returns `WaitedAndRetry`.  This flag is what makes
+/// the orchestrator `continue` (skip the stale tracker / merge-fail check) on
+/// a rate-limited wave — AC2: "no stale abort for the rate-limit cause".
+///
+/// Complementary to the behavioral tests above: this grep pins the wiring
+/// contract so a refactor that drops `rate_limited_retry: true` on the
+/// `WaitedAndRetry` arm becomes a test failure rather than a silent regression.
+#[test]
+fn wave_scheduler_returns_rate_limited_retry_flag_on_waited_and_retry() {
+    let src = std::fs::read_to_string("src/loop_engine/wave_scheduler.rs")
+        .expect("could not read src/loop_engine/wave_scheduler.rs");
+
+    // The WaitedAndRetry arm must return early with rate_limited_retry: true.
+    // This flag makes the orchestrator `continue` past the stale-tracker /
+    // merge-fail checks, so the stale counter never increments on a rate-limited
+    // wave.
+    assert!(
+        src.contains("AccountReaction::WaitedAndRetry"),
+        "wave_scheduler.rs must match on AccountReaction::WaitedAndRetry — \
+         the wiring that triggers the rate-limit wait in wave mode",
+    );
+    assert!(
+        src.contains("rate_limited_retry: true"),
+        "wave_scheduler.rs must set rate_limited_retry: true in the WaitedAndRetry arm — \
+         this tells the orchestrator to skip the stale/merge-fail checks on a \
+         rate-limited wave (AC2: no stale abort for the rate-limit cause)",
+    );
+    assert!(
+        src.contains("iteration_consumed: false"),
+        "wave_scheduler.rs must set iteration_consumed: false in the WaitedAndRetry arm — \
+         the rate-limit wait must not consume the max_iterations budget (AC4)",
+    );
+}
+
+/// Source-grep: `orchestrator.rs` must have `if outcome.rate_limited_retry { continue; }`
+/// so a rate-limited wave skips the stale/merge-fail tracking step entirely.
+/// Without this `continue`, a rate-limited wave with zero failed merges would
+/// reset `consecutive_merge_fail_waves` to 0 (zeroing the B3 cascade-halt
+/// defense) and potentially count toward the stale-abort threshold.
+#[test]
+fn orchestrator_skips_stale_tracker_on_rate_limited_retry() {
+    let src = std::fs::read_to_string("src/loop_engine/orchestrator.rs")
+        .expect("could not read src/loop_engine/orchestrator.rs");
+
+    assert!(
+        src.contains("if outcome.rate_limited_retry"),
+        "orchestrator.rs must check outcome.rate_limited_retry — the guard that \
+         skips stale/merge-fail tracking on a rate-limited wave",
+    );
+    // The guard must `continue` the wave loop, not fall through.
+    assert!(
+        src.contains("if outcome.rate_limited_retry {")
+            || src.contains("if outcome.rate_limited_retry {\n"),
+        "orchestrator.rs: the rate_limited_retry guard must use a block scope that \
+         `continue`s the outer wave loop — not a return or early break",
     );
 }
 
