@@ -19,9 +19,11 @@ use rusqlite::Connection;
 use tempfile::TempDir;
 
 use task_mgr::loop_engine::engine::IterationContext;
-use task_mgr::loop_engine::model::OPUS_MODEL_1M;
+use task_mgr::loop_engine::model::{OPUS_MODEL_1M, SONNET_MODEL};
 use task_mgr::loop_engine::overflow::{self, OverflowEvent, RecoveryAction};
-use task_mgr::loop_engine::project_config::{FallbackRunnerConfig, ProjectConfig};
+use task_mgr::loop_engine::project_config::{
+    FallbackRunnerConfig, PrimaryRunnerConfig, ProjectConfig,
+};
 use task_mgr::loop_engine::prompt::PromptResult;
 use task_mgr::loop_engine::runner::RunnerKind;
 
@@ -330,6 +332,281 @@ fn fallback_enabled_task_already_on_grok_returns_blocked() {
         Some(GROK_DEFAULT_MODEL),
         "tasks.model must remain at the Grok value — no second UPDATE on the Blocked rung",
     );
+    assert_eq!(task_status(&conn, task_id), "blocked");
+}
+
+// ── FEAT-PRIMARY-004 — Inverse Grok → Claude rung ─────────────────────────────
+
+/// A `ProjectConfig` whose `primary_runner` carries a Claude fallback model,
+/// optionally pairing it with an enabled Grok fallback (to prove the two
+/// directions don't interfere). `claude_fallback_model = None` exercises the
+/// "no inverse target → Blocked" path.
+fn primary_runner_cfg(
+    claude_fallback_model: Option<&str>,
+    with_grok_fallback: bool,
+) -> ProjectConfig {
+    ProjectConfig {
+        fallback_runner: with_grok_fallback.then(|| FallbackRunnerConfig {
+            enabled: true,
+            provider: "grok".to_string(),
+            model: GROK_DEFAULT_MODEL.to_string(),
+            cli_binary: None,
+            runtime_error_threshold: 2,
+        }),
+        primary_runner: Some(PrimaryRunnerConfig {
+            claude_fallback_model: claude_fallback_model.map(str::to_string),
+            ..PrimaryRunnerConfig::default()
+        }),
+        ..ProjectConfig::default()
+    }
+}
+
+/// AC #6 — A Grok-primary task that overflows at the ceiling, with
+/// `claudeFallbackModel` set, fires rung 4 in the inverse direction: the
+/// target is the configured Claude model, runner flips to Claude.
+#[test]
+fn grok_primary_overflow_with_claude_fallback_promotes_to_claude() {
+    let tmp = TempDir::new().expect("tempdir");
+    let task_id = "GROKP-FEAT-001";
+    // Native Grok-primary task: tasks.model is a Grok model, NO prior override.
+    let mut conn = make_conn_with_task(task_id, Some(GROK_DEFAULT_MODEL));
+    let mut ctx = IterationContext::new(10);
+    let pr = make_prompt_result(task_id);
+    let project_cfg = primary_runner_cfg(Some(SONNET_MODEL), false);
+
+    let action = overflow::handle_prompt_too_long(
+        &mut ctx,
+        &mut conn,
+        task_id,
+        Some("high"),
+        Some(GROK_DEFAULT_MODEL),
+        &pr,
+        1,
+        Some("run-inverse"),
+        tmp.path(),
+        None,
+        RunnerKind::Grok,
+        &project_cfg,
+    );
+
+    assert!(
+        matches!(
+            action,
+            RecoveryAction::FallbackToProvider { ref provider, ref model }
+                if provider == "claude" && model == SONNET_MODEL
+        ),
+        "Grok-primary overflow with claudeFallbackModel set MUST promote to Claude, got {action:?}",
+    );
+    assert_eq!(
+        ctx.runner_overrides.get(task_id),
+        Some(&RunnerKind::Claude),
+        "runner_overrides MUST flip to Claude for the inverse promotion",
+    );
+    assert_eq!(
+        ctx.model_overrides.get(task_id).map(String::as_str),
+        Some(SONNET_MODEL),
+        "model_overrides MUST be set to the claude fallback model",
+    );
+    assert_eq!(
+        task_model(&conn, task_id).as_deref(),
+        Some(SONNET_MODEL),
+        "tasks.model UPDATE must run so resolve_task_model picks Claude next iter",
+    );
+    assert_eq!(
+        task_status(&conn, task_id),
+        "todo",
+        "inverse FallbackToProvider must reset status to 'todo' for the Claude retry",
+    );
+    assert_eq!(
+        ctx.overflow_original_task_model.get(task_id),
+        Some(&Some(GROK_DEFAULT_MODEL.to_string())),
+        "Step 2 capture must snapshot the pre-UPDATE Grok tasks.model value",
+    );
+
+    let events = read_events(tmp.path());
+    assert_eq!(events.len(), 1);
+    assert!(matches!(
+        events[0].recovery,
+        RecoveryAction::FallbackToProvider { ref provider, ref model }
+            if provider == "claude" && model == SONNET_MODEL
+    ));
+    // The runner field reports the runner active when the overflow fired (Grok).
+    assert_eq!(events[0].runner.as_deref(), Some("grok"));
+}
+
+/// AC #7 — A Grok-primary task that overflows with `claudeFallbackModel`
+/// ABSENT skips rung 4 and lands on Blocked — no inverse target, no mutation.
+#[test]
+fn grok_primary_overflow_without_claude_fallback_blocks() {
+    let tmp = TempDir::new().expect("tempdir");
+    let task_id = "GROKP-FEAT-002";
+    let mut conn = make_conn_with_task(task_id, Some(GROK_DEFAULT_MODEL));
+    let mut ctx = IterationContext::new(10);
+    let pr = make_prompt_result(task_id);
+    let project_cfg = primary_runner_cfg(None, false);
+
+    let action = overflow::handle_prompt_too_long(
+        &mut ctx,
+        &mut conn,
+        task_id,
+        Some("high"),
+        Some(GROK_DEFAULT_MODEL),
+        &pr,
+        1,
+        None,
+        tmp.path(),
+        None,
+        RunnerKind::Grok,
+        &project_cfg,
+    );
+
+    assert!(
+        matches!(action, RecoveryAction::Blocked),
+        "Grok-primary overflow without claudeFallbackModel MUST land on Blocked, got {action:?}",
+    );
+    assert_eq!(task_status(&conn, task_id), "blocked");
+    assert!(!ctx.runner_overrides.contains_key(task_id));
+    assert!(!ctx.model_overrides.contains_key(task_id));
+    assert_eq!(
+        task_model(&conn, task_id).as_deref(),
+        Some(GROK_DEFAULT_MODEL),
+        "Blocked rung MUST NOT mutate tasks.model",
+    );
+}
+
+/// AC #8 (regression) — With `primary_runner = None`, an enabled Grok fallback
+/// promotes a Claude task to Grok exactly as before; the inverse branch is
+/// unreachable and the path is byte-identical to the FEAT-006 behavior.
+#[test]
+fn claude_to_grok_byte_identical_when_primary_runner_none() {
+    let tmp = TempDir::new().expect("tempdir");
+    let task_id = "REGRESS-FEAT-001";
+    let mut conn = make_conn_with_task(task_id, Some(OPUS_MODEL_1M));
+    let mut ctx = IterationContext::new(10);
+    let pr = make_prompt_result(task_id);
+    // fallback enabled, primary_runner explicitly None.
+    let project_cfg = enabled_fallback_cfg();
+    assert!(project_cfg.primary_runner.is_none());
+
+    let action = overflow::handle_prompt_too_long(
+        &mut ctx,
+        &mut conn,
+        task_id,
+        Some("high"),
+        Some(OPUS_MODEL_1M),
+        &pr,
+        1,
+        Some("run-regress"),
+        tmp.path(),
+        None,
+        RunnerKind::Claude,
+        &project_cfg,
+    );
+
+    assert!(
+        matches!(
+            action,
+            RecoveryAction::FallbackToProvider { ref provider, ref model }
+                if provider == "grok" && model == GROK_DEFAULT_MODEL
+        ),
+        "Claude→Grok promotion must be unchanged when primary_runner is None, got {action:?}",
+    );
+    assert_eq!(ctx.runner_overrides.get(task_id), Some(&RunnerKind::Grok));
+    assert_eq!(
+        task_model(&conn, task_id).as_deref(),
+        Some(GROK_DEFAULT_MODEL),
+    );
+    assert_eq!(task_status(&conn, task_id), "todo");
+}
+
+/// AC #9 (idempotency) — A task already promoted Grok→Claude that overflows
+/// AGAIN goes to Blocked. The standing Claude override means
+/// `was_already_promoted` is true, so rung 4 is skipped and the task does NOT
+/// bounce back to Grok even though an enabled Grok fallback is present.
+#[test]
+fn grok_to_claude_promoted_task_overflows_again_blocks() {
+    let tmp = TempDir::new().expect("tempdir");
+    let task_id = "BOUNCE-FEAT-001";
+    // Post-promotion state: the task climbed the Claude ladder to the
+    // Opus[1M]+high ceiling, so rungs 1-3 are exhausted and rung 4 is reached.
+    let mut conn = make_conn_with_task(task_id, Some(OPUS_MODEL_1M));
+    let mut ctx = IterationContext::new(10);
+    let pr = make_prompt_result(task_id);
+    // Both directions configured to prove neither re-fires.
+    let project_cfg = primary_runner_cfg(Some(SONNET_MODEL), true);
+
+    // Simulate the prior Grok→Claude promotion (now at the Opus[1M] ceiling).
+    ctx.runner_overrides
+        .insert(task_id.to_string(), RunnerKind::Claude);
+    ctx.model_overrides
+        .insert(task_id.to_string(), OPUS_MODEL_1M.to_string());
+
+    let action = overflow::handle_prompt_too_long(
+        &mut ctx,
+        &mut conn,
+        task_id,
+        Some("high"),
+        Some(OPUS_MODEL_1M),
+        &pr,
+        1,
+        None,
+        tmp.path(),
+        None,
+        // Post-promotion the task runs on Claude.
+        RunnerKind::Claude,
+        &project_cfg,
+    );
+
+    assert!(
+        matches!(action, RecoveryAction::Blocked),
+        "an already-promoted (Grok→Claude) task must Block, not bounce back to Grok, got {action:?}",
+    );
+    assert_eq!(
+        ctx.runner_overrides.get(task_id),
+        Some(&RunnerKind::Claude),
+        "the standing Claude override must be preserved on the Blocked rung",
+    );
+    assert_eq!(task_status(&conn, task_id), "blocked");
+}
+
+/// AC #9 (idempotency, mirror) — A task already promoted Claude→Grok that
+/// overflows AGAIN goes to Blocked even when `primary_runner` is configured —
+/// it must not bounce back to Claude via the inverse branch.
+#[test]
+fn claude_to_grok_promoted_task_with_primary_runner_blocks() {
+    let tmp = TempDir::new().expect("tempdir");
+    let task_id = "BOUNCE-FEAT-002";
+    let mut conn = make_conn_with_task(task_id, Some(GROK_DEFAULT_MODEL));
+    let mut ctx = IterationContext::new(10);
+    let pr = make_prompt_result(task_id);
+    let project_cfg = primary_runner_cfg(Some(SONNET_MODEL), true);
+
+    // Simulate the prior Claude→Grok promotion.
+    ctx.runner_overrides
+        .insert(task_id.to_string(), RunnerKind::Grok);
+    ctx.model_overrides
+        .insert(task_id.to_string(), GROK_DEFAULT_MODEL.to_string());
+
+    let action = overflow::handle_prompt_too_long(
+        &mut ctx,
+        &mut conn,
+        task_id,
+        Some("high"),
+        Some(GROK_DEFAULT_MODEL),
+        &pr,
+        1,
+        None,
+        tmp.path(),
+        None,
+        RunnerKind::Grok,
+        &project_cfg,
+    );
+
+    assert!(
+        matches!(action, RecoveryAction::Blocked),
+        "an already-promoted (Claude→Grok) task must Block, not bounce back to Claude, got {action:?}",
+    );
+    assert_eq!(ctx.runner_overrides.get(task_id), Some(&RunnerKind::Grok));
     assert_eq!(task_status(&conn, task_id), "blocked");
 }
 
