@@ -14,9 +14,10 @@
 //!   `loop_engine::prompt::build_prompt` after the split.
 //! - [`slot`]: parallel-wave builder. Produces a `Send`-safe
 //!   [`slot::SlotPromptBundle`] (a fully owned `String` + small metadata)
-//!   that worker threads consume directly. Composes the same `core` helpers
-//!   as `sequential`, so any new section added to the sequential prompt must
-//!   also be wired into `slot` — there is no second source of truth.
+//!   that worker threads consume directly. Both this builder and `sequential`
+//!   consume sections through the shared [`assembler`]; section completeness
+//!   is enforced by the roster-completeness test in
+//!   `tests/prompt_assembler_parity.rs`.
 //!
 //! # Main-thread bundle rule
 //!
@@ -30,6 +31,7 @@
 //! adding a non-`Send` field (e.g. `Rc`, `RefCell`, `Connection`) breaks
 //! the build by design.
 
+pub mod assembler;
 pub mod core;
 pub mod sequential;
 pub mod slot;

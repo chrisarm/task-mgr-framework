@@ -1,0 +1,555 @@
+{
+  "branchName": "feat/data-driven-prompt-construction",
+  "description": "Phase 2 / Item 3 of the coherence refactoring: introduce a data-driven prompt assembler (PromptContext + SectionSpec fn-pointer roster + assemble()) that BOTH the sequential and slot/wave prompt-composition paths consume, retiring the hand-enforced 'any new section MUST also be wired through slot' rule in prompt/mod.rs. Spike-validated design in docs/designs/prompt-assembler-contract.md (approach C: fn-pointer spec table + roster-completeness test). Each path supplies its OWN independently-ordered roster (set-subset, not order-subset); parity is proven per-section AND per-path whole-prompt.",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "Rust: No warnings in `cargo check` output",
+      "Rust: No warnings in `cargo clippy -- -D warnings` output",
+      "Rust: All scoped tests pass with `cargo test -p task-mgr <scope>`",
+      "Rust: `cargo fmt --check` passes",
+      "No breaking changes to the public re-exports loop_engine::prompt::{build_prompt, BuildPromptParams, PromptResult} or slot::SlotPromptBundle's Send contract unless explicitly required by the task",
+      "The `assert_impl_all!(SlotPromptBundle: Send)` assertion in tests/prompt_slot.rs still compiles after every change"
+    ],
+    "description": "These criteria apply to ALL implementation tasks"
+  },
+  "model": "claude-sonnet-4-6",
+  "priorityPhilosophy": {
+    "description": "Hierarchy of what matters most when implementing tasks",
+    "hierarchy": [
+      "1. PLAN — Anticipate edge cases before coding",
+      "2. PHASE 2 FOUNDATION — ~1 day now to save ~2+ weeks later (1:10+ ratio); we are pre-launch, foundations compound",
+      "3. FUNCTIONING CODE — Pragmatic, reliable, wired in per plan",
+      "4. CORRECTNESS — Compiles, type-checks, scoped tests pass deterministically",
+      "5. CODE QUALITY — Clean code, qualityDimensions satisfied, no warnings",
+      "6. POLISH — Docs, formatting, minor improvements"
+    ],
+    "principles": [
+      "Quality dimensions explicit — qualityDimensions on every task tells you what 'good' looks like",
+      "Phase 2 foundation — prefer solutions that lay strong post-launch foundations (1:10+ savings ratio)",
+      "Edge cases = test cases — every known edge case must have a corresponding test",
+      "Scoped per-iteration tests, full suite at REVIEW-001 — REVIEW must leave the trunk green including pre-existing failures",
+      "Byte-identical migration — each section migrated one (group) at a time behind a parity test; per-path whole-prompt parity, since each path keeps its own roster order"
+    ]
+  },
+  "prohibitedOutcomes": [
+    "Tests that only assert 'no crash' or check type without verifying the rendered prompt bytes",
+    "Tests that mirror implementation internals (break when refactoring)",
+    "A section whose text is still inlined in sequential.rs/slot.rs after it has been migrated (two sources of truth)",
+    "Sorting/emitting sections by SectionKind (criticals-first) instead of each path's roster order — changes whole-prompt byte layout silently",
+    "Trying to make ONE shared roster reproduce both paths' whole-prompt byte layouts — the two paths have different display orders; each path supplies its own ordered roster",
+    "Forgetting to clear shown_learning_ids when the learnings section is dropped — silently skews the UCB bandit",
+    "Threading per-section budget through PromptContext instead of SectionKind — collapses per-section budgets into one shared field",
+    "Letting the sequential overflow contract regress: assemble() reporting dropped=[\"CRITICAL\"] must still surface as Err(PromptOverflow) to the five-rung ladder"
+  ],
+  "project": "task-mgr",
+  "requires": [],
+  "taskPrefix": "2b6f1ba2",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "Positive: docs/designs/prompt-assembler-contract.md §CONTRACT-001 interface block is present and every referenced type resolves in the crate (grep-verified: Connection, Task, PermissionMode, Path, PathBuf — and confirm there is NO `SiblingPrd`/`SynergyCluster` type; the real inputs are batch_sibling_prds: &[PathBuf], run_id, task_prefix)",
+        "Positive: the invariants are documented — single render site; per-path roster ordering (slot ⊂ sequential as a SET, independently ordered); critical-overflow translation to Err(PromptOverflow) in the sequential caller; learnings side-output centralized; TOTAL_PROMPT_BUDGET parity",
+        "Positive: known-bad discriminators (phase/kind-order emit, missing id-clear, collapsed budgets, one-roster-for-both-paths) are documented",
+        "Positive: downstream-impact list maps to FEAT-001..FEAT-007 here",
+        "Negative: no production source file is modified by this task",
+        "Known-bad: a 'verification' that only confirms the file exists (not that the types resolve) would pass a naive check but miss a stale signature — must grep each referenced type, and must confirm SiblingPrd/SynergyCluster are NOT referenced"
+      ],
+      "dependsOn": [],
+      "description": "Design-only verification gate. The contract is authored in docs/designs/prompt-assembler-contract.md (spike result 2026-05-23, approach C; corrected after PRD review on 2026-05-23 to use real section signatures). This task confirms the interface is complete and unambiguous before downstream FEATs implement against it.\n\nDO: Read docs/designs/prompt-assembler-contract.md §CONTRACT-001 in full. Verify each type referenced by the PromptContext / SectionKind / Rendered / SectionSpec / Assembled / assemble() interface resolves in the crate (grep to confirm). Verify the invariants (including per-path roster ordering and the sequential critical-overflow translation), known-bad discriminators, edge cases, and downstream-impact list are present and map to FEAT-001..FEAT-007.\nDO NOT: Write any production code. Do NOT redesign the contract. If a genuine signature gap is found (the phantom-type bug was already fixed), record it in the progress log and note it on the affected FEAT.\n\nEdge cases:\n- A referenced type doesn't exist / has a different signature: record the delta in the progress log so the affected FEAT uses the real one.",
+      "edgeCases": [
+        "Referenced type signature drift: record delta, do not silently proceed"
+      ],
+      "estimatedEffort": "medium",
+      "id": "CONTRACT-001",
+      "modifiesBehavior": false,
+      "notes": "Contract authored by /spike 2026-05-23 (decision B), corrected after md-to-json PRD review same day (phantom SiblingPrd/SynergyCluster removed; per-path roster + overflow-translation invariants added). Full text in docs/designs/prompt-assembler-contract.md. Learning 3940: !Send fear unfounded. Verify signatures against: src/loop_engine/prompt/core.rs (build_learnings_block), src/loop_engine/prompt_sections/{dependencies,task_ops,siblings,synergy}.rs. Note synergy is a permanent no-op (build_synergy_section returns String::new()).",
+      "passes": true,
+      "priority": 1,
+      "qualityDimensions": [
+        "The contract is stable enough that seven independent FEATs can implement against it without revision",
+        "Every type named in the interface block resolves to a real crate type with the stated signature"
+      ],
+      "taskType": "contract",
+      "title": "Prompt assembler section contract (PromptSection + PromptAssembler)",
+      "touchesFiles": [
+        "docs/designs/prompt-assembler-contract.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: assembler.rs defines PromptContext, SectionKind, Rendered, SectionSpec, Assembled, assemble() exactly per docs/designs/prompt-assembler-contract.md §CONTRACT-001 (real types only)",
+        "Positive: const _: fn() = || { fn assert_send<T: Send>() {} assert_send::<SectionSpec>(); }; compiles (SectionSpec: Send)",
+        "Unit test: assemble() with three synthetic specs (2 critical + 1 trimmable) emits text in ROSTER order regardless of which phase rendered them",
+        "Unit test: criticals exceeding total_budget → Assembled.prompt == \"\" and dropped_sections == [\"CRITICAL\"]",
+        "Unit test: a trimmable that doesn't fit is named in dropped_sections; a section rendering \"\" is NOT named in dropped_sections",
+        "Unit test: when a synthetic 'learnings'-kind section carrying shown_learning_ids is dropped, Assembled.shown_learning_ids is empty",
+        "Negative: Assembled contains no &Connection / no non-Send field",
+        "Known-bad: a roster where the assembler sorts by SectionKind (criticals first) before emitting would pass a presence test — the order test above catches it",
+        "CONTRACT: try_fit_section reused from existing module (grep to confirm the symbol path), not reimplemented"
+      ],
+      "dependsOn": [
+        "CONTRACT-001"
+      ],
+      "description": "Create src/loop_engine/prompt/assembler.rs implementing the CONTRACT-001 interface (approach C, fn-pointer spec table). No real section is migrated yet — this is the engine + types + the assemble() loop, unit-tested in isolation with 2-3 synthetic SectionSpecs.\n\nDO: Define PromptContext<'a> (closed set of main-thread-available borrows, per the corrected contract — no phantom types), SectionKind { Critical, Trimmable { budget } }, Rendered { text, shown_learning_ids }, SectionSpec { name, kind, render: fn(&PromptContext, SectionKind) -> Rendered }, Assembled { prompt, section_sizes, dropped_sections, shown_learning_ids }, and `pub fn assemble(ctx, roster, total_budget) -> Assembled`. Reuse the existing try_fit_section budget logic (learning 2663) verbatim inside the Phase-2 trimmable loop. Render criticals first for the budget gate, store keyed by name, EMIT in roster order. Add a const Send assertion on SectionSpec.\nDO NOT: Migrate any real section. Do NOT store &Connection in Assembled. Do NOT collapse per-section budgets into a PromptContext field — budget rides on SectionKind::Trimmable. Do NOT sort the roster by kind before emitting.\n\nEdge cases:\n- criticals alone exceed total_budget → return Assembled with empty prompt + dropped_sections == [\"CRITICAL\"] (the uniform overflow signal; callers translate per the contract).\n- a render fn returns \"\" → NOT pushed into dropped_sections.\n- learnings section dropped → assemble() clears its shown_learning_ids.\n- empty roster → empty prompt, no panic.",
+      "edgeCases": [
+        "criticals exceed budget → empty prompt + dropped_sections == [\"CRITICAL\"]",
+        "render fn returns empty string → not counted as dropped",
+        "learnings section dropped → shown_learning_ids cleared",
+        "empty roster → empty prompt, empty section_sizes, no panic"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "criticals overflow budget",
+          "expectedBehavior": "return empty prompt + dropped == [\"CRITICAL\"] (uniform signal; caller translates)"
+        },
+        {
+          "cause": "trimmable section over its SectionKind budget",
+          "expectedBehavior": "drop it, record name in dropped_sections, continue"
+        }
+      ],
+      "id": "FEAT-001",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "New file src/loop_engine/prompt/assembler.rs; register `pub mod assembler;` in prompt/mod.rs. Reuse try_fit_section (learning 2663 — grep src/loop_engine/prompt/core.rs and prompt_sections/mod.rs for its location). The load-bearing Send assertion is assert_impl_all!(SlotPromptBundle: Send) in tests/prompt_slot.rs — preserve it; the new SectionSpec: Send assertion is cheap insurance. TOTAL_PROMPT_BUDGET=80_000. The uniform dropped=[\"CRITICAL\"] signal is translated by callers (FEAT-003), not by assemble().",
+      "passes": true,
+      "priority": 2,
+      "qualityDimensions": [
+        "assemble() is the single emit site; render-phase ordering is internal and never leaks into emit order",
+        "Budget accounting is byte-for-byte the existing try_fit_section logic, not a reimplementation",
+        "No heap/dyn dispatch (approach C) — specs are plain structs with fn pointers"
+      ],
+      "taskType": "implementation",
+      "title": "Assembler skeleton: PromptContext + SectionSpec + assemble()",
+      "touchesFiles": [
+        "src/loop_engine/prompt/assembler.rs",
+        "src/loop_engine/prompt/mod.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: the dependencies section is produced by exactly one render fn reached via each path's assembler roster",
+        "Positive: a sequential roster and a slot roster exist as independently-ordered Vec<SectionSpec>; the dependencies spec sits at its legacy position in each",
+        "Positive: assert_impl_all!(SlotPromptBundle: Send) still compiles; slot still builds its bundle on the main thread before thread::spawn",
+        "Parity test: Rendered.text for the dependencies spec == legacy build_dependency_section(conn, &task.id) for (a) a task with 2+ deps and (b) a task with zero deps — byte-identical",
+        "Negative: the dependencies section text is NOT inlined anywhere in sequential.rs/slot.rs after this change",
+        "Negative: no &Connection crosses a thread boundary (grep slot.rs spawn site)",
+        "Known-bad: a parity test comparing against a literal expected string (not the legacy fn) would pass even if the legacy fn changed — test MUST diff against the live legacy fn output",
+        "CONTRACT: build_dependency_section signature matches the real one in src/loop_engine/prompt_sections/dependencies.rs (grep to verify args)"
+      ],
+      "dependsOn": [
+        "FEAT-001"
+      ],
+      "description": "Migrate ONE section — `dependencies` (trimmable + needs &Connection, present in BOTH the sequential and slot rosters) — to a SectionSpec rendered via assemble(). Prove byte-identical output for that section in both paths, and establish the per-path roster pattern.\n\nDO: Wrap build_dependency_section(conn, &task.id) in a SectionSpec render fn. Introduce a sequential roster and a slot roster, each as its OWN ordered Vec<SectionSpec> preserving that path's existing display order; place the dependencies spec at its current position in each. Wire each path to call assemble() for (at least) the dependencies section while the not-yet-migrated sections remain inlined around it. Add tests/prompt_assembler_parity.rs asserting (a) Rendered.text == legacy build_dependency_section output, and (b) the section appears at the correct position in each path's roster.\nDO NOT: Migrate any other section. Do NOT change the dependency-section text. Do NOT read &Connection on a worker thread — slot builds the bundle on the main thread before spawn. Do NOT attempt one shared roster for both paths.\n\nEdge cases:\n- task with no dependencies → section renders empty, parity holds.\n- task with deps that span multiple statuses → text matches legacy exactly.\n\nKnown-bad to guard against:\n- 'parity' test that compares against a hand-written expected string rather than the live legacy builder output — must call the legacy fn and diff.",
+      "edgeCases": [
+        "task with zero dependencies → empty section, parity holds",
+        "task with deps in mixed statuses → byte-identical to legacy"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "assemble() section output differs from legacy by whitespace/order",
+          "expectedBehavior": "parity test fails; fix the render fn until byte-identical"
+        }
+      ],
+      "id": "FEAT-002",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": true,
+      "notes": "Pilot section = dependencies (BOTH rosters, trimmable + conn). Legacy fn: build_dependency_section(conn, &task.id) in src/loop_engine/prompt_sections/dependencies.rs (call sites: sequential.rs ~line 288, slot.rs ~line 280). Send assertion to preserve: assert_impl_all!(SlotPromptBundle: Send) in tests/prompt_slot.rs:38. iteration_pipeline_parity.rs is a STRUCTURAL reference for parity-test shape only — the new byte-diff test in tests/prompt_assembler_parity.rs is greenfield. Keep legacy fn callable until FEAT-007 deletes the wiring rule. Learning 2705: slot historically drifted — parity test is the guard.",
+      "passes": true,
+      "priority": 3,
+      "qualityDimensions": [
+        "Byte-identical parity proven by diffing against the live legacy builder, not a frozen string",
+        "Each path's roster preserves that path's own legacy display order",
+        "Slot path keeps all &Connection access on the main thread"
+      ],
+      "taskType": "implementation",
+      "title": "Pilot-migrate the dependencies section through the assembler (both paths) + byte-parity test",
+      "touchesFiles": [
+        "src/loop_engine/prompt/assembler.rs",
+        "src/loop_engine/prompt/sequential.rs",
+        "src/loop_engine/prompt/slot.rs",
+        "src/loop_engine/prompt_sections/dependencies.rs",
+        "tests/prompt_assembler_parity.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: task, task_ops, completion, base_prompt render via Critical SectionSpecs in both paths' rosters at their legacy positions",
+        "Positive: sequential build_prompt returns Err(TaskMgrError::PromptOverflow) when assemble() reports dropped_sections == [\"CRITICAL\"] — verified by a unit test that forces criticals over budget",
+        "Positive: slot keeps the sentinel-in-bundle overflow behavior — verified by a unit test",
+        "Parity test (per section): assemble() section text == legacy helper output, byte-identical, per path",
+        "Negative: none of these sections' text remains inlined in sequential.rs/slot.rs",
+        "Known-bad: returning the sentinel (empty prompt) from sequential WITHOUT translating to Err(PromptOverflow) would silently break overflow::handle_prompt_too_long's ladder — the forced-overflow test catches it",
+        "CONTRACT: TaskMgrError::PromptOverflow variant + overflow::handle_prompt_too_long exist and are unchanged (grep src/loop_engine/overflow.rs)"
+      ],
+      "dependsOn": [
+        "FEAT-002"
+      ],
+      "description": "Migrate the SectionKind::Critical sections shared by both paths — the task envelope, task_ops, completion, and base_prompt — to SectionSpecs, each behind a per-path parity assertion. Critically: wire the sequential caller to translate assemble()'s uniform dropped=[\"CRITICAL\"] signal back into Err(TaskMgrError::PromptOverflow) so the five-rung overflow ladder is unchanged; the slot caller keeps its sentinel-in-bundle behavior.\n\nDO: Add a SectionSpec (kind=Critical) per section wrapping the existing helper. Place each at its legacy position in BOTH rosters. In sequential build_prompt, when assemble() returns dropped_sections == [\"CRITICAL\"], return Err(TaskMgrError::PromptOverflow{..}) exactly as today (sequential.rs ~238-244). In slot, keep the sentinel-in-bundle behavior (slot.rs ~215-235). Add a test for each overflow contract.\nDO NOT: Migrate trimmables (learnings/source/etc.) — later tasks. Do NOT change any section text. Do NOT unify the two overflow contracts — they legitimately differ at the caller.\n\nEdge cases:\n- criticals overflow in sequential → Err(PromptOverflow), ladder engages.\n- criticals overflow in slot → sentinel-in-bundle, unchanged.\n- missing base prompt file → empty section, warn, continue (preserve current behavior).",
+      "edgeCases": [
+        "sequential criticals overflow → Err(PromptOverflow)",
+        "slot criticals overflow → sentinel-in-bundle",
+        "missing base prompt file → empty section + warn, no panic"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "sequential returns empty prompt instead of Err on critical overflow",
+          "expectedBehavior": "forced-overflow test fails; translate dropped==[\"CRITICAL\"] to Err(PromptOverflow)"
+        }
+      ],
+      "id": "FEAT-003",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": true,
+      "notes": "Criticals trio + base_prompt. The two overflow contracts: sequential returns Err(PromptOverflow) (sequential.rs ~238-244) feeding overflow::handle_prompt_too_long's 5-rung ladder (learnings 2852/2031); slot uses sentinel-in-bundle (slot.rs ~215-235). assemble() signals both uniformly via dropped=[\"CRITICAL\"]; the translation lives in each caller. Display orders differ per path — place each spec at its own legacy index.",
+      "passes": true,
+      "priority": 4,
+      "qualityDimensions": [
+        "Sequential overflow contract (Err(PromptOverflow)) preserved so the 5-rung ladder is byte-unchanged",
+        "Slot sentinel contract preserved",
+        "One render site per critical section; no inlined critical text remains"
+      ],
+      "taskType": "implementation",
+      "title": "Migrate the critical sections (task, task_ops, completion, base_prompt) + sequential overflow translation",
+      "touchesFiles": [
+        "src/loop_engine/prompt/assembler.rs",
+        "src/loop_engine/prompt/sequential.rs",
+        "src/loop_engine/prompt/slot.rs",
+        "src/loop_engine/prompt/core.rs",
+        "tests/prompt_assembler_parity.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: learnings renders via a Trimmable SectionSpec in both paths' rosters at legacy positions",
+        "Positive: shown_learning_ids clear-on-drop lives ONLY in assemble() — grep confirms it's removed from sequential.rs and slot.rs (slot.rs ~262-269)",
+        "Unit test: learnings section dropped under budget → resulting Assembled.shown_learning_ids is empty (centralized invariant)",
+        "Parity test: learnings section text == legacy output per path (sequential = recall-limit-driven bytes; slot = LEARNINGS_BUDGET=4000 bytes)",
+        "Negative: learnings text not inlined in sequential.rs/slot.rs; no duplicate id-clear remains",
+        "Known-bad: forgetting to remove the slot-side clear (leaving it in addition to assemble()'s) would double-clear and pass a naive test — the grep-for-removed-clear AC catches it",
+        "CONTRACT: core::build_learnings_block(conn, task, budget) signature matches the real one (grep src/loop_engine/prompt/core.rs)"
+      ],
+      "dependsOn": [
+        "FEAT-003"
+      ],
+      "description": "Migrate the `learnings` section (Trimmable) to a SectionSpec, and centralize the side-output invariant: when learnings is dropped under budget pressure, assemble() (already, from FEAT-001) clears shown_learning_ids — so the per-builder clears in sequential.rs/slot.rs must be REMOVED, leaving assemble() as the sole owner. This is the highest-risk section (UCB-skew known-bad).\n\nDO: Wrap core::build_learnings_block(conn, task, budget) in a Trimmable SectionSpec carrying its own budget on SectionKind::Trimmable{budget}. Remove the now-duplicated shown_learning_ids clear from slot.rs (~262-269) and any sequential equivalent. Parity-test the learnings section per path. NOTE: the sequential learnings path is recall-limit-driven (it does NOT use a LEARNINGS_BUDGET const the way slot.rs:37 does) — 'parity' for sequential learnings means matching the recall-limit-driven output, not a 4000-byte truncation; carry whatever budget reproduces each path's current bytes.\nDO NOT: Leave any shown_learning_ids clearing logic in the path builders. Do NOT collapse the learnings budget with the source budget.\n\nEdge cases:\n- learnings trimmed under budget → assemble() clears shown_learning_ids (no per-builder clear).\n- no learnings to show → empty section, empty shown_learning_ids, parity holds.",
+      "edgeCases": [
+        "learnings trimmed → shown_learning_ids cleared centrally",
+        "no learnings → empty section + empty ids, parity holds"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "a builder still clears shown_learning_ids locally",
+          "expectedBehavior": "remove it; assemble() owns the invariant — grep test catches the duplicate"
+        }
+      ],
+      "id": "FEAT-004",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": true,
+      "notes": "Highest-risk section — the shown_learning_ids side-output feeds the UCB bandit; a missed/duplicated clear silently skews ranking. assemble() owns the clear (FEAT-001); this task DELETES the per-builder clears (slot.rs ~262-269). Budget asymmetry (P3-2 from review): LEARNINGS_BUDGET=4000 exists only in slot.rs:37; sequential learnings is recall-limit-driven via build_learnings_section — match each path's actual bytes, not a single 4000 truncation. Per-section budgets stay distinct from SOURCE_CONTEXT_BUDGET.",
+      "passes": true,
+      "priority": 5,
+      "qualityDimensions": [
+        "shown_learning_ids invariant centralized in assemble(), zero duplication in path builders",
+        "Per-path learnings byte parity (recall-limit-driven sequential vs 4000-byte slot) preserved",
+        "Learnings budget distinct from source budget"
+      ],
+      "taskType": "implementation",
+      "title": "Migrate the learnings section + centralize the shown_learning_ids side-output invariant",
+      "touchesFiles": [
+        "src/loop_engine/prompt/assembler.rs",
+        "src/loop_engine/prompt/sequential.rs",
+        "src/loop_engine/prompt/slot.rs",
+        "src/loop_engine/prompt/core.rs",
+        "src/loop_engine/prompt_sections/learnings.rs",
+        "tests/prompt_assembler_parity.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: source, steering, session_guidance, tool_awareness, key_decision each render via a SectionSpec in both paths' rosters at legacy positions",
+        "Parity test (per section): assemble() output == legacy helper output, byte-identical, per path",
+        "Unit test: SOURCE_CONTEXT_BUDGET (2000) remains distinct — a source overflow does not shrink the learnings budget and vice versa",
+        "Negative: none of these sections' text remains inlined in sequential.rs/slot.rs",
+        "Failure mode: missing base/steering file → empty section + warning, no panic (matches pre-migration)",
+        "Known-bad: collapsing SOURCE_CONTEXT_BUDGET and LEARNINGS_BUDGET into one shared field passes a single-section test but fails the distinct-budget test",
+        "CONTRACT: SOURCE_CONTEXT_BUDGET const exists in both sequential.rs:42 and slot.rs:34 with value 2000 (grep to confirm before unifying onto SectionKind::Trimmable)"
+      ],
+      "dependsOn": [
+        "FEAT-004"
+      ],
+      "description": "Migrate the remaining sections shared by both paths — source/source-context, steering, session_guidance, tool_awareness, key_decision — each as a SectionSpec at its legacy position in both rosters, each behind a per-path parity assertion. After this task, every SHARED section flows through the assembler; only sequential-only sections (FEAT-006) remain inlined.\n\nDO: Add a SectionSpec per section (Critical or Trimmable as the legacy code treats it — source is Trimmable{SOURCE_CONTEXT_BUDGET=2000}; steering/session_guidance/tool_awareness/key_decision per current behavior). Wrap the existing core/prompt_sections helpers. Parity-test each per path. Keep SOURCE_CONTEXT_BUDGET distinct from the learnings budget.\nDO NOT: Touch sequential-only sections (synergy/escalation/siblings/reorder) — FEAT-006. Do NOT change section text. Do NOT collapse budgets.\n\nEdge cases:\n- empty task_files → source section empty, not an error.\n- missing steering file → empty section, warn, continue.\n- no key decision → empty section, parity holds.",
+      "edgeCases": [
+        "empty task_files → empty source section",
+        "missing steering file → empty section + warn",
+        "no key decision → empty section"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "collapsed per-section budget",
+          "expectedBehavior": "distinct-budget test fails; keep budget on each SectionKind::Trimmable"
+        }
+      ],
+      "id": "FEAT-005",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": true,
+      "notes": "Remaining shared trimmables/criticals. SOURCE_CONTEXT_BUDGET=2000 (sequential.rs:42, slot.rs:34). Helpers in core.rs + prompt_sections. Learning 2664: extract duplicated builder logic to core — the helpers become render-fn bodies. After this task every shared section is assembler-driven; FEAT-006 handles sequential-only.",
+      "passes": true,
+      "priority": 6,
+      "qualityDimensions": [
+        "One render site per section; zero inlined shared-section text remains",
+        "Per-section budgets preserved distinctly via SectionKind::Trimmable{budget}",
+        "Each section migrated behind its own per-path parity assertion"
+      ],
+      "taskType": "implementation",
+      "title": "Migrate the remaining shared trimmables (source, steering, session_guidance, tool_awareness, key_decision)",
+      "touchesFiles": [
+        "src/loop_engine/prompt/assembler.rs",
+        "src/loop_engine/prompt/sequential.rs",
+        "src/loop_engine/prompt/slot.rs",
+        "src/loop_engine/prompt/core.rs",
+        "tests/prompt_assembler_parity.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: synergy, escalation, siblings, reorder render via SectionSpecs present in the sequential roster only, at legacy positions",
+        "Positive: the slot roster does NOT contain these specs (assert on the slot roster construction)",
+        "Parity test: each sequential-only section's assemble() output == legacy builder output, byte-identical (synergy parity == empty string)",
+        "Unit test: when reorder_hint is None / batch_sibling_prds is empty, the corresponding spec is absent/empty rather than rendering a stray artifact",
+        "Negative: no sequential-only section text remains inlined in sequential.rs",
+        "Negative: the slot prompt's byte output is unchanged by this task",
+        "CONTRACT: build_sibling_prd_section takes (conn, task_id, task_prefix, batch_sibling_prds: &[PathBuf]) and build_synergy_section takes (conn, task_id, run_id) and returns String::new() — grep src/loop_engine/prompt_sections/{siblings,synergy}.rs to verify"
+      ],
+      "dependsOn": [
+        "FEAT-005"
+      ],
+      "description": "Migrate the sections that ONLY appear in the sequential roster — synergy, escalation, siblings, reorder-hint — as SectionSpecs present in the sequential roster but absent from the slot roster. This proves the per-path roster set-subset (slot ⊂ sequential) works with independently-ordered Vecs.\n\nDO: Add SectionSpecs for synergy/escalation/siblings/reorder using their REAL helper signatures (build_synergy_section(conn, task_id, run_id) — a permanent no-op returning String::new(); build_sibling_prd_section(conn, task_id, task_prefix, batch_sibling_prds: &[PathBuf]); escalation + reorder per current code). Put them in the sequential roster only at their legacy positions. Confirm the slot roster legitimately omits them. Parity-test each in the sequential path.\nDO NOT: Add these to the slot roster. Do NOT invent SiblingPrd/SynergyCluster types — use &[PathBuf] / the real args. Do NOT change section text. Do NOT 'fix' the synergy no-op — migrate it as-is behind a parity test.\n\nEdge cases:\n- reorder hint absent (None) → spec omitted from the sequential roster for that task.\n- batch_sibling_prds empty → siblings section empty, parity holds.\n- synergy → always empty (no-op), parity = empty string.",
+      "edgeCases": [
+        "reorder_hint None → spec omitted",
+        "batch_sibling_prds empty → siblings empty",
+        "synergy → always empty (no-op)"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "a sequential-only spec leaks into the slot roster",
+          "expectedBehavior": "slot-roster assertion fails; remove it"
+        }
+      ],
+      "id": "FEAT-006",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": true,
+      "notes": "Sequential-only sections prove slot's roster ⊂ sequential's as a SET (contract residual risk #1). Real signatures (NOT phantom types): build_sibling_prd_section(conn, task_id, task_prefix, batch_sibling_prds: &[PathBuf]) in siblings.rs:41 (private SiblingPrdSummary at :24); build_synergy_section(conn, task_id, run_id) in synergy.rs — permanent no-op returning String::new(). PromptContext carries run_id/task_prefix/batch_sibling_prds/reorder_hint as Option; slot leaves them None.",
+      "passes": true,
+      "priority": 7,
+      "qualityDimensions": [
+        "Per-path rosters are plain ordered data; the SAME SectionSpec type serves both — no path-specific spec variants",
+        "Absent optional inputs omit/empty the spec rather than rendering a stray section",
+        "Slot byte output provably unchanged"
+      ],
+      "taskType": "implementation",
+      "title": "Migrate sequential-only sections (synergy, escalation, siblings, reorder)",
+      "touchesFiles": [
+        "src/loop_engine/prompt/assembler.rs",
+        "src/loop_engine/prompt/sequential.rs",
+        "src/loop_engine/prompt/slot.rs",
+        "src/loop_engine/prompt_sections/synergy.rs",
+        "src/loop_engine/prompt_sections/escalation.rs",
+        "src/loop_engine/prompt_sections/siblings.rs",
+        "tests/prompt_assembler_parity.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: the 'must also be wired into slot / no second source of truth' comment is gone from prompt/mod.rs, replaced by an assembler-pointer note",
+        "Positive: the duplicate 'must also be wired through the wave builder' rule in src/loop_engine/CLAUDE.md is also removed/replaced (grep CLAUDE.md confirms no surviving copy)",
+        "Positive: a roster-completeness test asserts every known section NAME appears in the sequential roster (roster vs enumerated known-set, NOT a hardcoded count) and fails naming the missing section",
+        "Positive: docs/designs/coherence-refactoring.md §3 updated to reflect the assembler and mark Item 3 complete",
+        "Negative: no inlined section text remains in sequential.rs or slot.rs (grep)",
+        "Negative: assert_impl_all!(SlotPromptBundle: Send) still present and compiling",
+        "Known-bad: a completeness test that hardcodes the current section count would pass even when a section is dropped — must compare the roster against the enumerated known section names",
+        "Failure mode: unregistered section → test fails naming the missing section, not a generic 'count mismatch'"
+      ],
+      "dependsOn": [
+        "FEAT-006"
+      ],
+      "description": "Now that every section flows through the shared assembler, retire the 'any new section MUST also be wired into slot — there is no second source of truth' rule, in BOTH places it lives, and replace it with a roster-completeness test (recovering approach-B exhaustiveness as a test).\n\nDO: Remove/replace the wiring-rule doc comment in prompt/mod.rs (~lines 17-19). ALSO remove/replace the duplicate rule in src/loop_engine/CLAUDE.md (the 'Prompt-builder companion … sections added to the sequential prompt MUST also be wired through the wave builder' note). Add a test (in tests/prompt_assembler_parity.rs or a new completeness test) asserting every known section NAME appears in the sequential roster, comparing the roster against the enumerated known-section set (NOT a hardcoded count), failing with a message naming the missing section. Update docs/designs/coherence-refactoring.md §3 to mark Item 3 done and describe the assembler.\nDO NOT: Leave the old 'wire through slot' instruction anywhere (grep both prompt/mod.rs and CLAUDE.md). Do NOT remove the SlotPromptBundle Send assertion.\n\nEdge cases:\n- a section registered in slot but missing from sequential → completeness test flags (sequential is the superset roster).\n- a brand-new unregistered section name → test fails naming the missing section.",
+      "edgeCases": [
+        "section in slot roster but absent from sequential → flagged",
+        "new unregistered section → test fails naming it"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "a future section added without a SectionSpec",
+          "expectedBehavior": "completeness test fails in CI naming the missing section"
+        }
+      ],
+      "id": "FEAT-007",
+      "modifiesBehavior": false,
+      "notes": "Payoff task — removes the manual discipline the whole refactor retires. The rule lives in TWO places: src/loop_engine/prompt/mod.rs (rustdoc //! ~lines 17-19) AND src/loop_engine/CLAUDE.md ('Prompt-builder companion'). Delete/replace BOTH. Completeness-test approach: enumerate known section names, assert each is in the sequential roster; fail naming the missing one. Update coherence-refactoring.md §3 in the same change.",
+      "passes": true,
+      "priority": 8,
+      "qualityDimensions": [
+        "The manual 'remember to wire slot too' discipline is fully replaced by a CI-enforced completeness test",
+        "Both copies of the retired rule are gone (prompt/mod.rs AND CLAUDE.md)",
+        "Test failure messages name the offending section, not a count"
+      ],
+      "taskType": "implementation",
+      "title": "Delete the hand-enforced wiring rule (both copies) + add roster-completeness test",
+      "touchesFiles": [
+        "src/loop_engine/prompt/mod.rs",
+        "src/loop_engine/prompt/assembler.rs",
+        "src/loop_engine/CLAUDE.md",
+        "docs/designs/coherence-refactoring.md",
+        "tests/prompt_assembler_parity.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No code duplication across render fns that a shared helper would eliminate (DRY)",
+        "assemble() and roster builders are single-responsibility and as small as practical",
+        "Roster construction for sequential vs slot shares the common spec definitions (rosters differ only in membership + order)",
+        "Code follows existing prompt-module patterns (core helpers as render-fn bodies)",
+        "Any issues found spawn REFACTOR-FIX-xxx tasks via `task-mgr add --stdin --depended-on-by REVIEW-001`"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "FEAT-005",
+        "FEAT-006",
+        "FEAT-007"
+      ],
+      "description": "Review the assembler + all migrated sections for DRY violations, complexity, coupling, and clarity.\n\nDO: Check for duplicated render-fn boilerplate that could share a helper, assemble() complexity, roster-construction duplication between the sequential and slot rosters, and whether SectionKind/SectionSpec stay as simple as the contract intends.\nDO NOT: Re-architect away from approach C. Do NOT skip.",
+      "estimatedEffort": "high",
+      "id": "REFACTOR-001",
+      "model": "claude-opus-4-7",
+      "notes": "If issues found: `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001` for each (priority 50-97). If no issues, invoke /simplify on any ugly touchpoint, then emit `<task-status>REFACTOR-001:done</task-status>` with a one-line progress note.",
+      "passes": false,
+      "priority": 98,
+      "qualityDimensions": [
+        "DRY across render fns and roster builders",
+        "Single-responsibility assemble()",
+        "Pattern consistency with the existing three-builder layout"
+      ],
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Review for refactoring opportunities",
+      "touchesFiles": [
+        "src/loop_engine/prompt/assembler.rs",
+        "src/loop_engine/prompt/sequential.rs",
+        "src/loop_engine/prompt/slot.rs",
+        "src/loop_engine/prompt/core.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: every prompt section is produced via a path roster; grep confirms no inlined section text in sequential.rs/slot.rs",
+        "Positive: FULL cargo test, cargo clippy -- -D warnings, cargo fmt --check all clean (no scope filter)",
+        "Positive: assert_impl_all!(SlotPromptBundle: Send) compiles; no &Connection crosses thread::spawn in slot.rs",
+        "Positive: sequential overflow translation (dropped==[\"CRITICAL\"] → Err(PromptOverflow)) intact; overflow ladder unchanged",
+        "Positive: roster-completeness test present and passing; centralized shown_learning_ids invariant verified; both retired-rule copies gone (prompt/mod.rs + CLAUDE.md)",
+        "Negative: No unwrap() in production code paths added by this work",
+        "Negative: No dead code warnings for the new assembler module",
+        "Documentation: src/loop_engine/CLAUDE.md + docs/designs/coherence-refactoring.md §3 reflect the assembler and mark Item 3 done",
+        "Pre-existing test failures fixed (or spawned as FIX-xxx with verifyCommand if >~12 unrelated)",
+        "If issues found: FIX-xxx tasks spawned via `task-mgr add --stdin --depended-on-by REVIEW-001`"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "FEAT-005",
+        "FEAT-006",
+        "FEAT-007",
+        "REFACTOR-001"
+      ],
+      "description": "Review all implementation for quality, security, integration wiring, and documentation. RUN THE FULL QUALITY GATE (unscoped test suite).\n\nDO: Verify every section reaches production via each path's assembler roster (grep that sequential.rs/slot.rs no longer inline section text), the SlotPromptBundle Send assertion compiles, no &Connection crosses a thread boundary, the sequential critical-overflow translation to Err(PromptOverflow) is intact, the learnings side-output invariant is centralized, both copies of the retired wiring rule are gone, and the completeness test exists. Run full cargo fmt --check && cargo check && cargo clippy -- -D warnings && cargo test (no scope filter).\nDO NOT: Skip the wiring check. Do NOT scope the test suite.",
+      "estimatedEffort": "medium",
+      "id": "REVIEW-001",
+      "model": "claude-opus-4-7",
+      "notes": "Spawn fixes via `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001`. If no issues: emit `<task-status>REVIEW-001:done</task-status>` with 'Clean review' note. Known pre-existing flake (unrelated): test_wave_crash_tracker_any_completed_resets fails ~50% under concurrency — re-run to confirm, do not attribute to this work.",
+      "passes": false,
+      "priority": 99,
+      "qualityDimensions": [
+        "No unwrap in production",
+        "Every section wired through a path roster (no inlined text)",
+        "Sequential overflow contract preserved",
+        "Full suite green including pre-existing",
+        "Send/main-thread Connection invariants intact"
+      ],
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Code review + final verification",
+      "touchesFiles": [
+        "src/loop_engine/prompt/assembler.rs",
+        "src/loop_engine/prompt/sequential.rs",
+        "src/loop_engine/prompt/slot.rs",
+        "src/loop_engine/prompt/mod.rs",
+        "src/loop_engine/CLAUDE.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "slot.rs no longer declares its own CRITICAL_OVERFLOW_SENTINEL const",
+        "All references resolve to assembler::CRITICAL_OVERFLOW_SENTINEL (direct use or pub use re-export)",
+        "prompt_assembler_parity test stays green",
+        "cargo clippy -- -D warnings clean"
+      ],
+      "description": "slot.rs:183 declares its OWN `pub const CRITICAL_OVERFLOW_SENTINEL: &str = \"CRITICAL\"` independent of the canonical assembler.rs:38 const (sequential.rs:26 correctly imports the assembler one). Two unrelated pub consts with the same value, nothing enforces equality: if the assembler sentinel ever changes, slot.rs:374-377 overflow detection (`.any(|s| s == CRITICAL_OVERFLOW_SENTINEL)`) silently keeps comparing against the stale local and stops matching. FIX: delete slot.rs:183 and use assembler::CRITICAL_OVERFLOW_SENTINEL (slot already imports from that module at lines 27-29). If a downstream consumer needs slot::CRITICAL_OVERFLOW_SENTINEL, re-export via `pub use` rather than a fresh const. Byte-neutral; run `cargo test -p task-mgr --test prompt_assembler_parity` green-to-green.",
+      "estimatedEffort": "low",
+      "id": "2b6f1ba2-REFACTOR-FIX-001",
+      "passes": false,
+      "priority": 92,
+      "title": "Collapse the duplicate CRITICAL_OVERFLOW_SENTINEL const",
+      "touchesFiles": [
+        "src/loop_engine/prompt/slot.rs",
+        "src/loop_engine/prompt/assembler.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "fit_trimmable helper exists in assembler.rs and is used by every Phase-2 trimmable call site in both sequential.rs and slot.rs",
+        "Criticals-only filter is shared (no verbatim duplicate filter in both build_prompt fns)",
+        "prompt_assembler_parity test green-to-green (byte-identical output)",
+        "No dead-assignment clippy warnings; cargo clippy -- -D warnings clean",
+        "cargo fmt --check passes"
+      ],
+      "description": "The Phase-2 trimmable assembly repeats an identical 4-5 line block per section across BOTH build_prompt fns: sequential.rs:532-620 (8 trimmables) and slot.rs:431-486 (7 trimmables) — ~60 duplicated lines. Block shape: `let s = X_spec(); let a = assemble(&ctx, slice::from_ref(&s), remaining); let sec = a.prompt; remaining -= sec.len(); dropped_sections.extend(a.dropped_sections);`. The learnings variant adds one line to capture shown_learning_ids. FIX (byte-neutral, pure mechanical wrapping): add `pub(crate) fn fit_trimmable(ctx, spec: SectionSpec, remaining: &mut usize, dropped: &mut Vec<String>) -> Rendered` in assembler.rs that calls assemble over slice::from_ref, does `*remaining -= a.prompt.len()`, `dropped.extend(a.dropped_sections)`, returns `Rendered{text:a.prompt, shown_learning_ids:a.shown_learning_ids}`. Each call site collapses to one line; learnings keeps the Rendered to read shown_learning_ids. NOTE the last trimmable in each path intentionally skips the `remaining -=` (sequential tool_awareness 617-620, slot key_decision 483-486) — fit_trimmable decrements harmlessly (dead write on last call), behavior preserved; delete the now-stale dead-assignment comments. ALSO dedup the byte-identical criticals-only filter (sequential.rs:458-462 == slot.rs:367-371): add `assemble_criticals(ctx, roster, budget) -> Assembled` (filters Critical internally then assembles) so both call sites drop the filter+assemble pair. OPTIONAL nit: the `match kind { Trimmable{budget}=>budget, Critical=>usize::MAX }` idiom appears twice (core.rs:343 render_source_section, slot.rs:108 render_learnings_section) — a `SectionKind::budget_or_max()` inherent method would dedup it.",
+      "estimatedEffort": "medium",
+      "id": "2b6f1ba2-REFACTOR-FIX-002",
+      "passes": false,
+      "priority": 90,
+      "title": "Extract fit_trimmable + criticals-only helpers to kill Phase-2 boilerplate",
+      "touchesFiles": [
+        "src/loop_engine/prompt/assembler.rs",
+        "src/loop_engine/prompt/sequential.rs",
+        "src/loop_engine/prompt/slot.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "sequential build_prompt emits prompt via a single format! and section_sizes via a single vec! literal (matches slot.rs shape)",
+        "Display order byte-identical: prompt_assembler_parity test green-to-green",
+        "cargo fmt --check and cargo clippy -- -D warnings clean"
+      ],
+      "description": "sequential.rs:627-660 builds the final prompt + section_sizes via 16 hand-paired `push_str` + `section_sizes.push((name,len))` calls (~32 lines). The display order is encoded implicitly across those lines and each name/len pairing is repeated by hand — error-prone. The slot path (slot.rs:493-509) already does this more clearly: ONE `format!(\"{a}{b}...\")` for the prompt + ONE `vec![(\"a\", a.len()), ...]` literal for section_sizes. FIX: convert sequential to the slot shape — single format! over the display-ordered sections + single vec! literal for section_sizes. Byte-identical (concatenation order preserved). Subtlety: sequential mixes owned String sections (steering, learnings, ...) with borrowed &str criticals from section_text (task, task_ops, completion, escalation, reorder_instr, base_prompt); format! handles both via Display so the conversion is clean. Cuts ~16 lines and makes display order a single readable line, matching the sibling file pattern (acceptance criterion: follow existing prompt-module patterns).",
+      "estimatedEffort": "low",
+      "id": "2b6f1ba2-REFACTOR-FIX-003",
+      "passes": false,
+      "priority": 85,
+      "title": "Normalize sequential build_prompt tail stitching to slot-style format!+vec!",
+      "touchesFiles": [
+        "src/loop_engine/prompt/sequential.rs"
+      ]
+    }
+  ],
+  "version": "1.0"
+}

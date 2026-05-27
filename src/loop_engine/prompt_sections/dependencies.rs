@@ -6,9 +6,43 @@
 use rusqlite::Connection;
 
 use crate::error::TaskMgrResult;
+use crate::loop_engine::prompt::assembler::{PromptContext, Rendered, SectionKind, SectionSpec};
+
+/// Stable section identifier for the completed-dependencies section. Matches
+/// the `section_sizes` key both prompt builders already use for this section.
+pub const DEPENDENCIES_SECTION: &str = "dependencies";
+
+/// Render the completed-dependencies section for the data-driven assembler
+/// (CONTRACT-001). This is the **single render site** for the section — both
+/// the sequential and slot rosters reach it only via [`dependencies_spec`].
+///
+/// The section carries no dedicated per-section budget: [`build_dependency_section`]
+/// takes no budget and is never independently truncated (it either fits whole
+/// into the remaining total budget or is dropped by `assemble`). The
+/// [`SectionKind`] argument is therefore deliberately ignored.
+pub fn render_dependency_section(ctx: &PromptContext<'_>, _kind: SectionKind) -> Rendered {
+    Rendered {
+        text: build_dependency_section(ctx.conn, &ctx.task.id),
+        ..Default::default()
+    }
+}
+
+/// Build the dependencies [`SectionSpec`] (trimmable, no independent cap).
+///
+/// Shared by both prompt paths; each roster places the returned spec at its
+/// own legacy display position. The `budget` is `usize::MAX` because the
+/// section has no independent cap — `assemble` gates it against the remaining
+/// total budget and the render fn ignores the budget entirely.
+pub fn dependencies_spec() -> SectionSpec {
+    SectionSpec {
+        name: DEPENDENCIES_SECTION,
+        kind: SectionKind::Trimmable { budget: usize::MAX },
+        render: render_dependency_section,
+    }
+}
 
 /// Build a dependency completion section string.
-pub(crate) fn build_dependency_section(conn: &Connection, task_id: &str) -> String {
+pub fn build_dependency_section(conn: &Connection, task_id: &str) -> String {
     let deps = match get_completed_dependencies(conn, task_id) {
         Ok(deps) if !deps.is_empty() => deps,
         _ => return String::new(),
