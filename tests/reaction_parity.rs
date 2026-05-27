@@ -1022,3 +1022,592 @@ fn pre_spawn_and_gate_harness_compiles_and_setup_works() {
         resolved_model: Some(SONNET_MODEL),
     };
 }
+
+// ===========================================================================
+// TEST-INIT-003 — overflow reaction (`handle_overflow`) parity + per-slot
+// isolation (#5). Pins the contract that the converged coordinator
+// `reactions::post_output::handle_overflow` preserves the five-rung recovery
+// ladder, the diagnostics bundle (dump/JSONL/rotation), `FallbackToProvider`
+// promotion, and the per-slot keying isolation that `overflow.rs` already
+// guarantees (learning #2852: wave overflow recovery evolved bypass →
+// shared-ladder — do not regress).
+//
+// Unlike TEST-INIT-001/002, `handle_overflow` is ALREADY wired end-to-end
+// (CONTRACT-001: both iteration.rs and slot.rs route through it), so these
+// cases run LIVE — they are the relocation safety net. The existing
+// `tests/overflow_per_slot.rs` / `overflow_recovery.rs` suites drive the
+// `#[deprecated]` leaf directly and are the equivalence oracle; these cases
+// re-assert the same observable behavior through the coordinator so the
+// eventual body relocation (the owning FEAT) must keep BOTH suites green.
+//
+// Per-AC mapping (learning #4100):
+//   AC1  → handle_overflow_rung_ladder_matches_pre_relocation
+//          + handle_overflow_rung4_fallback_to_provider_when_enabled
+//          + handle_overflow_seq_and_wave_agree_on_rung
+//   AC2  → handle_overflow_per_slot_keying_excludes_sibling_slot_task_ids
+//   AC3  → handle_overflow_sanitizes_path_traversal_task_id
+//   AC4  → handle_overflow_emits_jsonl_event_with_core_fields
+//   AC5  → known_bad_overflow_skipping_rung1_fails_the_downgrade_assertion (LIVE)
+// ===========================================================================
+
+use task_mgr::loop_engine::model::{OPUS_MODEL_1M, escalate_below_opus, to_1m_model};
+use task_mgr::loop_engine::overflow::{OverflowEvent, RecoveryAction, sanitize_id_for_filename};
+use task_mgr::loop_engine::project_config::{FallbackRunnerConfig, ProjectConfig};
+use task_mgr::loop_engine::prompt::PromptResult;
+use task_mgr::loop_engine::reactions::post_output::{HandleOverflowParams, handle_overflow};
+
+/// Production-shaped `PromptResult` for an overflow event: a non-empty prompt
+/// with real per-section byte counts (so the dump + JSONL `sections` array is
+/// non-trivial), mirroring `tests/overflow_per_slot.rs::make_prompt_result`.
+fn make_overflow_prompt_result(task_id: &str) -> PromptResult {
+    PromptResult {
+        prompt: "TASK SECTION\n\nLEARNINGS SECTION\n\nBASE PROMPT SECTION\n".to_string(),
+        task_id: task_id.to_string(),
+        task_files: Vec::new(),
+        shown_learning_ids: Vec::new(),
+        resolved_model: None,
+        dropped_sections: Vec::new(),
+        task_difficulty: Some("medium".to_string()),
+        cluster_effort: None,
+        section_sizes: vec![("task", 12), ("learnings", 17), ("base_prompt", 19)],
+    }
+}
+
+/// Read + parse every JSONL line `handle_overflow` appended to
+/// `<base_dir>/overflow-events.jsonl`.
+fn read_overflow_events(base_dir: &Path) -> Vec<OverflowEvent> {
+    let path = base_dir.join("overflow-events.jsonl");
+    let raw = std::fs::read_to_string(&path).expect("overflow jsonl exists");
+    raw.lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str::<OverflowEvent>(l).expect("parse jsonl line"))
+        .collect()
+}
+
+/// A `ProjectConfig` with the Grok fallback runner ENABLED — the precondition
+/// for rung 4 (`FallbackToProvider`) on the Claude → Grok direction.
+fn config_with_fallback_enabled() -> ProjectConfig {
+    ProjectConfig {
+        fallback_runner: Some(FallbackRunnerConfig {
+            enabled: true,
+            ..FallbackRunnerConfig::default()
+        }),
+        ..ProjectConfig::default()
+    }
+}
+
+/// Run ONE overflow through the converged coordinator. Borrows `conn`/`ctx`
+/// mutably for the duration of the call (the temporary `PromptResult` lives for
+/// the full call expression). Returns the chosen [`RecoveryAction`].
+#[allow(clippy::too_many_arguments)]
+fn run_handle_overflow(
+    conn: &mut Connection,
+    ctx: &mut IterationContext,
+    task_id: &str,
+    effort: Option<&str>,
+    effective_model: Option<&str>,
+    iteration: u32,
+    base_dir: &Path,
+    slot_index: Option<usize>,
+    effective_runner: RunnerKind,
+    project_config: &ProjectConfig,
+) -> RecoveryAction {
+    handle_overflow(HandleOverflowParams {
+        ctx,
+        conn,
+        task_id,
+        effort,
+        effective_model,
+        prompt_result: &make_overflow_prompt_result(task_id),
+        iteration,
+        run_id: Some(RUN_ID),
+        base_dir,
+        slot_index,
+        effective_runner,
+        project_config,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// AC1: rung selection through the coordinator matches the pre-relocation
+// ladder. Each fresh (DB, ctx) drives one rung from a distinct (effort, model)
+// input and asserts the action AND the resulting task-row status transition.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn handle_overflow_rung_ladder_matches_pre_relocation() {
+    disable_llm_extraction();
+
+    // Rung 1 — effort downgrade (xhigh → high). DB row resets to todo.
+    {
+        let (tmp, mut conn) = setup_migrated_db();
+        insert_run(&conn);
+        insert_task_with_model(&conn, "OF-R1", None);
+        let mut ctx = IterationContext::new(10);
+        let action = run_handle_overflow(
+            &mut conn,
+            &mut ctx,
+            "OF-R1",
+            Some("xhigh"),
+            Some(SONNET_MODEL),
+            1,
+            tmp.path(),
+            None,
+            RunnerKind::Claude,
+            &ProjectConfig::default(),
+        );
+        assert_eq!(
+            action,
+            RecoveryAction::DowngradeEffort {
+                new_effort: "high".to_string()
+            },
+            "rung 1: xhigh effort must downgrade to high before any model escalation",
+        );
+        assert_eq!(task_status(&conn, "OF-R1").as_deref(), Some("todo"));
+        assert_eq!(ctx.effort_overrides.get("OF-R1").copied(), Some("high"));
+    }
+
+    // Rung 2 — model escalation below opus once effort floor (high) is reached.
+    for (model, expected) in [(SONNET_MODEL, OPUS_MODEL), (HAIKU_MODEL, SONNET_MODEL)] {
+        let (tmp, mut conn) = setup_migrated_db();
+        insert_run(&conn);
+        insert_task_with_model(&conn, "OF-R2", None);
+        let mut ctx = IterationContext::new(10);
+        let action = run_handle_overflow(
+            &mut conn,
+            &mut ctx,
+            "OF-R2",
+            Some("high"),
+            Some(model),
+            1,
+            tmp.path(),
+            None,
+            RunnerKind::Claude,
+            &ProjectConfig::default(),
+        );
+        assert_eq!(
+            action,
+            RecoveryAction::EscalateModel {
+                new_model: expected.to_string()
+            },
+            "rung 2: at the high effort floor, {model} must escalate to {expected}",
+        );
+        assert_eq!(task_status(&conn, "OF-R2").as_deref(), Some("todo"));
+        assert_eq!(
+            ctx.model_overrides.get("OF-R2").map(String::as_str),
+            Some(expected),
+        );
+    }
+
+    // Rung 3 — 1M-context escalation once at the Opus ceiling.
+    {
+        let (tmp, mut conn) = setup_migrated_db();
+        insert_run(&conn);
+        insert_task_with_model(&conn, "OF-R3", None);
+        let mut ctx = IterationContext::new(10);
+        let action = run_handle_overflow(
+            &mut conn,
+            &mut ctx,
+            "OF-R3",
+            Some("high"),
+            Some(OPUS_MODEL),
+            1,
+            tmp.path(),
+            None,
+            RunnerKind::Claude,
+            &ProjectConfig::default(),
+        );
+        assert_eq!(
+            action,
+            RecoveryAction::To1mModel {
+                new_model: OPUS_MODEL_1M.to_string()
+            },
+            "rung 3: opus must escalate to the 1M-context variant",
+        );
+        assert_eq!(task_status(&conn, "OF-R3").as_deref(), Some("todo"));
+    }
+
+    // Rung 5 — no recovery available (Opus[1M] at high effort, no fallback). The
+    // task is blocked, NOT reset to todo.
+    {
+        let (tmp, mut conn) = setup_migrated_db();
+        insert_run(&conn);
+        insert_task_with_model(&conn, "OF-R5", None);
+        let mut ctx = IterationContext::new(10);
+        let action = run_handle_overflow(
+            &mut conn,
+            &mut ctx,
+            "OF-R5",
+            Some("high"),
+            Some(OPUS_MODEL_1M),
+            1,
+            tmp.path(),
+            None,
+            RunnerKind::Claude,
+            &ProjectConfig::default(),
+        );
+        assert_eq!(
+            action,
+            RecoveryAction::Blocked,
+            "rung 5: Opus[1M] at high effort with no fallback config has no recovery",
+        );
+        assert_eq!(
+            task_status(&conn, "OF-R5").as_deref(),
+            Some("blocked"),
+            "rung 5 blocks the task (started_at preserved for audit); it is NOT reset to todo",
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AC1 (rung 4): FallbackToProvider fires through the coordinator when the
+// Claude ladder is exhausted AND the Grok fallback runner is enabled. The task
+// row is reset to todo and `tasks.model` is rewritten to the cross-provider
+// target so the next iteration picks up the Grok model.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn handle_overflow_rung4_fallback_to_provider_when_enabled() {
+    disable_llm_extraction();
+    let (tmp, mut conn) = setup_migrated_db();
+    insert_run(&conn);
+    insert_task_with_model(&conn, "OF-R4", Some(OPUS_MODEL_1M));
+    let mut ctx = IterationContext::new(10);
+
+    let action = run_handle_overflow(
+        &mut conn,
+        &mut ctx,
+        "OF-R4",
+        Some("high"),
+        Some(OPUS_MODEL_1M),
+        1,
+        tmp.path(),
+        None,
+        RunnerKind::Claude,
+        &config_with_fallback_enabled(),
+    );
+
+    assert_eq!(
+        action,
+        RecoveryAction::FallbackToProvider {
+            provider: "grok".to_string(),
+            model: "grok-build".to_string(),
+        },
+        "rung 4: Claude ladder exhausted + fallback enabled ⇒ pivot to the Grok runner",
+    );
+    // Recovery state written atomically: runner + model overrides + the todo reset.
+    assert_eq!(task_status(&conn, "OF-R4").as_deref(), Some("todo"));
+    assert_eq!(
+        ctx.model_overrides.get("OF-R4").map(String::as_str),
+        Some("grok-build"),
+        "rung 4 must record the cross-provider model override on ctx",
+    );
+    assert_eq!(
+        ctx.runner_overrides.get("OF-R4"),
+        Some(&RunnerKind::Grok),
+        "rung 4 must record the Grok runner override on ctx",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// AC1 (parity): the sequential (slot_index=None) and wave (slot_index=Some)
+// shapes route through the SAME coordinator, so identical (ctx, task, effort,
+// model) inputs select the same rung — only the JSONL slot_index differs.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn handle_overflow_seq_and_wave_agree_on_rung() {
+    disable_llm_extraction();
+
+    let (seq_tmp, mut seq_conn) = setup_migrated_db();
+    insert_run(&seq_conn);
+    insert_task_with_model(&seq_conn, "OF-PAR", None);
+    let mut seq_ctx = IterationContext::new(10);
+    let seq_action = run_handle_overflow(
+        &mut seq_conn,
+        &mut seq_ctx,
+        "OF-PAR",
+        Some("high"),
+        Some(SONNET_MODEL),
+        7,
+        seq_tmp.path(),
+        None,
+        RunnerKind::Claude,
+        &ProjectConfig::default(),
+    );
+
+    let (wave_tmp, mut wave_conn) = setup_migrated_db();
+    insert_run(&wave_conn);
+    insert_task_with_model(&wave_conn, "OF-PAR", None);
+    let mut wave_ctx = IterationContext::new(10);
+    let wave_action = run_handle_overflow(
+        &mut wave_conn,
+        &mut wave_ctx,
+        "OF-PAR",
+        Some("high"),
+        Some(SONNET_MODEL),
+        7,
+        wave_tmp.path(),
+        Some(2),
+        RunnerKind::Claude,
+        &ProjectConfig::default(),
+    );
+
+    assert_eq!(
+        seq_action, wave_action,
+        "sequential (None) and wave (Some(slot)) shapes must select the SAME rung",
+    );
+    // The ONLY shape-dependent observable is the JSONL slot_index.
+    let seq_events = read_overflow_events(seq_tmp.path());
+    let wave_events = read_overflow_events(wave_tmp.path());
+    assert_eq!(seq_events.len(), 1);
+    assert_eq!(wave_events.len(), 1);
+    assert_eq!(
+        seq_events[0].slot_index, None,
+        "sequential event must omit slot_index",
+    );
+    assert_eq!(
+        wave_events[0].slot_index,
+        Some(2),
+        "wave event must carry the slot index it overflowed on",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// AC2: per-slot isolation. In a 4-slot wave where only slot 2 overflows (walked
+// through rungs 1 → 2), the per-task recovery channels on ctx contain ONLY slot
+// 2's task_id — sibling slot task_ids never leak in. Mirrors
+// `overflow_per_slot.rs::slot_2_recovery_keying_excludes_sibling_slot_task_ids`
+// but routes through the coordinator.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn handle_overflow_per_slot_keying_excludes_sibling_slot_task_ids() {
+    disable_llm_extraction();
+    let (tmp, mut conn) = setup_migrated_db();
+    insert_run(&conn);
+    let slots = ["OF-WAVE-S0", "OF-WAVE-S1", "OF-WAVE-S2", "OF-WAVE-S3"];
+    for id in &slots {
+        insert_task_with_model(&conn, id, None);
+    }
+    let mut ctx = IterationContext::new(10);
+
+    // Slot 2 overflows on rung 1 (effort downgrade)...
+    run_handle_overflow(
+        &mut conn,
+        &mut ctx,
+        slots[2],
+        Some("xhigh"),
+        Some(SONNET_MODEL),
+        1,
+        tmp.path(),
+        Some(2),
+        RunnerKind::Claude,
+        &ProjectConfig::default(),
+    );
+    // ...is re-picked (production re-claims the row) and overflows again on
+    // rung 2 (model escalation) so we exercise BOTH effort + model channels.
+    conn.execute(
+        "UPDATE tasks SET status = 'in_progress' WHERE id = ?1",
+        [slots[2]],
+    )
+    .unwrap();
+    run_handle_overflow(
+        &mut conn,
+        &mut ctx,
+        slots[2],
+        Some("high"),
+        Some(SONNET_MODEL),
+        2,
+        tmp.path(),
+        Some(2),
+        RunnerKind::Claude,
+        &ProjectConfig::default(),
+    );
+
+    // Exactly one entry in every per-task channel, keyed on slot 2's id.
+    assert!(ctx.overflow_recovered.contains(slots[2]));
+    assert!(ctx.effort_overrides.contains_key(slots[2]));
+    assert!(ctx.model_overrides.contains_key(slots[2]));
+    assert!(ctx.overflow_original_model.contains_key(slots[2]));
+    for &sibling in &[slots[0], slots[1], slots[3]] {
+        assert!(
+            !ctx.overflow_recovered.contains(sibling),
+            "overflow_recovered leaked sibling {sibling}",
+        );
+        assert!(
+            !ctx.effort_overrides.contains_key(sibling),
+            "effort_overrides leaked sibling {sibling}",
+        );
+        assert!(
+            !ctx.model_overrides.contains_key(sibling),
+            "model_overrides leaked sibling {sibling}",
+        );
+        assert!(
+            !ctx.overflow_original_model.contains_key(sibling),
+            "overflow_original_model leaked sibling {sibling}",
+        );
+    }
+    // Set sizes pin the count — a wave-level or empty-string key would bump these.
+    assert_eq!(ctx.overflow_recovered.len(), 1);
+    assert_eq!(ctx.effort_overrides.len(), 1);
+    assert_eq!(ctx.model_overrides.len(), 1);
+    assert_eq!(ctx.overflow_original_model.len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// AC3: path-traversal defense preserved. A `..`-laden task id is collapsed by
+// `sanitize_id_for_filename` before it ever reaches the filesystem, so the
+// dump file `handle_overflow` writes stays inside `overflow-dumps/` — no `..`
+// or `/` survives into the on-disk filename or the JSONL dump_path.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn handle_overflow_sanitizes_path_traversal_task_id() {
+    disable_llm_extraction();
+    let (tmp, mut conn) = setup_migrated_db();
+    insert_run(&conn);
+    let evil_id = "../../../etc/passwd";
+    insert_task_with_model(&conn, evil_id, None);
+    let mut ctx = IterationContext::new(10);
+
+    run_handle_overflow(
+        &mut conn,
+        &mut ctx,
+        evil_id,
+        Some("xhigh"),
+        Some(SONNET_MODEL),
+        1,
+        tmp.path(),
+        None,
+        RunnerKind::Claude,
+        &ProjectConfig::default(),
+    );
+
+    // The dump lands inside overflow-dumps/ with a collapsed name (no traversal).
+    let dumps_dir = tmp.path().join("overflow-dumps");
+    let entries: Vec<_> = std::fs::read_dir(&dumps_dir)
+        .expect("overflow-dumps dir exists")
+        .map(|e| {
+            e.expect("dir entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    assert_eq!(entries.len(), 1, "exactly one dump file written");
+    let name = &entries[0];
+    assert!(
+        !name.contains("..") && !name.contains('/'),
+        "dump filename must collapse traversal segments; got {name}",
+    );
+    let sanitized = sanitize_id_for_filename(evil_id);
+    assert!(
+        name.starts_with(&sanitized),
+        "dump filename must begin with the sanitized id {sanitized}; got {name}",
+    );
+
+    // The JSONL dump_path points inside the dumps dir — never above base_dir.
+    let events = read_overflow_events(tmp.path());
+    assert_eq!(events.len(), 1);
+    assert!(
+        events[0]
+            .dump_path
+            .starts_with(&dumps_dir.to_string_lossy().into_owned()),
+        "JSONL dump_path must stay within overflow-dumps/; got {}",
+        events[0].dump_path,
+    );
+    assert!(
+        !events[0].dump_path.contains(".."),
+        "JSONL dump_path must not contain a traversal segment",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// AC4: the OverflowEvent JSONL line still carries the core fields
+// (task_id / iteration / model / recovery) through the coordinator.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn handle_overflow_emits_jsonl_event_with_core_fields() {
+    disable_llm_extraction();
+    let (tmp, mut conn) = setup_migrated_db();
+    insert_run(&conn);
+    insert_task_with_model(&conn, "OF-JSONL", None);
+    let mut ctx = IterationContext::new(10);
+
+    let action = run_handle_overflow(
+        &mut conn,
+        &mut ctx,
+        "OF-JSONL",
+        Some("xhigh"),
+        Some(SONNET_MODEL),
+        42,
+        tmp.path(),
+        None,
+        RunnerKind::Claude,
+        &ProjectConfig::default(),
+    );
+
+    let events = read_overflow_events(tmp.path());
+    assert_eq!(events.len(), 1, "exactly one JSONL event emitted");
+    let ev = &events[0];
+    assert_eq!(ev.task_id, "OF-JSONL", "task_id field must be populated");
+    assert_eq!(ev.iteration, 42, "iteration field must be populated");
+    assert_eq!(
+        ev.model.as_deref(),
+        Some(SONNET_MODEL),
+        "model field must reflect the effective model at overflow time",
+    );
+    assert_eq!(
+        ev.recovery, action,
+        "the JSONL recovery field must match the returned RecoveryAction",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// AC5 (RUNS LIVE): known-bad discriminator. A stub overflow ladder that SKIPS
+// rung 1 (effort downgrade) jumps straight to model escalation, so on the
+// (xhigh, sonnet) input it yields EscalateModel{opus} instead of
+// DowngradeEffort{high}. This proves the rung-1 assertion in
+// `handle_overflow_rung_ladder_matches_pre_relocation` actually discriminates:
+// a regression that drops the effort-downgrade rung is rejected.
+// ---------------------------------------------------------------------------
+
+/// A deliberately-wrong ladder: ignores `effort` and never tries rung 1.
+fn naive_overflow_skipping_rung1(_effort: Option<&str>, model: Option<&str>) -> RecoveryAction {
+    if let Some(next) = escalate_below_opus(model) {
+        RecoveryAction::EscalateModel {
+            new_model: next.to_string(),
+        }
+    } else if let Some(m1m) = to_1m_model(model) {
+        RecoveryAction::To1mModel {
+            new_model: m1m.to_string(),
+        }
+    } else {
+        RecoveryAction::Blocked
+    }
+}
+
+#[test]
+fn known_bad_overflow_skipping_rung1_fails_the_downgrade_assertion() {
+    // Same (effort, model) the rung-1 case feeds the real coordinator.
+    let action = naive_overflow_skipping_rung1(Some("xhigh"), Some(SONNET_MODEL));
+
+    // The real coordinator returns DowngradeEffort{high}; the rung-1-skipping
+    // stub returns EscalateModel{opus}, so it WOULD fail that assertion.
+    assert_eq!(
+        action,
+        RecoveryAction::EscalateModel {
+            new_model: OPUS_MODEL.to_string()
+        },
+        "rung-1-skipping stub jumps to model escalation on xhigh effort",
+    );
+    assert_ne!(
+        action,
+        RecoveryAction::DowngradeEffort {
+            new_effort: "high".to_string()
+        },
+        "...which violates the rung-1-first contract the real coordinator satisfies",
+    );
+}

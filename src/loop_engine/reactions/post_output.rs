@@ -23,7 +23,7 @@ use crate::loop_engine::runner::RunnerKind;
 /// Inputs to [`handle_overflow`]. Destructured exhaustively (no `..`). Mirrors
 /// the twelve arguments of `overflow::handle_prompt_too_long`; `slot_index` is
 /// `Some(n)` for a wave slot and `None` for the sequential path.
-pub(crate) struct HandleOverflowParams<'a> {
+pub struct HandleOverflowParams<'a> {
     pub ctx: &'a mut IterationContext,
     pub conn: &'a mut Connection,
     pub task_id: &'a str,
@@ -41,7 +41,7 @@ pub(crate) struct HandleOverflowParams<'a> {
 /// Overflow recovery coordinator: the single home both execution paths call
 /// when a task hits "Prompt is too long". Sequential passes `slot_index: None`
 /// and folds the one result; wave passes `slot_index: Some(n)` per slot.
-pub(crate) fn handle_overflow(params: HandleOverflowParams<'_>) -> RecoveryAction {
+pub fn handle_overflow(params: HandleOverflowParams<'_>) -> RecoveryAction {
     let HandleOverflowParams {
         ctx,
         conn,

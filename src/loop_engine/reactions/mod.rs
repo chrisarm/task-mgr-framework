@@ -44,14 +44,14 @@
 //! owning FEATs (FEAT-002/003/005/006/010/013). They carry `#[allow(dead_code)]`
 //! only until those FEATs call them from both paths.
 
-// `account` and `pre_spawn` are `pub` (not `pub(crate)`) so their converged
-// coordinators are reachable from the integration parity harness
-// (`tests/reaction_parity.rs`), mirroring `pub mod iteration_pipeline`:
+// `account`, `pre_spawn`, and `post_output` are `pub` (not `pub(crate)`) so
+// their converged coordinators are reachable from the integration parity
+// harness (`tests/reaction_parity.rs`), mirroring `pub mod iteration_pipeline`:
 // `account` for the post-output rate-limit reaction + usage gate (TEST-INIT-001/002),
-// `pre_spawn` for `resolve_task_execution` (TEST-INIT-002). The remaining
-// coordinator submodules stay crate-private until their owning FEAT needs
-// integration-test reachability.
+// `pre_spawn` for `resolve_task_execution` (TEST-INIT-002), `post_output` for
+// `handle_overflow` (TEST-INIT-003). The remaining coordinator submodule stays
+// crate-private until its owning FEAT needs integration-test reachability.
 pub mod account;
 pub(crate) mod post_completion;
-pub(crate) mod post_output;
+pub mod post_output;
 pub mod pre_spawn;
