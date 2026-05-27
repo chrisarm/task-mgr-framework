@@ -228,6 +228,9 @@ fn estimate_reset_seconds(reset_at: &str) -> Option<u64> {
 /// 3. If above threshold, wait for reset
 ///
 /// Returns the result of the check-and-wait cycle.
+#[deprecated(
+    note = "pre-dispatch usage gate converged into reactions::account::account_usage_gate (FEAT-003); the engine paths must route through that coordinator, not call this leaf directly"
+)]
 pub fn check_and_wait(threshold: u8, tasks_dir: &Path, fallback_wait: u64) -> UsageCheckResult {
     // Step 1: Ensure token is valid
     let path = oauth::credentials_path();

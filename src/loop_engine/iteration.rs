@@ -65,7 +65,7 @@ use crate::loop_engine::reactions;
 use crate::loop_engine::recovery::{prompt_overflow_result, update_trackers};
 use crate::loop_engine::runner;
 use crate::loop_engine::signals;
-use crate::loop_engine::usage::{self, UsageCheckResult};
+use crate::loop_engine::usage::UsageCheckResult;
 use crate::loop_engine::watchdog;
 use crate::loop_engine::wave_scheduler::classify_drained_queue;
 
@@ -119,13 +119,19 @@ pub fn run_iteration(
         );
     }
 
-    // Step 1.5: Pre-iteration usage check
+    // Step 1.5: Pre-iteration usage gate (account-global). Routes through the
+    // converged `reactions::account::account_usage_gate` coordinator — the SAME
+    // gate the wave path folds once per wave (`wave_scheduler::wave_preflight_check`),
+    // so both paths agree on the GateDecision for a given usage state. The
+    // relocated `usage::check_and_wait` leaf is `#[deprecated]` and this file
+    // carries `#![deny(deprecated)]`, so a direct call here is a compile error.
     if params.usage_params.enabled {
-        let check_result = usage::check_and_wait(
-            params.usage_params.threshold,
-            params.tasks_dir,
-            params.usage_params.fallback_wait,
-        );
+        let check_result =
+            reactions::account::account_usage_gate(reactions::account::AccountUsageGateParams {
+                threshold: params.usage_params.threshold,
+                tasks_dir: params.tasks_dir,
+                fallback_wait: params.usage_params.fallback_wait,
+            });
         match check_result {
             UsageCheckResult::StopSignaled => {
                 eprintln!("Stop signal during usage wait, exiting");

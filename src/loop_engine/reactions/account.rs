@@ -54,14 +54,15 @@ pub type UsageGateFn<'f> = &'f dyn Fn(u8, &Path, u64) -> UsageCheckResult;
 /// not per-task state, so the caller fires it **exactly once per wave** (and
 /// once per sequential iteration) — never once per slot.
 ///
-/// **Scaffold under TEST-INIT-002** — body implemented by FEAT-003.
-#[allow(dead_code)] // wired once-per-wave (and once-per-iteration sequentially) by FEAT-003
+/// The relocated leaf `usage::check_and_wait` carries `#[deprecated]` and the
+/// three engine files carry `#![deny(deprecated)]`, so this coordinator is its
+/// single legitimate caller; the engine paths route through here instead.
 pub fn account_usage_gate(params: AccountUsageGateParams<'_>) -> UsageCheckResult {
-    let _ = params;
-    unimplemented!(
-        "FEAT-003: build the gate closure from usage::check_and_wait and \
-         delegate to account_usage_gate_inner"
-    )
+    let gate = |threshold: u8, tasks_dir: &Path, fallback_wait: u64| -> UsageCheckResult {
+        #[allow(deprecated)] // single legitimate caller of the relocated leaf
+        usage::check_and_wait(threshold, tasks_dir, fallback_wait)
+    };
+    account_usage_gate_inner(params, &gate)
 }
 
 /// Hermetic core of the account-global usage gate. Destructures the params
@@ -70,19 +71,23 @@ pub fn account_usage_gate(params: AccountUsageGateParams<'_>) -> UsageCheckResul
 /// unchanged. Same usage state ⇒ same decision, independent of which path
 /// (sequential or wave) invoked it.
 ///
-/// **Scaffold under TEST-INIT-002** — body implemented by FEAT-003. The
-/// contract is pinned by the ignored tests in `tests/reaction_parity.rs`.
-#[allow(dead_code)] // invoked by account_usage_gate; pinned by TEST-INIT-002
+/// The contract is pinned by the parity tests in `tests/reaction_parity.rs`.
 pub fn account_usage_gate_inner(
     params: AccountUsageGateParams<'_>,
     gate: UsageGateFn<'_>,
 ) -> UsageCheckResult {
-    let _ = (params, gate);
-    unimplemented!(
-        "FEAT-003: destructure AccountUsageGateParams exhaustively; fire `gate` \
-         EXACTLY once with (threshold, tasks_dir, fallback_wait); return its \
-         UsageCheckResult unchanged"
-    )
+    // Exhaustive destructure (no `..`) — the single-home parity lock. Adding a
+    // field to `AccountUsageGateParams` forces this coordinator to account for
+    // it before the code compiles.
+    let AccountUsageGateParams {
+        threshold,
+        tasks_dir,
+        fallback_wait,
+    } = params;
+
+    // Fire the gate EXACTLY once and return its decision unchanged — same usage
+    // state ⇒ same UsageCheckResult, independent of the sequential vs wave caller.
+    gate(threshold, tasks_dir, fallback_wait)
 }
 
 // ---------------------------------------------------------------------------
@@ -201,6 +206,7 @@ pub fn react_to_outputs(
         // Try the usage API first (when enabled). It computes its own wait
         // internally, so the `wait_secs` arg is only consumed by the fallback.
         if usage_enabled {
+            #[allow(deprecated)] // single legitimate caller of the relocated leaf
             match usage::check_and_wait(threshold, tasks_dir, fallback_wait) {
                 UsageCheckResult::StopSignaled => return false,
                 UsageCheckResult::WaitedAndReset => return true,

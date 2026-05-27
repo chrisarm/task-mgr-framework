@@ -78,6 +78,7 @@ use crate::loop_engine::reactions;
 use crate::loop_engine::recovery::handle_task_failure;
 use crate::loop_engine::runner::RunnerKind;
 use crate::loop_engine::signals::{self, SignalFlag};
+use crate::loop_engine::usage::UsageCheckResult;
 // `claim_slot_task` is a deprecated shim over `TaskLifecycle::try_claim`; the
 // wave fan-out still calls it verbatim (this carve does not migrate it).
 #[allow(deprecated)]
@@ -235,6 +236,44 @@ fn wave_preflight_check(
             failed_merges: Vec::new(),
             rate_limited_retry: false,
         });
+    }
+
+    // Pre-iteration usage gate (FEAT-003): account-global, so fire it EXACTLY
+    // once per wave (not once per slot — that would issue N redundant API/DB
+    // checks). The wave path previously LACKED this gate entirely: a
+    // rate-limited account never waited before a wave dispatched, stranding
+    // in-flight work. Routes through the SAME
+    // `reactions::account::account_usage_gate` coordinator the sequential path
+    // folds at `run_iteration` Step 1.5, so both paths agree on the
+    // GateDecision for a given usage state. Ordered after the stop check and
+    // before crash backoff to mirror the sequential Step ordering.
+    if params.usage_params.enabled {
+        match reactions::account::account_usage_gate(reactions::account::AccountUsageGateParams {
+            threshold: params.usage_params.threshold,
+            tasks_dir: params.tasks_dir,
+            fallback_wait: params.usage_params.fallback_wait,
+        }) {
+            UsageCheckResult::StopSignaled => {
+                eprintln!("Stop signal during usage wait, exiting");
+                return Some(WaveOutcome {
+                    tasks_completed: 0,
+                    iteration_consumed: false,
+                    terminal: Some(WaveTerminal {
+                        exit_code: 0,
+                        reason: "stop signal during usage wait".to_string(),
+                        run_status: None,
+                    }),
+                    was_stopped: true,
+                    failed_merges: Vec::new(),
+                    rate_limited_retry: false,
+                });
+            }
+            UsageCheckResult::ApiError(ref msg) => {
+                eprintln!("Usage API warning: {} (continuing)", msg);
+            }
+            // BelowThreshold, WaitedAndReset, Skipped — proceed with the wave.
+            _ => {}
+        }
     }
 
     // Crash backoff + abort. Identical contract to the sequential path so

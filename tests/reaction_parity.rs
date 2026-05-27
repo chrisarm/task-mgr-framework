@@ -891,7 +891,6 @@ fn resolve_task_execution_invalidates_stale_overrides_on_operator_edit() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "unblocked by FEAT-003: account_usage_gate_inner body"]
 fn account_usage_gate_inner_same_decision_both_shapes() {
     let seq_dir = TempDir::new().expect("tempdir");
     let wave_dir = TempDir::new().expect("tempdir");
