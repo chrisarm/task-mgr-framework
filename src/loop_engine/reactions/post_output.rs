@@ -228,13 +228,15 @@ pub fn handle_overflow(params: HandleOverflowParams<'_>) -> RecoveryAction {
         .or_insert_with(|| effective_model.unwrap_or("(default)").to_string());
     ctx.overflow_original_task_model
         .entry(task_id.to_string())
-        .or_insert_with(|| match read_task_model_from_db(conn, task_id) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!(
-                    "Warning: handle_overflow({task_id}): model snapshot DB read failed: {e}"
-                );
-                None
+        .or_insert_with(|| {
+            match read_task_model_from_db(conn, task_id) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!(
+                        "Warning: read_task_model_from_db({task_id}) for overflow snapshot: DB read failed: {e}"
+                    );
+                    None
+                }
             }
         });
 

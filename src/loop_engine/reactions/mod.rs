@@ -46,6 +46,17 @@
 //! `#[allow(dead_code)]`, and the per-coordinator rustdoc names the sequential
 //! and wave call sites. `tests/reaction_parity.rs` pins that the two path shapes
 //! compute identical results for identical inputs.
+//!
+//! ## Param placement convention (conn/ctx)
+//!
+//! Per-task coordinators (`pre_spawn::resolve_task_execution`,
+//! `post_output::handle_overflow`) fold `&mut IterationContext` + `&mut Connection`
+//! (or `&Connection`) into their `*Params` struct so both path call sites remain
+//! uniform per slot/task. Batch/account-global coordinators (`account::*`,
+//! `post_completion::react_to_completions`) take `conn: &mut Connection` as the
+//! first positional argument (shared across the list of items) with the rest in
+//! the params struct. The split is deliberate for borrow checker and batch
+//! ergonomics, not accidental.
 
 // `account`, `pre_spawn`, `post_output`, and `post_completion` are `pub` (not
 // `pub(crate)`) so their converged coordinators are reachable from the
