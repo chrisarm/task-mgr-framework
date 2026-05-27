@@ -15,6 +15,13 @@
 //! iff the branch ran. The expected message text is:
 //!   `Operator changed task model for {task_id} — clearing auto-recovery overrides; resolving fresh.`
 
+// FEAT-002 relocated `check_override_invalidation` to
+// `reactions::pre_spawn::invalidate_stale_overrides`; the `engine::` re-export
+// these tests use is now a `#[deprecated]` shim. They remain the equivalence
+// oracle for the relocated body, so allow the lint until CLEANUP-001 migrates
+// them to the new home.
+#![allow(deprecated)]
+
 use rusqlite::Connection;
 
 use task_mgr::db::{create_schema, run_migrations};

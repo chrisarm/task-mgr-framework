@@ -17,8 +17,10 @@
 //! inline test modules that stay in `engine.rs`, so moving them would widen the
 //! carve's blast radius. The leaf concerns this module depends on come from
 //! `slot.rs` (FEAT-001: `run_slot_iteration`, `claim_slot_task`,
-//! `process_slot_result`, `slot_failure_result`), `recovery.rs` (FEAT-002:
-//! `handle_task_failure`, `check_override_invalidation`),
+//! `process_slot_result`, `slot_failure_result`), `recovery.rs`
+//! (`handle_task_failure`), the pre-spawn coordinator
+//! `reactions::pre_spawn::resolve_task_execution` (FEAT-002: the operator escape
+//! valve + crash escalation + effort override + runner, folded once per slot),
 //! `iteration_pipeline.rs` (the shared post-Claude pipeline invoked inside
 //! `slot.rs::process_slot_result` — not called directly here, but every wave
 //! iteration result flows through it), and `worktree.rs` (merge-back via
@@ -73,7 +75,7 @@ use crate::loop_engine::prd_reconcile::reconcile_passes_with_db;
 use crate::loop_engine::progress;
 use crate::loop_engine::prompt;
 use crate::loop_engine::reactions;
-use crate::loop_engine::recovery::{check_override_invalidation, handle_task_failure};
+use crate::loop_engine::recovery::handle_task_failure;
 use crate::loop_engine::runner::RunnerKind;
 use crate::loop_engine::signals::{self, SignalFlag};
 // `claim_slot_task` is a deprecated shim over `TaskLifecycle::try_claim`; the
@@ -540,6 +542,9 @@ pub(super) fn build_slot_contexts(
                 // directly (without the enrichment step) inherit Claude —
                 // the default-empty regression behavior.
                 effective_runner: RunnerKind::Claude, // kind-correct: sentinel default; same pattern as SlotPromptBundle — provider identity, not capability
+                // Sentinel default; main-thread enrichment in `run_wave_iteration`
+                // overwrites with the plan's effort override before spawn.
+                effective_effort: None,
             }
         })
         .collect()
@@ -989,25 +994,68 @@ pub fn run_wave_iteration(
     let slot_prompt_params = build_slot_prompt_params(&params);
     let mut slot_contexts =
         build_slot_contexts(params.conn, group, slot_paths, &slot_prompt_params);
-    // FEAT-005: resolve effective runner per slot on the main thread before
-    // spawning the worker. Single source of truth for the formula — slots
-    // never read `ctx.runner_overrides` directly (Learning #1810). The
-    // effective_model mirrors what `run_slot_iteration` recomputes internally
-    // (bundle.resolved_model → params.default_model fallback) so the
-    // runner resolution sees the same model string the slot will use.
+    // FEAT-002: resolve the pre-spawn execution plan per slot on the main
+    // thread (slots never touch the `IterationContext` override maps —
+    // Learning #1810). This is the SAME `reactions::pre_spawn` coordinator the
+    // sequential path folds (one call per slot here vs. one call there): it
+    // runs the operator escape valve FIRST, then crash escalation, the
+    // prior-overflow effort override, and runner resolution. Wave previously
+    // did review-only routing here and dropped both the crash-escalation and
+    // the effort channel — those gaps close by routing through the coordinator.
     for slot in slot_contexts.iter_mut() {
-        // FEAT-008: operator escape valve — clear stale overrides if tasks.model changed.
-        check_override_invalidation(ctx, params.conn, &slot.prompt_bundle.task_id);
-        // FEAT-002: route review-class slots to `reviewModel` BEFORE recomputing
-        // `effective_model`. Mutating the bundle's `resolved_model` (not just a
-        // local) keeps runner selection, the `--model` flag in
-        // `run_slot_iteration`, and the prompt-baked model consistent — a
-        // drift-`assert!` cross-check on `slot_result.effective_runner` would
-        // panic if these disagreed.
-        if let Some(review_model_override) = apply_review_model_override(
-            params.project_config.review_model.as_deref(),
-            &slot.prompt_bundle.task_id,
-        ) {
+        let task_id = slot.prompt_bundle.task_id.clone();
+        // Baseline model the worker would otherwise spawn with
+        // (`bundle.resolved_model → params.default_model`), captured BEFORE the
+        // coordinator so the crash-escalation + runner resolution see the same
+        // string `run_slot_iteration` resolves internally.
+        let baseline: Option<String> = slot
+            .prompt_bundle
+            .resolved_model
+            .clone()
+            .or_else(|| params.default_model.map(str::to_string));
+
+        let plan = reactions::pre_spawn::resolve_task_execution(
+            reactions::pre_spawn::ResolveTaskExecutionParams {
+                ctx,
+                conn: params.conn,
+                task_id: &task_id,
+                resolved_model: baseline.as_deref(),
+            },
+        );
+
+        // Apply the crash-escalated model to the bundle so the worker spawns
+        // with it. Wave previously skipped pre-spawn crash escalation; routing
+        // through the coordinator converges it with the sequential path.
+        if let Some(escalated) = plan.model {
+            eprintln!(
+                "Crash escalation [slot {}]: {} → {}",
+                slot.slot_index,
+                baseline.as_deref().unwrap_or("(default)"),
+                escalated,
+            );
+            slot.prompt_bundle.resolved_model = Some(escalated);
+        }
+
+        // Apply the prior-overflow effort override per slot (audit #6-effort):
+        // the worker reads `effective_effort` first, falling back to the
+        // difficulty-derived effort when `None`.
+        if let Some(effort) = plan.effort {
+            eprintln!(
+                "Effort override (prior prompt overflow) [slot {}]: → {}",
+                slot.slot_index, effort,
+            );
+        }
+        slot.effective_effort = plan.effort;
+
+        // Route review-class slots to `reviewModel` AFTER the escape valve /
+        // crash escalation (so neither overwrites the routing). Mutating the
+        // bundle's `resolved_model` (not just a local) keeps runner selection,
+        // the `--model` flag in `run_slot_iteration`, and the prompt-baked
+        // model consistent — a drift-`assert!` cross-check on
+        // `slot_result.effective_runner` would panic if these disagreed.
+        if let Some(review_model_override) =
+            apply_review_model_override(params.project_config.review_model.as_deref(), &task_id)
+        {
             let old = slot
                 .prompt_bundle
                 .resolved_model
@@ -1019,13 +1067,18 @@ pub fn run_wave_iteration(
             );
             slot.prompt_bundle.resolved_model = Some(review_model_override);
         }
+
+        // Resolve the runner over the FINAL model (post crash escalation +
+        // review routing). `plan.runner` reflects only the pre-routing
+        // baseline, so this re-resolution is the authoritative spawn
+        // discriminant — identical in shape to the sequential path's single
+        // `resolve_effective_runner` at the end of its pre-spawn block.
         let effective_model = slot
             .prompt_bundle
             .resolved_model
             .as_deref()
             .or(params.default_model);
-        slot.effective_runner =
-            resolve_effective_runner(ctx, &slot.prompt_bundle.task_id, effective_model);
+        slot.effective_runner = resolve_effective_runner(ctx, &task_id, effective_model);
     }
     let slot_params = build_shared_slot_params(&params);
 
@@ -1492,6 +1545,7 @@ mod tests {
             working_root,
             prompt_bundle,
             effective_runner: RunnerKind::Claude,
+            effective_effort: None,
         }
     }
 

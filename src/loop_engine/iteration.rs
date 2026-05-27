@@ -12,22 +12,26 @@
 //! (`resolve_effective_runner`, `apply_review_model_override`) remain in
 //! `engine.rs` and are imported here — `run_loop` and the inline engine test
 //! modules also consume them, so moving them would widen the carve's blast
-//! radius. The leaf recovery primitives come from `recovery.rs` (FEAT-002:
-//! `check_crash_escalation`, `check_override_invalidation`,
-//! `prompt_overflow_result`, `probe_rate_limit_lifted`, `update_trackers`).
+//! radius. The pre-spawn per-task recovery reactions (crash escalation, the
+//! operator escape valve, the effort override, runner resolution) are folded by
+//! `reactions::pre_spawn::resolve_task_execution` (FEAT-002) — the sequential
+//! path calls it once, the wave path once per slot. The remaining leaf
+//! primitives still come from `recovery.rs` (`prompt_overflow_result`,
+//! `probe_rate_limit_lifted`, `update_trackers`).
 //!
 //! `engine.rs` re-exports `run_iteration` `pub` so the external import path
 //! `task_mgr::loop_engine::engine::run_iteration` integration tests and callers
 //! rely on stays valid (FR-008).
 //!
-//! **Order-before-resolve invariant (load-bearing)**: `check_override_invalidation`
-//! runs at the TOP of the iteration, BEFORE `resolve_effective_runner`, so an
+//! **Order-before-resolve invariant (load-bearing)**: the escape valve inside
+//! `resolve_task_execution` runs at the TOP of the iteration, BEFORE crash
+//! escalation, the effort read, and `resolve_effective_runner`, so an
 //! operator's out-of-band `tasks.model` edit clears the stale per-task recovery
-//! channels before the spawn discriminant is derived. See
-//! `src/loop_engine/CLAUDE.md` → "Operator escape valve". `run_iteration` still
-//! hands its `IterationResult` to `iteration_pipeline::process_iteration_output`
-//! at the `run_loop` call site (the shared post-Claude pipeline is invoked
-//! after this function returns — see FR-006).
+//! channels before any of them is read. See `src/loop_engine/CLAUDE.md` →
+//! "Operator escape valve". `run_iteration` still hands its `IterationResult`
+//! to `iteration_pipeline::process_iteration_output` at the `run_loop` call
+//! site (the shared post-Claude pipeline is invoked after this function
+//! returns — see FR-006).
 //!
 //! **Reaction single-home lock (CONTRACT-001)**: `#![deny(deprecated)]` makes a
 //! direct call to any relocated reaction leaf (those marked `#[deprecated]` for
@@ -58,9 +62,7 @@ use crate::loop_engine::monitor;
 use crate::loop_engine::prd_reconcile::reconcile_passes_with_db;
 use crate::loop_engine::prompt::{self, BuildPromptParams};
 use crate::loop_engine::reactions;
-use crate::loop_engine::recovery::{
-    check_crash_escalation, check_override_invalidation, prompt_overflow_result, update_trackers,
-};
+use crate::loop_engine::recovery::{prompt_overflow_result, update_trackers};
 use crate::loop_engine::runner;
 use crate::loop_engine::signals;
 use crate::loop_engine::usage::{self, UsageCheckResult};
@@ -366,36 +368,52 @@ pub fn run_iteration(
     let task_files = prompt_result.task_files.clone();
     let shown_learning_ids = prompt_result.shown_learning_ids.clone();
 
-    // Step 4.5: Apply crash escalation and PromptTooLong model overrides
-    let mut effective_model = {
-        let resolved = prompt_result.resolved_model.as_deref();
-        let after_crash_escalation =
-            match check_crash_escalation(&ctx.crashed_last_iteration, &task_id, resolved) {
-                Some(escalated) => {
-                    let old = resolved.unwrap_or("(default)");
-                    eprintln!("Crash escalation: {} → {}", old, escalated);
-                    Some(escalated)
-                }
-                None => prompt_result.resolved_model.clone(),
-            };
-        // Apply per-task 1M model override from prior PromptTooLong recovery
-        if let Some(override_model) = ctx.model_overrides.get(&task_id) {
-            let old = after_crash_escalation.as_deref().unwrap_or("(default)");
-            eprintln!(
-                "Model override (prior prompt overflow): {} → {}",
-                old, override_model,
-            );
-            Some(override_model.clone())
-        } else {
-            after_crash_escalation
-        }
-    };
+    // Step 4.5: Pre-spawn recovery plan (FEAT-002). The `reactions::pre_spawn`
+    // coordinator runs the operator escape valve FIRST (clearing stale
+    // auto-recovery channels on an out-of-band `tasks.model` edit), then folds
+    // crash escalation, the prior-overflow effort override, and runner
+    // resolution into one plan. The wave path folds the SAME coordinator once
+    // per slot — identical inputs MUST yield an identical plan. The 1M
+    // `model_overrides` rewrite and review-class routing stay HERE: they are
+    // `--model` string rewrites layered on top of the plan, AFTER the escape
+    // valve has had its chance to clear them.
+    let resolved_model = prompt_result.resolved_model.clone();
+    let plan = reactions::pre_spawn::resolve_task_execution(
+        reactions::pre_spawn::ResolveTaskExecutionParams {
+            ctx,
+            conn: params.conn,
+            task_id: &task_id,
+            resolved_model: resolved_model.as_deref(),
+        },
+    );
 
-    // FEAT-002: route review-class tasks to `reviewModel` after the crash /
-    // overflow escalation block so escalation can't overwrite this routing.
-    // The single `effective_model` here feeds both `resolve_effective_runner`
-    // (runner selection) and the `--model` flag passed to the runner, so one
-    // assignment keeps selection and dispatch in sync.
+    let mut effective_model = if let Some(escalated) = plan.model {
+        eprintln!(
+            "Crash escalation: {} → {}",
+            resolved_model.as_deref().unwrap_or("(default)"),
+            escalated,
+        );
+        Some(escalated)
+    } else {
+        resolved_model.clone()
+    };
+    // Apply per-task 1M model override from a prior PromptTooLong recovery. The
+    // escape valve (inside the coordinator above) already cleared this channel
+    // if the operator edited `tasks.model`, so a stale override never resurfaces.
+    if let Some(override_model) = ctx.model_overrides.get(&task_id) {
+        let old = effective_model.as_deref().unwrap_or("(default)");
+        eprintln!(
+            "Model override (prior prompt overflow): {} → {}",
+            old, override_model,
+        );
+        effective_model = Some(override_model.clone());
+    }
+
+    // Route review-class tasks to `reviewModel` after the crash / overflow
+    // escalation so escalation can't overwrite this routing. The single
+    // `effective_model` here feeds both `resolve_effective_runner` (runner
+    // selection) and the `--model` flag passed to the runner, so one assignment
+    // keeps selection and dispatch in sync.
     if let Some(review_model_override) =
         apply_review_model_override(params.project_config.review_model.as_deref(), &task_id)
     {
@@ -407,12 +425,11 @@ pub fn run_iteration(
         effective_model = Some(review_model_override);
     }
 
-    // Use the cluster-wide effort computed by `build_prompt` — parallels the
-    // cluster-wide `resolved_model` so both axes scale with the hardest task
-    // in the synergy cluster. Apply any per-task override left by a prior
-    // `PromptTooLong` crash on top.
+    // Effort: the plan's prior-overflow override wins, else the cluster-wide
+    // effort `build_prompt` computed (parallels the cluster-wide
+    // `resolved_model` so both axes scale with the hardest task in the cluster).
     let base_effort = prompt_result.cluster_effort;
-    let effort = ctx.effort_overrides.get(&task_id).copied().or(base_effort);
+    let effort = plan.effort.or(base_effort);
     if effort != base_effort {
         eprintln!(
             "Effort override (prior prompt overflow): {} → {}",
@@ -421,12 +438,12 @@ pub fn run_iteration(
         );
     }
 
-    // FEAT-008: operator escape valve — clear stale overrides if tasks.model changed.
-    check_override_invalidation(ctx, params.conn, &task_id);
-
     // FEAT-005/009: resolve effective runner once per iteration (PRD §2.5
-    // single source of truth). Placed before the banner so the "(via grok)"
-    // annotation can be included in the iteration header.
+    // single source of truth) over the FINAL model (post escalation +
+    // model_overrides + review routing). `plan.runner` reflects only the
+    // pre-rewrite baseline, so this re-resolution is the authoritative spawn
+    // discriminant. Placed before the banner so the "(via grok)" annotation
+    // can be included in the iteration header.
     let effective_runner = resolve_effective_runner(ctx, &task_id, effective_model.as_deref());
 
     // Step 5: Print iteration header (with post-escalation effective_model + effort)

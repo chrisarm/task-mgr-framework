@@ -218,7 +218,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": false,
       "notes": "Preserve the deferred-promotion-after-commit contract (CLAUDE.md §'Transactional promotion ctx writes are deferred'). Existing crash-escalation + override-invalidation tests must still pass.",
-      "passes": false,
+      "passes": true,
       "priority": 3,
       "qualityDimensions": [
         "Plan equivalence across paths is the convergence proof for #2/#3",
@@ -263,7 +263,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": false,
       "notes": "Learning #2852: wave overflow recovery evolved bypass→shared-ladder — do not regress. Reuse existing overflow.rs tests as the equivalence oracle; the relocation must keep them green.",
-      "passes": false,
+      "passes": true,
       "priority": 4,
       "qualityDimensions": [
         "Equivalence to the existing overflow ladder is the bar — relocation is behavior-preserving",
@@ -380,7 +380,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": true,
       "notes": "THE headline bug fix. B3 verified at wave_scheduler.rs:738-739 (empty failed_merges zeroes the streak). B2 verified at orchestrator.rs:918-919/1021-1023/1256. Mixed-wave deferred-merge: a completed-but-unmerged slot from a rate-limited wave should reappear in next wave's ephemeral_overlay — verify; if the early return skips the overlay build, refresh it. Data contract: OutputReactionItem { task_id: Option<&str>, outcome: &IterationOutcome, output: &str } built from SlotResult.iteration_result.{task_id,outcome,output} (filter claim_succeeded).",
-      "passes": false,
+      "passes": true,
       "priority": 6,
       "qualityDimensions": [
         "Wait exactly once per wave (account-global)",

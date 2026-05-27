@@ -707,7 +707,6 @@ impl UsageGateSpy {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "unblocked by FEAT-002: resolve_task_execution body"]
 fn resolve_task_execution_parity_seq_and_wave_agree() {
     let task_id = "PS-PARITY-1";
 
@@ -764,7 +763,6 @@ fn resolve_task_execution_parity_seq_and_wave_agree() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "unblocked by FEAT-002: resolve_task_execution body"]
 fn resolve_task_execution_surfaces_prior_effort_override() {
     let task_id = "PS-EFFORT-1";
     let (_dir, conn) = setup_migrated_db();
@@ -798,7 +796,6 @@ fn resolve_task_execution_surfaces_prior_effort_override() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "unblocked by FEAT-002: resolve_task_execution body"]
 fn resolve_task_execution_escalates_on_crash_not_otherwise() {
     let task_id = "PS-CRASH-1";
 
@@ -848,7 +845,6 @@ fn resolve_task_execution_escalates_on_crash_not_otherwise() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "unblocked by FEAT-002: resolve_task_execution body"]
 fn resolve_task_execution_invalidates_stale_overrides_on_operator_edit() {
     let task_id = "PS-INVAL-1";
     let (_dir, conn) = setup_migrated_db();

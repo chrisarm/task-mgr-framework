@@ -16,6 +16,13 @@
 //! A task NOT present in `overflow_original_task_model` is a no-op.
 //! A no-op edit (model unchanged from snapshot) is also a no-op.
 
+// FEAT-002 relocated `check_override_invalidation` to
+// `reactions::pre_spawn::invalidate_stale_overrides`; the `engine::` re-export
+// these tests use is now a `#[deprecated]` shim. They remain the equivalence
+// oracle for the relocated body, so allow the lint until CLEANUP-001 migrates
+// them to the new home.
+#![allow(deprecated)]
+
 use rusqlite::Connection;
 use tempfile::TempDir;
 

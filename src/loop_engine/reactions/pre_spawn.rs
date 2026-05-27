@@ -25,9 +25,13 @@
 //! Wired into both paths by FEAT-002/FEAT-008 (sequential: `iteration.rs`
 //! ~L367/L419; wave: per-slot, folded in `wave_scheduler.rs` ~L983).
 
+use std::collections::HashMap;
+
 use rusqlite::Connection;
 
-use crate::loop_engine::engine::IterationContext;
+use crate::loop_engine::engine::{IterationContext, resolve_effective_runner};
+use crate::loop_engine::model;
+use crate::loop_engine::recovery::normalize_baseline;
 use crate::loop_engine::runner::RunnerKind;
 
 /// The resolved per-task execution decision produced by
@@ -75,19 +79,128 @@ pub struct ResolveTaskExecutionParams<'a> {
 /// escalation, the effort override, and runner resolution into one
 /// [`TaskExecutionPlan`].
 ///
-/// **Scaffold under TEST-INIT-002** — body implemented by FEAT-002, which
-/// removes the `#[ignore]` attributes on the behavioral cases in
-/// `tests/reaction_parity.rs`. The exhaustive destructure of
-/// [`ResolveTaskExecutionParams`] (no `..`) is part of the FEAT-002 body.
-#[allow(dead_code)] // wired into both paths by FEAT-002/FEAT-008
+/// The four steps run in a load-bearing order:
+/// 1. [`invalidate_stale_overrides`] — operator escape valve, FIRST so the
+///    subsequent effort/runner reads see cleared channels (an out-of-band
+///    `tasks.model` edit must not let a stale override resurface this
+///    iteration).
+/// 2. [`crash_escalated_model`] — `Some(model)` when the previous iteration on
+///    this task crashed, else `None` (the caller keeps its resolved baseline).
+/// 3. `ctx.effort_overrides[task_id]` — read AFTER invalidation so a cleared
+///    override is gone.
+/// 4. [`resolve_effective_runner`] over the post-escalation effective model
+///    (the crash-escalated model, or the resolved baseline when no escalation).
+///
+/// Both execution paths route through this single coordinator (the sequential
+/// path folds its 1 call; the wave path folds one call per slot), so identical
+/// `(ctx, task, resolved_model, conn)` inputs MUST produce an identical plan.
+///
+/// Model-string layers that are NOT account-global recovery channels —
+/// `ctx.model_overrides` (prior-overflow model) and `apply_review_model_override`
+/// (review-class routing) — stay at the call sites: they rewrite the `--model`
+/// string and, for review routing, re-resolve the runner, AFTER this plan is
+/// produced. `model_overrides` is always paired with a `runner_overrides`
+/// entry, so [`TaskExecutionPlan::runner`] already reflects it.
 pub fn resolve_task_execution(params: ResolveTaskExecutionParams<'_>) -> TaskExecutionPlan {
-    let _ = params;
-    unimplemented!(
-        "FEAT-002: destructure ResolveTaskExecutionParams exhaustively; call \
-         check_override_invalidation(ctx, conn, task_id) FIRST; then build the \
-         plan from check_crash_escalation(&ctx.crashed_last_iteration, task_id, \
-         resolved_model) (model), ctx.effort_overrides.get(task_id).copied() \
-         (effort), and resolve_effective_runner over the post-escalation \
-         effective model (runner)"
-    )
+    let ResolveTaskExecutionParams {
+        ctx,
+        conn,
+        task_id,
+        resolved_model,
+    } = params;
+
+    // 1. Operator escape valve FIRST — clears stale auto-recovery channels when
+    //    an operator edited `tasks.model` out-of-band.
+    invalidate_stale_overrides(ctx, conn, task_id);
+
+    // 2. Crash escalation (None when the last iteration on this task did not
+    //    crash — the caller keeps its already-resolved model).
+    let model = crash_escalated_model(&ctx.crashed_last_iteration, task_id, resolved_model);
+
+    // 3. Prior-overflow effort override, read AFTER invalidation.
+    let effort = ctx.effort_overrides.get(task_id).copied();
+
+    // 4. Runner over the post-escalation effective model.
+    let effective_model = model.as_deref().or(resolved_model);
+    let runner = resolve_effective_runner(ctx, task_id, effective_model);
+
+    TaskExecutionPlan {
+        model,
+        effort,
+        runner,
+    }
+}
+
+/// Crash-recovery model escalation (relocated from `recovery::check_crash_escalation`
+/// — the home now carries a `#[deprecated]` shim that delegates here).
+///
+/// Returns `Some(escalated_model)` when the previous iteration on
+/// `current_task_id` crashed (`crashed_last_iteration[current_task_id] == true`).
+/// Returns `None` when the task is absent from the map or its last outcome was
+/// not a crash. A `None`/empty/whitespace `resolved_model` is treated as the
+/// sonnet baseline and escalates to opus. Escalation is independent of
+/// `CrashTracker` backoff.
+pub(crate) fn crash_escalated_model(
+    crashed_last_iteration: &HashMap<String, bool>,
+    current_task_id: &str,
+    resolved_model: Option<&str>,
+) -> Option<String> {
+    if !crashed_last_iteration
+        .get(current_task_id)
+        .copied()
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    match normalize_baseline(resolved_model) {
+        None => Some(model::OPUS_MODEL.to_string()),
+        Some(m) => model::escalate_model(Some(m)),
+    }
+}
+
+/// Operator escape valve (relocated from `recovery::check_override_invalidation`
+/// — the home now carries a `#[deprecated]` shim that delegates here).
+///
+/// Detects an out-of-band `tasks.model` edit and clears all six per-task
+/// auto-recovery channels for that task. Short-circuits when `task_id` has no
+/// `overflow_original_task_model` snapshot (the dominant case — most tasks never
+/// trigger the overflow ladder — pays no DB round-trip). DB read errors are
+/// logged and treated as no-op so a transient failure never blocks the
+/// iteration. A single stderr line announces the clear.
+pub(crate) fn invalidate_stale_overrides(
+    ctx: &mut IterationContext,
+    conn: &Connection,
+    task_id: &str,
+) {
+    if !ctx.overflow_original_task_model.contains_key(task_id) {
+        return;
+    }
+
+    let current_model: Option<String> = match conn.query_row(
+        "SELECT model FROM tasks WHERE id = ?1",
+        rusqlite::params![task_id],
+        |row| row.get(0),
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Warning: invalidate_stale_overrides({task_id}): DB read failed: {e}");
+            return;
+        }
+    };
+
+    let snapshotted = ctx.overflow_original_task_model.get(task_id);
+    if snapshotted.map(Option::as_deref) == Some(current_model.as_deref()) {
+        return;
+    }
+
+    ctx.runner_overrides.remove(task_id);
+    ctx.model_overrides.remove(task_id);
+    ctx.effort_overrides.remove(task_id);
+    ctx.overflow_recovered.remove(task_id);
+    ctx.overflow_original_model.remove(task_id);
+    ctx.overflow_original_task_model.remove(task_id);
+
+    eprintln!(
+        "Operator changed task model for {task_id} — clearing auto-recovery overrides; resolving fresh."
+    );
 }

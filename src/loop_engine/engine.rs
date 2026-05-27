@@ -47,10 +47,15 @@ pub use crate::loop_engine::iteration::run_iteration;
 // them directly from `recovery`, so no `pub(super)` re-export is needed here.
 #[allow(deprecated)]
 pub use crate::loop_engine::recovery::auto_block_task;
+// FEAT-002: `check_crash_escalation` / `check_override_invalidation` relocated
+// to `reactions::pre_spawn`; the home shims are now `#[deprecated]`. Keep the
+// FR-008 external import paths (`engine::check_*`) valid behind a scoped
+// `#[allow(deprecated)]` for the transition window (dropped by CLEANUP-001).
+#[allow(deprecated)]
+pub use crate::loop_engine::recovery::{check_crash_escalation, check_override_invalidation};
 pub use crate::loop_engine::recovery::{
-    check_crash_escalation, check_override_invalidation, escalate_task_model_if_needed,
-    handle_task_failure, increment_consecutive_failures, reset_consecutive_failures,
-    should_auto_block, should_escalate_for_consecutive_failures,
+    escalate_task_model_if_needed, handle_task_failure, increment_consecutive_failures,
+    reset_consecutive_failures, should_auto_block, should_escalate_for_consecutive_failures,
 };
 
 // Parallel-wave scheduling + merge-back orchestration was carved into
@@ -431,6 +436,15 @@ pub struct SlotContext {
     /// enrichment (e.g. test fixtures) — matches today's pure-Claude
     /// behavior byte-for-byte.
     pub effective_runner: RunnerKind,
+    /// Prior-overflow effort override for this slot's task (FEAT-002),
+    /// resolved on the main thread by `reactions::pre_spawn::resolve_task_execution`
+    /// from `IterationContext.effort_overrides` — slot threads must not touch
+    /// the override maps (Learning #1810). `run_slot_iteration` prefers this
+    /// over `model::effort_for_difficulty(difficulty)`. `None` (the sentinel
+    /// default and the no-override case) falls back to the difficulty-derived
+    /// effort, so a wave with no overflow history is byte-identical to before.
+    /// Closes the audit-#6-effort gap: wave previously dropped this channel.
+    pub effective_effort: Option<&'static str>,
 }
 
 /// Result of running one slot during a wave.

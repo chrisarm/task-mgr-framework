@@ -30,94 +30,52 @@ use crate::loop_engine::runner::RunnerKind;
 
 /// Check whether crash recovery should escalate the model for this iteration.
 ///
-/// Returns `Some(escalated_model)` when the previous iteration on
-/// `current_task_id` crashed (i.e. `crashed_last_iteration[current_task_id]
-/// == true`). Returns `None` when the task is absent from the map or its
-/// last outcome was not a crash.
-///
-/// When `resolved_model` is `None`, assumes `SONNET_MODEL` baseline
-/// and escalates to `OPUS_MODEL` (architect decision: None crash → opus).
-///
-/// Escalation is independent of `CrashTracker` backoff logic.
+/// **Relocated (FEAT-002)** to
+/// [`crate::loop_engine::reactions::pre_spawn::crash_escalated_model`], which
+/// both execution paths now reach through
+/// `reactions::pre_spawn::resolve_task_execution`. This `#[deprecated]` shim
+/// delegates verbatim so the FR-008 re-export (`engine::check_crash_escalation`)
+/// and the co-located unit tests keep working during the transition window
+/// (removed by CLEANUP-001).
+#[deprecated(
+    note = "relocated to reactions::pre_spawn::crash_escalated_model; reach it via reactions::pre_spawn::resolve_task_execution"
+)]
 pub fn check_crash_escalation(
     crashed_last_iteration: &std::collections::HashMap<String, bool>,
     current_task_id: &str,
     resolved_model: Option<&str>,
 ) -> Option<String> {
-    if !crashed_last_iteration
-        .get(current_task_id)
-        .copied()
-        .unwrap_or(false)
-    {
-        return None;
-    }
-    // None / empty / whitespace model: assume sonnet baseline, escalate to opus
-    match normalize_baseline(resolved_model) {
-        None => Some(model::OPUS_MODEL.to_string()),
-        Some(m) => model::escalate_model(Some(m)),
-    }
+    crate::loop_engine::reactions::pre_spawn::crash_escalated_model(
+        crashed_last_iteration,
+        current_task_id,
+        resolved_model,
+    )
 }
 
 /// Operator escape valve: detect when an operator edited `tasks.model` in the
 /// DB out-of-band and clear any stale auto-recovery overrides for that task.
 ///
-/// Called at the top of every iteration (both wave and sequential) BEFORE
-/// `resolve_effective_runner`. Short-circuits immediately when `task_id` has no
-/// entry in `ctx.overflow_original_task_model` — the dominant case (most tasks
-/// never trigger the overflow ladder) is free.
-///
-/// When the current DB value differs from the snapshot, all six per-task
-/// override entries are cleared (in the same order the code removes them):
-/// 1. `runner_overrides`
-/// 2. `model_overrides`
-/// 3. `effort_overrides`
-/// 4. `overflow_recovered`
-/// 5. `overflow_original_model`
-/// 6. `overflow_original_task_model`
-///
-/// A single stderr line is emitted so operators can see the escape valve fired.
-/// DB read errors are logged and treated as no-op so a transient failure never
-/// blocks the iteration.
+/// **Relocated (FEAT-002)** to
+/// [`crate::loop_engine::reactions::pre_spawn::invalidate_stale_overrides`],
+/// which runs FIRST inside `reactions::pre_spawn::resolve_task_execution` on
+/// both execution paths. This `#[deprecated]` shim delegates verbatim so the
+/// FR-008 re-export (`engine::check_override_invalidation`) and the co-located
+/// unit tests keep working during the transition window (removed by
+/// CLEANUP-001).
+#[deprecated(
+    note = "relocated to reactions::pre_spawn::invalidate_stale_overrides; reach it via reactions::pre_spawn::resolve_task_execution"
+)]
 pub fn check_override_invalidation(ctx: &mut IterationContext, conn: &Connection, task_id: &str) {
-    // No snapshot → no override was ever set for this task; skip DB round-trip.
-    if !ctx.overflow_original_task_model.contains_key(task_id) {
-        return;
-    }
-
-    let current_model: Option<String> = match conn.query_row(
-        "SELECT model FROM tasks WHERE id = ?1",
-        rusqlite::params![task_id],
-        |row| row.get(0),
-    ) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("Warning: check_override_invalidation({task_id}): DB read failed: {e}");
-            return;
-        }
-    };
-
-    let snapshotted = ctx.overflow_original_task_model.get(task_id);
-    if snapshotted.map(Option::as_deref) == Some(current_model.as_deref()) {
-        return;
-    }
-
-    // Operator changed tasks.model — clear all six per-task override channels.
-    ctx.runner_overrides.remove(task_id);
-    ctx.model_overrides.remove(task_id);
-    ctx.effort_overrides.remove(task_id);
-    ctx.overflow_recovered.remove(task_id);
-    ctx.overflow_original_model.remove(task_id);
-    ctx.overflow_original_task_model.remove(task_id);
-
-    eprintln!(
-        "Operator changed task model for {task_id} — clearing auto-recovery overrides; resolving fresh."
-    );
+    crate::loop_engine::reactions::pre_spawn::invalidate_stale_overrides(ctx, conn, task_id);
 }
 
 /// Treat `Some("")` and `Some("   ")` as "no model known" so both escalation
-/// paths (`check_crash_escalation` and `escalate_task_model_if_needed`) share
-/// the same baseline-fallback semantics.
-fn normalize_baseline(model: Option<&str>) -> Option<&str> {
+/// paths share the same baseline-fallback semantics:
+/// `reactions::pre_spawn::crash_escalated_model` (crash recovery) and
+/// `escalate_task_model_if_needed` (consecutive-failure recovery). `pub(crate)`
+/// so the relocated pre-spawn coordinator can reuse it as the single
+/// normalize-then-escalate primitive.
+pub(crate) fn normalize_baseline(model: Option<&str>) -> Option<&str> {
     model.filter(|s| !s.trim().is_empty())
 }
 
@@ -677,6 +635,13 @@ pub(super) fn update_trackers(ctx: &mut IterationContext, outcome: &IterationOut
 
 #[cfg(test)]
 mod tests {
+    // These co-located unit tests drive the `#[deprecated]` shims
+    // (`check_crash_escalation`, `check_override_invalidation`, `auto_block_task`)
+    // directly — they are the equivalence oracle that the relocated
+    // `reactions::pre_spawn` bodies must keep green. Allow the lint here rather
+    // than peppering each call (removed with the shims by CLEANUP-001).
+    #![allow(deprecated)]
+
     use super::*;
     use crate::loop_engine::model::{HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL};
     use crate::loop_engine::test_utils::setup_test_db;

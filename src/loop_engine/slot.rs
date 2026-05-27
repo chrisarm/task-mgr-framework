@@ -137,7 +137,14 @@ pub fn run_slot_iteration(
         .clone()
         .or_else(|| params.default_model.clone());
 
-    let effort = model::effort_for_difficulty(bundle.difficulty.as_deref());
+    // FEAT-002: prefer the prior-overflow effort override resolved on the main
+    // thread (`reactions::pre_spawn::resolve_task_execution` → SlotContext),
+    // falling back to the difficulty-derived effort when there is none. Mirrors
+    // the sequential path's `plan.effort.or(base_effort)`. `None` here is the
+    // common (no-overflow) case and keeps behavior byte-identical to before.
+    let effort = slot
+        .effective_effort
+        .or_else(|| model::effort_for_difficulty(bundle.difficulty.as_deref()));
 
     if params.verbose {
         eprintln!(
@@ -682,6 +689,7 @@ mod tests {
             working_root,
             prompt_bundle,
             effective_runner: RunnerKind::Claude,
+            effective_effort: None,
         }
     }
 
