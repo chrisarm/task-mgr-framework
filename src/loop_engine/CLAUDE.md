@@ -163,9 +163,34 @@ dead-ends on `blocked` exactly as a Claude task without `fallbackRunner` does.
 
 When the Claude CLI subprocess returns "Prompt is too long", the loop engine
 walks a **five-rung recovery ladder** and writes a diagnostics bundle. Entry
-point: `overflow::handle_prompt_too_long` in `src/loop_engine/overflow.rs`,
-called from the `PromptTooLong` arm of `run_iteration` in
-`src/loop_engine/engine.rs`.
+point: `reactions::post_output::handle_overflow` in
+`src/loop_engine/reactions/post_output.rs` (FEAT-005 relocated the body here;
+`overflow::handle_prompt_too_long` is now a `#[deprecated]` shim that forwards
+to it, kept so the `tests/overflow_*.rs` equivalence-oracle suites can drive
+the leaf directly under `#[allow(deprecated)]`). The diagnostics primitives
+(`sanitize_id_for_filename`, `dump_prompt`, `append_event_log`,
+`rotate_dumps_keep_n`) and the wire types (`RecoveryAction`, `OverflowEvent`,
+`DumpHeader`) stay in `src/loop_engine/overflow.rs`.
+
+**Both execution paths route through `handle_overflow`** on the `PromptTooLong`
+crash outcome — sequential via Step 8.5 of `iteration.rs::run_iteration`
+(`slot_index: None`), wave via `slot.rs::process_slot_result`
+(`slot_index: Some(n)`). The three engine files
+(`iteration.rs`/`slot.rs`/`wave_scheduler.rs`) carry `#![deny(deprecated)]`, so
+a direct call to the old `handle_prompt_too_long` leaf is a compile error
+(CONTRACT-001 single-home reaction lock).
+
+**Ordering relative to `process_iteration_output`** (contractual, both paths):
+`handle_overflow` fires BEFORE the shared post-Claude pipeline
+(`iteration_pipeline::process_iteration_output`) runs for that iteration/slot.
+In the wave path this is explicit — `process_slot_result` calls
+`handle_overflow` and then `process_iteration_output` a few lines later; in the
+sequential path `run_iteration`'s Step 8.5 runs before the pipeline is invoked
+from the `run_loop` call site after `run_iteration` returns. The reason: the
+overflow ladder must durably reset the task row (`todo` on rungs 1-4, `blocked`
+on rung 5) and apply the ctx overrides BEFORE the pipeline's crash-tracking
+write observes the outcome — otherwise the pipeline could account an
+overflowed-but-to-be-retried task as a terminal failure.
 
 **The ladder** (in order; first rung whose precondition is met wins):
 
@@ -733,7 +758,7 @@ For the full site→verb audit table and source-allowance matrix see
 | Cross-wave overlay | `src/loop_engine/worktree.rs` + `src/commands/next/selection.rs` | `list_unmerged_branch_files`, `ephemeral_overlay` parameter |
 | Startup hygiene + slot-0 guard | `src/loop_engine/worktree.rs` | `reconcile_stale_ephemeral_slots`, `classify_ephemeral_branch` |
 | Run-level config caching | `src/loop_engine/engine.rs` | `WaveIterationParams::project_config`, `prd_implicit_overlap_files` |
-| Overflow recovery ladder | `src/loop_engine/overflow.rs` | `handle_prompt_too_long`, `sanitize_id_for_filename`, `rotate_dumps_keep_n`, `RecoveryAction::FallbackToProvider` |
+| Overflow recovery ladder | `src/loop_engine/reactions/post_output.rs` + `src/loop_engine/overflow.rs` | `handle_overflow` (coordinator, owns the ladder), `handle_prompt_too_long` (`#[deprecated]` shim), `sanitize_id_for_filename`, `rotate_dumps_keep_n`, `RecoveryAction::FallbackToProvider` |
 | LLM runner dispatch | `src/loop_engine/runner.rs` + `src/loop_engine/engine.rs` | `RunnerKind`, `dispatch`, `ClaudeRunner`, `GrokRunner`, `resolve_effective_runner` |
 | Capability surface | `src/loop_engine/runner.rs` | `RunnerCapability`, `LlmRunner::supports`, `enforce_capabilities`, `CHECKS` |
 | Provider routing | `src/loop_engine/model.rs` | `Provider`, `provider_for_model` |

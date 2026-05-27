@@ -450,7 +450,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": true,
       "notes": "Largest semantic merge: sequential is inline (iteration.rs:363-416) while wave does review-only routing + handle_task_failure escalation. Preserve overflow_original_task_model snapshot + operator escape valve. Relocate behind unchanged signatures first.",
-      "passes": false,
+      "passes": true,
       "priority": 7,
       "qualityDimensions": [
         "Plan is a pure function of inputs (same inputs → same plan)",
