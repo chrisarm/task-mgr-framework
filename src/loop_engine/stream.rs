@@ -188,9 +188,30 @@ fn drain_complete_lines(buf: &mut String) -> Vec<String> {
     lines
 }
 
+/// Tee one (possibly multi-line) text block, dropping lines that are empty or
+/// whitespace-only. Streamed reasoning/reply text is dense with blank lines
+/// (Grok in particular emits a blank line between almost every sentence); each
+/// would otherwise render as a prefix-only console row (`[slot 0]`) that adds
+/// noise without information. Display-only: the accumulator and transcript
+/// (built from the same events in `accumulate`) are untouched, so suppression
+/// here cannot affect output derivation or the completion ladder.
+fn emit_tee_block(slot_label: Option<&str>, text: &str) {
+    for line in tee_visible_lines(text) {
+        emit_prefixed_lines(slot_label, line);
+    }
+}
+
+/// The lines of `text` that survive blank-line suppression, in order. Pure
+/// (the I/O lives in `emit_tee_block`) so the suppression policy is unit-tested
+/// without touching real stderr.
+fn tee_visible_lines(text: &str) -> impl Iterator<Item = &str> {
+    text.lines().filter(|line| !line.trim().is_empty())
+}
+
 /// Tee one text chunk. When `buffered`, accumulate into `buf` and emit only
 /// complete lines (flushing the partial first on a channel switch); otherwise
-/// emit the chunk immediately (block-provider behavior, unchanged).
+/// emit the chunk immediately (block-provider behavior). Both paths route
+/// through `emit_tee_block`, which drops blank/whitespace-only lines.
 fn tee_push(
     buf: &mut String,
     channel: &mut Option<TeeChannel>,
@@ -200,18 +221,18 @@ fn tee_push(
     text: &str,
 ) {
     if !buffered {
-        emit_prefixed_lines(slot_label, text);
+        emit_tee_block(slot_label, text);
         return;
     }
     if *channel != Some(ch) {
         if !buf.is_empty() {
-            emit_prefixed_lines(slot_label, &std::mem::take(buf));
+            emit_tee_block(slot_label, &std::mem::take(buf));
         }
         *channel = Some(ch);
     }
     buf.push_str(text);
     for line in drain_complete_lines(buf) {
-        emit_prefixed_lines(slot_label, &line);
+        emit_tee_block(slot_label, &line);
     }
 }
 
@@ -284,7 +305,7 @@ pub(crate) fn drive_stream<F: StreamFormat>(
 
     // Flush any trailing partial line the provider never newline-terminated.
     if !tee_buf.is_empty() {
-        emit_prefixed_lines(slot_label, &tee_buf);
+        emit_tee_block(slot_label, &tee_buf);
     }
 
     let output = format.derive_output(&acc);
@@ -453,6 +474,27 @@ mod tests {
         let mut buf = "a\nb\nc".to_string();
         assert_eq!(drain_complete_lines(&mut buf), vec!["a".to_string(), "b".to_string()]);
         assert_eq!(buf, "c");
+    }
+
+    #[test]
+    fn tee_visible_lines_drops_blank_and_whitespace_only() {
+        // The dense blank-line reasoning text the live tee was rendering as
+        // prefix-only rows: every other line is empty or whitespace-only.
+        let block = "First, check the branch.\n\nUse run_terminal.\n   \nThen run the gate.";
+        let kept: Vec<&str> = tee_visible_lines(block).collect();
+        assert_eq!(
+            kept,
+            vec!["First, check the branch.", "Use run_terminal.", "Then run the gate."],
+            "blank and whitespace-only lines are suppressed; content lines kept in order"
+        );
+    }
+
+    #[test]
+    fn tee_visible_lines_empty_block_emits_nothing() {
+        // An empty text event (Grok partial flush, Claude empty content block)
+        // produces no prefix-only line at all.
+        assert_eq!(tee_visible_lines("").count(), 0);
+        assert_eq!(tee_visible_lines("\n\n").count(), 0);
     }
 
     #[test]
