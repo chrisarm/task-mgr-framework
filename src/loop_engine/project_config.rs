@@ -1115,32 +1115,32 @@ mod tests {
 
     #[test]
     fn test_primary_runner_present_populated() {
+        use crate::loop_engine::model::SONNET_MODEL;
         // Fully populated primaryRunner round-trips correctly.
         let dir = tempfile::tempdir().unwrap();
         fs::write(
             dir.path().join("config.json"),
-            r#"{
-                "primaryRunner": {
-                    "claudeFallbackModel": "claude-sonnet-4-6",
+            format!(
+                r#"{{
+                "primaryRunner": {{
+                    "claudeFallbackModel": "{SONNET_MODEL}",
                     "runtimeErrorThreshold": 3,
-                    "byTaskType": {
-                        "review":    { "provider": "grok", "model": "grok-4" },
-                        "milestone": { "provider": "grok", "model": "grok-4" }
-                    },
-                    "byIdPrefix": {
-                        "REVIEW-":    { "provider": "grok", "model": "grok-4" },
-                        "MILESTONE-": { "provider": "grok", "model": "grok-4" }
-                    }
-                }
-            }"#,
+                    "byTaskType": {{
+                        "review":    {{ "provider": "grok", "model": "grok-4" }},
+                        "milestone": {{ "provider": "grok", "model": "grok-4" }}
+                    }},
+                    "byIdPrefix": {{
+                        "REVIEW-":    {{ "provider": "grok", "model": "grok-4" }},
+                        "MILESTONE-": {{ "provider": "grok", "model": "grok-4" }}
+                    }}
+                }}
+            }}"#
+            ),
         )
         .unwrap();
         let config = read_project_config(dir.path());
         let pr = config.primary_runner.expect("should be Some");
-        assert_eq!(
-            pr.claude_fallback_model.as_deref(),
-            Some("claude-sonnet-4-6")
-        );
+        assert_eq!(pr.claude_fallback_model.as_deref(), Some(SONNET_MODEL));
         assert_eq!(pr.runtime_error_threshold, 3);
 
         let review_spec = pr.by_task_type.get("review").expect("review key missing");

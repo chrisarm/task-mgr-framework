@@ -85,7 +85,7 @@ as the FIRST choice.
 ```json
 {
   "primaryRunner": {
-    "claudeFallbackModel": "claude-sonnet-4-6",
+    "claudeFallbackModel": "<a Claude model id — e.g. the SONNET_MODEL constant in src/loop_engine/model.rs>",
     "runtimeErrorThreshold": 2,
     "byTaskType": {
       "review":    { "provider": "grok", "model": "grok-4-fast" },

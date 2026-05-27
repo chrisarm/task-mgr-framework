@@ -18,8 +18,6 @@
 //!   4. After inverse PromptTooLong fallback, `resolve_effective_runner` returns
 //!      `RunnerKind::Claude` confirming the next iteration will use Claude
 
-use std::path::Path;
-
 use rusqlite::Connection;
 use tempfile::TempDir;
 
