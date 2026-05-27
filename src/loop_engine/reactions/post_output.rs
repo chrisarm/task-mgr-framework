@@ -1,16 +1,14 @@
-//! Post-output reactions: rate-limit wait + overflow recovery (CONTRACT-001).
+//! Post-output overflow recovery (CONTRACT-001).
 //!
-//! Two post-Claude reactions live here because both key off the runner's
-//! captured output:
-//!
-//! - [`react_to_outputs`] — the post-output rate-limit reaction: parse a reset
-//!   timestamp from the output and wait once if the account hit its limit
-//!   mid-run (`usage::{parse_reset_from_output, wait_for_usage_reset}`).
-//!   **Typed scaffold** under CONTRACT-001; wired by FEAT-006/FEAT-010.
 //! - [`handle_overflow`] — the "Prompt is too long" five-rung recovery ladder
 //!   (`overflow::handle_prompt_too_long`). **Fully wired** by CONTRACT-001:
 //!   both `iteration.rs` and `slot.rs` route through it, proving the
 //!   `#[deprecated]` + `#![deny(deprecated)]` lock end-to-end.
+//!
+//! The post-output **rate-limit** reaction (`react_to_outputs`) was relocated
+//! to [`super::account`] by FEAT-006 — it is account-global (it reflects the
+//! shared API account state, not per-task state), so it lives alongside
+//! `account_usage_gate` rather than here.
 
 use std::path::Path;
 
@@ -21,33 +19,6 @@ use crate::loop_engine::overflow::{self, RecoveryAction};
 use crate::loop_engine::project_config::ProjectConfig;
 use crate::loop_engine::prompt::PromptResult;
 use crate::loop_engine::runner::RunnerKind;
-
-/// Inputs to [`react_to_outputs`]. Destructured exhaustively (no `..`).
-///
-/// **Invariant for the wiring FEAT**: a rate-limit wait/early-return here must
-/// NOT zero `ctx.consecutive_merge_fail_waves` — that field is the wave
-/// cascade-halt defense and is orthogonal to usage limits.
-#[allow(dead_code)] // constructed by FEAT-006/FEAT-010 wiring; scaffold under CONTRACT-001
-pub(crate) struct ReactToOutputsParams<'a> {
-    pub ctx: &'a mut IterationContext,
-    pub output: &'a str,
-    pub threshold: u8,
-    pub tasks_dir: &'a Path,
-    pub fallback_wait: u64,
-}
-
-/// Post-output rate-limit reaction. Fires the usage wait once per wave when the
-/// captured output reports a rate/session limit.
-#[allow(dead_code)] // wired into both paths by FEAT-006/FEAT-010
-pub(crate) fn react_to_outputs(params: ReactToOutputsParams<'_>) {
-    let ReactToOutputsParams {
-        ctx: _ctx,
-        output: _output,
-        threshold: _threshold,
-        tasks_dir: _tasks_dir,
-        fallback_wait: _fallback_wait,
-    } = params;
-}
 
 /// Inputs to [`handle_overflow`]. Destructured exhaustively (no `..`). Mirrors
 /// the twelve arguments of `overflow::handle_prompt_too_long`; `slot_index` is

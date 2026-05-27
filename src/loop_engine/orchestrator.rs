@@ -1015,14 +1015,31 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                 session_guidance: &wave_session_guidance,
                 prd_implicit_overlap_files: &prd_implicit_overlap_files,
                 project_config: &project_config,
+                usage_params: &usage_params,
             };
             let outcome = run_wave_iteration(wave_params, &mut ctx);
             tasks_completed += outcome.tasks_completed;
             if outcome.iteration_consumed {
                 iterations_completed += 1;
+            } else {
+                // FEAT-006 B2: a non-consuming wave (the rate-limit retry) gives
+                // back the loop-bound iteration so a persistently rate-limited
+                // account doesn't burn its budget on waits. FEAT-013 will fold
+                // this give-back into a shared accounting helper alongside the
+                // sequential `iteration -= 1` (orchestrator.rs RateLimit arm).
+                iteration = iteration.saturating_sub(1);
             }
             if outcome.was_stopped {
                 was_stopped = true;
+            }
+
+            // FEAT-006 B3: a rate-limit retry wave returned BEFORE merge-back
+            // carrying no merge outcomes. Skip the FEAT-002 reset/halt check —
+            // running it with this wave's empty `failed_merges` would zero the
+            // cascade-halt streak (`consecutive_merge_fail_waves`). The wave
+            // also has no terminal, so `continue` straight to the next iteration.
+            if outcome.rate_limited_retry {
+                continue;
             }
 
             // FEAT-002: reset/halt contract on parallel-slot merge-back
