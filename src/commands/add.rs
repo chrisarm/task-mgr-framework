@@ -24,6 +24,7 @@ use crate::commands::init::import::{
 };
 use crate::commands::init::parse::PrdUserStory;
 use crate::commands::next;
+use crate::loop_engine::output_parsing::strip_task_prefix;
 use crate::{TaskMgrError, TaskMgrResult};
 
 /// Deserialized input for `task-mgr add`.
@@ -341,7 +342,12 @@ pub fn add_with_conn(
     // the DB — the task is already in the database, and `task-mgr export`
     // can reconcile the JSON later.
     let prd_path = match locate_prd_json(conn, task_prefix.as_deref()) {
-        Ok(Some(path)) => match append_task_to_prd_json(&path, &story, effective_depended_on_by) {
+        Ok(Some(path)) => match append_task_to_prd_json(
+            &path,
+            &story,
+            effective_depended_on_by,
+            task_prefix.as_deref(),
+        ) {
             Ok(()) => Some(path),
             Err(e) => {
                 eprintln!(
@@ -740,11 +746,32 @@ fn locate_prd_json(conn: &Connection, task_prefix: Option<&str>) -> TaskMgrResul
 /// one of those ids gets the new task's id pushed into its `dependsOn` array
 /// (creating the array if missing). Targets that aren't found in the JSON are
 /// skipped with a warning — the DB is authoritative.
+/// Strip the active prefix from every string element of the `key` array on a
+/// serialized userStory object, rewriting the DB-prefixed relationship ids into
+/// the unprefixed JSON convention. No-op when the key is absent or not an array.
+fn strip_prefix_in_id_array(obj: &mut serde_json::Map<String, Value>, key: &str, prefix: Option<&str>) {
+    let Some(arr) = obj.get_mut(key).and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+    for elem in arr.iter_mut() {
+        if let Some(id) = elem.as_str() {
+            *elem = Value::String(strip_task_prefix(id, prefix).to_string());
+        }
+    }
+}
+
 fn append_task_to_prd_json(
     prd_path: &Path,
     story: &PrdUserStory,
     depended_on_by: &[String],
+    prefix: Option<&str>,
 ) -> TaskMgrResult<()> {
+    // The DB stores prefixed ids (`e474b6f2-CODE-REVIEW-2`) but PRD task-list
+    // JSON stores them unprefixed (`CODE-REVIEW-2`); the importer re-applies the
+    // prefix idempotently. Mirror `prd_reconcile::update_prd_task_passes` and
+    // write/match ids in the JSON's unprefixed convention so the new entry stays
+    // consistent with its siblings and the reverse-link sync actually lands.
+    let base_story_id = strip_task_prefix(&story.id, prefix);
     let original = fs::read_to_string(prd_path).map_err(|e| {
         TaskMgrError::invalid_state(
             "add",
@@ -774,7 +801,7 @@ fn append_task_to_prd_json(
         let dup = user_stories.iter().any(|t| {
             t.get("id")
                 .and_then(|v| v.as_str())
-                .is_some_and(|id| id == story.id)
+                .is_some_and(|id| id == story.id || id == base_story_id)
         });
         if dup {
             return Err(TaskMgrError::invalid_state(
@@ -786,7 +813,16 @@ fn append_task_to_prd_json(
         }
     }
 
-    let task_value = serde_json::to_value(story)?;
+    // Serialize the new entry, then rewrite its id-bearing fields into the
+    // unprefixed JSON convention (the struct carries the prefixed DB forms).
+    let mut task_value = serde_json::to_value(story)?;
+    if let Some(obj) = task_value.as_object_mut() {
+        obj.insert("id".to_string(), Value::String(base_story_id.to_string()));
+        for key in ["dependsOn", "synergyWith", "batchWith", "conflictsWith"] {
+            strip_prefix_in_id_array(obj, key, prefix);
+        }
+    }
+
     let arr = root_obj
         .entry("userStories")
         .or_insert_with(|| Value::Array(Vec::new()));
@@ -803,6 +839,10 @@ fn append_task_to_prd_json(
     // entry and push story.id into its dependsOn array (creating if missing).
     // Missing targets log a warning but don't fail — DB is the source of truth.
     for existing_id in depended_on_by {
+        // The JSON may carry either convention (originally-authored entries are
+        // unprefixed; entries spawned by an older `add` may be prefixed), so
+        // match on both the prefixed target and its unprefixed base.
+        let base_target = strip_task_prefix(existing_id, prefix);
         let mut matched = false;
         for entry in arr.iter_mut() {
             let Some(obj) = entry.as_object_mut() else {
@@ -811,7 +851,7 @@ fn append_task_to_prd_json(
             let is_match = obj
                 .get("id")
                 .and_then(|v| v.as_str())
-                .is_some_and(|id| id == existing_id);
+                .is_some_and(|id| id == existing_id || id == base_target);
             if !is_match {
                 continue;
             }
@@ -827,11 +867,13 @@ fn append_task_to_prd_json(
                     format!("{} dependsOn present but not an array", existing_id),
                 )
             })?;
+            // Push the unprefixed new id; dedup against both forms in case the
+            // array already mixes conventions.
             let already = deps_arr
                 .iter()
-                .any(|v| v.as_str().is_some_and(|s| s == story.id));
+                .any(|v| v.as_str().is_some_and(|s| s == story.id || s == base_story_id));
             if !already {
-                deps_arr.push(Value::String(story.id.clone()));
+                deps_arr.push(Value::String(base_story_id.to_string()));
             }
             break;
         }
@@ -1211,7 +1253,7 @@ mod tests {
             claims_shared_infra: None,
         };
 
-        append_task_to_prd_json(tmp.path(), &story, &[]).unwrap();
+        append_task_to_prd_json(tmp.path(), &story, &[], None).unwrap();
 
         let after = fs::read_to_string(tmp.path()).unwrap();
         let v: Value = serde_json::from_str(&after).unwrap();
@@ -1260,7 +1302,7 @@ mod tests {
             human_review_timeout: None,
             claims_shared_infra: None,
         };
-        let err = append_task_to_prd_json(tmp.path(), &story, &[]).unwrap_err();
+        let err = append_task_to_prd_json(tmp.path(), &story, &[], None).unwrap_err();
         assert!(format!("{err}").contains("DUP-001"));
     }
 

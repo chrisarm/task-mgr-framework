@@ -387,3 +387,172 @@ fn test_depended_on_by_missing_target_in_prd_json_logs_but_dbstill_updated() {
         "SEED-002 entry should still be absent from the JSON we edited"
     );
 }
+
+/// Run `init` with an explicit prefix so the DB stores prefixed ids while the
+/// on-disk JSON keeps its unprefixed convention (Explicit mode does not rewrite
+/// userStory ids). Mirrors `setup_with_prd` otherwise.
+fn setup_with_prefixed_prd(prd_json: &str, prefix: &str) -> (TempDir, std::path::PathBuf) {
+    let dir = TempDir::new().unwrap();
+    let prd_path = dir.path().join("test_prd.json");
+    fs::write(&prd_path, prd_json).unwrap();
+    init(
+        dir.path(),
+        &[&prd_path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Explicit(prefix.to_string()),
+    )
+    .unwrap();
+    (dir, prd_path)
+}
+
+#[test]
+fn test_depended_on_by_prefixed_db_unprefixed_json_sync() {
+    // Regression for the eks-inventory bug (learning #1087): DB stores prefixed
+    // ids, the PRD JSON stores them unprefixed. `add --depended-on-by
+    // e474b6f2-MILESTONE-1` must (a) write the new entry with an UNPREFIXED id
+    // and (b) actually sync MILESTONE-1's dependsOn — previously the prefixed
+    // target failed to match the unprefixed JSON entry and was silently skipped.
+    let _env = EnvIsolation::new();
+    let prd = serde_json::json!({
+        "project": "eks-test",
+        "userStories": [
+            {"id": "MILESTONE-1", "title": "milestone", "priority": 10, "passes": false},
+            {"id": "FEAT-1", "title": "feature one", "priority": 20, "passes": false}
+        ]
+    })
+    .to_string();
+    let (dir, prd_path) = setup_with_prefixed_prd(&prd, "e474b6f2");
+
+    // New task carries its own (bare) dependsOn to verify relationship-array
+    // stripping on the appended entry too.
+    let new_task = serde_json::json!({
+        "id": "CODE-REVIEW-2",
+        "title": "review",
+        "dependsOn": ["FEAT-1"]
+    })
+    .to_string();
+
+    let result = add(
+        dir.path(),
+        &new_task,
+        None,
+        &["e474b6f2-MILESTONE-1".to_string()],
+    )
+    .unwrap();
+    assert_eq!(
+        result.task_id, "e474b6f2-CODE-REVIEW-2",
+        "DB task id must carry the active prefix"
+    );
+
+    // --- DB: prefixed task + reverse edge + own dependsOn edge ---
+    let conn = rusqlite::Connection::open(dir.path().join("tasks.db")).unwrap();
+    let task_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tasks WHERE id = 'e474b6f2-CODE-REVIEW-2'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(task_count, 1, "new task stored with prefixed id");
+
+    let reverse: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM task_relationships \
+             WHERE task_id = 'e474b6f2-MILESTONE-1' \
+               AND related_id = 'e474b6f2-CODE-REVIEW-2' AND rel_type = 'dependsOn'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(reverse, 1, "reverse dependsOn edge recorded with prefixed ids");
+
+    let own_dep: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM task_relationships \
+             WHERE task_id = 'e474b6f2-CODE-REVIEW-2' \
+               AND related_id = 'e474b6f2-FEAT-1' AND rel_type = 'dependsOn'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(own_dep, 1, "new task's own dependsOn stored with prefixed ids");
+
+    // --- PRD JSON: ids stay in the unprefixed convention ---
+    let updated: Value = serde_json::from_str(&fs::read_to_string(&prd_path).unwrap()).unwrap();
+    let stories = updated["userStories"].as_array().unwrap();
+
+    let child = stories
+        .iter()
+        .find(|s| s["id"].as_str() == Some("CODE-REVIEW-2"))
+        .expect("new entry must be written with the UNPREFIXED id");
+    let child_deps = child["dependsOn"].as_array().expect("child dependsOn array");
+    assert!(
+        child_deps.iter().any(|v| v.as_str() == Some("FEAT-1")),
+        "new entry's own dependsOn must be unprefixed (FEAT-1), got: {child_deps:?}"
+    );
+    assert!(
+        !child_deps.iter().any(|v| v.as_str() == Some("e474b6f2-FEAT-1")),
+        "new entry's dependsOn must NOT carry the prefix"
+    );
+
+    let milestone = stories
+        .iter()
+        .find(|s| s["id"].as_str() == Some("MILESTONE-1"))
+        .expect("MILESTONE-1 entry preserved");
+    let deps = milestone["dependsOn"]
+        .as_array()
+        .expect("MILESTONE-1 dependsOn synced");
+    assert!(
+        deps.iter().any(|v| v.as_str() == Some("CODE-REVIEW-2")),
+        "MILESTONE-1.dependsOn must gain the unprefixed new id, got: {deps:?}"
+    );
+}
+
+#[test]
+fn test_depended_on_by_mixed_form_json_still_matches() {
+    // Defence for files already polluted by the old bug: an entry stored with a
+    // PREFIXED id must still be matched (prefix_id is idempotent on import, so
+    // the DB id is identical), and the new entry/sync still use the base id.
+    let _env = EnvIsolation::new();
+    let prd = serde_json::json!({
+        "project": "eks-test",
+        "userStories": [
+            {"id": "e474b6f2-MILESTONE-1", "title": "milestone", "priority": 10, "passes": false}
+        ]
+    })
+    .to_string();
+    let (dir, prd_path) = setup_with_prefixed_prd(&prd, "e474b6f2");
+
+    let new_task = serde_json::json!({"id": "CODE-REVIEW-3", "title": "review"}).to_string();
+    add(
+        dir.path(),
+        &new_task,
+        None,
+        &["e474b6f2-MILESTONE-1".to_string()],
+    )
+    .unwrap();
+
+    let updated: Value = serde_json::from_str(&fs::read_to_string(&prd_path).unwrap()).unwrap();
+    let stories = updated["userStories"].as_array().unwrap();
+
+    let milestone = stories
+        .iter()
+        .find(|s| s["id"].as_str() == Some("e474b6f2-MILESTONE-1"))
+        .expect("prefixed milestone entry preserved");
+    let deps = milestone["dependsOn"]
+        .as_array()
+        .expect("dependsOn synced on the prefixed entry");
+    assert!(
+        deps.iter().any(|v| v.as_str() == Some("CODE-REVIEW-3")),
+        "prefixed entry's dependsOn must gain the unprefixed new id, got: {deps:?}"
+    );
+    assert!(
+        stories
+            .iter()
+            .any(|s| s["id"].as_str() == Some("CODE-REVIEW-3")),
+        "new entry appended with the unprefixed id"
+    );
+}
