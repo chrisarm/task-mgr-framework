@@ -53,7 +53,11 @@ fn setup_initialized_tempdir() -> TempDir {
         }
 
         last_stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        if last_stderr.contains("database is locked") || last_stderr.contains("Database error") {
+        // Retry ONLY the transient WAL-contention flake. A broader match (e.g.
+        // any "Database error") would silently retry genuine non-transient
+        // failures — constraint violations, corrupt schema, migration errors —
+        // 5× and then mis-report them as a "persistent lock", hiding the real cause.
+        if last_stderr.contains("database is locked") {
             thread::sleep(Duration::from_millis(100 * (attempt as u64 + 1)));
             continue;
         }

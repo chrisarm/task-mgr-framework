@@ -4,9 +4,10 @@
 //!
 //! - [`test_lifecycle_latency_5task_three_runs`] — measures trimmed median
 //!   per-iteration lifecycle cost (try_claim + apply Done) over a 5-task
-//!   FEAT-only fixture using 7 samples and asserts IQR ≤ 40% of median
-//!   (bimodal guard, tolerant for first-capture jitter) and worst-case
-//!   outlier < 5× median (regression guard).
+//!   FEAT-only fixture using 7 samples and asserts the worst-case outlier is
+//!   < 5× the trimmed median (contention-robust regression guard). It does NOT
+//!   gate on within-run spread (IQR): at sub-ms scale that span is scheduler
+//!   noise that flakes under full-suite parallelism, not a property of the code.
 //!   Documents the trimmed median as the first numerical baseline.
 //!   (TEST-INIT-005 skipped capturing iteration latency because it required a
 //!   compiled binary + fixture; this test fills that gap.)
@@ -175,30 +176,19 @@ fn test_lifecycle_latency_5task_three_runs() {
         samples, trimmed_median, trimmed_min, trimmed_max
     );
 
-    // IQR consistency gate: the inner-5 window span must be ≤ 40% of the
-    // trimmed median. 40% (raised from 30% for first-capture tolerance) accommodates
-    // observed scheduler jitter and possible cache effects on some hosts/CI while
-    // still detecting gross bimodality from fixture bugs. The 5× worst-case guard
-    // below is the primary regression signal.
+    // No within-run IQR/bimodality gate: the inner-5 window span is a wall-clock
+    // *spread*, not a property of the code. At sub-millisecond granularity it is
+    // dominated by scheduler jitter, and when this test runs alongside the full
+    // suite (~3800 tests at full parallelism) CPU contention routinely inflates a
+    // couple of samples past any fixed percentage bound — an earlier 30% gate was
+    // bumped to 40% and still flaked at 49.6%. Tightening the threshold only moves
+    // the flake; the spread is environment noise, so we don't assert on it.
     //
-    // The ±10% PRD §2.5 requirement is relative to a known prior-baseline,
-    // not a within-run spread. Since TEST-INIT-005 did not record a numerical
-    // baseline (it required a compiled binary + fixture), THIS run establishes
-    // the baseline.
-    let iqr_pct = (trimmed_max.as_nanos() as f64 - trimmed_min.as_nanos() as f64)
-        / trimmed_median.as_nanos() as f64;
-
-    assert!(
-        iqr_pct <= 0.40,
-        "IQR of trimmed samples ({:.1}%) exceeds 40% of trimmed median {:?} \
-         (inner window {:?}..{:?}). \
-         The 7 samples are bimodal — possible fixture re-seed issue or a new \
-         SELECT-before-UPDATE round-trip causing cache miss pattern.",
-        iqr_pct * 100.0,
-        trimmed_median,
-        trimmed_min,
-        trimmed_max
-    );
+    // The ±10% PRD §2.5 requirement is relative to a known prior-baseline, not a
+    // within-run spread. TEST-INIT-005 recorded no numerical baseline, so THIS run
+    // establishes one (printed above). The 5× worst-case guard below is the
+    // contention-robust regression signal: it scales with the run's own median, so
+    // it survives slow hosts while still catching a structural blowup.
 
     // Catastrophic regression guard: even the worst outlier must be < 5× median.
     let worst = *samples.last().unwrap();
