@@ -17,6 +17,8 @@ use assert_cmd::cargo::cargo_bin;
 use predicates::prelude::*;
 use serde_json::Value;
 use std::fs;
+use std::thread;
+use std::time::Duration;
 use tempfile::TempDir;
 
 /// Get the path to the sample PRD fixture file.
@@ -28,22 +30,44 @@ fn sample_prd_path() -> std::path::PathBuf {
 }
 
 /// Create a tempdir and initialize it with the sample PRD.
+///
+/// Retries briefly on "database is locked" (pre-existing flake under high
+/// parallelism + WAL + many concurrent temp DB inits in cli_tests). Keeps the
+/// full `cargo test` suite stable without forcing --test-threads=1.
 fn setup_initialized_tempdir() -> TempDir {
     let temp_dir = TempDir::new().unwrap();
     let prd_path = sample_prd_path();
+    let dir_str = temp_dir.path().to_str().unwrap().to_owned();
+    let prd_str = prd_path.to_str().unwrap().to_owned();
 
-    Command::new(cargo_bin("task-mgr"))
-        .args(["--dir", temp_dir.path().to_str().unwrap()])
-        .args([
-            "init",
-            "--no-prefix",
-            "--from-json",
-            prd_path.to_str().unwrap(),
-        ])
-        .assert()
-        .success();
+    let mut last_stderr = String::new();
+    for attempt in 0..5 {
+        let output = Command::new(cargo_bin("task-mgr"))
+            .args(["--dir", &dir_str])
+            .args(["init", "--no-prefix", "--from-json", &prd_str])
+            .output()
+            .expect("failed to spawn task-mgr for init");
 
-    temp_dir
+        if output.status.success() {
+            return temp_dir;
+        }
+
+        last_stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        if last_stderr.contains("database is locked") || last_stderr.contains("Database error") {
+            thread::sleep(Duration::from_millis(100 * (attempt as u64 + 1)));
+            continue;
+        }
+        // Non-lock error: surface immediately with full context
+        panic!(
+            "init failed (non-lock error) in setup: stderr=\n{}",
+            last_stderr
+        );
+    }
+
+    panic!(
+        "init failed after 5 retries (persistent lock) in setup: stderr=\n{}",
+        last_stderr
+    );
 }
 
 // ============================================================================
