@@ -749,7 +749,11 @@ fn locate_prd_json(conn: &Connection, task_prefix: Option<&str>) -> TaskMgrResul
 /// Strip the active prefix from every string element of the `key` array on a
 /// serialized userStory object, rewriting the DB-prefixed relationship ids into
 /// the unprefixed JSON convention. No-op when the key is absent or not an array.
-fn strip_prefix_in_id_array(obj: &mut serde_json::Map<String, Value>, key: &str, prefix: Option<&str>) {
+fn strip_prefix_in_id_array(
+    obj: &mut serde_json::Map<String, Value>,
+    key: &str,
+    prefix: Option<&str>,
+) {
     let Some(arr) = obj.get_mut(key).and_then(|v| v.as_array_mut()) else {
         return;
     };
@@ -869,9 +873,10 @@ fn append_task_to_prd_json(
             })?;
             // Push the unprefixed new id; dedup against both forms in case the
             // array already mixes conventions.
-            let already = deps_arr
-                .iter()
-                .any(|v| v.as_str().is_some_and(|s| s == story.id || s == base_story_id));
+            let already = deps_arr.iter().any(|v| {
+                v.as_str()
+                    .is_some_and(|s| s == story.id || s == base_story_id)
+            });
             if !already {
                 deps_arr.push(Value::String(base_story_id.to_string()));
             }
