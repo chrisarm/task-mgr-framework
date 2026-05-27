@@ -1,5 +1,5 @@
-//! Pre-spawn per-task recovery resolution (CONTRACT-001 scaffold; contract
-//! expanded by TEST-INIT-002, body filled by FEAT-002).
+//! Pre-spawn per-task recovery resolution (converged by FEAT-002; contract
+//! expanded by TEST-INIT-002).
 //!
 //! Folds the pre-dispatch per-task recovery reactions that must run at the top
 //! of every iteration, BEFORE the spawn, into a single [`TaskExecutionPlan`]:

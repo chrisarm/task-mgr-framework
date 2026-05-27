@@ -1,12 +1,11 @@
-//! Account-global usage gate (CONTRACT-001 scaffold).
+//! Account-global usage gate (converged by FEAT-003/006).
 //!
 //! The pre-dispatch usage/rate-limit gate is an *account-global* reaction: it
-//! reflects the shared API account state, not per-task state, so it must fire
-//! **exactly once per wave** (not once per slot). The sequential path already
-//! calls `usage::check_and_wait` at `iteration.rs` ~L116; the wave path has no
-//! call site today — that omission is the strand-bug this framework fixes.
-//! FEAT (003/006) wires this coordinator into the wave preflight so a
-//! rate-limited account waits once before the whole wave dispatches.
+//! reflects the shared API account state, not per-task state, so it fires
+//! **exactly once per wave** (not once per slot). Both the sequential path
+//! (`iteration.rs` ~L116) and the wave preflight route through this coordinator
+//! — fixing the strand-bug where the wave path had no call site and a
+//! rate-limited account never waited before the wave dispatched.
 
 use std::path::Path;
 use std::thread;
@@ -103,10 +102,9 @@ pub fn account_usage_gate_inner(
 // Both reactions are account-global (they reflect shared API account state,
 // not per-task state), which is why this coordinator lives in `account.rs`
 // alongside `account_usage_gate` — NOTE: the CONTRACT-001 `mod.rs` table
-// listed a `post_output::react_to_outputs` scaffold; FEAT-006 / TEST-INIT-001
-// relocate the converged reaction here. The bodies below are TDD scaffolds
-// (`unimplemented!`): TEST-INIT-001 pins the contract via the ignored tests in
-// `tests/reaction_parity.rs`; FEAT-006 fills in the bodies and un-ignores them.
+// originally listed a `post_output::react_to_outputs` scaffold; FEAT-006 /
+// TEST-INIT-001 relocated the converged reaction here. The contract is pinned
+// by the parity tests in `tests/reaction_parity.rs` (all cases run live).
 // ---------------------------------------------------------------------------
 
 /// Outcome of the once-per-wave account rate-limit reaction.

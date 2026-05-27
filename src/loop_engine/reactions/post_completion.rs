@@ -1,13 +1,13 @@
-//! Post-completion reactions (CONTRACT-001 scaffold; contract pinned by
+//! Post-completion reactions (converged by FEAT-010; contract pinned by
 //! TEST-INIT-004).
 //!
 //! After a wave's slot results (or the sequential iteration's single result)
 //! are processed, completion-driven reactions fire — chiefly triggering any
 //! human-review CLARIFY tasks the just-completed work unblocked (#10), folding
 //! the external-git completion shadow (#9) and the optional wrapper-commit
-//! (#8). The leaf today is `orchestrator::trigger_human_reviews` (a private fn
-//! called from `orchestrator.rs` ~L1256). FEAT-010 relocates that body into
-//! this module and wires BOTH paths through this coordinator — ADDING the
+//! (#8). The leaf `orchestrator::trigger_human_reviews` (formerly a private fn
+//! at `orchestrator.rs` ~L1256) was relocated into this module by FEAT-010,
+//! which also wired BOTH paths through this coordinator — ADDING the
 //! human-review trigger to the wave path (an intentional behavior addition,
 //! documented in `src/loop_engine/CLAUDE.md`).
 //!
@@ -30,9 +30,8 @@
 //! [`react_to_completions_inner`], which takes the review action as an injected
 //! [`ReviewFn`] seam. Tests inject a recording spy so they touch no stdin and
 //! spawn no Claude subprocess (mirrors `account::{react_to_outputs,
-//! react_to_outputs_inner}` + `WaitFn`). The contract is pinned by the ignored
-//! TEST-INIT-004 cases in `tests/reaction_parity.rs`; FEAT-010 fills the bodies
-//! and removes the `#[ignore]` attributes.
+//! react_to_outputs_inner}` + `WaitFn`). The contract is pinned by the
+//! TEST-INIT-004 cases in `tests/reaction_parity.rs` (all cases run live).
 
 use std::cell::RefCell;
 use std::collections::HashSet;

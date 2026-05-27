@@ -24,15 +24,14 @@
 //! - Fixtures are production-shaped: real [`IterationOutcome`] values and real
 //!   `tasks` rows, never hand-built maps.
 //!
-//! ## TDD status
+//! ## Test coverage
 //!
-//! The behavioral cases are `#[ignore]`'d — they call
-//! `react_to_outputs_inner`, whose body is an `unimplemented!()` scaffold under
-//! CONTRACT-001/TEST-INIT-001. **FEAT-006 implements the body and removes the
-//! `#[ignore]` attributes** (its AC1 is "TEST-INIT-001 cases pass"). Two cases
-//! run live today: a known-bad discriminator (proves the wait-once assertion
-//! actually rejects a naive per-item-loop stub) and a harness-validity
-//! compile-marker (proves the production-shaped fixtures + setup helpers work).
+//! All behavioral cases run live — `react_to_outputs_inner` is fully
+//! implemented (FEAT-006) and none of the cases carry `#[ignore]`. The known-bad
+//! discriminator (proves the wait-once assertion actually rejects a naive
+//! per-item-loop stub) and the harness-validity compile-marker (proves the
+//! production-shaped fixtures + setup helpers work) remain as intentional
+//! live canaries.
 
 use std::cell::Cell;
 use std::path::Path;
@@ -615,10 +614,9 @@ fn harness_fixtures_are_production_shaped_and_setup_works() {
 // TEST-INIT-002 — pre-spawn `resolve_task_execution` + `account_usage_gate`
 // parity (#2 effort, #3 crash). Pins the contract for FEAT-002 (the
 // `resolve_task_execution` body) and FEAT-003 (the `account_usage_gate_inner`
-// body), which fill the `unimplemented!()` scaffolds and remove the `#[ignore]`
-// attributes below. The two LIVE cases (known-bad effort discriminator +
-// harness compile-marker) guard that the ignored assertions actually
-// discriminate and that the fixtures wire up.
+// body). Both bodies are fully implemented; all cases run live. The two
+// known-bad discriminators (effort drop + harness compile-marker) remain as
+// live canaries.
 // ===========================================================================
 
 use task_mgr::loop_engine::engine::IterationContext;
@@ -982,9 +980,9 @@ fn known_bad_plan_dropping_effort_fails_the_effort_assertion() {
 
 // ---------------------------------------------------------------------------
 // Harness-validity compile-marker (RUNS LIVE). Proves the TEST-INIT-002
-// fixtures + the new pub contract types wire up: a migrated DB stands up, a
-// task row with a model column inserts, an IterationContext seeds, and both
-// param structs are constructible. Does NOT call the unimplemented coordinators.
+// fixtures + pub contract types wire up: a migrated DB stands up, a task row
+// with a model column inserts, an IterationContext seeds, and both param
+// structs are constructible.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -2037,8 +2035,8 @@ fn no_transient_returns_none_resets_counter_and_writes_nothing() {
 //        is input-driven: only ids IN the provided `completed_ids` set are
 //        reviewed — it does NOT rediscover completions by timestamp, which is
 //        what preserves the intra-wave ordering (post-merge reconcile feeds the
-//        id set before the external-git shadow). FEAT-010 fills the body and
-//        removes the `#[ignore]` attributes.
+//        id set before the external-git shadow). FEAT-010 filled the body;
+//        all cases run live.
 //
 //   #13  `reactions::account_iteration_budget` is the single home for the
 //        iteration-budget rule: a `RateLimit` / `WaitedAndRetry` (give-back)
@@ -2046,16 +2044,16 @@ fn no_transient_returns_none_resets_counter_and_writes_nothing() {
 //        `max_iterations` on EITHER path, and a consuming outcome advances the
 //        `iterations_completed` stat. A persistently rate-limited run stays
 //        bounded — it terminates on `.stop`/signal, never on the iteration
-//        ceiling (give-back pins the loop-bound counter). FEAT-013 fills the
-//        body.
+//        ceiling (give-back pins the loop-bound counter). FEAT-013 filled
+//        the body; all cases run live.
 //
 // Hermetic, mirroring TEST-INIT-001/002/003: the human-review is injected as a
 // recording [`ReviewSpy`] closure (`ReviewFn`) so no stdin is read and no
 // Claude subprocess spawns; the budget cases are pure counter arithmetic. Two
 // LIVE known-bad discriminators (a DB-scan reviewer that ignores
-// `completed_ids`; a budget helper that skips only the stat) prove the ignored
+// `completed_ids`; a budget helper that skips only the stat) prove the
 // assertions actually discriminate, and a LIVE harness-validity marker proves
-// the fixtures + new pub contract types wire up.
+// the fixtures + pub contract types wire up.
 //
 // Per-AC mapping:
 //   AC1 → react_to_completions_human_review_fires_on_both_shapes
@@ -2518,10 +2516,9 @@ fn known_bad_budget_skipping_only_stat_fails_the_no_consumption_assertion() {
 
 // ---------------------------------------------------------------------------
 // Harness-validity compile-marker (RUNS LIVE). Proves the TEST-INIT-004
-// fixtures + new pub contract types wire up: a migrated DB stands up, a
+// fixtures + pub contract types wire up: a migrated DB stands up, a
 // requires_human/done row inserts, both param structs are constructible (the
 // budget one with live `&mut` borrows), and the review seam closure builds.
-// Does NOT call the unimplemented coordinator/helper.
 // ---------------------------------------------------------------------------
 
 #[test]

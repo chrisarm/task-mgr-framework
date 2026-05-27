@@ -27,7 +27,7 @@
 //!    every coordinator body accounts for it — the parity-divergence the
 //!    framework exists to prevent becomes a compile-time concern.
 //!
-//! ## The five coordinators
+//! ## The six coordinators
 //!
 //! | Coordinator | Module | Relocated leaf(s) |
 //! |---|---|---|
@@ -39,11 +39,10 @@
 //! | [`post_completion::react_to_completions`] | `post_completion` | `orchestrator::trigger_human_reviews` |
 //!
 //! CONTRACT-001 establishes the boundary, the enforcement mechanism, and the
-//! typed coordinator signatures. `handle_overflow` is fully wired (both engine
-//! paths route through it) to prove the lock end-to-end; the remaining four
-//! coordinators are typed scaffolds whose bodies are filled in / wired by the
-//! owning FEATs (FEAT-002/003/005/006/010/013). They carry `#[allow(dead_code)]`
-//! only until those FEATs call them from both paths.
+//! typed coordinator signatures. All six coordinators are implemented and wired:
+//! both execution paths route through each one; none carry `#[allow(dead_code)]`
+//! or `unimplemented!()` stubs (FEATs 002/003/005/006/010/013 filled and wired
+//! each body).
 
 // `account`, `pre_spawn`, `post_output`, and `post_completion` are `pub` (not
 // `pub(crate)`) so their converged coordinators are reachable from the
