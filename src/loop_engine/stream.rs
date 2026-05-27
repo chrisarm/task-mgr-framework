@@ -96,6 +96,16 @@ pub(crate) trait StreamFormat {
 
     /// Derive the final output string from the folded accumulator.
     fn derive_output(&self, acc: &Accumulator) -> String;
+
+    /// Whether displayed text arrives as token fragments that should be buffered
+    /// to newline boundaries before teeing (true), vs. complete units teed as-is
+    /// (false). Token-streaming providers (Grok emits one `text` chunk per token)
+    /// set true so the live console shows whole lines instead of one token per
+    /// line; block providers (Claude tees a whole message at once) keep the
+    /// default and tee each event immediately.
+    fn line_buffer_tee(&self) -> bool {
+        false
+    }
 }
 
 /// Fold a single event into the accumulator. Pure: no I/O, no atomics. This is
@@ -158,6 +168,53 @@ pub(crate) fn tail_truncate(s: &str, max: usize) -> String {
     s[start..].to_string()
 }
 
+/// Human-visible tee channels. Tracked so a buffered tee flushes its pending
+/// partial line when the provider switches between reasoning and reply text,
+/// instead of merging a thought's tail with the reply's head on one line.
+#[derive(PartialEq, Clone, Copy)]
+enum TeeChannel {
+    Assistant,
+    Thought,
+}
+
+/// Drain complete lines (split on `\n`) from `buf`, returning each WITHOUT its
+/// trailing newline and leaving any trailing partial line in `buf`.
+fn drain_complete_lines(buf: &mut String) -> Vec<String> {
+    let mut lines = Vec::new();
+    while let Some(nl) = buf.find('\n') {
+        lines.push(buf[..nl].to_string());
+        buf.replace_range(..=nl, "");
+    }
+    lines
+}
+
+/// Tee one text chunk. When `buffered`, accumulate into `buf` and emit only
+/// complete lines (flushing the partial first on a channel switch); otherwise
+/// emit the chunk immediately (block-provider behavior, unchanged).
+fn tee_push(
+    buf: &mut String,
+    channel: &mut Option<TeeChannel>,
+    buffered: bool,
+    slot_label: Option<&str>,
+    ch: TeeChannel,
+    text: &str,
+) {
+    if !buffered {
+        emit_prefixed_lines(slot_label, text);
+        return;
+    }
+    if *channel != Some(ch) {
+        if !buf.is_empty() {
+            emit_prefixed_lines(slot_label, &std::mem::take(buf));
+        }
+        *channel = Some(ch);
+    }
+    buf.push_str(text);
+    for line in drain_complete_lines(buf) {
+        emit_prefixed_lines(slot_label, &line);
+    }
+}
+
 /// Read provider stdout, tee live output, build the transcript, and return
 /// `(output, Some(conversation), permission_denials)`.
 ///
@@ -170,17 +227,34 @@ pub(crate) fn drive_stream<F: StreamFormat>(
     completion_epoch: &AtomicU64,
     slot_label: Option<&str>,
 ) -> (String, Option<String>, Vec<Value>) {
+    let buffered_tee = format.line_buffer_tee();
     let mut acc = Accumulator::default();
+    // Live-tee state for fragment-streaming providers (no-op when !buffered_tee).
+    let mut tee_buf = String::new();
+    let mut tee_channel: Option<TeeChannel> = None;
     {
         let mut sink = |ev: StreamEvent| {
+            let is_assistant_text = matches!(ev, StreamEvent::AssistantText(_));
             // Tee the human-visible channels live, before folding.
             match &ev {
-                StreamEvent::AssistantText(t)
-                | StreamEvent::LiveOnlyText(t)
-                | StreamEvent::Thought(t) => emit_prefixed_lines(slot_label, t),
+                StreamEvent::AssistantText(t) | StreamEvent::LiveOnlyText(t) => tee_push(
+                    &mut tee_buf,
+                    &mut tee_channel,
+                    buffered_tee,
+                    slot_label,
+                    TeeChannel::Assistant,
+                    t,
+                ),
+                StreamEvent::Thought(t) => tee_push(
+                    &mut tee_buf,
+                    &mut tee_channel,
+                    buffered_tee,
+                    slot_label,
+                    TeeChannel::Thought,
+                    t,
+                ),
                 _ => {}
             }
-            let is_assistant_text = matches!(ev, StreamEvent::AssistantText(_));
             accumulate(&mut acc, ev);
             // Arm the post-completion grace once the accumulated buffer contains
             // the target's `<completed>` tag — scanning the buffer (not a single
@@ -206,6 +280,11 @@ pub(crate) fn drive_stream<F: StreamFormat>(
                 }
             }
         }
+    }
+
+    // Flush any trailing partial line the provider never newline-terminated.
+    if !tee_buf.is_empty() {
+        emit_prefixed_lines(slot_label, &tee_buf);
     }
 
     let output = format.derive_output(&acc);
@@ -291,6 +370,10 @@ impl StreamFormat for GrokStreamFormat {
         // still preserving the trailing completion tag.
         tail_truncate(&acc.assistant_buf, MAX_OUTPUT_BYTES)
     }
+
+    fn line_buffer_tee(&self) -> bool {
+        true // grok streams assistant text one token per line
+    }
 }
 
 #[cfg(test)]
@@ -348,6 +431,35 @@ mod tests {
             output, "<task-status>TEST-1:done</task-status>",
             "real grok stdout capture must reassemble to the emitted assistant text"
         );
+    }
+
+    #[test]
+    fn drain_complete_lines_holds_trailing_partial() {
+        // Token fragments accumulate; only newline-terminated lines drain.
+        let mut buf = String::new();
+        buf.push_str("Hel");
+        assert!(drain_complete_lines(&mut buf).is_empty());
+        assert_eq!(buf, "Hel");
+        buf.push_str("lo\nwor");
+        assert_eq!(drain_complete_lines(&mut buf), vec!["Hello".to_string()]);
+        assert_eq!(buf, "wor", "trailing partial line is retained");
+        buf.push_str("ld\n");
+        assert_eq!(drain_complete_lines(&mut buf), vec!["world".to_string()]);
+        assert_eq!(buf, "", "fully consumed on trailing newline");
+    }
+
+    #[test]
+    fn drain_complete_lines_multiple_in_one_chunk() {
+        let mut buf = "a\nb\nc".to_string();
+        assert_eq!(drain_complete_lines(&mut buf), vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(buf, "c");
+    }
+
+    #[test]
+    fn format_line_buffer_tee_flags() {
+        // Grok opts into buffering; Claude keeps the immediate-tee default.
+        assert!(GrokStreamFormat.line_buffer_tee());
+        assert!(!ClaudeStreamFormat.line_buffer_tee());
     }
 
     #[test]
