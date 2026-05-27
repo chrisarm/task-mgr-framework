@@ -467,7 +467,10 @@ fn test_depended_on_by_prefixed_db_unprefixed_json_sync() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(reverse, 1, "reverse dependsOn edge recorded with prefixed ids");
+    assert_eq!(
+        reverse, 1,
+        "reverse dependsOn edge recorded with prefixed ids"
+    );
 
     let own_dep: i64 = conn
         .query_row(
@@ -478,7 +481,10 @@ fn test_depended_on_by_prefixed_db_unprefixed_json_sync() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(own_dep, 1, "new task's own dependsOn stored with prefixed ids");
+    assert_eq!(
+        own_dep, 1,
+        "new task's own dependsOn stored with prefixed ids"
+    );
 
     // --- PRD JSON: ids stay in the unprefixed convention ---
     let updated: Value = serde_json::from_str(&fs::read_to_string(&prd_path).unwrap()).unwrap();
@@ -488,13 +494,17 @@ fn test_depended_on_by_prefixed_db_unprefixed_json_sync() {
         .iter()
         .find(|s| s["id"].as_str() == Some("CODE-REVIEW-2"))
         .expect("new entry must be written with the UNPREFIXED id");
-    let child_deps = child["dependsOn"].as_array().expect("child dependsOn array");
+    let child_deps = child["dependsOn"]
+        .as_array()
+        .expect("child dependsOn array");
     assert!(
         child_deps.iter().any(|v| v.as_str() == Some("FEAT-1")),
         "new entry's own dependsOn must be unprefixed (FEAT-1), got: {child_deps:?}"
     );
     assert!(
-        !child_deps.iter().any(|v| v.as_str() == Some("e474b6f2-FEAT-1")),
+        !child_deps
+            .iter()
+            .any(|v| v.as_str() == Some("e474b6f2-FEAT-1")),
         "new entry's dependsOn must NOT carry the prefix"
     );
 

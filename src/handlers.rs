@@ -206,17 +206,24 @@ pub fn output_json<T: serde::Serialize>(result: &T) {
 }
 
 // ============================================================================
-// Panic-safe stdout writes
+// Panic-safe stdout writes (Unix OFD aliasing defense)
 // ============================================================================
+//
+// The helpers below defend against a specific Unix-only hazard: when the
+// caller does `task-mgr ... 2>&1 | tee ...`, fd 1 and fd 2 share an open file
+// description (OFD). A libuv-backed child (the `claude` CLI) inherits fd 2 and
+// can set O_NONBLOCK on the shared OFD. A subsequent large write via the
+// result formatters then returns EAGAIN and panics inside std::print!.
+//
+// We therefore centralize *all* large result text/JSON emission through
+// write_stdout (see output_result, output_migrate_result, output_json), which
+// on Unix clears the bit before the write. The bug and its fix are entirely
+// self-documented here; no CLAUDE.md footnote is needed.
 
+#[cfg(unix)]
 /// Clear `O_NONBLOCK` on `fd` if it is set.
 ///
-/// A child process (Node/libuv `claude`) can flip our stdout's open file
-/// description to non-blocking via an inherited, aliased fd: `2>&1` makes our
-/// fd 1 and fd 2 share one OFD, the child inherits fd 2 and marks it
-/// `O_NONBLOCK`, and the flag lives on the shared OFD. A later large write on
-/// our stdout then returns `EAGAIN`. Clearing the flag up front lets the write
-/// block normally instead.
+/// See module docs above for the full OFD aliasing scenario.
 fn clear_nonblocking(fd: libc::c_int) {
     // SAFETY: F_GETFL / F_SETFL on a valid fd take no pointers and only read or
     // write the fd's status flags; we clear a single bit and ignore the result.
@@ -228,15 +235,16 @@ fn clear_nonblocking(fd: libc::c_int) {
     }
 }
 
+#[cfg(unix)]
 /// Write all of `bytes` to `w` (backed by `fd`) without panicking.
 ///
-/// Clears `O_NONBLOCK` on `fd` first so the write blocks instead of returning
-/// `EAGAIN` (see [`clear_nonblocking`]); swallows `BrokenPipe` (the reader went
-/// away — nothing useful to do); exits with code 1 on any other write error.
+/// Clears `O_NONBLOCK` on `fd` first (see [`clear_nonblocking`]); swallows
+/// `BrokenPipe` (reader went away — nothing useful to do); exits with code 1
+/// on any other write error.
 ///
-/// We deliberately do NOT catch `WouldBlock` and retry the buffer: `write_all`
-/// may have already flushed an unknown prefix before erroring, so re-writing
-/// `bytes` would duplicate output. The proactive flag clear avoids the need.
+/// We deliberately do NOT catch `WouldBlock` and retry: `write_all` may have
+/// already flushed an unknown prefix, so re-writing `bytes` would duplicate.
+/// The proactive flag clear avoids the need.
 fn write_all_blocking<W: io::Write>(fd: libc::c_int, w: &mut W, bytes: &[u8]) {
     clear_nonblocking(fd);
     match w.write_all(bytes).and_then(|_| w.flush()) {
@@ -249,6 +257,7 @@ fn write_all_blocking<W: io::Write>(fd: libc::c_int, w: &mut W, bytes: &[u8]) {
     }
 }
 
+#[cfg(unix)]
 /// Write `s` to stdout without panicking on a transient `EAGAIN`.
 fn write_stdout(s: &str) {
     use std::os::fd::AsRawFd;
@@ -257,6 +266,26 @@ fn write_stdout(s: &str) {
     let mut lock = stdout.lock();
     let fd = lock.as_raw_fd();
     write_all_blocking(fd, &mut lock, s.as_bytes());
+}
+
+#[cfg(not(unix))]
+/// Write `s` to stdout without panicking.
+///
+/// On non-Unix there is no O_NONBLOCK-via-OFD aliasing hazard from libuv
+/// children (Windows pipe/handle semantics differ), so we emit directly while
+/// preserving the exact BrokenPipe-silent / other-error-exit(1) contract.
+fn write_stdout(s: &str) {
+    use std::io::Write;
+
+    let mut lock = io::stdout().lock();
+    match lock.write_all(s.as_bytes()).and_then(|_| lock.flush()) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {}
+        Err(e) => {
+            eprintln!("Error: failed to write to stdout: {}", e);
+            process::exit(1);
+        }
+    }
 }
 
 // ============================================================================
@@ -426,7 +455,7 @@ pub fn generate_completions(shell: Shell) {
     generate(completion_shell, &mut cmd, "task-mgr", &mut io::stdout());
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod stdout_write_tests {
     use super::{clear_nonblocking, write_all_blocking};
     use std::fs::File;
