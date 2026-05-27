@@ -34,11 +34,16 @@
 //! TEST-INIT-004 cases in `tests/reaction_parity.rs`; FEAT-010 fills the bodies
 //! and removes the `#[ignore]` attributes.
 
+use std::cell::RefCell;
+use std::collections::HashSet;
+use std::io;
 use std::path::Path;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::loop_engine::config::PermissionMode;
+use crate::loop_engine::guidance::SessionGuidance;
+use crate::loop_engine::{git_reconcile, prd_reconcile, signals};
 
 /// A `requires_human` task selected from the completed-id set, handed to the
 /// [`ReviewFn`] seam. Mirrors the `(id, title, notes, timeout)` tuple
@@ -89,6 +94,24 @@ pub struct PostCompletionParams<'a> {
     pub wrapper_commit: bool,
 }
 
+/// Outcome of [`react_to_completions`] / [`react_to_completions_inner`] that the
+/// caller folds into its own iteration/wave accounting.
+#[derive(Debug, Default)]
+pub struct PostCompletionOutcome {
+    /// Task ids newly marked done by the external-git completion shadow (#9)
+    /// during this call. Empty when no external repo is configured or nothing
+    /// new matched. The caller bumps `tasks_completed`, flips its outcome /
+    /// crash-tracker to "completed", and clears any claimed/pending task these
+    /// ids resolved — the same accounting the pre-convergence inline external-git
+    /// block did at each call site.
+    pub external_reconciled: Vec<String>,
+    /// The hash of the last wrapper-commit (#8) made on a completed task's
+    /// behalf, or `None` when `wrapper_commit` was `false`, nothing was dirty, or
+    /// the commit failed. The sequential caller stores it in `ctx.last_commit`;
+    /// the wave caller ignores it (`wrapper_commit = false`).
+    pub wrapper_commit_hash: Option<String>,
+}
+
 /// Post-completion coordinator (production entry point). Builds the real review
 /// action (stdin `handle_human_review` + `mutate_prd_from_feedback`) and
 /// delegates to [`react_to_completions_inner`].
@@ -96,44 +119,192 @@ pub struct PostCompletionParams<'a> {
 /// Folds the completion-driven reactions for the wave's N results or the
 /// sequential path's 1, consuming the **provided** `completed_ids` set so the
 /// intra-wave ordering (post-merge reconcile before external-git shadow) is
-/// preserved.
+/// preserved. BOTH execution paths route through this coordinator: the
+/// sequential path from `orchestrator::run_loop` (`wrapper_commit = true`), the
+/// wave path from `wave_scheduler::run_wave_iteration` (`wrapper_commit = false`
+/// — the slot merge-back already carries the commit), which ADDS human review to
+/// the wave path: an intentional behavior addition documented in
+/// `src/loop_engine/CLAUDE.md`.
 ///
-/// **Scaffold under TEST-INIT-004** — body implemented by FEAT-010.
-#[allow(dead_code)] // wired into both paths by FEAT-010
+/// `session_guidance` is threaded separately (not on [`PostCompletionParams`])
+/// because it is the mutable conversation state `handle_human_review` appends to
+/// — the same `&mut SessionGuidance` the pre-convergence
+/// `orchestrator::trigger_human_reviews` took. The production review closure
+/// captures it and, on feedback, records the text; `mutate_prd_from_feedback` is
+/// applied AFTER [`react_to_completions_inner`] returns so the `&mut Connection`
+/// it borrows is free.
 pub fn react_to_completions(
     conn: &mut Connection,
     completed_ids: &[String],
     params: &PostCompletionParams<'_>,
-) {
-    let _ = (conn, completed_ids, params);
-    unimplemented!(
-        "FEAT-010: build the real review action (handle_human_review + \
-         mutate_prd_from_feedback) and delegate to react_to_completions_inner"
-    )
+    session_guidance: &mut SessionGuidance,
+) -> PostCompletionOutcome {
+    // Feedback text captured per reviewed task whose reviewer supplied guidance.
+    // Deferred (not applied inside the closure) because `mutate_prd_from_feedback`
+    // needs `&mut Connection`, which `react_to_completions_inner` borrows.
+    let pending_feedback: RefCell<Vec<String>> = RefCell::new(Vec::new());
+    // `RefCell` because `ReviewFn` is `Fn` (not `FnMut`) yet `handle_human_review`
+    // mutably appends to the guidance — mirrors the `WaitFn` seam in `account`.
+    let guidance = RefCell::new(session_guidance);
+
+    let outcome = {
+        let review = |task: HumanReviewTask<'_>| -> bool {
+            let mut sg = guidance.borrow_mut();
+            let had_feedback = signals::handle_human_review(
+                io::BufReader::new(io::stdin()),
+                task.task_id,
+                task.title,
+                task.notes,
+                params.iteration,
+                &mut sg,
+                task.timeout_secs,
+            );
+            if had_feedback {
+                let feedback = sg.last_text().unwrap_or("").to_string();
+                pending_feedback.borrow_mut().push(feedback);
+            }
+            had_feedback
+        };
+        react_to_completions_inner(conn, completed_ids, params, &review)
+    };
+
+    // Apply downstream PRD mutation for every review that produced feedback, now
+    // that the inner call's `&mut Connection` borrow has been released.
+    for feedback in pending_feedback.into_inner() {
+        prd_reconcile::mutate_prd_from_feedback(
+            params.prd_file,
+            &feedback,
+            conn,
+            params.task_prefix,
+            params.default_model,
+            params.permission_mode,
+        );
+    }
+
+    outcome
 }
 
 /// Hermetic core of the post-completion coordinator. Destructures the params
-/// exhaustively; for each id in `completed_ids` that is `requires_human = 1`
-/// AND `status = 'done'`, fires `review` **exactly once** with its
-/// [`HumanReviewTask`]. Does NOT review a `requires_human` task whose id is
-/// absent from `completed_ids` (input-driven, no timestamp rediscovery), and
-/// folds the external-git completion shadow + the `wrapper_commit` knob.
+/// exhaustively; folds the three completion-driven reactions in order:
 ///
-/// **Scaffold under TEST-INIT-004** — body implemented by FEAT-010. The
-/// contract is pinned by the ignored tests in `tests/reaction_parity.rs`.
-#[allow(dead_code)] // invoked by react_to_completions; pinned by TEST-INIT-004
+/// 1. **Wrapper-commit (#8)** — when `wrapper_commit` is set, commit on each
+///    completed task's behalf (the slot merge-back covers this on the wave path,
+///    so it passes `false`). `wrapper_commit`'s own `git status --porcelain`
+///    check makes the call a no-op once the tree is clean, so at most one commit
+///    lands per iteration.
+/// 2. **External-git completion shadow (#9)** — scan the configured external repo
+///    for `<id>-completed` markers and mark matches done. Runs AFTER the caller
+///    fed `completed_ids` from the post-merge reconcile (AC5); its reconciled ids
+///    extend the human-review set.
+/// 3. **Human review (#10)** — for each id in `completed_ids` ∪
+///    `external_reconciled` that is `requires_human = 1` AND `status = 'done'`,
+///    fire `review` **exactly once** with its [`HumanReviewTask`]. A
+///    `requires_human` task whose id is absent from the set is NEVER reviewed
+///    (input-driven, no timestamp rediscovery) — this is what preserves the
+///    intra-wave ordering.
+///
+/// The contract is pinned by the parity tests in `tests/reaction_parity.rs`.
 pub fn react_to_completions_inner(
     conn: &mut Connection,
     completed_ids: &[String],
     params: &PostCompletionParams<'_>,
     review: ReviewFn<'_>,
-) {
-    let _ = (conn, completed_ids, params, review);
-    unimplemented!(
-        "FEAT-010: destructure PostCompletionParams exhaustively; for each id in \
-         completed_ids that is requires_human=1 AND status='done', fire `review` \
-         EXACTLY once with its HumanReviewTask; do NOT review a requires_human \
-         task whose id is absent from completed_ids (input-driven, no timestamp \
-         rediscovery); fold the external-git completion shadow + wrapper_commit"
+) -> PostCompletionOutcome {
+    // Exhaustive destructure (no `..`) — the single-home parity lock. Every field
+    // is `Copy` (references + scalars), so the `&Struct { .. }` pattern copies
+    // each out by value. `iteration`, `default_model`, and `permission_mode` are
+    // consumed only by the production review closure / `mutate_prd_from_feedback`
+    // in [`react_to_completions`], so they are acknowledged here as `_` rather
+    // than elided with `..`.
+    let &PostCompletionParams {
+        run_id,
+        iteration: _,
+        working_root,
+        prd_file,
+        task_prefix,
+        default_model: _,
+        permission_mode: _,
+        external_repo_path,
+        external_git_scan_depth,
+        wrapper_commit,
+    } = params;
+
+    // (1) Wrapper-commit (#8). Sequential only; the slot merge-back already
+    //     carries the commit on the wave path.
+    let mut wrapper_commit_hash = None;
+    if wrapper_commit {
+        for id in completed_ids {
+            if let Some(hash) =
+                git_reconcile::wrapper_commit(working_root, id, "loop wrapper commit")
+            {
+                wrapper_commit_hash = Some(hash);
+            }
+        }
+    }
+
+    // (2) External-git completion shadow (#9). Empty when no external repo is
+    //     configured — the hermetic test path.
+    let external_reconciled = match external_repo_path {
+        Some(ext_repo) => git_reconcile::reconcile_external_git_completions(
+            ext_repo,
+            conn,
+            run_id,
+            prd_file,
+            task_prefix,
+            external_git_scan_depth as usize,
+        ),
+        None => Vec::new(),
+    };
+
+    // (3) Human review (#10). Input-driven: only ids in the provided set (plus
+    //     the external-git ids just discovered) are eligible; a `requires_human`
+    //     row absent from the set is never reviewed. Deduped so each id fires at
+    //     most once even if it appears in both sources.
+    let mut reviewed: HashSet<String> = HashSet::new();
+    for id in completed_ids.iter().chain(external_reconciled.iter()) {
+        if !reviewed.insert(id.clone()) {
+            continue;
+        }
+        if let Some((title, notes, timeout_secs)) = select_human_review_task(conn, id) {
+            review(HumanReviewTask {
+                task_id: id.as_str(),
+                title: &title,
+                notes: notes.as_deref(),
+                timeout_secs,
+            });
+        }
+    }
+
+    PostCompletionOutcome {
+        external_reconciled,
+        wrapper_commit_hash,
+    }
+}
+
+/// Select a single `requires_human = 1`, `status = 'done'` task by id, returning
+/// its `(title, notes, human_review_timeout)` for the [`ReviewFn`] seam. Returns
+/// `None` when the id is missing or not a completed `requires_human` task — the
+/// input-driven query that replaces the timestamp scan
+/// `orchestrator::query_human_review_tasks` used, and `None` on any DB error (a
+/// transient read failure simply skips review for that id).
+fn select_human_review_task(
+    conn: &Connection,
+    task_id: &str,
+) -> Option<(String, Option<String>, Option<u32>)> {
+    conn.query_row(
+        "SELECT title, notes, human_review_timeout FROM tasks \
+         WHERE id = ?1 AND requires_human = 1 AND status = 'done'",
+        [task_id],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<i64>>(2)?
+                    .and_then(|v| u32::try_from(v).ok()),
+            ))
+        },
     )
+    .optional()
+    .ok()
+    .flatten()
 }

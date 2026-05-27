@@ -381,13 +381,71 @@ roster-completeness test in `tests/prompt_assembler_parity.rs` enforces that
 every known section appears in the sequential roster (the hand-enforced wiring
 rule has been retired).
 
-**Out of scope for the pipeline** (kept at the call sites): wrapper-commit,
-external-git reconciliation, post-merge-back slot completion reconciliation
-(slot-0 `{pre_merge_head}..HEAD` scan via
-`git_reconcile::reconcile_merged_slot_completions` — see the Touchpoints
-table below), human-review trigger, rate-limit waits, pause-signal
-handling, slot merge resolution (see "Slot merge-back conflict
-resolution" below).
+**Out of scope for the pipeline** (kept at the call sites): rate-limit waits,
+pause-signal handling, slot merge resolution (see "Slot merge-back conflict
+resolution" below), and the post-merge-back slot completion reconcile (slot-0
+`{pre_merge_head}..HEAD` scan via
+`git_reconcile::reconcile_merged_slot_completions` — see the Touchpoints table
+below). The remaining three post-Claude call-site reactions —
+**wrapper-commit (#8)**, **external-git reconciliation (#9)**, and the
+**human-review trigger (#10)** — were converged into a single
+`reactions::post_completion::react_to_completions` coordinator both paths route
+through (FEAT-010); see "Post-completion reactions (converged)" below.
+
+## Post-completion reactions (converged)
+
+`reactions::post_completion::react_to_completions` is the single home for the
+three completion-driven reactions that fire after the shared pipeline has
+flipped this iteration/wave's tasks to `done`:
+
+| # | Reaction | Sequential | Wave |
+|---|---|---|---|
+| #8 | Wrapper-commit (commit on a task's behalf when Claude couldn't) | `wrapper_commit = true` | `wrapper_commit = false` (slot merge-back already carries the commit) |
+| #9 | External-git completion shadow (`git_reconcile::reconcile_external_git_completions`) | ✓ | ✓ |
+| #10 | Human-review trigger for `requires_human` completions | ✓ | ✓ **(behavior addition)** |
+
+**Input-driven, not timestamp rediscovery.** The coordinator consumes the
+**already-computed** `completed_ids` set — the ids the shared pipeline + the
+post-merge slot reconcile (`apply_post_merge_reconcile` →
+`reconcile_merged_slot_completions`) flipped to `done` this iteration/wave. It
+does NOT re-query "everything completed since an epoch". This is what preserves
+intra-wave ordering: the post-merge reconcile result feeds `completed_ids`
+BEFORE the external-git shadow runs inside the coordinator, and human review
+fires only for `requires_human` ids in that set (∪ any the external-git shadow
+newly discovers). A `requires_human` task that completed out-of-band and is
+absent from the set is never reviewed.
+
+**Wave gains human review (intentional behavior addition).** Before FEAT-010 the
+wave path had no human-review trigger at all; a `requires_human` (e.g. CLARIFY)
+task a slot completed never spawned its review. It now does. `react_to_completions`
+runs once per wave at the post-merge-back step (after `apply_post_merge_reconcile`,
+before the terminal checks), so it can fire on a **partial wave** — one that
+reaches the post-completion step with a sibling slot still `in_progress` (it
+didn't complete this wave) or with a sibling's ephemeral branch unmerged (a
+failed merge-back). Because the reaction is input-driven it reviews ONLY the
+completed `requires_human` ids and leaves every `in_progress` / unmerged sibling
+untouched; the interactive review session can block in that partial state while
+sibling work is still outstanding. This is deliberate — a completed CLARIFY
+should unblock its dependents without waiting for the whole wave to drain. (The
+rate-limit / transient-backend `WaitedAndRetry` reactions early-return BEFORE
+merge-back, so a wave that bails on a rate limit defers its completed tasks'
+reviews to a later wave; that is the rate-limit retry path's existing contract,
+not a regression — the wave never reviewed at all pre-FEAT-010.)
+
+**Test seam (inner/outer split).** `react_to_completions` (production) builds the
+real review action — `signals::handle_human_review` over stdin, then
+`prd_reconcile::mutate_prd_from_feedback` on feedback (applied AFTER the inner
+returns, so the inner's `&mut Connection` is free) — and delegates to
+`react_to_completions_inner`, which takes the review action as an injected
+`ReviewFn` seam (hermetic: no stdin, no subprocess; pinned by
+`tests/reaction_parity.rs`). The param struct `PostCompletionParams` is
+destructured exhaustively (no `..`) — the CONTRACT-001 single-home parity lock.
+
+**Single-home lock.** The relocated leaf `orchestrator::trigger_human_reviews`
+carries `#[deprecated]` (now a timestamp-query shim that delegates to
+`react_to_completions`); the three engine files
+(`iteration.rs`/`wave_scheduler.rs`/`slot.rs`) carry `#![deny(deprecated)]`, so
+copy-pasting human review back into one path fails to compile.
 
 ## Drained-queue classification (sequential ↔ wave parity)
 
@@ -772,3 +830,4 @@ For the full site→verb audit table and source-allowance matrix see
 | Merge resolver | `src/loop_engine/merge_resolver.rs` | `ClaudeMergeResolver`, `MergeResolver` trait |
 | Stash preflight | `src/loop_engine/worktree.rs` | `prepare_slot0_for_merge`, `cleanup_preparation`, `run_slot_merge_attempt` |
 | Post-merge slot reconcile | `src/loop_engine/git_reconcile.rs` | `reconcile_merged_slot_completions` |
+| Post-completion reactions (#8/#9/#10) | `src/loop_engine/reactions/post_completion.rs` | `react_to_completions` (coordinator, both paths), `react_to_completions_inner` (hermetic core), `PostCompletionParams`, `ReviewFn`; relocated leaf `orchestrator::trigger_human_reviews` (`#[deprecated]` shim) |

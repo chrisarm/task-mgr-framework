@@ -2150,7 +2150,6 @@ fn post_completion_params<'a>(
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "unblocked by FEAT-010: react_to_completions_inner body"]
 fn react_to_completions_human_review_fires_on_both_shapes() {
     disable_llm_extraction();
 
@@ -2212,7 +2211,6 @@ fn react_to_completions_human_review_fires_on_both_shapes() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "unblocked by FEAT-010: react_to_completions_inner body"]
 fn react_to_completions_human_review_fires_on_partial_waited_and_retry_wave() {
     disable_llm_extraction();
     let (db, mut conn) = setup_migrated_db();
@@ -2257,7 +2255,6 @@ fn react_to_completions_human_review_fires_on_partial_waited_and_retry_wave() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "unblocked by FEAT-010: react_to_completions_inner body"]
 fn react_to_completions_is_input_driven_not_timestamp_rediscovery() {
     disable_llm_extraction();
     let (db, mut conn) = setup_migrated_db();

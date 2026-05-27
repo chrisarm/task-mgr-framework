@@ -66,9 +66,7 @@ use crate::loop_engine::engine::{
     SlotResult, WaveAggregator, WaveIterationParams, WaveOutcome, WaveResult, WaveTerminal,
     apply_review_model_override, resolve_effective_runner,
 };
-use crate::loop_engine::git_reconcile::{
-    reconcile_external_git_completions, reconcile_merged_slot_completions,
-};
+use crate::loop_engine::git_reconcile::reconcile_merged_slot_completions;
 use crate::loop_engine::merge_resolver;
 use crate::loop_engine::model;
 use crate::loop_engine::prd_reconcile::reconcile_passes_with_db;
@@ -882,11 +880,14 @@ pub(super) fn read_prd_implicit_overlap_files(prd_path: &Path) -> Vec<String> {
 ///     loop-exit reset doesn't flip the row back to `todo`,
 ///   - emit a one-line stderr summary for the operator.
 ///
-/// Called from `run_wave_iteration` BEFORE `run_cmd::update` and BEFORE the
-/// external-git `let mut tasks_completed = agg.tasks_completed;` shadow so
-/// the terminal returns observe the bumped counter. The reconcile function
-/// itself never errors — failures (git, DB, PRD I/O) are absorbed there and
-/// surface as an empty Vec, so this caller has no failure path.
+/// Returns the reconciled task IDs (empty when nothing matched) so the caller
+/// feeds them into the post-completion coordinator's `completed_ids` set BEFORE
+/// the external-git shadow runs (FEAT-010 AC5: post-merge reconcile feeds the id
+/// set before the external-git shadow). Called from `run_wave_iteration` BEFORE
+/// `run_cmd::update` and BEFORE `react_to_completions` so the terminal returns
+/// observe the bumped counter. The reconcile function itself never errors —
+/// failures (git, DB, PRD I/O) are absorbed there and surface as an empty Vec,
+/// so this caller has no failure path.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn apply_post_merge_reconcile(
     slot0_path: &Path,
@@ -897,7 +898,7 @@ pub(super) fn apply_post_merge_reconcile(
     task_prefix: Option<&str>,
     ctx: &mut IterationContext,
     agg: &mut WaveAggregator,
-) {
+) -> Vec<String> {
     let reconciled = reconcile_merged_slot_completions(
         slot0_path,
         pre_merge_head,
@@ -907,7 +908,7 @@ pub(super) fn apply_post_merge_reconcile(
         task_prefix,
     );
     if reconciled.is_empty() {
-        return;
+        return Vec::new();
     }
     agg.tasks_completed += reconciled.len() as u32;
     agg.any_completed = true;
@@ -918,6 +919,7 @@ pub(super) fn apply_post_merge_reconcile(
         reconciled.len(),
         reconciled.join(", ")
     );
+    reconciled
 }
 
 /// Wave-mode equivalent of `run_iteration` for the parallel execution path.
@@ -1325,6 +1327,10 @@ pub fn run_wave_iteration(
     // slots that did merge. The wave-loop boundary in `run_loop` consumes
     // `failed_merges` to drive the FEAT-002 reset/halt-check contract.
     let mut failed_merges: Vec<FailedMerge> = Vec::new();
+    // Task ids the post-merge reconcile flipped to `done` this wave. Fed into
+    // the post-completion coordinator's `completed_ids` BEFORE its external-git
+    // shadow runs (FEAT-010 AC5). Stays empty when no merge-back happened.
+    let mut post_merge_completed: Vec<String> = Vec::new();
     if params.parallel_slots > 1 {
         let resolved_model = params
             .default_model
@@ -1413,7 +1419,7 @@ pub fn run_wave_iteration(
             outcomes.pre_merge_head.as_deref(),
             params.slot_worktree_paths.first(),
         ) {
-            apply_post_merge_reconcile(
+            post_merge_completed = apply_post_merge_reconcile(
                 slot0,
                 pre,
                 params.conn,
@@ -1435,23 +1441,60 @@ pub fn run_wave_iteration(
         eprintln!("Warning: failed to update run: {}", e);
     }
 
-    // Per-wave external-git reconciliation. Mirrors the sequential
-    // "Post-iteration: reconcile external git completions" step.
+    // FEAT-010: post-completion reactions for the wave — external-git shadow (#9)
+    // + human review (#10), converged into `reactions::post_completion::
+    // react_to_completions` so the sequential path fires the identical set. The
+    // wave passes `wrapper_commit = false` (the slot merge-back already carries
+    // each task's commit) and ADDS the human-review trigger the wave path
+    // previously lacked — an intentional behavior addition (a `requires_human`
+    // task a slot completes now spawns its review, even on a partial
+    // `WaitedAndRetry` wave where sibling slots are unmerged; see
+    // `src/loop_engine/CLAUDE.md`). `completed_ids` is the union of this wave's
+    // slot completions and the post-merge reconcile ids (fed BEFORE the
+    // external-git shadow, AC5); the coordinator extends the human-review set
+    // with any ids the external-git shadow newly discovers.
+    let mut completed_ids: Vec<String> = wave_result
+        .outcomes
+        .iter()
+        .filter(|s| {
+            s.claim_succeeded && matches!(s.iteration_result.outcome, IterationOutcome::Completed)
+        })
+        .filter_map(|s| s.iteration_result.task_id.clone())
+        .collect();
+    completed_ids.extend(post_merge_completed);
+
     let mut tasks_completed = agg.tasks_completed;
-    if let Some(ext_repo) = params.external_repo_path {
-        let count = reconcile_external_git_completions(
-            ext_repo,
+    {
+        let pc_params = reactions::post_completion::PostCompletionParams {
+            run_id: params.run_id,
+            iteration: params.iteration,
+            // Unused on the wave path (`wrapper_commit = false`); `source_root` is
+            // the loop's main worktree, a valid placeholder.
+            working_root: params.source_root,
+            prd_file: params.prd_path,
+            task_prefix: params.task_prefix,
+            default_model: params.default_model,
+            permission_mode: params.permission_mode,
+            external_repo_path: params.external_repo_path,
+            external_git_scan_depth: params.external_git_scan_depth as u32,
+            wrapper_commit: false,
+        };
+        let pc_outcome = reactions::post_completion::react_to_completions(
             params.conn,
-            params.run_id,
-            params.prd_path,
-            params.task_prefix,
-            params.external_git_scan_depth,
+            &completed_ids,
+            &pc_params,
+            &mut ctx.session_guidance,
         );
-        if count > 0 {
-            tasks_completed += count as u32;
+        // Fold external-git completions into wave accounting — the same
+        // bookkeeping the inline external-git block did before the convergence.
+        if !pc_outcome.external_reconciled.is_empty() {
+            tasks_completed += pc_outcome.external_reconciled.len() as u32;
             agg.any_completed = true;
             ctx.crash_tracker.record_success();
-            eprintln!("Post-wave reconciliation: marked {} task(s) done", count);
+            eprintln!(
+                "Post-wave reconciliation: marked {} task(s) done",
+                pc_outcome.external_reconciled.len()
+            );
         }
     }
 
