@@ -31,7 +31,7 @@ pub mod progress;
 pub mod project_config;
 pub mod prompt;
 pub mod prompt_sections;
-pub(crate) mod reactions;
+pub mod reactions;
 pub(crate) mod recovery;
 pub mod runner;
 pub mod signals;
