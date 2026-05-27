@@ -54,6 +54,16 @@
 // reaction + usage gate (TEST-INIT-001/002), `pre_spawn` for
 // `resolve_task_execution` (TEST-INIT-002), `post_output` for `handle_overflow`
 // (TEST-INIT-003), `post_completion` for `react_to_completions` (TEST-INIT-004).
+//
+// conn/ctx param-placement convention: `pre_spawn` and `post_output` fold both
+// `conn` (&Connection, read-only) and `ctx` (&mut IterationContext) into the
+// param struct — ctx mutation IS the primary side effect, and the struct keeps
+// the exhaustive-destructure parity lock tight. `account` and `post_completion`
+// take `conn` (&mut Connection) as a positional arg alongside per-wave varying
+// inputs (items / completed_ids); their params struct holds only wave-constant
+// config. The split is intentional: where conn is read-only and ctx is the
+// mutated output, fold both; where conn itself is the mutable DB writer,
+// leave it positional.
 pub mod account;
 pub mod post_completion;
 pub mod post_output;
