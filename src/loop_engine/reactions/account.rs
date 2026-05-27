@@ -349,8 +349,7 @@ fn reset_in_progress_tasks(conn: &mut Connection, run_id: &str, prefix: &str, co
     } else {
         Some(prefix)
     };
-    if let Err(e) =
-        TaskLifecycle::with_run(conn, run_id).recover_in_progress_for_prefix(prefix_opt)
+    if let Err(e) = TaskLifecycle::with_run(conn, run_id).recover_in_progress_for_prefix(prefix_opt)
     {
         eprintln!(
             "Warning: failed to reset in_progress tasks after {}: {}",

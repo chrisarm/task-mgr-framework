@@ -228,7 +228,17 @@ pub fn handle_overflow(params: HandleOverflowParams<'_>) -> RecoveryAction {
         .or_insert_with(|| effective_model.unwrap_or("(default)").to_string());
     ctx.overflow_original_task_model
         .entry(task_id.to_string())
-        .or_insert_with(|| read_task_model_from_db(conn, task_id).unwrap_or(None));
+        .or_insert_with(|| {
+            match read_task_model_from_db(conn, task_id) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!(
+                        "Warning: read_task_model_from_db({task_id}) for overflow snapshot: DB read failed: {e}"
+                    );
+                    None
+                }
+            }
+        });
 
     // Step 3: update DB.
     //   - Blocked            → status='blocked' (started_at preserved for audit)
