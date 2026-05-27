@@ -140,7 +140,7 @@ pub fn resolve_task_execution(params: ResolveTaskExecutionParams<'_>) -> TaskExe
 /// not a crash. A `None`/empty/whitespace `resolved_model` is treated as the
 /// sonnet baseline and escalates to opus. Escalation is independent of
 /// `CrashTracker` backoff.
-pub(crate) fn crash_escalated_model(
+pub fn crash_escalated_model(
     crashed_last_iteration: &HashMap<String, bool>,
     current_task_id: &str,
     resolved_model: Option<&str>,
@@ -167,11 +167,7 @@ pub(crate) fn crash_escalated_model(
 /// trigger the overflow ladder — pays no DB round-trip). DB read errors are
 /// logged and treated as no-op so a transient failure never blocks the
 /// iteration. A single stderr line announces the clear.
-pub(crate) fn invalidate_stale_overrides(
-    ctx: &mut IterationContext,
-    conn: &Connection,
-    task_id: &str,
-) {
+pub fn invalidate_stale_overrides(ctx: &mut IterationContext, conn: &Connection, task_id: &str) {
     if !ctx.overflow_original_task_model.contains_key(task_id) {
         return;
     }

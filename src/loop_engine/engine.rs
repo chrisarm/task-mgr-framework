@@ -45,14 +45,13 @@ pub use crate::loop_engine::iteration::run_iteration;
 // `probe_rate_limit_lifted`, `update_trackers`) are consumed by the sequential
 // (`iteration.rs`, FEAT-004) and wave (`wave_scheduler.rs`) paths, which import
 // them directly from `recovery`, so no `pub(super)` re-export is needed here.
-#[allow(deprecated)]
+// CLEANUP-001: `auto_block_task` is no longer #[deprecated]; direct export.
 pub use crate::loop_engine::recovery::auto_block_task;
-// FEAT-002: `check_crash_escalation` / `check_override_invalidation` relocated
-// to `reactions::pre_spawn`; the home shims are now `#[deprecated]`. Keep the
-// FR-008 external import paths (`engine::check_*`) valid behind a scoped
-// `#[allow(deprecated)]` for the transition window (dropped by CLEANUP-001).
-#[allow(deprecated)]
-pub use crate::loop_engine::recovery::{check_crash_escalation, check_override_invalidation};
+// CLEANUP-001: shims removed from recovery.rs; re-export the real relocated
+// functions under the old FR-008 external import paths so external tests keep
+// compiling. `check_override_invalidation` had no external test caller so its
+// re-export is dropped entirely.
+pub use crate::loop_engine::reactions::pre_spawn::crash_escalated_model as check_crash_escalation;
 pub use crate::loop_engine::recovery::{
     escalate_task_model_if_needed, handle_task_failure, increment_consecutive_failures,
     reset_consecutive_failures, should_auto_block, should_escalate_for_consecutive_failures,

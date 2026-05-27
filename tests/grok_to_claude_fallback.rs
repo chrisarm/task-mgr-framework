@@ -1,7 +1,3 @@
-// CONTRACT-001: overflow::handle_prompt_too_long is #[deprecated] (relocated to
-// reactions::post_output::handle_overflow). These tests drive the leaf directly;
-// allow the transition shim until FEAT-006 relocates the body.
-#![allow(deprecated)]
 //! FEAT-PRIMARY-004 + FEAT-PRIMARY-005 — inverse Grok→Claude fallback via the
 //! overflow `PromptTooLong` rung 4.
 //!
@@ -27,11 +23,12 @@ use tempfile::TempDir;
 
 use task_mgr::loop_engine::engine::{IterationContext, resolve_effective_runner};
 use task_mgr::loop_engine::model::{OPUS_MODEL_1M, SONNET_MODEL};
-use task_mgr::loop_engine::overflow::{self, RecoveryAction};
+use task_mgr::loop_engine::overflow::RecoveryAction;
 use task_mgr::loop_engine::project_config::{
     FallbackRunnerConfig, PrimaryRunnerConfig, ProjectConfig,
 };
 use task_mgr::loop_engine::prompt::PromptResult;
+use task_mgr::loop_engine::reactions::post_output::{HandleOverflowParams, handle_overflow};
 use task_mgr::loop_engine::runner::RunnerKind;
 
 /// Grok model a task carries when it was promoted by `primaryRunner`.
@@ -132,20 +129,22 @@ fn grok_task_prompt_too_long_at_ceiling_falls_back_to_claude() {
     // Use the Grok model at effort="high" to bypass rungs 1-3 (effort already
     // at floor, Grok has no "below-Opus" escalation path, no 1M Grok variant
     // in the ladder). The ladder falls straight to rung 4.
-    let action = overflow::handle_prompt_too_long(
-        &mut ctx,
-        &mut conn,
-        task_id,
-        Some("high"), // effort floor reached
+    let action = handle_overflow(HandleOverflowParams {
+        ctx: &mut ctx,
+        conn: &mut conn,
+        task_id: task_id,
+        effort: Some("high"),
+        effective_model: // effort floor reached
         Some(GROK_MODEL),
-        &pr,
-        1,
-        Some("run-inverse"),
-        tmp.path(),
-        None,
-        RunnerKind::Grok, // effective runner is Grok
+        prompt_result: &pr,
+        iteration: 1,
+        run_id: Some("run-inverse"),
+        base_dir: tmp.path(),
+        slot_index: None,
+        effective_runner: RunnerKind::Grok,
+        project_config: // effective runner is Grok
         &project_cfg,
-    );
+    });
 
     assert!(
         matches!(
@@ -211,20 +210,20 @@ fn grok_task_prompt_too_long_without_claude_fallback_model_returns_blocked() {
     };
     let model_before = task_model(&conn, task_id);
 
-    let action = overflow::handle_prompt_too_long(
-        &mut ctx,
-        &mut conn,
-        task_id,
-        Some("high"),
-        Some(GROK_MODEL),
-        &pr,
-        1,
-        None,
-        tmp.path(),
-        None,
-        RunnerKind::Grok,
-        &project_cfg,
-    );
+    let action = handle_overflow(HandleOverflowParams {
+        ctx: &mut ctx,
+        conn: &mut conn,
+        task_id: task_id,
+        effort: Some("high"),
+        effective_model: Some(GROK_MODEL),
+        prompt_result: &pr,
+        iteration: 1,
+        run_id: None,
+        base_dir: tmp.path(),
+        slot_index: None,
+        effective_runner: RunnerKind::Grok,
+        project_config: &project_cfg,
+    });
 
     assert!(
         matches!(action, RecoveryAction::Blocked),
@@ -276,20 +275,21 @@ fn grok_task_already_promoted_to_claude_returns_blocked_not_promoted_again() {
     ctx.model_overrides
         .insert(task_id.to_string(), SONNET_MODEL.to_string());
 
-    let action = overflow::handle_prompt_too_long(
-        &mut ctx,
-        &mut conn,
-        task_id,
-        Some("high"),
-        Some(GROK_MODEL),
-        &pr,
-        2, // second overflow on the same task
+    let action = handle_overflow(HandleOverflowParams {
+        ctx: &mut ctx,
+        conn: &mut conn,
+        task_id: task_id,
+        effort: Some("high"),
+        effective_model: Some(GROK_MODEL),
+        prompt_result: &pr,
+        iteration: 2,
+        run_id: // second overflow on the same task
         None,
-        tmp.path(),
-        None,
-        RunnerKind::Grok,
-        &project_cfg,
-    );
+        base_dir: tmp.path(),
+        slot_index: None,
+        effective_runner: RunnerKind::Grok,
+        project_config: &project_cfg,
+    });
 
     assert!(
         matches!(action, RecoveryAction::Blocked),
@@ -332,20 +332,20 @@ fn after_inverse_overflow_fallback_next_iteration_resolves_claude_runner() {
     let project_cfg = project_cfg_with_primary_fallback(SONNET_MODEL);
 
     // Fire rung 4 — writes runner_overrides + model_overrides + DB UPDATE.
-    let action = overflow::handle_prompt_too_long(
-        &mut ctx,
-        &mut conn,
-        task_id,
-        Some("high"),
-        Some(GROK_MODEL),
-        &pr,
-        1,
-        Some("run-next-iter"),
-        tmp.path(),
-        None,
-        RunnerKind::Grok,
-        &project_cfg,
-    );
+    let action = handle_overflow(HandleOverflowParams {
+        ctx: &mut ctx,
+        conn: &mut conn,
+        task_id: task_id,
+        effort: Some("high"),
+        effective_model: Some(GROK_MODEL),
+        prompt_result: &pr,
+        iteration: 1,
+        run_id: Some("run-next-iter"),
+        base_dir: tmp.path(),
+        slot_index: None,
+        effective_runner: RunnerKind::Grok,
+        project_config: &project_cfg,
+    });
     assert!(
         matches!(action, RecoveryAction::FallbackToProvider { .. }),
         "pre-condition: rung 4 must fire; got {action:?}",
@@ -425,20 +425,21 @@ fn grok_runner_with_fallback_runner_configured_does_not_self_promote_to_grok() {
         ..ProjectConfig::default()
     };
 
-    let action = overflow::handle_prompt_too_long(
-        &mut ctx,
-        &mut conn,
-        task_id,
-        Some("high"),
-        Some(GROK_MODEL),
-        &pr,
-        1,
-        None,
-        tmp.path(),
-        None,
-        RunnerKind::Grok, // effective runner is already Grok
+    let action = handle_overflow(HandleOverflowParams {
+        ctx: &mut ctx,
+        conn: &mut conn,
+        task_id: task_id,
+        effort: Some("high"),
+        effective_model: Some(GROK_MODEL),
+        prompt_result: &pr,
+        iteration: 1,
+        run_id: None,
+        base_dir: tmp.path(),
+        slot_index: None,
+        effective_runner: RunnerKind::Grok,
+        project_config: // effective runner is already Grok
         &project_cfg,
-    );
+    });
 
     assert!(
         matches!(action, RecoveryAction::Blocked),
