@@ -261,7 +261,7 @@ fn resurrect_with_model_override_resets_in_progress_and_sets_model() {
 
     let applied = {
         let lc = TaskLifecycle::new(&mut conn);
-        lc.resurrect_with_model_override("FEAT-OVF-1", "grok-4-fast")
+        lc.resurrect_with_model_override("FEAT-OVF-1", "grok-build")
             .unwrap()
     };
     assert!(applied);
@@ -274,7 +274,7 @@ fn resurrect_with_model_override_resets_in_progress_and_sets_model() {
         )
         .unwrap();
     assert_eq!(status, "todo");
-    assert_eq!(model, "grok-4-fast");
+    assert_eq!(model, "grok-build");
 }
 
 #[test]

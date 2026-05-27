@@ -13,22 +13,24 @@
 /// wrapper that constructs `RunnerKind::Claude` and calls `runner::dispatch`;
 /// `SpawnOpts` / `ClaudeResult` are `pub type` aliases for
 /// `RunnerOpts` / `RunnerResult` so all 10 existing call sites compile unchanged.
-use std::io::{BufRead, BufReader};
+#[cfg(test)]
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::TaskMgrResult;
 use crate::loop_engine::config::PermissionMode;
 use crate::loop_engine::runner::{self, RunnerKind, RunnerOpts, RunnerResult};
+use crate::loop_engine::stream::{Accumulator, StreamEvent, StreamFormat};
+#[cfg(test)]
+use crate::loop_engine::stream::accumulate;
 
 /// Maximum bytes for the formatted conversation in stream-json mode.
 /// Byte-based for O(1) checking; limits are approximate and mostly-ASCII content means bytes ≈ chars.
-const MAX_CONVERSATION_BYTES: usize = 50_000;
+pub(crate) const MAX_CONVERSATION_BYTES: usize = 50_000;
 /// Maximum bytes for a single tool_use input block.
-const MAX_TOOL_USE_BYTES: usize = 500;
+pub(crate) const MAX_TOOL_USE_BYTES: usize = 500;
 /// Maximum bytes for a single tool_result content block.
-const MAX_TOOL_RESULT_BYTES: usize = 1_000;
+pub(crate) const MAX_TOOL_RESULT_BYTES: usize = 1_000;
 
 /// Env var name written to the spawned subprocess to communicate the active PRD prefix.
 /// Consumed by `resolve_active_prefix` in `src/commands/add.rs` so that
@@ -198,62 +200,6 @@ pub(crate) fn spawn_claude(
     runner::dispatch(RunnerKind::Claude, prompt, permission_mode, opts)
 }
 
-/// Read stream-json lines from Claude, tee assistant text to stderr, and return
-/// (output_text, conversation).
-///
-/// - `output_text`: extracted from the final `result.result` field (what `--print` would emit).
-/// - `conversation`: formatted transcript of the full conversation, capped at
-///   `MAX_CONVERSATION_BYTES`.
-///
-/// Each JSON line is parsed exactly once; the parsed `Value` is passed to both
-/// `tee_assistant_text` (for live display) and `process_stream_json_values` (for
-/// conversation building).
-pub(crate) fn tee_stream_json(
-    reader: BufReader<impl std::io::Read>,
-    target_task_id: Option<&str>,
-    completion_epoch: &AtomicU64,
-    slot_label: Option<&str>,
-) -> (String, Option<String>, Vec<serde_json::Value>) {
-    let mut parsed: Vec<serde_json::Value> = Vec::new();
-
-    for line_result in reader.lines() {
-        match line_result {
-            Ok(line) => {
-                match serde_json::from_str::<serde_json::Value>(&line) {
-                    Ok(val) => {
-                        // Tee assistant text live before collecting for conversation building
-                        tee_assistant_text(&val, slot_label);
-                        // Arm the post-completion grace once we see the current
-                        // task's `<completed>` in the stream. Other task IDs are
-                        // ignored here and captured normally via the post-process
-                        // parse_completed_tasks pass.
-                        if let Some(target) = target_task_id {
-                            scan_for_target_completion(&val, target, completion_epoch);
-                        }
-                        parsed.push(val);
-                    }
-                    Err(_) => {
-                        emit_prefixed_lines(
-                            slot_label,
-                            "Warning: malformed stream-json line (not valid JSON)",
-                        );
-                    }
-                }
-            }
-            Err(e) if is_pty_read_eof(&e) => break,
-            Err(e) => {
-                emit_prefixed_lines(
-                    slot_label,
-                    &format!("Warning: error reading Claude stdout: {}", e),
-                );
-                break;
-            }
-        }
-    }
-
-    process_stream_json_values(parsed.into_iter())
-}
-
 /// Extract error text from an assistant message, handling both string and object error shapes.
 fn extract_error_text(val: &serde_json::Value) -> Option<String> {
     let error = val.get("error")?;
@@ -276,21 +222,6 @@ fn assistant_content(val: &serde_json::Value) -> Option<&Vec<serde_json::Value>>
     val.get("message")
         .and_then(|m| m.get("content"))
         .and_then(|c| c.as_array())
-}
-
-fn tee_assistant_text(val: &serde_json::Value, slot_label: Option<&str>) {
-    if val.get("type").and_then(|t| t.as_str()) != Some("assistant") {
-        return;
-    }
-    if let Some(content) = assistant_content(val) {
-        for block in content {
-            if block.get("type").and_then(|t| t.as_str()) == Some("text")
-                && let Some(text) = block.get("text").and_then(|t| t.as_str())
-            {
-                emit_prefixed_lines(slot_label, text);
-            }
-        }
-    }
 }
 
 /// Emit `text` to stderr with `slot_label` prepended to every line.
@@ -342,64 +273,6 @@ pub(crate) fn write_prefixed_lines<W: std::io::Write>(
     Ok(())
 }
 
-/// Scan an assistant message for `<completed>TARGET</completed>` and arm the
-/// post-completion grace if the current target task's tag is present.
-///
-/// Writes `completion_epoch` at most once (first observation wins) so that
-/// repeated completions don't reset the grace timer. Uses
-/// `parse_completed_tasks` for tolerance against surrounding whitespace and
-/// to match the detection path the engine uses post-process.
-fn scan_for_target_completion(
-    val: &serde_json::Value,
-    target_task_id: &str,
-    completion_epoch: &AtomicU64,
-) {
-    if completion_epoch.load(Ordering::Acquire) != 0 {
-        return; // already armed — first observation wins
-    }
-    if val.get("type").and_then(|t| t.as_str()) != Some("assistant") {
-        return;
-    }
-    let Some(content) = assistant_content(val) else {
-        return;
-    };
-    let mut found = false;
-    for block in content {
-        if block.get("type").and_then(|t| t.as_str()) == Some("text")
-            && let Some(text) = block.get("text").and_then(|t| t.as_str())
-            && crate::loop_engine::output_parsing::parse_completed_tasks(text)
-                .iter()
-                .any(|id| id == target_task_id)
-        {
-            found = true;
-            break;
-        }
-    }
-    if !found {
-        return;
-    }
-    // Saturate to 1 so the sentinel `0 == not armed` stays unambiguous even on
-    // a system whose clock reads pre-epoch (unsynced VM / container init); a
-    // 0-valued store would silently fail the "already armed" short-circuit and
-    // the grace kill would never fire.
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .max(1);
-    // CAS so a second thread (shouldn't exist, but defensive) can't double-set.
-    if completion_epoch
-        .compare_exchange(0, now, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok()
-    {
-        eprintln!(
-            "[completion] saw <completed>{}</completed> in stream — {}s grace window begins",
-            target_task_id,
-            crate::loop_engine::watchdog::POST_COMPLETION_GRACE_SECS,
-        );
-    }
-}
-
 /// Parse an iterator of stream-json lines into (output_text, conversation).
 ///
 /// - `output_text` is extracted from the final `{"type":"result","result":"..."}` line.
@@ -419,45 +292,118 @@ pub(crate) fn parse_stream_json_lines<'a>(
 }
 
 /// Like `parse_stream_json_lines` but also returns permission_denials.
+///
+/// Test helper: folds Claude stream-json lines through the shared
+/// [`accumulate`](crate::loop_engine::stream::accumulate) core with
+/// [`ClaudeStreamFormat`], exercising the same accumulation the production
+/// [`drive_stream`](crate::loop_engine::stream::drive_stream) path uses (minus
+/// live teeing and grace arming, which are driver-only concerns).
 #[cfg(test)]
 pub(crate) fn parse_stream_json_lines_full<'a>(
     lines: impl Iterator<Item = &'a str>,
 ) -> (String, Option<String>, Vec<serde_json::Value>) {
-    let values = lines.filter_map(
-        |line| match serde_json::from_str::<serde_json::Value>(line) {
-            Ok(v) => Some(v),
-            Err(_) => {
-                eprintln!("Warning: malformed stream-json line (not valid JSON)");
-                None
+    let format = ClaudeStreamFormat;
+    let mut acc = Accumulator::default();
+    {
+        let mut sink = |ev| accumulate(&mut acc, ev);
+        for line in lines {
+            match serde_json::from_str::<serde_json::Value>(line) {
+                Ok(val) => format.parse_value(&val, &mut sink),
+                Err(_) => eprintln!("Warning: malformed stream-json line (not valid JSON)"),
             }
-        },
-    );
-    process_stream_json_values(values)
+        }
+    }
+    let output = format.derive_output(&acc);
+    (output, Some(acc.conversation), acc.denials)
 }
 
-/// Process an iterator of already-parsed stream-json `Value`s into
-/// (output_text, conversation, permission_denials).
+/// Claude `--output-format stream-json` interpretation: `{"type":"assistant",
+/// "message":{"content":[{"type":"text"|"tool_use",...}]}}` blocks, `user`
+/// tool_result blocks, and a terminal `{"type":"result","result":...}` carrying
+/// the authoritative output and any `permission_denials`.
 ///
-/// This is the shared core used by both `parse_stream_json_lines` (which parses strings first)
-/// and `tee_stream_json` (which passes pre-parsed values to avoid double-parsing).
-fn process_stream_json_values(
-    values: impl Iterator<Item = serde_json::Value>,
-) -> (String, Option<String>, Vec<serde_json::Value>) {
-    let mut output_text = String::new();
-    let mut conversation = String::new();
-    let mut permission_denials: Vec<serde_json::Value> = Vec::new();
+/// Lives here (not in `stream.rs`) to reuse the Claude-specific JSON helpers
+/// `assistant_content` / `extract_error_text`.
+pub(crate) struct ClaudeStreamFormat;
 
-    for val in values {
+impl StreamFormat for ClaudeStreamFormat {
+    fn parse_value(&self, val: &serde_json::Value, sink: &mut dyn FnMut(StreamEvent)) {
         match val.get("type").and_then(|t| t.as_str()) {
             Some("assistant") => {
-                process_assistant_message(&val, &mut conversation);
+                // Errored assistant message: tee its text live for visibility
+                // (LiveOnlyText) but suppress it from the transcript, which
+                // records only the error; tool_use blocks are suppressed
+                // entirely. Preserves the pre-refactor split between
+                // tee_assistant_text (ignored `error`) and
+                // process_assistant_message (short-circuited on `error`).
+                if let Some(error) = extract_error_text(val) {
+                    if let Some(content) = assistant_content(val) {
+                        for block in content {
+                            if block.get("type").and_then(|t| t.as_str()) == Some("text")
+                                && let Some(text) = block.get("text").and_then(|t| t.as_str())
+                            {
+                                sink(StreamEvent::LiveOnlyText(text.to_string()));
+                            }
+                        }
+                    }
+                    sink(StreamEvent::Error(error));
+                    return;
+                }
+                if let Some(content) = assistant_content(val) {
+                    for block in content {
+                        match block.get("type").and_then(|t| t.as_str()) {
+                            Some("text") => {
+                                if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                                    sink(StreamEvent::AssistantText(text.to_string()));
+                                }
+                            }
+                            Some("tool_use") => {
+                                let name = block
+                                    .get("name")
+                                    .and_then(|n| n.as_str())
+                                    .unwrap_or("unknown")
+                                    .to_string();
+                                let input = block
+                                    .get("input")
+                                    .map(|i| i.to_string())
+                                    .unwrap_or_default();
+                                sink(StreamEvent::ToolUse { name, input });
+                            }
+                            _ => {} // thinking blocks and unknown types
+                        }
+                    }
+                }
             }
             Some("user") => {
-                process_user_message(&val, &mut conversation);
+                if let Some(content) = val
+                    .get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| c.as_array())
+                {
+                    for block in content {
+                        if block.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
+                            let content_str = block
+                                .get("content")
+                                .and_then(|c| {
+                                    c.as_str().map(|s| s.to_string()).or_else(|| {
+                                        c.as_array().map(|arr| {
+                                            arr.iter()
+                                                .filter_map(|b| {
+                                                    b.get("text").and_then(|t| t.as_str())
+                                                })
+                                                .collect::<Vec<_>>()
+                                                .join("\n")
+                                        })
+                                    })
+                                })
+                                .unwrap_or_default();
+                            sink(StreamEvent::ToolResult(content_str));
+                        }
+                    }
+                }
             }
             Some("result") => {
-                // Extract the output text from the result line
-                output_text = val
+                let output = val
                     .get("result")
                     .map(|r| {
                         r.as_str().map(|s| s.to_string()).unwrap_or_else(|| {
@@ -469,91 +415,24 @@ fn process_stream_json_values(
                         })
                     })
                     .unwrap_or_default();
-
-                // Extract permission denials from the result line
+                sink(StreamEvent::FinalResult(output));
                 if let Some(denials) = val.get("permission_denials").and_then(|d| d.as_array()) {
-                    permission_denials.extend(denials.iter().cloned());
+                    sink(StreamEvent::PermissionDenials(denials.to_vec()));
                 }
             }
-            // Skip system/init and unknown types
-            _ => {}
+            _ => {} // system/init and unknown types
         }
     }
 
-    (output_text, Some(conversation), permission_denials)
-}
-
-/// Append formatted assistant message content to the conversation buffer.
-fn process_assistant_message(val: &serde_json::Value, conversation: &mut String) {
-    if let Some(error) = extract_error_text(val) {
-        append_capped(conversation, &format!("[Error: {}]\n", error));
-        return;
-    }
-
-    let content = match assistant_content(val) {
-        Some(c) => c,
-        None => return,
-    };
-
-    for block in content {
-        match block.get("type").and_then(|t| t.as_str()) {
-            Some("text") => {
-                if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                    append_capped(conversation, text);
-                    append_capped(conversation, "\n");
-                }
-            }
-            Some("tool_use") => {
-                let name = block
-                    .get("name")
-                    .and_then(|n| n.as_str())
-                    .unwrap_or("unknown");
-                let input_str = block
-                    .get("input")
-                    .map(|i| i.to_string())
-                    .unwrap_or_default();
-                let truncated = truncate_bytes(&input_str, MAX_TOOL_USE_BYTES);
-                append_capped(conversation, &format!("[Tool: {}] {}\n", name, truncated));
-            }
-            _ => {} // Skip thinking blocks and unknown types
-        }
-    }
-}
-
-/// Append formatted user message content (tool_result) to the conversation buffer.
-fn process_user_message(val: &serde_json::Value, conversation: &mut String) {
-    let content = match val
-        .get("message")
-        .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_array())
-    {
-        Some(c) => c,
-        None => return,
-    };
-
-    for block in content {
-        if block.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
-            let content_str = block
-                .get("content")
-                .and_then(|c| {
-                    c.as_str().map(|s| s.to_string()).or_else(|| {
-                        c.as_array().map(|arr| {
-                            arr.iter()
-                                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-                                .collect::<Vec<_>>()
-                                .join("\n")
-                        })
-                    })
-                })
-                .unwrap_or_default();
-            let truncated = truncate_bytes(&content_str, MAX_TOOL_RESULT_BYTES);
-            append_capped(conversation, &format!("[Result: {}]\n", truncated));
-        }
+    fn derive_output(&self, acc: &Accumulator) -> String {
+        // Claude's output is the authoritative final `result` line (empty when
+        // absent or null), NOT the accumulated assistant chunks.
+        acc.final_result.clone().unwrap_or_default()
     }
 }
 
 /// Append `s` to `buf` only up to `MAX_CONVERSATION_BYTES` total.
-fn append_capped(buf: &mut String, s: &str) {
+pub(crate) fn append_capped(buf: &mut String, s: &str) {
     if buf.len() >= MAX_CONVERSATION_BYTES {
         return;
     }
@@ -563,7 +442,7 @@ fn append_capped(buf: &mut String, s: &str) {
 }
 
 /// Truncate `s` to at most `max_bytes` bytes without splitting a UTF-8 character.
-fn truncate_bytes(s: &str, max_bytes: usize) -> &str {
+pub(crate) fn truncate_bytes(s: &str, max_bytes: usize) -> &str {
     if s.len() <= max_bytes {
         return s;
     }

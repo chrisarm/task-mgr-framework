@@ -843,7 +843,7 @@ mod tests {
             10,
             task_id,
             30,
-            Some("grok-4-fast"),
+            Some("grok-build"),
             Some("high"),
             &ctx.overflow_recovered,
             &ctx.overflow_original_model,

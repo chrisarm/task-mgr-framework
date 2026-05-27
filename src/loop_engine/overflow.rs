@@ -699,13 +699,13 @@ mod tests {
     fn user_message_fallback_to_provider_exact_string() {
         let msg = RecoveryAction::FallbackToProvider {
             provider: "grok".to_string(),
-            model: "grok-4-fast".to_string(),
+            model: "grok-build".to_string(),
         }
         .user_message("MY-TASK-001", Some("high"), Some(model::OPUS_MODEL_1M));
         assert_eq!(
             msg,
             format!(
-                "Prompt is too long for MY-TASK-001 at effort high, model {} — falling back to grok-4-fast (Claude ladder exhausted)",
+                "Prompt is too long for MY-TASK-001 at effort high, model {} — falling back to grok-build (Claude ladder exhausted)",
                 model::OPUS_MODEL_1M,
             )
         );
@@ -715,7 +715,7 @@ mod tests {
     fn recovery_fallback_to_provider_serialization() {
         let v = serde_json::to_value(RecoveryAction::FallbackToProvider {
             provider: "grok".to_string(),
-            model: "grok-4-fast".to_string(),
+            model: "grok-build".to_string(),
         })
         .unwrap();
         assert_eq!(
@@ -723,7 +723,7 @@ mod tests {
             serde_json::json!({
                 "action": "fallback_to_provider",
                 "provider": "grok",
-                "model": "grok-4-fast",
+                "model": "grok-build",
             })
         );
     }
@@ -732,7 +732,7 @@ mod tests {
     fn recovery_fallback_to_provider_round_trip() {
         let action = RecoveryAction::FallbackToProvider {
             provider: "grok".to_string(),
-            model: "grok-4-fast".to_string(),
+            model: "grok-build".to_string(),
         };
         let s = serde_json::to_string(&action).unwrap();
         let back: RecoveryAction = serde_json::from_str(&s).unwrap();

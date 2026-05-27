@@ -3,7 +3,7 @@
 //! Simulates the exact state the Grok overflow rung (5th rung) or RuntimeError
 //! fallback hook leaves in `IterationContext`:
 //!   - `runner_overrides[task] = RunnerKind::Grok`
-//!   - `model_overrides[task] = "grok-4-fast"`
+//!   - `model_overrides[task] = "grok-build"`
 //!   - `overflow_original_task_model[task] = Some(<OPUS_MODEL>)`
 //!
 //! When the operator subsequently edits `tasks.model` to a different value,
@@ -22,7 +22,7 @@ use task_mgr::loop_engine::engine::{IterationContext, check_override_invalidatio
 use task_mgr::loop_engine::model::{HAIKU_MODEL, OPUS_MODEL};
 use task_mgr::loop_engine::runner::RunnerKind;
 
-const GROK_FAST_MODEL: &str = "grok-4-fast";
+const GROK_FAST_MODEL: &str = "grok-build";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 

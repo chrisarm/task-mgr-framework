@@ -27,10 +27,11 @@ use crate::error::{TaskMgrError, TaskMgrResult};
 #[cfg(unix)]
 use crate::loop_engine::claude::open_pty_for_child_output;
 use crate::loop_engine::claude::{
-    ACTIVE_PREFIX_ENV, emit_prefixed_lines, is_pty_read_eof, tee_stream_json,
+    ACTIVE_PREFIX_ENV, ClaudeStreamFormat, emit_prefixed_lines, is_pty_read_eof,
 };
 use crate::loop_engine::config::PermissionMode;
 use crate::loop_engine::signals::SignalFlag;
+use crate::loop_engine::stream::{GrokStreamFormat, drive_stream};
 use crate::loop_engine::watchdog::{TimeoutConfig, exit_code_from_status, watchdog_loop};
 
 /// Default fast-fail window for the Grok auth-failure sniff (3 seconds).
@@ -628,8 +629,9 @@ impl LlmRunner for ClaudeRunner {
         let reader = BufReader::new(reader_source);
 
         let (output, conversation, permission_denials) = if stream_json {
-            tee_stream_json(
+            drive_stream(
                 reader,
+                &ClaudeStreamFormat,
                 target_task_id,
                 &watchdog.completion_epoch,
                 slot_label,
@@ -807,6 +809,21 @@ impl LlmRunner for GrokRunner {
                 }
             }
         }
+        // WORKAROUND(grok-cli-headless-subagent-coordinator): in headless
+        // one-shot mode (`--output-format streaming-json --prompt-file`) grok's
+        // background-subagent coordinator is unreliable. A review prompt that
+        // says "use the <X> agent for the review pass" makes grok try to
+        // background-spawn that subagent; the coordinator then cancels it
+        // mid-turn (`turn_ended outcome="cancelled" cancellation_category=
+        // "mid_turn_abort"`) and the session_state upload drops
+        // (`channel_dropped`), aborting the PARENT review at turn 0. task-mgr
+        // then finds the task stuck `in_progress`, auto-recovers it as stale,
+        // and retries forever without progress. task-mgr runs exactly one task
+        // per grok process and never relies on grok fanning out to subagents,
+        // so disable spawning outright — grok performs the work inline with its
+        // own prompt + context. Remove if upstream grok makes headless subagent
+        // spawning reliable.
+        args.push("--no-subagents".to_string());
         push_optional_flag(&mut args, "--disallowed-tools", disallowed_tools);
         push_optional_flag(&mut args, "--model", model);
         push_optional_flag(&mut args, "--effort", effort);
@@ -849,8 +866,9 @@ impl LlmRunner for GrokRunner {
         );
 
         let (output, conversation, permission_denials) = if stream_json {
-            tee_stream_json(
+            drive_stream(
                 reader,
+                &GrokStreamFormat,
                 target_task_id,
                 &watchdog.completion_epoch,
                 slot_label,
@@ -1934,6 +1952,14 @@ mod tests {
         assert!(
             !argv.iter().any(|a| a == "-p" || a == "--single"),
             "grok must not use a bare -p/--single prompt flag, got {argv:?}",
+        );
+        // WORKAROUND(grok-cli-headless-subagent-coordinator): headless grok must
+        // disable subagent spawning — a "use the <X> agent" review instruction
+        // otherwise aborts the parent session at turn 0 when the coordinator
+        // cancels the background spawn. See GrokRunner::spawn.
+        assert!(
+            argv.iter().any(|a| a == "--no-subagents"),
+            "grok must receive --no-subagents so it reviews inline, got {argv:?}",
         );
     }
 

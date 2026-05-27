@@ -28,7 +28,7 @@ use task_mgr::loop_engine::project_config::PrimaryRunnerConfig;
 use task_mgr::loop_engine::runner::RunnerKind;
 
 /// Grok model id a primary-runner-routed task carries in `tasks.model`.
-const GROK_MODEL: &str = "grok-4-fast";
+const GROK_MODEL: &str = "grok-build";
 
 /// Default inverse-promotion threshold (PRD: `primaryRunner.runtimeErrorThreshold`
 /// defaults to 2 — same gate as Claude-tier escalation).

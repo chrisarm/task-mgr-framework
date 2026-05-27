@@ -31,7 +31,7 @@ use task_mgr::loop_engine::prompt::PromptResult;
 use task_mgr::loop_engine::runner::RunnerKind;
 
 /// Grok model a task carries when it was promoted by `primaryRunner`.
-const GROK_MODEL: &str = "grok-4-fast";
+const GROK_MODEL: &str = "grok-build";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
