@@ -991,8 +991,10 @@ mod tests {
         let result = parse_reset_from_output(&output);
         assert!(result.is_some(), "Should parse '{}' from output", hour_str);
         let secs = result.unwrap();
-        // The top-of-hour is 1h01m..2h00m from now (depends on current minute)
-        assert!(secs > 3600, "Expected >3600 but got {}", secs);
+        // The top-of-hour is 1h00m01s..2h00m00s from now; `num_seconds()` floors
+        // the diff, so the lower bound is reachable (== 3600) when the wall clock
+        // is at :59:59.x — keep it inclusive or it flakes ~1/3600 of runs.
+        assert!(secs >= 3600, "Expected >=3600 but got {}", secs);
         assert!(secs <= 7200, "Expected <=7200 but got {}", secs);
     }
 
@@ -1005,14 +1007,20 @@ mod tests {
         let result = parse_reset_from_output(&output);
         assert!(result.is_some(), "Should parse '{}' from output", time_str);
         let secs = result.unwrap();
+        // `parse_reset_from_output` builds the target at :00 seconds while the
+        // format step above truncated `now + 90min` to minute resolution, so
+        // the diff is 5400s minus `now`'s sub-minute offset and `num_seconds()`
+        // floors it. The valid range is therefore [5340, 5400] inclusive — the
+        // lower bound is reachable when the wall-clock second is in (59, 60),
+        // so the assertion must be inclusive or it flakes ~1% of runs.
         assert!(
-            secs > 5340,
-            "Expected >5340 (90 min - tolerance) but got {}",
+            secs >= 5340,
+            "Expected >=5340 (90 min - truncation) but got {}",
             secs
         );
         assert!(
-            secs < 5460,
-            "Expected <5460 (90 min + tolerance) but got {}",
+            secs <= 5400,
+            "Expected <=5400 (90 min, target truncated to :00) but got {}",
             secs
         );
     }
