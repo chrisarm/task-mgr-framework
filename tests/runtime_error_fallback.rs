@@ -146,7 +146,8 @@ fn no_promotion_when_consecutive_failures_below_threshold() {
     insert_task(&conn, "BELOW-001", Some(OPUS_MODEL), 0);
 
     let mut ctx = IterationContext::new(8);
-    let result = escalate_task_model_if_needed(&conn, "BELOW-001", 1, &mut ctx, None, None).unwrap();
+    let result =
+        escalate_task_model_if_needed(&conn, "BELOW-001", 1, &mut ctx, None, None).unwrap();
     assert_eq!(
         result, None,
         "consecutive_failures=1 must not trigger escalation OR promotion",
@@ -279,9 +280,15 @@ fn escalate_task_model_does_not_mutate_consecutive_failures_column() {
     let before = read_consecutive_failures(&conn, "COUNTER-001");
 
     let mut ctx = IterationContext::new(8);
-    let _ =
-        escalate_task_model_if_needed(&conn, "COUNTER-001", FALLBACK_THRESHOLD, &mut ctx, None, None)
-            .unwrap();
+    let _ = escalate_task_model_if_needed(
+        &conn,
+        "COUNTER-001",
+        FALLBACK_THRESHOLD,
+        &mut ctx,
+        None,
+        None,
+    )
+    .unwrap();
 
     let after = read_consecutive_failures(&conn, "COUNTER-001");
     assert_eq!(

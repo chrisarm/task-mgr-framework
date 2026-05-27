@@ -90,7 +90,12 @@ fn primary_cfg_with_fallback(claude_model: &str) -> PrimaryRunnerConfig {
 #[test]
 fn inverse_promotion_fires_at_grok_and_threshold_with_claude_fallback() {
     let (_dir, conn) = setup_db();
-    insert_task(&conn, "GROK-PRIMARY-001", Some(GROK_MODEL), PRIMARY_THRESHOLD - 1);
+    insert_task(
+        &conn,
+        "GROK-PRIMARY-001",
+        Some(GROK_MODEL),
+        PRIMARY_THRESHOLD - 1,
+    );
 
     let mut ctx = IterationContext::new(8);
     let primary = primary_cfg_with_fallback(SONNET_MODEL);
@@ -148,7 +153,12 @@ fn inverse_promotion_fires_at_grok_and_threshold_with_claude_fallback() {
 #[test]
 fn after_inverse_promotion_next_iteration_resolves_claude_runner() {
     let (_dir, conn) = setup_db();
-    insert_task(&conn, "GROK-NEXT-001", Some(GROK_MODEL), PRIMARY_THRESHOLD - 1);
+    insert_task(
+        &conn,
+        "GROK-NEXT-001",
+        Some(GROK_MODEL),
+        PRIMARY_THRESHOLD - 1,
+    );
 
     let mut ctx = IterationContext::new(8);
     let primary = primary_cfg_with_fallback(SONNET_MODEL);
@@ -186,7 +196,12 @@ fn after_inverse_promotion_next_iteration_resolves_claude_runner() {
 #[test]
 fn no_inverse_promotion_when_claude_fallback_model_absent() {
     let (_dir, conn) = setup_db();
-    insert_task(&conn, "GROK-NOFB-001", Some(GROK_MODEL), PRIMARY_THRESHOLD - 1);
+    insert_task(
+        &conn,
+        "GROK-NOFB-001",
+        Some(GROK_MODEL),
+        PRIMARY_THRESHOLD - 1,
+    );
 
     let mut ctx = IterationContext::new(8);
     // claude_fallback_model is None (the Default).
@@ -226,19 +241,33 @@ fn no_inverse_promotion_when_claude_fallback_model_absent() {
 #[test]
 fn no_inverse_promotion_when_primary_runner_absent() {
     let (_dir, conn) = setup_db();
-    insert_task(&conn, "GROK-NOPR-001", Some(GROK_MODEL), PRIMARY_THRESHOLD - 1);
+    insert_task(
+        &conn,
+        "GROK-NOPR-001",
+        Some(GROK_MODEL),
+        PRIMARY_THRESHOLD - 1,
+    );
 
     let mut ctx = IterationContext::new(8);
-    let outcome =
-        escalate_task_model_if_needed(&conn, "GROK-NOPR-001", PRIMARY_THRESHOLD, &mut ctx, None, None)
-            .unwrap();
+    let outcome = escalate_task_model_if_needed(
+        &conn,
+        "GROK-NOPR-001",
+        PRIMARY_THRESHOLD,
+        &mut ctx,
+        None,
+        None,
+    )
+    .unwrap();
 
     assert_eq!(
         outcome, None,
         "primaryRunner absent → no inverse promotion (Grok tier has no Claude escalation)",
     );
     assert!(!ctx.runner_overrides.contains_key("GROK-NOPR-001"));
-    assert_eq!(read_model(&conn, "GROK-NOPR-001").as_deref(), Some(GROK_MODEL));
+    assert_eq!(
+        read_model(&conn, "GROK-NOPR-001").as_deref(),
+        Some(GROK_MODEL)
+    );
 }
 
 // ── Test #11 — GrokAuthFailure does NOT increment consecutive_failures ─────────
@@ -278,7 +307,15 @@ fn grok_auth_failure_does_not_increment_consecutive_failures_for_primary_task() 
     // GrokAuthFailure from incrementing the counter is the caller-site filter.
     let mut ctx = IterationContext::new(8);
     let primary = primary_cfg_with_fallback(SONNET_MODEL);
-    handle_task_failure(&mut conn, "GROK-AUTH-001", 1, &mut ctx, None, Some(&primary)).unwrap();
+    handle_task_failure(
+        &mut conn,
+        "GROK-AUTH-001",
+        1,
+        &mut ctx,
+        None,
+        Some(&primary),
+    )
+    .unwrap();
     assert_eq!(
         read_consecutive_failures(&conn, "GROK-AUTH-001"),
         before + 1,

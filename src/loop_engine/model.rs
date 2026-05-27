@@ -283,9 +283,7 @@ pub fn primary_runner_match<'a>(
     if let Some(id) = task_id {
         let body = strip_prd_prefix(id);
         for (prefix, spec) in &cfg.by_id_prefix {
-            if body.starts_with(prefix.as_str())
-                || body.contains(&format!("-{prefix}"))
-            {
+            if body.starts_with(prefix.as_str()) || body.contains(&format!("-{prefix}")) {
                 return Some(spec);
             }
         }

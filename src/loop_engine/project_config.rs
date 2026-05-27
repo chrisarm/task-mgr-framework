@@ -1095,11 +1095,7 @@ mod tests {
     fn test_primary_runner_explicit_null_is_none() {
         // Explicit JSON `null` → `None` (matches FallbackRunnerConfig behavior).
         let dir = tempfile::tempdir().unwrap();
-        fs::write(
-            dir.path().join("config.json"),
-            r#"{"primaryRunner": null}"#,
-        )
-        .unwrap();
+        fs::write(dir.path().join("config.json"), r#"{"primaryRunner": null}"#).unwrap();
         let config = read_project_config(dir.path());
         assert!(config.primary_runner.is_none());
     }
@@ -1108,11 +1104,7 @@ mod tests {
     fn test_primary_runner_present_empty_maps() {
         // Object present but no map entries → `Some` with empty maps and defaults.
         let dir = tempfile::tempdir().unwrap();
-        fs::write(
-            dir.path().join("config.json"),
-            r#"{"primaryRunner": {}}"#,
-        )
-        .unwrap();
+        fs::write(dir.path().join("config.json"), r#"{"primaryRunner": {}}"#).unwrap();
         let config = read_project_config(dir.path());
         let pr = config.primary_runner.expect("should be Some");
         assert!(pr.claude_fallback_model.is_none());
@@ -1145,14 +1137,20 @@ mod tests {
         .unwrap();
         let config = read_project_config(dir.path());
         let pr = config.primary_runner.expect("should be Some");
-        assert_eq!(pr.claude_fallback_model.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(
+            pr.claude_fallback_model.as_deref(),
+            Some("claude-sonnet-4-6")
+        );
         assert_eq!(pr.runtime_error_threshold, 3);
 
         let review_spec = pr.by_task_type.get("review").expect("review key missing");
         assert_eq!(review_spec.provider, "grok");
         assert_eq!(review_spec.model, "grok-4");
 
-        let milestone_spec = pr.by_task_type.get("milestone").expect("milestone key missing");
+        let milestone_spec = pr
+            .by_task_type
+            .get("milestone")
+            .expect("milestone key missing");
         assert_eq!(milestone_spec.provider, "grok");
         assert_eq!(milestone_spec.model, "grok-4");
 
@@ -1160,7 +1158,10 @@ mod tests {
         assert_eq!(rev_prefix_spec.provider, "grok");
         assert_eq!(rev_prefix_spec.model, "grok-4");
 
-        let ms_prefix_spec = pr.by_id_prefix.get("MILESTONE-").expect("MILESTONE- key missing");
+        let ms_prefix_spec = pr
+            .by_id_prefix
+            .get("MILESTONE-")
+            .expect("MILESTONE- key missing");
         assert_eq!(ms_prefix_spec.provider, "grok");
         assert_eq!(ms_prefix_spec.model, "grok-4");
     }
@@ -1183,7 +1184,10 @@ mod tests {
         .unwrap();
         let config = read_project_config(dir.path());
         let pr = config.primary_runner.expect("should be Some");
-        assert!(pr.claude_fallback_model.is_none(), "claudeFallbackModel absent → None");
+        assert!(
+            pr.claude_fallback_model.is_none(),
+            "claudeFallbackModel absent → None"
+        );
         assert_eq!(pr.runtime_error_threshold, 2, "default threshold is 2");
         assert!(pr.by_id_prefix.is_empty(), "byIdPrefix absent → empty map");
         let spec = pr.by_task_type.get("review").expect("review key missing");
