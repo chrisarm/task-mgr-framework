@@ -807,6 +807,21 @@ impl LlmRunner for GrokRunner {
                 }
             }
         }
+        // WORKAROUND(grok-cli-headless-subagent-coordinator): in headless
+        // one-shot mode (`--output-format streaming-json --prompt-file`) grok's
+        // background-subagent coordinator is unreliable. A review prompt that
+        // says "use the <X> agent for the review pass" makes grok try to
+        // background-spawn that subagent; the coordinator then cancels it
+        // mid-turn (`turn_ended outcome="cancelled" cancellation_category=
+        // "mid_turn_abort"`) and the session_state upload drops
+        // (`channel_dropped`), aborting the PARENT review at turn 0. task-mgr
+        // then finds the task stuck `in_progress`, auto-recovers it as stale,
+        // and retries forever without progress. task-mgr runs exactly one task
+        // per grok process and never relies on grok fanning out to subagents,
+        // so disable spawning outright — grok performs the work inline with its
+        // own prompt + context. Remove if upstream grok makes headless subagent
+        // spawning reliable.
+        args.push("--no-subagents".to_string());
         push_optional_flag(&mut args, "--disallowed-tools", disallowed_tools);
         push_optional_flag(&mut args, "--model", model);
         push_optional_flag(&mut args, "--effort", effort);
@@ -1934,6 +1949,14 @@ mod tests {
         assert!(
             !argv.iter().any(|a| a == "-p" || a == "--single"),
             "grok must not use a bare -p/--single prompt flag, got {argv:?}",
+        );
+        // WORKAROUND(grok-cli-headless-subagent-coordinator): headless grok must
+        // disable subagent spawning — a "use the <X> agent" review instruction
+        // otherwise aborts the parent session at turn 0 when the coordinator
+        // cancels the background spawn. See GrokRunner::spawn.
+        assert!(
+            argv.iter().any(|a| a == "--no-subagents"),
+            "grok must receive --no-subagents so it reviews inline, got {argv:?}",
         );
     }
 
