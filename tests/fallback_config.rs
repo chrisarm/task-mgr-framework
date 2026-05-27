@@ -67,7 +67,7 @@ fn fallback_runner_full_object_round_trips() {
         "fallbackRunner": {
             "enabled": true,
             "provider": "grok",
-            "model": "grok-4-fast",
+            "model": "grok-build",
             "cliBinary": "/opt/grok/bin/grok",
             "runtimeErrorThreshold": 5
         }
@@ -76,7 +76,7 @@ fn fallback_runner_full_object_round_trips() {
     let fr = cfg.fallback_runner.expect("fallback_runner deserialized");
     assert!(fr.enabled);
     assert_eq!(fr.provider, "grok");
-    assert_eq!(fr.model, "grok-4-fast");
+    assert_eq!(fr.model, "grok-build");
     assert_eq!(fr.cli_binary.as_deref(), Some("/opt/grok/bin/grok"));
     assert_eq!(fr.runtime_error_threshold, 5);
 }
@@ -92,7 +92,7 @@ fn fallback_runner_missing_runtime_error_threshold_defaults_to_two() {
         "fallbackRunner": {
             "enabled": true,
             "provider": "grok",
-            "model": "grok-4-fast"
+            "model": "grok-build"
         }
     }"#,
     );
@@ -139,7 +139,7 @@ fn fallback_runner_enabled_false_returns_some_not_none() {
         r#"{
         "fallbackRunner": {
             "enabled": false,
-            "model": "grok-4-fast-tuned"
+            "model": "grok-build-tuned"
         }
     }"#,
     );
@@ -150,7 +150,7 @@ fn fallback_runner_enabled_false_returns_some_not_none() {
     );
     assert!(!fr.enabled);
     assert_eq!(
-        fr.model, "grok-4-fast-tuned",
+        fr.model, "grok-build-tuned",
         "operator's model override preserved"
     );
 }

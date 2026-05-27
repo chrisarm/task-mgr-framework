@@ -53,7 +53,7 @@ pub const HAIKU_MODEL: &str = "claude-haiku-4-5-20251001";
 pub enum Provider {
     /// Anthropic Claude models (default for unknown / unset inputs).
     Claude,
-    /// xAI Grok models (`grok-4`, `grok-4-fast`, `grok-code-fast-1`, …).
+    /// xAI Grok models (`grok-build`, `grok-code-fast-1`, …).
     Grok,
 }
 
@@ -75,7 +75,7 @@ pub enum Provider {
 ///
 /// ```ignore
 /// use task_mgr::loop_engine::model::{Provider, provider_for_model};
-/// assert_eq!(provider_for_model(Some("grok-4-fast")), Provider::Grok);
+/// assert_eq!(provider_for_model(Some("grok-build")), Provider::Grok);
 /// assert_eq!(provider_for_model(Some("groq-llama-3")), Provider::Claude);
 /// assert_eq!(provider_for_model(Some("claude-opus-4-7")), Provider::Claude);
 /// assert_eq!(provider_for_model(None), Provider::Claude);
@@ -640,13 +640,13 @@ mod tests {
     // ============ primary_runner_match tests ============
 
     /// Build a minimal PrimaryRunnerConfig for tests: "review" and "milestone"
-    /// task types route to "grok-4" via byTaskType; "REVIEW-" id prefix also
-    /// routes to "grok-4" via byIdPrefix.
+    /// task types route to "grok-build" via byTaskType; "REVIEW-" id prefix also
+    /// routes to "grok-build" via byIdPrefix.
     fn make_primary_runner_cfg() -> PrimaryRunnerConfig {
         use std::collections::HashMap;
         let grok_spec = RunnerSpec {
             provider: "grok".to_string(),
-            model: "grok-4".to_string(),
+            model: "grok-build".to_string(),
         };
         let mut by_task_type = HashMap::new();
         by_task_type.insert("review".to_string(), grok_spec.clone());
@@ -661,7 +661,7 @@ mod tests {
         }
     }
 
-    /// AC: taskType='review' + no task.model → resolves to 'grok-4'.
+    /// AC: taskType='review' + no task.model → resolves to 'grok-build'.
     #[test]
     fn test_primary_runner_task_type_review_resolves_grok() {
         let cfg = make_primary_runner_cfg();
@@ -670,10 +670,10 @@ mod tests {
             primary_runner: Some(&cfg),
             ..ctx()
         });
-        assert_eq!(result, Some("grok-4".to_string()));
+        assert_eq!(result, Some("grok-build".to_string()));
     }
 
-    /// AC: taskType='milestone' → resolves to 'grok-4'.
+    /// AC: taskType='milestone' → resolves to 'grok-build'.
     #[test]
     fn test_primary_runner_task_type_milestone_resolves_grok() {
         let cfg = make_primary_runner_cfg();
@@ -682,10 +682,10 @@ mod tests {
             primary_runner: Some(&cfg),
             ..ctx()
         });
-        assert_eq!(result, Some("grok-4".to_string()));
+        assert_eq!(result, Some("grok-build".to_string()));
     }
 
-    /// AC: id='REVIEW-001' with taskType='implementation' → resolves to 'grok-4'
+    /// AC: id='REVIEW-001' with taskType='implementation' → resolves to 'grok-build'
     /// (prefix match: byIdPrefix has "REVIEW-" key; byTaskType has no "implementation" key).
     #[test]
     fn test_primary_runner_id_prefix_match_wins_when_task_type_absent() {
@@ -696,10 +696,10 @@ mod tests {
             primary_runner: Some(&cfg),
             ..ctx()
         });
-        assert_eq!(result, Some("grok-4".to_string()));
+        assert_eq!(result, Some("grok-build".to_string()));
     }
 
-    /// AC: id='FEAT-001' with taskType='review' → resolves to 'grok-4'
+    /// AC: id='FEAT-001' with taskType='review' → resolves to 'grok-build'
     /// (taskType match wins even when byIdPrefix has no "FEAT-" key).
     #[test]
     fn test_primary_runner_task_type_wins_over_no_prefix_match() {
@@ -710,7 +710,7 @@ mod tests {
             primary_runner: Some(&cfg),
             ..ctx()
         });
-        assert_eq!(result, Some("grok-4".to_string()));
+        assert_eq!(result, Some("grok-build".to_string()));
     }
 
     /// AC: explicit task.model='claude-opus-4-7' on a review task → resolves to
@@ -727,7 +727,7 @@ mod tests {
         assert_eq!(result, Some(OPUS_MODEL.to_string()));
     }
 
-    /// AC: difficulty='high' on a review task → resolves to 'grok-4'
+    /// AC: difficulty='high' on a review task → resolves to 'grok-build'
     /// (primaryRunner rung 2 wins over difficulty=high rung 3).
     #[test]
     fn test_primary_runner_wins_over_difficulty_high() {
@@ -740,7 +740,7 @@ mod tests {
         });
         assert_eq!(
             result,
-            Some("grok-4".to_string()),
+            Some("grok-build".to_string()),
             "primaryRunner rung must precede difficulty=high escalation"
         );
     }
@@ -784,7 +784,7 @@ mod tests {
             primary_runner: Some(&cfg),
             ..ctx()
         });
-        assert_eq!(result, Some("grok-4".to_string()));
+        assert_eq!(result, Some("grok-build".to_string()));
     }
 
     // ============ primary_runner_match unit tests ============
@@ -828,7 +828,7 @@ mod tests {
         let cfg = make_primary_runner_cfg();
         // task_type is not in byTaskType; id prefix IS in byIdPrefix.
         let spec = primary_runner_match(&cfg, Some("REVIEW-001"), Some("implementation"));
-        assert_eq!(spec.map(|s| s.model.as_str()), Some("grok-4"));
+        assert_eq!(spec.map(|s| s.model.as_str()), Some("grok-build"));
     }
 
     #[test]

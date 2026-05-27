@@ -37,14 +37,14 @@ use task_mgr::models::Task;
 
 // ── End-to-end shape via apply_review_model_override + resolve_effective_runner ──
 
-/// AC: positive (sequential shape). With `reviewModel = "grok-4"`, a
+/// AC: positive (sequential shape). With `reviewModel = "grok-build"`, a
 /// review-class task (`CODE-REVIEW-1`, `MILESTONE-FINAL`, `REVIEW-001`)
-/// resolves `effective_model` to `grok-4` and `resolve_effective_runner`
+/// resolves `effective_model` to `grok-build` and `resolve_effective_runner`
 /// returns `RunnerKind::Grok`. The `--model` flag downstream would receive
 /// the same string — this composition is what the sequential dispatch site
 /// does.
 #[test]
-fn sequential_review_class_routes_to_grok_4() {
+fn sequential_review_class_routes_to_grok_build() {
     let ctx = IterationContext::new(8);
     // Use prefixed ids — production task ids carry an 8-hex-char prefix.
     for task_id in &[
@@ -52,12 +52,12 @@ fn sequential_review_class_routes_to_grok_4() {
         "8d71d1f7-MILESTONE-FINAL",
         "8d71d1f7-REVIEW-001",
     ] {
-        let effective_model = apply_review_model_override(Some("grok-4"), task_id);
+        let effective_model = apply_review_model_override(Some("grok-build"), task_id);
         assert_eq!(
             effective_model.as_deref(),
-            Some("grok-4"),
-            "review-class id {task_id} MUST resolve effective_model to grok-4 \
-             when reviewModel is grok-4 — same string flows to the `--model` flag",
+            Some("grok-build"),
+            "review-class id {task_id} MUST resolve effective_model to grok-build \
+             when reviewModel is grok-build — same string flows to the `--model` flag",
         );
         assert_eq!(
             resolve_effective_runner(&ctx, task_id, effective_model.as_deref()),
@@ -104,14 +104,14 @@ fn non_review_tasks_are_not_routed_when_review_model_is_set() {
         "8d71d1f7-FEAT-001",
     ] {
         assert_eq!(
-            apply_review_model_override(Some("grok-4"), task_id),
+            apply_review_model_override(Some("grok-build"), task_id),
             None,
             "non-review id {task_id} MUST NOT receive reviewModel routing — \
              the predicate must be review-class-specific",
         );
         // And the baked Opus survives → Claude runner.
         let effective_model =
-            apply_review_model_override(Some("grok-4"), task_id).or(Some(OPUS_MODEL.to_string()));
+            apply_review_model_override(Some("grok-build"), task_id).or(Some(OPUS_MODEL.to_string()));
         assert_eq!(
             resolve_effective_runner(&ctx, task_id, effective_model.as_deref()),
             RunnerKind::Claude,
@@ -136,9 +136,9 @@ fn write_base_prompt(temp: &TempDir) -> std::path::PathBuf {
     p
 }
 
-/// AC: positive (wave). With `reviewModel = "grok-4"`, the per-slot
+/// AC: positive (wave). With `reviewModel = "grok-build"`, the per-slot
 /// `prompt_bundle.resolved_model` for a review-class slot is rewritten to
-/// `grok-4` BEFORE the slot worker spawns. This mirrors the wave loop's
+/// `grok-build` BEFORE the slot worker spawns. This mirrors the wave loop's
 /// inner per-slot mutation step — the field, not a transient local, is the
 /// thing that feeds runner selection, the `--model` flag, and the
 /// prompt-baked model.
@@ -148,7 +148,7 @@ fn write_base_prompt(temp: &TempDir) -> std::path::PathBuf {
 /// `prompt_bundle.resolved_model` as the baked Opus constant — runner would select
 /// Grok but the `--model` flag would still pass the Claude model id.
 #[test]
-fn wave_review_class_slot_bundle_resolved_model_is_rewritten_to_grok_4() {
+fn wave_review_class_slot_bundle_resolved_model_is_rewritten_to_grok_build() {
     let (temp, conn) = setup_migrated_db();
     let base = write_base_prompt(&temp);
 
@@ -187,7 +187,7 @@ fn wave_review_class_slot_bundle_resolved_model_is_rewritten_to_grok_4() {
     // `run_wave_iteration` does exactly this assignment after the bundle is
     // built and before the runner resolves.
     let mut bundle = bundle;
-    if let Some(rm) = apply_review_model_override(Some("grok-4"), &bundle.task_id) {
+    if let Some(rm) = apply_review_model_override(Some("grok-build"), &bundle.task_id) {
         bundle.resolved_model = Some(rm);
     }
 
@@ -195,7 +195,7 @@ fn wave_review_class_slot_bundle_resolved_model_is_rewritten_to_grok_4() {
     // — this is what `run_slot_iteration` reads for the `--model` flag.
     assert_eq!(
         bundle.resolved_model.as_deref(),
-        Some("grok-4"),
+        Some("grok-build"),
         "the bundle's resolved_model field MUST be rewritten — overriding \
          only a local would send the Grok runner a Claude `--model` value",
     );
@@ -238,7 +238,7 @@ fn wave_non_review_slot_bundle_is_untouched_when_review_model_is_set() {
     let mut bundle = build_prompt(&conn, &task, &params);
 
     // Mirror the wave-loop's override step.
-    if let Some(rm) = apply_review_model_override(Some("grok-4"), &bundle.task_id) {
+    if let Some(rm) = apply_review_model_override(Some("grok-build"), &bundle.task_id) {
         bundle.resolved_model = Some(rm);
     }
 

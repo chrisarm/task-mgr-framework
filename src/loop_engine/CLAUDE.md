@@ -88,12 +88,12 @@ as the FIRST choice.
     "claudeFallbackModel": "<a Claude model id — e.g. the SONNET_MODEL constant in src/loop_engine/model.rs>",
     "runtimeErrorThreshold": 2,
     "byTaskType": {
-      "review":    { "provider": "grok", "model": "grok-4-fast" },
-      "milestone": { "provider": "grok", "model": "grok-4-fast" }
+      "review":    { "provider": "grok", "model": "grok-build" },
+      "milestone": { "provider": "grok", "model": "grok-build" }
     },
     "byIdPrefix": {
-      "REVIEW-":    { "provider": "grok", "model": "grok-4" },
-      "MILESTONE-": { "provider": "grok", "model": "grok-4" }
+      "REVIEW-":    { "provider": "grok", "model": "grok-build" },
+      "MILESTONE-": { "provider": "grok", "model": "grok-build" }
     }
   }
 }

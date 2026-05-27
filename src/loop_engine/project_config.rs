@@ -55,7 +55,7 @@ impl Default for FallbackRunnerConfig {
 pub struct RunnerSpec {
     /// Provider name (e.g. `"grok"`, `"claude"`).
     pub provider: String,
-    /// Model identifier passed to the provider CLI (e.g. `"grok-4"`).
+    /// Model identifier passed to the provider CLI (e.g. `"grok-build"`).
     pub model: String,
 }
 
@@ -228,7 +228,7 @@ pub struct ProjectConfig {
     /// Optional model to route review-class tasks to (`CODE-REVIEW-*`,
     /// `MILESTONE-FINAL`, `REVIEW-*`). When set, these tasks are dispatched
     /// using this model instead of the default Claude model. Typically a Grok
-    /// model id (e.g. `"grok-4"`). Absent key or explicit `null` → `None`.
+    /// model id (e.g. `"grok-build"`). Absent key or explicit `null` → `None`.
     #[serde(default)]
     pub review_model: Option<String>,
 
@@ -954,11 +954,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(
             dir.path().join("config.json"),
-            r#"{"reviewModel": "grok-4"}"#,
+            r#"{"reviewModel": "grok-build"}"#,
         )
         .unwrap();
         let config = read_project_config(dir.path());
-        assert_eq!(config.review_model.as_deref(), Some("grok-4"));
+        assert_eq!(config.review_model.as_deref(), Some("grok-build"));
     }
 
     #[test]
@@ -974,7 +974,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(
             dir.path().join("config.json"),
-            r#"{"review_model": "grok-4"}"#,
+            r#"{"review_model": "grok-build"}"#,
         )
         .unwrap();
         let config = read_project_config(dir.path());
@@ -1047,12 +1047,12 @@ mod tests {
         let _guard = GROK_BINARY_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let bogus = "/tmp/task-mgr-test-nonexistent-grok-binary-xyz";
         unsafe { std::env::set_var("GROK_BINARY", bogus) };
-        let result = check_review_model_binary(Some("grok-4"), None);
+        let result = check_review_model_binary(Some("grok-build"), None);
         unsafe { std::env::remove_var("GROK_BINARY") };
         assert!(result.is_err(), "missing grok binary must return Err");
         let msg = format!("{}", result.unwrap_err());
         assert!(
-            msg.contains("grok-4"),
+            msg.contains("grok-build"),
             "error should mention the reviewModel value; got: {msg}"
         );
     }
@@ -1066,7 +1066,7 @@ mod tests {
         let bogus_cli = "/tmp/task-mgr-test-nonexistent-grok-cli-xyz";
         // Ensure GROK_BINARY is absent so we fall through to fallback_cli_binary.
         unsafe { std::env::remove_var("GROK_BINARY") };
-        let result = check_review_model_binary(Some("grok-4-fast"), Some(bogus_cli));
+        let result = check_review_model_binary(Some("grok-build"), Some(bogus_cli));
         assert!(
             result.is_err(),
             "non-existent cliBinary path must return Err"
@@ -1126,12 +1126,12 @@ mod tests {
                     "claudeFallbackModel": "{SONNET_MODEL}",
                     "runtimeErrorThreshold": 3,
                     "byTaskType": {{
-                        "review":    {{ "provider": "grok", "model": "grok-4" }},
-                        "milestone": {{ "provider": "grok", "model": "grok-4" }}
+                        "review":    {{ "provider": "grok", "model": "grok-build" }},
+                        "milestone": {{ "provider": "grok", "model": "grok-build" }}
                     }},
                     "byIdPrefix": {{
-                        "REVIEW-":    {{ "provider": "grok", "model": "grok-4" }},
-                        "MILESTONE-": {{ "provider": "grok", "model": "grok-4" }}
+                        "REVIEW-":    {{ "provider": "grok", "model": "grok-build" }},
+                        "MILESTONE-": {{ "provider": "grok", "model": "grok-build" }}
                     }}
                 }}
             }}"#
@@ -1145,25 +1145,25 @@ mod tests {
 
         let review_spec = pr.by_task_type.get("review").expect("review key missing");
         assert_eq!(review_spec.provider, "grok");
-        assert_eq!(review_spec.model, "grok-4");
+        assert_eq!(review_spec.model, "grok-build");
 
         let milestone_spec = pr
             .by_task_type
             .get("milestone")
             .expect("milestone key missing");
         assert_eq!(milestone_spec.provider, "grok");
-        assert_eq!(milestone_spec.model, "grok-4");
+        assert_eq!(milestone_spec.model, "grok-build");
 
         let rev_prefix_spec = pr.by_id_prefix.get("REVIEW-").expect("REVIEW- key missing");
         assert_eq!(rev_prefix_spec.provider, "grok");
-        assert_eq!(rev_prefix_spec.model, "grok-4");
+        assert_eq!(rev_prefix_spec.model, "grok-build");
 
         let ms_prefix_spec = pr
             .by_id_prefix
             .get("MILESTONE-")
             .expect("MILESTONE- key missing");
         assert_eq!(ms_prefix_spec.provider, "grok");
-        assert_eq!(ms_prefix_spec.model, "grok-4");
+        assert_eq!(ms_prefix_spec.model, "grok-build");
     }
 
     #[test]
@@ -1176,7 +1176,7 @@ mod tests {
             r#"{
                 "primaryRunner": {
                     "byTaskType": {
-                        "review": { "provider": "grok", "model": "grok-4-fast" }
+                        "review": { "provider": "grok", "model": "grok-build" }
                     }
                 }
             }"#,
@@ -1191,7 +1191,7 @@ mod tests {
         assert_eq!(pr.runtime_error_threshold, 2, "default threshold is 2");
         assert!(pr.by_id_prefix.is_empty(), "byIdPrefix absent → empty map");
         let spec = pr.by_task_type.get("review").expect("review key missing");
-        assert_eq!(spec.model, "grok-4-fast");
+        assert_eq!(spec.model, "grok-build");
     }
 
     #[test]

@@ -12,7 +12,7 @@
 //!
 //! 1. Token-equality, not substring matching. `lower.split('-').any(|t| t == "grok")`
 //!    correctly classifies:
-//!    - `grok-4`, `grok-4-fast`, `grok-code-fast-1`, `GROK-4`, `Grok-4-Fast`
+//!    - `grok-build`, `grok-code-fast-1`, `GROK-BUILD`, `Grok-Code-Fast-1`
 //!      → `Provider::Grok`
 //!    - `groq-llama-70b`, `groq-llama-3` (Groq Inc., NOT xAI) → `Provider::Claude`
 //!    - `OPUS_MODEL`, `SONNET_MODEL`, `HAIKU_MODEL` (Claude model constants),
@@ -50,12 +50,11 @@ use task_mgr::loop_engine::model::{
 #[test]
 fn provider_for_model_positive_grok_ids() {
     let positives = [
-        "grok-4",
-        "grok-4-fast",
+        "grok-build",
         "grok-code-fast-1",
         // Case-insensitive normalization (also covered by `mixed_case` test).
-        "GROK-4",
-        "Grok-4-Fast",
+        "GROK-BUILD",
+        "Grok-Code-Fast-1",
     ];
     for m in positives {
         assert_eq!(
@@ -191,11 +190,10 @@ fn provider_for_model_grok_with_hyphen_artifacts_is_grok() {
 #[test]
 fn escalate_model_on_grok_returns_none() {
     for m in [
-        "grok-4-fast",
-        "grok-4",
+        "grok-build",
         "grok-code-fast-1",
-        "GROK-4",
-        "Grok-4-Fast",
+        "GROK-BUILD",
+        "Grok-Code-Fast-1",
     ] {
         assert_eq!(
             escalate_model(Some(m)),
@@ -208,7 +206,7 @@ fn escalate_model_on_grok_returns_none() {
 /// AC 6: escalate_below_opus on a Grok model returns None.
 #[test]
 fn escalate_below_opus_on_grok_returns_none() {
-    for m in ["grok-4", "grok-4-fast", "grok-code-fast-1"] {
+    for m in ["grok-build", "grok-code-fast-1", "GROK-BUILD"] {
         assert_eq!(
             escalate_below_opus(Some(m)),
             None,
@@ -223,7 +221,7 @@ fn escalate_below_opus_on_grok_returns_none() {
 /// equivalent and the helper must not pretend otherwise.
 #[test]
 fn to_1m_model_on_grok_returns_none() {
-    for m in ["grok-4-fast", "grok-4", "grok-code-fast-1"] {
+    for m in ["grok-build", "grok-code-fast-1", "Grok-Code-Fast-1"] {
         assert_eq!(
             to_1m_model(Some(m)),
             None,

@@ -296,14 +296,14 @@ Claude after the overflow ladder is exhausted (rung 4) or after repeated
   "fallbackRunner": {
     "enabled": true,
     "provider": "grok",
-    "model": "grok-4-fast",
+    "model": "grok-build",
     "cliBinary": "/usr/local/bin/grok",
     "runtimeErrorThreshold": 2
   }
 }
 ```
 
-Field defaults: `enabled=false`, `provider="grok"`, `model="grok-4-fast"`,
+Field defaults: `enabled=false`, `provider="grok"`, `model="grok-build"`,
 `cliBinary=null` (resolves bare `grok` on PATH), `runtimeErrorThreshold=2`.
 With the block absent or `enabled:false`, loop behavior is byte-identical
 to the pure-Claude 4-rung overflow ladder ending in `Blocked`.

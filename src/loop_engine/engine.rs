@@ -933,9 +933,9 @@ mod tests {
     #[test]
     fn feat_005_default_empty_ctx_with_grok_model_resolves_to_grok() {
         let ctx = IterationContext::new(8);
-        // Token-equality on `-` splits — `grok-4-fast` has token `grok`.
+        // Token-equality on `-` splits — `grok-build` has token `grok`.
         assert_eq!(
-            resolve_effective_runner(&ctx, "TASK-001", Some("grok-4-fast")),
+            resolve_effective_runner(&ctx, "TASK-001", Some("grok-build")),
             RunnerKind::Grok,
             "Grok model with empty runner_overrides MUST resolve to Grok via \
              provider_for_model token-equality",
@@ -1004,8 +1004,8 @@ mod tests {
             "8d71d1f7-REVIEW-001",
         ] {
             assert_eq!(
-                apply_review_model_override(Some("grok-4"), id),
-                Some("grok-4".to_string()),
+                apply_review_model_override(Some("grok-build"), id),
+                Some("grok-build".to_string()),
                 "review-class id {id} MUST receive the reviewModel override",
             );
         }
@@ -1028,7 +1028,7 @@ mod tests {
             "8d71d1f7-REFACTOR-REVIEW-FINAL",
         ] {
             assert_eq!(
-                apply_review_model_override(Some("grok-4"), id),
+                apply_review_model_override(Some("grok-build"), id),
                 None,
                 "non-review id {id} MUST NOT receive the reviewModel override",
             );
@@ -1050,11 +1050,11 @@ mod tests {
 
     #[test]
     fn feat_002_review_override_trims_whitespace() {
-        // Outer whitespace is trimmed so a `"reviewModel": "  grok-4  "` config
+        // Outer whitespace is trimmed so a `"reviewModel": "  grok-build  "` config
         // doesn't ship a model id with surprise whitespace to the runner.
         assert_eq!(
-            apply_review_model_override(Some("  grok-4  "), "CODE-REVIEW-1"),
-            Some("grok-4".to_string()),
+            apply_review_model_override(Some("  grok-build  "), "CODE-REVIEW-1"),
+            Some("grok-build".to_string()),
         );
     }
 
@@ -1073,8 +1073,8 @@ mod tests {
             Some("gpt-4".to_string()),
         );
         assert_eq!(
-            apply_review_model_override(Some("grok-4-fast"), "REVIEW-001"),
-            Some("grok-4-fast".to_string()),
+            apply_review_model_override(Some("grok-build"), "REVIEW-001"),
+            Some("grok-build".to_string()),
         );
     }
 
@@ -1086,8 +1086,8 @@ mod tests {
         // dispatch site relies on to keep selection + `--model` consistent.
         let ctx = IterationContext::new(8);
         let task_id = "8d71d1f7-CODE-REVIEW-1";
-        let effective_model = apply_review_model_override(Some("grok-4"), task_id);
-        assert_eq!(effective_model.as_deref(), Some("grok-4"));
+        let effective_model = apply_review_model_override(Some("grok-build"), task_id);
+        assert_eq!(effective_model.as_deref(), Some("grok-build"));
         assert_eq!(
             resolve_effective_runner(&ctx, task_id, effective_model.as_deref()),
             RunnerKind::Grok,

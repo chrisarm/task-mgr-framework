@@ -33,7 +33,7 @@ use task_mgr::loop_engine::runner::RunnerKind;
 
 /// Grok model used throughout these tests — mirrors what a real operator would
 /// write in `byTaskType["review"].model`.
-const GROK_MODEL: &str = "grok-4-fast";
+const GROK_MODEL: &str = "grok-build";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -137,13 +137,13 @@ fn by_id_prefix_match_when_task_type_is_absent() {
 /// To make this observable, we use different models for the two specs.
 #[test]
 fn by_task_type_wins_over_by_id_prefix_when_both_match() {
-    let grok_prefix_model = "grok-4";
+    let grok_prefix_model = "grok-code-fast-1";
     let mut by_task_type = HashMap::new();
     by_task_type.insert(
         "review".to_string(),
         RunnerSpec {
             provider: "grok".to_string(),
-            model: GROK_MODEL.to_string(), // "grok-4-fast"
+            model: GROK_MODEL.to_string(), // "grok-build"
         },
     );
     let mut by_id_prefix = HashMap::new();
@@ -151,7 +151,7 @@ fn by_task_type_wins_over_by_id_prefix_when_both_match() {
         "REVIEW-".to_string(),
         RunnerSpec {
             provider: "grok".to_string(),
-            model: grok_prefix_model.to_string(), // "grok-4" — different
+            model: grok_prefix_model.to_string(), // "grok-code-fast-1" — different
         },
     );
     let cfg = PrimaryRunnerConfig {
@@ -168,7 +168,7 @@ fn by_task_type_wins_over_by_id_prefix_when_both_match() {
     });
     assert_eq!(
         result.as_deref(),
-        Some(GROK_MODEL), // "grok-4-fast", NOT "grok-4"
+        Some(GROK_MODEL), // "grok-build", NOT "grok-code-fast-1"
         "byTaskType MUST win over byIdPrefix when both maps contain a matching entry",
     );
 }
