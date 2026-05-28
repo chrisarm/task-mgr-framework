@@ -54,6 +54,30 @@ fn get_project_root() -> Result<PathBuf, TaskMgrError> {
     Ok(PathBuf::from(root))
 }
 
+/// Resolve the active PRD task prefix for the diagnostics log filename,
+/// best-effort. Reuses the same active-PRD-context resolver `task-mgr current`
+/// uses (`resolve_context`: env `TASK_MGR_ACTIVE_PREFIX` → single-prefix
+/// fallback) so the log file is suffixed by the SAME prefix as
+/// `tasks/progress-<prefix>.txt`.
+///
+/// Guarded so logging setup has no surprising side effects:
+/// - skips when `tasks.db` is absent → never *creates* a database (e.g. during
+///   `task-mgr init` on a fresh repo);
+/// - uses `open_connection` (schema-only, idempotent), NOT `open_and_migrate`,
+///   so it never applies pending migrations behind `task-mgr migrate status`.
+///
+/// Any resolution error degrades to `None` → the unsuffixed `task-mgr.log`.
+fn resolve_active_prefix_for_logging(db_dir: &Path) -> Option<String> {
+    if !db_dir.join("tasks.db").exists() {
+        return None;
+    }
+    let conn = open_connection(db_dir).ok()?;
+    task_mgr::commands::add::resolve_context(&conn)
+        .ok()
+        .flatten()
+        .map(|ctx| ctx.prefix)
+}
+
 /// Args passed to [`dispatch_init`] — fields mirror `Commands::Init`'s clap
 /// args one-for-one so the call site stays a straight `Args { … }` shuffle.
 struct DispatchInitArgs {
@@ -278,6 +302,13 @@ fn main() {
     }
 
     cli.dir = resolved.path.clone();
+
+    // Initialize diagnostics logging (CONTRACT-LOG-001 channel B) once, before
+    // any loop work. Best-effort: resolves the active PRD prefix the same way
+    // `task-mgr current` does so the log file is suffixed like
+    // `tasks/progress-<prefix>.txt`. Never aborts on failure.
+    let active_prefix = resolve_active_prefix_for_logging(&cli.dir);
+    let _ = task_mgr::observability::init(&cli.dir, active_prefix.as_deref());
 
     if let Err(e) = run(cli, resolved) {
         eprintln!("Error: {}", e);

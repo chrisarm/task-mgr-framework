@@ -122,7 +122,10 @@ pub(crate) fn accumulate(acc: &mut Accumulator, ev: StreamEvent) {
         StreamEvent::LiveOnlyText(_) | StreamEvent::Thought(_) => {}
         StreamEvent::ToolUse { name, input } => {
             let truncated = truncate_bytes(&input, MAX_TOOL_USE_BYTES);
-            append_capped(&mut acc.conversation, &format!("[Tool: {}] {}\n", name, truncated));
+            append_capped(
+                &mut acc.conversation,
+                &format!("[Tool: {}] {}\n", name, truncated),
+            );
         }
         StreamEvent::ToolResult(content) => {
             let truncated = truncate_bytes(&content, MAX_TOOL_RESULT_BYTES);
@@ -296,7 +299,10 @@ pub(crate) fn drive_stream<F: StreamFormat>(
                 },
                 Err(e) if is_pty_read_eof(&e) => break,
                 Err(e) => {
-                    emit_prefixed_lines(slot_label, &format!("Warning: error reading stdout: {}", e));
+                    emit_prefixed_lines(
+                        slot_label,
+                        &format!("Warning: error reading stdout: {}", e),
+                    );
                     break;
                 }
             }
@@ -414,7 +420,11 @@ mod tests {
             }
         }
         let output = format.derive_output(&acc);
-        (output, acc.conversation.clone(), std::mem::take(&mut acc.denials))
+        (
+            output,
+            acc.conversation.clone(),
+            std::mem::take(&mut acc.denials),
+        )
     }
 
     #[test]
@@ -472,7 +482,10 @@ mod tests {
     #[test]
     fn drain_complete_lines_multiple_in_one_chunk() {
         let mut buf = "a\nb\nc".to_string();
-        assert_eq!(drain_complete_lines(&mut buf), vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(
+            drain_complete_lines(&mut buf),
+            vec!["a".to_string(), "b".to_string()]
+        );
         assert_eq!(buf, "c");
     }
 
@@ -484,7 +497,11 @@ mod tests {
         let kept: Vec<&str> = tee_visible_lines(block).collect();
         assert_eq!(
             kept,
-            vec!["First, check the branch.", "Use run_terminal.", "Then run the gate."],
+            vec![
+                "First, check the branch.",
+                "Use run_terminal.",
+                "Then run the gate."
+            ],
             "blank and whitespace-only lines are suppressed; content lines kept in order"
         );
     }
@@ -519,7 +536,10 @@ mod tests {
         let epoch = AtomicU64::new(0);
         // Two text chunks that only form the tag once concatenated.
         let mut acc = Accumulator::default();
-        accumulate(&mut acc, StreamEvent::AssistantText("<completed>RE".to_string()));
+        accumulate(
+            &mut acc,
+            StreamEvent::AssistantText("<completed>RE".to_string()),
+        );
         arm_completion_grace(&acc.assistant_buf, Some("REVIEW-1"), &epoch);
         assert_eq!(epoch.load(Ordering::Acquire), 0, "partial tag must not arm");
         accumulate(
@@ -576,7 +596,10 @@ mod tests {
         // transcript records only [Error: ...] — content blocks suppressed.
         let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"should not appear"}]},"model":"m","error":"boom"}"#;
         let (_output, conv, _d) = run_format(&ClaudeStreamFormat, &[line]);
-        assert!(conv.contains("[Error: boom]"), "error must be in transcript");
+        assert!(
+            conv.contains("[Error: boom]"),
+            "error must be in transcript"
+        );
         assert!(
             !conv.contains("should not appear"),
             "errored-message text must be suppressed from the transcript"

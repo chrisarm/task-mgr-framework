@@ -609,8 +609,10 @@ fn write_project_defaults(db_dir: &Path) -> std::io::Result<bool> {
 const GITIGNORE_MARKER_BEGIN: &str = "# task-mgr begin: progress files (untracked)";
 const GITIGNORE_MARKER_END: &str = "# task-mgr end: progress files (untracked)";
 
-/// The single pattern inserted between the gitignore markers.
-const GITIGNORE_BODY: &str = "tasks/progress-*.txt\n";
+/// The patterns inserted between the gitignore markers: per-PRD progress files
+/// and the diagnostics log directory (CONTRACT-LOG-001 channel B), both
+/// task-mgr-managed and untracked.
+const GITIGNORE_BODY: &str = "tasks/progress-*.txt\n.task-mgr/logs/\n";
 
 /// Compute the new contents of `.gitignore` after ensuring the task-mgr managed
 /// block is present and has the expected body. Returns `None` when no rewrite is

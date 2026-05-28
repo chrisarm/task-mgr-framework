@@ -1,3 +1,16 @@
+//! Product/operator output channel.
+//!
+//! [`ui`] is the CONTRACT-LOG-001 channels A/A2 surface: human-facing progress,
+//! byte-locked operator-contract lines, and machine-readable CLI data, each
+//! written to its audience FD with **no** level/timestamp decoration. Internal
+//! diagnostics (channel B) live in [`crate::observability`] (`tracing`) instead.
+//!
+//! The decorated helpers below ([`warn`]) own the color/NO_COLOR/TTY discipline
+//! via [`should_color`]; the raw `ui::` passthrough emitters deliberately do not
+//! decorate, so they preserve exact bytes for snapshot tests and operator greps.
+
+pub mod ui;
+
 /// Emit a `[warn]` line to stderr.
 ///
 /// Color (yellow ANSI) is suppressed when `NO_COLOR` is set (any value, per
