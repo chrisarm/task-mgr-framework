@@ -33,6 +33,16 @@ impl StaleTracker {
         }
     }
 
+    /// Record that no progress was made this iteration (increments stale counter).
+    pub fn mark_stale(&mut self) {
+        self.consecutive_stale = self.consecutive_stale.saturating_add(1);
+    }
+
+    /// Record that progress was made this iteration (resets stale counter to 0).
+    pub fn reset_progress(&mut self) {
+        self.consecutive_stale = 0;
+    }
+
     /// Whether the loop should abort due to too many consecutive stale iterations.
     pub fn should_abort(&self) -> bool {
         self.consecutive_stale >= self.threshold

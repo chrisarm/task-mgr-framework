@@ -393,7 +393,7 @@ fn handle_no_eligible_tasks(
 
     // (3) Genuinely stuck: nothing eligible, nothing recoverable. Count toward
     // the stale-abort threshold exactly as before.
-    ctx.stale_tracker.check("stale", "stale");
+    ctx.stale_tracker.mark_stale();
     progress::log_iteration(
         params.progress_path,
         params.iteration,
@@ -458,7 +458,7 @@ fn handle_ephemeral_deadlock(
     ctx: &mut IterationContext,
     diagnostics: Vec<(String, Vec<String>)>,
 ) -> WaveOutcome {
-    ctx.stale_tracker.check("stale", "stale");
+    ctx.stale_tracker.mark_stale();
     progress::log_iteration(
         params.progress_path,
         params.iteration,
@@ -665,7 +665,11 @@ pub(crate) fn count_remaining_tasks(
 /// "skipped", "irrelevant" and "blocked" are terminal — anything else is
 /// still work to do.
 pub(crate) fn count_remaining_active_tasks(conn: &Connection, task_prefix: Option<&str>) -> i64 {
-    count_remaining_tasks(conn, task_prefix, &["done", "irrelevant", "skipped", "blocked"])
+    count_remaining_tasks(
+        conn,
+        task_prefix,
+        &["done", "irrelevant", "skipped", "blocked"],
+    )
 }
 
 /// Count tasks in a single terminal-but-unfinished `status` for the current PRD
@@ -1052,9 +1056,8 @@ pub fn run_wave_iteration(
         return handle_no_eligible_tasks(&mut params, ctx);
     }
 
-    // Selected at least one eligible task → reset stale tracker (mirrors
-    // the sequential `else` branch that calls `check("a", "b")`).
-    ctx.stale_tracker.check("a", "b");
+    // Selected at least one eligible task → reset stale tracker.
+    ctx.stale_tracker.reset_progress();
 
     let n_slots = group.len();
     let slot_paths: &[PathBuf] = &params.slot_worktree_paths[..n_slots];
@@ -2026,8 +2029,8 @@ mod tests {
         let signal = SignalFlag::new();
         let mut ctx = IterationContext::new(5);
         // Pre-stale twice so the next NoEligibleTasks wave hits threshold=3.
-        ctx.stale_tracker.check("x", "x");
-        ctx.stale_tracker.check("x", "x");
+        ctx.stale_tracker.mark_stale();
+        ctx.stale_tracker.mark_stale();
         let project_cfg = crate::loop_engine::project_config::ProjectConfig::default();
         let prd_implicit: Vec<String> = Vec::new();
         let outcome = run_wave_iteration(
