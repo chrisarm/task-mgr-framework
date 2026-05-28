@@ -631,19 +631,27 @@ fn build_slot_prompt_params<'a>(
     }
 }
 
-/// Count tasks still in flight for the current PRD prefix. "Done",
-/// "skipped", "irrelevant" and "blocked" are terminal — anything else is
-/// still work to do.
-pub(crate) fn count_remaining_active_tasks(conn: &Connection, task_prefix: Option<&str>) -> i64 {
+/// Count tasks whose status is not in `excluded` for the current PRD prefix.
+///
+/// Both the sequential (`run_iteration`) and wave (`run_wave_iteration`) paths
+/// check how many tasks remain — they differ only in which statuses they treat
+/// as terminal. `archived_at IS NULL` is mandatory: archiving stamps `archived_at`
+/// on prefix-matched rows regardless of status (archive.rs), so an archived row
+/// would otherwise mis-classify the drain state. Locked by
+/// archive.rs::test_archived_tasks_invisible_to_status_count_query.
+pub(crate) fn count_remaining_tasks(
+    conn: &Connection,
+    task_prefix: Option<&str>,
+    excluded: &[&str],
+) -> i64 {
     let (clause, param) = prefix_and(task_prefix);
-    // `archived_at IS NULL` is mandatory: archiving stamps `archived_at` on all
-    // prefix-matched rows regardless of status (archive.rs), so an archived
-    // todo/in_progress row would otherwise count as remaining work and the wave
-    // would never recognize completion. Matches the sequential predicate and is
-    // locked by archive.rs::test_archived_tasks_invisible_to_status_count_query.
+    let not_in = excluded
+        .iter()
+        .map(|s| format!("'{s}'"))
+        .collect::<Vec<_>>()
+        .join(",");
     let sql = format!(
-        "SELECT COUNT(*) FROM tasks WHERE status NOT IN \
-         ('done','irrelevant','skipped','blocked') AND archived_at IS NULL {clause}"
+        "SELECT COUNT(*) FROM tasks WHERE status NOT IN ({not_in}) AND archived_at IS NULL {clause}"
     );
     let p_vec: Vec<&dyn rusqlite::types::ToSql> = match &param {
         Some(p) => vec![p],
@@ -651,6 +659,13 @@ pub(crate) fn count_remaining_active_tasks(conn: &Connection, task_prefix: Optio
     };
     conn.query_row(&sql, p_vec.as_slice(), |r| r.get(0))
         .unwrap_or(0)
+}
+
+/// Count tasks still in flight for the current PRD prefix. "Done",
+/// "skipped", "irrelevant" and "blocked" are terminal — anything else is
+/// still work to do.
+pub(crate) fn count_remaining_active_tasks(conn: &Connection, task_prefix: Option<&str>) -> i64 {
+    count_remaining_tasks(conn, task_prefix, &["done", "irrelevant", "skipped", "blocked"])
 }
 
 /// Count tasks in a single terminal-but-unfinished `status` for the current PRD
