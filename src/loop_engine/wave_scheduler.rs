@@ -644,21 +644,32 @@ pub(crate) fn count_remaining_tasks(
     task_prefix: Option<&str>,
     excluded: &[&str],
 ) -> i64 {
+    if excluded.is_empty() {
+        tracing::error!(
+            "count_remaining_tasks called with empty excluded slice — SQL `NOT IN ()` would be invalid; returning 0. Caller must pass at least one terminal status."
+        );
+        return 0;
+    }
     let (clause, param) = prefix_and(task_prefix);
-    let not_in = excluded
-        .iter()
-        .map(|s| format!("'{s}'"))
-        .collect::<Vec<_>>()
-        .join(",");
+    let placeholders = vec!["?"; excluded.len()].join(",");
     let sql = format!(
-        "SELECT COUNT(*) FROM tasks WHERE status NOT IN ({not_in}) AND archived_at IS NULL {clause}"
+        "SELECT COUNT(*) FROM tasks WHERE status NOT IN ({placeholders}) AND archived_at IS NULL {clause}"
     );
-    let p_vec: Vec<&dyn rusqlite::types::ToSql> = match &param {
-        Some(p) => vec![p],
-        None => vec![],
-    };
-    conn.query_row(&sql, p_vec.as_slice(), |r| r.get(0))
-        .unwrap_or(0)
+    let mut bound: Vec<&dyn rusqlite::types::ToSql> = Vec::with_capacity(excluded.len() + 1);
+    for s in excluded {
+        bound.push(s);
+    }
+    if let Some(p) = &param {
+        bound.push(p);
+    }
+    conn.query_row(&sql, bound.as_slice(), |r| r.get(0))
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                error = %e,
+                "count_remaining_tasks query failed; reporting 0 (drained) may mis-classify completion"
+            );
+            0
+        })
 }
 
 /// Count tasks still in flight for the current PRD prefix. "Done",

@@ -21,7 +21,7 @@ use std::path::Path;
 
 use rusqlite::Connection;
 use serde::Serialize;
-use serde_json;
+use serde_json::to_string_pretty;
 
 use crate::commands::next::output::{LearningSummaryOutput, NextTaskOutput};
 use crate::learnings::recall::{RecallParams, recall_learnings};
@@ -128,7 +128,7 @@ fn format_task_json_raw(
         status,
         title,
     };
-    serde_json::to_string_pretty(&payload).unwrap_or_else(|_| format!("{{\"id\":\"{id}\"}}"))
+    to_string_pretty(&payload).unwrap_or_else(|_| format!("{{\"id\":\"{id}\"}}"))
 }
 
 /// Build the completion-instruction section that tells the agent how to
