@@ -11,11 +11,10 @@ use tempfile::TempDir;
 
 use task_mgr::loop_engine::engine::IterationContext;
 use task_mgr::loop_engine::model::{HAIKU_MODEL, OPUS_MODEL, OPUS_MODEL_1M, SONNET_MODEL};
-use task_mgr::loop_engine::overflow::{
-    self, OverflowEvent, RecoveryAction, sanitize_id_for_filename,
-};
+use task_mgr::loop_engine::overflow::{OverflowEvent, RecoveryAction, sanitize_id_for_filename};
 use task_mgr::loop_engine::project_config::ProjectConfig;
 use task_mgr::loop_engine::prompt::PromptResult;
+use task_mgr::loop_engine::reactions::post_output::{HandleOverflowParams, handle_overflow};
 use task_mgr::loop_engine::runner::RunnerKind;
 
 // ---------- helpers ----------------------------------------------------------
@@ -111,20 +110,20 @@ fn dispatch_wave_overflows(
     for &slot in crashing_slots {
         let task_id = all_task_ids[slot];
         let pr = make_prompt_result(task_id);
-        let action = overflow::handle_prompt_too_long(
+        let action = handle_overflow(HandleOverflowParams {
             ctx,
             conn,
             task_id,
             effort,
-            model,
-            &pr,
+            effective_model: model,
+            prompt_result: &pr,
             iteration,
-            Some("run-wave"),
-            tmp_dir,
-            Some(slot),
-            RunnerKind::Claude,
-            &ProjectConfig::default(),
-        );
+            run_id: Some("run-wave"),
+            base_dir: tmp_dir,
+            slot_index: Some(slot),
+            effective_runner: RunnerKind::Claude,
+            project_config: &ProjectConfig::default(),
+        });
         results.push((slot, action));
     }
     results
@@ -499,20 +498,20 @@ fn sequential_jsonl_event_has_no_slot_index_field() {
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_id);
 
-    let _ = overflow::handle_prompt_too_long(
-        &mut ctx,
-        &mut conn,
+    let _ = handle_overflow(HandleOverflowParams {
+        ctx: &mut ctx,
+        conn: &mut conn,
         task_id,
-        Some("xhigh"),
-        Some(SONNET_MODEL),
-        &pr,
-        1,
-        Some("run-seq"),
-        tmp.path(),
-        None,
-        RunnerKind::Claude,
-        &ProjectConfig::default(),
-    );
+        effort: Some("xhigh"),
+        effective_model: Some(SONNET_MODEL),
+        prompt_result: &pr,
+        iteration: 1,
+        run_id: Some("run-seq"),
+        base_dir: tmp.path(),
+        slot_index: None,
+        effective_runner: RunnerKind::Claude,
+        project_config: &ProjectConfig::default(),
+    });
 
     let raw_events = read_event_values(tmp.path());
     assert_eq!(raw_events.len(), 1);
@@ -550,20 +549,20 @@ fn dump_rotation_keeps_newest_3_across_wave_iterations() {
     ];
     for (iter, &(effort, model)) in calls.iter().enumerate() {
         reset_to_in_progress(&conn, task_id);
-        let _ = overflow::handle_prompt_too_long(
-            &mut ctx,
-            &mut conn,
+        let _ = handle_overflow(HandleOverflowParams {
+            ctx: &mut ctx,
+            conn: &mut conn,
             task_id,
             effort,
-            model,
-            &pr,
-            (iter + 1) as u32,
-            Some("run-wave"),
-            tmp.path(),
-            Some(2),
-            RunnerKind::Claude,
-            &ProjectConfig::default(),
-        );
+            effective_model: model,
+            prompt_result: &pr,
+            iteration: (iter + 1) as u32,
+            run_id: Some("run-wave"),
+            base_dir: tmp.path(),
+            slot_index: Some(2),
+            effective_runner: RunnerKind::Claude,
+            project_config: &ProjectConfig::default(),
+        });
         // Clear model_overrides so each call re-selects the intended rung.
         ctx.model_overrides.remove(task_id);
         ctx.effort_overrides.remove(task_id);
@@ -607,20 +606,20 @@ fn dump_rotation_namespaces_are_per_task_id() {
     // 4 overflows for task_a (all at rung 1 by resetting effort_overrides).
     for iter in 1u32..=4 {
         reset_to_in_progress(&conn, task_a);
-        let _ = overflow::handle_prompt_too_long(
-            &mut ctx,
-            &mut conn,
-            task_a,
-            Some("xhigh"),
-            Some(SONNET_MODEL),
-            &pr_a,
-            iter,
-            Some("run-wave"),
-            tmp.path(),
-            Some(0),
-            RunnerKind::Claude,
-            &ProjectConfig::default(),
-        );
+        let _ = handle_overflow(HandleOverflowParams {
+            ctx: &mut ctx,
+            conn: &mut conn,
+            task_id: task_a,
+            effort: Some("xhigh"),
+            effective_model: Some(SONNET_MODEL),
+            prompt_result: &pr_a,
+            iteration: iter,
+            run_id: Some("run-wave"),
+            base_dir: tmp.path(),
+            slot_index: Some(0),
+            effective_runner: RunnerKind::Claude,
+            project_config: &ProjectConfig::default(),
+        });
         ctx.effort_overrides.remove(task_a);
         ctx.overflow_recovered.remove(task_a);
         ctx.overflow_original_model.remove(task_a);
@@ -629,20 +628,20 @@ fn dump_rotation_namespaces_are_per_task_id() {
     // 2 overflows for task_b.
     for iter in 1u32..=2 {
         reset_to_in_progress(&conn, task_b);
-        let _ = overflow::handle_prompt_too_long(
-            &mut ctx,
-            &mut conn,
-            task_b,
-            Some("xhigh"),
-            Some(SONNET_MODEL),
-            &pr_b,
-            iter,
-            Some("run-wave"),
-            tmp.path(),
-            Some(1),
-            RunnerKind::Claude,
-            &ProjectConfig::default(),
-        );
+        let _ = handle_overflow(HandleOverflowParams {
+            ctx: &mut ctx,
+            conn: &mut conn,
+            task_id: task_b,
+            effort: Some("xhigh"),
+            effective_model: Some(SONNET_MODEL),
+            prompt_result: &pr_b,
+            iteration: iter,
+            run_id: Some("run-wave"),
+            base_dir: tmp.path(),
+            slot_index: Some(1),
+            effective_runner: RunnerKind::Claude,
+            project_config: &ProjectConfig::default(),
+        });
         ctx.effort_overrides.remove(task_b);
         ctx.overflow_recovered.remove(task_b);
         ctx.overflow_original_model.remove(task_b);
@@ -680,20 +679,20 @@ fn overflow_recovered_persists_from_wave_through_sequential_transition() {
     let pr = make_prompt_result(task_id);
 
     // Wave overflow: slot 4, Sonnet, xhigh → rung 1 (DowngradeEffort).
-    let wave_action = overflow::handle_prompt_too_long(
-        &mut ctx,
-        &mut conn,
+    let wave_action = handle_overflow(HandleOverflowParams {
+        ctx: &mut ctx,
+        conn: &mut conn,
         task_id,
-        Some("xhigh"),
-        Some(SONNET_MODEL),
-        &pr,
-        1,
-        Some("run-wave"),
-        tmp.path(),
-        Some(4),
-        RunnerKind::Claude,
-        &ProjectConfig::default(),
-    );
+        effort: Some("xhigh"),
+        effective_model: Some(SONNET_MODEL),
+        prompt_result: &pr,
+        iteration: 1,
+        run_id: Some("run-wave"),
+        base_dir: tmp.path(),
+        slot_index: Some(4),
+        effective_runner: RunnerKind::Claude,
+        project_config: &ProjectConfig::default(),
+    });
     assert!(
         matches!(wave_action, RecoveryAction::DowngradeEffort { .. }),
         "rung 1 expected: {wave_action:?}"
@@ -711,20 +710,20 @@ fn overflow_recovered_persists_from_wave_through_sequential_transition() {
     reset_to_in_progress(&conn, task_id);
 
     // Sequential overflow: same task_id, now at high effort → rung 2 (EscalateModel).
-    let seq_action = overflow::handle_prompt_too_long(
-        &mut ctx,
-        &mut conn,
+    let seq_action = handle_overflow(HandleOverflowParams {
+        ctx: &mut ctx,
+        conn: &mut conn,
         task_id,
-        Some("high"),
-        Some(SONNET_MODEL),
-        &pr,
-        2,
-        Some("run-seq"),
-        tmp.path(),
-        None,
-        RunnerKind::Claude,
-        &ProjectConfig::default(),
-    );
+        effort: Some("high"),
+        effective_model: Some(SONNET_MODEL),
+        prompt_result: &pr,
+        iteration: 2,
+        run_id: Some("run-seq"),
+        base_dir: tmp.path(),
+        slot_index: None,
+        effective_runner: RunnerKind::Claude,
+        project_config: &ProjectConfig::default(),
+    });
     assert!(
         matches!(seq_action, RecoveryAction::EscalateModel { .. }),
         "rung 2 expected: {seq_action:?}"
@@ -784,20 +783,20 @@ fn overflow_recovered_persists_from_sequential_through_wave_transition() {
     let pr = make_prompt_result(task_id);
 
     // Sequential overflow: Haiku, xhigh → rung 1.
-    let _ = overflow::handle_prompt_too_long(
-        &mut ctx,
-        &mut conn,
+    let _ = handle_overflow(HandleOverflowParams {
+        ctx: &mut ctx,
+        conn: &mut conn,
         task_id,
-        Some("xhigh"),
-        Some(HAIKU_MODEL),
-        &pr,
-        1,
-        Some("run-seq"),
-        tmp.path(),
-        None,
-        RunnerKind::Claude,
-        &ProjectConfig::default(),
-    );
+        effort: Some("xhigh"),
+        effective_model: Some(HAIKU_MODEL),
+        prompt_result: &pr,
+        iteration: 1,
+        run_id: Some("run-seq"),
+        base_dir: tmp.path(),
+        slot_index: None,
+        effective_runner: RunnerKind::Claude,
+        project_config: &ProjectConfig::default(),
+    });
     assert!(ctx.overflow_recovered.contains(task_id));
     assert_eq!(
         ctx.overflow_original_model.get(task_id).map(String::as_str),
@@ -808,20 +807,20 @@ fn overflow_recovered_persists_from_sequential_through_wave_transition() {
     reset_to_in_progress(&conn, task_id);
 
     // Wave overflow: Haiku at high → rung 2 (EscalateModel: Haiku → Sonnet).
-    let wave_action = overflow::handle_prompt_too_long(
-        &mut ctx,
-        &mut conn,
+    let wave_action = handle_overflow(HandleOverflowParams {
+        ctx: &mut ctx,
+        conn: &mut conn,
         task_id,
-        Some("high"),
-        Some(HAIKU_MODEL),
-        &pr,
-        2,
-        Some("run-wave"),
-        tmp.path(),
-        Some(0),
-        RunnerKind::Claude,
-        &ProjectConfig::default(),
-    );
+        effort: Some("high"),
+        effective_model: Some(HAIKU_MODEL),
+        prompt_result: &pr,
+        iteration: 2,
+        run_id: Some("run-wave"),
+        base_dir: tmp.path(),
+        slot_index: Some(0),
+        effective_runner: RunnerKind::Claude,
+        project_config: &ProjectConfig::default(),
+    });
     assert!(
         matches!(wave_action, RecoveryAction::EscalateModel { ref new_model } if new_model == SONNET_MODEL),
         "Haiku at high → escalate to Sonnet: {wave_action:?}"
@@ -858,39 +857,39 @@ fn overflow_recovered_is_persistent_across_consecutive_waves() {
 
     // Wave 1: wave1_task overflows.
     let pr1 = make_prompt_result(wave1_task);
-    let _ = overflow::handle_prompt_too_long(
-        &mut ctx,
-        &mut conn,
-        wave1_task,
-        Some("xhigh"),
-        Some(SONNET_MODEL),
-        &pr1,
-        1,
-        Some("run-wave-1"),
-        tmp.path(),
-        Some(1),
-        RunnerKind::Claude,
-        &ProjectConfig::default(),
-    );
+    let _ = handle_overflow(HandleOverflowParams {
+        ctx: &mut ctx,
+        conn: &mut conn,
+        task_id: wave1_task,
+        effort: Some("xhigh"),
+        effective_model: Some(SONNET_MODEL),
+        prompt_result: &pr1,
+        iteration: 1,
+        run_id: Some("run-wave-1"),
+        base_dir: tmp.path(),
+        slot_index: Some(1),
+        effective_runner: RunnerKind::Claude,
+        project_config: &ProjectConfig::default(),
+    });
     assert!(ctx.overflow_recovered.contains(wave1_task));
 
     // Wave 2: wave2_task overflows (different task, different slot).
     reset_to_in_progress(&conn, wave2_task);
     let pr2 = make_prompt_result(wave2_task);
-    let _ = overflow::handle_prompt_too_long(
-        &mut ctx,
-        &mut conn,
-        wave2_task,
-        Some("xhigh"),
-        Some(SONNET_MODEL),
-        &pr2,
-        1,
-        Some("run-wave-2"),
-        tmp.path(),
-        Some(0),
-        RunnerKind::Claude,
-        &ProjectConfig::default(),
-    );
+    let _ = handle_overflow(HandleOverflowParams {
+        ctx: &mut ctx,
+        conn: &mut conn,
+        task_id: wave2_task,
+        effort: Some("xhigh"),
+        effective_model: Some(SONNET_MODEL),
+        prompt_result: &pr2,
+        iteration: 1,
+        run_id: Some("run-wave-2"),
+        base_dir: tmp.path(),
+        slot_index: Some(0),
+        effective_runner: RunnerKind::Claude,
+        project_config: &ProjectConfig::default(),
+    });
 
     // Both task_ids in overflow_recovered (long-lived ctx, wave-global set).
     assert!(
@@ -945,20 +944,20 @@ fn wave_overflow_jsonl_contains_task_difficulty_from_slot() {
         section_sizes: vec![("task", 12), ("base_prompt", 5)],
     };
 
-    let _ = overflow::handle_prompt_too_long(
-        &mut ctx,
-        &mut conn,
+    let _ = handle_overflow(HandleOverflowParams {
+        ctx: &mut ctx,
+        conn: &mut conn,
         task_id,
-        Some("xhigh"),
-        Some(SONNET_MODEL),
-        &pr,
-        1,
-        Some("run-wave"),
-        tmp.path(),
-        Some(0),
-        RunnerKind::Claude,
-        &ProjectConfig::default(),
-    );
+        effort: Some("xhigh"),
+        effective_model: Some(SONNET_MODEL),
+        prompt_result: &pr,
+        iteration: 1,
+        run_id: Some("run-wave"),
+        base_dir: tmp.path(),
+        slot_index: Some(0),
+        effective_runner: RunnerKind::Claude,
+        project_config: &ProjectConfig::default(),
+    });
 
     // Verify typed struct has task_difficulty propagated.
     let events = read_events(tmp.path());

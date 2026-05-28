@@ -936,14 +936,37 @@ impl LlmRunner for GrokRunner {
             }
         });
 
-        // Auth-failure sniff: only credible when the child died fast AND with
-        // a known auth-phrase on stderr. Either condition alone falls through
-        // to a normal RunnerResult. Window is overridable via env var for tests.
-        if exit_code != 0 && elapsed < grok_auth_failure_window() {
+        // Post-exit stderr classification. Read the buffered stderr ONCE for
+        // both sniffs (auth-failure + transient-backend).
+        if exit_code != 0 {
             let stderr_str = stderr_buf.lock().map(|b| b.clone()).unwrap_or_default();
-            if stderr_contains_auth_failure(&stderr_str) {
+
+            // Auth-failure sniff: only credible when the child died fast AND
+            // with a known auth-phrase on stderr. The fast-fail timing window
+            // distinguishes a real auth lapse (errors at startup) from a
+            // long-running tool-use error that happens to mention auth strings.
+            // Window is overridable via env var for tests.
+            if elapsed < grok_auth_failure_window() && stderr_contains_auth_failure(&stderr_str) {
                 return Err(TaskMgrError::GrokAuthFailure {
                     hint: GROK_AUTH_FAILURE_HINT.to_string(),
+                });
+            }
+
+            // Transient-backend sniff (FEAT-014): a 5xx / Bad Gateway /
+            // overloaded response is a "retry later" signal, NOT a task crash.
+            // UNLIKE the auth sniff this is NOT time-windowed — the motivating
+            // incident was a `cli-chat-proxy.grok.com` 502 that recurred after
+            // grok restarted its turn repeatedly, so the elapsed wall-clock was
+            // well past the 3s auth window. Surfacing TransientBackend (instead
+            // of letting the non-zero exit fall through to Crash(RuntimeError))
+            // keeps the loop from burning crash budget / resetting in-flight
+            // work. Uses the shared `detection` classifiers so the Grok-stderr
+            // and Claude-stdout paths cannot drift.
+            if crate::loop_engine::detection::is_transient_backend(&stderr_str) {
+                return Err(TaskMgrError::TransientBackend {
+                    retry_after_secs: crate::loop_engine::detection::parse_retry_after_secs(
+                        &stderr_str,
+                    ),
                 });
             }
         }

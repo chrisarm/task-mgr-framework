@@ -107,6 +107,15 @@ const ALLOWLIST_SUFFIXES: &[&str] = &[
     "src/loop_engine/prompt_sections/escalation.rs",
     "src/loop_engine/prompt_sections/learnings.rs",
     "src/loop_engine/prompt_sections/mod.rs",
+    // reactions/* arrived with PR #22 (refactor-reactions-framework-convergence)
+    // after the 147cf226 logging-standardization migration completed. Their
+    // bodies are relocations of overflow/usage/recovery code that pre-dated the
+    // migration on the reactions branch, so they carry raw prints. Allow-listed
+    // here pending a "finish logging migration in reactions::" follow-up — same
+    // pattern + justification as the other documented exceptions above.
+    "src/loop_engine/reactions/account.rs",
+    "src/loop_engine/reactions/post_output.rs",
+    "src/loop_engine/reactions/pre_spawn.rs",
     "src/loop_engine/runner.rs", // FEAT-006: stream-C capture + many grok paths (core of child process mgmt)
     "src/loop_engine/stream.rs",
     "src/loop_engine/user_config.rs",

@@ -25,11 +25,10 @@ use tempfile::TempDir;
 use task_mgr::loop_engine::config::{CrashType, IterationOutcome};
 use task_mgr::loop_engine::engine::IterationContext;
 use task_mgr::loop_engine::model::{OPUS_MODEL, OPUS_MODEL_1M, SONNET_MODEL};
-use task_mgr::loop_engine::overflow::{
-    self, OverflowEvent, RecoveryAction, sanitize_id_for_filename,
-};
+use task_mgr::loop_engine::overflow::{OverflowEvent, RecoveryAction, sanitize_id_for_filename};
 use task_mgr::loop_engine::project_config::ProjectConfig;
 use task_mgr::loop_engine::prompt::PromptResult;
+use task_mgr::loop_engine::reactions::post_output::{HandleOverflowParams, handle_overflow};
 use task_mgr::loop_engine::runner::RunnerKind;
 
 // ---------- Test fixtures ---------------------------------------------------
@@ -149,20 +148,20 @@ fn ladder_walk_sonnet_xhigh_to_blocked() {
     let pr = make_prompt_result(task_id);
 
     // Iter 1: Sonnet + xhigh → downgrade_effort to high.
-    let a1 = overflow::handle_prompt_too_long(
-        &mut ctx,
-        &mut conn,
+    let a1 = handle_overflow(HandleOverflowParams {
+        ctx: &mut ctx,
+        conn: &mut conn,
         task_id,
-        Some("xhigh"),
-        Some(SONNET_MODEL),
-        &pr,
-        1,
-        Some("run-test"),
-        base,
-        None,
-        RunnerKind::Claude,
-        &ProjectConfig::default(),
-    );
+        effort: Some("xhigh"),
+        effective_model: Some(SONNET_MODEL),
+        prompt_result: &pr,
+        iteration: 1,
+        run_id: Some("run-test"),
+        base_dir: base,
+        slot_index: None,
+        effective_runner: RunnerKind::Claude,
+        project_config: &ProjectConfig::default(),
+    });
     assert_eq!(rung_label(&a1), "downgrade_effort");
     assert!(
         matches!(a1, RecoveryAction::DowngradeEffort { ref new_effort } if new_effort == "high")
@@ -181,20 +180,20 @@ fn ladder_walk_sonnet_xhigh_to_blocked() {
     .unwrap();
 
     // Iter 2: Sonnet + high → escalate_below_opus to Opus.
-    let a2 = overflow::handle_prompt_too_long(
-        &mut ctx,
-        &mut conn,
+    let a2 = handle_overflow(HandleOverflowParams {
+        ctx: &mut ctx,
+        conn: &mut conn,
         task_id,
-        Some("high"),
-        Some(SONNET_MODEL),
-        &pr,
-        2,
-        Some("run-test"),
-        base,
-        None,
-        RunnerKind::Claude,
-        &ProjectConfig::default(),
-    );
+        effort: Some("high"),
+        effective_model: Some(SONNET_MODEL),
+        prompt_result: &pr,
+        iteration: 2,
+        run_id: Some("run-test"),
+        base_dir: base,
+        slot_index: None,
+        effective_runner: RunnerKind::Claude,
+        project_config: &ProjectConfig::default(),
+    });
     assert_eq!(rung_label(&a2), "escalate_model");
     assert!(
         matches!(a2, RecoveryAction::EscalateModel { ref new_model } if new_model == OPUS_MODEL)
@@ -212,20 +211,20 @@ fn ladder_walk_sonnet_xhigh_to_blocked() {
     .unwrap();
 
     // Iter 3: Opus + high → to_1m_model.
-    let a3 = overflow::handle_prompt_too_long(
-        &mut ctx,
-        &mut conn,
+    let a3 = handle_overflow(HandleOverflowParams {
+        ctx: &mut ctx,
+        conn: &mut conn,
         task_id,
-        Some("high"),
-        Some(OPUS_MODEL),
-        &pr,
-        3,
-        Some("run-test"),
-        base,
-        None,
-        RunnerKind::Claude,
-        &ProjectConfig::default(),
-    );
+        effort: Some("high"),
+        effective_model: Some(OPUS_MODEL),
+        prompt_result: &pr,
+        iteration: 3,
+        run_id: Some("run-test"),
+        base_dir: base,
+        slot_index: None,
+        effective_runner: RunnerKind::Claude,
+        project_config: &ProjectConfig::default(),
+    });
     assert_eq!(rung_label(&a3), "to_1m_model");
     assert!(
         matches!(a3, RecoveryAction::To1mModel { ref new_model } if new_model == OPUS_MODEL_1M)
@@ -243,20 +242,20 @@ fn ladder_walk_sonnet_xhigh_to_blocked() {
     .unwrap();
 
     // Iter 4: Opus[1M] + high → blocked (no further escape).
-    let a4 = overflow::handle_prompt_too_long(
-        &mut ctx,
-        &mut conn,
+    let a4 = handle_overflow(HandleOverflowParams {
+        ctx: &mut ctx,
+        conn: &mut conn,
         task_id,
-        Some("high"),
-        Some(OPUS_MODEL_1M),
-        &pr,
-        4,
-        Some("run-test"),
-        base,
-        None,
-        RunnerKind::Claude,
-        &ProjectConfig::default(),
-    );
+        effort: Some("high"),
+        effective_model: Some(OPUS_MODEL_1M),
+        prompt_result: &pr,
+        iteration: 4,
+        run_id: Some("run-test"),
+        base_dir: base,
+        slot_index: None,
+        effective_runner: RunnerKind::Claude,
+        project_config: &ProjectConfig::default(),
+    });
     assert_eq!(rung_label(&a4), "blocked");
     assert!(matches!(a4, RecoveryAction::Blocked));
     assert_eq!(
@@ -279,20 +278,20 @@ fn explicit_opus_at_floor_skips_to_1m_rung() {
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_id);
 
-    let action = overflow::handle_prompt_too_long(
-        &mut ctx,
-        &mut conn,
+    let action = handle_overflow(HandleOverflowParams {
+        ctx: &mut ctx,
+        conn: &mut conn,
         task_id,
-        Some("high"),
-        Some(OPUS_MODEL),
-        &pr,
-        1,
-        None,
-        tmp.path(),
-        None,
-        RunnerKind::Claude,
-        &ProjectConfig::default(),
-    );
+        effort: Some("high"),
+        effective_model: Some(OPUS_MODEL),
+        prompt_result: &pr,
+        iteration: 1,
+        run_id: None,
+        base_dir: tmp.path(),
+        slot_index: None,
+        effective_runner: RunnerKind::Claude,
+        project_config: &ProjectConfig::default(),
+    });
     assert_eq!(
         rung_label(&action),
         "to_1m_model",
@@ -317,20 +316,20 @@ fn filename_sanitization_neutralizes_traversal() {
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_id);
 
-    let _ = overflow::handle_prompt_too_long(
-        &mut ctx,
-        &mut conn,
+    let _ = handle_overflow(HandleOverflowParams {
+        ctx: &mut ctx,
+        conn: &mut conn,
         task_id,
-        Some("xhigh"),
-        Some(SONNET_MODEL),
-        &pr,
-        1,
-        None,
-        tmp.path(),
-        None,
-        RunnerKind::Claude,
-        &ProjectConfig::default(),
-    );
+        effort: Some("xhigh"),
+        effective_model: Some(SONNET_MODEL),
+        prompt_result: &pr,
+        iteration: 1,
+        run_id: None,
+        base_dir: tmp.path(),
+        slot_index: None,
+        effective_runner: RunnerKind::Claude,
+        project_config: &ProjectConfig::default(),
+    });
 
     let sanitized = sanitize_id_for_filename(task_id);
     assert_eq!(sanitized, "FOO-BAR--baz", "sanitization mismatch");
@@ -383,20 +382,20 @@ fn dump_content_includes_breakdown_note_and_verbatim_prompt() {
     let prompt_body = pr.prompt.clone();
     let total = prompt_body.len();
 
-    let _ = overflow::handle_prompt_too_long(
-        &mut ctx,
-        &mut conn,
+    let _ = handle_overflow(HandleOverflowParams {
+        ctx: &mut ctx,
+        conn: &mut conn,
         task_id,
-        Some("xhigh"),
-        Some(SONNET_MODEL),
-        &pr,
-        1,
-        None,
-        tmp.path(),
-        None,
-        RunnerKind::Claude,
-        &ProjectConfig::default(),
-    );
+        effort: Some("xhigh"),
+        effective_model: Some(SONNET_MODEL),
+        prompt_result: &pr,
+        iteration: 1,
+        run_id: None,
+        base_dir: tmp.path(),
+        slot_index: None,
+        effective_runner: RunnerKind::Claude,
+        project_config: &ProjectConfig::default(),
+    });
 
     let sanitized = sanitize_id_for_filename(task_id);
     let dump_files = list_dump_files(tmp.path(), &sanitized);
@@ -452,20 +451,20 @@ fn jsonl_appends_one_line_per_iteration_with_matching_action() {
             [task_id],
         )
         .unwrap();
-        let action = overflow::handle_prompt_too_long(
-            &mut ctx,
-            &mut conn,
+        let action = handle_overflow(HandleOverflowParams {
+            ctx: &mut ctx,
+            conn: &mut conn,
             task_id,
-            *effort,
-            *model,
-            &pr,
-            (i as u32) + 1,
-            None,
-            tmp.path(),
-            None,
-            RunnerKind::Claude,
-            &ProjectConfig::default(),
-        );
+            effort: *effort,
+            effective_model: *model,
+            prompt_result: &pr,
+            iteration: (i as u32) + 1,
+            run_id: None,
+            base_dir: tmp.path(),
+            slot_index: None,
+            effective_runner: RunnerKind::Claude,
+            project_config: &ProjectConfig::default(),
+        });
         assert_eq!(rung_label(&action), *expected, "scenario {i} rung mismatch");
     }
 
@@ -507,20 +506,20 @@ fn rotation_keeps_only_newest_three_dumps() {
             [task_id],
         )
         .unwrap();
-        let _ = overflow::handle_prompt_too_long(
-            &mut ctx,
-            &mut conn,
+        let _ = handle_overflow(HandleOverflowParams {
+            ctx: &mut ctx,
+            conn: &mut conn,
             task_id,
-            Some("xhigh"),
-            Some(SONNET_MODEL),
-            &pr,
-            i,
-            None,
-            tmp.path(),
-            None,
-            RunnerKind::Claude,
-            &ProjectConfig::default(),
-        );
+            effort: Some("xhigh"),
+            effective_model: Some(SONNET_MODEL),
+            prompt_result: &pr,
+            iteration: i,
+            run_id: None,
+            base_dir: tmp.path(),
+            slot_index: None,
+            effective_runner: RunnerKind::Claude,
+            project_config: &ProjectConfig::default(),
+        });
         // Sleep enough for distinguishable mtimes on coarse filesystems —
         // resolution is at least 1s on common Linux setups (ext4 with
         // default options).
@@ -577,20 +576,20 @@ fn overflow_recovered_set_populated_after_first_overflow() {
         "precondition: set must start empty",
     );
 
-    let _ = overflow::handle_prompt_too_long(
-        &mut ctx,
-        &mut conn,
+    let _ = handle_overflow(HandleOverflowParams {
+        ctx: &mut ctx,
+        conn: &mut conn,
         task_id,
-        Some("xhigh"),
-        Some(SONNET_MODEL),
-        &pr,
-        1,
-        None,
-        tmp.path(),
-        None,
-        RunnerKind::Claude,
-        &ProjectConfig::default(),
-    );
+        effort: Some("xhigh"),
+        effective_model: Some(SONNET_MODEL),
+        prompt_result: &pr,
+        iteration: 1,
+        run_id: None,
+        base_dir: tmp.path(),
+        slot_index: None,
+        effective_runner: RunnerKind::Claude,
+        project_config: &ProjectConfig::default(),
+    });
 
     assert!(
         ctx.overflow_recovered.contains(task_id),
@@ -612,20 +611,20 @@ fn original_model_captured_on_first_overflow_only() {
     let pr = make_prompt_result(task_id);
 
     // Iter 1: original model = Sonnet.
-    let _ = overflow::handle_prompt_too_long(
-        &mut ctx,
-        &mut conn,
+    let _ = handle_overflow(HandleOverflowParams {
+        ctx: &mut ctx,
+        conn: &mut conn,
         task_id,
-        Some("xhigh"),
-        Some(SONNET_MODEL),
-        &pr,
-        1,
-        None,
-        tmp.path(),
-        None,
-        RunnerKind::Claude,
-        &ProjectConfig::default(),
-    );
+        effort: Some("xhigh"),
+        effective_model: Some(SONNET_MODEL),
+        prompt_result: &pr,
+        iteration: 1,
+        run_id: None,
+        base_dir: tmp.path(),
+        slot_index: None,
+        effective_runner: RunnerKind::Claude,
+        project_config: &ProjectConfig::default(),
+    });
     assert_eq!(
         ctx.overflow_original_model.get(task_id).map(String::as_str),
         Some(SONNET_MODEL),
@@ -645,20 +644,20 @@ fn original_model_captured_on_first_overflow_only() {
             [task_id],
         )
         .unwrap();
-        let _ = overflow::handle_prompt_too_long(
-            &mut ctx,
-            &mut conn,
+        let _ = handle_overflow(HandleOverflowParams {
+            ctx: &mut ctx,
+            conn: &mut conn,
             task_id,
-            *effort,
-            *model,
-            &pr,
-            (i as u32) + 2,
-            None,
-            tmp.path(),
-            None,
-            RunnerKind::Claude,
-            &ProjectConfig::default(),
-        );
+            effort: *effort,
+            effective_model: *model,
+            prompt_result: &pr,
+            iteration: (i as u32) + 2,
+            run_id: None,
+            base_dir: tmp.path(),
+            slot_index: None,
+            effective_runner: RunnerKind::Claude,
+            project_config: &ProjectConfig::default(),
+        });
         assert_eq!(
             ctx.overflow_original_model.get(task_id).map(String::as_str),
             Some(SONNET_MODEL),
@@ -681,20 +680,20 @@ fn blocked_rung_writes_both_dump_and_jsonl() {
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_id);
 
-    let action = overflow::handle_prompt_too_long(
-        &mut ctx,
-        &mut conn,
+    let action = handle_overflow(HandleOverflowParams {
+        ctx: &mut ctx,
+        conn: &mut conn,
         task_id,
-        Some("high"),
-        Some(OPUS_MODEL_1M),
-        &pr,
-        1,
-        Some("run-blk"),
-        tmp.path(),
-        None,
-        RunnerKind::Claude,
-        &ProjectConfig::default(),
-    );
+        effort: Some("high"),
+        effective_model: Some(OPUS_MODEL_1M),
+        prompt_result: &pr,
+        iteration: 1,
+        run_id: Some("run-blk"),
+        base_dir: tmp.path(),
+        slot_index: None,
+        effective_runner: RunnerKind::Claude,
+        project_config: &ProjectConfig::default(),
+    });
     assert!(matches!(action, RecoveryAction::Blocked));
     assert_eq!(task_status(&conn, task_id), "blocked");
 
@@ -728,20 +727,20 @@ fn no_pollution_outside_tempdir() {
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_id);
 
-    let _ = overflow::handle_prompt_too_long(
-        &mut ctx,
-        &mut conn,
+    let _ = handle_overflow(HandleOverflowParams {
+        ctx: &mut ctx,
+        conn: &mut conn,
         task_id,
-        Some("xhigh"),
-        Some(SONNET_MODEL),
-        &pr,
-        1,
-        None,
-        tmp.path(),
-        None,
-        RunnerKind::Claude,
-        &ProjectConfig::default(),
-    );
+        effort: Some("xhigh"),
+        effective_model: Some(SONNET_MODEL),
+        prompt_result: &pr,
+        iteration: 1,
+        run_id: None,
+        base_dir: tmp.path(),
+        slot_index: None,
+        effective_runner: RunnerKind::Claude,
+        project_config: &ProjectConfig::default(),
+    });
 
     let canon_root = tmp.path().canonicalize().expect("canonicalize root");
 
@@ -788,20 +787,20 @@ fn override_persists_across_iterations() {
     let pr = make_prompt_result(task_id);
 
     // Rung 2 fires: Sonnet at effort floor (high) → escalate to Opus.
-    let action = overflow::handle_prompt_too_long(
-        &mut ctx,
-        &mut conn,
+    let action = handle_overflow(HandleOverflowParams {
+        ctx: &mut ctx,
+        conn: &mut conn,
         task_id,
-        Some("high"),
-        Some(SONNET_MODEL),
-        &pr,
-        2,
-        None,
-        tmp.path(),
-        None,
-        RunnerKind::Claude,
-        &ProjectConfig::default(),
-    );
+        effort: Some("high"),
+        effective_model: Some(SONNET_MODEL),
+        prompt_result: &pr,
+        iteration: 2,
+        run_id: None,
+        base_dir: tmp.path(),
+        slot_index: None,
+        effective_runner: RunnerKind::Claude,
+        project_config: &ProjectConfig::default(),
+    });
     assert_eq!(rung_label(&action), "escalate_model");
     assert_eq!(
         ctx.model_overrides.get(task_id).map(String::as_str),
@@ -837,20 +836,20 @@ fn original_model_captured_first_overflow_only() {
     let pr = make_prompt_result(task_id);
 
     // Observation 1: Sonnet+xhigh → rung 1 (downgrade_effort).
-    let a1 = overflow::handle_prompt_too_long(
-        &mut ctx,
-        &mut conn,
+    let a1 = handle_overflow(HandleOverflowParams {
+        ctx: &mut ctx,
+        conn: &mut conn,
         task_id,
-        Some("xhigh"),
-        Some(SONNET_MODEL),
-        &pr,
-        1,
-        None,
-        tmp.path(),
-        None,
-        RunnerKind::Claude,
-        &ProjectConfig::default(),
-    );
+        effort: Some("xhigh"),
+        effective_model: Some(SONNET_MODEL),
+        prompt_result: &pr,
+        iteration: 1,
+        run_id: None,
+        base_dir: tmp.path(),
+        slot_index: None,
+        effective_runner: RunnerKind::Claude,
+        project_config: &ProjectConfig::default(),
+    });
     assert_eq!(rung_label(&a1), "downgrade_effort");
     assert_eq!(
         ctx.overflow_original_model.get(task_id).map(String::as_str),
@@ -865,20 +864,20 @@ fn original_model_captured_first_overflow_only() {
     .unwrap();
 
     // Observation 2: Sonnet+high → rung 2 (escalate_model).
-    let a2 = overflow::handle_prompt_too_long(
-        &mut ctx,
-        &mut conn,
+    let a2 = handle_overflow(HandleOverflowParams {
+        ctx: &mut ctx,
+        conn: &mut conn,
         task_id,
-        Some("high"),
-        Some(SONNET_MODEL),
-        &pr,
-        2,
-        None,
-        tmp.path(),
-        None,
-        RunnerKind::Claude,
-        &ProjectConfig::default(),
-    );
+        effort: Some("high"),
+        effective_model: Some(SONNET_MODEL),
+        prompt_result: &pr,
+        iteration: 2,
+        run_id: None,
+        base_dir: tmp.path(),
+        slot_index: None,
+        effective_runner: RunnerKind::Claude,
+        project_config: &ProjectConfig::default(),
+    });
     assert_eq!(rung_label(&a2), "escalate_model");
     assert_eq!(
         ctx.overflow_original_model.get(task_id).map(String::as_str),
@@ -894,20 +893,20 @@ fn original_model_captured_first_overflow_only() {
 
     // Observation 3: Opus+high → rung 3 (to_1m_model). Even though the
     // *current* effective_model is Opus, the snapshot must remain Sonnet.
-    let a3 = overflow::handle_prompt_too_long(
-        &mut ctx,
-        &mut conn,
+    let a3 = handle_overflow(HandleOverflowParams {
+        ctx: &mut ctx,
+        conn: &mut conn,
         task_id,
-        Some("high"),
-        Some(OPUS_MODEL),
-        &pr,
-        3,
-        None,
-        tmp.path(),
-        None,
-        RunnerKind::Claude,
-        &ProjectConfig::default(),
-    );
+        effort: Some("high"),
+        effective_model: Some(OPUS_MODEL),
+        prompt_result: &pr,
+        iteration: 3,
+        run_id: None,
+        base_dir: tmp.path(),
+        slot_index: None,
+        effective_runner: RunnerKind::Claude,
+        project_config: &ProjectConfig::default(),
+    });
     assert_eq!(rung_label(&a3), "to_1m_model");
     assert_eq!(
         ctx.overflow_original_model.get(task_id).map(String::as_str),
@@ -929,20 +928,21 @@ fn run_id_none_serializes_correctly() {
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_id);
 
-    let _ = overflow::handle_prompt_too_long(
-        &mut ctx,
-        &mut conn,
+    let _ = handle_overflow(HandleOverflowParams {
+        ctx: &mut ctx,
+        conn: &mut conn,
         task_id,
-        Some("xhigh"),
-        Some(SONNET_MODEL),
-        &pr,
-        1,
-        None, // <-- run_id is None
+        effort: Some("xhigh"),
+        effective_model: Some(SONNET_MODEL),
+        prompt_result: &pr,
+        iteration: 1,
+        run_id: None,
+        base_dir: // <-- run_id is None
         tmp.path(),
-        None,
-        RunnerKind::Claude,
-        &ProjectConfig::default(),
-    );
+        slot_index: None,
+        effective_runner: RunnerKind::Claude,
+        project_config: &ProjectConfig::default(),
+    });
 
     let events = read_events(tmp.path());
     assert_eq!(events.len(), 1, "expected exactly one JSONL line");
@@ -973,20 +973,21 @@ fn effective_model_none_dump_header() {
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_id);
 
-    let _ = overflow::handle_prompt_too_long(
-        &mut ctx,
-        &mut conn,
+    let _ = handle_overflow(HandleOverflowParams {
+        ctx: &mut ctx,
+        conn: &mut conn,
         task_id,
-        Some("xhigh"),
-        None, // <-- effective_model is None
+        effort: Some("xhigh"),
+        effective_model: None,
+        prompt_result: // <-- effective_model is None
         &pr,
-        1,
-        None,
-        tmp.path(),
-        None,
-        RunnerKind::Claude,
-        &ProjectConfig::default(),
-    );
+        iteration: 1,
+        run_id: None,
+        base_dir: tmp.path(),
+        slot_index: None,
+        effective_runner: RunnerKind::Claude,
+        project_config: &ProjectConfig::default(),
+    });
 
     let sanitized = sanitize_id_for_filename(task_id);
     let dump_files = list_dump_files(tmp.path(), &sanitized);
@@ -1019,20 +1020,20 @@ fn rung_4_writes_observability() {
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_id);
 
-    let action = overflow::handle_prompt_too_long(
-        &mut ctx,
-        &mut conn,
+    let action = handle_overflow(HandleOverflowParams {
+        ctx: &mut ctx,
+        conn: &mut conn,
         task_id,
-        Some("high"),
-        Some(OPUS_MODEL_1M),
-        &pr,
-        1,
-        Some("run-r4obs"),
-        tmp.path(),
-        None,
-        RunnerKind::Claude,
-        &ProjectConfig::default(),
-    );
+        effort: Some("high"),
+        effective_model: Some(OPUS_MODEL_1M),
+        prompt_result: &pr,
+        iteration: 1,
+        run_id: Some("run-r4obs"),
+        base_dir: tmp.path(),
+        slot_index: None,
+        effective_runner: RunnerKind::Claude,
+        project_config: &ProjectConfig::default(),
+    });
     assert!(
         matches!(action, RecoveryAction::Blocked),
         "Opus[1M]+high must produce Blocked action",
@@ -1078,20 +1079,21 @@ fn dump_uses_sent_effort_not_resolved() {
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_id);
 
-    let action = overflow::handle_prompt_too_long(
-        &mut ctx,
-        &mut conn,
+    let action = handle_overflow(HandleOverflowParams {
+        ctx: &mut ctx,
+        conn: &mut conn,
         task_id,
-        Some("xhigh"), // sent effort
+        effort: Some("xhigh"),
+        effective_model: // sent effort
         Some(SONNET_MODEL),
-        &pr,
-        1,
-        None,
-        tmp.path(),
-        None,
-        RunnerKind::Claude,
-        &ProjectConfig::default(),
-    );
+        prompt_result: &pr,
+        iteration: 1,
+        run_id: None,
+        base_dir: tmp.path(),
+        slot_index: None,
+        effective_runner: RunnerKind::Claude,
+        project_config: &ProjectConfig::default(),
+    });
     assert_eq!(rung_label(&action), "downgrade_effort");
     assert!(
         matches!(action, RecoveryAction::DowngradeEffort { ref new_effort } if new_effort == "high")

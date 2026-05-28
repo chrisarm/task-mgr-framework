@@ -31,9 +31,10 @@ use tempfile::TempDir;
 use task_mgr::loop_engine::config::{CrashType, IterationOutcome};
 use task_mgr::loop_engine::engine::IterationContext;
 use task_mgr::loop_engine::model::SONNET_MODEL;
-use task_mgr::loop_engine::overflow::{self, OverflowEvent, RecoveryAction};
+use task_mgr::loop_engine::overflow::{OverflowEvent, RecoveryAction};
 use task_mgr::loop_engine::project_config::ProjectConfig;
 use task_mgr::loop_engine::prompt::PromptResult;
+use task_mgr::loop_engine::reactions::post_output::{HandleOverflowParams, handle_overflow};
 use task_mgr::loop_engine::runner::RunnerKind;
 
 // ---------- Test fixtures ---------------------------------------------------
@@ -151,20 +152,20 @@ fn slot_2_prompt_too_long_invokes_handler_with_slot_2_task_id() {
     let mut last_action: Option<RecoveryAction> = None;
     for (slot_idx, outcome) in slot_outcomes.iter().enumerate() {
         if matches!(outcome, IterationOutcome::Crash(CrashType::PromptTooLong)) {
-            let action = overflow::handle_prompt_too_long(
-                &mut ctx,
-                &mut conn,
-                task_ids[slot_idx],
-                Some("xhigh"),
-                Some(SONNET_MODEL),
-                &pr,
-                1,
-                Some("run-wave"),
-                tmp.path(),
-                Some(slot_idx),
-                RunnerKind::Claude,
-                &ProjectConfig::default(),
-            );
+            let action = handle_overflow(HandleOverflowParams {
+                ctx: &mut ctx,
+                conn: &mut conn,
+                task_id: task_ids[slot_idx],
+                effort: Some("xhigh"),
+                effective_model: Some(SONNET_MODEL),
+                prompt_result: &pr,
+                iteration: 1,
+                run_id: Some("run-wave"),
+                base_dir: tmp.path(),
+                slot_index: Some(slot_idx),
+                effective_runner: RunnerKind::Claude,
+                project_config: &ProjectConfig::default(),
+            });
             last_action = Some(action);
         }
     }
@@ -211,40 +212,40 @@ fn slot_2_recovery_keying_excludes_sibling_slot_task_ids() {
 
     // Walk slot 2 from rung 1 through rung 2 so we exercise BOTH
     // effort_overrides AND model_overrides keying.
-    let _r1 = overflow::handle_prompt_too_long(
-        &mut ctx,
-        &mut conn,
-        task_ids[2],
-        Some("xhigh"),
-        Some(SONNET_MODEL),
-        &pr,
-        1,
-        Some("run-wave"),
-        tmp.path(),
-        Some(2),
-        RunnerKind::Claude,
-        &ProjectConfig::default(),
-    );
+    let _r1 = handle_overflow(HandleOverflowParams {
+        ctx: &mut ctx,
+        conn: &mut conn,
+        task_id: task_ids[2],
+        effort: Some("xhigh"),
+        effective_model: Some(SONNET_MODEL),
+        prompt_result: &pr,
+        iteration: 1,
+        run_id: Some("run-wave"),
+        base_dir: tmp.path(),
+        slot_index: Some(2),
+        effective_runner: RunnerKind::Claude,
+        project_config: &ProjectConfig::default(),
+    });
     // Re-claim (production: task selection re-picks the row).
     conn.execute(
         "UPDATE tasks SET status = 'in_progress' WHERE id = ?1",
         [task_ids[2]],
     )
     .unwrap();
-    let _r2 = overflow::handle_prompt_too_long(
-        &mut ctx,
-        &mut conn,
-        task_ids[2],
-        Some("high"),
-        Some(SONNET_MODEL),
-        &pr,
-        2,
-        Some("run-wave"),
-        tmp.path(),
-        Some(2),
-        RunnerKind::Claude,
-        &ProjectConfig::default(),
-    );
+    let _r2 = handle_overflow(HandleOverflowParams {
+        ctx: &mut ctx,
+        conn: &mut conn,
+        task_id: task_ids[2],
+        effort: Some("high"),
+        effective_model: Some(SONNET_MODEL),
+        prompt_result: &pr,
+        iteration: 2,
+        run_id: Some("run-wave"),
+        base_dir: tmp.path(),
+        slot_index: Some(2),
+        effective_runner: RunnerKind::Claude,
+        project_config: &ProjectConfig::default(),
+    });
 
     // Only slot 2's task_id is present in the per-task state maps.
     assert!(
@@ -323,20 +324,20 @@ fn slot_index_present_in_jsonl_for_wave_event() {
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_ids[2]);
 
-    let _ = overflow::handle_prompt_too_long(
-        &mut ctx,
-        &mut conn,
-        task_ids[2],
-        Some("xhigh"),
-        Some(SONNET_MODEL),
-        &pr,
-        1,
-        Some("run-wave"),
-        tmp.path(),
-        Some(2),
-        RunnerKind::Claude,
-        &ProjectConfig::default(),
-    );
+    let _ = handle_overflow(HandleOverflowParams {
+        ctx: &mut ctx,
+        conn: &mut conn,
+        task_id: task_ids[2],
+        effort: Some("xhigh"),
+        effective_model: Some(SONNET_MODEL),
+        prompt_result: &pr,
+        iteration: 1,
+        run_id: Some("run-wave"),
+        base_dir: tmp.path(),
+        slot_index: Some(2),
+        effective_runner: RunnerKind::Claude,
+        project_config: &ProjectConfig::default(),
+    });
 
     let raw_events = read_event_values(tmp.path());
     assert_eq!(raw_events.len(), 1, "expected one JSONL line for slot 2");
@@ -378,20 +379,20 @@ fn slot_index_omitted_for_sequential_jsonl_event() {
     let pr = make_prompt_result(task_id);
 
     // Sequential overflow path — no slot context.
-    let _ = overflow::handle_prompt_too_long(
-        &mut ctx,
-        &mut conn,
+    let _ = handle_overflow(HandleOverflowParams {
+        ctx: &mut ctx,
+        conn: &mut conn,
         task_id,
-        Some("xhigh"),
-        Some(SONNET_MODEL),
-        &pr,
-        1,
-        Some("run-seq"),
-        tmp.path(),
-        None,
-        RunnerKind::Claude,
-        &ProjectConfig::default(),
-    );
+        effort: Some("xhigh"),
+        effective_model: Some(SONNET_MODEL),
+        prompt_result: &pr,
+        iteration: 1,
+        run_id: Some("run-seq"),
+        base_dir: tmp.path(),
+        slot_index: None,
+        effective_runner: RunnerKind::Claude,
+        project_config: &ProjectConfig::default(),
+    });
 
     let events = read_event_values(tmp.path());
     assert_eq!(events.len(), 1, "expected one JSONL line");
@@ -420,20 +421,20 @@ fn sequential_prompt_too_long_unchanged() {
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_id);
 
-    let action = overflow::handle_prompt_too_long(
-        &mut ctx,
-        &mut conn,
+    let action = handle_overflow(HandleOverflowParams {
+        ctx: &mut ctx,
+        conn: &mut conn,
         task_id,
-        Some("xhigh"),
-        Some(SONNET_MODEL),
-        &pr,
-        1,
-        Some("run-seq"),
-        tmp.path(),
-        None,
-        RunnerKind::Claude,
-        &ProjectConfig::default(),
-    );
+        effort: Some("xhigh"),
+        effective_model: Some(SONNET_MODEL),
+        prompt_result: &pr,
+        iteration: 1,
+        run_id: Some("run-seq"),
+        base_dir: tmp.path(),
+        slot_index: None,
+        effective_runner: RunnerKind::Claude,
+        project_config: &ProjectConfig::default(),
+    });
 
     // Rung 1 fired: effort downgrade.
     assert!(

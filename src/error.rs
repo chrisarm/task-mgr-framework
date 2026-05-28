@@ -204,6 +204,26 @@ pub enum TaskMgrError {
         /// authenticate, then retry the task.").
         hint: String,
     },
+
+    /// A transient backend failure (HTTP 502/503/504, "Bad Gateway",
+    /// "Service Unavailable", Anthropic `overloaded_error` / HTTP 529) was
+    /// detected on the runner's captured stderr (FEAT-014).
+    ///
+    /// Returned by `GrokRunner` when the post-exit stderr classifier
+    /// (`detection::is_transient_backend`) matches a 5xx / Bad Gateway /
+    /// overloaded pattern — e.g. the `cli-chat-proxy.grok.com` 502 from the
+    /// motivating incident, where grok's turn restarted repeatedly against a
+    /// Cloudflare 502 and the non-zero exit was previously mis-classified as a
+    /// `Crash(RuntimeError)` (burning crash budget + resetting in-flight work).
+    /// The loop reacts with a bounded backoff-retry
+    /// (`reactions::account::react_to_transient`), NOT a task-failure increment.
+    /// `retry_after_secs` carries the parsed `Retry-After` value when the
+    /// backend supplied one.
+    #[error("transient backend error (retry_after_secs: {retry_after_secs:?})")]
+    TransientBackend {
+        /// Parsed `Retry-After` seconds, when the backend supplied one.
+        retry_after_secs: Option<u64>,
+    },
 }
 
 /// Default hint for lock errors when a specific PID is known.

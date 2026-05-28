@@ -2482,9 +2482,25 @@ fn test_init_force_without_from_json_rejected() {
     let temp_dir = TempDir::new().unwrap();
     let db_dir = temp_dir.path().join(".task-mgr");
 
+    // Baseline: the dir must not exist before the command runs. If it does,
+    // a prior test leaked state (helps distinguish pre-existing vs created).
+    assert!(
+        !db_dir.exists(),
+        "test precondition: db_dir must not exist before command; stale artifact?"
+    );
+
     let assert = Command::new(cargo_bin("task-mgr"))
         .args(["--dir", db_dir.to_str().unwrap()])
         .args(["init", "--force"])
+        // Prevent ambient TASK_MGR_DIR / TASK_MGR_ACTIVE_PREFIX (set by the
+        // loop runner or the user's shell) from leaking into the child and
+        // confounding path resolution or the prefix guard — same isolation
+        // pattern used by worktree_db_resolution tests and cli_tests add/current
+        // tests. Without this, TASK_MGR_DIR can redirect the child's DB path
+        // away from db_dir and the "no dir creation on reject" assertion races
+        // against whatever the inherited path resolves to.
+        .env_remove("TASK_MGR_DIR")
+        .env_remove("TASK_MGR_ACTIVE_PREFIX")
         .assert()
         .failure()
         .code(2);

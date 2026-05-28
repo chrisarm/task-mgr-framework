@@ -76,6 +76,19 @@ pub fn analyze_output(output: &str, exit_code: i32, _dir: &Path) -> IterationOut
         return IterationOutcome::Crash(CrashType::PromptTooLong);
     }
 
+    // Step 3.6: Detect transient backend failures (HTTP 502/503/504, Bad
+    // Gateway, Service Unavailable, Anthropic overloaded_error / HTTP 529)
+    // BEFORE the generic non-zero-exit crash branch (FEAT-014). A 5xx /
+    // overloaded response is a "try again later" signal, not a task failure —
+    // classifying it as Crash(RuntimeError) burns crash budget and resets
+    // in-flight work. The converged `reactions::account::react_to_transient`
+    // performs a bounded backoff-retry instead.
+    if is_transient_backend(output) {
+        return IterationOutcome::TransientBackend {
+            retry_after_secs: parse_retry_after_secs(output),
+        };
+    }
+
     // Step 4: Check exit code for crashes
     if exit_code != 0 {
         return IterationOutcome::Crash(categorize_crash(exit_code));
@@ -150,6 +163,66 @@ pub(crate) fn is_rate_limited(output: &str) -> bool {
         // Broader "hit your ... limit" — catches the original "hit your limit"
         // and the newer "hit your org's ... limit" / "hit your session limit".
         || output_lower.contains("hit your") && output_lower.contains("limit")
+}
+
+/// Check if `text` reports a transient backend failure (FEAT-014).
+///
+/// Single source of truth for both execution paths: the Claude path scans
+/// stdout (`analyze_output`), the Grok path scans the captured stderr
+/// (`runner.rs`, where the `cli-chat-proxy.grok.com` 502 lands). A transient
+/// backend error is a "retry later" signal (the API/gateway is briefly
+/// unavailable or overloaded), distinct from a per-account rate limit
+/// (`is_rate_limited`) — so it routes to the bounded backoff-retry reaction
+/// rather than the crash-backoff path.
+///
+/// Recognized signals:
+///
+///   - Anthropic `overloaded_error` (JSON error type / HTTP 529 overloaded).
+///   - The unambiguous gateway/availability phrases `bad gateway` and
+///     `service unavailable` (covers the Cloudflare 502 page grok proxies).
+///   - The numeric 5xx gateway/availability codes `502`/`503`/`504`/`529`,
+///     gated on a backend-context word (`gateway`, `unavailable`,
+///     `overloaded`, `upstream`, `cloudflare`) so a bare `503` elsewhere in
+///     normal output does not trigger a false backoff.
+pub(crate) fn is_transient_backend(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.contains("overloaded_error")
+        || lower.contains("bad gateway")
+        || lower.contains("service unavailable")
+        || (has_5xx_gateway_code(&lower) && has_backend_context(&lower))
+}
+
+/// True when `lower` (already lowercased) contains one of the transient 5xx
+/// gateway/overloaded HTTP status codes.
+fn has_5xx_gateway_code(lower: &str) -> bool {
+    lower.contains("502") || lower.contains("503") || lower.contains("504") || lower.contains("529")
+}
+
+/// True when `lower` (already lowercased) carries a backend-error context word.
+/// Pairing a 5xx code with one of these avoids firing on an arbitrary numeric
+/// occurrence (e.g. "503 tests passed").
+fn has_backend_context(lower: &str) -> bool {
+    lower.contains("gateway")
+        || lower.contains("unavailable")
+        || lower.contains("overloaded")
+        || lower.contains("upstream")
+        || lower.contains("cloudflare")
+}
+
+/// Parse a `Retry-After` value (seconds) from `text`, if present (FEAT-014).
+///
+/// Recognizes the HTTP header form `Retry-After: 60` (case-insensitive, with
+/// optional `:`/`=`/whitespace separators). Only the integer-seconds form is
+/// parsed — an HTTP-date `Retry-After` returns `None`, so the reaction falls
+/// back to its exponential backoff. Shared by the Claude (stdout) and Grok
+/// (stderr) classification paths.
+pub(crate) fn parse_retry_after_secs(text: &str) -> Option<u64> {
+    let lower = text.to_lowercase();
+    let idx = lower.find("retry-after")?;
+    let after = &lower[idx + "retry-after".len()..];
+    let after = after.trim_start_matches([':', '=', ' ', '\t']);
+    let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse::<u64>().ok()
 }
 
 // --- Key Decision Extraction ---
@@ -1650,5 +1723,127 @@ mod tests {
         let output = "<task-status>FEAT-001:done</task-status>";
         let outcome = analyze_output(output, 0, &test_dir());
         assert_ne!(outcome, IterationOutcome::Completed);
+    }
+
+    // ======================================================================
+    // Transient backend detection (FEAT-014)
+    // ======================================================================
+
+    #[test]
+    fn test_is_transient_backend_overloaded_error() {
+        assert!(is_transient_backend(
+            "{\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"}}"
+        ));
+    }
+
+    #[test]
+    fn test_is_transient_backend_bad_gateway() {
+        // The Cloudflare 502 page grok's proxy returns on stderr.
+        assert!(is_transient_backend(
+            "cli-chat-proxy.grok.com returned 502 Bad Gateway (cloudflare)"
+        ));
+    }
+
+    #[test]
+    fn test_is_transient_backend_service_unavailable() {
+        assert!(is_transient_backend("HTTP 503 Service Unavailable"));
+    }
+
+    #[test]
+    fn test_is_transient_backend_numeric_code_needs_context() {
+        // A bare 5xx code with no backend-context word must NOT trigger.
+        assert!(
+            !is_transient_backend("503 tests passed, 0 failed"),
+            "a bare 503 without a gateway/overloaded context must not trigger"
+        );
+        // ...but the same code WITH context does.
+        assert!(is_transient_backend("upstream returned 504 from gateway"));
+        assert!(is_transient_backend(
+            "HTTP 529: server overloaded, try later"
+        ));
+    }
+
+    #[test]
+    fn test_is_transient_backend_negative() {
+        assert!(!is_transient_backend(""));
+        assert!(!is_transient_backend("normal output, task completed"));
+        assert!(!is_transient_backend("rate_limit_error")); // that's a rate limit, not transient
+    }
+
+    #[test]
+    fn test_analyze_output_classifies_transient_backend() {
+        let output = "Error: cli-chat-proxy.grok.com 502 Bad Gateway\n";
+        assert_eq!(
+            analyze_output(output, 1, &test_dir()),
+            IterationOutcome::TransientBackend {
+                retry_after_secs: None
+            },
+            "a 502 Bad Gateway with non-zero exit must classify as TransientBackend, not Crash"
+        );
+    }
+
+    #[test]
+    fn test_analyze_output_transient_backend_carries_retry_after() {
+        let output = "503 Service Unavailable\nRetry-After: 60\n";
+        assert_eq!(
+            analyze_output(output, 1, &test_dir()),
+            IterationOutcome::TransientBackend {
+                retry_after_secs: Some(60)
+            },
+        );
+    }
+
+    #[test]
+    fn test_rate_limit_beats_transient_backend() {
+        // RateLimit is checked first (step 3) — a body with both signals routes
+        // to the usage-wait path, never the transient backoff.
+        let output = "rate_limit_error\n503 service unavailable\n";
+        assert_eq!(
+            analyze_output(output, 1, &test_dir()),
+            IterationOutcome::RateLimit,
+            "rate limit must take priority over transient backend"
+        );
+    }
+
+    #[test]
+    fn test_prompt_too_long_beats_transient_backend() {
+        // PromptTooLong (step 3.5) is more specific than the transient backend
+        // sweep (step 3.6) and must win.
+        let output = "Prompt is too long\n502 bad gateway\n";
+        assert_eq!(
+            analyze_output(output, 1, &test_dir()),
+            IterationOutcome::Crash(CrashType::PromptTooLong),
+        );
+    }
+
+    #[test]
+    fn test_completed_beats_transient_backend() {
+        let output = "502 bad gateway earlier\nrecovered\n<promise>COMPLETE</promise>\n";
+        assert_eq!(
+            analyze_output(output, 0, &test_dir()),
+            IterationOutcome::Completed,
+        );
+    }
+
+    #[test]
+    fn test_parse_retry_after_secs() {
+        assert_eq!(parse_retry_after_secs("Retry-After: 60"), Some(60));
+        assert_eq!(parse_retry_after_secs("retry-after:120"), Some(120));
+        assert_eq!(parse_retry_after_secs("RETRY-AFTER = 5"), Some(5));
+        assert_eq!(
+            parse_retry_after_secs("503\nRetry-After: 30\nmore text"),
+            Some(30)
+        );
+    }
+
+    #[test]
+    fn test_parse_retry_after_secs_none() {
+        assert_eq!(parse_retry_after_secs(""), None);
+        assert_eq!(parse_retry_after_secs("no header here"), None);
+        // HTTP-date form is not parsed (falls back to exponential backoff).
+        assert_eq!(
+            parse_retry_after_secs("Retry-After: Wed, 21 Oct 2025 07:28:00 GMT"),
+            None
+        );
     }
 }

@@ -45,12 +45,16 @@ pub use crate::loop_engine::iteration::run_iteration;
 // `probe_rate_limit_lifted`, `update_trackers`) are consumed by the sequential
 // (`iteration.rs`, FEAT-004) and wave (`wave_scheduler.rs`) paths, which import
 // them directly from `recovery`, so no `pub(super)` re-export is needed here.
-#[allow(deprecated)]
+// CLEANUP-001: `auto_block_task` is no longer #[deprecated]; direct export.
 pub use crate::loop_engine::recovery::auto_block_task;
+// CLEANUP-001: shims removed from recovery.rs; re-export the real relocated
+// functions under the old FR-008 external import paths so external tests keep
+// compiling. `check_override_invalidation` had no external test caller so its
+// re-export is dropped entirely.
+pub use crate::loop_engine::reactions::pre_spawn::crash_escalated_model as check_crash_escalation;
 pub use crate::loop_engine::recovery::{
-    check_crash_escalation, check_override_invalidation, escalate_task_model_if_needed,
-    handle_task_failure, increment_consecutive_failures, reset_consecutive_failures,
-    should_auto_block, should_escalate_for_consecutive_failures,
+    escalate_task_model_if_needed, handle_task_failure, increment_consecutive_failures,
+    reset_consecutive_failures, should_auto_block, should_escalate_for_consecutive_failures,
 };
 
 // Parallel-wave scheduling + merge-back orchestration was carved into
@@ -310,6 +314,17 @@ pub struct IterationContext {
     /// records that the DB column was NULL at snapshot time, distinct from
     /// the key being absent.
     pub overflow_original_task_model: std::collections::HashMap<String, Option<String>>,
+    /// Count of consecutive transient-backend backoff waits without progress
+    /// (FEAT-014). Account-global (a backend 5xx / overloaded response is a
+    /// shared-account condition, not per-task), so a single scalar — not a
+    /// per-task map. Read+written ONLY by the converged
+    /// `reactions::account::react_to_transient` (passed as `&mut u32`): reset
+    /// to 0 when a wave/iteration carries no `TransientBackend` outcome,
+    /// incremented on each `WaitedAndRetry`, and compared against
+    /// `TRANSIENT_MAX_ATTEMPTS` to decide when to escalate to the crash/abort
+    /// path. Loop-thread-local (the reaction runs on the main thread in both
+    /// paths), preserving the no-Mutex contract.
+    pub transient_backend_attempts: u32,
 }
 
 impl IterationContext {
@@ -333,6 +348,7 @@ impl IterationContext {
             consecutive_merge_fail_waves: 0,
             runner_overrides: std::collections::HashMap::new(),
             overflow_original_task_model: std::collections::HashMap::new(),
+            transient_backend_attempts: 0,
         }
     }
 }
@@ -431,6 +447,15 @@ pub struct SlotContext {
     /// enrichment (e.g. test fixtures) — matches today's pure-Claude
     /// behavior byte-for-byte.
     pub effective_runner: RunnerKind,
+    /// Prior-overflow effort override for this slot's task (FEAT-002),
+    /// resolved on the main thread by `reactions::pre_spawn::resolve_task_execution`
+    /// from `IterationContext.effort_overrides` — slot threads must not touch
+    /// the override maps (Learning #1810). `run_slot_iteration` prefers this
+    /// over `model::effort_for_difficulty(difficulty)`. `None` (the sentinel
+    /// default and the no-override case) falls back to the difficulty-derived
+    /// effort, so a wave with no overflow history is byte-identical to before.
+    /// Closes the audit-#6-effort gap: wave previously dropped this channel.
+    pub effective_effort: Option<&'static str>,
 }
 
 /// Result of running one slot during a wave.
@@ -595,6 +620,11 @@ pub struct WaveIterationParams<'a> {
     /// and shared across the wave loop instead of being re-read per call site.
     /// Same restart-required semantics as `prd_implicit_overlap_files`.
     pub project_config: &'a project_config::ProjectConfig,
+    /// Usage API monitoring parameters. Threaded so the converged post-output
+    /// rate-limit reaction (`reactions::account::react_to_outputs`, FEAT-006)
+    /// can fire the usage wait once per wave — the wave path previously had no
+    /// rate-limit handling at all. Mirrors `IterationParams::usage_params`.
+    pub usage_params: &'a UsageParams,
 }
 
 /// Aggregated outcome of one parallel wave returned to `run_loop`.
@@ -648,6 +678,14 @@ pub struct WaveOutcome {
     /// `IterationContext::consecutive_merge_fail_waves`, and halt when the
     /// counter reaches `ProjectConfig::merge_fail_halt_threshold`.
     pub failed_merges: Vec<FailedMerge>,
+    /// True only on the FEAT-006 `WaitedAndRetry` early return: the wave hit a
+    /// rate limit, waited once, reset its `in_progress` tasks, and bailed out
+    /// BEFORE merge-back. The orchestrator must (B3) skip
+    /// `apply_merge_fail_reset_and_halt_check` for this wave — calling it with
+    /// the empty `failed_merges` this path carries would zero the cascade-halt
+    /// streak. Always `false` for every other exit (sequential runs, normal
+    /// waves, terminal stops).
+    pub rate_limited_retry: bool,
 }
 
 /// Wave-mode aggregator collected during per-slot post-processing.

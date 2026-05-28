@@ -17,8 +17,10 @@
 //! inline test modules that stay in `engine.rs`, so moving them would widen the
 //! carve's blast radius. The leaf concerns this module depends on come from
 //! `slot.rs` (FEAT-001: `run_slot_iteration`, `claim_slot_task`,
-//! `process_slot_result`, `slot_failure_result`), `recovery.rs` (FEAT-002:
-//! `handle_task_failure`, `check_override_invalidation`),
+//! `process_slot_result`, `slot_failure_result`), `recovery.rs`
+//! (`handle_task_failure`), the pre-spawn coordinator
+//! `reactions::pre_spawn::resolve_task_execution` (FEAT-002: the operator escape
+//! valve + crash escalation + effort override + runner, folded once per slot),
 //! `iteration_pipeline.rs` (the shared post-Claude pipeline invoked inside
 //! `slot.rs::process_slot_result` — not called directly here, but every wave
 //! iteration result flows through it), and `worktree.rs` (merge-back via
@@ -35,6 +37,14 @@
 //! `merge_slot_branches_with_resolver`; slot 0's path is NEVER recomputed via
 //! `compute_slot_worktree_path(_, branch, 0)`. See `src/loop_engine/CLAUDE.md`
 //! → "Parallel-slot scheduling".
+//!
+//! **Reaction single-home lock (CONTRACT-001)**: `#![deny(deprecated)]` makes a
+//! direct call to any relocated reaction leaf (marked `#[deprecated]`) a compile
+//! error here, forcing both execution paths through
+//! `crate::loop_engine::reactions::*`. Pre-existing `#[allow(deprecated)]` shims
+//! (e.g. `claim_slot_task`) keep working — an inner `#[allow]` overrides this
+//! module-level deny at that specific site.
+#![deny(deprecated)]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -56,17 +66,17 @@ use crate::loop_engine::engine::{
     SlotResult, WaveAggregator, WaveIterationParams, WaveOutcome, WaveResult, WaveTerminal,
     apply_review_model_override, resolve_effective_runner,
 };
-use crate::loop_engine::git_reconcile::{
-    reconcile_external_git_completions, reconcile_merged_slot_completions,
-};
+use crate::loop_engine::git_reconcile::reconcile_merged_slot_completions;
 use crate::loop_engine::merge_resolver;
 use crate::loop_engine::model;
 use crate::loop_engine::prd_reconcile::reconcile_passes_with_db;
 use crate::loop_engine::progress;
 use crate::loop_engine::prompt;
-use crate::loop_engine::recovery::{check_override_invalidation, handle_task_failure};
+use crate::loop_engine::reactions;
+use crate::loop_engine::recovery::handle_task_failure;
 use crate::loop_engine::runner::RunnerKind;
 use crate::loop_engine::signals::{self, SignalFlag};
+use crate::loop_engine::usage::UsageCheckResult;
 use crate::output::ui;
 // `claim_slot_task` is a deprecated shim over `TaskLifecycle::try_claim`; the
 // wave fan-out still calls it verbatim (this carve does not migrate it).
@@ -208,6 +218,7 @@ fn wave_preflight_check(
             }),
             was_stopped: false,
             failed_merges: Vec::new(),
+            rate_limited_retry: false,
         });
     }
     if signals::check_stop_signal(params.tasks_dir, params.task_prefix) {
@@ -222,7 +233,46 @@ fn wave_preflight_check(
             }),
             was_stopped: true,
             failed_merges: Vec::new(),
+            rate_limited_retry: false,
         });
+    }
+
+    // Pre-iteration usage gate (FEAT-003): account-global, so fire it EXACTLY
+    // once per wave (not once per slot — that would issue N redundant API/DB
+    // checks). The wave path previously LACKED this gate entirely: a
+    // rate-limited account never waited before a wave dispatched, stranding
+    // in-flight work. Routes through the SAME
+    // `reactions::account::account_usage_gate` coordinator the sequential path
+    // folds at `run_iteration` Step 1.5, so both paths agree on the
+    // GateDecision for a given usage state. Ordered after the stop check and
+    // before crash backoff to mirror the sequential Step ordering.
+    if params.usage_params.enabled {
+        match reactions::account::account_usage_gate(reactions::account::AccountUsageGateParams {
+            threshold: params.usage_params.threshold,
+            tasks_dir: params.tasks_dir,
+            fallback_wait: params.usage_params.fallback_wait,
+        }) {
+            UsageCheckResult::StopSignaled => {
+                ui::emit("Stop signal during usage wait, exiting");
+                return Some(WaveOutcome {
+                    tasks_completed: 0,
+                    iteration_consumed: false,
+                    terminal: Some(WaveTerminal {
+                        exit_code: 0,
+                        reason: "stop signal during usage wait".to_string(),
+                        run_status: None,
+                    }),
+                    was_stopped: true,
+                    failed_merges: Vec::new(),
+                    rate_limited_retry: false,
+                });
+            }
+            UsageCheckResult::ApiError(ref msg) => {
+                tracing::warn!(msg = %msg, "usage API warning (continuing)");
+            }
+            // BelowThreshold, WaitedAndReset, Skipped — proceed with the wave.
+            _ => {}
+        }
     }
 
     // Crash backoff + abort. Identical contract to the sequential path so
@@ -248,6 +298,7 @@ fn wave_preflight_check(
             }),
             was_stopped: false,
             failed_merges: Vec::new(),
+            rate_limited_retry: false,
         });
     }
     None
@@ -315,6 +366,7 @@ fn handle_no_eligible_tasks(
             }),
             was_stopped: false,
             failed_merges: Vec::new(),
+            rate_limited_retry: false,
         };
     }
 
@@ -335,6 +387,7 @@ fn handle_no_eligible_tasks(
             terminal: None,
             was_stopped: false,
             failed_merges: Vec::new(),
+            rate_limited_retry: false,
         };
     }
 
@@ -369,6 +422,7 @@ fn handle_no_eligible_tasks(
             }),
             was_stopped: false,
             failed_merges: Vec::new(),
+            rate_limited_retry: false,
         };
     }
     WaveOutcome {
@@ -377,6 +431,7 @@ fn handle_no_eligible_tasks(
         terminal: None,
         was_stopped: false,
         failed_merges: Vec::new(),
+        rate_limited_retry: false,
     }
 }
 
@@ -483,6 +538,7 @@ fn handle_ephemeral_deadlock(
         terminal: None,
         was_stopped: false,
         failed_merges,
+        rate_limited_retry: false,
     }
 }
 
@@ -528,6 +584,9 @@ pub(super) fn build_slot_contexts(
                 // directly (without the enrichment step) inherit Claude —
                 // the default-empty regression behavior.
                 effective_runner: RunnerKind::Claude, // kind-correct: sentinel default; same pattern as SlotPromptBundle — provider identity, not capability
+                // Sentinel default; main-thread enrichment in `run_wave_iteration`
+                // overwrites with the plan's effort override before spawn.
+                effective_effort: None,
             }
         })
         .collect()
@@ -832,11 +891,14 @@ pub(super) fn read_prd_implicit_overlap_files(prd_path: &Path) -> Vec<String> {
 ///     loop-exit reset doesn't flip the row back to `todo`,
 ///   - emit a one-line stderr summary for the operator.
 ///
-/// Called from `run_wave_iteration` BEFORE `run_cmd::update` and BEFORE the
-/// external-git `let mut tasks_completed = agg.tasks_completed;` shadow so
-/// the terminal returns observe the bumped counter. The reconcile function
-/// itself never errors — failures (git, DB, PRD I/O) are absorbed there and
-/// surface as an empty Vec, so this caller has no failure path.
+/// Returns the reconciled task IDs (empty when nothing matched) so the caller
+/// feeds them into the post-completion coordinator's `completed_ids` set BEFORE
+/// the external-git shadow runs (FEAT-010 AC5: post-merge reconcile feeds the id
+/// set before the external-git shadow). Called from `run_wave_iteration` BEFORE
+/// `run_cmd::update` and BEFORE `react_to_completions` so the terminal returns
+/// observe the bumped counter. The reconcile function itself never errors —
+/// failures (git, DB, PRD I/O) are absorbed there and surface as an empty Vec,
+/// so this caller has no failure path.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn apply_post_merge_reconcile(
     slot0_path: &Path,
@@ -847,7 +909,7 @@ pub(super) fn apply_post_merge_reconcile(
     task_prefix: Option<&str>,
     ctx: &mut IterationContext,
     agg: &mut WaveAggregator,
-) {
+) -> Vec<String> {
     let reconciled = reconcile_merged_slot_completions(
         slot0_path,
         pre_merge_head,
@@ -857,7 +919,7 @@ pub(super) fn apply_post_merge_reconcile(
         task_prefix,
     );
     if reconciled.is_empty() {
-        return;
+        return Vec::new();
     }
     agg.tasks_completed += reconciled.len() as u32;
     agg.any_completed = true;
@@ -868,6 +930,7 @@ pub(super) fn apply_post_merge_reconcile(
         reconciled.len(),
         reconciled.join(", ")
     ));
+    reconciled
 }
 
 /// Wave-mode equivalent of `run_iteration` for the parallel execution path.
@@ -983,25 +1046,68 @@ pub fn run_wave_iteration(
     let slot_prompt_params = build_slot_prompt_params(&params);
     let mut slot_contexts =
         build_slot_contexts(params.conn, group, slot_paths, &slot_prompt_params);
-    // FEAT-005: resolve effective runner per slot on the main thread before
-    // spawning the worker. Single source of truth for the formula — slots
-    // never read `ctx.runner_overrides` directly (Learning #1810). The
-    // effective_model mirrors what `run_slot_iteration` recomputes internally
-    // (bundle.resolved_model → params.default_model fallback) so the
-    // runner resolution sees the same model string the slot will use.
+    // FEAT-002: resolve the pre-spawn execution plan per slot on the main
+    // thread (slots never touch the `IterationContext` override maps —
+    // Learning #1810). This is the SAME `reactions::pre_spawn` coordinator the
+    // sequential path folds (one call per slot here vs. one call there): it
+    // runs the operator escape valve FIRST, then crash escalation, the
+    // prior-overflow effort override, and runner resolution. Wave previously
+    // did review-only routing here and dropped both the crash-escalation and
+    // the effort channel — those gaps close by routing through the coordinator.
     for slot in slot_contexts.iter_mut() {
-        // FEAT-008: operator escape valve — clear stale overrides if tasks.model changed.
-        check_override_invalidation(ctx, params.conn, &slot.prompt_bundle.task_id);
-        // FEAT-002: route review-class slots to `reviewModel` BEFORE recomputing
-        // `effective_model`. Mutating the bundle's `resolved_model` (not just a
-        // local) keeps runner selection, the `--model` flag in
-        // `run_slot_iteration`, and the prompt-baked model consistent — a
-        // drift-`assert!` cross-check on `slot_result.effective_runner` would
-        // panic if these disagreed.
-        if let Some(review_model_override) = apply_review_model_override(
-            params.project_config.review_model.as_deref(),
-            &slot.prompt_bundle.task_id,
-        ) {
+        let task_id = slot.prompt_bundle.task_id.clone();
+        // Baseline model the worker would otherwise spawn with
+        // (`bundle.resolved_model → params.default_model`), captured BEFORE the
+        // coordinator so the crash-escalation + runner resolution see the same
+        // string `run_slot_iteration` resolves internally.
+        let baseline: Option<String> = slot
+            .prompt_bundle
+            .resolved_model
+            .clone()
+            .or_else(|| params.default_model.map(str::to_string));
+
+        let plan = reactions::pre_spawn::resolve_task_execution(
+            reactions::pre_spawn::ResolveTaskExecutionParams {
+                ctx,
+                conn: params.conn,
+                task_id: &task_id,
+                resolved_model: baseline.as_deref(),
+            },
+        );
+
+        // Apply the crash-escalated model to the bundle so the worker spawns
+        // with it. Wave previously skipped pre-spawn crash escalation; routing
+        // through the coordinator converges it with the sequential path.
+        if let Some(escalated) = plan.model {
+            ui::emit(&format!(
+                "Crash escalation [slot {}]: {} → {}",
+                slot.slot_index,
+                baseline.as_deref().unwrap_or("(default)"),
+                escalated,
+            ));
+            slot.prompt_bundle.resolved_model = Some(escalated);
+        }
+
+        // Apply the prior-overflow effort override per slot (audit #6-effort):
+        // the worker reads `effective_effort` first, falling back to the
+        // difficulty-derived effort when `None`.
+        if let Some(effort) = plan.effort {
+            ui::emit(&format!(
+                "Effort override (prior prompt overflow) [slot {}]: → {}",
+                slot.slot_index, effort,
+            ));
+        }
+        slot.effective_effort = plan.effort;
+
+        // Route review-class slots to `reviewModel` AFTER the escape valve /
+        // crash escalation (so neither overwrites the routing). Mutating the
+        // bundle's `resolved_model` (not just a local) keeps runner selection,
+        // the `--model` flag in `run_slot_iteration`, and the prompt-baked
+        // model consistent — a drift-`assert!` cross-check on
+        // `slot_result.effective_runner` would panic if these disagreed.
+        if let Some(review_model_override) =
+            apply_review_model_override(params.project_config.review_model.as_deref(), &task_id)
+        {
             let old = slot
                 .prompt_bundle
                 .resolved_model
@@ -1013,13 +1119,18 @@ pub fn run_wave_iteration(
             ));
             slot.prompt_bundle.resolved_model = Some(review_model_override);
         }
+
+        // Resolve the runner over the FINAL model (post crash escalation +
+        // review routing). `plan.runner` reflects only the pre-routing
+        // baseline, so this re-resolution is the authoritative spawn
+        // discriminant — identical in shape to the sequential path's single
+        // `resolve_effective_runner` at the end of its pre-spawn block.
         let effective_model = slot
             .prompt_bundle
             .resolved_model
             .as_deref()
             .or(params.default_model);
-        slot.effective_runner =
-            resolve_effective_runner(ctx, &slot.prompt_bundle.task_id, effective_model);
+        slot.effective_runner = resolve_effective_runner(ctx, &task_id, effective_model);
     }
     let slot_params = build_shared_slot_params(&params);
 
@@ -1032,6 +1143,140 @@ pub fn run_wave_iteration(
     let mut agg = WaveAggregator::new(wave_result.outcomes.len());
     for slot_result in &mut wave_result.outcomes {
         process_slot_result(slot_result, &mut params, ctx, &mut agg);
+    }
+
+    // FEAT-006: account-global post-output rate-limit reaction. Folds all N
+    // slot outputs into ONE reaction so the usage wait fires exactly once per
+    // wave (never once per rate-limited slot). Runs AFTER `process_slot_result`
+    // — so completed slots are already `done` and the reset's
+    // `status='in_progress'` guard cannot clobber them (B1) — and BEFORE
+    // `handle_task_failure` / crash policy / merge-back. On `WaitedAndRetry` the
+    // wave returns early WITHOUT consuming the loop-bound iteration (B2,
+    // `iteration_consumed: false`) and WITHOUT zeroing the merge-fail streak
+    // (B3, `rate_limited_retry: true` makes the orchestrator skip the FEAT-002
+    // reset/halt check this wave). The completed-but-unmerged slots' ephemeral
+    // branches persist; next wave's `ephemeral_overlay` (built at the top of
+    // `run_wave_iteration`) re-discovers them, so deferred-merge affinity is
+    // preserved without extra work here.
+    {
+        let rate_limit_items: Vec<reactions::account::OutputReactionItem<'_>> = wave_result
+            .outcomes
+            .iter()
+            .filter(|s| s.claim_succeeded)
+            .map(|s| reactions::account::OutputReactionItem {
+                task_id: s.iteration_result.task_id.as_deref(),
+                outcome: &s.iteration_result.outcome,
+                output: &s.iteration_result.output,
+            })
+            .collect();
+        let account_params = reactions::account::AccountReactionParams {
+            threshold: params.usage_params.threshold,
+            usage_enabled: params.usage_params.enabled,
+            tasks_dir: params.tasks_dir,
+            fallback_wait: params.usage_params.fallback_wait,
+            prefix: params.task_prefix.unwrap_or(""),
+            run_id: params.run_id,
+            permission_mode: params.permission_mode,
+        };
+        match reactions::account::react_to_outputs(params.conn, &rate_limit_items, &account_params)
+        {
+            reactions::account::AccountReaction::None => {}
+            reactions::account::AccountReaction::WaitedAndRetry => {
+                return WaveOutcome {
+                    tasks_completed: agg.tasks_completed,
+                    iteration_consumed: false,
+                    terminal: None,
+                    was_stopped: false,
+                    failed_merges: Vec::new(),
+                    rate_limited_retry: true,
+                };
+            }
+            reactions::account::AccountReaction::Stop => {
+                return WaveOutcome {
+                    tasks_completed: agg.tasks_completed,
+                    iteration_consumed: true,
+                    terminal: Some(WaveTerminal {
+                        exit_code: 130,
+                        reason: "stop signal during rate-limit wait".to_string(),
+                        run_status: None,
+                    }),
+                    was_stopped: true,
+                    failed_merges: Vec::new(),
+                    rate_limited_retry: false,
+                };
+            }
+        }
+    }
+
+    // FEAT-014: account-global transient-backend backoff reaction. Sibling to
+    // the rate-limit reaction above — only reached when rate-limit returned
+    // `None` (rate-limit takes precedence). Folds all N slot outcomes into ONE
+    // reaction so the backoff wait fires exactly once per wave. Same B1/B2/B3
+    // contract as the rate-limit path:
+    //   - `WaitedAndRetry`: return early WITHOUT consuming the loop-bound
+    //     iteration (B2, `iteration_consumed: false`) and WITHOUT zeroing the
+    //     merge-fail streak (B3, `rate_limited_retry: true` makes the
+    //     orchestrator skip the FEAT-002 reset/halt check this wave). The reset
+    //     (B1) only touches `status='in_progress'` rows, so completed slots
+    //     stay `done`.
+    //   - `Stop`: `.stop` during the backoff → terminal exit 130.
+    //   - `Escalate` / `None`: fall through. On `Escalate` the transient
+    //     slot(s) reach the FEAT-007 retry-tracking loop below (TransientBackend
+    //     is NOT in its skip-set), so a prolonged outage feeds the crash/abort
+    //     path; on `None` (no transient slot this wave) the reaction has reset
+    //     the attempt counter and the wave proceeds normally.
+    {
+        let transient_items: Vec<reactions::account::OutputReactionItem<'_>> = wave_result
+            .outcomes
+            .iter()
+            .filter(|s| s.claim_succeeded)
+            .map(|s| reactions::account::OutputReactionItem {
+                task_id: s.iteration_result.task_id.as_deref(),
+                outcome: &s.iteration_result.outcome,
+                output: &s.iteration_result.output,
+            })
+            .collect();
+        let transient_params = reactions::account::TransientReactionParams {
+            tasks_dir: params.tasks_dir,
+            prefix: params.task_prefix.unwrap_or(""),
+            run_id: params.run_id,
+            max_attempts: reactions::account::TRANSIENT_MAX_ATTEMPTS,
+            base_wait_secs: reactions::account::TRANSIENT_BACKOFF_BASE_SECS,
+            max_wait_secs: reactions::account::TRANSIENT_BACKOFF_MAX_SECS,
+        };
+        match reactions::account::react_to_transient(
+            params.conn,
+            &transient_items,
+            &transient_params,
+            &mut ctx.transient_backend_attempts,
+        ) {
+            reactions::account::TransientReaction::None
+            | reactions::account::TransientReaction::Escalate => {}
+            reactions::account::TransientReaction::WaitedAndRetry => {
+                return WaveOutcome {
+                    tasks_completed: agg.tasks_completed,
+                    iteration_consumed: false,
+                    terminal: None,
+                    was_stopped: false,
+                    failed_merges: Vec::new(),
+                    rate_limited_retry: true,
+                };
+            }
+            reactions::account::TransientReaction::Stop => {
+                return WaveOutcome {
+                    tasks_completed: agg.tasks_completed,
+                    iteration_consumed: true,
+                    terminal: Some(WaveTerminal {
+                        exit_code: 130,
+                        reason: "stop signal during transient backend backoff".to_string(),
+                        run_status: None,
+                    }),
+                    was_stopped: true,
+                    failed_merges: Vec::new(),
+                    rate_limited_retry: false,
+                };
+            }
+        }
     }
 
     // FEAT-007: post-wave retry tracking. Mirrors the sequential call site in
@@ -1095,6 +1340,10 @@ pub fn run_wave_iteration(
     // slots that did merge. The wave-loop boundary in `run_loop` consumes
     // `failed_merges` to drive the FEAT-002 reset/halt-check contract.
     let mut failed_merges: Vec<FailedMerge> = Vec::new();
+    // Task ids the post-merge reconcile flipped to `done` this wave. Fed into
+    // the post-completion coordinator's `completed_ids` BEFORE its external-git
+    // shadow runs (FEAT-010 AC5). Stays empty when no merge-back happened.
+    let mut post_merge_completed: Vec<String> = Vec::new();
     if params.parallel_slots > 1 {
         let resolved_model = params
             .default_model
@@ -1183,7 +1432,7 @@ pub fn run_wave_iteration(
             outcomes.pre_merge_head.as_deref(),
             params.slot_worktree_paths.first(),
         ) {
-            apply_post_merge_reconcile(
+            post_merge_completed = apply_post_merge_reconcile(
                 slot0,
                 pre,
                 params.conn,
@@ -1205,25 +1454,59 @@ pub fn run_wave_iteration(
         tracing::warn!("failed to update run: {}", e);
     }
 
-    // Per-wave external-git reconciliation. Mirrors the sequential
-    // "Post-iteration: reconcile external git completions" step.
+    // FEAT-010: post-completion reactions for the wave — external-git shadow (#9)
+    // + human review (#10), converged into `reactions::post_completion::
+    // react_to_completions` so the sequential path fires the identical set. The
+    // wave passes `wrapper_commit = false` (the slot merge-back already carries
+    // each task's commit) and ADDS the human-review trigger the wave path
+    // previously lacked — an intentional behavior addition (a `requires_human`
+    // task a slot completes now spawns its review, even on a partial
+    // `WaitedAndRetry` wave where sibling slots are unmerged; see
+    // `src/loop_engine/CLAUDE.md`). `completed_ids` is the union of this wave's
+    // slot completions and the post-merge reconcile ids (fed BEFORE the
+    // external-git shadow, AC5); the coordinator extends the human-review set
+    // with any ids the external-git shadow newly discovers.
+    let mut completed_ids: Vec<String> = wave_result
+        .outcomes
+        .iter()
+        .filter(|s| {
+            s.claim_succeeded && matches!(s.iteration_result.outcome, IterationOutcome::Completed)
+        })
+        .filter_map(|s| s.iteration_result.task_id.clone())
+        .collect();
+    completed_ids.extend(post_merge_completed);
+
     let mut tasks_completed = agg.tasks_completed;
-    if let Some(ext_repo) = params.external_repo_path {
-        let count = reconcile_external_git_completions(
-            ext_repo,
+    {
+        let pc_params = reactions::post_completion::PostCompletionParams {
+            run_id: params.run_id,
+            iteration: params.iteration,
+            // Unused on the wave path (`wrapper_commit = false`); `source_root` is
+            // the loop's main worktree, a valid placeholder.
+            working_root: params.source_root,
+            prd_file: params.prd_path,
+            task_prefix: params.task_prefix,
+            default_model: params.default_model,
+            permission_mode: params.permission_mode,
+            external_repo_path: params.external_repo_path,
+            external_git_scan_depth: params.external_git_scan_depth as u32,
+            wrapper_commit: false,
+        };
+        let pc_outcome = reactions::post_completion::react_to_completions(
             params.conn,
-            params.run_id,
-            params.prd_path,
-            params.task_prefix,
-            params.external_git_scan_depth,
+            &completed_ids,
+            &pc_params,
+            &mut ctx.session_guidance,
         );
-        if count > 0 {
-            tasks_completed += count as u32;
+        // Fold external-git completions into wave accounting — the same
+        // bookkeeping the inline external-git block did before the convergence.
+        if !pc_outcome.external_reconciled.is_empty() {
+            tasks_completed += pc_outcome.external_reconciled.len() as u32;
             agg.any_completed = true;
             ctx.crash_tracker.record_success();
             ui::emit(&format!(
                 "Post-wave reconciliation: marked {} task(s) done",
-                count
+                pc_outcome.external_reconciled.len()
             ));
         }
     }
@@ -1241,6 +1524,7 @@ pub fn run_wave_iteration(
             }),
             was_stopped: false,
             failed_merges,
+            rate_limited_retry: false,
         };
     }
     if ctx.crash_tracker.should_abort() {
@@ -1254,6 +1538,7 @@ pub fn run_wave_iteration(
             }),
             was_stopped: false,
             failed_merges,
+            rate_limited_retry: false,
         };
     }
 
@@ -1270,6 +1555,7 @@ pub fn run_wave_iteration(
             }),
             was_stopped: false,
             failed_merges,
+            rate_limited_retry: false,
         };
     }
 
@@ -1301,6 +1587,7 @@ pub fn run_wave_iteration(
         },
         was_stopped: false,
         failed_merges,
+        rate_limited_retry: false,
     }
 }
 
@@ -1425,8 +1712,19 @@ mod tests {
             working_root,
             prompt_bundle,
             effective_runner: RunnerKind::Claude,
+            effective_effort: None,
         }
     }
+
+    /// Disabled usage params shared by the wave-param test fixtures. `const`
+    /// so `&TEST_USAGE_PARAMS` is a `'static` reference the borrowed
+    /// `WaveIterationParams` field can hold without per-test plumbing.
+    const TEST_USAGE_PARAMS: crate::loop_engine::engine::UsageParams =
+        crate::loop_engine::engine::UsageParams {
+            enabled: false,
+            threshold: 92,
+            fallback_wait: 300,
+        };
 
     #[allow(clippy::too_many_arguments)]
     fn make_wave_params<'a>(
@@ -1472,6 +1770,7 @@ mod tests {
             session_guidance: "",
             prd_implicit_overlap_files,
             project_config,
+            usage_params: &TEST_USAGE_PARAMS,
         }
     }
 
@@ -2006,6 +2305,7 @@ mod tests {
                 session_guidance: "",
                 prd_implicit_overlap_files: &prd_implicit,
                 project_config: &project_cfg,
+                usage_params: &TEST_USAGE_PARAMS,
             },
             &mut ctx,
         );
@@ -2208,6 +2508,7 @@ mod tests {
                 session_guidance: "",
                 prd_implicit_overlap_files,
                 project_config,
+                usage_params: &TEST_USAGE_PARAMS,
             }
         }
 
@@ -2859,6 +3160,7 @@ mod tests {
             terminal: None,
             was_stopped: false,
             failed_merges: Vec::new(),
+            rate_limited_retry: false,
         };
         assert!(outcome.failed_merges.is_empty());
     }
@@ -2883,6 +3185,7 @@ mod tests {
                     task_id: Some("FEAT-002".into()),
                 },
             ],
+            rate_limited_retry: false,
         };
         assert_eq!(outcome.failed_merges.len(), 2);
         assert_eq!(outcome.failed_merges[0].slot, 1);

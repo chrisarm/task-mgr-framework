@@ -47,18 +47,15 @@ use crate::loop_engine::config::{self, IterationOutcome, PermissionMode};
 use crate::loop_engine::deadline;
 use crate::loop_engine::display;
 use crate::loop_engine::env;
-use crate::loop_engine::git_reconcile::{
-    check_git_for_task_completion, reconcile_external_git_completions, wrapper_commit,
-};
+use crate::loop_engine::git_reconcile::reconcile_external_git_completions;
 use crate::loop_engine::guidance::SessionGuidance;
 use crate::loop_engine::iteration_pipeline;
 use crate::loop_engine::model;
 use crate::loop_engine::oauth;
-use crate::loop_engine::prd_reconcile::{
-    self as prd_reconcile, hash_file, read_prd_metadata, reconcile_passes_with_db,
-};
+use crate::loop_engine::prd_reconcile::{hash_file, read_prd_metadata, reconcile_passes_with_db};
 use crate::loop_engine::progress;
-use crate::loop_engine::signals::{self, SignalFlag, handle_human_review};
+use crate::loop_engine::reactions;
+use crate::loop_engine::signals::{self, SignalFlag};
 use crate::loop_engine::status_queries::read_prd_hints;
 use crate::loop_engine::wave_scheduler::classify_drained_queue;
 use crate::loop_engine::worktree;
@@ -794,7 +791,8 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
             &paths.prd_file,
             task_prefix.as_deref(),
             run_config.config.external_git_scan_depth,
-        );
+        )
+        .len();
         if count > 0 {
             ui::emit(&format!(
                 "Startup reconciliation: marked {} task(s) done from external repo",
@@ -1013,14 +1011,33 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                 session_guidance: &wave_session_guidance,
                 prd_implicit_overlap_files: &prd_implicit_overlap_files,
                 project_config: &project_config,
+                usage_params: &usage_params,
             };
             let outcome = run_wave_iteration(wave_params, &mut ctx);
             tasks_completed += outcome.tasks_completed;
-            if outcome.iteration_consumed {
-                iterations_completed += 1;
-            }
+            // FEAT-013: the iteration-budget rule lives in one helper shared
+            // with the sequential path below. A non-consuming wave (the
+            // FEAT-006 B2 rate-limit retry) gives back the loop-bound iteration
+            // so a persistently rate-limited account doesn't burn its budget on
+            // waits; a consuming wave advances `iterations_completed`. Routing
+            // both branches through `account_iteration_budget` keeps the two
+            // execution paths from drifting on the rule.
+            reactions::account_iteration_budget(reactions::IterationBudgetParams {
+                iteration: &mut iteration,
+                iterations_completed: &mut iterations_completed,
+                consumes_budget: outcome.iteration_consumed,
+            });
             if outcome.was_stopped {
                 was_stopped = true;
+            }
+
+            // FEAT-006 B3: a rate-limit retry wave returned BEFORE merge-back
+            // carrying no merge outcomes. Skip the FEAT-002 reset/halt check —
+            // running it with this wave's empty `failed_merges` would zero the
+            // cascade-halt streak (`consecutive_merge_fail_waves`). The wave
+            // also has no terminal, so `continue` straight to the next iteration.
+            if outcome.rate_limited_retry {
+                continue;
             }
 
             // FEAT-002: reset/halt contract on parallel-slot merge-back
@@ -1114,14 +1131,6 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
             tracing::warn!("failed to update run: {}", e);
         }
 
-        // Record epoch before completion detection so we can later identify tasks
-        // completed this iteration (used for human review triggering).
-        let completion_epoch_start: i64 = conn
-            .query_row("SELECT CAST(strftime('%s', 'now') AS INTEGER)", [], |r| {
-                r.get(0)
-            })
-            .unwrap_or(0);
-
         // Run the shared post-Claude pipeline: progress logging, key-decision
         // extraction, `<task-status>` dispatch, completion ladder
         // (status-tag → completed-tag → git/scan → already-complete fallback),
@@ -1173,39 +1182,46 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
             last_claimed_task = None;
         }
 
-        // Wrapper commit: if the claimed task was completed but no git commit
-        // exists (Claude couldn't commit in scoped permission mode), commit on
-        // its behalf.
-        if claimed_was_completed
-            && let Some(ref task_id) = result.task_id
-            && check_git_for_task_completion(
-                &working_root,
-                task_id,
-                run_config.config.git_scan_depth,
-            )
-            .is_none()
-            && let Some(hash) = wrapper_commit(&working_root, task_id, "loop wrapper commit")
-        {
-            ctx.last_commit = Some(hash);
-        }
-
-        // Post-iteration: reconcile external git completions
-        // Catches tasks completed in the current iteration (and any missed from prior)
-        if let Some(ref ext_repo) = external_repo_path
-            && !matches!(result.outcome, IterationOutcome::Empty)
-        {
-            let count = reconcile_external_git_completions(
-                ext_repo,
+        // Post-completion reactions (#8 wrapper-commit, #9 external-git shadow,
+        // #10 human-review) — converged into `reactions::post_completion::
+        // react_to_completions` so the wave path fires the identical set
+        // (FEAT-010). Skipped on an `Empty` iteration: nothing completed, which
+        // matches the pre-convergence guards (the external-git + human-review
+        // blocks already short-circuited on `Empty`, and the wrapper-commit was
+        // gated on `claimed_was_completed`, false whenever the outcome is Empty).
+        if !matches!(result.outcome, IterationOutcome::Empty) {
+            let pc_params = reactions::post_completion::PostCompletionParams {
+                run_id: &run_id,
+                iteration,
+                working_root: working_root.as_path(),
+                prd_file: &paths.prd_file,
+                task_prefix: task_prefix.as_deref(),
+                default_model: default_model.as_deref(),
+                permission_mode: &permission_mode,
+                external_repo_path: external_repo_path.as_deref(),
+                external_git_scan_depth: run_config.config.external_git_scan_depth as u32,
+                wrapper_commit: true,
+            };
+            let pc_outcome = reactions::post_completion::react_to_completions(
                 &mut conn,
-                &run_id,
-                &paths.prd_file,
-                task_prefix.as_deref(),
-                run_config.config.external_git_scan_depth,
+                &processing_outcome.completed_task_ids,
+                &pc_params,
+                &mut ctx.session_guidance,
             );
-            if count > 0 {
+
+            if let Some(hash) = pc_outcome.wrapper_commit_hash {
+                ctx.last_commit = Some(hash);
+            }
+
+            // Fold any external-git completions into iteration accounting — the
+            // same bookkeeping the inline external-git block did before the
+            // convergence.
+            if !pc_outcome.external_reconciled.is_empty() {
+                let count = pc_outcome.external_reconciled.len();
                 tasks_completed += count as u32;
 
-                // Override outcome so stale/crash trackers reset — task was actually completed
+                // Override outcome so stale/crash trackers reset — tasks were
+                // actually completed.
                 result.outcome = IterationOutcome::Completed;
                 ctx.crash_tracker.record_success();
 
@@ -1213,7 +1229,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                     "Post-iteration reconciliation: marked {} task(s) done",
                     count
                 ));
-                // Clear tracker if the claimed task was reconciled as done
+                // Clear tracker if the claimed task was reconciled as done.
                 if let Some(ref claimed) = last_claimed_task {
                     let status: Option<String> = conn
                         .query_row(
@@ -1229,43 +1245,82 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
             }
         }
 
-        // Trigger human review for requires_human tasks completed this iteration.
-        // Queries by timestamp to capture all detection paths (tags, git, output scan,
-        // external reconciliation). Pre-completed tasks have older timestamps and are skipped.
-        if !matches!(result.outcome, IterationOutcome::Empty) {
-            trigger_human_reviews(
+        // FEAT-014: sequential transient-backend reaction (account-global).
+        // The single sequential call site of `react_to_transient` — the
+        // convergence point for BOTH origins of a `TransientBackend` outcome:
+        // the Claude path (`analyze_output` inside `run_iteration`) and the Grok
+        // path (the `TaskMgrError::TransientBackend` early-return mapped in
+        // `iteration.rs`, which never reaches a `run_iteration`-internal
+        // reaction). Called unconditionally so a non-transient iteration resets
+        // the attempt counter via the reaction's `None` branch. Runs AFTER the
+        // pipeline + external-git reconcile (so a task completed out-of-band is
+        // not backed off) and BEFORE the budget/retry-tracking below.
+        //
+        // - `WaitedAndRetry`: the outcome stays `TransientBackend`, so the
+        //   budget match gives the iteration back and the retry-tracking guard
+        //   skips it — identical to `RateLimit` (B2/B3).
+        // - `Escalate`: the outcome is rewritten to `Crash(RuntimeError)` so it
+        //   falls through to the crash/abort path (budget consumed +
+        //   `handle_task_failure` runs).
+        // - `Stop`: `.stop` during the backoff → stop the loop (terminal exit).
+        let transient_reaction = {
+            let items = [reactions::account::OutputReactionItem {
+                task_id: result.task_id.as_deref(),
+                outcome: &result.outcome,
+                output: &result.output,
+            }];
+            let tparams = reactions::account::TransientReactionParams {
+                tasks_dir: paths.tasks_dir.as_path(),
+                prefix: task_prefix.as_deref().unwrap_or(""),
+                run_id: &run_id,
+                max_attempts: reactions::account::TRANSIENT_MAX_ATTEMPTS,
+                base_wait_secs: reactions::account::TRANSIENT_BACKOFF_BASE_SECS,
+                max_wait_secs: reactions::account::TRANSIENT_BACKOFF_MAX_SECS,
+            };
+            reactions::account::react_to_transient(
                 &mut conn,
-                HumanReviewParams {
-                    completion_epoch_start,
-                    iteration,
-                    session_guidance: &mut ctx.session_guidance,
-                    prd_file: &paths.prd_file,
-                    task_prefix: task_prefix.as_deref(),
-                    default_model: default_model.as_deref(),
-                    permission_mode: &permission_mode,
-                },
-            );
+                &items,
+                &tparams,
+                &mut ctx.transient_backend_attempts,
+            )
+        };
+        match transient_reaction {
+            reactions::account::TransientReaction::None
+            | reactions::account::TransientReaction::WaitedAndRetry => {}
+            reactions::account::TransientReaction::Stop => {
+                result.should_stop = true;
+            }
+            reactions::account::TransientReaction::Escalate => {
+                result.outcome = IterationOutcome::Crash(config::CrashType::RuntimeError);
+            }
         }
 
-        // Track iteration count (skip reorders and rate limits)
-        match result.outcome {
-            IterationOutcome::Reorder(_) | IterationOutcome::RateLimit => {
-                // Don't count against iteration budget
-                iteration -= 1;
-            }
-            IterationOutcome::Completed => {
-                iterations_completed += 1;
-            }
-            _ => {
-                iterations_completed += 1;
-            }
-        }
+        // Track iteration count (skip reorders, rate limits, and the
+        // transient-backend WaitedAndRetry — all give back the iteration so a
+        // persistently unavailable backend / rate-limited account doesn't burn
+        // its budget on waits). FEAT-013: the budget rule itself lives in
+        // `account_iteration_budget`, shared with the wave path above so the
+        // give-back and the stat advance cannot drift between the two paths.
+        let consumes_budget = !matches!(
+            result.outcome,
+            IterationOutcome::Reorder(_)
+                | IterationOutcome::RateLimit
+                | IterationOutcome::TransientBackend { .. }
+        );
+        reactions::account_iteration_budget(reactions::IterationBudgetParams {
+            iteration: &mut iteration,
+            iterations_completed: &mut iterations_completed,
+            consumes_budget,
+        });
 
         // Retry tracking: increment consecutive_failures for non-Completed task failures.
         // Excluded: Empty (no task attempted), Reorder (not a failure), RateLimit (external).
         // FEAT-007: also exclude Crash(GrokAuthFailure) — an xAI auth lapse is an operator
         // problem, not a task failure; incrementing here would push a healthy task toward
         // auto_block_task with a misleading reason.
+        // FEAT-014: exclude TransientBackend — a 5xx/overloaded WaitedAndRetry must not burn
+        // crash budget. (On escalation the reaction already rewrote the outcome to
+        // Crash(RuntimeError) above, which IS tracked here — the crash/abort path.)
         if let Some(ref task_id) = result.task_id
             && !matches!(
                 result.outcome,
@@ -1273,6 +1328,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                     | IterationOutcome::Empty
                     | IterationOutcome::Reorder(_)
                     | IterationOutcome::RateLimit
+                    | IterationOutcome::TransientBackend { .. }
                     | IterationOutcome::Crash(config::CrashType::GrokAuthFailure)
             )
             && let Err(e) = handle_task_failure(
@@ -1482,7 +1538,8 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
     }
 }
 
-/// Context parameters for `trigger_human_reviews`.
+/// Context parameters for the deprecated `trigger_human_reviews` shim.
+#[allow(dead_code)] // only the deprecated shim below references this
 struct HumanReviewParams<'a> {
     completion_epoch_start: i64,
     iteration: u32,
@@ -1533,12 +1590,24 @@ pub(crate) fn query_human_review_tasks(
     }
 }
 
-/// Trigger interactive human review for any `requires_human` tasks completed this iteration.
+/// Trigger interactive human review for any `requires_human` tasks completed
+/// this iteration.
 ///
-/// Queries tasks completed at or after `completion_epoch_start` to capture all detection
-/// paths (tags, git, output scan, external reconciliation). For each such task, calls
-/// `handle_human_review` and — if feedback was provided — calls `mutate_prd_from_feedback`
-/// to update downstream tasks.
+/// **Relocated (FEAT-010).** The human-review reaction now lives in
+/// [`reactions::post_completion::react_to_completions`], which BOTH execution
+/// paths route through — the wave path gained human review as an intentional
+/// behavior addition. This function is retained ONLY as the `#[deprecated]`
+/// timestamp-query shim the CONTRACT-001 single-home lock pins: the three engine
+/// files (`iteration.rs`/`wave_scheduler.rs`/`slot.rs`) carry
+/// `#![deny(deprecated)]`, so copy-pasting human review back into one path fails
+/// to compile. It translates its legacy `completed_at >= epoch` selection into
+/// the input-driven id set and delegates — no human-review logic lives here
+/// anymore. No production caller remains (hence `#[allow(dead_code)]`); the
+/// sole legitimate callers of the reaction are the two coordinator call sites.
+#[deprecated(note = "FEAT-010: human review relocated to \
+            reactions::post_completion::react_to_completions (input-driven). \
+            Retained as the single-home lock marker; not called from any engine file.")]
+#[allow(dead_code)]
 fn trigger_human_reviews(conn: &mut Connection, params: HumanReviewParams<'_>) {
     let HumanReviewParams {
         completion_epoch_start,
@@ -1550,30 +1619,32 @@ fn trigger_human_reviews(conn: &mut Connection, params: HumanReviewParams<'_>) {
         permission_mode,
     } = params;
 
-    let review_tasks = query_human_review_tasks(conn, completion_epoch_start);
-
-    for (task_id, title, notes, timeout) in review_tasks {
-        let had_feedback = handle_human_review(
-            io::BufReader::new(io::stdin()),
-            &task_id,
-            &title,
-            notes.as_deref(),
-            iteration,
-            session_guidance,
-            timeout,
-        );
-        if had_feedback {
-            let feedback = session_guidance.last_text().unwrap_or("").to_string();
-            prd_reconcile::mutate_prd_from_feedback(
-                prd_file,
-                &feedback,
-                conn,
-                task_prefix,
-                default_model,
-                permission_mode,
-            );
-        }
-    }
+    // Translate the legacy timestamp selection into the input-driven id set the
+    // coordinator consumes, then delegate. `run_id` / `working_root` /
+    // `external_*` are unused on this human-review-only path (`wrapper_commit =
+    // false`, `external_repo_path = None`) — exactly what this shim did before.
+    let completed_ids: Vec<String> = query_human_review_tasks(conn, completion_epoch_start)
+        .into_iter()
+        .map(|(id, _, _, _)| id)
+        .collect();
+    let pc_params = reactions::post_completion::PostCompletionParams {
+        run_id: "",
+        iteration,
+        working_root: Path::new("."),
+        prd_file,
+        task_prefix,
+        default_model,
+        permission_mode,
+        external_repo_path: None,
+        external_git_scan_depth: 0,
+        wrapper_commit: false,
+    };
+    let _ = reactions::post_completion::react_to_completions(
+        conn,
+        &completed_ids,
+        &pc_params,
+        session_guidance,
+    );
 }
 
 /// Query pending key decisions for the run and prompt the user to resolve or defer each.
@@ -1797,7 +1868,7 @@ fn record_session_guidance(guidance: &SessionGuidance, progress_path: &Path, yes
 }
 
 #[cfg(test)]
-#[allow(deprecated)] // FEAT-010: tests exercise the deprecated apply_status_updates / auto_block_task shims directly.
+#[allow(deprecated)] // FEAT-010: tests exercise the deprecated apply_status_updates shim directly.
 mod tests {
     use super::*;
     use crate::loop_engine::detection;

@@ -313,16 +313,16 @@ fn run_iteration_wires_review_model_override_at_the_right_spot() {
          both runner selection and the --model flag see the new value",
     );
 
-    // Relative-order check: the override site MUST be AFTER both
-    // `check_crash_escalation` and `ctx.model_overrides`, and BEFORE
-    // `resolve_effective_runner`. Otherwise escalation can overwrite the
-    // routing (known-bad path called out in the AC).
+    // Relative-order check: the override site MUST be AFTER both the pre-spawn
+    // coordinator (`resolve_task_execution`, which folds crash escalation as of
+    // FEAT-002) and `ctx.model_overrides`, and BEFORE `resolve_effective_runner`.
+    // Otherwise escalation can overwrite the routing (known-bad path in the AC).
     let override_idx = body
         .find("apply_review_model_override(")
         .expect("expected apply_review_model_override call in run_iteration body");
     let crash_escalation_idx = body
-        .find("check_crash_escalation(")
-        .expect("expected check_crash_escalation call in run_iteration body");
+        .find("resolve_task_execution(")
+        .expect("expected resolve_task_execution call in run_iteration body");
     let model_overrides_idx = body
         .find("ctx.model_overrides.get(&task_id)")
         .expect("expected ctx.model_overrides.get(&task_id) in run_iteration body");
@@ -332,8 +332,9 @@ fn run_iteration_wires_review_model_override_at_the_right_spot() {
 
     assert!(
         override_idx > crash_escalation_idx,
-        "review-model override MUST be applied AFTER crash escalation — \
-         otherwise crash escalation could overwrite the routing",
+        "review-model override MUST be applied AFTER the resolve_task_execution \
+         coordinator (which folds crash escalation) — otherwise escalation \
+         could overwrite the routing",
     );
     assert!(
         override_idx > model_overrides_idx,

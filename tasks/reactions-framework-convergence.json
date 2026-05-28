@@ -1,0 +1,963 @@
+{
+  "branchName": "refactor/reactions-framework-convergence",
+  "description": "Converge the sequential and parallel/wave loop-engine execution paths by relocating all non-path-specific main-thread post-Claude reactions into a single src/loop_engine/reactions/ module that both paths route through, enforced by #[deprecated] + #![deny(deprecated)] on iteration.rs/wave_scheduler.rs/slot.rs and exhaustive param-struct destructure on the five coordinators. Fixes bug #3 (wave mode never waits on rate/session limits, false-aborting and resetting in-flight work). Minimum bar: converge AND lock six audit items — #2 crash escalation (+effort), #3 pre-iteration usage gate, #5 overflow recovery, #6 rate-limit wait, #10 human-review, #13 budget accounting. Authoritative spec: ~/.claude/plans/what-can-we-do-breezy-shore.md + tasks/grok-review-convergence-plan.md + tasks/grok-review-spike-enforcement.md (SPIKE-001).",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "Rust: no warnings in `cargo check`",
+      "Rust: no warnings in `cargo clippy -- -D warnings`",
+      "Rust: scoped tests pass (`cargo test -p task-mgr <module>`); full suite green at milestones",
+      "Rust: `cargo fmt --check` passes",
+      "No breaking changes to public APIs unless the task explicitly relocates a leaf (then a transition #[deprecated] shim + #[allow(deprecated)] at legit sites)",
+      "Each of the five reactions:: coordinators destructures its param struct exhaustively (no `..`)"
+    ],
+    "description": "These criteria apply to ALL implementation tasks"
+  },
+  "mergeStrategy": "Merge to main after MILESTONE-FINAL passes. This is an all-or-nothing platform refactor: the reactions module, enforcement, harness, and the six converged behaviors land together. Squash optional.",
+  "model": "claude-sonnet-4-6",
+  "priorityPhilosophy": {
+    "description": "Hierarchy of what matters most when implementing tasks",
+    "hierarchy": [
+      "1. PLAN — Anticipate edge cases before coding",
+      "2. PHASE 2 FOUNDATION — ~1 day now to save ~2+ weeks later (1:10+ ratio); we are pre-launch, foundations compound",
+      "3. FUNCTIONING CODE — Pragmatic, reliable, wired in per plan",
+      "4. CORRECTNESS — Compiles, type-checks, scoped tests pass deterministically",
+      "5. CODE QUALITY — Clean code, qualityDimensions satisfied, no warnings",
+      "6. POLISH — Docs, formatting, minor improvements"
+    ],
+    "principles": [
+      "Single home: every converged reaction lives in reactions:: and is called by both paths; never copy-paste into one path",
+      "Wave folds N: the wave path applies a reaction over its N slot results; sequential over its 1 result",
+      "Account-global reactions (rate-limit) fire exactly ONCE per wave",
+      "Edge cases = test cases — every known edge case must have a corresponding test",
+      "Scoped per-iteration tests, full suite at milestones — milestones must leave the trunk green including pre-existing failures",
+      "Relocate behind unchanged signatures first, move call sites second, delete shims last (FR-CLEANUP) — keep recovery.rs/overflow.rs tests green throughout"
+    ]
+  },
+  "prohibitedOutcomes": [
+    "Copy-pasting a reaction into one path instead of calling the shared coordinator",
+    "A rate-limit early return that zeroes ctx.consecutive_merge_fail_waves (wipes the cascade-halt defense)",
+    "Resetting a task to todo that completed in the same wave (must filter on status='in_progress')",
+    "N sequential usage waits for N rate-limited slots — the wait must fire exactly once",
+    "Tests that only assert 'no crash' or check a type without verifying content",
+    "A coordinator param struct destructured with `..` (defeats the compile-time parity lock)",
+    "Catch-all error handlers that swallow context; unwrap() on fallible paths in production"
+  ],
+  "project": "task-mgr",
+  "requires": [],
+  "reviewGuidelines": {
+    "priorityGuidelines": {
+      "critical": "1-10: Blocks further work, fix immediately",
+      "high": "11-20: Fix before phase completion",
+      "low": "51-99: Defer to hardening phase",
+      "medium": "21-50: Fix in current phase if time permits"
+    }
+  },
+  "taskPrefix": "31342c85",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "Consumer Impact Table generated in progress log covering all callers of the six leaf functions",
+        "Every engine.rs `pub use` re-export of a relocated leaf is identified with its external-test consumers (FR-008)",
+        "slot.rs:492 handle_prompt_too_long caller confirmed (routes through reactions::post_output::handle_overflow per FR-OQ)",
+        "Test files calling relocated leaves listed with the repoint-or-#[allow(deprecated)] decision",
+        "Deny-scope confirmed as iteration.rs + wave_scheduler.rs + slot.rs"
+      ],
+      "dependsOn": [],
+      "description": "Before relocating check_crash_escalation, check_override_invalidation, usage::check_and_wait / wait_for_usage_reset / parse_reset_from_output, overflow::handle_prompt_too_long, and trigger_human_reviews into reactions::, enumerate EVERY caller (production, engine.rs pub-use re-exports, slot.rs, and tests) so the #[deprecated] + #![deny(deprecated)] rollout on iteration.rs/wave_scheduler.rs/slot.rs has zero surprise compile errors. Produce a Consumer Impact Table in the progress log: file:line, which leaf, OK / BREAKS / NEEDS_REVIEW, and the migration (route through coordinator vs #[allow(deprecated)] at a legit transition site).",
+      "estimatedEffort": "medium",
+      "id": "ANALYSIS-001",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "Use `git grep` for each leaf name across src/ and tests/. Learning #2852: wave-mode overflow recovery already evolved bypass→shared-ladder; confirm current call sites match. Output feeds CONTRACT-001's deprecation rollout.",
+      "passes": true,
+      "priority": 0,
+      "qualityDimensions": [
+        "Completeness: a missed caller becomes a surprise compile error during CONTRACT-001 rollout",
+        "Distinguish production callers (route through coordinator) from legit transition sites (engine re-exports, tests → #[allow(deprecated)])"
+      ],
+      "requiresHuman": false,
+      "taskType": "analysis",
+      "title": "Consumer sweep: callers of the leaves being relocated into reactions::",
+      "touchesFiles": [
+        "src/loop_engine/recovery.rs",
+        "src/loop_engine/usage.rs",
+        "src/loop_engine/overflow.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/slot.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "src/loop_engine/reactions/{mod,pre_spawn,account,post_output,post_completion}.rs exist and are registered in loop_engine/mod.rs",
+        "Five coordinator fns declared: resolve_task_execution, account_usage_gate, react_to_outputs, handle_overflow, react_to_completions — each destructures its param struct with NO `..`",
+        "#![deny(deprecated)] is active at the top of iteration.rs, wave_scheduler.rs, AND slot.rs",
+        "At least one to-be-relocated leaf carries #[deprecated]; demonstrate (in the progress log) that calling it from any of the three engine files fails `cargo build` (then route through the coordinator or #[allow] at a legit site)",
+        "cargo check + cargo clippy -- -D warnings clean; existing recovery.rs/overflow.rs/iteration_pipeline_parity.rs tests still green",
+        "Note in progress log: the parity-harness skeleton (tests/reaction_parity.rs) is created by TEST-INIT-001; the CLAUDE.md 'Reaction framework (shared)' section + the iteration_pipeline.rs 'Out of scope' rate-limit removal are owned by VERIFY-001 (the authoritative doc gate)"
+      ],
+      "dependsOn": [
+        "ANALYSIS-001"
+      ],
+      "description": "Create src/loop_engine/reactions/{mod,pre_spawn,account,post_output,post_completion}.rs registered in loop_engine/mod.rs, with the five coordinator entry points (signatures stubbed/typed but bodies may delegate to the still-in-place leaves initially). Establish the SPIKE-001 enforcement mechanism: add #![deny(deprecated)] to iteration.rs + wave_scheduler.rs + slot.rs, and mark the to-be-relocated leaves #[deprecated]. (The tests/reaction_parity.rs harness skeleton is owned by TEST-INIT-001; the CLAUDE.md 'Reaction framework (shared)' section + the iteration_pipeline.rs 'Out of scope' rate-limit removal are owned by VERIFY-001 — do NOT create them here, to keep this contract's blast radius bounded.) This contract gates all six FEATs.",
+      "estimatedEffort": "high",
+      "id": "CONTRACT-001",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "FR-OQ RESOLVED: slot.rs routes through handle_overflow and carries the deny. Exhaustive-destructure precedent: ProcessingParams in iteration_pipeline.rs / tests/iteration_pipeline_parity.rs:1196-1322. Deprecation precedent: recovery.rs:428, slot.rs:336. Bodies may temporarily delegate to in-place leaves; FEAT-002/003/005/006/010/013 fill them in. Learning #2300/#2157: parity tests run identical fixtures through both path shapes.",
+      "passes": true,
+      "priority": 1,
+      "qualityDimensions": [
+        "The compile-time lock is the primary anti-drift guarantee: re-inlining a relocated leaf into the three engine files MUST fail the build",
+        "Coordinator param structs use exhaustive destructure (no `..`) so adding a field breaks compilation at both call sites",
+        "Keep the deny narrowly scoped to the three engine files; legit transition sites (engine re-exports, tests) use targeted #[allow(deprecated)]",
+        "Idiomatic: pub(crate) surface inside reactions::; thin coordinators"
+      ],
+      "requiresHuman": false,
+      "taskType": "contract",
+      "title": "reactions:: module boundary + enforcement mechanism + parity-harness skeleton",
+      "touchesFiles": [
+        "src/loop_engine/reactions/mod.rs",
+        "src/loop_engine/reactions/pre_spawn.rs",
+        "src/loop_engine/reactions/account.rs",
+        "src/loop_engine/reactions/post_output.rs",
+        "src/loop_engine/reactions/post_completion.rs",
+        "src/loop_engine/mod.rs",
+        "src/loop_engine/iteration.rs",
+        "src/loop_engine/wave_scheduler.rs",
+        "src/loop_engine/slot.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Wait-once: a 3-slot item-slice with 2 RateLimit items fires the injected wait closure EXACTLY once",
+        "Mixed-wave durability: a slice with one RateLimit + one Completed leaves the completed task `done` and resets only the rate-limited task to `todo`",
+        "RateLimit-output inert: a RateLimit item's output produces zero learnings/completions/status-updates (assert DB state)",
+        "Parse-fail fallback: unparseable reset output → wait closure invoked with the fallback_wait value (both shapes agree)",
+        "Negative control: a slice with no RateLimit returns AccountReaction::None and performs ZERO DB writes",
+        "Stop: injected stop/signal during the wait → AccountReaction::Stop",
+        "Known-bad discriminator: a naive 'loop over items calling wait per item' stub FAILS the wait-once test",
+        "Fixtures use production-shaped structs (OutputReactionItem, real task rows), not hand-built maps",
+        "Establishes the tests/reaction_parity.rs harness skeleton (two independent DBs, TASK_MGR_NO_EXTRACT_LEARNINGS=1, public-API setup helpers) reused by TEST-INIT-002/003/004"
+      ],
+      "dependsOn": [
+        "CONTRACT-001"
+      ],
+      "description": "Write failing/ignored tests in tests/reaction_parity.rs for reactions::account::react_to_outputs covering the rate-limit (#6) behavior across the sequential (1-item) and wave (N-item, incl. mixed) shapes. Inject the wait as a counting closure (react_to_outputs_inner) so tests are hermetic (no OAuth / usage API / real sleep).",
+      "edgeCases": [
+        "3-slot wave, 2 rate-limited → single wait",
+        "Mixed wave: 1 completed + 1 rate-limited → completed stays done",
+        "RateLimit message as output → zero learnings/completions/status-updates",
+        "Unparseable reset time → fallback_wait used identically on both shapes",
+        "No RateLimit in slice → AccountReaction::None, zero DB writes",
+        "Stop/.stop during wait → AccountReaction::Stop",
+        "Rate-limit wave while merge-fail streak=1 → streak preserved, NOT zeroed (B3): a merge-fail→rate-limit→merge-fail sequence reaches the halt threshold"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "All slots rate-limited",
+          "expectedBehavior": "Single wait, all in-progress tasks reset to todo, WaitedAndRetry"
+        },
+        {
+          "cause": "Stop signal mid-wait",
+          "expectedBehavior": "Returns Stop; caller emits terminal exit 130"
+        }
+      ],
+      "id": "TEST-INIT-001",
+      "invariants": [
+        "react_to_outputs performs at most one wait per call regardless of N",
+        "Only status='in_progress' rows are reset; 'done' rows are never reverted"
+      ],
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "Harness conventions: two independent DBs, TASK_MGR_NO_EXTRACT_LEARNINGS=1, public-API setup (per tests/iteration_pipeline_parity.rs header). Inner/outer split mirrors maybe_fire/maybe_fire_inner (auto_review.rs).",
+      "passes": true,
+      "priority": 2,
+      "qualityDimensions": [
+        "Wait-once is the headline invariant — the test must reject a per-item wait stub",
+        "Mixed-wave durability pins the B1 ordering (completion before reset)"
+      ],
+      "requiresHuman": false,
+      "taskType": "test",
+      "title": "TDD: rate-limit account reaction (react_to_outputs) parity",
+      "touchesFiles": [
+        "tests/reaction_parity.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "resolve_task_execution returns an identical TaskExecutionPlan (model, effort, runner) for the same (ctx, task, prompt_result, config) regardless of path shape",
+        "Effort override flows through (a prior overflow effort_override is reflected in the plan) — guards the #6-effort requirement",
+        "Crash escalation: a task flagged crashed escalates model on re-pick; non-crash does not",
+        "Override invalidation: an out-of-band tasks.model edit clears the six per-task recovery channels (operator escape valve preserved)",
+        "account_usage_gate returns the same GateDecision for the same usage state on both shapes",
+        "Known-bad discriminator: a plan that drops effort_overrides FAILS the effort test"
+      ],
+      "dependsOn": [
+        "CONTRACT-001"
+      ],
+      "description": "Failing/ignored parity tests for reactions::pre_spawn::resolve_task_execution (crash escalation + model AND effort overrides + override invalidation + review routing) and account_usage_gate, asserting identical results for sequential (1 call) and wave (per-slot) shapes.",
+      "edgeCases": [
+        "Prior overflow left an effort_override → plan reflects it",
+        "Crashed-last task re-picked → escalates; clean task → no escalation",
+        "Out-of-band tasks.model edit → recovery channels cleared",
+        "review-class task → reviewModel routing applied after escalation"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "tasks.model edited out-of-band",
+          "expectedBehavior": "override channels cleared; one stderr line announces it"
+        }
+      ],
+      "id": "TEST-INIT-002",
+      "invariants": [
+        "resolve_task_execution is a pure function of (ctx, task, prompt_result, config) — same inputs, same plan",
+        "Promotion ctx mutations are applied only after the owning DB transaction commits"
+      ],
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "Preserve the deferred-promotion-after-commit contract (CLAUDE.md §'Transactional promotion ctx writes are deferred'). Existing crash-escalation + override-invalidation tests must still pass.",
+      "passes": true,
+      "priority": 3,
+      "qualityDimensions": [
+        "Plan equivalence across paths is the convergence proof for #2/#3",
+        "Effort overrides explicitly asserted (the §3.6 hard requirement)"
+      ],
+      "requiresHuman": false,
+      "taskType": "test",
+      "title": "TDD: pre-spawn resolve_task_execution + account_usage_gate parity (#2, #3)",
+      "touchesFiles": [
+        "tests/reaction_parity.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Rung selection (effort downgrade → model escalate → 1M → provider fallback → block) matches pre-relocation behavior on identical inputs",
+        "Per-slot isolation: a PromptTooLong on one task's invocation does not corrupt another task's overflow_recovered / model_overrides entries",
+        "sanitize_id_for_filename path-traversal defense preserved (a `..`-laden task id is collapsed)",
+        "OverflowEvent JSONL still emitted with task_id/iteration/model/recovery fields",
+        "Known-bad discriminator: a stub that skips rung 1 (effort downgrade) FAILS"
+      ],
+      "dependsOn": [
+        "CONTRACT-001"
+      ],
+      "description": "Failing/ignored tests for reactions::post_output::handle_overflow asserting the five-rung ladder, dumps/JSONL/rotation, and FallbackToProvider promotion are unchanged, and that all three call sites (iteration.rs, wave via process_slot_result, slot.rs:492) route through the coordinator.",
+      "edgeCases": [
+        "Same task hits PromptTooLong in two consecutive iterations → overflow_recovered membership stable",
+        "Task id containing `..` → sanitized before filesystem write",
+        "Grok task at effort floor → skips rungs 2/3 straight to provider fallback / block"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Dump dir unwritable",
+          "expectedBehavior": "log via eprintln!, recovery still proceeds"
+        }
+      ],
+      "id": "TEST-INIT-003",
+      "invariants": [
+        "handle_overflow keys all ctx mutations on task_id",
+        "Best-effort dump/JSONL/rotation failures never propagate (eprintln! only)"
+      ],
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "Learning #2852: wave overflow recovery evolved bypass→shared-ladder — do not regress. Reuse existing overflow.rs tests as the equivalence oracle; the relocation must keep them green.",
+      "passes": true,
+      "priority": 4,
+      "qualityDimensions": [
+        "Equivalence to the existing overflow ladder is the bar — relocation is behavior-preserving",
+        "Per-task keying prevents cross-task recovery corruption"
+      ],
+      "requiresHuman": false,
+      "taskType": "test",
+      "title": "TDD: overflow reaction (handle_overflow) parity + per-slot isolation (#5)",
+      "touchesFiles": [
+        "tests/reaction_parity.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Human-review fires for the same completed requires_human task on both the sequential and wave shapes",
+        "Human-review fires on a wave that also has a rate-limited slot (WaitedAndRetry) — intentional behavior addition",
+        "Intra-wave ordering preserved: post-merge reconcile result is consumed before the external-git shadow (react_to_completions takes the completed-id set as input)",
+        "Budget: a WaitedAndRetry/RateLimit wave does NOT advance the loop-bound iteration count against max_iterations on either path",
+        "Termination: a persistently-rate-limited sequence still exits on signal/.stop (bounded), not unbounded",
+        "Known-bad discriminator: a budget helper that only skips the iterations_completed stat (but not the loop-bound iteration) FAILS the no-consumption test"
+      ],
+      "dependsOn": [
+        "CONTRACT-001"
+      ],
+      "description": "Failing/ignored tests for reactions::post_completion::react_to_completions (human-review fires on both paths, incl. on a partial WaitedAndRetry wave) and the shared budget-accounting helper (RateLimit/WaitedAndRetry does not consume max_iterations; termination still bounded).",
+      "edgeCases": [
+        "requires_human task completed in a mixed (partially rate-limited) wave → review fires",
+        "WaitedAndRetry wave → max_iterations not consumed",
+        "Persistent rate limit → exits on signal, bounded by MAX_WAIT_SECS"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Review session spawned while ephemerals unmerged",
+          "expectedBehavior": "blocks interactively; documented as intentional"
+        }
+      ],
+      "id": "TEST-INIT-004",
+      "invariants": [
+        "iteration_consumed=false ⟺ loop-bound iteration is given back (single shared accounting helper)",
+        "react_to_completions never rediscovers completions; it consumes the provided id set"
+      ],
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "B2 confirmed: orchestrator.rs:918 `while iteration < max_iterations`, :919 increments at top, sequential :1256 `iteration -= 1`; wave branch must also give back the loop-bound iteration. react_to_completions is input-driven to preserve wave ordering (wave_scheduler.rs:1172 before :1196).",
+      "passes": true,
+      "priority": 5,
+      "qualityDimensions": [
+        "Budget no-consumption must be proven against the loop-bound counter, not just the stat",
+        "Human-review-on-partial-wave is intentional and asserted"
+      ],
+      "requiresHuman": false,
+      "taskType": "test",
+      "title": "TDD: human-review (#10) + budget accounting (#13) parity",
+      "touchesFiles": [
+        "tests/reaction_parity.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "TEST-INIT-001 cases pass: wait-once, mixed-wave durability, RateLimit-output-inert, parse-fail fallback, negative control, Stop",
+        "Sequential: iteration.rs:621-688 replaced by a one-item react_to_outputs call; Stop→should_stop early return (output:\"\"), WaitedAndRetry→fall through; behavior unchanged vs today",
+        "B1: the wave reaction runs AFTER process_slot_result (completed slots already `done`); reset filters on status='in_progress'",
+        "B2: on WaitedAndRetry the wave gives back the loop-bound iteration (no max_iterations consumption) via the shared accounting path (coordinate with FEAT-013)",
+        "B3: the WaitedAndRetry early return does NOT zero ctx.consecutive_merge_fail_waves (returns before/around apply_merge_fail_reset_and_halt_check so the streak is preserved)",
+        "usage_params added to WaveIterationParams and wired at orchestrator.rs:991",
+        "On WaitedAndRetry, WaveOutcome carries tasks_completed: agg.tasks_completed; on Stop, terminal exit 130",
+        "No second inline wait_for_usage_reset remains in iteration.rs or wave_scheduler.rs (the lock holds)"
+      ],
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/loop_engine/iteration.rs",
+            "impact": "OK",
+            "line": 621,
+            "mitigation": "replace with one-item react_to_outputs call; preserve should_stop/output semantics",
+            "usage": "inline sequential rate-limit wait (Step 7.5)"
+          },
+          {
+            "file": "src/loop_engine/wave_scheduler.rs",
+            "impact": "NEEDS_REVIEW",
+            "line": 1024,
+            "mitigation": "insert react_to_outputs; honor B1/B2/B3 on the early return",
+            "usage": "post-process_slot_result region; today no rate-limit handling"
+          },
+          {
+            "file": "src/loop_engine/orchestrator.rs",
+            "impact": "OK",
+            "line": 991,
+            "mitigation": "add usage_params: &usage_params (already in scope)",
+            "usage": "WaveIterationParams construction"
+          }
+        ],
+        "semanticDistinctions": [
+          {
+            "context": "Sequential (1 outcome)",
+            "currentBehavior": "waits inline on RateLimit",
+            "requiredBehavior": "calls react_to_outputs with a 1-item slice"
+          },
+          {
+            "context": "Wave (N outcomes, shared account)",
+            "currentBehavior": "no wait → false stale-abort",
+            "requiredBehavior": "calls react_to_outputs with all slot items; waits ONCE; resets in-progress; gives back iteration; preserves merge-fail streak"
+          }
+        ]
+      },
+      "dependsOn": [
+        "CONTRACT-001",
+        "TEST-INIT-001"
+      ],
+      "description": "Implement reactions::account::react_to_outputs(conn, &[OutputReactionItem], &AccountReactionParams) -> AccountReaction (+ react_to_outputs_inner taking the wait as an injected &dyn Fn). Detect RateLimit across the slice, reset affected in_progress tasks to todo via TaskLifecycle::recover_in_progress_for_prefix, perform the usage wait ONCE (usage::check_and_wait → parse_reset_from_output + wait_for_usage_reset with probe_rate_limit_lifted). Replace iteration.rs:621-688 with a one-item call. Insert the wave call after the process_slot_result loop (wave_scheduler.rs:1024), before handle_task_failure/crash/merge-back. Thread usage_params into WaveIterationParams (engine.rs:548-595) wired from orchestrator.rs:991.",
+      "estimatedEffort": "high",
+      "id": "FEAT-006",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": true,
+      "notes": "THE headline bug fix. B3 verified at wave_scheduler.rs:738-739 (empty failed_merges zeroes the streak). B2 verified at orchestrator.rs:918-919/1021-1023/1256. Mixed-wave deferred-merge: a completed-but-unmerged slot from a rate-limited wave should reappear in next wave's ephemeral_overlay — verify; if the early return skips the overlay build, refresh it. Data contract: OutputReactionItem { task_id: Option<&str>, outcome: &IterationOutcome, output: &str } built from SlotResult.iteration_result.{task_id,outcome,output} (filter claim_succeeded).",
+      "passes": true,
+      "priority": 6,
+      "qualityDimensions": [
+        "Wait exactly once per wave (account-global)",
+        "B1 completion durability before reset (filter status='in_progress')",
+        "B2 no max_iterations consumption on WaitedAndRetry (give back loop-bound iteration)",
+        "B3 preserve ctx.consecutive_merge_fail_waves on the early return",
+        "Stop maps to terminal exit 130 with output:\"\" (sequential parity)",
+        "No unwrap() on the wait/reset paths"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "react_to_outputs — converge the rate-limit wait (fixes bug #3, audit #6)",
+      "touchesFiles": [
+        "src/loop_engine/reactions/account.rs",
+        "src/loop_engine/iteration.rs",
+        "src/loop_engine/wave_scheduler.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/orchestrator.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "TEST-INIT-002 resolve_task_execution cases pass (plan equivalence, effort flows through, escalation, override invalidation, review routing)",
+        "iteration.rs:363-419 replaced by a resolve_task_execution call",
+        "wave_scheduler.rs:981-1011 per-slot loop routes through the same coordinator",
+        "Deferred-promotion-after-commit contract preserved (no ctx promotion mutation before tx.commit)",
+        "recovery.rs leaves carry #[deprecated]; no production caller in the three engine files invokes them directly",
+        "Existing crash-escalation + override-invalidation tests pass"
+      ],
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/loop_engine/iteration.rs",
+            "impact": "OK",
+            "line": 363,
+            "mitigation": "replace with resolve_task_execution",
+            "usage": "Step 4.5 inline crash escalation + model/effort + review routing"
+          },
+          {
+            "file": "src/loop_engine/wave_scheduler.rs",
+            "impact": "NEEDS_REVIEW",
+            "line": 990,
+            "mitigation": "route through coordinator; ensure effort overrides now applied per-slot too",
+            "usage": "per-slot review routing + runner resolution"
+          }
+        ],
+        "semanticDistinctions": [
+          {
+            "context": "Sequential",
+            "currentBehavior": "inline escalation + effort override",
+            "requiredBehavior": "coordinator call"
+          },
+          {
+            "context": "Wave",
+            "currentBehavior": "review-only; effort override not applied per-slot",
+            "requiredBehavior": "full plan incl. effort via coordinator"
+          }
+        ]
+      },
+      "dependsOn": [
+        "CONTRACT-001",
+        "TEST-INIT-002"
+      ],
+      "description": "Implement reactions::pre_spawn::resolve_task_execution folding override invalidation (#1), crash escalation (#2), model AND effort overrides, and review-model routing into one coordinator returning TaskExecutionPlan { model, effort, runner }. Route iteration.rs:363-419 and the wave per-slot pre-spawn loop (wave_scheduler.rs:981-1011) through it. Relocate check_crash_escalation / check_override_invalidation logic into reactions::pre_spawn (deprecated shims left in recovery.rs).",
+      "estimatedEffort": "high",
+      "id": "FEAT-002",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": true,
+      "notes": "Largest semantic merge: sequential is inline (iteration.rs:363-416) while wave does review-only routing + handle_task_failure escalation. Preserve overflow_original_task_model snapshot + operator escape valve. Relocate behind unchanged signatures first.",
+      "passes": true,
+      "priority": 7,
+      "qualityDimensions": [
+        "Plan is a pure function of inputs (same inputs → same plan)",
+        "Effort overrides flow through on BOTH paths (closes the wave gap)",
+        "Deferred-promotion contract intact; operator escape valve preserved"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "resolve_task_execution — converge pre-spawn crash escalation + model/effort overrides (#1, #2, #6-effort)",
+      "touchesFiles": [
+        "src/loop_engine/reactions/pre_spawn.rs",
+        "src/loop_engine/iteration.rs",
+        "src/loop_engine/wave_scheduler.rs",
+        "src/loop_engine/recovery.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "TEST-INIT-003 cases pass (rung equivalence, per-slot isolation, sanitization, JSONL emission)",
+        "iteration.rs:714, wave (process_slot_result), and slot.rs:492 all call reactions::post_output::handle_overflow",
+        "overflow.rs handle_prompt_too_long is a #[deprecated] shim (no direct call from the three engine files)",
+        "FallbackToProvider promotion still runs the DB UPDATE + ctx override inserts together, applied only after tx.commit",
+        "Existing overflow.rs tests pass unchanged",
+        "CLAUDE.md documents handle_overflow ordering relative to process_iteration_output"
+      ],
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/loop_engine/iteration.rs",
+            "impact": "OK",
+            "line": 714,
+            "mitigation": "call handle_overflow",
+            "usage": "sequential PromptTooLong dispatch"
+          },
+          {
+            "file": "src/loop_engine/slot.rs",
+            "impact": "BREAKS",
+            "line": 492,
+            "mitigation": "route through handle_overflow (FR-OQ resolved); slot.rs deny forces it",
+            "usage": "wave per-slot overflow dispatch (direct)"
+          }
+        ],
+        "semanticDistinctions": [
+          {
+            "context": "Per-task overflow",
+            "currentBehavior": "per-task ladder, both paths call the same leaf",
+            "requiredBehavior": "same ladder via one coordinator; per-task keying retained (NOT account-global)"
+          }
+        ]
+      },
+      "dependsOn": [
+        "CONTRACT-001",
+        "TEST-INIT-003"
+      ],
+      "description": "Relocate overflow::handle_prompt_too_long into reactions::post_output::handle_overflow (overflow.rs keeps a deprecated shim). Route ALL THREE call sites through it: iteration.rs:714, the wave path via process_slot_result, AND slot.rs:492 (FR-OQ resolved). Preserve the five-rung ladder, dumps/JSONL/rotation, FallbackToProvider transactional promotion, and sanitize_id_for_filename. Document the handle_overflow↔pipeline ordering in CLAUDE.md.",
+      "estimatedEffort": "high",
+      "id": "FEAT-005",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": true,
+      "notes": "Learning #2852: do not regress the bypass→shared-ladder evolution. Highest relocation risk (transactional promotion + dumps). Relocate behind the existing signature first; keep overflow.rs tests as the equivalence oracle. slot.rs gains #![deny(deprecated)] in CONTRACT-001 so its direct call must move here.",
+      "passes": true,
+      "priority": 8,
+      "qualityDimensions": [
+        "Behavior-preserving relocation: existing overflow tests are the oracle",
+        "Per-task keying retained (overflow is per-task, not account-global)",
+        "Transactional promotion: ctx mutations applied only after tx.commit",
+        "Path-traversal defense (sanitize_id_for_filename) intact"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "handle_overflow — relocate overflow recovery as its own reaction (#5), all 3 call sites",
+      "touchesFiles": [
+        "src/loop_engine/reactions/post_output.rs",
+        "src/loop_engine/overflow.rs",
+        "src/loop_engine/iteration.rs",
+        "src/loop_engine/slot.rs",
+        "src/loop_engine/wave_scheduler.rs",
+        "src/loop_engine/CLAUDE.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "TEST-INIT-002 account_usage_gate case passes (same GateDecision per usage state on both shapes)",
+        "iteration.rs:114-142 routes through account_usage_gate",
+        "Wave performs the pre-iteration usage gate once per wave (not per slot)",
+        "usage:: leaves used by the gate carry #[deprecated]; no direct call from the three engine files",
+        "Injected/hermetic in tests (no real OAuth/API)"
+      ],
+      "dependsOn": [
+        "CONTRACT-001",
+        "TEST-INIT-002"
+      ],
+      "description": "Implement reactions::pre_spawn::account_usage_gate (relocating the iteration.rs:114-142 pre-spawn usage check) and call it on both paths so wave gains the pre-iteration gate it currently lacks. usage:: leaves keep deprecated shims.",
+      "estimatedEffort": "medium",
+      "id": "FEAT-003",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": true,
+      "notes": "Account-global: fire once per wave, not per slot (avoids N redundant API/DB checks). Reuse the injected-wait seam pattern for hermeticity. Opus because modifiesBehavior:true (rubric).",
+      "passes": true,
+      "priority": 9,
+      "qualityDimensions": [
+        "Gate fires once per wave (account-global), not per slot",
+        "Decision identical to sequential for the same usage state"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "account_usage_gate — converge the pre-iteration usage gate (#3)",
+      "touchesFiles": [
+        "src/loop_engine/reactions/pre_spawn.rs",
+        "src/loop_engine/iteration.rs",
+        "src/loop_engine/wave_scheduler.rs",
+        "src/loop_engine/usage.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "TEST-INIT-004 budget cases pass (WaitedAndRetry/RateLimit ⇒ no max_iterations consumption on both paths; bounded termination)",
+        "Sequential `iteration -= 1` (orchestrator.rs:1256) and the wave give-back go through the one helper",
+        "A persistently-rate-limited sequence still terminates on signal/.stop",
+        "No drift: the loop-bound counter and the iterations_completed stat are updated consistently from one place"
+      ],
+      "dependsOn": [
+        "CONTRACT-001",
+        "TEST-INIT-004"
+      ],
+      "description": "Extract a single helper owning the iteration-budget rule so a RateLimit/Reorder/WaitedAndRetry wave does not consume max_iterations, used by both the sequential (orchestrator.rs:1253-1264) and wave (orchestrator.rs:1021-1023) branches. Generalizes the FEAT-006 B2 fix so the two paths cannot drift on budget.",
+      "estimatedEffort": "medium",
+      "id": "FEAT-013",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": true,
+      "notes": "Verified loop bound: orchestrator.rs:918 `while iteration < max_iterations`, :919 top increment. Coordinate the wave give-back with FEAT-006's early return.",
+      "passes": true,
+      "priority": 10,
+      "qualityDimensions": [
+        "Single source of truth for budget accounting across both paths",
+        "Bounded termination preserved (no unbounded no-consumption loop)"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Shared budget-accounting helper (#13) — iteration_consumed ↔ iteration give-back",
+      "touchesFiles": [
+        "src/loop_engine/orchestrator.rs",
+        "src/loop_engine/reactions/mod.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "TEST-INIT-004 human-review cases pass (fires on both paths incl. on a partial WaitedAndRetry wave)",
+        "react_to_completions consumes a provided completed-id set; it does NOT rediscover completions",
+        "Wave gains the human-review trigger (intentional behavior addition); sequential behavior unchanged",
+        "wrapper_commit=true on sequential, false on wave (merge-back covers it)",
+        "Intra-wave ordering preserved: post-merge reconcile (wave_scheduler.rs:1172) feeds the id set before the external-git shadow (:1196)",
+        "trigger_human_reviews leaf carries #[deprecated]; no direct call from the three engine files"
+      ],
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/loop_engine/orchestrator.rs",
+            "impact": "OK",
+            "line": 1238,
+            "mitigation": "route through react_to_completions",
+            "usage": "sequential human-review trigger"
+          },
+          {
+            "file": "src/loop_engine/wave_scheduler.rs",
+            "impact": "NEEDS_REVIEW",
+            "line": 1196,
+            "mitigation": "add react_to_completions call AFTER post-merge reconcile; feed it the reconciled id set",
+            "usage": "wave external-git reconcile; no human-review today"
+          }
+        ],
+        "semanticDistinctions": [
+          {
+            "context": "Sequential",
+            "currentBehavior": "human-review fires per iteration",
+            "requiredBehavior": "via react_to_completions (unchanged)"
+          },
+          {
+            "context": "Wave",
+            "currentBehavior": "no human-review",
+            "requiredBehavior": "human-review fires (intentional addition), may fire on partial WaitedAndRetry wave"
+          }
+        ]
+      },
+      "dependsOn": [
+        "CONTRACT-001",
+        "TEST-INIT-004"
+      ],
+      "description": "Implement reactions::post_completion::react_to_completions(conn, &[String] completed_ids, &PostCompletionParams) folding human-review (#10) and external-git reconciliation (#9), with wrapper-commit (#8) behind a wrapper_commit: bool knob. Route orchestrator.rs:1178-1250 through it and ADD the human-review trigger to the wave path. Takes the already-computed completed-id set so wave intra-wave ordering (post-merge reconcile before external-git shadow) is preserved.",
+      "estimatedEffort": "high",
+      "id": "FEAT-010",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": true,
+      "notes": "Behavior ADDITION to wave mode: requires_human tasks now spawn review sessions in wave; review may fire on a partial WaitedAndRetry wave (other ephemerals unmerged, session blocks) — document as intentional in CLAUDE.md. Input-driven to preserve ordering.",
+      "passes": true,
+      "priority": 11,
+      "qualityDimensions": [
+        "Input-driven (consumes completed-id set) to preserve wave intra-wave ordering",
+        "wrapper_commit knob: sequential true, wave false",
+        "Human-review-on-partial-wave documented as intentional"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "react_to_completions — converge human-review + external-git + wrapper-commit (#10)",
+      "touchesFiles": [
+        "src/loop_engine/reactions/post_completion.rs",
+        "src/loop_engine/orchestrator.rs",
+        "src/loop_engine/wave_scheduler.rs",
+        "src/loop_engine/CLAUDE.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Verified: re-inlining any relocated leaf into iteration.rs/wave_scheduler.rs/slot.rs fails the build (lock holds)",
+        "Verified: all five coordinators destructure params with no `..`",
+        "Verified: B1 (durability), B2 (budget give-back), B3 (merge-fail streak) on the rate-limit path",
+        "Verified: deferred-promotion-after-commit preserved in pre_spawn + post_output relocations",
+        "Any issue found has a CODE-FIX-xxx / WIRE-FIX-xxx task added via task-mgr add --stdin --depended-on-by MILESTONE-1; if none, emit done with a one-line note"
+      ],
+      "dependsOn": [
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-005",
+        "FEAT-006",
+        "FEAT-010",
+        "FEAT-013"
+      ],
+      "description": "Review all FEAT/TEST-INIT/CONTRACT work for the six converged reactions. Focus: the compile-time lock actually holds (no inline duplicate of a relocated leaf in the three engine files), exhaustive param-struct destructure on the five coordinators, B1/B2/B3 invariants on the rate-limit path, transactional-promotion integrity in FEAT-002/FEAT-005, no unwrap() on fallible paths, wiring reachable.",
+      "estimatedEffort": "medium",
+      "id": "CODE-REVIEW-1",
+      "model": "grok-build",
+      "modifiesBehavior": false,
+      "notes": "Use the rust-python-code-reviewer agent. Spawn fixups with --depended-on-by MILESTONE-1.",
+      "passes": true,
+      "priority": 13,
+      "qualityDimensions": [
+        "The lock and the six invariants are the review's primary targets",
+        "Wiring reachable from production on all three engine files"
+      ],
+      "requiresHuman": false,
+      "taskType": "review",
+      "title": "Code review: reactions framework + six converged behaviors",
+      "touchesFiles": [
+        "src/loop_engine/reactions/account.rs",
+        "src/loop_engine/reactions/pre_spawn.rs",
+        "src/loop_engine/reactions/post_output.rs",
+        "src/loop_engine/reactions/post_completion.rs",
+        "src/loop_engine/iteration.rs",
+        "src/loop_engine/wave_scheduler.rs",
+        "src/loop_engine/slot.rs",
+        "src/loop_engine/orchestrator.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "All dependsOn tasks passes:true",
+        "cargo fmt --check && cargo check && cargo clippy -- -D warnings && cargo test all green (full workspace)",
+        "Any failure (incl. pre-existing) fixed inline or spawned as a FIX-xxx --depended-on-by MILESTONE-1",
+        "The #![deny(deprecated)] lock is active on all three engine files in the green build"
+      ],
+      "dependsOn": [
+        "CODE-REVIEW-1",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-005",
+        "FEAT-006",
+        "FEAT-010",
+        "FEAT-013"
+      ],
+      "description": "Full unscoped quality gate after the framework, enforcement, and the six converged reactions plus any CODE-REVIEW-1 fixups. Leave the trunk green including any pre-existing failures.",
+      "estimatedEffort": "medium",
+      "id": "MILESTONE-1",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "passes": true,
+      "priority": 20,
+      "qualityDimensions": [
+        "Trunk green is the invariant; fix pre-existing failures too"
+      ],
+      "requiresHuman": false,
+      "taskType": "milestone",
+      "timeoutSecs": 1800,
+      "title": "Gate: full suite green after reactions framework + six behaviors",
+      "touchesFiles": [
+        "src/loop_engine/"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "A 2-slot wave hitting the injected session-limit string triggers a single usage wait (injected/hermetic) and resumes",
+        "No 'no eligible tasks after 3 consecutive stale iterations' abort occurs for the rate-limit cause",
+        "Rate-limited tasks return to todo and are re-run after the wait",
+        "max_iterations is not consumed by the rate-limited wave"
+      ],
+      "dependsOn": [
+        "MILESTONE-1"
+      ],
+      "description": "Extend tests/wave_runtime_error_fallback.rs (or a sibling e2e harness) to drive a parallel_slots>=2 wave whose slots return the session-limit string via a fixture runner, asserting the loop performs the usage wait and resumes — instead of false-aborting with 'no eligible tasks after 3 consecutive stale iterations'.",
+      "edgeCases": [
+        "2-slot wave both rate-limited → single wait, both reset, resume",
+        "rate-limit then clean wave → completes without false abort"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "limit lifts mid-wait (probe)",
+          "expectedBehavior": "resume immediately on probe success"
+        }
+      ],
+      "id": "TEST-001",
+      "invariants": [
+        "A rate-limited wave never advances toward stale-abort"
+      ],
+      "modifiesBehavior": false,
+      "notes": "This is the regression that would have caught the production incident. Keep it hermetic via the injected wait seam.",
+      "passes": true,
+      "priority": 30,
+      "qualityDimensions": [
+        "End-to-end proof the bug is fixed; hermetic (no real sleep/API)"
+      ],
+      "requiresHuman": false,
+      "taskType": "test",
+      "title": "E2E: wave-mode rate-limit waits and resumes (bug #3 repro)",
+      "touchesFiles": [
+        "tests/wave_runtime_error_fallback.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "All dependsOn tasks passes:true",
+        "Full workspace gate green (fmt/check/clippy/test)",
+        "Any failure fixed inline or spawned as FIX-xxx --depended-on-by MILESTONE-2"
+      ],
+      "dependsOn": [
+        "MILESTONE-1",
+        "TEST-001"
+      ],
+      "description": "Full unscoped quality gate after the e2e repro lands.",
+      "estimatedEffort": "low",
+      "id": "MILESTONE-2",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "passes": true,
+      "priority": 50,
+      "qualityDimensions": [
+        "Trunk green including pre-existing failures"
+      ],
+      "requiresHuman": false,
+      "taskType": "milestone",
+      "timeoutSecs": 1800,
+      "title": "Gate: full suite green after e2e",
+      "touchesFiles": [
+        "src/loop_engine/",
+        "tests/"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Each handoff point named and confirmed wired: slot.rs → SlotResult → process_slot_result → react_to_outputs → TaskLifecycle/usage → WaveOutcome → orchestrator.rs:1019-1058",
+        "usage_params reaches react_to_outputs from orchestrator.rs:991 through WaveIterationParams",
+        "B2/B3 handling confirmed at the orchestrator wave boundary (budget give-back, streak preserved)",
+        "If a handoff is missing, a WIRE-FIX-xxx is spawned --depended-on-by MILESTONE-FINAL"
+      ],
+      "dependsOn": [
+        "MILESTONE-2"
+      ],
+      "description": "Trace the cross-boundary control/data path for the headline fix: slot worker output (slot.rs) → SlotResult → process_slot_result (main thread) → OutputReactionItem slice → reactions::account::react_to_outputs → TaskLifecycle reset + usage wait → WaveOutcome early return → orchestrator budget/streak handling. Confirm each handoff is wired and no step is silently skipped. Write no new code unless wiring is missing.",
+      "estimatedEffort": "low",
+      "id": "INT-001",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "Cross-boundary path spans slot.rs (worker) → wave_scheduler.rs/orchestrator.rs (main thread) → reactions::account → lifecycle/usage. This is the single distinct cross-boundary path for the headline behavior.",
+      "passes": true,
+      "priority": 55,
+      "qualityDimensions": [
+        "Every handoff wired; no silently-skipped step"
+      ],
+      "requiresHuman": false,
+      "taskType": "verification",
+      "title": "Integration trace: wave RateLimit slot output → react_to_outputs → reset + wait → resume",
+      "touchesFiles": [
+        "src/loop_engine/slot.rs",
+        "src/loop_engine/wave_scheduler.rs",
+        "src/loop_engine/orchestrator.rs",
+        "src/loop_engine/reactions/account.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "reactions:: reviewed for DRY/complexity/coupling/clarity with full context",
+        "Confirmed the five coordinators share param-struct + destructure conventions consistently",
+        "Any issue spawns a REFACTOR-xxx --depended-on-by MILESTONE-FINAL; if none, emit done with a note"
+      ],
+      "dependsOn": [
+        "INT-001"
+      ],
+      "description": "Full-context review of all reactions:: code + tests: DRY across the five coordinators, complexity, coupling to IterationContext, clarity, and adherence to the single-home/exhaustive-destructure contract. Spawn REFACTOR-xxx for issues.",
+      "estimatedEffort": "medium",
+      "id": "REFACTOR-REVIEW-FINAL",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "passes": true,
+      "priority": 70,
+      "qualityDimensions": [
+        "Full-context cohesion pass before merge"
+      ],
+      "requiresHuman": false,
+      "taskType": "review",
+      "title": "Final refactor review: reactions framework cohesion",
+      "touchesFiles": [
+        "src/loop_engine/reactions/"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No #[deprecated] shim for a relocated leaf remains",
+        "git grep shows each relocated leaf defined only under reactions::",
+        "Stale #[allow(deprecated)] annotations removed (engine re-exports kept only where external tests genuinely need them)",
+        "cargo build + full test suite green"
+      ],
+      "dependsOn": [
+        "REFACTOR-REVIEW-FINAL"
+      ],
+      "description": "After all six items route through reactions::, delete the #[deprecated] shims for relocated leaves and slim recovery.rs/usage.rs/overflow.rs to near-zero (no permanent dual-home, per resolved open question). Audit every #[allow(deprecated)] site and remove those no longer needed.",
+      "estimatedEffort": "medium",
+      "id": "CLEANUP-001",
+      "modifiesBehavior": false,
+      "notes": "Resolved open question: slim-to-near-zero, no permanent dual-home. Run after the six FEATs + REFACTOR-REVIEW-FINAL so nothing still depends on the shims.",
+      "passes": true,
+      "priority": 85,
+      "qualityDimensions": [
+        "End state: reactions:: is the unambiguous single home",
+        "No dead deprecated shims left behind"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Remove transition shims; slim recovery.rs/usage.rs/overflow.rs to near-zero (FR-CLEANUP-001)",
+      "touchesFiles": [
+        "src/loop_engine/recovery.rs",
+        "src/loop_engine/usage.rs",
+        "src/loop_engine/overflow.rs",
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "All six audit items (#2/#3/#5/#6/#10/#13) route through a single reactions:: coordinator called by both paths",
+        "src/loop_engine/CLAUDE.md 'Reaction framework (shared)' section complete; 'Out of scope' list reclassified; human-review-on-partial-wave + iteration_consumed=false invariants + handle_overflow ordering documented",
+        "iteration_pipeline.rs:45-50 'Out of scope' rustdoc no longer lists rate-limit waits",
+        "grep-verified: each coordinator has exactly one production home and is called from both paths",
+        "No unwrap() on fallible reaction paths; tests use production-shaped fixtures",
+        "Demonstrated once more: re-inlining a relocated leaf fails the build"
+      ],
+      "dependsOn": [
+        "REFACTOR-REVIEW-FINAL",
+        "INT-001"
+      ],
+      "description": "Authoritative final check: all six items converged + locked, docs updated, reachability grep-verified, no unwrap() in production reaction paths.",
+      "estimatedEffort": "medium",
+      "id": "VERIFY-001",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "passes": true,
+      "priority": 90,
+      "qualityDimensions": [
+        "Bug class verifiably closed: six items converged + compile-time locked + documented"
+      ],
+      "requiresHuman": false,
+      "taskType": "verification",
+      "timeoutSecs": 1800,
+      "title": "Final validation + documentation",
+      "touchesFiles": [
+        "src/loop_engine/CLAUDE.md",
+        "src/loop_engine/iteration_pipeline.rs",
+        "src/loop_engine/reactions/"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "All dependsOn tasks passes:true",
+        "Full workspace gate green (fmt/check/clippy/test)",
+        "No #[deprecated] shim for a relocated leaf remains (CLEANUP-001 done)",
+        "Any remaining failure fixed inline or routed via a single FIX/CLARIFY task with BLOCKED"
+      ],
+      "dependsOn": [
+        "VERIFY-001",
+        "CLEANUP-001"
+      ],
+      "description": "Final full-gate checkpoint. Confirms the trunk is green, the lock holds, the six items are converged, and the transition shims are gone.",
+      "estimatedEffort": "medium",
+      "id": "MILESTONE-FINAL",
+      "model": "grok-build",
+      "modifiesBehavior": false,
+      "passes": false,
+      "priority": 99,
+      "qualityDimensions": [
+        "Trunk green; lock active; six items converged; shims removed"
+      ],
+      "requiresHuman": false,
+      "taskType": "milestone",
+      "timeoutSecs": 1800,
+      "title": "Final gate: full suite + lock verified, ready to merge",
+      "touchesFiles": [
+        "src/loop_engine/",
+        "tests/"
+      ]
+    }
+  ],
+  "version": "1.0"
+}
