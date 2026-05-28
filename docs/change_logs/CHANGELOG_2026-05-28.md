@@ -81,3 +81,26 @@ None for end-users. Internal to the engine:
   (converged)".
 
 ---
+
+## Parallel task execution — refactor tail (REFACTOR-077…080 + VERIFY-001)
+
+**Branch**: `feat/parallel-task-execution`
+**PRD**: `tasks/prd-parallel-task-execution.md`
+
+### What shipped
+
+Closing-cleanup of the parallel-execution PRD: extracted a shared `count_remaining_tasks` helper used by both sequential and wave paths (REFACTOR-077); replaced two magic-string `StaleTracker::check("stale","stale")` / `check("a","b")` call sites with named `mark_stale()` / `reset_progress()` methods (REFACTOR-078); converted `progress::log_iteration`'s 8-arg signature to a `LogIterationParams` struct and dropped `#[allow(clippy::too_many_arguments)]` (REFACTOR-079); replaced manual `serde_json::json!({...})` + 5 if-let blocks in `format_task_json_raw` with a `TaskJsonPayload` struct using `skip_serializing_if = "Option::is_none"` (REFACTOR-080). CLAUDE.md picked up the missing `--parallel` cheat sheet entry, slot worktree paths, and a pointer to the most recent migration (VERIFY-001).
+
+### Why it matters
+
+These are call-site preserving cleanups — no behavior change, no API breakage, full suite (3843 tests) green and clippy clean. The benefit accrues to the next engineer touching this code: named methods over magic strings, params struct over 8-arg signatures, derive-Serialize over hand-rolled JSON. The CLAUDE.md edit closes a discoverability gap on the `--parallel` flag.
+
+### Breaking changes
+
+None.
+
+### Footnote
+
+REFACTOR-080 initially broke the `prompt_sequential_v1` snapshot test because the serde struct serialized fields in declaration order while the prior `json!({...})` macro alphabetized via its internal BTreeMap. Fixed in a follow-up commit (`605d47c`) by reordering `TaskJsonPayload`'s fields alphabetically by their camelCase serialized name. The struct now carries a comment documenting the constraint, and a new learning (`task-mgr recall --tags serde,snapshot`) captures the rule for future struct-for-`json!` refactors.
+
+---
