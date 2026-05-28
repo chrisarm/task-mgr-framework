@@ -320,14 +320,16 @@ fn test_e2e_progress_log_records_model() {
     let progress_path = temp_dir.path().join("progress.txt");
 
     task_mgr::loop_engine::progress::log_iteration(
-        &progress_path,
-        1,
-        Some("MR-001"),
-        &task_mgr::loop_engine::config::IterationOutcome::Completed,
-        &["src/core.rs".to_string()],
-        Some(OPUS_MODEL),
-        Some("max"),
-        None,
+        task_mgr::loop_engine::progress::LogIterationParams {
+            progress_path: &progress_path,
+            iteration: 1,
+            task_id: Some("MR-001"),
+            outcome: &task_mgr::loop_engine::config::IterationOutcome::Completed,
+            files: &["src/core.rs".to_string()],
+            model: Some(OPUS_MODEL),
+            effort: Some("max"),
+            slot: None,
+        },
     );
 
     let content = fs::read_to_string(&progress_path).unwrap();
@@ -338,14 +340,16 @@ fn test_e2e_progress_log_records_model() {
 
     // Second iteration with no model
     task_mgr::loop_engine::progress::log_iteration(
-        &progress_path,
-        2,
-        Some("MR-003"),
-        &task_mgr::loop_engine::config::IterationOutcome::Completed,
-        &[],
-        None,
-        None,
-        None,
+        task_mgr::loop_engine::progress::LogIterationParams {
+            progress_path: &progress_path,
+            iteration: 2,
+            task_id: Some("MR-003"),
+            outcome: &task_mgr::loop_engine::config::IterationOutcome::Completed,
+            files: &[],
+            model: None,
+            effort: None,
+            slot: None,
+        },
     );
 
     let content = fs::read_to_string(&progress_path).unwrap();

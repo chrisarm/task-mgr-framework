@@ -234,16 +234,16 @@ pub fn process_iteration_output(params: ProcessingParams<'_>) -> ProcessingOutco
     // Step 1: progress log entry. FEAT-005 widened `ProcessingParams` so the
     // sequential call site no longer needs to log separately; FEAT-006 wires
     // the wave call site through the same path.
-    progress::log_iteration(
+    progress::log_iteration(progress::LogIterationParams {
         progress_path,
         iteration,
         task_id,
         outcome,
-        files_modified,
-        effective_model,
-        effective_effort,
-        slot_index,
-    );
+        files: files_modified,
+        model: effective_model,
+        effort: effective_effort,
+        slot: slot_index,
+    });
 
     // Step 2: extract `<key-decision>` tags and persist.
     let key_decisions = detection::extract_key_decisions(output);

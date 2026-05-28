@@ -346,16 +346,16 @@ fn handle_no_eligible_tasks(
     // one where tasks were left blocked/skipped (non-zero exit, named reason)
     // so the loop-end banner is honest.
     if let Some(drained) = classify_drained_queue(params.conn, task_prefix) {
-        progress::log_iteration(
-            params.progress_path,
-            params.iteration,
-            None,
-            &IterationOutcome::Completed,
-            &[],
-            None,
-            None,
-            None,
-        );
+        progress::log_iteration(progress::LogIterationParams {
+            progress_path: params.progress_path,
+            iteration: params.iteration,
+            task_id: None,
+            outcome: &IterationOutcome::Completed,
+            files: &[],
+            model: None,
+            effort: None,
+            slot: None,
+        });
         return WaveOutcome {
             tasks_completed: 0,
             iteration_consumed: true,
@@ -394,16 +394,16 @@ fn handle_no_eligible_tasks(
     // (3) Genuinely stuck: nothing eligible, nothing recoverable. Count toward
     // the stale-abort threshold exactly as before.
     ctx.stale_tracker.mark_stale();
-    progress::log_iteration(
-        params.progress_path,
-        params.iteration,
-        None,
-        &IterationOutcome::NoEligibleTasks,
-        &[],
-        None,
-        None,
-        None,
-    );
+    progress::log_iteration(progress::LogIterationParams {
+        progress_path: params.progress_path,
+        iteration: params.iteration,
+        task_id: None,
+        outcome: &IterationOutcome::NoEligibleTasks,
+        files: &[],
+        model: None,
+        effort: None,
+        slot: None,
+    });
     if ctx.stale_tracker.should_abort() {
         ui::emit(&format!(
             "Aborting: no eligible tasks after {} consecutive stale iterations",
@@ -459,16 +459,16 @@ fn handle_ephemeral_deadlock(
     diagnostics: Vec<(String, Vec<String>)>,
 ) -> WaveOutcome {
     ctx.stale_tracker.mark_stale();
-    progress::log_iteration(
-        params.progress_path,
-        params.iteration,
-        None,
-        &IterationOutcome::NoEligibleTasks,
-        &[],
-        None,
-        None,
-        None,
-    );
+    progress::log_iteration(progress::LogIterationParams {
+        progress_path: params.progress_path,
+        iteration: params.iteration,
+        task_id: None,
+        outcome: &IterationOutcome::NoEligibleTasks,
+        files: &[],
+        model: None,
+        effort: None,
+        slot: None,
+    });
 
     ui::emit(
         "Cross-wave deadlock: every eligible candidate is blocked by un-merged ephemeral branch(es). \
