@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::error::{TaskMgrError, TaskMgrResult};
+use crate::output::ui;
 
 use super::env::{get_current_branch, prompt_user_yn};
 
@@ -185,11 +186,11 @@ pub fn ensure_worktree(
             if branch.as_deref() == Some(branch_name) {
                 // Found existing worktree for this branch
                 if path.exists() {
-                    eprintln!(
+                    ui::emit(&format!(
                         "Using existing worktree for '{}' at {}",
                         branch_name,
                         path.display()
-                    );
+                    ));
                     return Ok(path.clone());
                 }
             }
@@ -200,11 +201,11 @@ pub fn ensure_worktree(
             // It's a worktree, check which branch
             let wt_branch = get_current_branch(&worktree_path)?;
             if wt_branch == branch_name {
-                eprintln!(
+                ui::emit(&format!(
                     "Using existing worktree for '{}' at {}",
                     branch_name,
                     worktree_path.display()
-                );
+                ));
                 return Ok(worktree_path);
             } else {
                 return Err(TaskMgrError::InvalidState {
@@ -224,11 +225,11 @@ pub fn ensure_worktree(
 
     // Need to create the worktree
     if !yes_mode {
-        eprintln!(
+        ui::emit(&format!(
             "Creating git worktree for branch '{}' at {}",
             branch_name,
             worktree_path.display()
-        );
+        ));
         if !prompt_user_yn("Create worktree? [y/N] ")? {
             return Err(TaskMgrError::InvalidState {
                 resource_type: "User confirmation".to_string(),
@@ -238,11 +239,11 @@ pub fn ensure_worktree(
             });
         }
     } else {
-        eprintln!(
+        ui::emit(&format!(
             "Creating worktree for '{}' at {}",
             branch_name,
             worktree_path.display()
-        );
+        ));
     }
 
     // Create parent directory for worktrees; track if we created it so we can
@@ -352,7 +353,7 @@ pub fn ensure_worktree(
         });
     }
 
-    eprintln!("Created worktree at {}", worktree_path.display());
+    ui::emit(&format!("Created worktree at {}", worktree_path.display()));
     Ok(worktree_path)
 }
 
@@ -390,10 +391,10 @@ pub fn remove_worktree(project_root: &Path, worktree_path: &Path) -> TaskMgrResu
         let stderr = String::from_utf8_lossy(&output.stderr);
         // git exits non-zero with this message when the worktree has dirty changes
         if stderr.contains("contains modified or untracked files") {
-            eprintln!(
+            ui::emit_err(&format!(
                 "warning: skipping removal of dirty worktree at {} (uncommitted changes)",
                 worktree_path.display()
-            );
+            ));
             return Ok(false);
         }
         return Err(TaskMgrError::InvalidState {
@@ -564,7 +565,10 @@ pub(crate) fn ensure_slot_worktrees(
     if num_slots > 1
         && let Err(e) = ensure_progress_union_merge(project_root)
     {
-        eprintln!("Warning: failed to configure progress union merge: {}", e);
+        ui::emit_err(&format!(
+            "Warning: failed to configure progress union merge: {}",
+            e
+        ));
     }
 
     let mut paths = Vec::with_capacity(num_slots);
@@ -629,7 +633,7 @@ enum EphemeralCase {
 /// would have considered, and case 3 / case 4 outcomes are pure observation.
 ///
 /// Errors propagate only for the abort cases; per-branch classification or
-/// deletion failures are logged via `eprintln!` and the pass continues with
+/// deletion failures are logged via `ui::emit_err` and the pass continues with
 /// the remaining branches so a single corrupt branch can never block all
 /// hygiene.
 pub(crate) fn reconcile_stale_ephemeral_slots(
@@ -671,13 +675,13 @@ pub(crate) fn reconcile_stale_ephemeral_slots_inner(
     // Emit warnings for un-merged branches whether or not we're going to
     // abort — the operator needs to see the commit subjects either way.
     for (ephemeral, commits) in &unmerged {
-        eprintln!(
+        ui::emit_err(&format!(
             "warning: stale ephemeral branch {} has {} un-merged commit(s):",
             ephemeral,
             commits.len()
-        );
+        ));
         for subject in commits {
-            eprintln!("    {}", subject);
+            ui::emit_err(&format!("    {}", subject));
         }
     }
 
@@ -738,17 +742,17 @@ pub(crate) fn reconcile_stale_ephemeral_slots_inner(
                 resolver,
             ) {
                 Ok(()) => {
-                    eprintln!(
+                    ui::emit(&format!(
                         "auto-recovery: successfully merged stale ephemeral {} back into {} and deleted the branch",
                         ephemeral, branch_name
-                    );
+                    ));
                     recovered.push(ephemeral.clone());
                 }
                 Err(msg) => {
-                    eprintln!(
+                    ui::emit_err(&format!(
                         "auto-recovery: failed to recover stale ephemeral {}: {}",
                         ephemeral, msg
-                    );
+                    ));
                     attempted_failed.push(ephemeral.clone());
                 }
             }
@@ -841,16 +845,16 @@ fn attempt_auto_recovery_for_branch(
     match &cleanup_result {
         CleanupOutcome::Restored => {}
         CleanupOutcome::PopConflict { tag, conflicted } => {
-            eprintln!(
+            ui::emit_err(&format!(
                 "auto-recovery: stash pop conflict on branch {} (tag {}, paths {:?}); stash retained on stack",
                 ephemeral, tag, conflicted
-            );
+            ));
         }
         CleanupOutcome::StashLimitExceeded { count } => {
-            eprintln!(
+            ui::emit_err(&format!(
                 "auto-recovery: stash count {} exceeded limit {} on branch {}; stash retained on stack",
                 count, cfg.stash_limit, ephemeral
-            );
+            ));
         }
     }
 
@@ -869,10 +873,10 @@ fn attempt_auto_recovery_for_branch(
                 &[project_root.to_path_buf(), worktree_path.clone()],
                 cfg.progress_file_name,
             ) {
-                eprintln!(
+                ui::emit_err(&format!(
                     "warning: auto-recovery failed to union progress for {}: {}",
                     ephemeral, e
-                );
+                ));
             }
             if worktree_path.exists()
                 && let Err(e) = remove_worktree(project_root, &worktree_path)
@@ -935,10 +939,10 @@ fn enumerate_stale_ephemeral_branches(
         })?;
 
     if !output.status.success() {
-        eprintln!(
+        ui::emit_err(&format!(
             "warning: git branch --list failed during stale-ephemeral reconcile (continuing): {}",
             String::from_utf8_lossy(&output.stderr).trim()
-        );
+        ));
         return Ok(Vec::new());
     }
 
@@ -964,25 +968,25 @@ fn classify_stale_branches(
         match classify_ephemeral_branch(project_root, branch_name, ephemeral) {
             Ok(EphemeralCase::OrphanBranch) => {
                 if let Err(e) = delete_branch_force(project_root, ephemeral) {
-                    eprintln!(
+                    ui::emit_err(&format!(
                         "warning: failed to delete orphan ephemeral branch {} (continuing): {}",
                         ephemeral, e
-                    );
+                    ));
                 } else {
-                    eprintln!("Deleted orphan ephemeral branch {}", ephemeral);
+                    ui::emit(&format!("Deleted orphan ephemeral branch {}", ephemeral));
                 }
             }
             Ok(EphemeralCase::CleanMerged { worktree_path }) => {
                 if let Err(e) = delete_merged_ephemeral(project_root, &worktree_path, ephemeral) {
-                    eprintln!(
+                    ui::emit_err(&format!(
                         "warning: failed to clean already-merged ephemeral {} (continuing): {}",
                         ephemeral, e
-                    );
+                    ));
                 } else {
-                    eprintln!(
+                    ui::emit(&format!(
                         "Cleaned already-merged ephemeral branch {} and its worktree",
                         ephemeral
-                    );
+                    ));
                 }
             }
             Ok(EphemeralCase::CleanUnmerged { commits }) => {
@@ -992,10 +996,10 @@ fn classify_stale_branches(
                 dirty_paths.push(worktree_path);
             }
             Err(e) => {
-                eprintln!(
+                ui::emit_err(&format!(
                     "warning: failed to classify ephemeral branch {} during reconcile (continuing): {}",
                     ephemeral, e
-                );
+                ));
             }
         }
     }
@@ -1224,11 +1228,11 @@ pub(crate) fn cleanup_preparation(
     let stash_ref = match resolve_stash_ref_by_tag(slot0_path, tag) {
         Ok(Some(r)) => r,
         Ok(None) => {
-            eprintln!("[warn] stash tag {tag} not found; treating as Restored");
+            tracing::warn!("stash tag {tag} not found; treating as Restored");
             return CleanupOutcome::Restored;
         }
         Err(e) => {
-            eprintln!("[warn] failed to resolve stash ref for {tag}: {e}");
+            tracing::warn!("failed to resolve stash ref for {tag}: {e}");
             return CleanupOutcome::Restored;
         }
     };
@@ -1239,7 +1243,7 @@ pub(crate) fn cleanup_preparation(
         .output()
     {
         Err(e) => {
-            eprintln!("[warn] git stash pop spawn failed: {e}");
+            tracing::warn!("git stash pop spawn failed: {e}");
             return CleanupOutcome::Restored;
         }
         Ok(o) => o,
@@ -1438,8 +1442,8 @@ pub(crate) fn union_slot_progress_files(
             // Worktree directory removed between merge-back and union (e.g.
             // cleanup-first wiring). Warn — this is a wiring anomaly, distinct
             // from a slot that simply never wrote a progress file.
-            eprintln!(
-                "warning: slot {} worktree {} no longer exists; skipping its progress",
+            tracing::warn!(
+                "slot {} worktree {} no longer exists; skipping its progress",
                 idx,
                 slot_path.display()
             );
@@ -1453,8 +1457,8 @@ pub(crate) fn union_slot_progress_files(
                 continue;
             }
             Err(e) => {
-                eprintln!(
-                    "warning: failed to read slot {} progress file {}: {} — skipping this slot",
+                tracing::warn!(
+                    "failed to read slot {} progress file {}: {} — skipping this slot",
                     idx,
                     progress_path.display(),
                     e
@@ -1464,8 +1468,8 @@ pub(crate) fn union_slot_progress_files(
         };
         let content = String::from_utf8_lossy(&bytes);
         if matches!(content, std::borrow::Cow::Owned(_)) {
-            eprintln!(
-                "warning: slot {} progress file {} contained invalid UTF-8; using lossy conversion",
+            tracing::debug!(
+                "slot {} progress file {} contained invalid UTF-8; using lossy conversion",
                 idx,
                 progress_path.display()
             );
@@ -1502,8 +1506,8 @@ pub(crate) fn union_slot_progress_files(
         if progress_path.exists()
             && let Err(e) = std::fs::write(&progress_path, b"")
         {
-            eprintln!(
-                "warning: failed to truncate slot progress file {}: {}",
+            tracing::warn!(
+                "failed to truncate slot progress file {}: {}",
                 progress_path.display(),
                 e
             );
@@ -1933,17 +1937,17 @@ pub(crate) fn merge_slot_branches_with_resolver(
                 outcomes.merged_slots.push(slot);
             }
             (Ok(()), CleanupOutcome::PopConflict { tag, conflicted }) => {
-                eprintln!(
+                ui::emit_err(&format!(
                     "warning: slot {} stash pop conflict (tag {}, paths {:?}); stash retained on stack — slot still merged",
                     slot, tag, conflicted
-                );
+                ));
                 outcomes.merged_slots.push(slot);
             }
             (Ok(()), CleanupOutcome::StashLimitExceeded { count }) => {
-                eprintln!(
+                ui::emit_err(&format!(
                     "warning: slot {} stash count {} exceeded limit {}; demoting slot to failed_slots — repeated pop conflicts suggest a systemic dirty-WT problem",
                     slot, count, stash_limit
-                );
+                ));
                 outcomes.failed_slots.push((
                     slot,
                     format!(
@@ -1960,10 +1964,10 @@ pub(crate) fn merge_slot_branches_with_resolver(
                 outcomes.failed_slots.push((slot, msg, kind));
             }
             (Err((msg, kind)), CleanupOutcome::PopConflict { tag, conflicted }) => {
-                eprintln!(
+                ui::emit_err(&format!(
                     "warning: slot {} stash pop conflict (tag {}, paths {:?}); stash retained on stack",
                     slot, tag, conflicted
-                );
+                ));
                 maybe_poison_slot0(&mut slot0_poisoned, &msg, &kind);
                 outcomes.failed_slots.push((
                     slot,
@@ -1975,10 +1979,10 @@ pub(crate) fn merge_slot_branches_with_resolver(
                 ));
             }
             (Err((msg, kind)), CleanupOutcome::StashLimitExceeded { count }) => {
-                eprintln!(
+                ui::emit_err(&format!(
                     "warning: slot {} stash count {} exceeded limit {}; demoting slot to failed_slots — repeated pop conflicts suggest a systemic dirty-WT problem",
                     slot, count, stash_limit
-                );
+                ));
                 maybe_poison_slot0(&mut slot0_poisoned, &msg, &kind);
                 outcomes.failed_slots.push((
                     slot,
@@ -2139,10 +2143,10 @@ fn reset_or_escalate(
     match hard_reset(slot0_path, pre_merge_head) {
         Ok(()) => (original_msg, kind),
         Err(reset_err) => {
-            eprintln!(
+            ui::emit_err(&format!(
                 "warning: slot-0 cleanup reset failed; subsequent slots will short-circuit: {}",
                 reset_err
-            );
+            ));
             (
                 format!("{} | reset cleanup failed: {}", original_msg, reset_err),
                 SlotFailureKind::PreResolver,
@@ -2195,10 +2199,10 @@ fn handle_conflict_for_slot(
             match conditional_reset(slot0_path, pre_merge_head) {
                 Ok(()) => Err((original_msg, SlotFailureKind::ResolverAttempted)),
                 Err(reset_err) => {
-                    eprintln!(
+                    ui::emit_err(&format!(
                         "warning: slot-0 cleanup reset failed; subsequent slots will short-circuit: {}",
                         reset_err
-                    );
+                    ));
                     Err((
                         format!("{} | reset cleanup failed: {}", original_msg, reset_err),
                         SlotFailureKind::PreResolver,
@@ -2255,11 +2259,11 @@ fn fast_forward_merged_slots(
                 let detail = format_git_failure(&output.stdout, &output.stderr);
                 match recover_progress_only_slot(slot, slot_path, branch_name) {
                     ProgressRecovery::Recovered => {
-                        eprintln!(
+                        ui::emit(&format!(
                             "info: slot {} progress-only sync conflict auto-resolved \
                              (committed dirty progress + union-merged {})",
                             slot, branch_name
-                        );
+                        ));
                     }
                     ProgressRecovery::NotApplicable => {
                         outcomes.merged_slots.retain(|s| *s != slot);
@@ -2484,10 +2488,10 @@ pub(crate) fn cleanup_slot_worktrees(
             false => {
                 // `remove_worktree` already warned; skip branch deletion
                 // because the worktree still has the branch checked out.
-                eprintln!(
+                ui::emit_err(&format!(
                     "warning: skipping ephemeral branch deletion for dirty slot {}",
                     slot
-                );
+                ));
             }
         }
     }

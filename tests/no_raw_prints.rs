@@ -66,7 +66,6 @@ const ALLOWLIST_SUFFIXES: &[&str] = &[
     "src/loop_engine/engine.rs",
     "src/loop_engine/env.rs",
     "src/loop_engine/feedback.rs",
-    "src/loop_engine/git_reconcile.rs",
     "src/loop_engine/iteration.rs",
     "src/loop_engine/iteration_pipeline.rs",
     "src/loop_engine/monitor.rs",
@@ -85,13 +84,10 @@ const ALLOWLIST_SUFFIXES: &[&str] = &[
     "src/loop_engine/recovery.rs",
     "src/loop_engine/runner.rs",
     "src/loop_engine/signals.rs",
-    "src/loop_engine/slot.rs",
     "src/loop_engine/stream.rs",
     "src/loop_engine/usage.rs",
     "src/loop_engine/user_config.rs",
     "src/loop_engine/watchdog.rs",
-    "src/loop_engine/wave_scheduler.rs",
-    "src/loop_engine/worktree.rs",
 ];
 
 /// Directories to skip entirely.
