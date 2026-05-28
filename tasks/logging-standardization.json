@@ -328,7 +328,7 @@
       "id": "FEAT-006",
       "modifiesBehavior": true,
       "notes": "runner.rs:1021 spawn_grok_stderr_sniffer (tee at 1037), runner.rs:1057 apply_common_env. The sniff buffer is read by GrokRunner auth sniff (runner.rs:918) AND by reactions FEAT-014 — leave it untouched. Memory project_grok_502_reactions_routing: this is the noise-reduction half deliberately split out of FEAT-014. Learning #4169. GROK_TELEMETRY_TRACE_UPLOAD=0 documented in ~/.grok config notes.",
-      "passes": false,
+      "passes": true,
       "priority": 6,
       "qualityDimensions": [
         "Sniff buffer semantics byte-for-byte preserved (other code depends on it)",
@@ -399,7 +399,9 @@
         "FEAT-005",
         "FEAT-006",
         "REFACTOR-001",
-        "FIX-001"
+        "FIX-001",
+        "REFACTOR-FIX-001",
+        "REFACTOR-FIX-002"
       ],
       "description": "Review all implementation for quality, security, integration wiring, and documentation. RUN THE FULL UNSCOPED QUALITY GATE.\n\nDO: Run full cargo test / clippy -D warnings / fmt --check. Verify the no_raw_prints allow-list is EMPTY (every module migrated) or that any remaining entry is a deliberate, documented exception. Verify byte-locked snapshot tests (lifecycle_stderr_contract + siblings) pass. Verify TASK_MGR_LOG actually controls console verbosity and the log file receives DEBUG. Check CLAUDE.md / docs need updating for the new logging model.\nDO NOT: Skip the full suite or leave the guard allow-list with undocumented entries.",
       "estimatedEffort": "medium",
@@ -432,11 +434,52 @@
       ],
       "description": "Pre-existing FEAT-001 bug (fails identically at HEAD 3799b86, independent of FEAT-005 CLI migration). main() calls observability::init() for every command; its build_file_writer does std::fs::create_dir_all(logs_dir) where logs_dir=.task-mgr/logs, which creates .task-mgr/ from scratch for ANY command in ANY directory. This breaks the init --force no-disk-write-before-reject invariant (test_init_force_without_from_json_rejected) and silently creates stray .task-mgr/ dirs for read-only commands run outside a project.",
       "id": "FIX-001",
-      "passes": false,
+      "passes": true,
       "priority": 60,
       "title": "Fix: observability::init bootstraps stray .task-mgr/ before init --force rejects",
       "touchesFiles": [
         "src/observability.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "All 6 callers in runner.rs/stream.rs/slot.rs use ui::emit_prefixed",
+        "claude::emit_prefixed_lines and write_prefixed_lines are deleted along with the 7 duplicate tests",
+        "ui:: tests still pass (write_prefixed semantics covered by src/output/ui.rs tests)",
+        "lifecycle_stderr_contract passes UNCHANGED (slot-prefixed output not snapshotted there but verifies no contract regression)",
+        "no warnings under clippy -D warnings",
+        "cargo fmt --check clean"
+      ],
+      "description": "FEAT-001 introduced `ui::emit_prefixed` + `ui::write_prefixed` (src/output/ui.rs:89-200) as the SINGLE home for the per-slot tee, with rustdoc explicitly promising \"the original `claude::emit_prefixed_lines` stays in place until its callers migrate in FEAT-002/003.\" Those callers never migrated. The result: `claude::emit_prefixed_lines` + `write_prefixed_lines` (src/loop_engine/claude.rs:238-274) is a byte-identical duplicate of the ui:: implementation, with 7 duplicate tests (claude.rs:2983-3057) mirroring ui.rs:125-200. Two maintained copies + two parallel test suites will drift silently. This is a clear DRY/per-module-reinvention violation that REFACTOR-001 was asked to catch.",
+      "estimatedEffort": "low",
+      "id": "REFACTOR-FIX-001",
+      "passes": false,
+      "priority": 90,
+      "title": "Dedupe: replace claude::emit_prefixed_lines callers with ui::emit_prefixed + delete the duplicate",
+      "touchesFiles": [
+        "src/loop_engine/claude.rs",
+        "src/loop_engine/runner.rs",
+        "src/loop_engine/stream.rs",
+        "src/loop_engine/slot.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "wave_scheduler.rs Review-class routing emits via ui::emit, not tracing::debug!",
+        "The [slot N] prefix is retained on the wave variant",
+        "iteration.rs sequential path is unchanged (ui::emit at line 401-404)",
+        "review_model_routing tests pass",
+        "lifecycle_stderr_contract passes UNCHANGED",
+        "no warnings under clippy -D warnings"
+      ],
+      "description": "Same call into `apply_review_model_override`, opposite channel: sequential `iteration.rs:401` announces \"Review-class routing: <old> → <new> (reviewModel)\" via `ui::emit` (operator sees it on console at the default WARN+ floor); parallel-wave `wave_scheduler.rs:1005-1010` announces the identical event via `tracing::debug!` (file-only at default — wave-mode operators go blind to routing they would see in sequential mode). This is a real cross-module classification inconsistency that REFACTOR-001 was asked to catch. Either both should be ui::emit (operator visibility — what sequential operators see today) or both tracing::debug! (consistent suppression — but that regresses sequential UX). Recommendation: route the wave path through ui::emit so wave and sequential operators see the same routing announcement.",
+      "estimatedEffort": "low",
+      "id": "REFACTOR-FIX-002",
+      "passes": false,
+      "priority": 75,
+      "title": "Fix: Review-class routing channel asymmetry — wave silences what sequential announces",
+      "touchesFiles": [
+        "src/loop_engine/wave_scheduler.rs"
       ]
     }
   ],
