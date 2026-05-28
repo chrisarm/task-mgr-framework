@@ -114,6 +114,12 @@ pub fn format_outcome(outcome: &IterationOutcome) -> String {
         IterationOutcome::Blocked => "Blocked".to_string(),
         IterationOutcome::Crash(crash_type) => format!("Crash ({:?})", crash_type),
         IterationOutcome::RateLimit => "RateLimit".to_string(),
+        IterationOutcome::TransientBackend { retry_after_secs } => {
+            format!(
+                "TransientBackend (retry_after_secs: {:?})",
+                retry_after_secs
+            )
+        }
         IterationOutcome::Reorder(task_id) => format!("Reorder ({})", task_id),
         IterationOutcome::NoEligibleTasks => "NoEligibleTasks".to_string(),
         IterationOutcome::Empty => "Empty".to_string(),

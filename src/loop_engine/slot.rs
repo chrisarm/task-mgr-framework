@@ -22,6 +22,14 @@
 //! **Per-task recovery is NOT owned here**: auto-block, crash escalation, and
 //! model/provider promotion live in `recovery.rs` and are invoked by
 //! `wave_scheduler.rs` after it collects the `SlotResult` from this module.
+//!
+//! **Reaction single-home lock (CONTRACT-001)**: `#![deny(deprecated)]` makes a
+//! direct call to any relocated reaction leaf (marked `#[deprecated]`) a compile
+//! error here. The per-slot overflow reaction routes through
+//! `crate::loop_engine::reactions::post_output::handle_overflow`. Pre-existing
+//! `#[allow(deprecated)]` shims (e.g. the `claim_slot_task` lifecycle shim) keep
+//! working — an inner `#[allow]` is more specific than this module-level deny.
+#![deny(deprecated)]
 
 use std::sync::Arc;
 
@@ -40,7 +48,7 @@ use crate::loop_engine::engine::{
 use crate::loop_engine::iteration_pipeline;
 use crate::loop_engine::model;
 use crate::loop_engine::monitor;
-use crate::loop_engine::overflow;
+use crate::loop_engine::reactions;
 use crate::loop_engine::runner::{self, RunnerKind};
 use crate::loop_engine::watchdog;
 use crate::models::TaskStatus;
@@ -129,7 +137,14 @@ pub fn run_slot_iteration(
         .clone()
         .or_else(|| params.default_model.clone());
 
-    let effort = model::effort_for_difficulty(bundle.difficulty.as_deref());
+    // FEAT-002: prefer the prior-overflow effort override resolved on the main
+    // thread (`reactions::pre_spawn::resolve_task_execution` → SlotContext),
+    // falling back to the difficulty-derived effort when there is none. Mirrors
+    // the sequential path's `plan.effort.or(base_effort)`. `None` here is the
+    // common (no-overflow) case and keeps behavior byte-identical to before.
+    let effort = slot
+        .effective_effort
+        .or_else(|| model::effort_for_difficulty(bundle.difficulty.as_deref()));
 
     if params.verbose {
         eprintln!(
@@ -225,6 +240,30 @@ pub fn run_slot_iteration(
                     files_modified: task_files,
                     should_stop: false,
                     output: hint,
+                    effective_model,
+                    effective_effort: effort,
+                },
+            ));
+        }
+        // FEAT-014: surface a Grok transient backend error (HTTP 5xx /
+        // overloaded on stderr) as `TransientBackend` on the slot result.
+        // Mirrors the GrokAuthFailure arm above; the converged
+        // `reactions::account::react_to_transient` fires once per wave in
+        // `run_wave_iteration` (the wave's convergence point with the Claude
+        // path, where `analyze_output` produces the same outcome). The
+        // aggregator never counts a `TransientBackend` slot as crashed.
+        Err(crate::error::TaskMgrError::TransientBackend { retry_after_secs }) => {
+            eprintln!(
+                "[slot {}] Transient backend error for task {} (retry_after_secs: {:?}); will back off and retry",
+                slot.slot_index, task_id, retry_after_secs
+            );
+            return Ok(slot_early_exit(
+                slot,
+                SlotEarlyExit {
+                    outcome: IterationOutcome::TransientBackend { retry_after_secs },
+                    files_modified: task_files,
+                    should_stop: false,
+                    output: String::new(),
                     effective_model,
                     effective_effort: effort,
                 },
@@ -489,20 +528,24 @@ pub(super) fn process_slot_result(
             effective_runner,
             "effective_runner drift: process_slot_result re-derivation diverged from pre-dispatch value"
         );
-        let _ = overflow::handle_prompt_too_long(
-            ctx,
-            params.conn,
-            tid,
-            slot_result.iteration_result.effective_effort,
-            slot_result.iteration_result.effective_model.as_deref(),
-            &synthetic_prompt,
-            params.iteration,
-            Some(params.run_id),
-            params.db_dir,
-            Some(slot_idx),
-            effective_runner,
-            params.project_config,
-        );
+        // CONTRACT-001: route the per-slot overflow reaction through the shared
+        // coordinator (`slot_index: Some(slot_idx)`); the direct leaf call is
+        // denied here by `#![deny(deprecated)]`.
+        let _ =
+            reactions::post_output::handle_overflow(reactions::post_output::HandleOverflowParams {
+                ctx,
+                conn: params.conn,
+                task_id: tid,
+                effort: slot_result.iteration_result.effective_effort,
+                effective_model: slot_result.iteration_result.effective_model.as_deref(),
+                prompt_result: &synthetic_prompt,
+                iteration: params.iteration,
+                run_id: Some(params.run_id),
+                base_dir: params.db_dir,
+                slot_index: Some(slot_idx),
+                effective_runner,
+                project_config: params.project_config,
+            });
     }
 
     // Pipeline contract requires a `working_root` even when skip_git is on
@@ -670,6 +713,7 @@ mod tests {
             working_root,
             prompt_bundle,
             effective_runner: RunnerKind::Claude,
+            effective_effort: None,
         }
     }
 

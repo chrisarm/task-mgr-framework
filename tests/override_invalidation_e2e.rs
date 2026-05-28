@@ -15,11 +15,15 @@
 //! iff the branch ran. The expected message text is:
 //!   `Operator changed task model for {task_id} — clearing auto-recovery overrides; resolving fresh.`
 
+// CLEANUP-001: migrated from `engine::check_override_invalidation` (deprecated
+// shim removed) to the real function at its new home.
+
 use rusqlite::Connection;
 
 use task_mgr::db::{create_schema, run_migrations};
-use task_mgr::loop_engine::engine::{IterationContext, check_override_invalidation};
+use task_mgr::loop_engine::engine::IterationContext;
 use task_mgr::loop_engine::model::{HAIKU_MODEL, OPUS_MODEL};
+use task_mgr::loop_engine::reactions::pre_spawn::invalidate_stale_overrides;
 use task_mgr::loop_engine::runner::RunnerKind;
 
 const GROK_FAST_MODEL: &str = "grok-build";
@@ -110,7 +114,7 @@ fn operator_model_edit_clears_grok_overrides() {
     )
     .unwrap();
 
-    check_override_invalidation(&mut ctx, &conn, task_id);
+    invalidate_stale_overrides(&mut ctx, &conn, task_id);
 
     // All six maps must be clear for the edited task.
     assert_all_overrides_absent(&ctx, task_id);
@@ -151,7 +155,7 @@ fn operator_model_edit_clears_all_six_when_fully_populated() {
     )
     .unwrap();
 
-    check_override_invalidation(&mut ctx, &conn, task_id);
+    invalidate_stale_overrides(&mut ctx, &conn, task_id);
 
     assert_all_overrides_absent(&ctx, task_id);
 }
@@ -171,7 +175,7 @@ fn no_op_when_model_unchanged_from_grok_snapshot() {
     seed_grok_fallback_overrides(&mut ctx, task_id, OPUS_MODEL);
 
     // DB still has OPUS_MODEL — same as the snapshot. No-op expected.
-    check_override_invalidation(&mut ctx, &conn, task_id);
+    invalidate_stale_overrides(&mut ctx, &conn, task_id);
 
     // All three seeded maps remain intact — no-op branch ran (not the clearing branch).
     assert_eq!(

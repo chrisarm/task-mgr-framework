@@ -12,22 +12,33 @@
 //! (`resolve_effective_runner`, `apply_review_model_override`) remain in
 //! `engine.rs` and are imported here — `run_loop` and the inline engine test
 //! modules also consume them, so moving them would widen the carve's blast
-//! radius. The leaf recovery primitives come from `recovery.rs` (FEAT-002:
-//! `check_crash_escalation`, `check_override_invalidation`,
-//! `prompt_overflow_result`, `probe_rate_limit_lifted`, `update_trackers`).
+//! radius. The pre-spawn per-task recovery reactions (crash escalation, the
+//! operator escape valve, the effort override, runner resolution) are folded by
+//! `reactions::pre_spawn::resolve_task_execution` (FEAT-002) — the sequential
+//! path calls it once, the wave path once per slot. The remaining leaf
+//! primitives still come from `recovery.rs` (`prompt_overflow_result`,
+//! `probe_rate_limit_lifted`, `update_trackers`).
 //!
 //! `engine.rs` re-exports `run_iteration` `pub` so the external import path
 //! `task_mgr::loop_engine::engine::run_iteration` integration tests and callers
 //! rely on stays valid (FR-008).
 //!
-//! **Order-before-resolve invariant (load-bearing)**: `check_override_invalidation`
-//! runs at the TOP of the iteration, BEFORE `resolve_effective_runner`, so an
+//! **Order-before-resolve invariant (load-bearing)**: the escape valve inside
+//! `resolve_task_execution` runs at the TOP of the iteration, BEFORE crash
+//! escalation, the effort read, and `resolve_effective_runner`, so an
 //! operator's out-of-band `tasks.model` edit clears the stale per-task recovery
-//! channels before the spawn discriminant is derived. See
-//! `src/loop_engine/CLAUDE.md` → "Operator escape valve". `run_iteration` still
-//! hands its `IterationResult` to `iteration_pipeline::process_iteration_output`
-//! at the `run_loop` call site (the shared post-Claude pipeline is invoked
-//! after this function returns — see FR-006).
+//! channels before any of them is read. See `src/loop_engine/CLAUDE.md` →
+//! "Operator escape valve". `run_iteration` still hands its `IterationResult`
+//! to `iteration_pipeline::process_iteration_output` at the `run_loop` call
+//! site (the shared post-Claude pipeline is invoked after this function
+//! returns — see FR-006).
+//!
+//! **Reaction single-home lock (CONTRACT-001)**: `#![deny(deprecated)]` makes a
+//! direct call to any relocated reaction leaf (those marked `#[deprecated]` for
+//! the convergence) a compile error here. Post-Claude reactions must route
+//! through `crate::loop_engine::reactions::*` so both execution paths share one
+//! implementation — see `src/loop_engine/reactions/mod.rs`.
+#![deny(deprecated)]
 
 use std::sync::Arc;
 use std::thread;
@@ -48,16 +59,13 @@ use crate::loop_engine::engine::{
     apply_review_model_override, resolve_effective_runner,
 };
 use crate::loop_engine::monitor;
-use crate::loop_engine::overflow;
 use crate::loop_engine::prd_reconcile::reconcile_passes_with_db;
 use crate::loop_engine::prompt::{self, BuildPromptParams};
-use crate::loop_engine::recovery::{
-    check_crash_escalation, check_override_invalidation, probe_rate_limit_lifted,
-    prompt_overflow_result, update_trackers,
-};
+use crate::loop_engine::reactions;
+use crate::loop_engine::recovery::{prompt_overflow_result, update_trackers};
 use crate::loop_engine::runner;
 use crate::loop_engine::signals;
-use crate::loop_engine::usage::{self, UsageCheckResult};
+use crate::loop_engine::usage::UsageCheckResult;
 use crate::loop_engine::watchdog;
 use crate::loop_engine::wave_scheduler::classify_drained_queue;
 
@@ -111,13 +119,19 @@ pub fn run_iteration(
         );
     }
 
-    // Step 1.5: Pre-iteration usage check
+    // Step 1.5: Pre-iteration usage gate (account-global). Routes through the
+    // converged `reactions::account::account_usage_gate` coordinator — the SAME
+    // gate the wave path folds once per wave (`wave_scheduler::wave_preflight_check`),
+    // so both paths agree on the GateDecision for a given usage state. The
+    // relocated `usage::check_and_wait` leaf is `#[deprecated]` and this file
+    // carries `#![deny(deprecated)]`, so a direct call here is a compile error.
     if params.usage_params.enabled {
-        let check_result = usage::check_and_wait(
-            params.usage_params.threshold,
-            params.tasks_dir,
-            params.usage_params.fallback_wait,
-        );
+        let check_result =
+            reactions::account::account_usage_gate(reactions::account::AccountUsageGateParams {
+                threshold: params.usage_params.threshold,
+                tasks_dir: params.tasks_dir,
+                fallback_wait: params.usage_params.fallback_wait,
+            });
         match check_result {
             UsageCheckResult::StopSignaled => {
                 eprintln!("Stop signal during usage wait, exiting");
@@ -360,36 +374,52 @@ pub fn run_iteration(
     let task_files = prompt_result.task_files.clone();
     let shown_learning_ids = prompt_result.shown_learning_ids.clone();
 
-    // Step 4.5: Apply crash escalation and PromptTooLong model overrides
-    let mut effective_model = {
-        let resolved = prompt_result.resolved_model.as_deref();
-        let after_crash_escalation =
-            match check_crash_escalation(&ctx.crashed_last_iteration, &task_id, resolved) {
-                Some(escalated) => {
-                    let old = resolved.unwrap_or("(default)");
-                    eprintln!("Crash escalation: {} → {}", old, escalated);
-                    Some(escalated)
-                }
-                None => prompt_result.resolved_model.clone(),
-            };
-        // Apply per-task 1M model override from prior PromptTooLong recovery
-        if let Some(override_model) = ctx.model_overrides.get(&task_id) {
-            let old = after_crash_escalation.as_deref().unwrap_or("(default)");
-            eprintln!(
-                "Model override (prior prompt overflow): {} → {}",
-                old, override_model,
-            );
-            Some(override_model.clone())
-        } else {
-            after_crash_escalation
-        }
-    };
+    // Step 4.5: Pre-spawn recovery plan (FEAT-002). The `reactions::pre_spawn`
+    // coordinator runs the operator escape valve FIRST (clearing stale
+    // auto-recovery channels on an out-of-band `tasks.model` edit), then folds
+    // crash escalation, the prior-overflow effort override, and runner
+    // resolution into one plan. The wave path folds the SAME coordinator once
+    // per slot — identical inputs MUST yield an identical plan. The 1M
+    // `model_overrides` rewrite and review-class routing stay HERE: they are
+    // `--model` string rewrites layered on top of the plan, AFTER the escape
+    // valve has had its chance to clear them.
+    let resolved_model = prompt_result.resolved_model.clone();
+    let plan = reactions::pre_spawn::resolve_task_execution(
+        reactions::pre_spawn::ResolveTaskExecutionParams {
+            ctx,
+            conn: params.conn,
+            task_id: &task_id,
+            resolved_model: resolved_model.as_deref(),
+        },
+    );
 
-    // FEAT-002: route review-class tasks to `reviewModel` after the crash /
-    // overflow escalation block so escalation can't overwrite this routing.
-    // The single `effective_model` here feeds both `resolve_effective_runner`
-    // (runner selection) and the `--model` flag passed to the runner, so one
-    // assignment keeps selection and dispatch in sync.
+    let mut effective_model = if let Some(escalated) = plan.model {
+        eprintln!(
+            "Crash escalation: {} → {}",
+            resolved_model.as_deref().unwrap_or("(default)"),
+            escalated,
+        );
+        Some(escalated)
+    } else {
+        resolved_model.clone()
+    };
+    // Apply per-task 1M model override from a prior PromptTooLong recovery. The
+    // escape valve (inside the coordinator above) already cleared this channel
+    // if the operator edited `tasks.model`, so a stale override never resurfaces.
+    if let Some(override_model) = ctx.model_overrides.get(&task_id) {
+        let old = effective_model.as_deref().unwrap_or("(default)");
+        eprintln!(
+            "Model override (prior prompt overflow): {} → {}",
+            old, override_model,
+        );
+        effective_model = Some(override_model.clone());
+    }
+
+    // Route review-class tasks to `reviewModel` after the crash / overflow
+    // escalation so escalation can't overwrite this routing. The single
+    // `effective_model` here feeds both `resolve_effective_runner` (runner
+    // selection) and the `--model` flag passed to the runner, so one assignment
+    // keeps selection and dispatch in sync.
     if let Some(review_model_override) =
         apply_review_model_override(params.project_config.review_model.as_deref(), &task_id)
     {
@@ -401,12 +431,11 @@ pub fn run_iteration(
         effective_model = Some(review_model_override);
     }
 
-    // Use the cluster-wide effort computed by `build_prompt` — parallels the
-    // cluster-wide `resolved_model` so both axes scale with the hardest task
-    // in the synergy cluster. Apply any per-task override left by a prior
-    // `PromptTooLong` crash on top.
+    // Effort: the plan's prior-overflow override wins, else the cluster-wide
+    // effort `build_prompt` computed (parallels the cluster-wide
+    // `resolved_model` so both axes scale with the hardest task in the cluster).
     let base_effort = prompt_result.cluster_effort;
-    let effort = ctx.effort_overrides.get(&task_id).copied().or(base_effort);
+    let effort = plan.effort.or(base_effort);
     if effort != base_effort {
         eprintln!(
             "Effort override (prior prompt overflow): {} → {}",
@@ -415,12 +444,12 @@ pub fn run_iteration(
         );
     }
 
-    // FEAT-008: operator escape valve — clear stale overrides if tasks.model changed.
-    check_override_invalidation(ctx, params.conn, &task_id);
-
     // FEAT-005/009: resolve effective runner once per iteration (PRD §2.5
-    // single source of truth). Placed before the banner so the "(via grok)"
-    // annotation can be included in the iteration header.
+    // single source of truth) over the FINAL model (post escalation +
+    // model_overrides + review routing). `plan.runner` reflects only the
+    // pre-rewrite baseline, so this re-resolution is the authoritative spawn
+    // discriminant. Placed before the banner so the "(via grok)" annotation
+    // can be included in the iteration header.
     let effective_runner = resolve_effective_runner(ctx, &task_id, effective_model.as_deref());
 
     // Step 5: Print iteration header (with post-escalation effective_model + effort)
@@ -499,6 +528,32 @@ pub fn run_iteration(
                 files_modified: task_files,
                 should_stop: false,
                 output: hint,
+                effective_model,
+                effective_effort: effort,
+                key_decisions_count: 0,
+                conversation: None,
+                shown_learning_ids: Vec::new(),
+            });
+        }
+        // FEAT-014: surface a Grok transient backend error (HTTP 5xx /
+        // overloaded on stderr) as `TransientBackend` instead of a crash.
+        // Mirrors the GrokAuthFailure arm above. The bounded backoff-retry
+        // reaction (`reactions::account::react_to_transient`) runs at the
+        // `run_loop` call site after this returns — the common convergence
+        // point with the Claude path (where `analyze_output` produces the same
+        // outcome). `retry_after_secs` rides on the outcome so the reaction
+        // honors the backend's `Retry-After` without re-parsing output.
+        Err(crate::error::TaskMgrError::TransientBackend { retry_after_secs }) => {
+            eprintln!(
+                "Transient backend error for task {} (retry_after_secs: {:?}); will back off and retry",
+                task_id, retry_after_secs
+            );
+            return Ok(IterationResult {
+                outcome: IterationOutcome::TransientBackend { retry_after_secs },
+                task_id: Some(task_id),
+                files_modified: task_files,
+                should_stop: false,
+                output: String::new(),
                 effective_model,
                 effective_effort: effort,
                 key_decisions_count: 0,
@@ -622,73 +677,44 @@ pub fn run_iteration(
     let outcome =
         detection::analyze_output(&claude_output, claude_result.exit_code, params.project_root);
 
-    // Step 7.5: On rate-limit detection, trigger usage wait and mark as non-counting
+    // Step 7.5: On rate-limit detection, run the converged account-global
+    // post-output reaction (`reactions::account::react_to_outputs`) — the single
+    // home both execution paths share. The sequential path folds its one output
+    // into a one-item slice; the wave path folds its N. `WaitedAndRetry` (or
+    // `None`) falls through with the outcome still `RateLimit` (`run_loop` marks
+    // it non-counting); `Stop` returns early with `should_stop` and empty output.
     if outcome == IterationOutcome::RateLimit {
-        eprintln!("Rate limit detected in output, checking usage API...");
-
-        let mut waited = false;
-
-        // Try the usage API first (if enabled)
-        if params.usage_params.enabled {
-            let check_result = usage::check_and_wait(
-                params.usage_params.threshold,
-                params.tasks_dir,
-                params.usage_params.fallback_wait,
-            );
-            match check_result {
-                UsageCheckResult::StopSignaled => {
-                    return Ok(IterationResult {
-                        outcome: IterationOutcome::RateLimit,
-                        task_id: Some(task_id),
-                        files_modified: task_files,
-                        should_stop: true,
-                        output: String::new(),
-                        effective_model: None,
-                        effective_effort: None,
-                        key_decisions_count: 0,
-                        conversation: None,
-                        shown_learning_ids: Vec::new(),
-                    });
-                }
-                UsageCheckResult::WaitedAndReset => {
-                    waited = true;
-                }
-                _ => {} // Skipped, BelowThreshold, ApiError — didn't actually wait
-            }
-        }
-
-        // Fallback: if the usage API didn't wait, parse reset time from output
-        if !waited {
-            let wait_secs = usage::parse_reset_from_output(&claude_output).unwrap_or(0);
-            eprintln!(
-                "Usage API did not wait (CLI session limit). Falling back to output-parsed reset time ({})...",
-                if wait_secs > 0 {
-                    display::format_duration(wait_secs)
-                } else {
-                    format!("fallback {}s", params.usage_params.fallback_wait)
-                }
-            );
-            let probe = || probe_rate_limit_lifted(params.permission_mode);
-            let completed = usage::wait_for_usage_reset(
-                wait_secs,
-                params.tasks_dir,
-                params.usage_params.fallback_wait,
-                Some(&probe),
-            );
-            if !completed {
-                return Ok(IterationResult {
-                    outcome: IterationOutcome::RateLimit,
-                    task_id: Some(task_id),
-                    files_modified: task_files,
-                    should_stop: true,
-                    output: String::new(),
-                    effective_model: None,
-                    effective_effort: None,
-                    key_decisions_count: 0,
-                    conversation: None,
-                    shown_learning_ids: Vec::new(),
-                });
-            }
+        eprintln!("Rate limit detected in output, running account reaction...");
+        let reaction = {
+            let items = [reactions::account::OutputReactionItem {
+                task_id: Some(task_id.as_str()),
+                outcome: &outcome,
+                output: &claude_output,
+            }];
+            let account_params = reactions::account::AccountReactionParams {
+                threshold: params.usage_params.threshold,
+                usage_enabled: params.usage_params.enabled,
+                tasks_dir: params.tasks_dir,
+                fallback_wait: params.usage_params.fallback_wait,
+                prefix: params.task_prefix.unwrap_or(""),
+                run_id: params.run_id,
+                permission_mode: params.permission_mode,
+            };
+            reactions::account::react_to_outputs(params.conn, &items, &account_params)
+        };
+        if reaction == reactions::account::AccountReaction::Stop {
+            return Ok(IterationResult {
+                outcome: IterationOutcome::RateLimit,
+                task_id: Some(task_id),
+                files_modified: task_files,
+                should_stop: true,
+                output: String::new(),
+                effective_model: None,
+                effective_effort: None,
+                key_decisions_count: 0,
+                conversation: None,
+                shown_learning_ids: Vec::new(),
+            });
         }
     }
 
@@ -723,20 +749,23 @@ pub fn run_iteration(
         // FEAT-006/H3: use the primary effective_runner computed above (PRD §2.5
         // single-source rule — never re-derive). The outer binding from the
         // banner step is in scope here; shadowing it would be drift-prone.
-        let _ = overflow::handle_prompt_too_long(
-            ctx,
-            params.conn,
-            &task_id,
-            effort,
-            effective_model.as_deref(),
-            &prompt_result,
-            params.iteration,
-            Some(params.run_id),
-            params.db_dir,
-            None,
-            effective_runner,
-            params.project_config,
-        );
+        // CONTRACT-001: route through the shared coordinator (sequential folds 1
+        // result, `slot_index: None`); the direct leaf call is denied here.
+        let _ =
+            reactions::post_output::handle_overflow(reactions::post_output::HandleOverflowParams {
+                ctx,
+                conn: params.conn,
+                task_id: &task_id,
+                effort,
+                effective_model: effective_model.as_deref(),
+                prompt_result: &prompt_result,
+                iteration: params.iteration,
+                run_id: Some(params.run_id),
+                base_dir: params.db_dir,
+                slot_index: None,
+                effective_runner,
+                project_config: params.project_config,
+            });
     }
 
     // Step 9: Update trackers based on outcome

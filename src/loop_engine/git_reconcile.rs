@@ -43,7 +43,12 @@ fn query_incomplete_task_ids(
 /// in the external repo for any that contain a task ID (case-insensitive).
 /// Matches are marked as done and the PRD JSON is updated.
 ///
-/// Returns the number of tasks reconciled.
+/// Returns the list of reconciled task IDs (NOT a count), mirroring
+/// [`reconcile_merged_slot_completions`]. Callers that only need the count use
+/// `.len()`; the converged post-completion coordinator
+/// (`reactions::post_completion::react_to_completions`) folds these ids into
+/// its human-review set so a `requires_human` task completed out-of-band in the
+/// external repo still triggers review. Empty Vec means nothing matched.
 pub(crate) fn reconcile_external_git_completions(
     external_repo: &Path,
     conn: &mut Connection,
@@ -51,7 +56,7 @@ pub(crate) fn reconcile_external_git_completions(
     prd_path: &Path,
     task_prefix: Option<&str>,
     scan_depth: usize,
-) -> usize {
+) -> Vec<String> {
     use std::process::Command;
 
     // Validate the external repo exists
@@ -60,7 +65,7 @@ pub(crate) fn reconcile_external_git_completions(
             "Warning: external git repo not found at {}, skipping reconciliation",
             external_repo.display()
         );
-        return 0;
+        return Vec::new();
     }
 
     // Get recent commits from external repo
@@ -77,7 +82,7 @@ pub(crate) fn reconcile_external_git_completions(
                 external_repo.display(),
                 String::from_utf8_lossy(&o.stderr).trim()
             );
-            return 0;
+            return Vec::new();
         }
         Err(e) => {
             eprintln!(
@@ -85,12 +90,12 @@ pub(crate) fn reconcile_external_git_completions(
                 external_repo.display(),
                 e
             );
-            return 0;
+            return Vec::new();
         }
     };
 
     if output.is_empty() {
-        return 0;
+        return Vec::new();
     }
 
     // Per-commit processing: split into individual lines instead of bulk string
@@ -102,11 +107,11 @@ pub(crate) fn reconcile_external_git_completions(
         Ok(ids) => ids,
         Err(e) => {
             eprintln!("Warning: could not query tasks for reconciliation: {}", e);
-            return 0;
+            return Vec::new();
         }
     };
 
-    let mut reconciled = 0;
+    let mut reconciled: Vec<String> = Vec::new();
 
     for task_id in &task_ids {
         // Require "-completed" suffix in commit message (case-insensitive)
@@ -140,7 +145,7 @@ pub(crate) fn reconcile_external_git_completions(
                 "Reconciled task {} (found in external repo commits)",
                 task_id
             );
-            reconciled += 1;
+            reconciled.push(task_id.clone());
         }
     }
 
@@ -459,6 +464,30 @@ mod tests {
             .expect("create commit");
     }
 
+    /// Count of tasks reconciled — the pre-FEAT-010 `usize` shape these tests
+    /// assert against. `reconcile_external_git_completions` now returns the
+    /// reconciled ids (so the post-completion coordinator can review
+    /// externally-completed `requires_human` tasks); these unit tests still
+    /// verify the count via `.len()`.
+    fn reconcile_external_count(
+        external_repo: &Path,
+        conn: &mut Connection,
+        run_id: &str,
+        prd_path: &Path,
+        task_prefix: Option<&str>,
+        scan_depth: usize,
+    ) -> usize {
+        reconcile_external_git_completions(
+            external_repo,
+            conn,
+            run_id,
+            prd_path,
+            task_prefix,
+            scan_depth,
+        )
+        .len()
+    }
+
     // ======================================================================
     // contains_task_id() unit tests — boundary-aware matching
     // ======================================================================
@@ -739,7 +768,7 @@ mod tests {
         let prd_path = prd_dir.path().join("prd.json");
         std::fs::write(&prd_path, r#"{"project":"test","userStories":[]}"#).unwrap();
 
-        let count = reconcile_external_git_completions(
+        let count = reconcile_external_count(
             Path::new("/nonexistent/repo"),
             &mut conn,
             "run-1",
@@ -790,14 +819,8 @@ mod tests {
         // Insert a run so complete_cmd works
         crate::loop_engine::test_utils::insert_run(&conn, "run-1");
 
-        let count = reconcile_external_git_completions(
-            ext_repo.path(),
-            &mut conn,
-            "run-1",
-            &prd_path,
-            None,
-            50,
-        );
+        let count =
+            reconcile_external_count(ext_repo.path(), &mut conn, "run-1", &prd_path, None, 50);
 
         // Should find FEAT-001 (in_progress → done), skip FEAT-003 (already done)
         // FEAT-002 is in_progress but not in commits
@@ -844,14 +867,8 @@ mod tests {
 
         crate::loop_engine::test_utils::insert_run(&conn, "run-1");
 
-        let count = reconcile_external_git_completions(
-            ext_repo.path(),
-            &mut conn,
-            "run-1",
-            &prd_path,
-            None,
-            50,
-        );
+        let count =
+            reconcile_external_count(ext_repo.path(), &mut conn, "run-1", &prd_path, None, 50);
 
         assert_eq!(count, 1, "Should match case-insensitively");
     }
@@ -879,14 +896,8 @@ mod tests {
         )
         .unwrap();
 
-        let count = reconcile_external_git_completions(
-            ext_repo.path(),
-            &mut conn,
-            "run-1",
-            &prd_path,
-            None,
-            50,
-        );
+        let count =
+            reconcile_external_count(ext_repo.path(), &mut conn, "run-1", &prd_path, None, 50);
 
         assert_eq!(
             count, 0,
@@ -927,7 +938,7 @@ mod tests {
 
         crate::loop_engine::test_utils::insert_run(&conn, "run-1");
 
-        let count = reconcile_external_git_completions(
+        let count = reconcile_external_count(
             ext_repo.path(),
             &mut conn,
             "run-1",
@@ -989,14 +1000,8 @@ mod tests {
 
         crate::loop_engine::test_utils::insert_run(&conn, "run-1");
 
-        let count = reconcile_external_git_completions(
-            ext_repo.path(),
-            &mut conn,
-            "run-1",
-            &prd_path,
-            None,
-            50,
-        );
+        let count =
+            reconcile_external_count(ext_repo.path(), &mut conn, "run-1", &prd_path, None, 50);
 
         // FEAT-001 should reconcile (no deps).
         // FEAT-002 depends on FEAT-001 — but since reconciliation processes
@@ -1045,14 +1050,8 @@ mod tests {
 
         crate::loop_engine::test_utils::insert_run(&conn, "run-1");
 
-        let count = reconcile_external_git_completions(
-            ext_repo.path(),
-            &mut conn,
-            "run-1",
-            &prd_path,
-            None,
-            50,
-        );
+        let count =
+            reconcile_external_count(ext_repo.path(), &mut conn, "run-1", &prd_path, None, 50);
 
         assert_eq!(
             count, 0,
@@ -1112,14 +1111,8 @@ mod tests {
 
         crate::loop_engine::test_utils::insert_run(&conn, "run-1");
 
-        let count = reconcile_external_git_completions(
-            ext_repo.path(),
-            &mut conn,
-            "run-1",
-            &prd_path,
-            None,
-            50,
-        );
+        let count =
+            reconcile_external_count(ext_repo.path(), &mut conn, "run-1", &prd_path, None, 50);
 
         assert_eq!(
             count, 3,
@@ -1159,14 +1152,8 @@ mod tests {
 
         crate::loop_engine::test_utils::insert_run(&conn, "run-1");
 
-        let count = reconcile_external_git_completions(
-            ext_repo.path(),
-            &mut conn,
-            "run-1",
-            &prd_path,
-            None,
-            50,
-        );
+        let count =
+            reconcile_external_count(ext_repo.path(), &mut conn, "run-1", &prd_path, None, 50);
 
         assert_eq!(
             count, 1,
@@ -1201,7 +1188,7 @@ mod tests {
 
         crate::loop_engine::test_utils::insert_run(&conn, "run-1");
 
-        let count = reconcile_external_git_completions(
+        let count = reconcile_external_count(
             ext_repo.path(),
             &mut conn,
             "run-1",
@@ -1245,7 +1232,7 @@ mod tests {
 
         crate::loop_engine::test_utils::insert_run(&conn, "run-1");
 
-        let count = reconcile_external_git_completions(
+        let count = reconcile_external_count(
             ext_repo.path(),
             &mut conn,
             "run-1",
