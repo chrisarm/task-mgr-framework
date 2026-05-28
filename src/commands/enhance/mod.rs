@@ -39,6 +39,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::TaskMgrError;
+use crate::output::ui;
 use crate::util::marker_splice::{splice_block, write_atomic};
 use templates::{EnhanceProfile, MARKER_BEGIN, MARKER_END};
 
@@ -441,12 +442,12 @@ pub fn enhance_agents(params: AgentsParams) -> Result<EnhanceResult, TaskMgrErro
     for target in &targets {
         let outcome = agents_one(target, &body, params.create, params.dry_run);
         if matches!(outcome.action, ActionTaken::Skipped) {
-            eprintln!(
+            ui::emit(&format!(
                 "skipping {} (not found; pass --create to create)",
                 outcome.target.display()
-            );
+            ));
         } else if let Some(err) = &outcome.error {
-            eprintln!("enhance agents: {err}");
+            ui::emit_err(&format!("enhance agents: {err}"));
         }
         outcomes.push(outcome);
     }
@@ -481,9 +482,12 @@ pub fn enhance_strip(params: StripParams) -> Result<EnhanceResult, TaskMgrError>
     for target in &targets {
         let outcome = strip_one(target, params.dry_run);
         if outcome.action == ActionTaken::NothingToStrip {
-            eprintln!("no marker block found in {}", outcome.target.display());
+            ui::emit(&format!(
+                "no marker block found in {}",
+                outcome.target.display()
+            ));
         } else if let Some(err) = &outcome.error {
-            eprintln!("enhance strip: {err}");
+            ui::emit_err(&format!("enhance strip: {err}"));
         }
         outcomes.push(outcome);
     }

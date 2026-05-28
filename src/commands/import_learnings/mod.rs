@@ -18,6 +18,7 @@ use chrono::{DateTime, Utc};
 use crate::db::open_and_migrate as open_connection;
 use crate::learnings::{LearningWriter, RecordLearningParams};
 use crate::models::{LearningExport, ProgressExport};
+use crate::output::ui;
 use crate::{TaskMgrError, TaskMgrResult};
 
 /// SQLite datetime format (matches parse_datetime in models/datetime.rs).
@@ -109,7 +110,9 @@ pub fn import_learnings(
     // flush() MUST run after tx.commit() to avoid holding DB locks during HTTP calls.
     let embedded = writer.flush(&conn);
     if embedded > 0 {
-        eprintln!("Embedded {embedded}/{imported} imported learning(s).");
+        ui::emit(&format!(
+            "Embedded {embedded}/{imported} imported learning(s)."
+        ));
     }
 
     Ok(ImportLearningsResult {

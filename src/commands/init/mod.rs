@@ -45,6 +45,7 @@ use crate::TaskMgrError;
 use crate::TaskMgrResult;
 use crate::db::open_and_migrate as open_connection;
 use crate::error::validate_safe_path;
+use crate::output::ui;
 
 // Re-export public types
 pub use output::{DryRunDeletePreview, InitResult, format_init_verbose, format_text};
@@ -295,11 +296,11 @@ pub fn init(
                     let generated = generate_prefix(prd.branch_name.as_deref(), filename);
                     if prd.task_prefix.as_deref() != Some(&generated) {
                         if prd.task_prefix.is_some() {
-                            eprintln!(
+                            ui::emit(&format!(
                                 "Note: ignoring JSON taskPrefix '{}', using deterministic prefix '{}'",
                                 prd.task_prefix.as_deref().unwrap_or(""),
                                 generated,
-                            );
+                            ));
                         }
                         if !dry_run {
                             let _ = write_prefix_to_json(json_path, &generated);
@@ -535,7 +536,7 @@ pub fn init(
     tx.commit()?;
 
     if saw_deprecated_relationships {
-        eprintln!("{}", DEPRECATED_RELATIONSHIPS_WARNING);
+        ui::emit(DEPRECATED_RELATIONSHIPS_WARNING);
     }
 
     // Note: the model picker is intentionally NOT invoked here. Per the
@@ -670,19 +671,18 @@ fn untrack_progress_files(project_root: &Path) -> Result<(), String> {
         Ok(o) => o,
         Err(e) => {
             // Not a fatal condition: task-mgr is usable outside a git repo.
-            eprintln!(
-                "task-mgr: progress migration skipped (git unavailable: {})",
-                e
-            );
+            ui::emit(&format!(
+                "task-mgr: progress migration skipped (git unavailable: {e})"
+            ));
             return Ok(());
         }
     };
 
     if !ls_output.status.success() {
-        eprintln!(
+        ui::emit(&format!(
             "task-mgr: progress migration skipped ({})",
             String::from_utf8_lossy(&ls_output.stderr).trim()
-        );
+        ));
         return Ok(());
     }
 
@@ -703,9 +703,9 @@ fn untrack_progress_files(project_root: &Path) -> Result<(), String> {
         .output()
     {
         Ok(o) if !o.status.success() => {
-            eprintln!(
+            ui::emit(
                 "task-mgr: progress migration skipped — you have staged changes; \
-                 commit or unstage them and re-run `task-mgr init`"
+                 commit or unstage them and re-run `task-mgr init`",
             );
             return Ok(());
         }
@@ -771,10 +771,9 @@ fn unstage_paths(project_root: &Path, files: &[&str]) {
         .current_dir(project_root)
         .output()
     {
-        eprintln!(
-            "task-mgr: warning: could not roll back staged progress removals: {}",
-            e
-        );
+        ui::emit_err(&format!(
+            "task-mgr: warning: could not roll back staged progress removals: {e}"
+        ));
     }
 }
 
@@ -806,7 +805,9 @@ pub fn init_project(dir: &Path) -> TaskMgrResult<InitResult> {
     // Ensure .gitignore ignores per-PRD progress files. Non-fatal: a warning is
     // printed if the file can't be written, but init_project still succeeds.
     if let Err(e) = ensure_progress_gitignore(dir) {
-        eprintln!("task-mgr: warning: could not update .gitignore: {}", e);
+        ui::emit_err(&format!(
+            "task-mgr: warning: could not update .gitignore: {e}"
+        ));
     }
 
     // One-time migration: untrack any already-tracked progress files. Fully
@@ -814,7 +815,9 @@ pub fn init_project(dir: &Path) -> TaskMgrResult<InitResult> {
     // is reported as a warning and any staged removals are rolled back inside
     // `untrack_progress_files`, so `init` still succeeds with a clean index.
     if let Err(e) = untrack_progress_files(dir) {
-        eprintln!("task-mgr: warning: progress migration failed: {}", e);
+        ui::emit_err(&format!(
+            "task-mgr: warning: progress migration failed: {e}"
+        ));
     }
 
     Ok(InitResult {

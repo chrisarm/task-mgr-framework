@@ -103,6 +103,7 @@ use crate::db::open_and_migrate as open_connection;
 use crate::learnings::recall::{RecallParams, recall_learnings};
 use crate::lifecycle::TaskLifecycle;
 use crate::models::TaskStatus;
+use crate::output::ui;
 
 // Re-export public types
 pub use decay::{DecayWarning, apply_decay, find_decay_warnings};
@@ -226,10 +227,9 @@ fn claim_task(
 
         match run_status {
             Ok(status) if status != "active" => {
-                eprintln!(
-                    "Warning: run '{}' was externally changed to '{}'; continuing without run linkage",
-                    rid, status
-                );
+                ui::emit_err(&format!(
+                    "Warning: run '{rid}' was externally changed to '{status}'; continuing without run linkage"
+                ));
                 effective_run_id = None;
             }
             Err(rusqlite::Error::QueryReturnedNoRows) => {
@@ -313,8 +313,10 @@ fn retrieve_learnings_for_task(conn: &Connection, task_id: &str) -> Vec<Learning
             .map(LearningSummaryOutput::from)
             .collect(),
         Err(e) => {
-            // Log warning but don't fail the command
-            eprintln!("Warning: failed to retrieve learnings: {}", e);
+            // Internal diagnostic (channel B): recall is best-effort here, so a
+            // retrieval failure must not fail the command. Goes to the log file /
+            // console-WARN, not the human-facing ui:: channel.
+            tracing::warn!("failed to retrieve learnings: {e}");
             Vec::new()
         }
     }

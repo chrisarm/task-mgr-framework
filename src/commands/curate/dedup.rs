@@ -10,6 +10,7 @@ use std::collections::HashMap;
 
 use crate::TaskMgrResult;
 use crate::commands::curate::types::{DeduplicateLearningItem, RawDedupCluster};
+use crate::output::ui;
 
 use super::json_utils::extract_json_array;
 
@@ -285,10 +286,9 @@ pub fn parse_dedup_response(
     let raw: Vec<RawDedupCluster> = match serde_json::from_str(&json_str) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!(
-                "Warning: failed to parse dedup response as JSON array: {}",
-                e
-            );
+            ui::emit_err(&format!(
+                "Warning: failed to parse dedup response as JSON array: {e}"
+            ));
             return Ok(Vec::new());
         }
     };

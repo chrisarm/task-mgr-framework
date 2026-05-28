@@ -39,26 +39,14 @@ use regex::Regex;
 const ALLOWLIST_SUFFIXES: &[&str] = &[
     "src/bin/gen-docs.rs",
     "src/cli/introspect.rs",
-    "src/commands/add.rs",
-    "src/commands/curate/dedup.rs",
-    "src/commands/curate/enrich.rs",
-    "src/commands/curate/mod.rs",
+    // FEAT-005 migrated src/main.rs, src/handlers.rs, and all of src/commands/**
+    // to ui:: / tracing. `curate/tests.rs` stays: it is a `#[cfg(test)] mod tests;`
+    // file whose raw prints are test diagnostics (libtest-captured eprintln!),
+    // not production output — strip_cfg_test does not strip a whole standalone
+    // test file, so the guard would otherwise flag it.
     "src/commands/curate/tests.rs",
-    "src/commands/dependency_checker.rs",
-    "src/commands/doctor/mod.rs",
-    "src/commands/enhance/mod.rs",
-    "src/commands/import_learnings/mod.rs",
-    "src/commands/init/mod.rs",
-    "src/commands/models/cache.rs",
-    "src/commands/models/ensure_default.rs",
-    "src/commands/models/handlers.rs",
-    "src/commands/next/decay.rs",
-    "src/commands/next/mod.rs",
-    "src/commands/next/selection.rs",
-    "src/commands/worktrees.rs",
     "src/db/connection.rs",
     "src/db/schema/key_decisions.rs",
-    "src/handlers.rs",
     "src/learnings/crud/writer.rs",
     "src/learnings/embeddings/mod.rs",
     "src/learnings/ingestion/extraction.rs",
@@ -104,7 +92,6 @@ const ALLOWLIST_SUFFIXES: &[&str] = &[
     "src/loop_engine/watchdog.rs",
     "src/loop_engine/wave_scheduler.rs",
     "src/loop_engine/worktree.rs",
-    "src/main.rs",
 ];
 
 /// Directories to skip entirely.

@@ -11,6 +11,7 @@ use fs2::FileExt;
 use crate::db::LockGuard;
 use crate::error::{TaskMgrError, TaskMgrResult};
 use crate::loop_engine::worktree::{parse_worktree_list, remove_worktree};
+use crate::output::ui;
 
 /// Status of a worktree's active lock.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -199,11 +200,11 @@ pub fn prune(db_dir: &Path, source_root: &Path) -> TaskMgrResult<WorktreesResult
                 skipped.push(wt.clone());
             }
             Err(e) => {
-                eprintln!(
+                ui::emit_err(&format!(
                     "warning: failed to remove worktree {}: {}",
                     wt.path.display(),
                     e
-                );
+                ));
                 skipped.push(wt.clone());
             }
         }

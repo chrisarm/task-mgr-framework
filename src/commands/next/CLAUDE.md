@@ -49,10 +49,11 @@ spawns ad-hoc fixups in response to a milestone's AC text.
   `mentioned_fixup_prefixes` and `find_active_blockers_for_prefixes` iterate
   it directly, no other registration needed.
 
-**Operator visibility**: a single `eprintln!` per deferred candidate
+**Operator visibility**: a single `ui::emit` per deferred candidate
 (`"Deferring <id>: AC references active fixup task(s): <sorted blocker IDs>"`)
 fires at the filter site — not per-blocker, not per-AC-line. Sort order in
-the message is stable for grep friendliness.
+the message is stable for grep friendliness. It is an operator-contract line
+(channel A2): stays on stderr, byte-exact, never routed through `tracing`.
 
 **Companion prompt-side teaching** (`src/loop_engine/prompt_sections/task_ops.rs`):
 the loop agent is taught to pass `--depended-on-by <milestone-id>` when spawning

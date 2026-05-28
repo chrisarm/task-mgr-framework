@@ -19,6 +19,7 @@ use crate::TaskMgrResult;
 use crate::db::prefix::{prefix_and, prefix_and_col, prefix_where_col};
 use crate::loop_engine::calibrate;
 use crate::models::Task;
+use crate::output::ui;
 
 /// Scoring weights for task selection
 pub const FILE_OVERLAP_SCORE: i32 = 10;
@@ -316,11 +317,11 @@ fn build_scored_candidates(
             if blockers.is_empty() {
                 return true;
             }
-            eprintln!(
+            ui::emit(&format!(
                 "Deferring {}: AC references active fixup task(s): {}",
                 task.id,
                 blockers.join(", ")
-            );
+            ));
             false
         })
         .collect();
