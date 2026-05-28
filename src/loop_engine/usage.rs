@@ -15,6 +15,7 @@ use chrono::TimeZone;
 use crate::loop_engine::display;
 use crate::loop_engine::oauth;
 use crate::loop_engine::signals;
+use crate::output::ui;
 
 /// Maximum wait time for usage reset: 5 hours in seconds.
 const MAX_WAIT_SECS: u64 = 5 * 3600;
@@ -55,7 +56,7 @@ pub enum UsageCheckResult {
 /// Check the usage API and return current usage info.
 ///
 /// Makes a GET request to the Anthropic usage endpoint.
-/// Returns `None` if the API call fails (logged to stderr).
+/// Returns `None` if the API call fails (logged via `tracing`).
 pub fn check_usage_api(access_token: &str) -> Option<UsageInfo> {
     let response = match ureq::get(USAGE_API_URL)
         .set("Authorization", &format!("Bearer {}", access_token))
@@ -64,8 +65,8 @@ pub fn check_usage_api(access_token: &str) -> Option<UsageInfo> {
     {
         Ok(resp) => resp,
         Err(e) => {
-            eprintln!(
-                "Warning: usage API call failed: {}",
+            tracing::warn!(
+                "usage API call failed: {}",
                 sanitize_api_error(&e.to_string())
             );
             return None;
@@ -75,7 +76,7 @@ pub fn check_usage_api(access_token: &str) -> Option<UsageInfo> {
     let json: serde_json::Value = match response.into_json() {
         Ok(j) => j,
         Err(e) => {
-            eprintln!("Warning: failed to parse usage API response: {}", e);
+            tracing::warn!("failed to parse usage API response: {}", e);
             return None;
         }
     };
@@ -99,7 +100,7 @@ pub fn check_usage_api(access_token: &str) -> Option<UsageInfo> {
     let percentage = match percentage {
         Some(p) => p,
         None => {
-            eprintln!("Warning: usage API response missing percentage data");
+            tracing::warn!("usage API response missing percentage data");
             return None;
         }
     };
@@ -139,7 +140,7 @@ pub fn wait_for_usage_reset(
         wait_secs.min(MAX_WAIT_SECS)
     };
 
-    eprintln!(
+    ui::emit(&format!(
         "Usage limit reached. Waiting {} for reset{}...",
         display::format_duration(effective_wait),
         if probe_fn.is_some() {
@@ -147,7 +148,7 @@ pub fn wait_for_usage_reset(
         } else {
             String::new()
         }
-    );
+    ));
 
     let mut remaining = effective_wait;
     // Start at the probe interval so the first probe fires immediately
@@ -156,7 +157,7 @@ pub fn wait_for_usage_reset(
     while remaining > 0 {
         // Check for stop signal
         if signals::check_stop_signal(tasks_dir, None) {
-            eprintln!("Stop signal detected during usage wait. Exiting wait.");
+            ui::emit("Stop signal detected during usage wait. Exiting wait.");
             return false;
         }
 
@@ -165,29 +166,29 @@ pub fn wait_for_usage_reset(
             && since_last_probe >= PROBE_INTERVAL_SECS
         {
             since_last_probe = 0;
-            eprintln!("  Probing whether rate limit has been lifted...");
+            ui::emit("  Probing whether rate limit has been lifted...");
             if probe() {
-                eprintln!("  Rate limit lifted early! Resuming...");
+                ui::emit("  Rate limit lifted early! Resuming...");
                 return true;
             }
-            eprintln!("  Still rate-limited. Continuing wait...");
+            ui::emit("  Still rate-limited. Continuing wait...");
         }
 
         // Display countdown every interval
         let sleep_time = remaining.min(WAIT_CHECK_INTERVAL_SECS);
 
-        eprintln!(
+        ui::emit(&format!(
             "  Usage reset in {} (checking .stop every {}s)...",
             display::format_duration(remaining),
             WAIT_CHECK_INTERVAL_SECS
-        );
+        ));
 
         thread::sleep(Duration::from_secs(sleep_time));
         remaining = remaining.saturating_sub(sleep_time);
         since_last_probe += sleep_time;
     }
 
-    eprintln!("Usage wait complete. Resuming...");
+    ui::emit("Usage wait complete. Resuming...");
     true
 }
 
@@ -236,9 +237,9 @@ pub fn check_and_wait(threshold: u8, tasks_dir: &Path, fallback_wait: u64) -> Us
     // Refresh if needed
     if oauth::is_token_expiring(&creds, 5) {
         match oauth::refresh_token(&path, &creds) {
-            Ok(_) => eprintln!("OAuth token refreshed for usage check"),
+            Ok(_) => tracing::debug!("OAuth token refreshed for usage check"),
             Err(e) => {
-                eprintln!("Warning: could not refresh token for usage check: {}", e);
+                tracing::warn!("could not refresh token for usage check: {}", e);
                 // Try with existing token anyway
             }
         }
@@ -256,10 +257,10 @@ pub fn check_and_wait(threshold: u8, tasks_dir: &Path, fallback_wait: u64) -> Us
         None => return UsageCheckResult::ApiError("Failed to check usage API".to_string()),
     };
 
-    eprintln!(
+    ui::emit(&format!(
         "Usage: {:.1}% (threshold: {}%)",
         usage.percentage, threshold
-    );
+    ));
 
     if usage.percentage < f64::from(threshold) {
         return UsageCheckResult::BelowThreshold;

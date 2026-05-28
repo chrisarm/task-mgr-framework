@@ -49,6 +49,30 @@ pub fn emit_data(msg: &str) {
     let _ = writeln!(out, "{msg}");
 }
 
+/// Emit an inline prompt to **stderr** (FD 2) **without** a trailing newline.
+///
+/// For interactive confirmations whose reply is typed on the same line (e.g.
+/// `"Remove worktree? [y/N] "`) and for pre-formatted multi-line banners that
+/// already carry their own newlines (the pause / human-review checkpoints).
+/// Flushes so the prompt is visible before the caller's blocking stdin read.
+///
+/// Writes the caller's exact bytes — no level/timestamp/color and, crucially,
+/// no appended `\n`. That missing newline is the only thing distinguishing it
+/// from [`emit`]; using `emit` for a prompt would push the cursor to the next
+/// line. The byte contract is locked by [`write_prompt`]'s test.
+pub fn prompt(msg: &str) {
+    let mut out = std::io::stderr().lock();
+    let _ = write_prompt(&mut out, msg);
+    let _ = out.flush();
+}
+
+/// Inner, testable core of [`prompt`]: writes `msg` verbatim with no trailing
+/// newline to an arbitrary `Write` so the no-decoration / no-newline contract
+/// can be asserted byte-for-byte.
+pub(crate) fn write_prompt<W: Write>(out: &mut W, msg: &str) -> std::io::Result<()> {
+    write!(out, "{msg}")
+}
+
 /// Emit `text` to **stderr** (FD 2) with `slot_label` prepended to every line.
 ///
 /// Re-home of `loop_engine::claude::emit_prefixed_lines` (the per-slot tee).
@@ -148,6 +172,21 @@ mod tests {
     #[test]
     fn empty_text_with_prefix_is_one_blank_prefixed_line() {
         assert_eq!(write_to_string(Some("[slot 2]"), ""), "[slot 2]\n");
+    }
+
+    #[test]
+    fn prompt_writes_exact_bytes_with_no_trailing_newline() {
+        // The defining contract of `prompt` vs `emit`: the caller's bytes go out
+        // verbatim with NO appended `\n`, so the reply types on the same line.
+        let mut buf: Vec<u8> = Vec::new();
+        write_prompt(&mut buf, "Remove worktree? [y/N] ").unwrap();
+        assert_eq!(String::from_utf8(buf).unwrap(), "Remove worktree? [y/N] ");
+
+        // A pre-formatted banner that already ends in its own newline is passed
+        // through unchanged — `prompt` must not add a second one.
+        let mut buf2: Vec<u8> = Vec::new();
+        write_prompt(&mut buf2, "line\n").unwrap();
+        assert_eq!(String::from_utf8(buf2).unwrap(), "line\n");
     }
 
     #[test]

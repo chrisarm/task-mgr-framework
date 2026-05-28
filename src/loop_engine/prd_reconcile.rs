@@ -17,6 +17,7 @@ use crate::loop_engine::config::PermissionMode;
 use crate::loop_engine::model::SONNET_MODEL;
 use crate::loop_engine::output_parsing::strip_task_prefix;
 use crate::models::TaskStatus;
+use crate::output::ui;
 
 /// Build a per-writer tmp path next to `prd_path` for atomic rename.
 ///
@@ -208,7 +209,7 @@ pub(crate) fn mark_task_done(
         ctx.crashed_last_iteration.remove(task_id);
     }
     if let Err(e) = update_prd_task_passes(prd_path, task_id, true, task_prefix) {
-        eprintln!("Warning: failed to update PRD for task {}: {}", task_id, e);
+        tracing::warn!("failed to update PRD for task {}: {}", task_id, e);
     }
     Ok(())
 }
@@ -314,10 +315,10 @@ pub(crate) fn reconcile_passes_with_db(
                 };
                 match TaskLifecycle::new(conn).reconcile_from_prd(plan) {
                     Ok(report) if report.applied > 0 => {
-                        eprintln!(
+                        ui::emit(&format!(
                             "Reconciled task {} as done (passes: true in PRD but was not done in DB)",
                             task_id
-                        );
+                        ));
                         updated_count += 1;
                     }
                     _ => {}
@@ -440,8 +441,8 @@ fn apply_modifications_to_prd(
                                     story[key] = value.clone();
                                 }
                                 _ => {
-                                    eprintln!(
-                                        "Warning: task mutation - field '{}' is not whitelisted and was skipped",
+                                    tracing::warn!(
+                                        "task mutation - field '{}' is not whitelisted and was skipped",
                                         key
                                     );
                                 }
@@ -450,10 +451,7 @@ fn apply_modifications_to_prd(
                         stats.modified += 1;
                     }
                 } else {
-                    eprintln!(
-                        "Warning: task mutation - 'modify' target '{}' not found in PRD",
-                        id
-                    );
+                    tracing::warn!("task mutation - 'modify' target '{}' not found in PRD", id);
                 }
             }
             "irrelevant" => {
@@ -468,8 +466,8 @@ fn apply_modifications_to_prd(
                     story["mutationStatus"] = serde_json::Value::String("irrelevant".to_string());
                     stats.irrelevant += 1;
                 } else {
-                    eprintln!(
-                        "Warning: task mutation - 'irrelevant' target '{}' not found in PRD",
+                    tracing::warn!(
+                        "task mutation - 'irrelevant' target '{}' not found in PRD",
                         id
                     );
                 }
@@ -487,9 +485,10 @@ fn apply_modifications_to_prd(
                 stats.added += 1;
             }
             _ => {
-                eprintln!(
-                    "Warning: task mutation - unknown action '{}' for task '{}'",
-                    action, id
+                tracing::warn!(
+                    "task mutation - unknown action '{}' for task '{}'",
+                    action,
+                    id
                 );
             }
         }
@@ -548,9 +547,11 @@ fn sync_mutations_to_db(
                             "UPDATE tasks SET {col} = ?, updated_at = datetime('now') WHERE id = ?"
                         );
                         if let Err(e) = conn.execute(&sql, rusqlite::params![sql_val, db_id]) {
-                            eprintln!(
-                                "Warning: task mutation DB update failed for {}/{}: {}",
-                                db_id, col, e
+                            tracing::warn!(
+                                "task mutation DB update failed for {}/{}: {}",
+                                db_id,
+                                col,
+                                e
                             );
                         }
                     }
@@ -565,9 +566,10 @@ fn sync_mutations_to_db(
                     }],
                 };
                 if let Err(e) = TaskLifecycle::new(conn).reconcile_from_prd(plan) {
-                    eprintln!(
-                        "Warning: task mutation DB update failed marking {} irrelevant: {}",
-                        db_id, e
+                    tracing::warn!(
+                        "task mutation DB update failed marking {} irrelevant: {}",
+                        db_id,
+                        e
                     );
                 }
             }
@@ -588,10 +590,7 @@ fn sync_mutations_to_db(
                      VALUES (?, ?, ?, ?, 'todo', ?)",
                     rusqlite::params![db_id, title, description, priority, notes],
                 ) {
-                    eprintln!(
-                        "Warning: task mutation DB insert failed for {}: {}",
-                        db_id, e
-                    );
+                    tracing::warn!("task mutation DB insert failed for {}: {}", db_id, e);
                 }
             }
             _ => {} // already warned in apply_modifications_to_prd
@@ -625,17 +624,14 @@ pub(crate) fn mutate_prd_from_feedback(
     let content = match std::fs::read_to_string(prd_path) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Warning: task mutation skipped - could not read PRD: {}", e);
+            tracing::warn!("task mutation skipped - could not read PRD: {}", e);
             return;
         }
     };
     let prd: serde_json::Value = match serde_json::from_str(&content) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!(
-                "Warning: task mutation skipped - could not parse PRD: {}",
-                e
-            );
+            tracing::warn!("task mutation skipped - could not parse PRD: {}", e);
             return;
         }
     };
@@ -656,7 +652,7 @@ pub(crate) fn mutate_prd_from_feedback(
         .unwrap_or_default();
 
     if todo_tasks.is_empty() {
-        eprintln!("Task mutation skipped: no todo tasks remaining in PRD.");
+        ui::emit("Task mutation skipped: no todo tasks remaining in PRD.");
         return;
     }
 
@@ -664,17 +660,14 @@ pub(crate) fn mutate_prd_from_feedback(
     let todo_json = match serde_json::to_string_pretty(&todo_tasks) {
         Ok(j) => j,
         Err(e) => {
-            eprintln!(
-                "Warning: task mutation skipped - could not serialize tasks: {}",
-                e
-            );
+            tracing::warn!("task mutation skipped - could not serialize tasks: {}", e);
             return;
         }
     };
     let prompt = build_mutation_prompt(human_feedback, &todo_json);
 
     // 4. Spawn Claude subprocess
-    eprintln!("Running task mutation via Claude...");
+    ui::emit("Running task mutation via Claude...");
     let effective_model = model.unwrap_or(SONNET_MODEL);
     let result = match claude::spawn_claude(
         &prompt,
@@ -689,14 +682,14 @@ pub(crate) fn mutate_prd_from_feedback(
     ) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("Warning: task mutation failed (spawn error): {}", e);
+            tracing::warn!("task mutation failed (spawn error): {}", e);
             return;
         }
     };
 
     if result.exit_code != 0 {
-        eprintln!(
-            "Warning: task mutation failed (Claude exit code {})",
+        tracing::warn!(
+            "task mutation failed (Claude exit code {})",
             result.exit_code
         );
         return;
@@ -706,23 +699,21 @@ pub(crate) fn mutate_prd_from_feedback(
     let modifications = match parse_mutation_output(&result.output) {
         Some(mods) => mods,
         None => {
-            eprintln!(
-                "Warning: task mutation skipped - could not parse Claude output as JSON array"
-            );
+            tracing::warn!("task mutation skipped - could not parse Claude output as JSON array");
             return;
         }
     };
 
     if modifications.is_empty() {
-        eprintln!("Task mutation: no modifications requested by Claude.");
+        ui::emit("Task mutation: no modifications requested by Claude.");
         return;
     }
 
     // 6. Create a backup of the PRD before mutating
     let bak_path = prd_path.with_extension("json.bak");
     if let Err(e) = std::fs::copy(prd_path, &bak_path) {
-        eprintln!(
-            "Warning: could not create PRD backup at {}: {} (continuing)",
+        tracing::warn!(
+            "could not create PRD backup at {}: {} (continuing)",
             bak_path.display(),
             e
         );
@@ -732,7 +723,7 @@ pub(crate) fn mutate_prd_from_feedback(
     let (updated_prd, stats) = match apply_modifications_to_prd(prd, &modifications, task_prefix) {
         Ok(result) => result,
         Err(e) => {
-            eprintln!("Warning: task mutation failed (apply modifications): {}", e);
+            tracing::warn!("task mutation failed (apply modifications): {}", e);
             return;
         }
     };
@@ -743,13 +734,13 @@ pub(crate) fn mutate_prd_from_feedback(
     let updated_json = match serde_json::to_string_pretty(&updated_prd) {
         Ok(j) => j,
         Err(e) => {
-            eprintln!("Warning: task mutation failed (serialize): {}", e);
+            tracing::warn!("task mutation failed (serialize): {}", e);
             return;
         }
     };
     if let Err(e) = std::fs::write(&tmp_path, &updated_json) {
-        eprintln!(
-            "Warning: task mutation failed (write temp file {}): {}",
+        tracing::warn!(
+            "task mutation failed (write temp file {}): {}",
             tmp_path.display(),
             e
         );
@@ -757,8 +748,8 @@ pub(crate) fn mutate_prd_from_feedback(
     }
     if let Err(e) = std::fs::rename(&tmp_path, prd_path) {
         let _ = std::fs::remove_file(&tmp_path);
-        eprintln!(
-            "Warning: task mutation failed (rename to {}): {}",
+        tracing::warn!(
+            "task mutation failed (rename to {}): {}",
             prd_path.display(),
             e
         );
@@ -769,10 +760,10 @@ pub(crate) fn mutate_prd_from_feedback(
     sync_mutations_to_db(conn, &modifications, task_prefix);
 
     // 10. Log summary
-    eprintln!(
+    ui::emit(&format!(
         "Task mutation: {} tasks modified, {} added, {} marked irrelevant",
         stats.modified, stats.added, stats.irrelevant
-    );
+    ));
 }
 
 #[cfg(test)]

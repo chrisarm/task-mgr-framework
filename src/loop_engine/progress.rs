@@ -38,7 +38,7 @@ const MILESTONE_SUMMARY_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// thread after the wave completes — log_iteration is not called from worker
 /// threads.
 ///
-/// Errors are logged to stderr but don't propagate — progress logging
+/// Errors are logged via `tracing` but don't propagate — progress logging
 /// should never crash the loop.
 #[allow(clippy::too_many_arguments)]
 pub fn log_iteration(
@@ -90,16 +90,16 @@ pub fn log_iteration(
     {
         Ok(mut file) => {
             if let Err(e) = file.write_all(entry.as_bytes()) {
-                eprintln!(
-                    "Warning: could not write to progress file {}: {}",
+                tracing::warn!(
+                    "could not write to progress file {}: {}",
                     progress_path.display(),
                     e
                 );
             }
         }
         Err(e) => {
-            eprintln!(
-                "Warning: could not open progress file {}: {}",
+            tracing::warn!(
+                "could not open progress file {}: {}",
                 progress_path.display(),
                 e
             );
@@ -140,14 +140,14 @@ fn is_milestone_summary(entry: &str) -> bool {
 ///
 /// Reads the file, splits on `---` delimiters, keeps every milestone summary plus
 /// the trailing N regular entries (in original order), and writes back. Errors are
-/// logged to stderr but never crash the loop.
+/// logged via `tracing` but never crash the loop.
 pub fn rotate_progress(progress_path: &Path) {
     let content = match fs::read_to_string(progress_path) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
         Err(e) => {
-            eprintln!(
-                "Warning: could not read progress file for rotation {}: {}",
+            tracing::warn!(
+                "could not read progress file for rotation {}: {}",
                 progress_path.display(),
                 e
             );
@@ -189,8 +189,8 @@ pub fn rotate_progress(progress_path: &Path) {
     rotated.push_str("\n---\n");
 
     if let Err(e) = fs::write(progress_path, rotated) {
-        eprintln!(
-            "Warning: could not write rotated progress file {}: {}",
+        tracing::warn!(
+            "could not write rotated progress file {}: {}",
             progress_path.display(),
             e
         );
@@ -331,23 +331,23 @@ fn try_haiku_summary(
     ) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!(
-                "Warning: milestone summary Haiku spawn failed: {} — falling back to heuristic",
+            tracing::warn!(
+                "milestone summary Haiku spawn failed: {} — falling back to heuristic",
                 e
             );
             return None;
         }
     };
     if result.timed_out {
-        eprintln!(
-            "Warning: milestone summary Haiku timed out after {}s — falling back to heuristic",
+        tracing::warn!(
+            "milestone summary Haiku timed out after {}s — falling back to heuristic",
             MILESTONE_SUMMARY_TIMEOUT.as_secs()
         );
         return None;
     }
     if result.exit_code != 0 {
-        eprintln!(
-            "Warning: milestone summary Haiku exited with code {} — falling back to heuristic",
+        tracing::warn!(
+            "milestone summary Haiku exited with code {} — falling back to heuristic",
             result.exit_code
         );
         return None;
@@ -384,14 +384,14 @@ fn try_haiku_summary(
 /// iterations elapsed. `rotate_progress` may have already trimmed older
 /// entries before the milestone fired, so the count is a lower bound.
 ///
-/// Best-effort: file I/O and LLM failures log to stderr and do not propagate.
+/// Best-effort: file I/O and LLM failures log via `tracing` and do not propagate.
 pub fn summarize_milestone(progress_path: &Path, milestone_task_id: &str, db_dir: Option<&Path>) {
     let content = match fs::read_to_string(progress_path) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
         Err(e) => {
-            eprintln!(
-                "Warning: could not read progress file for milestone summary {}: {}",
+            tracing::warn!(
+                "could not read progress file for milestone summary {}: {}",
                 progress_path.display(),
                 e
             );
@@ -505,8 +505,8 @@ pub fn summarize_milestone(progress_path: &Path, milestone_task_id: &str, db_dir
     rebuilt.push_str(&summary);
 
     if let Err(e) = fs::write(progress_path, rebuilt) {
-        eprintln!(
-            "Warning: could not write milestone summary to {}: {}",
+        tracing::warn!(
+            "could not write milestone summary to {}: {}",
             progress_path.display(),
             e
         );

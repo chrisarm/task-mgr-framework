@@ -55,7 +55,6 @@ const ALLOWLIST_SUFFIXES: &[&str] = &[
     "src/lifecycle/apply/mod.rs",
     "src/lifecycle/plan_apply.rs",
     "src/loop_engine/auto_review.rs",
-    "src/loop_engine/batch.rs",
     "src/loop_engine/branch.rs",
     "src/loop_engine/calibrate.rs",
     "src/loop_engine/claude.rs",
@@ -72,8 +71,10 @@ const ALLOWLIST_SUFFIXES: &[&str] = &[
     "src/loop_engine/oauth.rs",
     "src/loop_engine/orchestrator.rs",
     "src/loop_engine/overflow.rs",
-    "src/loop_engine/prd_reconcile.rs",
-    "src/loop_engine/progress.rs",
+    // FEAT-004 migrated prd_reconcile.rs, batch.rs, usage.rs, signals.rs, and
+    // progress.rs to ui:: / tracing (the byte-locked PRD-sync warning lives in
+    // engine.rs / lifecycle, not here, so lifecycle_stderr_contract.rs is
+    // untouched by this batch).
     "src/loop_engine/project_config.rs",
     "src/loop_engine/prompt/core.rs",
     "src/loop_engine/prompt/sequential.rs",
@@ -83,9 +84,7 @@ const ALLOWLIST_SUFFIXES: &[&str] = &[
     "src/loop_engine/prompt_sections/mod.rs",
     "src/loop_engine/recovery.rs",
     "src/loop_engine/runner.rs",
-    "src/loop_engine/signals.rs",
     "src/loop_engine/stream.rs",
-    "src/loop_engine/usage.rs",
     "src/loop_engine/user_config.rs",
     "src/loop_engine/watchdog.rs",
 ];
