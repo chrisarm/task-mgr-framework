@@ -65,12 +65,13 @@ const ALLOWLIST_SUFFIXES: &[&str] = &[
     "src/loop_engine/engine.rs",
     "src/loop_engine/env.rs",
     "src/loop_engine/feedback.rs",
-    "src/loop_engine/iteration.rs",
-    "src/loop_engine/iteration_pipeline.rs",
     "src/loop_engine/monitor.rs",
     "src/loop_engine/oauth.rs",
-    "src/loop_engine/orchestrator.rs",
-    "src/loop_engine/overflow.rs",
+    // FEAT-002 migrated orchestrator.rs, iteration.rs, iteration_pipeline.rs,
+    // overflow.rs, and recovery.rs to ui:: / tracing. The byte-locked overflow
+    // recovery banner (overflow.rs) and operator escape-valve line (recovery.rs)
+    // stay on ui::emit (byte-exact), so they are unchanged. engine.rs is NOT in
+    // this task's scope and remains allow-listed for a later migration.
     // FEAT-004 migrated prd_reconcile.rs, batch.rs, usage.rs, signals.rs, and
     // progress.rs to ui:: / tracing (the byte-locked PRD-sync warning lives in
     // engine.rs / lifecycle, not here, so lifecycle_stderr_contract.rs is
@@ -82,7 +83,6 @@ const ALLOWLIST_SUFFIXES: &[&str] = &[
     "src/loop_engine/prompt_sections/escalation.rs",
     "src/loop_engine/prompt_sections/learnings.rs",
     "src/loop_engine/prompt_sections/mod.rs",
-    "src/loop_engine/recovery.rs",
     "src/loop_engine/runner.rs",
     "src/loop_engine/stream.rs",
     "src/loop_engine/user_config.rs",

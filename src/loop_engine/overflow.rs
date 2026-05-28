@@ -21,6 +21,7 @@ use crate::loop_engine::model;
 use crate::loop_engine::project_config::ProjectConfig;
 use crate::loop_engine::prompt::PromptResult;
 use crate::loop_engine::runner::RunnerKind;
+use crate::output::ui;
 
 /// Recovery action chosen by `handle_prompt_too_long` for a given overflow.
 ///
@@ -266,8 +267,8 @@ pub fn append_event_log(dir: &Path, event: &OverflowEvent) -> io::Result<()> {
         serde_json::to_vec(event).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     line.push(b'\n');
     if line.len() > 4096 {
-        eprintln!(
-            "warning: overflow JSONL line is {} bytes — exceeds PIPE_BUF (4096); O_APPEND atomicity is not guaranteed",
+        tracing::warn!(
+            "overflow JSONL line is {} bytes — exceeds PIPE_BUF (4096); O_APPEND atomicity is not guaranteed",
             line.len()
         );
     }
@@ -282,8 +283,8 @@ pub fn append_event_log(dir: &Path, event: &OverflowEvent) -> io::Result<()> {
 /// are not touched. Returns `Ok(())` if `dir` does not yet exist.
 ///
 /// **Per-entry log-and-continue**: an unreadable dir entry, missing metadata,
-/// or failed deletion is logged via `eprintln!` and the rotation pass moves
-/// on to the next file. A single filesystem error never aborts the call —
+/// or failed deletion is logged via `tracing::warn!` and the rotation pass
+/// moves on to the next file. A single filesystem error never aborts the call —
 /// observability is best-effort, but rotation drift is bounded.
 pub fn rotate_dumps_keep_n(dir: &Path, sanitized_task_id: &str, keep: usize) -> io::Result<()> {
     let prefix = format!("{sanitized_task_id}-iter");
@@ -298,7 +299,7 @@ pub fn rotate_dumps_keep_n(dir: &Path, sanitized_task_id: &str, keep: usize) -> 
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
-                eprintln!("warning: overflow rotate: skipping unreadable dir entry: {e}");
+                tracing::warn!("overflow rotate: skipping unreadable dir entry: {e}");
                 continue;
             }
         };
@@ -308,8 +309,8 @@ pub fn rotate_dumps_keep_n(dir: &Path, sanitized_task_id: &str, keep: usize) -> 
             let meta = match entry.metadata() {
                 Ok(m) => m,
                 Err(e) => {
-                    eprintln!(
-                        "warning: overflow rotate: skipping {}: metadata error: {e}",
+                    tracing::warn!(
+                        "overflow rotate: skipping {}: metadata error: {e}",
                         entry.path().display()
                     );
                     continue;
@@ -325,10 +326,7 @@ pub fn rotate_dumps_keep_n(dir: &Path, sanitized_task_id: &str, keep: usize) -> 
 
     for (_, path) in entries.into_iter().skip(keep) {
         if let Err(e) = fs::remove_file(&path) {
-            eprintln!(
-                "warning: overflow rotate: failed to remove {}: {e}",
-                path.display()
-            );
+            tracing::warn!("overflow rotate: failed to remove {}: {e}", path.display());
         }
     }
 
@@ -407,8 +405,10 @@ fn read_task_model_from_db(conn: &Connection, task_id: &str) -> rusqlite::Result
 /// 6. Best-effort: append JSONL event line.
 /// 7. Best-effort: rotate dumps (keep newest 3 per task).
 ///
-/// Filesystem failures in steps 5-7 are logged via `eprintln!` and never
-/// propagate — observability is best-effort, recovery is not.
+/// Filesystem failures in steps 5-7 are logged via `tracing::warn!` and never
+/// propagate — observability is best-effort, recovery is not. The rung-specific
+/// banner in step 4 is product output (CONTRACT-LOG-001 channel A2) and goes
+/// through `ui::emit` so its bytes stay operator-greppable (never decorated).
 ///
 /// `effective_runner` is the single computed value from
 /// [`crate::loop_engine::engine::resolve_effective_runner`] at the spawn
@@ -527,7 +527,11 @@ pub fn handle_prompt_too_long(
     // true) so a wave-mode task that triggers BOTH the overflow rung-4 path
     // and the RuntimeError hook in the same wave emits exactly one banner.
     if !matches!(action, RecoveryAction::FallbackToProvider { .. }) || !was_already_promoted {
-        eprintln!("{}", action.user_message(task_id, effort, effective_model));
+        // Byte-locked operator contract (CONTRACT-LOG-001 channel A2): the
+        // recovery announcement is grepped by operators and its order in the
+        // step sequence is contractual — emit the exact bytes to stderr with no
+        // level/timestamp decoration. NEVER route through tracing.
+        ui::emit(&action.user_message(task_id, effort, effective_model));
     }
 
     // Step 5: best-effort prompt dump.
@@ -545,7 +549,7 @@ pub fn handle_prompt_too_long(
     let dump_path = match dump_prompt(&dumps_dir, task_id, &header, &prompt_result.prompt) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("warning: overflow dump write failed: {}", e);
+            tracing::warn!("overflow dump write failed: {}", e);
             // Synthetic placeholder path so JSONL still records *something*.
             dumps_dir.join(format!(
                 "{}-iter{}-FAILED.txt",
@@ -584,13 +588,13 @@ pub fn handle_prompt_too_long(
         ),
     };
     if let Err(e) = append_event_log(base_dir, &event) {
-        eprintln!("warning: overflow event log append failed: {}", e);
+        tracing::warn!("overflow event log append failed: {}", e);
     }
 
     // Step 7: best-effort dump rotation (keep newest 3 per task).
     let sanitized = sanitize_id_for_filename(task_id);
     if let Err(e) = rotate_dumps_keep_n(&dumps_dir, &sanitized, 3) {
-        eprintln!("warning: overflow dump rotation failed: {}", e);
+        tracing::warn!("overflow dump rotation failed: {}", e);
     }
 
     action

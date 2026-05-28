@@ -60,6 +60,7 @@ use crate::loop_engine::signals;
 use crate::loop_engine::usage::{self, UsageCheckResult};
 use crate::loop_engine::watchdog;
 use crate::loop_engine::wave_scheduler::classify_drained_queue;
+use crate::output::ui;
 
 /// Run a single iteration of the agent loop.
 ///
@@ -70,7 +71,7 @@ pub fn run_iteration(
 ) -> TaskMgrResult<IterationResult> {
     // Step 0: Check for SIGINT/SIGTERM
     if params.signal_flag.is_signaled() {
-        eprintln!("Signal received, stopping loop...");
+        ui::emit("Signal received, stopping loop...");
         return Ok(IterationResult {
             outcome: IterationOutcome::Empty,
             task_id: None,
@@ -87,7 +88,7 @@ pub fn run_iteration(
 
     // Step 1: Check file-based signals
     if signals::check_stop_signal(params.tasks_dir, params.task_prefix) {
-        eprintln!("Stop signal detected (.stop file found)");
+        ui::emit("Stop signal detected (.stop file found)");
         return Ok(IterationResult {
             outcome: IterationOutcome::Empty,
             task_id: None,
@@ -120,7 +121,7 @@ pub fn run_iteration(
         );
         match check_result {
             UsageCheckResult::StopSignaled => {
-                eprintln!("Stop signal during usage wait, exiting");
+                ui::emit("Stop signal during usage wait, exiting");
                 return Ok(IterationResult {
                     outcome: IterationOutcome::Empty,
                     task_id: None,
@@ -135,7 +136,10 @@ pub fn run_iteration(
                 });
             }
             UsageCheckResult::ApiError(ref msg) => {
-                eprintln!("Usage API warning: {} (continuing)", msg);
+                // Graceful-degradation diagnostic: the usage API failed but the
+                // loop continues. Channel B (matches usage.rs's own API-failure
+                // routing); stays visible on the console at WARN+.
+                tracing::warn!("usage API warning: {} (continuing)", msg);
             }
             _ => {} // BelowThreshold, WaitedAndReset, Skipped — proceed
         }
@@ -144,15 +148,15 @@ pub fn run_iteration(
     // Step 2: Check crash tracker backoff
     let backoff = ctx.crash_tracker.backoff_duration();
     if !backoff.is_zero() {
-        eprintln!(
+        ui::emit(&format!(
             "Crash backoff: waiting {} before retry...",
             display::format_duration(backoff.as_secs())
-        );
+        ));
         thread::sleep(backoff);
     }
 
     if ctx.crash_tracker.should_abort() {
-        eprintln!("Too many consecutive crashes, aborting loop");
+        ui::emit("Too many consecutive crashes, aborting loop");
         return Ok(IterationResult {
             outcome: IterationOutcome::Crash(crate::loop_engine::config::CrashType::RuntimeError),
             task_id: None,
@@ -169,10 +173,10 @@ pub fn run_iteration(
 
     // Step 3: Force algorithmic pick if too many reorders
     let effective_reorder_hint = if ctx.reorder_count >= MAX_CONSECUTIVE_REORDERS {
-        eprintln!(
+        ui::emit(&format!(
             "Forcing algorithmic task selection after {} consecutive reorders",
             ctx.reorder_count
-        );
+        ));
         ctx.reorder_count = 0;
         None
     } else {
@@ -239,7 +243,7 @@ pub fn run_iteration(
             if classify_drained_queue(params.conn, params.task_prefix)
                 .is_some_and(|d| d.exit_code == 0)
             {
-                eprintln!("All tasks complete!");
+                ui::emit("All tasks complete!");
                 return Ok(IterationResult {
                     outcome: IterationOutcome::Completed,
                     task_id: None,
@@ -272,10 +276,10 @@ pub fn run_iteration(
                 .unwrap_or(0);
 
             if recovered > 0 {
-                eprintln!(
+                ui::emit(&format!(
                     "Auto-recovered {} stale in_progress task(s), retrying task selection...",
                     recovered
-                );
+                ));
                 // Retry build_prompt once with a fresh BuildPromptParams (the
                 // previous temporary was dropped at the let above so the
                 // conn re-borrow path is clean here).
@@ -301,10 +305,10 @@ pub fn run_iteration(
                 match retry_attempt {
                     Ok(Some(result)) => result,
                     Ok(None) => {
-                        eprintln!(
+                        ui::emit(&format!(
                             "No eligible tasks after recovery ({} remaining). Treating as stale.",
                             remaining
-                        );
+                        ));
                         return Ok(IterationResult {
                             outcome: IterationOutcome::NoEligibleTasks,
                             task_id: None,
@@ -328,10 +332,10 @@ pub fn run_iteration(
                     Err(e) => return Err(e),
                 }
             } else {
-                eprintln!(
+                ui::emit(&format!(
                     "No eligible tasks right now ({} remaining in todo/in-progress/blocked). Treating as stale.",
                     remaining
-                );
+                ));
                 return Ok(IterationResult {
                     outcome: IterationOutcome::NoEligibleTasks,
                     task_id: None,
@@ -367,7 +371,7 @@ pub fn run_iteration(
             match check_crash_escalation(&ctx.crashed_last_iteration, &task_id, resolved) {
                 Some(escalated) => {
                     let old = resolved.unwrap_or("(default)");
-                    eprintln!("Crash escalation: {} → {}", old, escalated);
+                    ui::emit(&format!("Crash escalation: {} → {}", old, escalated));
                     Some(escalated)
                 }
                 None => prompt_result.resolved_model.clone(),
@@ -375,10 +379,10 @@ pub fn run_iteration(
         // Apply per-task 1M model override from prior PromptTooLong recovery
         if let Some(override_model) = ctx.model_overrides.get(&task_id) {
             let old = after_crash_escalation.as_deref().unwrap_or("(default)");
-            eprintln!(
+            ui::emit(&format!(
                 "Model override (prior prompt overflow): {} → {}",
                 old, override_model,
-            );
+            ));
             Some(override_model.clone())
         } else {
             after_crash_escalation
@@ -394,10 +398,10 @@ pub fn run_iteration(
         apply_review_model_override(params.project_config.review_model.as_deref(), &task_id)
     {
         let old = effective_model.as_deref().unwrap_or("(default)");
-        eprintln!(
+        ui::emit(&format!(
             "Review-class routing: {} → {} (reviewModel)",
             old, review_model_override,
-        );
+        ));
         effective_model = Some(review_model_override);
     }
 
@@ -408,11 +412,11 @@ pub fn run_iteration(
     let base_effort = prompt_result.cluster_effort;
     let effort = ctx.effort_overrides.get(&task_id).copied().or(base_effort);
     if effort != base_effort {
-        eprintln!(
+        ui::emit(&format!(
             "Effort override (prior prompt overflow): {} → {}",
             base_effort.unwrap_or("(default)"),
             effort.unwrap_or("(default)"),
-        );
+        ));
     }
 
     // FEAT-008: operator escape valve — clear stale overrides if tasks.model changed.
@@ -423,21 +427,22 @@ pub fn run_iteration(
     // annotation can be included in the iteration header.
     let effective_runner = resolve_effective_runner(ctx, &task_id, effective_model.as_deref());
 
-    // Step 5: Print iteration header (with post-escalation effective_model + effort)
-    eprintln!(
-        "{}",
-        display::format_iteration_banner_with_recovery(
-            params.iteration,
-            params.max_iterations,
-            &task_id,
-            params.elapsed_secs,
-            effective_model.as_deref(),
-            effort,
-            &ctx.overflow_recovered,
-            &ctx.overflow_original_model,
-            effective_runner,
-        )
-    );
+    // Step 5: Print iteration header (with post-escalation effective_model + effort).
+    // The iteration banner is product output (CONTRACT-LOG-001 channel A) — it
+    // MUST go through `ui::emit`, never `tracing`. Routing it to `tracing::info!`
+    // would bury it below the WARN+ console default and the loop would look
+    // silent to an operator watching the console.
+    ui::emit(&display::format_iteration_banner_with_recovery(
+        params.iteration,
+        params.max_iterations,
+        &task_id,
+        params.elapsed_secs,
+        effective_model.as_deref(),
+        effort,
+        &ctx.overflow_recovered,
+        &ctx.overflow_original_model,
+        effective_runner,
+    ));
 
     // Step 6: Start activity monitor, spawn Claude subprocess, stop monitor.
     // Timeout is intentionally derived from the primary task's difficulty, not
@@ -492,7 +497,7 @@ pub fn run_iteration(
     let claude_result = match claude_result {
         Ok(r) => r,
         Err(crate::error::TaskMgrError::GrokAuthFailure { hint }) => {
-            eprintln!("Grok auth failure for task {}: {}", task_id, hint);
+            ui::emit_err(&format!("Grok auth failure for task {}: {}", task_id, hint));
             return Ok(IterationResult {
                 outcome: IterationOutcome::Crash(config::CrashType::GrokAuthFailure),
                 task_id: Some(task_id),
@@ -526,22 +531,24 @@ pub fn run_iteration(
             let pattern = format!("Bash({}:*)", cmd);
             if allowed_str.contains(&pattern) {
                 // Tool is in the allowlist but Claude CLI still denied it —
-                // likely user-level deny rules in ~/.claude/settings.json
-                eprintln!(
+                // likely user-level deny rules in ~/.claude/settings.json.
+                // Operator hint (CONTRACT-LOG-001 channel A): exact ANSI bytes
+                // preserved on stderr — undecorated.
+                ui::emit(&format!(
                     "\x1b[33m[hint]\x1b[0m Tool denied: {} (already in --allowedTools \u{2014} \
                      check ~/.claude/settings.json or project .claude/settings.json for deny rules)",
                     cmd,
-                );
+                ));
             } else {
-                eprintln!(
+                ui::emit(&format!(
                     "\x1b[33m[hint]\x1b[0m Tool denied: {} \u{2014} to allow in future loops, add to {}:",
                     cmd,
                     config_path.display(),
-                );
-                eprintln!(
+                ));
+                ui::emit(&format!(
                     "       {{\"additionalAllowedTools\": [\"Bash({}:*)\"]}}",
                     cmd,
-                );
+                ));
             }
         }
     }
@@ -552,26 +559,26 @@ pub fn run_iteration(
     let tasks_json_denials = claude::extract_tasks_json_denials(&claude_result.permission_denials);
     for (tool, path) in &tasks_json_denials {
         match tool.as_str() {
-            "Write" => eprintln!(
+            "Write" => ui::emit(&format!(
                 "\x1b[33m[hint]\x1b[0m Tool denied: {} on {} \u{2014} \
                  use 'task-mgr init --from-json --append' to create new PRDs",
                 tool, path,
-            ),
-            _ => eprintln!(
+            )),
+            _ => ui::emit(&format!(
                 "\x1b[33m[hint]\x1b[0m Tool denied: {} on {} \u{2014} \
                  use 'task-mgr add --stdin' or <task-status> tag instead",
                 tool, path,
-            ),
+            )),
         }
     }
 
     // Step 6.5a: If iteration timed out, log and treat as a crash-like outcome
     if claude_result.timed_out {
-        eprintln!(
+        ui::emit_err(&format!(
             "Iteration timed out for task {} (difficulty: {})",
             task_id,
             prompt_result.task_difficulty.as_deref().unwrap_or("medium"),
-        );
+        ));
         return Ok(IterationResult {
             outcome: IterationOutcome::Crash(crate::loop_engine::config::CrashType::RuntimeError),
             task_id: Some(task_id),
@@ -624,7 +631,7 @@ pub fn run_iteration(
 
     // Step 7.5: On rate-limit detection, trigger usage wait and mark as non-counting
     if outcome == IterationOutcome::RateLimit {
-        eprintln!("Rate limit detected in output, checking usage API...");
+        ui::emit("Rate limit detected in output, checking usage API...");
 
         let mut waited = false;
 
@@ -660,14 +667,14 @@ pub fn run_iteration(
         // Fallback: if the usage API didn't wait, parse reset time from output
         if !waited {
             let wait_secs = usage::parse_reset_from_output(&claude_output).unwrap_or(0);
-            eprintln!(
+            ui::emit(&format!(
                 "Usage API did not wait (CLI session limit). Falling back to output-parsed reset time ({})...",
                 if wait_secs > 0 {
                     display::format_duration(wait_secs)
                 } else {
                     format!("fallback {}s", params.usage_params.fallback_wait)
                 }
-            );
+            ));
             let probe = || probe_rate_limit_lifted(params.permission_mode);
             let completed = usage::wait_for_usage_reset(
                 wait_secs,
@@ -746,7 +753,7 @@ pub fn run_iteration(
     if let IterationOutcome::Reorder(ref requested_task_id) = outcome {
         ctx.reorder_hint = Some(requested_task_id.clone());
         ctx.reorder_count += 1;
-        eprintln!("Reorder requested: {}", requested_task_id);
+        ui::emit(&format!("Reorder requested: {}", requested_task_id));
     } else {
         ctx.reorder_count = 0;
     }

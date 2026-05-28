@@ -27,6 +27,7 @@ use crate::loop_engine::engine::{IterationContext, IterationResult, resolve_effe
 use crate::loop_engine::model;
 use crate::loop_engine::project_config;
 use crate::loop_engine::runner::RunnerKind;
+use crate::output::ui;
 
 /// Check whether crash recovery should escalate the model for this iteration.
 ///
@@ -91,7 +92,7 @@ pub fn check_override_invalidation(ctx: &mut IterationContext, conn: &Connection
     ) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("Warning: check_override_invalidation({task_id}): DB read failed: {e}");
+            tracing::warn!("check_override_invalidation({task_id}): DB read failed: {e}");
             return;
         }
     };
@@ -109,9 +110,12 @@ pub fn check_override_invalidation(ctx: &mut IterationContext, conn: &Connection
     ctx.overflow_original_model.remove(task_id);
     ctx.overflow_original_task_model.remove(task_id);
 
-    eprintln!(
+    // Byte-locked operator contract (CONTRACT-LOG-001 channel A2): emit the
+    // exact bytes to stderr with no level/timestamp decoration so the escape
+    // valve stays operator-greppable. NEVER route through tracing.
+    ui::emit(&format!(
         "Operator changed task model for {task_id} — clearing auto-recovery overrides; resolving fresh."
-    );
+    ));
 }
 
 /// Treat `Some("")` and `Some("   ")` as "no model known" so both escalation
@@ -181,10 +185,11 @@ pub(crate) fn apply_pending_promotion(ctx: &mut IterationContext, p: &PendingPro
             RunnerKind::Grok => ("Grok", "Opus"),
             RunnerKind::Claude => ("Claude", "Grok"),
         };
-        eprintln!(
+        // Operator-facing state-change announcement (CONTRACT-LOG-001 channel A).
+        ui::emit(&format!(
             "Promoted task {} to {} runner (model={}) after {} consecutive failures at {}",
             p.task_id, runner_label, p.target_model, p.new_count, from_label
-        );
+        ));
     }
 }
 
@@ -223,10 +228,11 @@ pub(crate) fn escalate_task_model_if_needed_inner(
             "UPDATE tasks SET model = ? WHERE id = ?",
             rusqlite::params![new_model, task_id],
         )?;
-        eprintln!(
+        // Operator-facing state-change announcement (CONTRACT-LOG-001 channel A).
+        ui::emit(&format!(
             "Escalated task {} to model {} after {} consecutive failures",
             task_id, new_model, new_count
-        );
+        ));
     }
 
     // Provider promotion hooks. The effective runner is computed once against
@@ -479,9 +485,10 @@ pub fn handle_task_failure(
         let tx = conn.transaction()?;
 
         let new_count = increment_consecutive_failures(&tx, task_id).map_err(|e| {
-            eprintln!(
-                "Warning: failed to increment consecutive_failures for {}: {}",
-                task_id, e
+            tracing::warn!(
+                "failed to increment consecutive_failures for {}: {}",
+                task_id,
+                e
             );
             e
         })?;
@@ -516,7 +523,7 @@ pub fn handle_task_failure(
                     pending_promotion = promotion;
                 }
                 Err(e) => {
-                    eprintln!("Warning: failed to escalate model for {}: {}", task_id, e);
+                    tracing::warn!("failed to escalate model for {}: {}", task_id, e);
                 }
             }
         }
@@ -536,12 +543,14 @@ pub fn handle_task_failure(
         #[allow(deprecated)]
         let res = auto_block_task(conn, task_id, new_count, current_iteration);
         if let Err(e) = res {
-            eprintln!("Warning: failed to auto-block task {}: {}", task_id, e);
+            tracing::warn!("failed to auto-block task {}: {}", task_id, e);
         } else {
-            eprintln!(
+            // Operator-facing state-change announcement (CONTRACT-LOG-001 channel A):
+            // the task is now blocked; operators rely on this stderr line.
+            ui::emit(&format!(
                 "Auto-blocked task {} after {} consecutive failures",
                 task_id, new_count
-            );
+            ));
         }
     }
 
@@ -554,11 +563,13 @@ pub(super) fn prompt_overflow_result(
     budget: usize,
     task_id: String,
 ) -> IterationResult {
-    eprintln!(
+    // Operator-facing fatal error (CONTRACT-LOG-001 channel A): the loop stops
+    // on this; the operator must see it on stderr.
+    ui::emit_err(&format!(
         "FATAL: Prompt critical sections ({} bytes) exceed budget ({} bytes) for task {}. \
          Reduce base prompt.md size or split the task.",
         critical_size, budget, task_id,
-    );
+    ));
     IterationResult {
         outcome: IterationOutcome::PromptOverflow,
         task_id: Some(task_id),
@@ -621,7 +632,13 @@ pub(super) fn probe_rate_limit_lifted(permission_mode: &PermissionMode) -> bool 
     {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("  Probe failed to spawn: {}", e);
+            // Sub-line of the operator-facing rate-limit probe flow (usage.rs
+            // prints "  Probing whether rate limit has been lifted..." via
+            // ui::emit). Keep it visible on stderr alongside that flow.
+            // AMBIGUOUS (REVIEW-001): spawn-failure diagnostic shown in operator
+            // context — defaulted to ui::emit per CONTRACT-LOG-001's "preserve
+            // visibility" rule rather than tracing.
+            ui::emit(&format!("  Probe failed to spawn: {}", e));
             return false;
         }
     };

@@ -67,6 +67,7 @@ use crate::loop_engine::output_parsing::{parse_completed_tasks, scan_output_for_
 use crate::loop_engine::prd_reconcile::{mark_task_done, update_prd_task_passes};
 use crate::loop_engine::progress;
 use crate::loop_engine::signals::SignalFlag;
+use crate::output::ui;
 
 /// Aggregated results from one pass through the pipeline.
 ///
@@ -240,10 +241,7 @@ pub fn process_iteration_output(params: ProcessingParams<'_>) -> ProcessingOutco
             decision,
         ) {
             Ok(_) => result.key_decisions_count += 1,
-            Err(e) => eprintln!(
-                "Warning: failed to store key decision '{}': {}",
-                decision.title, e
-            ),
+            Err(e) => tracing::warn!("failed to store key decision '{}': {}", decision.title, e),
         }
     }
 
@@ -296,17 +294,17 @@ pub fn process_iteration_output(params: ProcessingParams<'_>) -> ProcessingOutco
             if id == claimed_id {
                 task_marked_done = true;
                 record_completion(claimed_id, &mut completed_set, &mut result, outcome);
-                eprintln!(
+                ui::emit(&format!(
                     "Task {} completed (detected from <task-status> tag)",
                     claimed_id
-                );
+                ));
             } else if completed_set.insert(id.clone()) {
                 result.tasks_completed += 1;
                 result.completed_task_ids.push(id.clone());
-                eprintln!(
+                ui::emit(&format!(
                     "Peer task {} completed (detected from <task-status> tag)",
                     id
-                );
+                ));
             }
         }
 
@@ -328,17 +326,18 @@ pub fn process_iteration_output(params: ProcessingParams<'_>) -> ProcessingOutco
                         task_marked_done = true;
                     }
                     record_completion(completed_id, &mut completed_set, &mut result, outcome);
-                    eprintln!(
+                    ui::emit(&format!(
                         "Task {} completed (detected from <completed> tag)",
                         completed_id
-                    );
+                    ));
                 }
                 Err(e) => {
                     // Non-fatal: a duplicate `<completed>` after a status-tag
                     // dispatch already moved the row to `done` will fail
                     // here (transition guard). The dedup set above keeps the
-                    // counters honest; the warning preserves visibility.
-                    eprintln!("Warning: mark_task_done({}) failed: {}", completed_id, e);
+                    // counters honest; the warning preserves visibility
+                    // (tracing::warn! still shows on the console at WARN+).
+                    tracing::warn!("mark_task_done({}) failed: {}", completed_id, e);
                 }
             }
         }
@@ -371,23 +370,17 @@ pub fn process_iteration_output(params: ProcessingParams<'_>) -> ProcessingOutco
                         if let Err(e) =
                             update_prd_task_passes(prd_path, claimed_id, true, task_prefix)
                         {
-                            eprintln!(
-                                "Warning: failed to update PRD for task {}: {}",
-                                claimed_id, e
-                            );
+                            tracing::warn!("failed to update PRD for task {}: {}", claimed_id, e);
                         } else {
-                            eprintln!(
+                            ui::emit(&format!(
                                 "Task {} completed (commit {})",
                                 claimed_id,
                                 &commit_hash[..7.min(commit_hash.len())]
-                            );
+                            ));
                         }
                     }
                     Err(e) => {
-                        eprintln!(
-                            "Warning: failed to mark task {} as done in DB: {}",
-                            claimed_id, e
-                        );
+                        tracing::warn!("failed to mark task {} as done in DB: {}", claimed_id, e);
                     }
                 }
             }
@@ -410,19 +403,20 @@ pub fn process_iteration_output(params: ProcessingParams<'_>) -> ProcessingOutco
                             if let Err(e) =
                                 update_prd_task_passes(prd_path, completed_id, true, task_prefix)
                             {
-                                eprintln!(
-                                    "Warning: failed to update PRD for task {}: {}",
-                                    completed_id, e
+                                tracing::warn!(
+                                    "failed to update PRD for task {}: {}",
+                                    completed_id,
+                                    e
                                 );
                             } else {
-                                eprintln!("Task {} completed (detected from output)", completed_id);
+                                ui::emit(&format!(
+                                    "Task {} completed (detected from output)",
+                                    completed_id
+                                ));
                             }
                         }
                         Err(e) => {
-                            eprintln!(
-                                "Warning: failed to mark task {} as done: {}",
-                                completed_id, e
-                            );
+                            tracing::warn!("failed to mark task {} as done: {}", completed_id, e);
                         }
                     }
                 }
@@ -444,7 +438,10 @@ pub fn process_iteration_output(params: ProcessingParams<'_>) -> ProcessingOutco
             )
         {
             record_completion(claimed_id, &mut completed_set, &mut result, outcome);
-            eprintln!("Task {} completed (reported as already done)", claimed_id);
+            ui::emit(&format!(
+                "Task {} completed (reported as already done)",
+                claimed_id
+            ));
         }
     }
 
@@ -470,20 +467,20 @@ pub fn process_iteration_output(params: ProcessingParams<'_>) -> ProcessingOutco
             Ok(extraction) => {
                 result.learnings_extracted = extraction.learnings_extracted;
                 if extraction.learnings_extracted > 0 {
-                    eprintln!(
+                    ui::emit(&format!(
                         "Extracted {} learning(s) from output",
                         extraction.learnings_extracted
-                    );
+                    ));
                 }
             }
-            Err(e) => eprintln!("Warning: learning extraction failed: {}", e),
+            Err(e) => tracing::warn!("learning extraction failed: {}", e),
         }
     }
 
     // Step 6: bandit feedback for shown learnings (gates on Completed
     // outcome internally, so we pass the post-mutation `outcome`).
     if let Err(e) = feedback::record_iteration_feedback(conn, shown_learning_ids, outcome) {
-        eprintln!("Warning: failed to record iteration feedback: {}", e);
+        tracing::warn!("failed to record iteration feedback: {}", e);
     }
 
     // Step 7: per-task crash-tracking write. Keys by task_id so the map size
