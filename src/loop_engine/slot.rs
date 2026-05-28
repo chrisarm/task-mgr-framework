@@ -160,7 +160,7 @@ pub fn run_slot_iteration(
         effective_model.as_deref(),
         effort,
     );
-    claude::emit_prefixed_lines(Some(&slot_label_buf), banner.trim_start_matches('\n'));
+    ui::emit_prefixed(Some(&slot_label_buf), banner.trim_start_matches('\n'));
 
     // Per-slot activity monitor + timeout. Each slot gets its own monitor
     // polling its own working_root so heartbeats/change-tracking lines and

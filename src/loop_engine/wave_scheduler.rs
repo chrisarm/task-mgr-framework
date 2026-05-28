@@ -1004,9 +1004,7 @@ pub fn run_wave_iteration(
                 .unwrap_or("(default)");
             ui::emit(&format!(
                 "Review-class routing [slot {}]: {} → {} (reviewModel)",
-                slot.slot_index,
-                old,
-                review_model_override,
+                slot.slot_index, old, review_model_override,
             ));
             slot.prompt_bundle.resolved_model = Some(review_model_override);
         }

@@ -26,9 +26,7 @@ use uuid::Uuid;
 use crate::error::{TaskMgrError, TaskMgrResult};
 #[cfg(unix)]
 use crate::loop_engine::claude::open_pty_for_child_output;
-use crate::loop_engine::claude::{
-    ACTIVE_PREFIX_ENV, ClaudeStreamFormat, emit_prefixed_lines, is_pty_read_eof,
-};
+use crate::loop_engine::claude::{ACTIVE_PREFIX_ENV, ClaudeStreamFormat, is_pty_read_eof};
 use crate::loop_engine::config::PermissionMode;
 use crate::loop_engine::signals::SignalFlag;
 use crate::loop_engine::stream::{GrokStreamFormat, drive_stream};
@@ -1322,13 +1320,13 @@ fn read_plain_stdout(
     for line_result in reader.lines() {
         match line_result {
             Ok(line) => {
-                emit_prefixed_lines(slot_label, &line);
+                ui::emit_prefixed(slot_label, &line);
                 buf.push_str(&line);
                 buf.push('\n');
             }
             Err(e) if is_pty_read_eof(&e) => break,
             Err(e) => {
-                emit_prefixed_lines(
+                ui::emit_prefixed(
                     slot_label,
                     &format!("Warning: error reading {provider_label} stdout: {e}"),
                 );

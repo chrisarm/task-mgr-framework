@@ -235,44 +235,6 @@ fn assistant_content(val: &serde_json::Value) -> Option<&Vec<serde_json::Value>>
 /// `None` prefix is the legacy unprefixed path: a single write with the
 /// original text + trailing newline, preserving exact byte-for-byte behavior
 /// for the sequential `run_iteration` caller.
-pub(crate) fn emit_prefixed_lines(slot_label: Option<&str>, text: &str) {
-    let mut stderr = std::io::stderr().lock();
-    let _ = write_prefixed_lines(&mut stderr, slot_label, text);
-}
-
-/// Inner helper: same semantics as `emit_prefixed_lines` but writes to an
-/// arbitrary `Write` so the line-splitting logic is testable.
-///
-/// Returns `io::Result<()>` so a failed write surfaces in tests; production
-/// callers ignore it (stderr write failure isn't actionable).
-pub(crate) fn write_prefixed_lines<W: std::io::Write>(
-    out: &mut W,
-    slot_label: Option<&str>,
-    text: &str,
-) -> std::io::Result<()> {
-    match slot_label {
-        None => {
-            writeln!(out, "{}", text)?;
-        }
-        Some(prefix) => {
-            // `str::lines()` splits on `\n`/`\r\n` and drops a trailing empty
-            // token, matching the trailing-newline semantics of a single
-            // `writeln!("{}", text)`. Interior blank lines are preserved as
-            // empty strings so they still get a prefix (and stay attributable).
-            // An empty `text` produces zero lines — emit one prefixed blank so
-            // the slot's "I said nothing this turn" still shows up.
-            if text.is_empty() {
-                writeln!(out, "{}", prefix)?;
-                return Ok(());
-            }
-            for line in text.lines() {
-                writeln!(out, "{} {}", prefix, line)?;
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Parse an iterator of stream-json lines into (output_text, conversation).
 ///
 /// - `output_text` is extracted from the final `{"type":"result","result":"..."}` line.
@@ -2978,83 +2940,6 @@ mod tests {
             Some(&fake_cwd),
         )
         .expect("missing target should be silent Ok, not Err");
-    }
-
-    // --- emit_prefixed_lines / write_prefixed_lines ---
-    //
-    // Test the inner `write_prefixed_lines` against a Vec<u8> so we can
-    // assert exact bytes; `emit_prefixed_lines` is just a thin wrapper that
-    // points the same logic at stderr.
-
-    fn write_to_string(slot_label: Option<&str>, text: &str) -> String {
-        let mut buf: Vec<u8> = Vec::new();
-        write_prefixed_lines(&mut buf, slot_label, text).unwrap();
-        String::from_utf8(buf).unwrap()
-    }
-
-    #[test]
-    fn test_write_prefixed_lines_none_prefix_passthrough() {
-        // No prefix: identical to a single writeln!("{}", text).
-        assert_eq!(write_to_string(None, "hello"), "hello\n");
-        assert_eq!(write_to_string(None, "a\nb"), "a\nb\n");
-        assert_eq!(write_to_string(None, ""), "\n");
-    }
-
-    #[test]
-    fn test_write_prefixed_lines_single_line() {
-        assert_eq!(
-            write_to_string(Some("[slot 0]"), "hello"),
-            "[slot 0] hello\n"
-        );
-    }
-
-    #[test]
-    fn test_write_prefixed_lines_multi_line_each_prefixed() {
-        // Each line of a multi-line message gets its own prefix so an
-        // interleaved peer slot can't make a line look like ours (or vice
-        // versa) — every line is attributable in isolation.
-        assert_eq!(
-            write_to_string(Some("[slot 1]"), "line one\nline two\nline three"),
-            "[slot 1] line one\n[slot 1] line two\n[slot 1] line three\n"
-        );
-    }
-
-    #[test]
-    fn test_write_prefixed_lines_trailing_newline_dropped() {
-        // Matches `eprintln!("{}", "a\n")` semantics: writeln adds one newline,
-        // and `str::lines()` drops the trailing empty token, so we don't
-        // emit a stray "[slot 0] " line.
-        assert_eq!(
-            write_to_string(Some("[slot 0]"), "a\nb\n"),
-            "[slot 0] a\n[slot 0] b\n"
-        );
-    }
-
-    #[test]
-    fn test_write_prefixed_lines_interior_blank_line_preserved() {
-        // A deliberately blank line between two non-empty lines is preserved
-        // as a prefixed-blank line so the slot's blank line is attributable.
-        assert_eq!(
-            write_to_string(Some("[slot 2]"), "a\n\nb"),
-            "[slot 2] a\n[slot 2] \n[slot 2] b\n"
-        );
-    }
-
-    #[test]
-    fn test_write_prefixed_lines_empty_text_emits_prefix_only() {
-        // Empty text still produces a single prefixed line so a slot's
-        // "I said nothing this iteration" still shows up — distinguishes
-        // a slot that emitted nothing from a slot that wasn't there at all.
-        assert_eq!(write_to_string(Some("[slot 0]"), ""), "[slot 0]\n");
-    }
-
-    #[test]
-    fn test_write_prefixed_lines_crlf_split_like_lines() {
-        // `str::lines()` accepts both `\n` and `\r\n` line endings.
-        assert_eq!(
-            write_to_string(Some("[slot 0]"), "a\r\nb"),
-            "[slot 0] a\n[slot 0] b\n"
-        );
     }
 
     // --- FEAT-001: ACTIVE_PREFIX_ENV constant and active_prefix env-var pinning ---

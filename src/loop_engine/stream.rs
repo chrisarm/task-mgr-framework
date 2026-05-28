@@ -24,11 +24,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::Value;
 
 use crate::loop_engine::claude::{
-    MAX_TOOL_RESULT_BYTES, MAX_TOOL_USE_BYTES, append_capped, emit_prefixed_lines, is_pty_read_eof,
-    truncate_bytes,
+    MAX_TOOL_RESULT_BYTES, MAX_TOOL_USE_BYTES, append_capped, is_pty_read_eof, truncate_bytes,
 };
 use crate::loop_engine::output_parsing::parse_completed_tasks;
 use crate::loop_engine::watchdog::POST_COMPLETION_GRACE_SECS;
+use crate::output::ui;
 
 /// Soft cap on the accumulated assistant output buffer (the source of
 /// `RunnerResult.output` for providers that lack an authoritative final-result
@@ -200,7 +200,7 @@ fn drain_complete_lines(buf: &mut String) -> Vec<String> {
 /// here cannot affect output derivation or the completion ladder.
 fn emit_tee_block(slot_label: Option<&str>, text: &str) {
     for line in tee_visible_lines(text) {
-        emit_prefixed_lines(slot_label, line);
+        ui::emit_prefixed(slot_label, line);
     }
 }
 
@@ -292,17 +292,14 @@ pub(crate) fn drive_stream<F: StreamFormat>(
             match line_result {
                 Ok(line) => match serde_json::from_str::<Value>(&line) {
                     Ok(val) => format.parse_value(&val, &mut sink),
-                    Err(_) => emit_prefixed_lines(
+                    Err(_) => ui::emit_prefixed(
                         slot_label,
                         "Warning: malformed stream-json line (not valid JSON)",
                     ),
                 },
                 Err(e) if is_pty_read_eof(&e) => break,
                 Err(e) => {
-                    emit_prefixed_lines(
-                        slot_label,
-                        &format!("Warning: error reading stdout: {}", e),
-                    );
+                    ui::emit_prefixed(slot_label, &format!("Warning: error reading stdout: {}", e));
                     break;
                 }
             }
