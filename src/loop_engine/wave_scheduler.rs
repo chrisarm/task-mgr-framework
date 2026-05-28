@@ -1002,12 +1002,12 @@ pub fn run_wave_iteration(
                 .resolved_model
                 .as_deref()
                 .unwrap_or("(default)");
-            tracing::debug!(
+            ui::emit(&format!(
                 "Review-class routing [slot {}]: {} → {} (reviewModel)",
                 slot.slot_index,
                 old,
                 review_model_override,
-            );
+            ));
             slot.prompt_bundle.resolved_model = Some(review_model_override);
         }
         let effective_model = slot
