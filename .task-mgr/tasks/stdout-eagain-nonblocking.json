@@ -1,0 +1,130 @@
+{
+  "branchName": "fix/stdout-eagain-nonblocking",
+  "description": "Make task-mgr's stdout report writes panic-safe. A spawned Node `claude` child can flip the parent's stdout open file description to O_NONBLOCK (via inherited stderr aliased onto fd 1 by `2>&1`); a subsequent large bare print! then returns EAGAIN and panics. Replace the three bare-print sites in handlers.rs with a libc-backed helper that clears O_NONBLOCK before a blocking write_all, swallows BrokenPipe, and exits(1) on other errors.",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "Rust: No warnings in `cargo check` output",
+      "Rust: No warnings in `cargo clippy -- -D warnings` output",
+      "Rust: All scoped tests pass with `cargo test`",
+      "Rust: `cargo fmt --check` passes",
+      "No breaking changes to existing public APIs — output_result/output_json keep their () signatures",
+      "Every `unsafe` block carries a `// SAFETY:` comment per the existing claude.rs convention"
+    ],
+    "description": "These criteria apply to ALL implementation tasks"
+  },
+  "model": "claude-sonnet-4-6",
+  "priorityPhilosophy": {
+    "description": "Hierarchy of what matters most when implementing tasks",
+    "hierarchy": [
+      "1. PLAN — Anticipate edge cases before coding",
+      "2. PHASE 2 FOUNDATION — ~1 day now to save ~2+ weeks later (1:10+ ratio); we are pre-launch, foundations compound",
+      "3. FUNCTIONING CODE — Pragmatic, reliable, wired in per plan",
+      "4. CORRECTNESS — Compiles, type-checks, scoped tests pass deterministically",
+      "5. CODE QUALITY — Clean code, qualityDimensions satisfied, no warnings",
+      "6. POLISH — Docs, formatting, minor improvements"
+    ],
+    "principles": [
+      "Quality dimensions explicit — qualityDimensions on every task tells you what 'good' looks like",
+      "Phase 2 foundation — prefer solutions that lay strong post-launch foundations (1:10+ savings ratio)",
+      "Edge cases = test cases — every known edge case must have a corresponding test",
+      "Scoped per-iteration tests, full suite at REVIEW-001 — REVIEW must leave the trunk green including pre-existing failures",
+      "Ship working code with tests to prove it; handle Option/Result explicitly; avoid unwrap() in production"
+    ]
+  },
+  "prohibitedOutcomes": [
+    "Tests that only assert 'no crash' or check type without verifying content",
+    "Tests that mirror implementation internals (break when refactoring)",
+    "A catch-WouldBlock-and-retry loop that re-writes the full buffer (write_all's partial-write semantics duplicate the already-flushed prefix) or busy-spins",
+    "Swallowing genuine write errors (not BrokenPipe/WouldBlock) silently — they must still exit(1) with a message",
+    "Changing the () return signatures of output_result/output_json (would ripple to 59 call sites)"
+  ],
+  "project": "task-mgr",
+  "requires": [],
+  "taskPrefix": "d9aec227",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "Positive: clear_nonblocking clears O_NONBLOCK when set — unit test sets it via fcntl(F_SETFL) on a pipe write end, calls clear_nonblocking, asserts F_GETFL & O_NONBLOCK == 0",
+        "Positive: write_all_blocking delivers a 128 KB payload in full over a preset-O_NONBLOCK pipe write end with a draining reader thread — assert all bytes received, no panic, no error",
+        "Negative control (recreate the bug): with the write end O_NONBLOCK and the 64 KB pipe full (no reader draining), a raw `write_all` of the 128 KB payload returns ErrorKind::WouldBlock — proves the regression mechanism so the fix test can't silently pass",
+        "Positive: BrokenPipe is swallowed — close the read end before writing, call write_all_blocking on the write end, assert it returns normally (no panic, no process exit)",
+        "Negative: output_result and output_json keep `()` signatures — no changes at the 59 call sites in main.rs (grep-verify call sites still compile unchanged)",
+        "Negative: the JSON *serialization* error arm in output_json still does eprintln! + process::exit(1) (unchanged)",
+        "Positive: every new `unsafe` block has a `// SAFETY:` comment",
+        "Failure mode: if F_GETFL returns -1, clear_nonblocking does not panic and the write is still attempted",
+        "Scoped gate green: cargo fmt --check, cargo check, cargo clippy -- -D warnings, cargo test handlers all pass"
+      ],
+      "dependsOn": [],
+      "description": "Add a libc-backed helper to src/handlers.rs that writes report text to stdout without panicking, and route the three existing bare-print sites through it.\n\nROOT CAUSE: `curate dedup` (and any command) prints its final report via a bare `print!` (handlers.rs:151). When invoked as `... 2>&1 | tee`, fd 1 and fd 2 share one open file description; the spawned Node `claude` child inherits stderr (runner.rs:576, Stdio::inherit) and libuv marks the shared OFD O_NONBLOCK. The large report write then returns EAGAIN and bare print! panics (exit masked to 0 by tee without pipefail). The panic is strictly downstream of curate_dedup() returning, so the DB result is already complete — only the print fails.\n\nDO:\n- Add `fn clear_nonblocking(fd: libc::c_int)`: `libc::fcntl(fd, F_GETFL)`; if `flags >= 0 && (flags & O_NONBLOCK) != 0`, `libc::fcntl(fd, F_SETFL, flags & !O_NONBLOCK)`. Wrap in `unsafe` with a `// SAFETY:` comment (mirror the libc/raw-fd style already in src/loop_engine/claude.rs::open_pty_for_child_output).\n- Add `fn write_all_blocking<W: std::io::Write>(fd: libc::c_int, w: &mut W, bytes: &[u8])`: call clear_nonblocking(fd) FIRST, then `w.write_all(bytes).and_then(|_| w.flush())`; `Ok(())` => done; `Err(e) if e.kind()==BrokenPipe` => return quietly; `Err(e)` => `eprintln!(\"Error: failed to write to stdout: {}\", e); process::exit(1)`.\n- Add `fn write_stdout(s: &str)`: lock stdout, call `write_all_blocking(libc::STDOUT_FILENO, &mut lock, s.as_bytes())`.\n- Rewrite the 3 sites: handlers.rs:151 `print!(\"{}\", result.format_text())` -> `write_stdout(&result.format_text())`; handlers.rs:166 `print!(\"{}\", format_migrate_text(result, action))` -> `write_stdout(&format_migrate_text(result, action))`; handlers.rs:200 (output_json) `Ok(json) => println!(\"{}\", json)` -> `Ok(json) => write_stdout(&format!(\"{}\\n\", json))`.\n- Keep the existing `eprintln!` + `process::exit(1)` for the JSON *serialization* error in output_json untouched (real programmer error, distinct from a transient write).\n\nDO NOT:\n- Do NOT catch WouldBlock and retry the full buffer (duplicates the already-flushed prefix) or busy-spin — clear the flag up front and do one blocking write.\n- Do NOT change the `()` return types of output_result / output_json (would ripple to 59 call sites in main.rs).\n- Do NOT touch the stderr path (emit_prefixed_lines / loop-engine streaming) — explicitly out of scope; it already swallows write errors.\n- Do NOT add nix/rustix — libc=\"0.2\" is already a direct dep and is the house style.\n\nEdge cases:\n- fd already blocking: clear_nonblocking is a cheap no-op (GETFL shows flag unset, skip SETFL).\n- F_GETFL fails (returns -1): skip the clear, attempt the write anyway (don't error on the diagnostic).\n- Reader closed (BrokenPipe): return quietly, no panic, no exit.\n- Payload larger than the 64 KB pipe buffer with a slow reader: blocking write must complete in full, not EAGAIN.\n\nKnown-bad to guard against:\n- Catch-WouldBlock-and-retry on the SAME locked writer: write_all already consumed an unknown prefix before the error, so retrying `bytes` duplicates output. The proactive-clear design avoids this entirely.",
+      "edgeCases": [
+        "fd already blocking: clear_nonblocking is a no-op (skip SETFL)",
+        "F_GETFL returns -1: skip clear, still attempt write, do not panic",
+        "Reader closed (BrokenPipe): return quietly",
+        "Payload > 64 KB pipe buffer with slow reader: blocking write completes in full",
+        "Empty string: write_stdout(\"\") writes nothing, no error"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Child process re-flips O_NONBLOCK between clear and write (concurrent live children)",
+          "expectedBehavior": "Residual EAGAIN caught by the Err(_) => exit(1) backstop — never unwinds/panics; documented as best-effort under concurrency"
+        },
+        {
+          "cause": "Downstream reader (| head, | less) closes the pipe",
+          "expectedBehavior": "BrokenPipe swallowed, return normally, no panic"
+        },
+        {
+          "cause": "Disk-full / other genuine write error",
+          "expectedBehavior": "eprintln! diagnostic + process::exit(1)"
+        }
+      ],
+      "id": "FEAT-001",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": true,
+      "notes": "All changes in src/handlers.rs. Mirror libc + std::os::fd usage from src/loop_engine/claude.rs::open_pty_for_child_output (libc::openpty + unsafe + SAFETY comments). Reuse the existing output_result match shape (handlers.rs:145-154), output_migrate_result (~:160-166), output_json (:198-206). DI seam: write_all_blocking takes (fd, &mut W: Write, bytes) so tests drive it over a libc::pipe() without touching real stdout. Test fd ownership: wrap ONLY the write end in File via from_raw_fd (File owns it, closes on drop); close the read end manually from the side the reader thread doesn't own — avoid double-close/EBADF. Linux 64 KB pipe buffer is the stable default; 128 KB payload guarantees it fills. Learning [3068]/[693]: expect()/documented-invariant IO is house style — but here prefer explicit Result handling since the whole point is not to panic. Learning [3129]: write commands emit context headers to stderr first; stdout is data only — unaffected here. Learning [3813]: output types register via impl_text_formattable!; format_text() returns String, write it as-is.",
+      "passes": false,
+      "priority": 1,
+      "qualityDimensions": [
+        "Correctness: clearing O_NONBLOCK before a single blocking write_all eliminates EAGAIN without the partial-write duplication of a retry loop",
+        "Robustness: BrokenPipe handled gracefully (standard `| head` behavior); genuine errors still surface + exit(1)",
+        "Testability: write_all_blocking is fd-parameterized so tests exercise it over a real pipe with no global-stdout coupling",
+        "Idiomatic: unsafe libc usage matches claude.rs (SAFETY comments, std::os::fd wrappers); no new crates",
+        "Surgical: changes confined to src/handlers.rs; no call-site ripple (() signatures preserved)"
+      ],
+      "taskType": "implementation",
+      "title": "Panic-safe stdout writes via O_NONBLOCK-clearing helper",
+      "touchesFiles": ["src/handlers.rs"]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: all three sites (handlers.rs ~:151, ~:166, ~:200) write through write_stdout; grep confirms no remaining bare print!/println! of large report text in output_result/output_migrate_result/output_json",
+        "Positive: FULL cargo test, cargo clippy -- -D warnings, cargo fmt --check all clean (no scope filter)",
+        "Positive: unsafe block has correct F_GETFL/F_SETFL bit math (clears, never sets, O_NONBLOCK) and a SAFETY comment; no other fd flags touched",
+        "Negative: no unwrap() introduced in the new code paths; output_result/output_json signatures unchanged (() return)",
+        "Negative: no dead-code / unused-import warnings for the new helpers",
+        "Documentation: consider a one-line CLAUDE.md note under a stdout/output gotcha if warranted (optional — only if it earns its place)",
+        "Pre-existing test failures fixed (or, if >~12 clearly-unrelated, spawned as a single FIX-xxx with verifyCommand and BLOCKED for human routing)",
+        "If issues found: FIX-xxx tasks spawned via `task-mgr add --stdin --depended-on-by REVIEW-001`"
+      ],
+      "dependsOn": ["FEAT-001"],
+      "description": "Review the handlers.rs change for quality, security (unsafe correctness), integration wiring, and documentation needs. RUN THE FULL QUALITY GATE (unscoped test suite).\n\nDO: Verify the three bare-print sites are all routed through write_stdout; verify no call site of output_result/output_json broke (() signatures preserved); verify the unsafe fcntl block is correct (F_GETFL/F_SETFL bit math, SAFETY comment) and the BrokenPipe/error contract matches the plan; run full cargo test / clippy / fmt with NO scope filter and fix every failure including pre-existing.\nDO NOT: Skip the full unscoped suite — this is THE place it runs. Do NOT scope the test run.",
+      "estimatedEffort": "low",
+      "id": "REVIEW-001",
+      "model": "grok-build",
+      "notes": "Spawn fixes via `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001` — DB + JSON synced atomically, no manual edit. If no issues: emit `<task-status>REVIEW-001:done</task-status>` with 'Clean review' note. End-to-end smoke: build, then run a command through a pipe (e.g. `task-mgr curate count | cat`) and confirm full output + exit 0; the original failing shape is `task-mgr curate dedup 2>&1 | tee`.",
+      "passes": false,
+      "priority": 99,
+      "qualityDimensions": [
+        "No unwrap in production paths",
+        "unsafe fcntl correctness (bit math + SAFETY comment)",
+        "All three print sites wired through the helper",
+        "Full suite green including any pre-existing failures"
+      ],
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Code review + final verification",
+      "touchesFiles": ["src/handlers.rs"]
+    }
+  ],
+  "version": "1.0"
+}
