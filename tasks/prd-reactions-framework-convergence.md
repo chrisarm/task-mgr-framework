@@ -8,7 +8,7 @@
 
 > **Filename note**: the original `/prd` arg named `tasks/prd-unify-sequential-and-wave-execution.md`, but that path already holds an **earlier, completed** PRD (the FEAT-010 prompt-builder split + shared `iteration_pipeline`, i.e. convergence incident #1). This PRD is the *next* convergence effort (the reactions framework) and is filed separately to avoid clobbering that record.
 
-**Authoritative spec (read all three before implementing):**
+**Authoritative spec:**
 - Plan: `~/.claude/plans/what-can-we-do-breezy-shore.md`
 - First review (scope decisions): `tasks/grok-review-convergence-plan.md`
 - Enforcement spike (SPIKE-001): `tasks/grok-review-spike-enforcement.md`
@@ -22,7 +22,7 @@
 The loop engine has two execution paths — **sequential** (`iteration.rs::run_iteration` + `orchestrator.rs::run_loop` post-processing) and **parallel/wave** (`wave_scheduler.rs::run_wave_iteration` + `slot.rs`, used when `parallel_slots > 1`). Main-thread post-Claude *reactions* (rate-limit waits, crash escalation, the usage gate, overflow recovery, human-review) were implemented at the call sites of one path and silently omitted or shaped differently in the other. The result is a recurring, high-severity bug class: **behavioral drift between the two paths.**
 
 Three incidents to date:
-1. Wave skipped learning extraction / bandit feedback / the already-complete completion fallback → fixed reactively by the shared `iteration_pipeline::process_iteration_output` (learnings #2111, #2224, #2286). *(This is the subject of the earlier `prd-unify-sequential-and-wave-execution.md`.)*
+1. Wave skipped learning extraction / bandit feedback / the already-complete completion fallback → fixed reactively by the shared `iteration_pipeline::process_iteration_output` (learnings #2111, #2224, #2286).
 2. Wave's empty-group path lacked the sequential all-complete + recovery handling → false `"no eligible tasks after 3 consecutive stale iterations"` aborts → fixed reactively by `classify_drained_queue`.
 3. **(current)** Rate-limit / session-limit waiting exists **only** in sequential. In wave mode every slot returns the limit message instantly, the wave never waits, tasks strand `in_progress`, the todo pool drains, and the loop false-aborts with the same `3 consecutive stale iterations` message — resetting all in-progress work.
 
@@ -36,10 +36,10 @@ The first two fixes built shared seams reactively. This effort makes convergence
 
 ### Primary Goals
 
-- [ ] Create `src/loop_engine/reactions/` as the single physical home for the converged reactions (functions move here; `recovery.rs`/`usage.rs`/`overflow.rs` become thin deprecated callers during transition).
+- [ ] Create `src/loop_engine/reactions/` as the single physical home for the converged reactions (functions move here; `recovery.rs`/`usage.rs`/`overflow.rs` slim to near-zero with transition-only deprecated shims).
 - [ ] Fix bug #3: wave mode waits on rate/session limits exactly like sequential.
 - [ ] Converge **and lock** all six audit items: **#2** crash escalation (incl. effort overrides), **#3** pre-iteration usage gate, **#5** overflow recovery, **#6** rate-limit wait, **#10** human-review, **#13** budget accounting.
-- [ ] Implement the compile-time enforcement mechanism so calling a relocated leaf from `iteration.rs` or `wave_scheduler.rs` is a compile error.
+- [ ] Implement the compile-time enforcement mechanism so calling a relocated leaf from `iteration.rs`, `wave_scheduler.rs`, or `slot.rs` is a compile error.
 - [ ] Stand up `tests/reaction_parity.rs` covering each reaction across sequential (1-item) and wave (N-item, incl. mixed) shapes.
 
 ### Success Metrics
@@ -68,7 +68,7 @@ The first two fixes built shared seams reactively. This effort makes convergence
 ### Style Requirements
 
 - Follow existing codebase patterns. **Mandatory**: all five coordinator functions destructure their param structs exhaustively (no `..` rest pattern), per the `ProcessingParams` precedent — adding a field becomes a compile error in both call sites.
-- Enforcement (SPIKE-001): `#![deny(deprecated)]` at the top of `iteration.rs` and `wave_scheduler.rs`; `#[deprecated(note = "use reactions::… — direct calls are a compile error")]` on relocated leaves; targeted `#[allow(deprecated)]` only at legitimate transition sites (engine re-exports, tests). Established pattern (`recovery.rs:428`, `slot.rs:336`).
+- Enforcement (SPIKE-001, RESOLVED): `#![deny(deprecated)]` at the top of **`iteration.rs`, `wave_scheduler.rs`, AND `slot.rs`**; `#[deprecated(note = "use reactions::… — direct calls are a compile error")]` on relocated leaves; targeted `#[allow(deprecated)]` only at legitimate transition sites (engine re-exports, tests). Established pattern (`recovery.rs:428`, `slot.rs:336`).
 - No `.unwrap()` on fallible paths; preserve existing error propagation. Best-effort observability writes (overflow dumps/JSONL) keep the `eprintln!`-and-never-propagate pattern.
 
 ### Known Edge Cases
@@ -82,7 +82,7 @@ The first two fixes built shared seams reactively. This effort makes convergence
 | Rate-limit wave while merge-fail streak = 1 | Early return with empty `failed_merges` | Streak preserved (not reset to 0); next merge-fail reaches threshold and halts |
 | Persistent (never-lifting) rate limit | Wait could loop without consuming budget | Bounded by `MAX_WAIT_SECS` + `.stop`/signal breaks it (same as sequential today) |
 | Human-review fires on a `WaitedAndRetry` wave | Other slots still rate-limited; ephemerals unmerged | Allowed & intentional (§3.3); interactive session blocks; documented |
-| `slot.rs:492` direct `handle_prompt_too_long` call | Spike scope only denied the two orchestrators | Open question FR-OQ — decide whether slot.rs must route through `reactions::post_output::handle_overflow` |
+| `slot.rs:492` direct `handle_prompt_too_long` call | Was a drift loophole | RESOLVED: routes through `reactions::post_output::handle_overflow`; slot.rs also carries the deny |
 
 ---
 
@@ -95,7 +95,7 @@ The foundational abstraction every FEAT below depends on. `taskType: "contract"`
 - `src/loop_engine/reactions/{mod,pre_spawn,account,post_output,post_completion}.rs` exist and are registered in `loop_engine/mod.rs`.
 - The five coordinator entry points exist with the signatures in §6 Public Contracts: `resolve_task_execution`, `account_usage_gate`, `react_to_outputs`, `handle_overflow`, `react_to_completions`.
 - Each coordinator destructures its param struct exhaustively (no `..`).
-- Enforcement active: `#![deny(deprecated)]` on `iteration.rs` + `wave_scheduler.rs`; relocated leaves carry `#[deprecated]`. A demonstration that calling a relocated leaf from either orchestrator fails `cargo build`.
+- Enforcement active: `#![deny(deprecated)]` on **`iteration.rs` + `wave_scheduler.rs` + `slot.rs`**; relocated leaves carry `#[deprecated]`. A demonstration that calling a relocated leaf from any of the three files fails `cargo build`.
 - `tests/reaction_parity.rs` skeleton present with the harness fixtures (two independent DBs, `TASK_MGR_NO_EXTRACT_LEARNINGS=1`, public-API setup) and at least structural + negative-control cases passing.
 - "Reaction framework (shared)" section written in `src/loop_engine/CLAUDE.md`, referencing CONTRACT-001; "rate-limit waits" removed from the "Out of scope (kept at call sites)" lists in CLAUDE.md AND `iteration_pipeline.rs:45-50` (same commit).
 - The six target items declared `dependsOn: CONTRACT-001`.
@@ -122,7 +122,7 @@ Wire all FEAT/FIX dependents with `--depended-on-by CONTRACT-001`.
 **So that** the next reaction can't become bug #4.
 
 **Acceptance Criteria:**
-- [ ] Re-inlining a relocated leaf into `iteration.rs`/`wave_scheduler.rs` fails `cargo build`.
+- [ ] Re-inlining a relocated leaf into `iteration.rs`/`wave_scheduler.rs`/`slot.rs` fails `cargo build`.
 - [ ] `tests/reaction_parity.rs` exercises every converged reaction on both path shapes.
 - [ ] Adding a field to a coordinator param struct breaks compilation at both call sites until both are updated.
 
@@ -153,9 +153,9 @@ See §2.6. Foundational; blocks all FEATs.
 **Validation:** wave performs the pre-iteration usage check; gate decision identical to sequential for the same usage state.
 
 ### FR-005: Relocate overflow recovery as its own reaction (audit #5)
-`reactions::post_output::handle_overflow` becomes the single home for `handle_prompt_too_long` (relocated from `overflow.rs`/call sites). NOT folded into `process_iteration_output`. Preserves the five-rung ladder, prompt dumps, JSONL events, rotation, FallbackToProvider transactional promotion, and `sanitize_id_for_filename`. Ordering relative to the pipeline is a written CLAUDE.md contract.
+`reactions::post_output::handle_overflow` becomes the single home for `handle_prompt_too_long` (relocated from `overflow.rs`/call sites). NOT folded into `process_iteration_output`. **All three call sites route through it: `iteration.rs:714`, `wave_scheduler.rs` (via `process_slot_result`), AND `slot.rs:492`** (FR-OQ resolved — no leaf call escapes the framework). Preserves the five-rung ladder, prompt dumps, JSONL events, rotation, FallbackToProvider transactional promotion, and `sanitize_id_for_filename`. Ordering relative to the pipeline is a written CLAUDE.md contract.
 
-**Validation:** existing overflow tests green; both paths call the coordinator; learning #2852 evolution honored (no regression to per-path bypass).
+**Validation:** existing overflow tests green; all three paths call the coordinator; learning #2852 evolution honored (no regression to per-path bypass).
 
 ### FR-006: Converge the rate-limit wait — fixes bug #3 (audit #6)
 `reactions::account::react_to_outputs(conn, &[OutputReactionItem], &AccountReactionParams) -> AccountReaction` folds N `(outcome, output)`, detects `RateLimit` across the slice, resets affected tasks `in_progress→todo` (`recover_in_progress_for_prefix`), and performs the wait **once** (reusing `usage::check_and_wait` → `parse_reset_from_output` + `wait_for_usage_reset` with the `probe_rate_limit_lifted` probe). `react_to_outputs_inner` takes the wait as an injected `&dyn Fn` for hermetic tests.
@@ -176,8 +176,10 @@ A single helper owns the `iteration_consumed ↔ iteration -= 1` mapping so a ra
 
 **Validation:** `WaitedAndRetry`/`RateLimit` ⇒ no `max_iterations` consumption on both paths; persistent-rate-limit termination test (exits on signal/`.stop`, not unbounded budget).
 
-### FR-OQ (Open): `slot.rs:492` overflow routing
-Decide whether the direct `overflow::handle_prompt_too_long` call at `slot.rs:492` must route through `reactions::post_output::handle_overflow` (SPIKE-001 scope only denied the two orchestrators). See Open Questions; resolve in CONTRACT-001.
+### FR-CLEANUP-001: Remove transition shims
+After all six items route through `reactions::`, delete the `#[deprecated]` shims in `recovery.rs`/`usage.rs`/`overflow.rs` and slim those modules to near-zero (RESOLVED: no permanent dual-home). Audit all `#[allow(deprecated)]` sites; remove those no longer needed. `dependsOn` the six FEATs.
+
+**Validation:** no `#[deprecated]` shim for a relocated leaf remains; `cargo build` + full test suite green; `git grep` shows relocated leaves defined only under `reactions::`.
 
 ---
 
@@ -199,10 +201,10 @@ Decide whether the direct `overflow::handle_prompt_too_long` call at `slot.rs:49
 - `src/loop_engine/reactions/` *(new)* — `mod.rs`, `pre_spawn.rs`, `account.rs`, `post_output.rs`, `post_completion.rs`. Physical home of relocated leaves.
 - `src/loop_engine/iteration.rs` — replace Step 1.5 (`114-142`), Step 4.5 (`363-419`), Step 7.5 (`621-688`) with coordinator calls; add `#![deny(deprecated)]`.
 - `src/loop_engine/wave_scheduler.rs` — pre-spawn loop (`981-1011`); `react_to_outputs` call after `process_slot_result` (`1024`); B3 streak preservation at the boundary (`738-739` interaction); add `#![deny(deprecated)]`.
+- `src/loop_engine/slot.rs` — route `slot.rs:492` overflow call through `handle_overflow`; align per-slot pre-spawn resolution; add `#![deny(deprecated)]`.
 - `src/loop_engine/orchestrator.rs` — route post-completion block (`1178-1250`) through `react_to_completions`; thread `usage_params` (`991`); B2/#13 budget helper (`1253-1264`).
 - `src/loop_engine/engine.rs` — add `usage_params` to `WaveIterationParams` (`548-595`); preserve `pub use` re-exports (apply `#[allow(deprecated)]` as needed).
-- `src/loop_engine/recovery.rs`, `usage.rs`, `overflow.rs` — relocate leaf logic to `reactions::`; thin deprecated shims during transition.
-- `src/loop_engine/slot.rs` — `slot.rs:492` overflow call (FR-OQ); pre-spawn resolution alignment.
+- `src/loop_engine/recovery.rs`, `usage.rs`, `overflow.rs` — relocate leaf logic to `reactions::`; transition-only deprecated shims, removed by FR-CLEANUP-001.
 - `src/loop_engine/CLAUDE.md`, `iteration_pipeline.rs:45-50` — "Reaction framework (shared)" section; reclassify the "Out of scope" list.
 - `tests/reaction_parity.rs` *(new)*; extend `tests/wave_runtime_error_fallback.rs` for the e2e.
 
@@ -219,7 +221,7 @@ Decide whether the direct `overflow::handle_prompt_too_long` call at `slot.rs:49
 | B. **Physical home + `#[deprecated]`/`#[deny]` enforcement + exhaustive destructure** | Real single home; compile-time bypass prevention; matches crate's deprecation culture & `ProcessingParams` precedent | Large first increment; transition `#[allow(deprecated)]` noise | **Preferred** (SPIKE-001 + §3 decisions) |
 | C. Sealed-trait / marker-type enforcement | Strong invariant | High complexity; poor fit; high maintenance | Rejected (SPIKE-001 §3) |
 
-**Selected Approach**: B. Physical relocation into `reactions/`, enforced by `#![deny(deprecated)]` scoped to the two orchestrator files + `#[deprecated]` on relocated leaves (primary), with exhaustive param-struct destructure on the five coordinators (secondary hygiene). All-or-nothing first increment (no tactical standalone PR).
+**Selected Approach**: B. Physical relocation into `reactions/`, enforced by `#![deny(deprecated)]` scoped to the three engine files + `#[deprecated]` on relocated leaves (primary), with exhaustive param-struct destructure on the five coordinators (secondary hygiene). All-or-nothing first increment (no tactical standalone PR).
 
 **Phase 2 Foundation Check**: Strongly favorable (1:10+). The physical-home + compile-time-lock costs more now (relocation + transition shims) but permanently closes a bug class that has already cost three reactive fixes; each future reaction becomes a one-place change protected by the compiler.
 
@@ -231,7 +233,7 @@ Decide whether the direct `overflow::handle_prompt_too_long` call at `slot.rs:49
 | B3 merge-fail streak silently wiped by rate-limit early return | High | Med-High | Preserve `consecutive_merge_fail_waves`; dedicated test (merge-fail → rate-limit → merge-fail reaches threshold) |
 | B2 budget drift / unbounded loop | Med | Med | Shared #13 accounting helper; persistent-rate-limit termination test |
 | Very large first deliverable (all-or-nothing) → review/rebase risk | Med | High | Tightly-stacked task sequence under CONTRACT-001; review the contract in isolation first |
-| `#[deny(deprecated)]` transition noise across tests / engine re-exports | Med | Med | Narrow deny to the two files only; targeted `#[allow(deprecated)]`; aggressive shim cleanup in follow-on tasks |
+| `#[deny(deprecated)]` transition noise across tests / engine re-exports | Med | Med | Narrow deny to the three engine files only; targeted `#[allow(deprecated)]`; aggressive shim cleanup in FR-CLEANUP-001 |
 | Human-review now firing on partial waves surprises operators | Low | Low (decision accepted §3.3) | Docs + banner noting other slots in flight |
 
 #### Top 3 Risks (Impact × Likelihood)
@@ -260,7 +262,7 @@ Decide whether the direct `overflow::handle_prompt_too_long` call at `slot.rs:49
 | Type | Current | Proposed | Breaking? | Migration |
 | ---- | ------- | -------- | --------- | --------- |
 | `WaveIterationParams<'a>` | no `usage_params` | add `pub usage_params: &'a UsageParams` | No (internal struct) | Wire at `orchestrator.rs:991` |
-| `recovery::check_crash_escalation`, `usage::check_and_wait`/`wait_for_usage_reset`, `overflow::handle_prompt_too_long`, `trigger_human_reviews` | callable from orchestrators | relocated to `reactions::`; `#[deprecated]` shims | Yes (intentional compile error from the two files) | Route via coordinators; `#[allow(deprecated)]` at transition sites |
+| `recovery::check_crash_escalation`, `usage::check_and_wait`/`wait_for_usage_reset`, `overflow::handle_prompt_too_long`, `trigger_human_reviews` | callable from orchestrators + slot.rs | relocated to `reactions::`; transition `#[deprecated]` shims (removed by FR-CLEANUP-001) | Yes (intentional compile error from the three files) | Route via coordinators; `#[allow(deprecated)]` at transition sites |
 
 ### Data Flow Contracts
 
@@ -272,8 +274,8 @@ N/A — no new cross-module data structure with non-obvious key types. Reactions
 | --------- | ----- | ------ | ---------- |
 | `iteration.rs:114-142,363-419,621-688` | inline reactions | BREAKS (intentional) | Replace with coordinator calls |
 | `wave_scheduler.rs:981-1011,1024,1052,738-739` | pre-spawn + post-slot + halt check | NEEDS REVIEW | Add coordinator calls; preserve streak (B3) |
+| `slot.rs:492` | direct `handle_prompt_too_long` | BREAKS (intentional, FR-OQ resolved) | Route through `handle_overflow` |
 | `orchestrator.rs:1178-1250,1253-1264` | post-completion + budget | NEEDS REVIEW | Route via `react_to_completions`; shared budget helper |
-| `slot.rs:492` | direct `handle_prompt_too_long` | NEEDS REVIEW | FR-OQ decision |
 | `engine.rs` `pub use` re-exports | external test paths (FR-008) | NEEDS REVIEW | Keep functional; `#[allow(deprecated)]` |
 | `tests/*` calling relocated leaves | unit/integration tests | NEEDS REVIEW | `#[allow(deprecated)]` or repoint to coordinators |
 
@@ -281,7 +283,7 @@ N/A — no new cross-module data structure with non-obvious key types. Reactions
 
 | Code Path | Context | Current Behavior | Required After Change |
 | --------- | ------- | ---------------- | --------------------- |
-| Per-task overflow (#5) | each task, own model/effort ladder | per-task recovery | Stays per-task (own reaction), NOT account-global |
+| Per-task overflow (#5) | each task, own model/effort ladder | per-task recovery | Stays per-task (own reaction), NOT account-global; all 3 call sites route through it |
 | Account-global rate-limit (#6) | all slots share one account | sequential-only | Folds N slot outcomes → one wait |
 | Wrapper-commit (#8) | sequential base branch vs wave ephemeral | sequential commits on behalf; wave merges back | `wrapper_commit: bool` knob; wave keeps merge-back |
 
@@ -305,9 +307,11 @@ N/A — no new cross-module data structure with non-obvious key types. Reactions
 
 ## 7. Open Questions
 
-- [ ] **FR-OQ**: Must `slot.rs:492` (`overflow::handle_prompt_too_long`) also route through `reactions::post_output::handle_overflow`? SPIKE-001 only required denying the two orchestrators; `slot.rs` is the wave per-slot overflow site. Recommendation: yes (route it) so #5 is genuinely single-home, but confirm before FEAT-005. Resolve in CONTRACT-001.
-- [ ] Should `recovery.rs`/`usage.rs` be slimmed to near-zero or retained as a deprecated compatibility layer post-transition? (Affects follow-on cleanup tasks.)
-- [ ] Exact deny scope confirmation: only `iteration.rs` + `wave_scheduler.rs`, or also `slot.rs`?
+- [x] **FR-OQ** *(RESOLVED 2026-05-27)*: `slot.rs:492` (`overflow::handle_prompt_too_long`) **must route through** `reactions::post_output::handle_overflow`. #5 overflow is genuinely single-home — no leaf call escapes the framework. FEAT-005 relocates this call site too.
+- [x] *(RESOLVED 2026-05-27)*: `recovery.rs`/`usage.rs`/`overflow.rs` are **slimmed to near-zero**: logic moves into `reactions::`; thin `#[deprecated]` shims exist only during transition and are **removed in FR-CLEANUP-001**. End state: `reactions::` is unambiguously the home; no permanent dual-home.
+- [x] *(RESOLVED 2026-05-27)*: `#![deny(deprecated)]` is applied to **all three engine files** — `iteration.rs` + `wave_scheduler.rs` + `slot.rs` — consistent with routing slot.rs through the coordinator. Strongest lock; no slot.rs drift loophole.
+
+*(No open questions remain. All three resolved 2026-05-27; folded into CONTRACT-001, FR-005, FR-CLEANUP-001, and the §2.5 enforcement scope.)*
 
 ---
 
