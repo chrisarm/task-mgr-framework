@@ -159,6 +159,8 @@ promoting. A task can only cross the provider boundary ONCE per loop run
 `claudeFallbackModel` absent → no Grok→Claude fallback. The Grok task
 dead-ends on `blocked` exactly as a Claude task without `fallbackRunner` does.
 
+**Stream-C (grok child stderr capture, FEAT-006)**: Raw grok stderr (telemetry, HTML errors, etc.) is captured by a sniffer thread to `.task-mgr/logs/<prefix>-<run>-<slot>-iterN-grok-stderr.log` (path announced via `ui::emit`; never teed to console). The capture file is the permanent artifact for post-run inspection. Classifier-based extraction/surfacing of notable lines from these files into the operator or learnings flow is deferred to FEAT-014 (intentionally decoupled).
+
 ## Overflow recovery and diagnostics
 
 When the Claude CLI subprocess returns "Prompt is too long", the loop engine

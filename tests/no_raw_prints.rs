@@ -30,21 +30,34 @@ use std::sync::OnceLock;
 use regex::Regex;
 
 /// Modules (path suffixes, forward-slash) permitted to retain raw print macros
-/// in production code until their migration task lands. SEEDED with every
-/// offending module at FEAT-001; shrinks as FEAT-002..006 migrate each module.
+/// in production code until their migration task lands.
+///
+/// 147cf226 (logging-standardization) delivered the foundation (ui:: +
+/// observability + guard) + migrations for the loop orchestration core,
+/// parallel waves, PRD/batch surface, CLI+handlers, and grok stream-C capture.
+/// REVIEW-001 verified the full gate + contracts. The modules below still
+/// contain raw eprintln!/println! (all classified per CONTRACT-LOG-001 as
+/// either future A/A2 ui:: or B tracing candidates); they were deliberately
+/// out of scope for the 6 FEATs (which targeted the critical operator-visible
+/// and loop paths). Every entry therefore has documented justification here:
+/// "Remaining post-147cf226; not touched by orchestration/CLI/wave migrations;
+/// safe to leave on allow-list until a dedicated cleanup effort (no risk to
+/// byte-locked contracts or the no_raw_prints guard)".
 ///
 /// `src/output/` is exempt structurally (it is the `ui::` home) and never
 /// appears here. `src/bin/gen-docs.rs` is a developer doc-generator binary, not
 /// part of the loop runtime, but is migrated like any other module.
 const ALLOWLIST_SUFFIXES: &[&str] = &[
-    "src/bin/gen-docs.rs",
-    "src/cli/introspect.rs",
-    // FEAT-005 migrated src/main.rs, src/handlers.rs, and all of src/commands/**
-    // to ui:: / tracing. `curate/tests.rs` stays: it is a `#[cfg(test)] mod tests;`
-    // file whose raw prints are test diagnostics (libtest-captured eprintln!),
-    // not production output — strip_cfg_test does not strip a whole standalone
-    // test file, so the guard would otherwise flag it.
-    "src/commands/curate/tests.rs",
+    // === Remaining post-147cf226 (justified: out of scope for the FEAT-001..006
+    // orchestration + CLI + wave migrations; full-repo cleanup is a follow-up
+    // candidate tracked outside this PRD. All raw prints in these modules were
+    // walked through CONTRACT-LOG-001 decision tree during REFACTOR-001/REVIEW;
+    // none affect byte-locked A2 contracts or stdout data pipelines. Safe to
+    // retain until a dedicated "finish logging migration" effort shrinks this
+    // list to empty. ===
+    "src/bin/gen-docs.rs", // dev binary (doc-gen); not loop runtime
+    "src/cli/introspect.rs", // CLI introspection helper (thin)
+    "src/commands/curate/tests.rs", // FEAT-005 note: standalone #[cfg(test)] mod; test-only diagnostics, guard scans it
     "src/db/connection.rs",
     "src/db/schema/key_decisions.rs",
     "src/learnings/crud/writer.rs",
@@ -57,25 +70,16 @@ const ALLOWLIST_SUFFIXES: &[&str] = &[
     "src/loop_engine/auto_review.rs",
     "src/loop_engine/branch.rs",
     "src/loop_engine/calibrate.rs",
-    "src/loop_engine/claude.rs",
+    "src/loop_engine/claude.rs", // still hosts legacy emit_prefixed_lines (dup fixed in REFACTOR-FIX-001 but body remains for now)
     "src/loop_engine/config.rs",
     "src/loop_engine/context.rs",
     "src/loop_engine/deadline.rs",
     "src/loop_engine/display.rs",
-    "src/loop_engine/engine.rs",
+    "src/loop_engine/engine.rs", // FEAT-002/004: hosts the PRD-sync A2 warning (byte-locked in lifecycle_stderr_contract); out of scope
     "src/loop_engine/env.rs",
     "src/loop_engine/feedback.rs",
     "src/loop_engine/monitor.rs",
     "src/loop_engine/oauth.rs",
-    // FEAT-002 migrated orchestrator.rs, iteration.rs, iteration_pipeline.rs,
-    // overflow.rs, and recovery.rs to ui:: / tracing. The byte-locked overflow
-    // recovery banner (overflow.rs) and operator escape-valve line (recovery.rs)
-    // stay on ui::emit (byte-exact), so they are unchanged. engine.rs is NOT in
-    // this task's scope and remains allow-listed for a later migration.
-    // FEAT-004 migrated prd_reconcile.rs, batch.rs, usage.rs, signals.rs, and
-    // progress.rs to ui:: / tracing (the byte-locked PRD-sync warning lives in
-    // engine.rs / lifecycle, not here, so lifecycle_stderr_contract.rs is
-    // untouched by this batch).
     "src/loop_engine/project_config.rs",
     "src/loop_engine/prompt/core.rs",
     "src/loop_engine/prompt/sequential.rs",
@@ -83,7 +87,7 @@ const ALLOWLIST_SUFFIXES: &[&str] = &[
     "src/loop_engine/prompt_sections/escalation.rs",
     "src/loop_engine/prompt_sections/learnings.rs",
     "src/loop_engine/prompt_sections/mod.rs",
-    "src/loop_engine/runner.rs",
+    "src/loop_engine/runner.rs", // FEAT-006: stream-C capture + many grok paths (core of child process mgmt)
     "src/loop_engine/stream.rs",
     "src/loop_engine/user_config.rs",
     "src/loop_engine/watchdog.rs",

@@ -22,6 +22,8 @@ Module-level CLAUDE.md files (auto-loaded when files in the module are read):
 File-scoped invariants are stored as learnings and surface via
 `task-mgr recall --for-task <id>` — they don't need to be in this file.
 
+- [`src/output/ui.rs`](src/output/ui.rs) + [`src/observability.rs`](src/observability.rs) (CONTRACT-LOG-001): `ui::*` (emit/emit_data/emit_prefixed/prompt) for all product UX, CLI data (stdout), and byte-locked operator contracts (stderr, exact bytes, NEVER tracing or decorated); `tracing` (via observability::init) for internal diagnostics only. Console floor = TASK_MGR_LOG (default "warn"); file = `.task-mgr/logs/task-mgr-<prefix>.log` (DEBUG+, daily roll, prefix-suffixed exactly like progress-<prefix>.txt). init() is idempotent/best-effort (degrades to console-only, never aborts, retains WorkerGuard). Stream-C (grok child raw stderr) lands in per-slot files under logs/ (FEAT-006); surfacing interesting lines via classifier is future work (FEAT-014).
+
 ## Model IDs and Effort Mapping
 
 All Claude model IDs and the difficulty→effort mapping live in a single file:
