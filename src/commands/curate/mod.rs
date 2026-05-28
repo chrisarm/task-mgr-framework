@@ -1097,7 +1097,7 @@ pub fn curate_dedup(conn: &Connection, params: DedupParams) -> TaskMgrResult<Ded
                         // dismissal block are NOT rewritten and NOT filtered out —
                         // which is correct: the LLM did examine them, they're still
                         // active, so a dismissal against the original ID is meaningful.
-                        ui::emit_err(&format!("Warning: merge_cluster failed: {e}"));
+                        tracing::warn!(error = %e, "merge_cluster failed");
                         continue;
                     }
                 }
@@ -1343,7 +1343,11 @@ pub fn curate_embed(conn: &Connection, params: EmbedParams) -> TaskMgrResult<Emb
                 }
             }
             Err(e) => {
-                ui::emit_err(&format!("Warning: embedding batch failed: {e}"));
+                tracing::warn!(
+                    error = %e,
+                    chunk_size = chunk.len(),
+                    "embedding batch failed",
+                );
                 errors += chunk.len();
             }
         }

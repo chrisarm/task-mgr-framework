@@ -230,7 +230,7 @@ fn dispatch_init_shim(
     )?;
 
     if verbose {
-        eprint!("{}", format_init_verbose(&result));
+        ui::prompt(&format_init_verbose(&result));
     }
     output_result(&result, format);
     Ok(())
@@ -428,7 +428,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
             )?;
 
             if cli.verbose {
-                eprint!("{}", format_next_verbose(&result));
+                ui::prompt(&format_next_verbose(&result));
             }
             output_result(&result, cli.format);
             Ok(())
@@ -568,7 +568,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                 )?;
 
                 if cli.verbose {
-                    eprint!("{}", format_doctor_verbose(&result));
+                    ui::prompt(&format_doctor_verbose(&result));
                 }
                 output_result(&result, cli.format);
             }
@@ -679,7 +679,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
             let result = recall(&conn, params)?;
 
             if cli.verbose {
-                eprint!("{}", format_recall_verbose(&result));
+                ui::prompt(&format_recall_verbose(&result));
             }
             output_result(&result, cli.format);
             Ok(())
@@ -1084,7 +1084,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                         prefix_mode,
                     )?;
                     if cli.verbose {
-                        eprint!("{}", format_init_verbose(&result));
+                        ui::prompt(&format_init_verbose(&result));
                     }
                     output_result(&result, cli.format);
                     Ok(())
@@ -1269,7 +1269,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                         prefix_mode,
                     )?;
                     if cli.verbose {
-                        eprint!("{}", format_init_verbose(&result));
+                        ui::prompt(&format_init_verbose(&result));
                     }
                     output_result(&result, cli.format);
                     Ok(())

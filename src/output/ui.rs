@@ -35,9 +35,31 @@ pub fn emit(msg: &str) {
 ///
 /// Same wire format as [`emit`] (the caller's bytes, undecorated); the separate
 /// name documents intent at the call site and keeps error routing greppable.
+///
+/// NOTE: byte-identical to [`emit`] today. If future severity-aware decoration
+/// is desired (e.g. `should_color()` + a yellow `[warn]` prefix), implement it
+/// once in a shared `emit_with_severity` helper rather than diverging the two
+/// implementations — the call-site name distinction is the contract; the wire
+/// format must NOT diverge silently (would break byte-locked A2 snapshots).
 pub fn emit_err(msg: &str) {
     let mut out = std::io::stderr().lock();
     let _ = writeln!(out, "{msg}");
+}
+
+/// Wrap `msg` in ANSI yellow iff [`crate::output::should_color`] returns true;
+/// otherwise return `msg` unchanged. Composes with [`emit`] / [`emit_err`] so
+/// the call site reads `ui::emit(&ui::yellow(&format!(...)))`.
+///
+/// Keeps ANSI escapes out of caller string literals and uniformly applies the
+/// project's `NO_COLOR` / stderr-`is_terminal()` discipline. Use this for
+/// human-facing warnings that should *look* like warnings on a TTY but emit
+/// undecorated bytes when the output is captured or redirected.
+pub fn yellow(msg: &str) -> String {
+    if super::should_color() {
+        format!("\x1b[33m{msg}\x1b[0m")
+    } else {
+        msg.to_string()
+    }
 }
 
 /// Emit machine-readable / CLI data to **stdout** (FD 1).
@@ -75,7 +97,8 @@ pub(crate) fn write_prompt<W: Write>(out: &mut W, msg: &str) -> std::io::Result<
 
 /// Emit `text` to **stderr** (FD 2) with `slot_label` prepended to every line.
 ///
-/// Re-home of `loop_engine::claude::emit_prefixed_lines` (the per-slot tee).
+/// Single home for the per-slot tee — REFACTOR-FIX-001 deleted the duplicate
+/// `loop_engine::claude::emit_prefixed_lines` and re-routed every caller here.
 /// The byte semantics are locked by [`write_prefixed`]'s tests and preserved
 /// exactly:
 /// - `None` label → a single `writeln!(text)` (legacy unprefixed path).
@@ -83,9 +106,6 @@ pub(crate) fn write_prompt<W: Write>(out: &mut W, msg: &str) -> std::io::Result<
 /// - empty `text` with a label → one prefixed blank line, so a slot's "I said
 ///   nothing this turn" still shows up and stays attributable.
 /// - interior blank lines are preserved as prefixed blanks.
-///
-/// (The original `claude::emit_prefixed_lines` stays in place until its callers
-/// migrate in FEAT-002/003; this is the new single home for the semantics.)
 pub fn emit_prefixed(slot_label: Option<&str>, text: &str) {
     let mut out = std::io::stderr().lock();
     let _ = write_prefixed(&mut out, slot_label, text);

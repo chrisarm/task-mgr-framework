@@ -585,9 +585,9 @@ impl LlmRunner for ClaudeRunner {
                     Some(master)
                 }
                 Err(e) => {
-                    eprintln!(
-                        "Warning: failed to allocate PTY for streaming (falling back to pipe): {}",
-                        e
+                    tracing::warn!(
+                        error = %e,
+                        "failed to allocate PTY for streaming (falling back to pipe)",
                     );
                     cmd.stdout(Stdio::piped()).stderr(Stdio::inherit());
                     None
@@ -1106,6 +1106,12 @@ fn spawn_grok_stderr_sniffer(
 /// a DB directory). The prefix, run-id, slot, and iteration components all fall
 /// back to placeholder strings when their respective opts fields are `None` so
 /// the scheme is always fully specified for callers that do provide `db_dir`.
+///
+/// All `&str` components are sanitized to `[A-Za-z0-9_-]` via
+/// [`sanitize_path_component`] before joining, so a callsite passing a
+/// `..` / `/` / NUL-bearing string cannot escape `<db_dir>/logs/`. The current
+/// sources (8-char hex PRD prefix, internal UUID run-id, fixed-format slot
+/// label) are already safe; this is defense-in-depth.
 fn grok_stderr_capture_path(
     db_dir: Option<&Path>,
     active_prefix: Option<&str>,
@@ -1114,11 +1120,15 @@ fn grok_stderr_capture_path(
     iteration: Option<u32>,
 ) -> Option<PathBuf> {
     let db_dir = db_dir?;
-    let prefix = active_prefix.unwrap_or("no-prefix");
-    let run = run_id.unwrap_or("no-run");
+    let prefix = active_prefix
+        .map(|s| sanitize_path_component(s, "no-prefix"))
+        .unwrap_or_else(|| "no-prefix".to_string());
+    let run = run_id
+        .map(|s| sanitize_path_component(s, "no-run"))
+        .unwrap_or_else(|| "no-run".to_string());
     // Sanitize slot_label ("[slot 1]") to a filename-safe token ("slot1").
-    let slot: String = slot_label
-        .map(|s| s.chars().filter(|c| c.is_alphanumeric()).collect())
+    let slot = slot_label
+        .map(|s| sanitize_path_component(s, "noSlot"))
         .unwrap_or_else(|| "noSlot".to_string());
     let iter = iteration.unwrap_or(0);
     Some(
@@ -1126,6 +1136,25 @@ fn grok_stderr_capture_path(
             .join("logs")
             .join(format!("{prefix}-{run}-{slot}-iter{iter}-grok-stderr.log")),
     )
+}
+
+/// Filter `s` to `[A-Za-z0-9_-]` (a single filename-safe path component).
+/// Falls back to `fallback` if filtering empties the string.
+///
+/// Path-traversal hardening for [`grok_stderr_capture_path`]: `/`, `\`, `.`,
+/// and NUL are stripped, so even a hostile caller cannot break out of
+/// `<db_dir>/logs/`. `-` and `_` are preserved (UUID dashes, kebab-case run
+/// ids), unlike a bare `is_alphanumeric()` filter.
+fn sanitize_path_component(s: &str, fallback: &str) -> String {
+    let cleaned: String = s
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    if cleaned.is_empty() {
+        fallback.to_string()
+    } else {
+        cleaned
+    }
 }
 
 /// Wire subprocess environment variables common to every LLM runner.
@@ -1496,7 +1525,12 @@ pub fn dispatch(
                 RunnerKind::Claude => "claude",
                 RunnerKind::Grok => "grok",
             };
-            eprintln!("[cleanup warn] {provider}: {e} ({})", cwd.display());
+            tracing::warn!(
+                provider = %provider,
+                error = %e,
+                cwd = %cwd.display(),
+                "session cleanup failed",
+            );
         }
     }
     result
@@ -3453,6 +3487,52 @@ mod tests {
         assert!(
             n1.contains("slot1"),
             "slot-1 path must contain 'slot1', got {n1:?}"
+        );
+    }
+
+    /// Defense-in-depth: a hostile `active_prefix` / `run_id` cannot escape
+    /// `<db_dir>/logs/` via `..` or path separators. Every `&str` component
+    /// is sanitized to `[A-Za-z0-9_-]` before being joined into the filename.
+    #[test]
+    fn grok_stderr_capture_path_sanitizes_components_against_traversal() {
+        let db = std::path::PathBuf::from("/fake/.task-mgr");
+        let logs_dir = db.join("logs");
+
+        // Hostile prefix, run, and slot. Path separators, `..`, and NUL would
+        // each independently break out of `<db_dir>/logs/` if passed through.
+        let path = grok_stderr_capture_path(
+            Some(&db),
+            Some("../../etc"),
+            Some("/passwd\0"),
+            Some("[../slot]"),
+            Some(0),
+        )
+        .expect("db_dir provided → Some(path)");
+
+        assert_eq!(
+            path.parent(),
+            Some(logs_dir.as_path()),
+            "sanitized path must stay under <db_dir>/logs/, got {path:?}",
+        );
+        let name = path.file_name().unwrap().to_string_lossy();
+        assert!(
+            !name.contains("..") && !name.contains('/') && !name.contains('\0'),
+            "filename must be filename-safe, got {name:?}",
+        );
+        assert!(
+            name.ends_with("-grok-stderr.log"),
+            "filename must keep the capture suffix, got {name:?}",
+        );
+
+        // Fallback path: a component that sanitizes to empty falls back to the
+        // documented placeholder, not an empty string (which would corrupt the
+        // dash-separated scheme).
+        let p2 = grok_stderr_capture_path(Some(&db), Some("///"), Some("..."), None, None)
+            .expect("db_dir provided → Some(path)");
+        let n2 = p2.file_name().unwrap().to_string_lossy();
+        assert!(
+            n2.starts_with("no-prefix-no-run-noSlot-iter0-"),
+            "empty-after-sanitize must fall back to placeholders, got {n2:?}",
         );
     }
 

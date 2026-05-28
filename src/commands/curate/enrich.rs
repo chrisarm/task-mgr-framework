@@ -109,14 +109,14 @@ pub fn parse_enrich_response(
     batch_ids: &[i64],
 ) -> TaskMgrResult<Vec<EnrichProposal>> {
     let Some(json_str) = extract_json_array(response) else {
-        ui::emit_err("Warning: enrich response contained no JSON array");
+        tracing::warn!("enrich response contained no JSON array");
         return Ok(Vec::new());
     };
 
     let raw: Vec<RawEnrichItem> = match serde_json::from_str(&json_str) {
         Ok(v) => v,
         Err(e) => {
-            ui::emit_err(&format!("Warning: failed to parse enrich response: {e}"));
+            tracing::warn!(error = %e, "failed to parse enrich response");
             return Ok(Vec::new());
         }
     };

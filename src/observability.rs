@@ -12,11 +12,14 @@
 //!   output or libtest's capture (learning #3295: a tracing writer to
 //!   `io::stderr()` bypasses libtest's thread-local capture, so a noisier floor
 //!   would leak into unrelated test output).
-//! - **File layer** → `<.task-mgr>/logs/task-mgr-<prefix>.log`, always `DEBUG`+,
-//!   daily-rolling. The filename is suffixed by the active PRD task prefix — the
-//!   same convention `tasks/progress-<prefix>.txt` uses — so concurrent loops on
-//!   different PRDs never share one log file. Falls back to `task-mgr.log` when
-//!   no prefix resolves.
+//! - **File layer** → `<.task-mgr>/logs/task-mgr-<prefix>.<YYYY-MM-DD>.log`,
+//!   always `DEBUG`+, daily-rolling. The base name is suffixed by the active
+//!   PRD task prefix — the same convention `tasks/progress-<prefix>.txt` uses
+//!   — so concurrent loops on different PRDs never share one log file. Falls
+//!   back to `task-mgr.<YYYY-MM-DD>.log` when no prefix resolves. The `.log`
+//!   extension lands at the end (via `filename_suffix`) so editors and
+//!   log-rotation tools that filetype-match `*.log` still recognize rotated
+//!   files.
 //!
 //! [`init`] is **idempotent** and **best-effort**: if the log directory or file
 //! cannot be opened it degrades to console-only and never aborts the CLI. The
@@ -50,8 +53,8 @@ static LOG_GUARD: OnceLock<Option<WorkerGuard>> = OnceLock::new();
 ///
 /// `db_dir` is the resolved `.task-mgr` directory; logs are written under
 /// `db_dir/logs/`. `active_prefix` is the active PRD task prefix (resolved by
-/// the caller via the same source `task-mgr current` uses); `None` falls back to
-/// an unsuffixed `task-mgr.log`.
+/// the caller via the same source `task-mgr current` uses); `None` falls back
+/// to an unsuffixed `task-mgr.<YYYY-MM-DD>.log` base name.
 ///
 /// Always returns `Ok(())` — a file-open failure degrades to console-only and
 /// is never propagated. Call this once from `main` before any loop work.
@@ -104,18 +107,24 @@ fn log_dir(db_dir: &Path) -> PathBuf {
     db_dir.join("logs")
 }
 
-/// Base log file name, suffixed by the active PRD prefix exactly like
-/// `tasks/progress-<prefix>.txt`. `None` (or blank) → unsuffixed `task-mgr.log`.
+/// Stem of the log file name (no `.log` extension), suffixed by the active PRD
+/// prefix exactly like `tasks/progress-<prefix>.txt`.
 ///
-/// With daily rotation the appender appends a `.YYYY-MM-DD` suffix to this name,
-/// so the on-disk file is e.g. `task-mgr-abc12345.log.2026-05-27`; this is the
-/// base name the appender targets.
-fn log_file_name(active_prefix: Option<&str>) -> String {
+/// `None` (or blank) → bare `task-mgr` (no prefix segment). The rolling appender
+/// adds the date between this stem and the `.log` extension via
+/// [`LOG_FILE_EXTENSION`] / `filename_suffix`, producing on-disk names like
+/// `task-mgr-abc12345.2026-05-27.log` — the conventional `*.log` form that
+/// editors / log-rotation tools recognize.
+fn log_file_base(active_prefix: Option<&str>) -> String {
     match active_prefix.map(str::trim).filter(|p| !p.is_empty()) {
-        Some(prefix) => format!("task-mgr-{prefix}.log"),
-        None => "task-mgr.log".to_string(),
+        Some(prefix) => format!("task-mgr-{prefix}"),
+        None => "task-mgr".to_string(),
     }
 }
+
+/// Extension used by the rolling file appender (`filename_suffix`). Kept as a
+/// constant so the test that reads files back stays in sync with the appender.
+const LOG_FILE_EXTENSION: &str = "log";
 
 /// Build the console `EnvFilter` from an explicit env value (`None` = unset).
 ///
@@ -156,7 +165,8 @@ fn build_file_writer(
     std::fs::create_dir_all(logs_dir).ok()?;
     let appender = RollingFileAppender::builder()
         .rotation(Rotation::DAILY)
-        .filename_prefix(log_file_name(active_prefix))
+        .filename_prefix(log_file_base(active_prefix))
+        .filename_suffix(LOG_FILE_EXTENSION)
         .build(logs_dir)
         .ok()?;
     Some(tracing_appender::non_blocking(appender))
@@ -173,16 +183,18 @@ mod tests {
     }
 
     #[test]
-    fn log_file_name_is_prefix_suffixed() {
-        assert_eq!(log_file_name(Some("abc12345")), "task-mgr-abc12345.log");
-        assert_eq!(log_file_name(Some("  abc12345  ")), "task-mgr-abc12345.log");
+    fn log_file_base_is_prefix_suffixed() {
+        // The base (no `.log`) carries the prefix; `filename_suffix(LOG_FILE_EXTENSION)`
+        // adds `.log` AFTER the rotation date for conventional `*.log` files.
+        assert_eq!(log_file_base(Some("abc12345")), "task-mgr-abc12345");
+        assert_eq!(log_file_base(Some("  abc12345  ")), "task-mgr-abc12345");
     }
 
     #[test]
-    fn log_file_name_falls_back_to_unsuffixed() {
-        assert_eq!(log_file_name(None), "task-mgr.log");
-        assert_eq!(log_file_name(Some("")), "task-mgr.log");
-        assert_eq!(log_file_name(Some("   ")), "task-mgr.log");
+    fn log_file_base_falls_back_to_unsuffixed() {
+        assert_eq!(log_file_base(None), "task-mgr");
+        assert_eq!(log_file_base(Some("")), "task-mgr");
+        assert_eq!(log_file_base(Some("   ")), "task-mgr");
     }
 
     #[test]
@@ -257,8 +269,13 @@ mod tests {
             .collect();
         let log_file = names
             .iter()
-            .find(|n| n.starts_with("task-mgr-abc12345.log"))
-            .unwrap_or_else(|| panic!("expected prefix-suffixed log file, got {names:?}"));
+            .find(|n| {
+                n.starts_with("task-mgr-abc12345.")
+                    && n.ends_with(&format!(".{LOG_FILE_EXTENSION}"))
+            })
+            .unwrap_or_else(|| {
+                panic!("expected prefix-suffixed `task-mgr-abc12345.<date>.log`, got {names:?}")
+            });
 
         // Timestamps in the line are non-deterministic (learning #3855), so we
         // assert on the marker substring rather than exact bytes.

@@ -705,7 +705,12 @@ pub(super) fn reset_task_to_todo(conn: &mut Connection, task_id: &str, kind_labe
     match TaskLifecycle::new(conn).resurrect_for_iteration(None, &[task_id]) {
         Ok(1) => ui::emit(&format!("Reset {} {} to todo", kind_label, task_id)),
         Ok(_) => {} // row missing, or status changed by reconciliation
-        Err(e) => ui::emit_err(&format!("Warning: failed to reset task {}: {}", task_id, e)),
+        Err(e) => tracing::warn!(
+            task_id = %task_id,
+            kind = %kind_label,
+            error = %e,
+            "failed to reset task to todo",
+        ),
     }
 }
 

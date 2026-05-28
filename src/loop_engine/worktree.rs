@@ -565,10 +565,7 @@ pub(crate) fn ensure_slot_worktrees(
     if num_slots > 1
         && let Err(e) = ensure_progress_union_merge(project_root)
     {
-        ui::emit_err(&format!(
-            "Warning: failed to configure progress union merge: {}",
-            e
-        ));
+        tracing::warn!(error = %e, "failed to configure progress union merge");
     }
 
     let mut paths = Vec::with_capacity(num_slots);

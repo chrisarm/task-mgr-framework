@@ -462,17 +462,19 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                 .filter(|c| c.severity == SetupSeverity::Blocker)
                 .collect();
             if !blockers.is_empty() {
-                ui::emit(&format!(
-                    "\x1b[33m⚠ Setup warning: {} blocker(s) detected in ~/.claude/settings.json:\x1b[0m",
+                ui::emit(&ui::yellow(&format!(
+                    "⚠ Setup warning: {} blocker(s) detected in ~/.claude/settings.json:",
                     blockers.len()
-                ));
+                )));
                 for b in &blockers {
-                    ui::emit(&format!("  \x1b[33m•\x1b[0m {}", b.message));
+                    ui::emit(&format!("  {} {}", ui::yellow("•"), b.message));
                     if let Some(ref fix) = b.fix_command {
                         ui::emit(&format!("    Fix: {fix}"));
                     }
                 }
-                ui::emit("\x1b[33m  The loop will continue but tool calls may be blocked.\x1b[0m");
+                ui::emit(&ui::yellow(
+                    "  The loop will continue but tool calls may be blocked.",
+                ));
                 ui::emit("  Run `task-mgr doctor --setup` for a full audit.");
                 ui::emit("");
             }
@@ -1758,7 +1760,7 @@ fn record_session_guidance(guidance: &SessionGuidance, progress_path: &Path, yes
             }
             Err(_) => {
                 // stdin not available (non-interactive), skip
-                ui::emit_err("Warning: could not read stdin, skipping guidance recording");
+                tracing::warn!("could not read stdin, skipping guidance recording");
                 return;
             }
         }

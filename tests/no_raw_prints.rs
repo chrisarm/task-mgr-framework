@@ -21,6 +21,23 @@
 //! detector here anchors on a macro-name boundary so `eprintln!` and `println!`
 //! are distinguished — see [`tests::eprintln_and_println_are_distinguished`].
 //!
+//! ## All four macros are caught (newline AND no-newline variants)
+//!
+//! The detector matches `eprintln!` / `println!` AND their no-newline siblings
+//! `eprint!` / `print!`. A pre-formatted-banner caller using `eprint!("{}", s)`
+//! is exactly as channel-A as one using `eprintln!` — both must route through
+//! `ui::` (typically [`ui::prompt`] for "no trailing newline" callers). See
+//! [`tests::no_newline_variants_are_caught_too`].
+//!
+//! ## Line comments are stripped before scanning
+//!
+//! `// eprintln!(...)` in a doc/comment isn't a real macro invocation. The
+//! scanner truncates each line at the first `//` before applying the regex so
+//! comments don't trip the guard. Known limitation: a string literal containing
+//! `//` is treated as a comment by this strip — a latent false-negative, not a
+//! false-positive (it could only hide an offender, not create a spurious one).
+//! See [`tests::line_comments_are_stripped_before_scan`].
+//!
 //! Mirrors `tests/no_hardcoded_models.rs`.
 
 use std::fs;
@@ -55,8 +72,8 @@ const ALLOWLIST_SUFFIXES: &[&str] = &[
     // none affect byte-locked A2 contracts or stdout data pipelines. Safe to
     // retain until a dedicated "finish logging migration" effort shrinks this
     // list to empty. ===
-    "src/bin/gen-docs.rs", // dev binary (doc-gen); not loop runtime
-    "src/cli/introspect.rs", // CLI introspection helper (thin)
+    "src/bin/gen-docs.rs",          // dev binary (doc-gen); not loop runtime
+    "src/cli/introspect.rs",        // CLI introspection helper (thin)
     "src/commands/curate/tests.rs", // FEAT-005 note: standalone #[cfg(test)] mod; test-only diagnostics, guard scans it
     "src/db/connection.rs",
     "src/db/schema/key_decisions.rs",
@@ -75,7 +92,10 @@ const ALLOWLIST_SUFFIXES: &[&str] = &[
     "src/loop_engine/context.rs",
     "src/loop_engine/deadline.rs",
     "src/loop_engine/display.rs",
-    "src/loop_engine/engine.rs", // FEAT-002/004: hosts the PRD-sync A2 warning (byte-locked in lifecycle_stderr_contract); out of scope
+    // engine.rs was previously here for the byte-locked PRD-sync A2 warning;
+    // the review (LOW#6) migrated it to `crate::output::ui::emit_err` (same
+    // wire bytes, channel A2) and removed the entry — `lifecycle_stderr_contract`
+    // still passes unchanged.
     "src/loop_engine/env.rs",
     "src/loop_engine/feedback.rs",
     "src/loop_engine/monitor.rs",
@@ -99,13 +119,34 @@ const SKIP_DIR_SUFFIXES: &[&str] = &["target", ".git"];
 /// The `ui::` home — raw print macros are expected here and never flagged.
 const OUTPUT_HOME_PREFIX: &str = "src/output/";
 
-/// Macro-name-boundary regex for `println!` / `eprintln!`. The leading
-/// `(?:^|[^A-Za-z0-9_])` is the boundary: `println` inside `eprintln` is NOT
-/// preceded by a boundary char (it is preceded by `e`), so a `println!` match
-/// cannot swallow an `eprintln!`. Capture group 1 names the macro.
+/// Macro-name-boundary regex for `eprintln!` / `println!` / `eprint!` /
+/// `print!`. The leading `(?:^|[^A-Za-z0-9_])` is the boundary: `println`
+/// inside `eprintln` is NOT preceded by a boundary char (it is preceded by
+/// `e`), so a `println!` match cannot swallow an `eprintln!`. Alternation
+/// order puts the longer macro names first so `eprintln`/`println` win over
+/// `eprint`/`print` when both could match. Capture group 1 names the macro.
 fn print_macro_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?:^|[^A-Za-z0-9_])(eprintln|println)\s*!").unwrap())
+    RE.get_or_init(|| {
+        Regex::new(r"(?:^|[^A-Za-z0-9_])(eprintln|println|eprint|print)\s*!").unwrap()
+    })
+}
+
+/// Truncate `line` at the first `//`, returning the prefix.
+///
+/// Used to strip line-comments before applying [`print_macro_regex`] so a
+/// `// eprintln!("doc")` style comment doesn't register as an offender. The
+/// scan is intentionally naive (does NOT honor string-literal boundaries); the
+/// degraded case is a string containing `//` followed by a real print macro on
+/// the same line, which becomes a false-negative (a missed offender), never a
+/// false-positive. Safe for a guard whose failure mode we care about is letting
+/// a real offender through — which the cfg(test) stripping + per-module
+/// allow-list already address.
+fn strip_line_comment(line: &str) -> &str {
+    match line.find("//") {
+        Some(i) => &line[..i],
+        None => line,
+    }
 }
 
 /// Names of raw print macros invoked on `line`, in order. Boundary-anchored so
@@ -218,7 +259,9 @@ fn scan_dir(dir: &Path, repo_root: &Path, out: &mut Vec<String>) {
         };
         let production = strip_cfg_test(&contents);
         for (lineno, line) in production.lines().enumerate() {
-            for macro_name in raw_print_macros(line) {
+            // Strip comments first so `// eprintln!("x")` in docs / FIXMEs
+            // doesn't trip the guard.
+            for macro_name in raw_print_macros(strip_line_comment(line)) {
                 out.push(format!(
                     "  {rel}:{}: {macro_name}! — {}",
                     lineno + 1,
@@ -255,6 +298,46 @@ mod tests {
         assert!(raw_print_macros("logger.println(x)").is_empty());
         // No `!`, so not a macro invocation.
         assert!(raw_print_macros("let println = 3;").is_empty());
+    }
+
+    #[test]
+    fn no_newline_variants_are_caught_too() {
+        // `eprint!` / `print!` (no trailing-newline siblings) are channel-A
+        // candidates just like `eprintln!` / `println!` — the regex must catch
+        // all four. The HIGH#1 review finding was that 6 `eprint!` sites in
+        // main.rs slipped past the FEAT-005 gate because the old regex only
+        // matched the `*ln!` variants.
+        assert_eq!(raw_print_macros(r#"    eprint!("x");"#), vec!["eprint"]);
+        assert_eq!(raw_print_macros(r#"    print!("x");"#), vec!["print"]);
+
+        // Alternation order: `eprintln`/`println` must still win over
+        // `eprint`/`print` when both could match (i.e. don't capture `eprint`
+        // out of `eprintln!`).
+        assert_eq!(raw_print_macros(r#"eprintln!("x");"#), vec!["eprintln"]);
+        assert_eq!(raw_print_macros(r#"println!("x");"#), vec!["println"]);
+    }
+
+    #[test]
+    fn line_comments_are_stripped_before_scan() {
+        // A `// eprintln!(...)` in a comment is not a real macro invocation;
+        // the scanner must strip everything from `//` to end-of-line before
+        // applying the macro regex.
+        assert_eq!(strip_line_comment("// eprintln!(\"x\")"), "");
+        assert_eq!(
+            strip_line_comment("let x = 1; // print!(\"hi\")"),
+            "let x = 1; "
+        );
+        // Combined with the scan: a comment-only macro must not register as an
+        // offender.
+        assert!(raw_print_macros(strip_line_comment("// eprintln!(\"x\")")).is_empty());
+        assert!(raw_print_macros(strip_line_comment("// std::print!.")).is_empty());
+
+        // Sanity: a non-commented macro on the same line as a trailing comment
+        // is still caught (the macro precedes the `//`).
+        assert_eq!(
+            raw_print_macros(strip_line_comment(r#"eprintln!("x"); // trailing"#)),
+            vec!["eprintln"]
+        );
     }
 
     #[test]
