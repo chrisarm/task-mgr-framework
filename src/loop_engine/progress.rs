@@ -22,6 +22,20 @@ use crate::loop_engine::watchdog::TimeoutConfig;
 /// hangs on milestone rollups.
 const MILESTONE_SUMMARY_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
+/// Parameters for [`log_iteration`]. Using a struct keeps the call sites
+/// readable and makes future field additions cheap.
+pub struct LogIterationParams<'a> {
+    pub progress_path: &'a Path,
+    pub iteration: u32,
+    pub task_id: Option<&'a str>,
+    pub outcome: &'a IterationOutcome,
+    pub files: &'a [String],
+    pub model: Option<&'a str>,
+    pub effort: Option<&'a str>,
+    /// `None` for sequential iterations; `Some(index)` for parallel wave slots.
+    pub slot: Option<usize>,
+}
+
 /// Log an iteration result to the progress file.
 ///
 /// Appends a structured entry in the format:
@@ -33,24 +47,22 @@ const MILESTONE_SUMMARY_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// ---
 /// ```
 ///
-/// `slot` is `None` for sequential iterations and `Some(index)` for parallel
-/// wave slots (FEAT-010). Slot lines are written sequentially on the main
-/// thread after the wave completes — log_iteration is not called from worker
-/// threads.
+/// Slot lines are written sequentially on the main thread after the wave
+/// completes — log_iteration is not called from worker threads.
 ///
 /// Errors are logged via `tracing` but don't propagate — progress logging
 /// should never crash the loop.
-#[allow(clippy::too_many_arguments)]
-pub fn log_iteration(
-    progress_path: &Path,
-    iteration: u32,
-    task_id: Option<&str>,
-    outcome: &IterationOutcome,
-    files: &[String],
-    model: Option<&str>,
-    effort: Option<&str>,
-    slot: Option<usize>,
-) {
+pub fn log_iteration(params: LogIterationParams<'_>) {
+    let LogIterationParams {
+        progress_path,
+        iteration,
+        task_id,
+        outcome,
+        files,
+        model,
+        effort,
+        slot,
+    } = params;
     let timestamp = Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
     let task = task_id.unwrap_or("(none)");
     let outcome_str = format_outcome(outcome);
@@ -533,16 +545,16 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let progress_path = temp_dir.path().join("progress.txt");
 
-        log_iteration(
-            &progress_path,
-            1,
-            Some("FEAT-001"),
-            &IterationOutcome::Completed,
-            &["src/lib.rs".to_string()],
-            None,
-            None,
-            None,
-        );
+        log_iteration(LogIterationParams {
+            progress_path: &progress_path,
+            iteration: 1,
+            task_id: Some("FEAT-001"),
+            outcome: &IterationOutcome::Completed,
+            files: &["src/lib.rs".to_string()],
+            model: None,
+            effort: None,
+            slot: None,
+        });
 
         assert!(progress_path.exists());
         let content = fs::read_to_string(&progress_path).unwrap();
@@ -561,26 +573,26 @@ mod tests {
         // Write initial content
         fs::write(&progress_path, "# Progress\n").unwrap();
 
-        log_iteration(
-            &progress_path,
-            1,
-            Some("FEAT-001"),
-            &IterationOutcome::Completed,
-            &[],
-            None,
-            None,
-            None,
-        );
-        log_iteration(
-            &progress_path,
-            2,
-            Some("FEAT-002"),
-            &IterationOutcome::Blocked,
-            &[],
-            None,
-            None,
-            None,
-        );
+        log_iteration(LogIterationParams {
+            progress_path: &progress_path,
+            iteration: 1,
+            task_id: Some("FEAT-001"),
+            outcome: &IterationOutcome::Completed,
+            files: &[],
+            model: None,
+            effort: None,
+            slot: None,
+        });
+        log_iteration(LogIterationParams {
+            progress_path: &progress_path,
+            iteration: 2,
+            task_id: Some("FEAT-002"),
+            outcome: &IterationOutcome::Blocked,
+            files: &[],
+            model: None,
+            effort: None,
+            slot: None,
+        });
 
         let content = fs::read_to_string(&progress_path).unwrap();
         assert!(content.starts_with("# Progress\n"));
@@ -593,16 +605,16 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let progress_path = temp_dir.path().join("progress.txt");
 
-        log_iteration(
-            &progress_path,
-            1,
-            None,
-            &IterationOutcome::Empty,
-            &[],
-            None,
-            None,
-            None,
-        );
+        log_iteration(LogIterationParams {
+            progress_path: &progress_path,
+            iteration: 1,
+            task_id: None,
+            outcome: &IterationOutcome::Empty,
+            files: &[],
+            model: None,
+            effort: None,
+            slot: None,
+        });
 
         let content = fs::read_to_string(&progress_path).unwrap();
         assert!(content.contains("(none)"));
@@ -613,16 +625,16 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let progress_path = temp_dir.path().join("progress.txt");
 
-        log_iteration(
-            &progress_path,
-            1,
-            Some("FEAT-001"),
-            &IterationOutcome::Completed,
-            &[],
-            None,
-            None,
-            None,
-        );
+        log_iteration(LogIterationParams {
+            progress_path: &progress_path,
+            iteration: 1,
+            task_id: Some("FEAT-001"),
+            outcome: &IterationOutcome::Completed,
+            files: &[],
+            model: None,
+            effort: None,
+            slot: None,
+        });
 
         let content = fs::read_to_string(&progress_path).unwrap();
         assert!(content.contains("Files: (none)"));
@@ -633,16 +645,16 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let progress_path = temp_dir.path().join("progress.txt");
 
-        log_iteration(
-            &progress_path,
-            1,
-            Some("FEAT-001"),
-            &IterationOutcome::Completed,
-            &["src/a.rs".to_string(), "src/b.rs".to_string()],
-            None,
-            None,
-            None,
-        );
+        log_iteration(LogIterationParams {
+            progress_path: &progress_path,
+            iteration: 1,
+            task_id: Some("FEAT-001"),
+            outcome: &IterationOutcome::Completed,
+            files: &["src/a.rs".to_string(), "src/b.rs".to_string()],
+            model: None,
+            effort: None,
+            slot: None,
+        });
 
         let content = fs::read_to_string(&progress_path).unwrap();
         assert!(content.contains("src/a.rs, src/b.rs"));
@@ -651,16 +663,16 @@ mod tests {
     #[test]
     fn test_log_iteration_invalid_path_does_not_panic() {
         // Write to a nonexistent directory — should not panic
-        log_iteration(
-            Path::new("/nonexistent/dir/progress.txt"),
-            1,
-            Some("FEAT-001"),
-            &IterationOutcome::Completed,
-            &[],
-            None,
-            None,
-            None,
-        );
+        log_iteration(LogIterationParams {
+            progress_path: Path::new("/nonexistent/dir/progress.txt"),
+            iteration: 1,
+            task_id: Some("FEAT-001"),
+            outcome: &IterationOutcome::Completed,
+            files: &[],
+            model: None,
+            effort: None,
+            slot: None,
+        });
     }
 
     #[test]
@@ -668,16 +680,16 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let progress_path = temp_dir.path().join("progress.txt");
 
-        log_iteration(
-            &progress_path,
-            1,
-            Some("FEAT-001"),
-            &IterationOutcome::Completed,
-            &[],
-            None,
-            None,
-            None,
-        );
+        log_iteration(LogIterationParams {
+            progress_path: &progress_path,
+            iteration: 1,
+            task_id: Some("FEAT-001"),
+            outcome: &IterationOutcome::Completed,
+            files: &[],
+            model: None,
+            effort: None,
+            slot: None,
+        });
 
         let content = fs::read_to_string(&progress_path).unwrap();
         assert!(content.contains("- Model: (default)"));
@@ -689,16 +701,16 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let progress_path = temp_dir.path().join("progress.txt");
 
-        log_iteration(
-            &progress_path,
-            1,
-            Some("FEAT-001"),
-            &IterationOutcome::Completed,
-            &[],
-            Some(SONNET_MODEL),
-            Some("xhigh"),
-            None,
-        );
+        log_iteration(LogIterationParams {
+            progress_path: &progress_path,
+            iteration: 1,
+            task_id: Some("FEAT-001"),
+            outcome: &IterationOutcome::Completed,
+            files: &[],
+            model: Some(SONNET_MODEL),
+            effort: Some("xhigh"),
+            slot: None,
+        });
 
         let content = fs::read_to_string(&progress_path).unwrap();
         assert!(content.contains(&format!("- Model: {SONNET_MODEL}")));
@@ -710,16 +722,16 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let progress_path = temp_dir.path().join("progress.txt");
 
-        log_iteration(
-            &progress_path,
-            7,
-            Some("FEAT-042"),
-            &IterationOutcome::Completed,
-            &["src/a.rs".to_string()],
-            None,
-            None,
-            Some(2),
-        );
+        log_iteration(LogIterationParams {
+            progress_path: &progress_path,
+            iteration: 7,
+            task_id: Some("FEAT-042"),
+            outcome: &IterationOutcome::Completed,
+            files: &["src/a.rs".to_string()],
+            model: None,
+            effort: None,
+            slot: Some(2),
+        });
 
         let content = fs::read_to_string(&progress_path).unwrap();
         // Header gets " Slot N" suffix; a body "- Slot: N" line is also added
@@ -740,16 +752,16 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let progress_path = temp_dir.path().join("progress.txt");
 
-        log_iteration(
-            &progress_path,
-            7,
-            Some("FEAT-042"),
-            &IterationOutcome::Completed,
-            &[],
-            None,
-            None,
-            None,
-        );
+        log_iteration(LogIterationParams {
+            progress_path: &progress_path,
+            iteration: 7,
+            task_id: Some("FEAT-042"),
+            outcome: &IterationOutcome::Completed,
+            files: &[],
+            model: None,
+            effort: None,
+            slot: None,
+        });
 
         let content = fs::read_to_string(&progress_path).unwrap();
         assert!(

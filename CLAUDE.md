@@ -2,12 +2,17 @@
 
 ## Project layout
 
-- Database: `.task-mgr/tasks.db` (per worktree)
+- Database: `.task-mgr/tasks.db` (per worktree; schema migrations under `src/db/migrations/v*.rs` — most recent: v19 adds `tasks.claims_shared_infra` for the parallel-slot shared-infra heuristic)
 - Main worktree: `$HOME/projects/task-mgr`
 - Feature worktrees: `$HOME/projects/task-mgr-worktrees/<branch-name>/`
+- Parallel-slot worktrees: `$HOME/projects/task-mgr-worktrees/<branch-name>-slot-<N>/` for slots 1+ (slot 0 reuses the feature worktree directly; see `src/loop_engine/CLAUDE.md` "Parallel-slot scheduling")
 - PRD task lists: `.task-mgr/tasks/<prd-name>.json`
 - Loop prompts: `.task-mgr/tasks/<prd-name>-prompt.md`
 - Progress log: `.task-mgr/tasks/progress-<prefix>.txt` (gitignored — managed by `task-mgr init`)
+
+## Parallel task execution
+
+`task-mgr loop run` and `task-mgr batch run` accept `--parallel N` (1-3, default 2) to schedule non-conflicting tasks across N slots per wave. Conflict detection uses each task's `touchesFiles` (file overlap → serialize) plus the shared-infra heuristic in `src/commands/next/selection.rs`. `--parallel 1` is byte-identical to sequential execution. The deprecated `synergyWith` / `batchWith` / `conflictsWith` relationship fields still parse without error but are ignored — `touchesFiles` is the sole conflict source. See `src/loop_engine/CLAUDE.md` "Parallel-slot scheduling" for the full defense layering.
 
 ## Subsystem design notes
 

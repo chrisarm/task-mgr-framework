@@ -1359,7 +1359,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                 final_run_status = drained.run_status;
                 break;
             }
-            ctx.stale_tracker.check("stale", "stale"); // same hash → increment
+            ctx.stale_tracker.mark_stale();
             if ctx.stale_tracker.should_abort() {
                 ui::emit_err(&format!(
                     "Aborting: no eligible tasks after {} consecutive stale iterations",
@@ -1373,7 +1373,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                 break;
             }
         } else {
-            ctx.stale_tracker.check("a", "b"); // different hash → reset
+            ctx.stale_tracker.reset_progress();
         }
 
         // Check for terminal outcomes
@@ -2121,21 +2121,21 @@ mod tests {
         let mut ctx = IterationContext::new(5);
 
         // First stale
-        ctx.stale_tracker.check("stale", "stale");
+        ctx.stale_tracker.mark_stale();
         assert!(
             !ctx.stale_tracker.should_abort(),
             "1 stale should not abort"
         );
 
         // Second stale
-        ctx.stale_tracker.check("stale", "stale");
+        ctx.stale_tracker.mark_stale();
         assert!(
             !ctx.stale_tracker.should_abort(),
             "2 stale should not abort"
         );
 
         // Third stale
-        ctx.stale_tracker.check("stale", "stale");
+        ctx.stale_tracker.mark_stale();
         assert!(
             ctx.stale_tracker.should_abort(),
             "3 consecutive stale should abort"
@@ -2148,12 +2148,12 @@ mod tests {
         let mut ctx = IterationContext::new(5);
 
         // Two stale
-        ctx.stale_tracker.check("stale", "stale");
-        ctx.stale_tracker.check("stale", "stale");
+        ctx.stale_tracker.mark_stale();
+        ctx.stale_tracker.mark_stale();
         assert_eq!(ctx.stale_tracker.count(), 2);
 
         // Non-stale resets
-        ctx.stale_tracker.check("a", "b");
+        ctx.stale_tracker.reset_progress();
         assert_eq!(
             ctx.stale_tracker.count(),
             0,
@@ -2162,7 +2162,7 @@ mod tests {
         assert!(!ctx.stale_tracker.should_abort());
 
         // One more stale — not enough to abort
-        ctx.stale_tracker.check("stale", "stale");
+        ctx.stale_tracker.mark_stale();
         assert_eq!(ctx.stale_tracker.count(), 1);
         assert!(!ctx.stale_tracker.should_abort());
     }

@@ -45,7 +45,6 @@ use std::thread;
 use std::time::Duration;
 
 use crate::TaskMgrResult;
-use crate::db::prefix::prefix_and;
 use crate::error::TaskMgrError;
 use crate::lifecycle::TaskLifecycle;
 use crate::loop_engine::claude;
@@ -67,7 +66,7 @@ use crate::loop_engine::runner;
 use crate::loop_engine::signals;
 use crate::loop_engine::usage::UsageCheckResult;
 use crate::loop_engine::watchdog;
-use crate::loop_engine::wave_scheduler::classify_drained_queue;
+use crate::loop_engine::wave_scheduler::{classify_drained_queue, count_remaining_tasks};
 use crate::output::ui;
 
 /// Run a single iteration of the agent loop.
@@ -234,18 +233,8 @@ pub fn run_iteration(
         Ok(Some(result)) => result,
         Ok(None) => {
             // No eligible task found — check if truly all done or just temporarily unavailable
-            let (rem_pfx_clause, rem_pfx_param) = prefix_and(params.task_prefix);
-            let rem_sql = format!(
-                "SELECT COUNT(*) FROM tasks WHERE status NOT IN ('done', 'irrelevant') AND archived_at IS NULL {rem_pfx_clause}"
-            );
-            let rem_params: Vec<&dyn rusqlite::types::ToSql> = match &rem_pfx_param {
-                Some(p) => vec![p],
-                None => vec![],
-            };
-            let remaining: i64 = params
-                .conn
-                .query_row(&rem_sql, rem_params.as_slice(), |row| row.get(0))
-                .unwrap_or(0);
+            let remaining =
+                count_remaining_tasks(params.conn, params.task_prefix, &["done", "irrelevant"]);
             // Clean-completion decision routes through the shared
             // `classify_drained_queue` so the sequential and wave paths cannot
             // drift on "what counts as complete". A clean drain (only

@@ -346,16 +346,16 @@ fn handle_no_eligible_tasks(
     // one where tasks were left blocked/skipped (non-zero exit, named reason)
     // so the loop-end banner is honest.
     if let Some(drained) = classify_drained_queue(params.conn, task_prefix) {
-        progress::log_iteration(
-            params.progress_path,
-            params.iteration,
-            None,
-            &IterationOutcome::Completed,
-            &[],
-            None,
-            None,
-            None,
-        );
+        progress::log_iteration(progress::LogIterationParams {
+            progress_path: params.progress_path,
+            iteration: params.iteration,
+            task_id: None,
+            outcome: &IterationOutcome::Completed,
+            files: &[],
+            model: None,
+            effort: None,
+            slot: None,
+        });
         return WaveOutcome {
             tasks_completed: 0,
             iteration_consumed: true,
@@ -393,17 +393,17 @@ fn handle_no_eligible_tasks(
 
     // (3) Genuinely stuck: nothing eligible, nothing recoverable. Count toward
     // the stale-abort threshold exactly as before.
-    ctx.stale_tracker.check("stale", "stale");
-    progress::log_iteration(
-        params.progress_path,
-        params.iteration,
-        None,
-        &IterationOutcome::NoEligibleTasks,
-        &[],
-        None,
-        None,
-        None,
-    );
+    ctx.stale_tracker.mark_stale();
+    progress::log_iteration(progress::LogIterationParams {
+        progress_path: params.progress_path,
+        iteration: params.iteration,
+        task_id: None,
+        outcome: &IterationOutcome::NoEligibleTasks,
+        files: &[],
+        model: None,
+        effort: None,
+        slot: None,
+    });
     if ctx.stale_tracker.should_abort() {
         ui::emit(&format!(
             "Aborting: no eligible tasks after {} consecutive stale iterations",
@@ -458,17 +458,17 @@ fn handle_ephemeral_deadlock(
     ctx: &mut IterationContext,
     diagnostics: Vec<(String, Vec<String>)>,
 ) -> WaveOutcome {
-    ctx.stale_tracker.check("stale", "stale");
-    progress::log_iteration(
-        params.progress_path,
-        params.iteration,
-        None,
-        &IterationOutcome::NoEligibleTasks,
-        &[],
-        None,
-        None,
-        None,
-    );
+    ctx.stale_tracker.mark_stale();
+    progress::log_iteration(progress::LogIterationParams {
+        progress_path: params.progress_path,
+        iteration: params.iteration,
+        task_id: None,
+        outcome: &IterationOutcome::NoEligibleTasks,
+        files: &[],
+        model: None,
+        effort: None,
+        slot: None,
+    });
 
     ui::emit(
         "Cross-wave deadlock: every eligible candidate is blocked by un-merged ephemeral branch(es). \
@@ -631,26 +631,56 @@ fn build_slot_prompt_params<'a>(
     }
 }
 
+/// Count tasks whose status is not in `excluded` for the current PRD prefix.
+///
+/// Both the sequential (`run_iteration`) and wave (`run_wave_iteration`) paths
+/// check how many tasks remain — they differ only in which statuses they treat
+/// as terminal. `archived_at IS NULL` is mandatory: archiving stamps `archived_at`
+/// on prefix-matched rows regardless of status (archive.rs), so an archived row
+/// would otherwise mis-classify the drain state. Locked by
+/// archive.rs::test_archived_tasks_invisible_to_status_count_query.
+pub(crate) fn count_remaining_tasks(
+    conn: &Connection,
+    task_prefix: Option<&str>,
+    excluded: &[&str],
+) -> i64 {
+    if excluded.is_empty() {
+        tracing::error!(
+            "count_remaining_tasks called with empty excluded slice — SQL `NOT IN ()` would be invalid; returning 0. Caller must pass at least one terminal status."
+        );
+        return 0;
+    }
+    let (clause, param) = prefix_and(task_prefix);
+    let placeholders = vec!["?"; excluded.len()].join(",");
+    let sql = format!(
+        "SELECT COUNT(*) FROM tasks WHERE status NOT IN ({placeholders}) AND archived_at IS NULL {clause}"
+    );
+    let mut bound: Vec<&dyn rusqlite::types::ToSql> = Vec::with_capacity(excluded.len() + 1);
+    for s in excluded {
+        bound.push(s);
+    }
+    if let Some(p) = &param {
+        bound.push(p);
+    }
+    conn.query_row(&sql, bound.as_slice(), |r| r.get(0))
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                error = %e,
+                "count_remaining_tasks query failed; reporting 0 (drained) may mis-classify completion"
+            );
+            0
+        })
+}
+
 /// Count tasks still in flight for the current PRD prefix. "Done",
 /// "skipped", "irrelevant" and "blocked" are terminal — anything else is
 /// still work to do.
 pub(crate) fn count_remaining_active_tasks(conn: &Connection, task_prefix: Option<&str>) -> i64 {
-    let (clause, param) = prefix_and(task_prefix);
-    // `archived_at IS NULL` is mandatory: archiving stamps `archived_at` on all
-    // prefix-matched rows regardless of status (archive.rs), so an archived
-    // todo/in_progress row would otherwise count as remaining work and the wave
-    // would never recognize completion. Matches the sequential predicate and is
-    // locked by archive.rs::test_archived_tasks_invisible_to_status_count_query.
-    let sql = format!(
-        "SELECT COUNT(*) FROM tasks WHERE status NOT IN \
-         ('done','irrelevant','skipped','blocked') AND archived_at IS NULL {clause}"
-    );
-    let p_vec: Vec<&dyn rusqlite::types::ToSql> = match &param {
-        Some(p) => vec![p],
-        None => vec![],
-    };
-    conn.query_row(&sql, p_vec.as_slice(), |r| r.get(0))
-        .unwrap_or(0)
+    count_remaining_tasks(
+        conn,
+        task_prefix,
+        &["done", "irrelevant", "skipped", "blocked"],
+    )
 }
 
 /// Count tasks in a single terminal-but-unfinished `status` for the current PRD
@@ -1037,9 +1067,8 @@ pub fn run_wave_iteration(
         return handle_no_eligible_tasks(&mut params, ctx);
     }
 
-    // Selected at least one eligible task → reset stale tracker (mirrors
-    // the sequential `else` branch that calls `check("a", "b")`).
-    ctx.stale_tracker.check("a", "b");
+    // Selected at least one eligible task → reset stale tracker.
+    ctx.stale_tracker.reset_progress();
 
     let n_slots = group.len();
     let slot_paths: &[PathBuf] = &params.slot_worktree_paths[..n_slots];
@@ -2011,8 +2040,8 @@ mod tests {
         let signal = SignalFlag::new();
         let mut ctx = IterationContext::new(5);
         // Pre-stale twice so the next NoEligibleTasks wave hits threshold=3.
-        ctx.stale_tracker.check("x", "x");
-        ctx.stale_tracker.check("x", "x");
+        ctx.stale_tracker.mark_stale();
+        ctx.stale_tracker.mark_stale();
         let project_cfg = crate::loop_engine::project_config::ProjectConfig::default();
         let prd_implicit: Vec<String> = Vec::new();
         let outcome = run_wave_iteration(
