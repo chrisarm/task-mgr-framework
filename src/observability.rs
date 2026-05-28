@@ -139,10 +139,20 @@ fn console_env_filter(raw: Option<&str>) -> (EnvFilter, bool) {
 /// fallible `RollingFileAppender::builder().build()` rather than the
 /// `rolling::daily()` convenience constructor precisely so a read-only
 /// `.task-mgr` degrades instead of crashing the CLI.
+///
+/// Crucially, we only create `logs/` when the parent `.task-mgr/` directory
+/// already exists. If the project is not yet initialized we return `None`
+/// (console-only) rather than bootstrapping a stray `.task-mgr/` from a
+/// read-only command running outside an initialized project.
 fn build_file_writer(
     logs_dir: &Path,
     active_prefix: Option<&str>,
 ) -> Option<(NonBlocking, WorkerGuard)> {
+    // Degrade to console-only when the .task-mgr parent dir doesn't exist yet.
+    let parent = logs_dir.parent()?;
+    if !parent.is_dir() {
+        return None;
+    }
     std::fs::create_dir_all(logs_dir).ok()?;
     let appender = RollingFileAppender::builder()
         .rotation(Rotation::DAILY)
