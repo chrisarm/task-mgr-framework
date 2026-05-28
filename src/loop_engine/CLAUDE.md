@@ -285,12 +285,13 @@ When the Claude CLI subprocess returns "Prompt is too long", the loop engine
 walks a **five-rung recovery ladder** and writes a diagnostics bundle. Entry
 point: `reactions::post_output::handle_overflow` in
 `src/loop_engine/reactions/post_output.rs` (FEAT-005 relocated the body here;
-`overflow::handle_prompt_too_long` is now a `#[deprecated]` shim that forwards
-to it, kept so the `tests/overflow_*.rs` equivalence-oracle suites can drive
-the leaf directly under `#[allow(deprecated)]`). The diagnostics primitives
+the original `overflow::handle_prompt_too_long` leaf was a transition
+`#[deprecated]` shim that FR-CLEANUP-001 then removed entirely — the only
+home is the coordinator). The diagnostics primitives
 (`sanitize_id_for_filename`, `dump_prompt`, `append_event_log`,
 `rotate_dumps_keep_n`) and the wire types (`RecoveryAction`, `OverflowEvent`,
-`DumpHeader`) stay in `src/loop_engine/overflow.rs`.
+`DumpHeader`) stay in `src/loop_engine/overflow.rs` and are exercised
+directly by the `tests/overflow_*.rs` equivalence-oracle suites.
 
 **Both execution paths route through `handle_overflow`** on the `PromptTooLong`
 crash outcome — sequential via Step 8.5 of `iteration.rs::run_iteration`

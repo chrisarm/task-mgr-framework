@@ -2,10 +2,11 @@
 //!
 //! - [`handle_overflow`] — the "Prompt is too long" five-rung recovery ladder.
 //!   FEAT-005 physically relocated the body here from
-//!   `overflow::handle_prompt_too_long` (which is now a `#[deprecated]` shim
-//!   delegating to this coordinator). Both `iteration.rs` and `slot.rs` (via
-//!   `process_slot_result`) route through it, and the three engine files carry
-//!   `#![deny(deprecated)]` so a direct call to the old leaf is a compile error.
+//!   `overflow::handle_prompt_too_long` (a transition `#[deprecated]` shim that
+//!   FR-CLEANUP-001 removed — the only home is now this coordinator). Both
+//!   `iteration.rs` and `slot.rs` (via `process_slot_result`) route through it,
+//!   and the three engine files carry `#![deny(deprecated)]` so any future
+//!   re-introduction of the old leaf as a direct call would be a compile error.
 //!
 //! The diagnostics primitives the ladder writes (`dump_prompt`,
 //! `append_event_log`, `rotate_dumps_keep_n`, `sanitize_id_for_filename`) and
@@ -93,9 +94,9 @@ fn read_task_model_from_db(conn: &Connection, task_id: &str) -> rusqlite::Result
 }
 
 /// Inputs to [`handle_overflow`]. Destructured exhaustively (no `..`). Mirrors
-/// the twelve arguments of the (now deprecated) `overflow::handle_prompt_too_long`
-/// shim; `slot_index` is `Some(n)` for a wave slot and `None` for the
-/// sequential path.
+/// the twelve arguments of the original `overflow::handle_prompt_too_long`
+/// leaf (deleted by FR-CLEANUP-001); `slot_index` is `Some(n)` for a wave slot
+/// and `None` for the sequential path.
 pub struct HandleOverflowParams<'a> {
     pub ctx: &'a mut IterationContext,
     pub conn: &'a mut Connection,
