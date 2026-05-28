@@ -78,25 +78,27 @@ pub fn format_next_task_json(task: &NextTaskOutput) -> String {
     )
 }
 
+// Field order matches the BTreeMap-sorted output of the previous `json!({...})`
+// implementation, which keeps the prompt_sequential_v1 snapshot byte-identical.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TaskJsonPayload<'a> {
-    id: &'a str,
-    title: &'a str,
-    priority: i32,
-    status: &'a str,
     acceptance_criteria: &'a [String],
-    files: &'a [String],
     #[serde(skip_serializing_if = "Option::is_none")]
     description: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    notes: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    model: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     difficulty: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     escalation_note: Option<&'a str>,
+    files: &'a [String],
+    id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    notes: Option<&'a str>,
+    priority: i32,
+    status: &'a str,
+    title: &'a str,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -114,17 +116,17 @@ fn format_task_json_raw(
     escalation_note: Option<&str>,
 ) -> String {
     let payload = TaskJsonPayload {
-        id,
-        title,
-        priority,
-        status,
         acceptance_criteria,
-        files,
         description,
-        notes,
-        model,
         difficulty,
         escalation_note,
+        files,
+        id,
+        model,
+        notes,
+        priority,
+        status,
+        title,
     };
     serde_json::to_string_pretty(&payload).unwrap_or_else(|_| format!("{{\"id\":\"{id}\"}}"))
 }
