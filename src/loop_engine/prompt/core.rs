@@ -20,7 +20,8 @@ use std::fs;
 use std::path::Path;
 
 use rusqlite::Connection;
-use serde_json::{Value, json};
+use serde::Serialize;
+use serde_json;
 
 use crate::commands::next::output::{LearningSummaryOutput, NextTaskOutput};
 use crate::learnings::recall::{RecallParams, recall_learnings};
@@ -77,6 +78,27 @@ pub fn format_next_task_json(task: &NextTaskOutput) -> String {
     )
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TaskJsonPayload<'a> {
+    id: &'a str,
+    title: &'a str,
+    priority: i32,
+    status: &'a str,
+    acceptance_criteria: &'a [String],
+    files: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    notes: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    difficulty: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    escalation_note: Option<&'a str>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn format_task_json_raw(
     id: &str,
@@ -91,32 +113,20 @@ fn format_task_json_raw(
     difficulty: Option<&str>,
     escalation_note: Option<&str>,
 ) -> String {
-    let mut json = json!({
-        "id": id,
-        "title": title,
-        "priority": priority,
-        "status": status,
-        "acceptanceCriteria": acceptance_criteria,
-        "files": files,
-    });
-
-    if let Some(desc) = description {
-        json["description"] = Value::String(desc.to_owned());
-    }
-    if let Some(n) = notes {
-        json["notes"] = Value::String(n.to_owned());
-    }
-    if let Some(m) = model {
-        json["model"] = Value::String(m.to_owned());
-    }
-    if let Some(d) = difficulty {
-        json["difficulty"] = Value::String(d.to_owned());
-    }
-    if let Some(e) = escalation_note {
-        json["escalationNote"] = Value::String(e.to_owned());
-    }
-
-    serde_json::to_string_pretty(&json).unwrap_or_else(|_| format!("{{\"id\":\"{id}\"}}"))
+    let payload = TaskJsonPayload {
+        id,
+        title,
+        priority,
+        status,
+        acceptance_criteria,
+        files,
+        description,
+        notes,
+        model,
+        difficulty,
+        escalation_note,
+    };
+    serde_json::to_string_pretty(&payload).unwrap_or_else(|_| format!("{{\"id\":\"{id}\"}}"))
 }
 
 /// Build the completion-instruction section that tells the agent how to

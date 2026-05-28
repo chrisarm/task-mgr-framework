@@ -70,7 +70,6 @@ fn sample_task() -> Task {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "FEAT-001 implements format_task_json (stub returns empty)"]
 fn format_task_json_includes_id_title_and_files() {
     let task = sample_task();
     let files = vec!["src/foo.rs".to_string(), "src/bar.rs".to_string()];
@@ -111,7 +110,6 @@ fn format_task_json_includes_id_title_and_files() {
 }
 
 #[test]
-#[ignore = "FEAT-001 implements format_task_json (stub returns empty)"]
 fn format_task_json_round_trips_with_empty_files() {
     let task = sample_task();
     let json_str = format_task_json(&task, &[]);
