@@ -77,6 +77,7 @@ use crate::loop_engine::recovery::handle_task_failure;
 use crate::loop_engine::runner::RunnerKind;
 use crate::loop_engine::signals::{self, SignalFlag};
 use crate::loop_engine::usage::UsageCheckResult;
+use crate::output::ui;
 // `claim_slot_task` is a deprecated shim over `TaskLifecycle::try_claim`; the
 // wave fan-out still calls it verbatim (this carve does not migrate it).
 #[allow(deprecated)]
@@ -155,10 +156,10 @@ pub fn run_parallel_wave(
         match handle.join() {
             Ok(Ok(result)) => outcomes.push(result),
             Ok(Err(e)) => {
-                eprintln!(
+                ui::emit(&format!(
                     "[slot {}] iteration error for {}: {}",
                     slot_index, task_id, e,
-                );
+                ));
                 outcomes.push(slot_failure_result(
                     slot_index,
                     Some(task_id),
@@ -176,7 +177,7 @@ pub fn run_parallel_wave(
                             .map(|s| (*s).to_string())
                     })
                     .unwrap_or_else(|| "unknown panic".to_string());
-                eprintln!("[slot {}] thread panicked: {}", slot_index, msg);
+                ui::emit(&format!("[slot {}] thread panicked: {}", slot_index, msg));
                 outcomes.push(slot_failure_result(
                     slot_index,
                     Some(task_id),
@@ -221,7 +222,7 @@ fn wave_preflight_check(
         });
     }
     if signals::check_stop_signal(params.tasks_dir, params.task_prefix) {
-        eprintln!("Stop signal detected (.stop file found)");
+        ui::emit("Stop signal detected (.stop file found)");
         return Some(WaveOutcome {
             tasks_completed: 0,
             iteration_consumed: false,
@@ -252,7 +253,7 @@ fn wave_preflight_check(
             fallback_wait: params.usage_params.fallback_wait,
         }) {
             UsageCheckResult::StopSignaled => {
-                eprintln!("Stop signal during usage wait, exiting");
+                ui::emit("Stop signal during usage wait, exiting");
                 return Some(WaveOutcome {
                     tasks_completed: 0,
                     iteration_consumed: false,
@@ -267,7 +268,7 @@ fn wave_preflight_check(
                 });
             }
             UsageCheckResult::ApiError(ref msg) => {
-                eprintln!("Usage API warning: {} (continuing)", msg);
+                tracing::warn!(msg = %msg, "usage API warning (continuing)");
             }
             // BelowThreshold, WaitedAndReset, Skipped — proceed with the wave.
             _ => {}
@@ -279,14 +280,14 @@ fn wave_preflight_check(
     // when every slot of the previous wave crashed.
     let backoff = ctx.crash_tracker.backoff_duration();
     if !backoff.is_zero() {
-        eprintln!(
+        ui::emit(&format!(
             "Crash backoff: waiting {} before retry...",
             display::format_duration(backoff.as_secs())
-        );
+        ));
         thread::sleep(backoff);
     }
     if ctx.crash_tracker.should_abort() {
-        eprintln!("Too many consecutive crashes, aborting loop");
+        ui::emit("Too many consecutive crashes, aborting loop");
         return Some(WaveOutcome {
             tasks_completed: 0,
             iteration_consumed: true,
@@ -376,10 +377,10 @@ fn handle_no_eligible_tasks(
         .recover_in_progress_for_prefix(task_prefix)
         .unwrap_or(0);
     if recovered > 0 {
-        eprintln!(
+        ui::emit(&format!(
             "Auto-recovered {} stale in_progress task(s), retrying task selection next wave...",
             recovered
-        );
+        ));
         return WaveOutcome {
             tasks_completed: 0,
             iteration_consumed: true,
@@ -404,10 +405,10 @@ fn handle_no_eligible_tasks(
         None,
     );
     if ctx.stale_tracker.should_abort() {
-        eprintln!(
+        ui::emit(&format!(
             "Aborting: no eligible tasks after {} consecutive stale iterations",
             ctx.stale_tracker.count()
-        );
+        ));
         return WaveOutcome {
             tasks_completed: 0,
             iteration_consumed: true,
@@ -469,12 +470,16 @@ fn handle_ephemeral_deadlock(
         None,
     );
 
-    eprintln!(
+    ui::emit(
         "Cross-wave deadlock: every eligible candidate is blocked by un-merged ephemeral branch(es). \
-         Treating as merge-fail wave so the halt threshold can fire."
+         Treating as merge-fail wave so the halt threshold can fire.",
     );
     for (cand_id, branches) in &diagnostics {
-        eprintln!("  {} blocked by: {}", cand_id, branches.join(", "));
+        ui::emit(&format!(
+            "  {} blocked by: {}",
+            cand_id,
+            branches.join(", ")
+        ));
     }
 
     // Collect distinct slot indices from the union of blocking branches across
@@ -494,10 +499,10 @@ fn handle_ephemeral_deadlock(
                         synth_slots.push(slot);
                     }
                 }
-                _ => eprintln!(
+                _ => ui::emit(&format!(
                     "Warning: skipping ephemeral branch with non-numeric / zero slot suffix: {}",
                     branch
-                ),
+                )),
             }
         }
     }
@@ -513,9 +518,9 @@ fn handle_ephemeral_deadlock(
     // to print a `<malformed deadlock blocker>` placeholder instead of
     // synthesizing a `{branch}-slot-18446744073709551615` name.
     if synth_slots.is_empty() && !diagnostics.is_empty() {
-        eprintln!(
+        ui::emit(
             "warning: deadlock guard fired with no parseable ephemeral slot indices \
-             — inserting synthetic halt slot so the threshold counter still increments"
+             — inserting synthetic halt slot so the threshold counter still increments",
         );
         synth_slots.push(SYNTHETIC_DEADLOCK_SLOT);
     }
@@ -605,6 +610,7 @@ fn build_shared_slot_params(params: &WaveIterationParams<'_>) -> Arc<SlotIterati
         max_iterations: params.max_iterations,
         elapsed_secs: params.elapsed_secs,
         task_prefix: params.task_prefix.map(|s| s.to_string()),
+        run_id: Some(params.run_id.to_string()),
     })
 }
 
@@ -756,9 +762,14 @@ fn wait_inter_wave_delay(delay: Duration, signal_flag: &SignalFlag) -> bool {
 /// log the failure but continue with remaining failed slots").
 pub(super) fn reset_task_to_todo(conn: &mut Connection, task_id: &str, kind_label: &str) {
     match TaskLifecycle::new(conn).resurrect_for_iteration(None, &[task_id]) {
-        Ok(1) => eprintln!("Reset {} {} to todo", kind_label, task_id),
+        Ok(1) => ui::emit(&format!("Reset {} {} to todo", kind_label, task_id)),
         Ok(_) => {} // row missing, or status changed by reconciliation
-        Err(e) => eprintln!("Warning: failed to reset task {}: {}", task_id, e),
+        Err(e) => tracing::warn!(
+            task_id = %task_id,
+            kind = %kind_label,
+            error = %e,
+            "failed to reset task to todo",
+        ),
     }
 }
 
@@ -833,13 +844,13 @@ pub(super) fn apply_merge_fail_reset_and_halt_check(
             }
         })
         .collect();
-    eprintln!(
+    ui::emit(&format!(
         "Aborting: {} consecutive merge-back failure wave(s) (threshold={}). \
          Failed slot branches: {}",
         ctx.consecutive_merge_fail_waves,
         threshold,
         names.join(", ")
-    );
+    ));
 
     // (5) Halt.
     MergeFailHaltDecision::Halt {
@@ -914,11 +925,11 @@ pub(super) fn apply_post_merge_reconcile(
     agg.any_completed = true;
     ctx.crash_tracker.record_success();
     ctx.pending_slot_tasks.retain(|t| !reconciled.contains(t));
-    eprintln!(
+    ui::emit(&format!(
         "Post-merge reconcile: marked {} task(s) done from merged commits ({})",
         reconciled.len(),
         reconciled.join(", ")
-    );
+    ));
     reconciled
 }
 
@@ -983,10 +994,10 @@ pub fn run_wave_iteration(
             ) {
                 Ok(v) => v,
                 Err(e) => {
-                    eprintln!(
+                    ui::emit_err(&format!(
                         "Warning: list_unmerged_branch_files({}) failed: {} (treating as no claim)",
                         eph, e
-                    );
+                    ));
                     Vec::new()
                 }
             };
@@ -1004,10 +1015,10 @@ pub fn run_wave_iteration(
     ) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!(
+            ui::emit_err(&format!(
                 "Warning: select_parallel_group failed: {} (treating wave as stale)",
                 e
-            );
+            ));
             crate::commands::next::selection::ParallelGroupResult::default()
         }
     };
@@ -1068,12 +1079,12 @@ pub fn run_wave_iteration(
         // with it. Wave previously skipped pre-spawn crash escalation; routing
         // through the coordinator converges it with the sequential path.
         if let Some(escalated) = plan.model {
-            eprintln!(
+            ui::emit(&format!(
                 "Crash escalation [slot {}]: {} → {}",
                 slot.slot_index,
                 baseline.as_deref().unwrap_or("(default)"),
                 escalated,
-            );
+            ));
             slot.prompt_bundle.resolved_model = Some(escalated);
         }
 
@@ -1081,10 +1092,10 @@ pub fn run_wave_iteration(
         // the worker reads `effective_effort` first, falling back to the
         // difficulty-derived effort when `None`.
         if let Some(effort) = plan.effort {
-            eprintln!(
+            ui::emit(&format!(
                 "Effort override (prior prompt overflow) [slot {}]: → {}",
                 slot.slot_index, effort,
-            );
+            ));
         }
         slot.effective_effort = plan.effort;
 
@@ -1102,10 +1113,10 @@ pub fn run_wave_iteration(
                 .resolved_model
                 .as_deref()
                 .unwrap_or("(default)");
-            eprintln!(
+            ui::emit(&format!(
                 "Review-class routing [slot {}]: {} → {} (reviewModel)",
                 slot.slot_index, old, review_model_override,
-            );
+            ));
             slot.prompt_bundle.resolved_model = Some(review_model_override);
         }
 
@@ -1302,9 +1313,11 @@ pub fn run_wave_iteration(
             params.project_config.fallback_runner.as_ref(),
             params.project_config.primary_runner.as_ref(),
         ) {
-            eprintln!(
-                "Warning: failed to start retry tracking transaction for slot {} task {}: {}",
-                slot_result.slot_index, task_id, e
+            tracing::warn!(
+                "failed to start retry tracking transaction for slot {} task {}: {}",
+                slot_result.slot_index,
+                task_id,
+                e
             );
         }
     }
@@ -1371,15 +1384,15 @@ pub fn run_wave_iteration(
         );
         for (slot, detail, kind) in &outcomes.failed_slots {
             if *kind == worktree::SlotFailureKind::ResolverAttempted {
-                eprintln!(
+                ui::emit_err(&format!(
                     "Warning: slot {} merge-back failed after Claude resolution attempt: {} (slot's commits remain on its ephemeral branch)",
                     slot, detail
-                );
+                ));
             } else {
-                eprintln!(
+                ui::emit_err(&format!(
                     "Warning: slot {} merge-back failed: {} (slot's commits remain on its ephemeral branch)",
                     slot, detail
-                );
+                ));
             }
             // Capture failed slot index alongside the task_id its slot had
             // claimed. The `FailedMerge` shape keeps the pairing as one
@@ -1404,7 +1417,7 @@ pub fn run_wave_iteration(
             &params.slot_worktree_paths[..n_slots],
             &branch::progress_file_name(params.task_prefix),
         ) {
-            eprintln!("Warning: failed to union slot progress files: {}", e);
+            tracing::warn!("failed to union slot progress files: {}", e);
         }
 
         // FEAT-003: post-merge reconcile. Scan slot 0's `{pre..HEAD}` for
@@ -1438,7 +1451,7 @@ pub fn run_wave_iteration(
         ctx.last_commit.as_deref(),
         Some(&agg.aggregated_files),
     ) {
-        eprintln!("Warning: failed to update run: {}", e);
+        tracing::warn!("failed to update run: {}", e);
     }
 
     // FEAT-010: post-completion reactions for the wave — external-git shadow (#9)
@@ -1491,10 +1504,10 @@ pub fn run_wave_iteration(
             tasks_completed += pc_outcome.external_reconciled.len() as u32;
             agg.any_completed = true;
             ctx.crash_tracker.record_success();
-            eprintln!(
+            ui::emit(&format!(
                 "Post-wave reconciliation: marked {} task(s) done",
                 pc_outcome.external_reconciled.len()
-            );
+            ));
         }
     }
 
@@ -1671,6 +1684,7 @@ mod tests {
             max_iterations: 1,
             elapsed_secs: 0,
             task_prefix: None,
+            run_id: None,
         }
     }
 

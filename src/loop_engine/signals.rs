@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::guidance::SessionGuidance;
 use super::{DEADLINE_FILE_PREFIX, PAUSE_FILE, STOP_FILE};
+use crate::output::ui;
 
 /// Check if a stop signal exists for the given session.
 ///
@@ -57,7 +58,7 @@ pub fn cleanup_signal_files_for_prefix(tasks_dir: &Path, prefix: Option<&str>) {
         if path.exists()
             && let Err(e) = fs::remove_file(path)
         {
-            eprintln!("Warning: could not remove {}: {}", path.display(), e);
+            tracing::warn!("could not remove {}: {}", path.display(), e);
         }
     }
 }
@@ -75,11 +76,14 @@ pub fn handle_pause(
     session_guidance: &mut SessionGuidance,
     prefix: Option<&str>,
 ) -> bool {
-    eprintln!("\n╔══════════════════════════════════════════╗");
-    eprintln!("║          PAUSED (iteration {:<4})         ║", iteration);
-    eprintln!("╠══════════════════════════════════════════╣");
-    eprintln!("║  Enter guidance (empty line to resume):  ║");
-    eprintln!("╚══════════════════════════════════════════╝\n");
+    ui::emit("\n╔══════════════════════════════════════════╗");
+    ui::emit(&format!(
+        "║          PAUSED (iteration {:<4})         ║",
+        iteration
+    ));
+    ui::emit("╠══════════════════════════════════════════╣");
+    ui::emit("║  Enter guidance (empty line to resume):  ║");
+    ui::emit("╚══════════════════════════════════════════╝\n");
 
     let lines = read_lines_with_timeout(io::BufReader::new(io::stdin()), None);
     let _ = fs::remove_file(pause_file_path(tasks_dir, prefix));
@@ -88,10 +92,10 @@ pub fn handle_pause(
     let has_guidance = !text.trim().is_empty();
 
     if has_guidance {
-        eprintln!("Guidance recorded. Resuming...\n");
+        ui::emit("Guidance recorded. Resuming...\n");
         session_guidance.add(iteration, text);
     } else {
-        eprintln!("Resuming without guidance...\n");
+        ui::emit("Resuming without guidance...\n");
     }
 
     has_guidance
@@ -156,7 +160,7 @@ pub fn cleanup_signal_files(tasks_dir: &Path) {
         if path.exists()
             && let Err(e) = fs::remove_file(&path)
         {
-            eprintln!("Warning: could not remove {}: {}", path.display(), e);
+            tracing::warn!("could not remove {}: {}", path.display(), e);
         }
     }
 
@@ -176,8 +180,8 @@ fn cleanup_deadline_files(tasks_dir: &Path) {
             && name.starts_with(DEADLINE_FILE_PREFIX)
             && let Err(e) = fs::remove_file(entry.path())
         {
-            eprintln!(
-                "Warning: could not remove deadline file {}: {}",
+            tracing::warn!(
+                "could not remove deadline file {}: {}",
                 entry.path().display(),
                 e
             );
@@ -233,7 +237,10 @@ pub fn handle_human_review<R: io::BufRead + Send + 'static>(
     timeout_secs: Option<u32>,
 ) -> bool {
     let banner = format_human_review_banner(task_id, task_title, task_notes);
-    eprint!("{banner}");
+    // The banner already carries its own trailing newline and is immediately
+    // followed by a blocking stdin read, so it goes through `ui::prompt`
+    // (no appended newline) rather than `ui::emit`.
+    ui::prompt(&banner);
 
     let lines = read_lines_with_timeout(reader, timeout_secs);
     let text = lines.join("\n");
@@ -241,10 +248,10 @@ pub fn handle_human_review<R: io::BufRead + Send + 'static>(
 
     if has_guidance {
         let tagged = format!("[Human Review for {task_id}] {text}");
-        eprintln!("Guidance recorded. Continuing...\n");
+        ui::emit("Guidance recorded. Continuing...\n");
         session_guidance.add(iteration, tagged);
     } else {
-        eprintln!("Skipping human review (no input).\n");
+        ui::emit("Skipping human review (no input).\n");
     }
 
     has_guidance
@@ -295,7 +302,9 @@ pub(crate) fn read_lines_with_timeout<R: io::BufRead + Send + 'static>(
                 }
             }
             if saw_eof && lines.is_empty() {
-                eprintln!("Warning: EOF reached reading human review input. No guidance provided.");
+                ui::emit_err(
+                    "Warning: EOF reached reading human review input. No guidance provided.",
+                );
             }
             lines
         }
@@ -328,9 +337,9 @@ pub(crate) fn read_lines_with_timeout<R: io::BufRead + Send + 'static>(
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                 if remaining.is_zero() {
                     if lines.is_empty() {
-                        eprintln!("Human review timeout reached. No input provided.");
+                        ui::emit("Human review timeout reached. No input provided.");
                     } else {
-                        eprintln!("Human review timeout reached. Using partial input.");
+                        ui::emit("Human review timeout reached. Using partial input.");
                     }
                     break;
                 }
@@ -338,16 +347,16 @@ pub(crate) fn read_lines_with_timeout<R: io::BufRead + Send + 'static>(
                     Ok(Some(line)) if line.trim().is_empty() => break,
                     Ok(Some(line)) => lines.push(line),
                     Ok(None) => {
-                        eprintln!(
-                            "Warning: EOF reached reading human review input. No guidance provided."
+                        ui::emit_err(
+                            "Warning: EOF reached reading human review input. No guidance provided.",
                         );
                         break;
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {
                         if lines.is_empty() {
-                            eprintln!("Human review timeout reached. No input provided.");
+                            ui::emit("Human review timeout reached. No input provided.");
                         } else {
-                            eprintln!("Human review timeout reached. Using partial input.");
+                            ui::emit("Human review timeout reached. Using partial input.");
                         }
                         break;
                     }

@@ -111,13 +111,13 @@ fn dispatch_wave_overflows(
         let task_id = all_task_ids[slot];
         let pr = make_prompt_result(task_id);
         let action = handle_overflow(HandleOverflowParams {
-            ctx: ctx,
-            conn: conn,
-            task_id: task_id,
-            effort: effort,
+            ctx,
+            conn,
+            task_id,
+            effort,
             effective_model: model,
             prompt_result: &pr,
-            iteration: iteration,
+            iteration,
             run_id: Some("run-wave"),
             base_dir: tmp_dir,
             slot_index: Some(slot),
@@ -501,7 +501,7 @@ fn sequential_jsonl_event_has_no_slot_index_field() {
     let _ = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
         conn: &mut conn,
-        task_id: task_id,
+        task_id,
         effort: Some("xhigh"),
         effective_model: Some(SONNET_MODEL),
         prompt_result: &pr,
@@ -552,8 +552,8 @@ fn dump_rotation_keeps_newest_3_across_wave_iterations() {
         let _ = handle_overflow(HandleOverflowParams {
             ctx: &mut ctx,
             conn: &mut conn,
-            task_id: task_id,
-            effort: effort,
+            task_id,
+            effort,
             effective_model: model,
             prompt_result: &pr,
             iteration: (iter + 1) as u32,
@@ -682,7 +682,7 @@ fn overflow_recovered_persists_from_wave_through_sequential_transition() {
     let wave_action = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
         conn: &mut conn,
-        task_id: task_id,
+        task_id,
         effort: Some("xhigh"),
         effective_model: Some(SONNET_MODEL),
         prompt_result: &pr,
@@ -713,7 +713,7 @@ fn overflow_recovered_persists_from_wave_through_sequential_transition() {
     let seq_action = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
         conn: &mut conn,
-        task_id: task_id,
+        task_id,
         effort: Some("high"),
         effective_model: Some(SONNET_MODEL),
         prompt_result: &pr,
@@ -786,7 +786,7 @@ fn overflow_recovered_persists_from_sequential_through_wave_transition() {
     let _ = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
         conn: &mut conn,
-        task_id: task_id,
+        task_id,
         effort: Some("xhigh"),
         effective_model: Some(HAIKU_MODEL),
         prompt_result: &pr,
@@ -810,7 +810,7 @@ fn overflow_recovered_persists_from_sequential_through_wave_transition() {
     let wave_action = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
         conn: &mut conn,
-        task_id: task_id,
+        task_id,
         effort: Some("high"),
         effective_model: Some(HAIKU_MODEL),
         prompt_result: &pr,
@@ -947,7 +947,7 @@ fn wave_overflow_jsonl_contains_task_difficulty_from_slot() {
     let _ = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
         conn: &mut conn,
-        task_id: task_id,
+        task_id,
         effort: Some("xhigh"),
         effective_model: Some(SONNET_MODEL),
         prompt_result: &pr,

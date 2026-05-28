@@ -49,9 +49,9 @@ pub fn check_usage_api(access_token: &str) -> Option<UsageInfo> {
     {
         Ok(resp) => resp,
         Err(e) => {
-            eprintln!(
-                "Warning: usage API call failed: {}",
-                sanitize_api_error(&e.to_string())
+            tracing::warn!(
+                error = %sanitize_api_error(&e.to_string()),
+                "usage API call failed",
             );
             return None;
         }
@@ -60,7 +60,7 @@ pub fn check_usage_api(access_token: &str) -> Option<UsageInfo> {
     let json: serde_json::Value = match response.into_json() {
         Ok(j) => j,
         Err(e) => {
-            eprintln!("Warning: failed to parse usage API response: {}", e);
+            tracing::warn!(error = %e, "failed to parse usage API response");
             return None;
         }
     };
@@ -84,7 +84,7 @@ pub fn check_usage_api(access_token: &str) -> Option<UsageInfo> {
     let percentage = match percentage {
         Some(p) => p,
         None => {
-            eprintln!("Warning: usage API response missing percentage data");
+            tracing::warn!("usage API response missing percentage data");
             return None;
         }
     };

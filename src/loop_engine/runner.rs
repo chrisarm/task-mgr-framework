@@ -14,7 +14,7 @@
 //! `claude.rs`, so existing call sites compile unchanged.
 
 use std::collections::HashSet;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -26,13 +26,12 @@ use uuid::Uuid;
 use crate::error::{TaskMgrError, TaskMgrResult};
 #[cfg(unix)]
 use crate::loop_engine::claude::open_pty_for_child_output;
-use crate::loop_engine::claude::{
-    ACTIVE_PREFIX_ENV, ClaudeStreamFormat, emit_prefixed_lines, is_pty_read_eof,
-};
+use crate::loop_engine::claude::{ACTIVE_PREFIX_ENV, ClaudeStreamFormat, is_pty_read_eof};
 use crate::loop_engine::config::PermissionMode;
 use crate::loop_engine::signals::SignalFlag;
 use crate::loop_engine::stream::{GrokStreamFormat, drive_stream};
 use crate::loop_engine::watchdog::{TimeoutConfig, exit_code_from_status, watchdog_loop};
+use crate::output::ui;
 
 /// Default fast-fail window for the Grok auth-failure sniff (3 seconds).
 ///
@@ -211,6 +210,12 @@ pub struct RunnerOpts<'a> {
     /// PATH). `ClaudeRunner` ignores it. `None` falls through to the PATH
     /// default; `Some(p)` is invoked verbatim (no PATH re-resolution).
     pub fallback_cli_binary: Option<&'a str>,
+    /// Loop run ID forwarded to the per-slot grok stderr capture file name.
+    /// Non-loop callers pass `None`; the sniffer uses `"no-run"` as a fallback.
+    pub run_id: Option<&'a str>,
+    /// Iteration index forwarded to the per-slot grok stderr capture file name.
+    /// `None` causes the sniffer to use `0` as a fallback.
+    pub iteration: Option<u32>,
 }
 
 /// Which LLM CLI to invoke.
@@ -580,9 +585,9 @@ impl LlmRunner for ClaudeRunner {
                     Some(master)
                 }
                 Err(e) => {
-                    eprintln!(
-                        "Warning: failed to allocate PTY for streaming (falling back to pipe): {}",
-                        e
+                    tracing::warn!(
+                        error = %e,
+                        "failed to allocate PTY for streaming (falling back to pipe)",
                     );
                     cmd.stdout(Stdio::piped()).stderr(Stdio::inherit());
                     None
@@ -598,7 +603,13 @@ impl LlmRunner for ClaudeRunner {
             cmd.stdout(Stdio::piped()).stderr(Stdio::inherit());
         }
 
-        apply_common_env(&mut cmd, db_dir, active_prefix, working_dir);
+        apply_common_env(
+            &mut cmd,
+            db_dir,
+            active_prefix,
+            working_dir,
+            RunnerKind::Claude,
+        );
         let mut child = spawn_with_context(&mut cmd, &binary, "Claude")?;
         write_prompt_to_stdin(&mut child, prompt, &binary, "Claude")?;
         let watchdog = spawn_watchdog(child.id(), signal_flag, timeout, target_task_id);
@@ -752,6 +763,8 @@ impl LlmRunner for GrokRunner {
             slot_label,
             active_prefix,
             fallback_cli_binary,
+            run_id,
+            iteration,
             // Capabilities the runner does not support are enforced at dispatch;
             // this destructure consumes only the fields Grok actively uses.
             ..
@@ -850,12 +863,23 @@ impl LlmRunner for GrokRunner {
             // while still teeing each line to the parent stderr in real time.
             .stderr(Stdio::piped());
 
-        apply_common_env(&mut cmd, db_dir, active_prefix, working_dir);
+        apply_common_env(
+            &mut cmd,
+            db_dir,
+            active_prefix,
+            working_dir,
+            RunnerKind::Grok,
+        );
+        let capture_path =
+            grok_stderr_capture_path(db_dir, active_prefix, run_id, slot_label, iteration);
         let spawn_instant = Instant::now();
         let mut child = spawn_with_context(&mut cmd, &binary, "Grok")?;
         let watchdog = spawn_watchdog(child.id(), signal_flag, timeout, target_task_id);
 
-        let (stderr_buf, stderr_handle) = spawn_grok_stderr_sniffer(&mut child, slot_label);
+        if let Some(ref path) = capture_path {
+            ui::emit(&format!("grok stderr → {}", path.display()));
+        }
+        let (stderr_buf, stderr_handle) = spawn_grok_stderr_sniffer(&mut child, capture_path);
 
         // Plain pipe — grok PTY support is out of v1 scope.
         let reader = BufReader::new(
@@ -1036,14 +1060,22 @@ impl WatchdogHandles {
     }
 }
 
-/// Grok-specific: spawn a stderr-tee thread that mirrors child stderr to the
-/// parent (with slot-label prefix) AND buffers up to
-/// [`GROK_STDERR_SNIFF_CAP_BYTES`] for the post-exit auth-failure sniff.
-/// Returns the shared buffer (for the sniff) and the join handle (for clean
-/// teardown).
+/// Grok-specific: spawn a stderr-capture thread that writes child stderr to a
+/// per-slot-per-iteration file AND buffers up to [`GROK_STDERR_SNIFF_CAP_BYTES`]
+/// for the post-exit auth-failure sniff. Console tee is intentionally absent —
+/// grok telemetry dumps and 502 HTML no longer flood the operator console.
+///
+/// `capture_path`: the file to write stderr lines to. When `None` (e.g. no
+/// `db_dir` was provided), lines are silently dropped from the file side only.
+/// When `Some(path)` but the file cannot be opened, one `tracing::warn!` is
+/// emitted and lines are dropped — the thread does NOT crash.
+///
+/// The sniff buffer (return value) is byte-for-byte identical to the previous
+/// implementation: the `Arc<Mutex<String>>` fills from child stderr up to
+/// [`GROK_STDERR_SNIFF_CAP_BYTES`], exactly as before.
 fn spawn_grok_stderr_sniffer(
     child: &mut std::process::Child,
-    slot_label: Option<&str>,
+    capture_path: Option<PathBuf>,
 ) -> (Arc<Mutex<String>>, std::thread::JoinHandle<()>) {
     let stderr_pipe = child
         .stderr
@@ -1051,13 +1083,30 @@ fn spawn_grok_stderr_sniffer(
         .expect("stderr should be piped (Stdio::piped() was set on spawn)");
     let stderr_buf = Arc::new(Mutex::new(String::new()));
     let buf = Arc::clone(&stderr_buf);
-    let label = slot_label.map(str::to_owned);
     let handle = std::thread::spawn(move || {
+        let mut file: Option<std::fs::File> = capture_path.as_ref().and_then(|p| {
+            if let Some(parent) = p.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            match std::fs::File::create(p) {
+                Ok(f) => Some(f),
+                Err(e) => {
+                    tracing::warn!(
+                        path = %p.display(),
+                        error = %e,
+                        "grok stderr capture file could not be opened; lines will be dropped"
+                    );
+                    None
+                }
+            }
+        });
         let reader = BufReader::new(stderr_pipe);
         for line_result in reader.lines() {
             match line_result {
                 Ok(line) => {
-                    emit_prefixed_lines(label.as_deref(), &line);
+                    if let Some(ref mut f) = file {
+                        let _ = writeln!(f, "{line}");
+                    }
                     if let Ok(mut b) = buf.lock()
                         && b.len() < GROK_STDERR_SNIFF_CAP_BYTES
                     {
@@ -1072,16 +1121,78 @@ fn spawn_grok_stderr_sniffer(
     (stderr_buf, handle)
 }
 
+/// Compute the per-slot-per-iteration capture file path for grok stderr.
+///
+/// Path scheme: `<db_dir>/logs/<prefix>-<run>-<slot>-iter<N>-grok-stderr.log`
+///
+/// Returns `None` when `db_dir` is absent (non-loop callers that don't provide
+/// a DB directory). The prefix, run-id, slot, and iteration components all fall
+/// back to placeholder strings when their respective opts fields are `None` so
+/// the scheme is always fully specified for callers that do provide `db_dir`.
+///
+/// All `&str` components are sanitized to `[A-Za-z0-9_-]` via
+/// [`sanitize_path_component`] before joining, so a callsite passing a
+/// `..` / `/` / NUL-bearing string cannot escape `<db_dir>/logs/`. The current
+/// sources (8-char hex PRD prefix, internal UUID run-id, fixed-format slot
+/// label) are already safe; this is defense-in-depth.
+fn grok_stderr_capture_path(
+    db_dir: Option<&Path>,
+    active_prefix: Option<&str>,
+    run_id: Option<&str>,
+    slot_label: Option<&str>,
+    iteration: Option<u32>,
+) -> Option<PathBuf> {
+    let db_dir = db_dir?;
+    let prefix = active_prefix
+        .map(|s| sanitize_path_component(s, "no-prefix"))
+        .unwrap_or_else(|| "no-prefix".to_string());
+    let run = run_id
+        .map(|s| sanitize_path_component(s, "no-run"))
+        .unwrap_or_else(|| "no-run".to_string());
+    // Sanitize slot_label ("[slot 1]") to a filename-safe token ("slot1").
+    let slot = slot_label
+        .map(|s| sanitize_path_component(s, "noSlot"))
+        .unwrap_or_else(|| "noSlot".to_string());
+    let iter = iteration.unwrap_or(0);
+    Some(
+        db_dir
+            .join("logs")
+            .join(format!("{prefix}-{run}-{slot}-iter{iter}-grok-stderr.log")),
+    )
+}
+
+/// Filter `s` to `[A-Za-z0-9_-]` (a single filename-safe path component).
+/// Falls back to `fallback` if filtering empties the string.
+///
+/// Path-traversal hardening for [`grok_stderr_capture_path`]: `/`, `\`, `.`,
+/// and NUL are stripped, so even a hostile caller cannot break out of
+/// `<db_dir>/logs/`. `-` and `_` are preserved (UUID dashes, kebab-case run
+/// ids), unlike a bare `is_alphanumeric()` filter.
+fn sanitize_path_component(s: &str, fallback: &str) -> String {
+    let cleaned: String = s
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    if cleaned.is_empty() {
+        fallback.to_string()
+    } else {
+        cleaned
+    }
+}
+
 /// Wire subprocess environment variables common to every LLM runner.
 ///
 /// Sets `LOOP_ALLOW_DESTRUCTIVE`, `TASK_MGR_DIR` (canonicalized), and
 /// `TASK_MGR_ACTIVE_PREFIX`; applies `current_dir`; puts the child in its
-/// own process group on Unix.
+/// own process group on Unix. For Grok, also sets
+/// `GROK_TELEMETRY_TRACE_UPLOAD=0` to suppress BatchSpanProcessor export
+/// noise from grok's OpenTelemetry background exporter.
 fn apply_common_env(
     cmd: &mut Command,
     db_dir: Option<&Path>,
     active_prefix: Option<&str>,
     working_dir: Option<&Path>,
+    runner_kind: RunnerKind,
 ) {
     cmd.env("LOOP_ALLOW_DESTRUCTIVE", "1");
     if let Some(dir) = db_dir {
@@ -1093,6 +1204,9 @@ fn apply_common_env(
     }
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);
+    }
+    if runner_kind == RunnerKind::Grok {
+        cmd.env("GROK_TELEMETRY_TRACE_UPLOAD", "0");
     }
     #[cfg(unix)]
     {
@@ -1258,13 +1372,13 @@ fn read_plain_stdout(
     for line_result in reader.lines() {
         match line_result {
             Ok(line) => {
-                emit_prefixed_lines(slot_label, &line);
+                ui::emit_prefixed(slot_label, &line);
                 buf.push_str(&line);
                 buf.push('\n');
             }
             Err(e) if is_pty_read_eof(&e) => break,
             Err(e) => {
-                emit_prefixed_lines(
+                ui::emit_prefixed(
                     slot_label,
                     &format!("Warning: error reading {provider_label} stdout: {e}"),
                 );
@@ -1434,7 +1548,12 @@ pub fn dispatch(
                 RunnerKind::Claude => "claude",
                 RunnerKind::Grok => "grok",
             };
-            eprintln!("[cleanup warn] {provider}: {e} ({})", cwd.display());
+            tracing::warn!(
+                provider = %provider,
+                error = %e,
+                cwd = %cwd.display(),
+                "session cleanup failed",
+            );
         }
     }
     result
@@ -3262,5 +3381,269 @@ mod tests {
         assert_eq!(r.exit_code, 0);
         assert!(r.output.contains(marker));
         assert!(r.output.contains("legacy-shape"));
+    }
+
+    // ── FEAT-006: grok stderr capture tests ─────────────────────────────
+
+    /// AC(FEAT-006): GROK_TELEMETRY_TRACE_UPLOAD=0 is forwarded to the grok
+    /// child env (cuts BatchSpanProcessor export noise). The env var must NOT
+    /// be set on the Claude child — that is enforced by the `RunnerKind::Grok`
+    /// guard in `apply_common_env`, verified here by inspecting the child env
+    /// via a mock shell script that echoes the variable's value.
+    #[test]
+    fn grok_telemetry_trace_upload_set_on_grok_child() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let _guard = GROK_BINARY_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
+        let out_file = std::env::temp_dir().join("task_mgr_grok_telemetry_env_check.txt");
+        let script = std::env::temp_dir().join("task_mgr_grok_telemetry_env_check.sh");
+        {
+            let mut f = std::fs::File::create(&script).unwrap();
+            writeln!(f, "#!/bin/sh").unwrap();
+            writeln!(
+                f,
+                r#"printf 'GROK_TELEMETRY_TRACE_UPLOAD=%s\n' "$GROK_TELEMETRY_TRACE_UPLOAD" >> "{out}""#,
+                out = out_file.display()
+            )
+            .unwrap();
+            writeln!(f, r#"echo "ok""#).unwrap();
+        }
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_file(&out_file);
+        unsafe { std::env::set_var("GROK_BINARY", script.to_str().unwrap()) };
+
+        let perm = scoped_coding();
+        dispatch(
+            RunnerKind::Grok,
+            "telemetry-probe",
+            &perm,
+            RunnerOpts::default(),
+        )
+        .expect("dispatch(Grok) returned Err");
+
+        unsafe { std::env::remove_var("GROK_BINARY") };
+        let _ = std::fs::remove_file(&script);
+
+        let content = std::fs::read_to_string(&out_file).unwrap_or_default();
+        let _ = std::fs::remove_file(&out_file);
+        assert!(
+            content.contains("GROK_TELEMETRY_TRACE_UPLOAD=0"),
+            "grok child must receive GROK_TELEMETRY_TRACE_UPLOAD=0, got: {content:?}",
+        );
+    }
+
+    /// AC(FEAT-006 CONTRACT): `spawn_grok_stderr_sniffer` still returns
+    /// `(Arc<Mutex<String>>, JoinHandle)` and the buffer fills from child stderr
+    /// byte-for-byte as before. The capture path replaces the console tee but
+    /// must NOT alter the sniff buffer used by the auth-failure short-circuit.
+    #[test]
+    fn grok_stderr_sniffer_buffer_fills_unchanged_after_capture_path_change() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        let script = tmp.path().join("emit_stderr.sh");
+        {
+            let mut f = std::fs::File::create(&script).unwrap();
+            writeln!(f, "#!/bin/sh").unwrap();
+            writeln!(f, r#"printf 'auth failure line\n' >&2"#).unwrap();
+            writeln!(f, r#"printf 'second line\n' >&2"#).unwrap();
+        }
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut child = Command::new(&script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let (buf, handle) = spawn_grok_stderr_sniffer(&mut child, None);
+        let _ = child.wait();
+        let _ = handle.join();
+
+        let content = buf.lock().unwrap().clone();
+        assert!(
+            content.contains("auth failure line"),
+            "sniff buffer must contain line 1, got: {content:?}",
+        );
+        assert!(
+            content.contains("second line"),
+            "sniff buffer must contain line 2, got: {content:?}",
+        );
+    }
+
+    /// AC(FEAT-006): two concurrent slots produce two distinct capture files
+    /// (no interleave) — slot index is in the path. Verified at the path-
+    /// computation level: `grok_stderr_capture_path` with different slot labels
+    /// must return distinct, non-overlapping paths.
+    #[test]
+    fn grok_stderr_capture_path_concurrent_slots_produce_distinct_paths() {
+        let db = std::path::PathBuf::from("/fake/.task-mgr");
+        let run = Some("run-abc");
+        let iter = Some(3u32);
+
+        let p0 = grok_stderr_capture_path(Some(&db), Some("pfx"), run, Some("[slot 0]"), iter);
+        let p1 = grok_stderr_capture_path(Some(&db), Some("pfx"), run, Some("[slot 1]"), iter);
+
+        assert_ne!(p0, p1, "different slot labels must produce different paths");
+
+        let n0 = p0
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let n1 = p1
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            n0.contains("slot0"),
+            "slot-0 path must contain 'slot0', got {n0:?}"
+        );
+        assert!(
+            n1.contains("slot1"),
+            "slot-1 path must contain 'slot1', got {n1:?}"
+        );
+    }
+
+    /// Defense-in-depth: a hostile `active_prefix` / `run_id` cannot escape
+    /// `<db_dir>/logs/` via `..` or path separators. Every `&str` component
+    /// is sanitized to `[A-Za-z0-9_-]` before being joined into the filename.
+    #[test]
+    fn grok_stderr_capture_path_sanitizes_components_against_traversal() {
+        let db = std::path::PathBuf::from("/fake/.task-mgr");
+        let logs_dir = db.join("logs");
+
+        // Hostile prefix, run, and slot. Path separators, `..`, and NUL would
+        // each independently break out of `<db_dir>/logs/` if passed through.
+        let path = grok_stderr_capture_path(
+            Some(&db),
+            Some("../../etc"),
+            Some("/passwd\0"),
+            Some("[../slot]"),
+            Some(0),
+        )
+        .expect("db_dir provided → Some(path)");
+
+        assert_eq!(
+            path.parent(),
+            Some(logs_dir.as_path()),
+            "sanitized path must stay under <db_dir>/logs/, got {path:?}",
+        );
+        let name = path.file_name().unwrap().to_string_lossy();
+        assert!(
+            !name.contains("..") && !name.contains('/') && !name.contains('\0'),
+            "filename must be filename-safe, got {name:?}",
+        );
+        assert!(
+            name.ends_with("-grok-stderr.log"),
+            "filename must keep the capture suffix, got {name:?}",
+        );
+
+        // Fallback path: a component that sanitizes to empty falls back to the
+        // documented placeholder, not an empty string (which would corrupt the
+        // dash-separated scheme).
+        let p2 = grok_stderr_capture_path(Some(&db), Some("///"), Some("..."), None, None)
+            .expect("db_dir provided → Some(path)");
+        let n2 = p2.file_name().unwrap().to_string_lossy();
+        assert!(
+            n2.starts_with("no-prefix-no-run-noSlot-iter0-"),
+            "empty-after-sanitize must fall back to placeholders, got {n2:?}",
+        );
+    }
+
+    /// AC(FEAT-006): sniffer writes to the capture file; both the file and the
+    /// sniff buffer contain the stderr lines — the write path and the sniff
+    /// path are independent.
+    #[test]
+    fn grok_stderr_sniffer_writes_lines_to_capture_file() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let capture_path = tmp.path().join("logs").join("test-grok-stderr.log");
+
+        let script = tmp.path().join("emit.sh");
+        {
+            let mut f = std::fs::File::create(&script).unwrap();
+            writeln!(f, "#!/bin/sh").unwrap();
+            writeln!(f, r#"printf 'line-alpha\n' >&2"#).unwrap();
+            writeln!(f, r#"printf 'line-beta\n' >&2"#).unwrap();
+        }
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut child = Command::new(&script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let (buf, handle) = spawn_grok_stderr_sniffer(&mut child, Some(capture_path.clone()));
+        let _ = child.wait();
+        let _ = handle.join();
+
+        let file_content = std::fs::read_to_string(&capture_path).unwrap();
+        assert!(
+            file_content.contains("line-alpha"),
+            "capture file must contain line-alpha"
+        );
+        assert!(
+            file_content.contains("line-beta"),
+            "capture file must contain line-beta"
+        );
+
+        let sniff = buf.lock().unwrap().clone();
+        assert!(
+            sniff.contains("line-alpha"),
+            "sniff buffer must also contain line-alpha"
+        );
+    }
+
+    /// AC(FEAT-006 failure mode): when the capture file cannot be opened (e.g.
+    /// an ancestor path is a regular file), the sniffer thread must not crash.
+    /// Lines are dropped from the file side, but the sniff buffer still fills.
+    #[test]
+    fn grok_stderr_sniffer_bad_capture_path_is_graceful() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        // Make a regular file where a directory would need to be, so
+        // create_dir_all and File::create both fail.
+        let blocker = tmp.path().join("not-a-dir");
+        std::fs::write(&blocker, "i am a file").unwrap();
+        let bad_path = blocker.join("subdir").join("stderr.log");
+
+        let script = tmp.path().join("emit.sh");
+        {
+            let mut f = std::fs::File::create(&script).unwrap();
+            writeln!(f, "#!/bin/sh").unwrap();
+            writeln!(f, r#"printf 'still-sniffed\n' >&2"#).unwrap();
+        }
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut child = Command::new(&script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let (buf, handle) = spawn_grok_stderr_sniffer(&mut child, Some(bad_path));
+        let _ = child.wait();
+        let _ = handle.join(); // must not panic
+
+        let sniff = buf.lock().unwrap().clone();
+        assert!(
+            sniff.contains("still-sniffed"),
+            "sniff buffer must fill even when capture file can't be opened, got: {sniff:?}",
+        );
     }
 }

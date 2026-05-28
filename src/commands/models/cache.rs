@@ -12,6 +12,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::api::RemoteModel;
+use crate::output::ui;
 use crate::paths::user_cache_dir;
 
 const CACHE_FILENAME: &str = "models-cache.json";
@@ -65,10 +66,10 @@ pub fn read_fresh_at(path: &Path, ttl: Duration, now: DateTime<Utc>) -> Option<V
 pub fn write(models: &[RemoteModel]) {
     let Some(path) = cache_path() else { return };
     if let Err(e) = write_at(&path, models, Utc::now()) {
-        eprintln!(
+        ui::emit_err(&format!(
             "\x1b[33m[warn]\x1b[0m models cache write failed ({}): {e}",
             path.display()
-        );
+        ));
     }
 }
 

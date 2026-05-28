@@ -12,6 +12,7 @@ use rusqlite::Connection;
 use crate::commands::complete as complete_cmd;
 use crate::db::prefix::prefix_and;
 use crate::loop_engine::prd_reconcile::update_prd_task_passes;
+use crate::output::ui;
 
 fn query_incomplete_task_ids(
     conn: &Connection,
@@ -61,8 +62,8 @@ pub(crate) fn reconcile_external_git_completions(
 
     // Validate the external repo exists
     if !external_repo.exists() {
-        eprintln!(
-            "Warning: external git repo not found at {}, skipping reconciliation",
+        tracing::warn!(
+            "external git repo not found at {}, skipping reconciliation",
             external_repo.display()
         );
         return Vec::new();
@@ -77,19 +78,15 @@ pub(crate) fn reconcile_external_git_completions(
     {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
         Ok(o) => {
-            eprintln!(
-                "Warning: git log failed in {}: {}",
+            tracing::warn!(
+                "git log failed in {}: {}",
                 external_repo.display(),
                 String::from_utf8_lossy(&o.stderr).trim()
             );
             return Vec::new();
         }
         Err(e) => {
-            eprintln!(
-                "Warning: could not run git in {}: {}",
-                external_repo.display(),
-                e
-            );
+            tracing::warn!("could not run git in {}: {}", external_repo.display(), e);
             return Vec::new();
         }
     };
@@ -106,7 +103,7 @@ pub(crate) fn reconcile_external_git_completions(
     let task_ids = match query_incomplete_task_ids(conn, task_prefix) {
         Ok(ids) => ids,
         Err(e) => {
-            eprintln!("Warning: could not query tasks for reconciliation: {}", e);
+            tracing::warn!("could not query tasks for reconciliation: {}", e);
             return Vec::new();
         }
     };
@@ -129,22 +126,23 @@ pub(crate) fn reconcile_external_git_completions(
                 None, // no specific commit hash from oneline
                 false,
             ) {
-                eprintln!("Reconciliation skipped for {}: {}", task_id, e);
+                tracing::warn!("reconciliation skipped for {}: {}", task_id, e);
                 continue;
             }
 
             // Update PRD JSON
             if let Err(e) = update_prd_task_passes(prd_path, task_id, true, task_prefix) {
-                eprintln!(
-                    "Warning: failed to update PRD for reconciled task {}: {}",
-                    task_id, e
+                tracing::warn!(
+                    "failed to update PRD for reconciled task {}: {}",
+                    task_id,
+                    e
                 );
             }
 
-            eprintln!(
+            ui::emit(&format!(
                 "Reconciled task {} (found in external repo commits)",
                 task_id
-            );
+            ));
             reconciled.push(task_id.clone());
         }
     }
@@ -192,7 +190,9 @@ pub(crate) fn reconcile_merged_slot_completions(
     // pre-merge HEAD couldn't be captured, there's no range to scan. Emit a
     // single warn line so the operator sees why no reconcile fired.
     if pre_merge_head.is_empty() {
-        eprintln!("Post-merge reconcile: skipped (pre-merge HEAD was not captured for slot 0)");
+        tracing::warn!(
+            "Post-merge reconcile: skipped (pre-merge HEAD was not captured for slot 0)"
+        );
         return Vec::new();
     }
 
@@ -207,7 +207,7 @@ pub(crate) fn reconcile_merged_slot_completions(
     {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
         Ok(o) => {
-            eprintln!(
+            tracing::warn!(
                 "Post-merge reconcile: git log failed in {}: {}",
                 slot0_path.display(),
                 String::from_utf8_lossy(&o.stderr).trim()
@@ -215,7 +215,7 @@ pub(crate) fn reconcile_merged_slot_completions(
             return Vec::new();
         }
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "Post-merge reconcile: could not run git in {}: {}",
                 slot0_path.display(),
                 e
@@ -250,7 +250,7 @@ pub(crate) fn reconcile_merged_slot_completions(
     let task_ids = match query_incomplete_task_ids(conn, task_prefix) {
         Ok(ids) => ids,
         Err(e) => {
-            eprintln!("Post-merge reconcile: could not query tasks: {}", e);
+            tracing::warn!("Post-merge reconcile: could not query tasks: {}", e);
             return Vec::new();
         }
     };
@@ -268,21 +268,22 @@ pub(crate) fn reconcile_merged_slot_completions(
 
         let ids = [task_id.clone()];
         if let Err(e) = complete_cmd::complete(conn, &ids, Some(run_id), None, false) {
-            eprintln!("Post-merge reconcile: skipped {} ({})", task_id, e);
+            tracing::warn!("Post-merge reconcile: skipped {} ({})", task_id, e);
             continue;
         }
 
         if let Err(e) = update_prd_task_passes(prd_path, task_id, true, task_prefix) {
-            eprintln!(
+            tracing::warn!(
                 "Post-merge reconcile: failed to update PRD for {}: {}",
-                task_id, e
+                task_id,
+                e
             );
         }
 
-        eprintln!(
+        ui::emit(&format!(
             "Post-merge reconcile: marked {} done (found in merged-back commits)",
             task_id
-        );
+        ));
         reconciled.push(task_id.clone());
     }
 
@@ -409,8 +410,8 @@ pub(crate) fn wrapper_commit(
         .ok()?;
 
     if !add.status.success() {
-        eprintln!(
-            "Warning: wrapper git add failed: {}",
+        tracing::warn!(
+            "wrapper git add failed: {}",
             String::from_utf8_lossy(&add.stderr).trim()
         );
         return None;
@@ -425,8 +426,8 @@ pub(crate) fn wrapper_commit(
         .ok()?;
 
     if !commit.status.success() {
-        eprintln!(
-            "Warning: wrapper git commit failed: {}",
+        tracing::warn!(
+            "wrapper git commit failed: {}",
             String::from_utf8_lossy(&commit.stderr).trim()
         );
         return None;
@@ -441,11 +442,11 @@ pub(crate) fn wrapper_commit(
 
     if hash.status.success() {
         let h = String::from_utf8_lossy(&hash.stdout).trim().to_string();
-        eprintln!(
+        ui::emit(&format!(
             "Wrapper committed changes for task {} ({})",
             task_id,
             &h[..7.min(h.len())]
-        );
+        ));
         Some(h)
     } else {
         None

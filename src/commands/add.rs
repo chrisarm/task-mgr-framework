@@ -25,6 +25,7 @@ use crate::commands::init::import::{
 use crate::commands::init::parse::PrdUserStory;
 use crate::commands::next;
 use crate::loop_engine::output_parsing::strip_task_prefix;
+use crate::output::ui;
 use crate::{TaskMgrError, TaskMgrResult};
 
 /// Deserialized input for `task-mgr add`.
@@ -245,10 +246,10 @@ pub fn add_with_conn(
         } else {
             ctx.prd_json_path.display().to_string()
         };
-        eprintln!(
+        ui::emit(&format!(
             "→ active prefix={}  source={}  target={}",
             ctx.prefix, ctx.source, target,
-        );
+        ));
     }
 
     // Hard-refuse cross-PRD `--depended-on-by` before any DB write. Each
@@ -264,10 +265,10 @@ pub fn add_with_conn(
         let original_id = input.id.clone();
         input.apply_prefix(prefix);
         if input.id != original_id {
-            eprintln!(
+            ui::emit(&format!(
                 "Note: auto-prefixed task ID as {} (active prefix: {})",
                 input.id, prefix,
-            );
+            ));
         }
         prefixed_depended_on_by = depended_on_by
             .iter()
@@ -335,7 +336,7 @@ pub fn add_with_conn(
     tx.commit()?;
 
     if rel_outcome.had_deprecated {
-        eprintln!("{}", DEPRECATED_RELATIONSHIPS_WARNING);
+        ui::emit(DEPRECATED_RELATIONSHIPS_WARNING);
     }
 
     // Best-effort PRD JSON sync. Failure here logs but does not roll back
@@ -350,27 +351,27 @@ pub fn add_with_conn(
         ) {
             Ok(()) => Some(path),
             Err(e) => {
-                eprintln!(
+                ui::emit_err(&format!(
                     "Warning: task {} added to DB but PRD JSON sync failed ({}): {}",
                     story.id,
                     path.display(),
                     e,
-                );
+                ));
                 Some(path)
             }
         },
         Ok(None) => {
-            eprintln!(
+            ui::emit(&format!(
                 "Note: task {} added to DB; no PRD JSON registered in prd_files — skipping file sync",
                 story.id,
-            );
+            ));
             None
         }
         Err(e) => {
-            eprintln!(
+            ui::emit_err(&format!(
                 "Warning: task {} added to DB; could not locate PRD JSON: {}",
                 story.id, e,
-            );
+            ));
             None
         }
     };
@@ -883,11 +884,11 @@ fn append_task_to_prd_json(
             break;
         }
         if !matched {
-            eprintln!(
+            ui::emit_err(&format!(
                 "Warning: --depended-on-by target {} not found in PRD JSON {}; DB updated but JSON dependsOn not synced for that target",
                 existing_id,
                 prd_path.display(),
-            );
+            ));
         }
     }
 

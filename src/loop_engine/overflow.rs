@@ -262,9 +262,9 @@ pub fn append_event_log(dir: &Path, event: &OverflowEvent) -> io::Result<()> {
         serde_json::to_vec(event).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     line.push(b'\n');
     if line.len() > 4096 {
-        eprintln!(
-            "warning: overflow JSONL line is {} bytes — exceeds PIPE_BUF (4096); O_APPEND atomicity is not guaranteed",
-            line.len()
+        tracing::warn!(
+            bytes = line.len(),
+            "overflow JSONL line exceeds PIPE_BUF (4096); O_APPEND atomicity is not guaranteed",
         );
     }
     let mut file = OpenOptions::new().append(true).create(true).open(&path)?;
@@ -294,7 +294,7 @@ pub fn rotate_dumps_keep_n(dir: &Path, sanitized_task_id: &str, keep: usize) -> 
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
-                eprintln!("warning: overflow rotate: skipping unreadable dir entry: {e}");
+                tracing::warn!(error = %e, "overflow rotate: skipping unreadable dir entry");
                 continue;
             }
         };
@@ -304,9 +304,10 @@ pub fn rotate_dumps_keep_n(dir: &Path, sanitized_task_id: &str, keep: usize) -> 
             let meta = match entry.metadata() {
                 Ok(m) => m,
                 Err(e) => {
-                    eprintln!(
-                        "warning: overflow rotate: skipping {}: metadata error: {e}",
-                        entry.path().display()
+                    tracing::warn!(
+                        path = %entry.path().display(),
+                        error = %e,
+                        "overflow rotate: skipping entry, metadata error",
                     );
                     continue;
                 }
@@ -321,9 +322,10 @@ pub fn rotate_dumps_keep_n(dir: &Path, sanitized_task_id: &str, keep: usize) -> 
 
     for (_, path) in entries.into_iter().skip(keep) {
         if let Err(e) = fs::remove_file(&path) {
-            eprintln!(
-                "warning: overflow rotate: failed to remove {}: {e}",
-                path.display()
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "overflow rotate: failed to remove",
             );
         }
     }

@@ -3029,6 +3029,19 @@ fn test_merged_gitignore_rewrites_drifted_block() {
     assert!(result.contains("tasks/progress-*.txt"));
 }
 
+#[test]
+fn test_merged_gitignore_includes_logs_dir() {
+    // CONTRACT-LOG-001: the diagnostics log directory is task-mgr-managed and
+    // must be ignored alongside the progress files.
+    let result = merged_gitignore_contents("").expect("must rewrite empty file");
+    assert!(
+        result.lines().any(|l| l == ".task-mgr/logs/"),
+        "managed block must ignore .task-mgr/logs/: {result}"
+    );
+    // The progress pattern is still present (the logs entry is additive).
+    assert!(result.contains("tasks/progress-*.txt"));
+}
+
 // ── untrack_progress_files tests ─────────────────────────────────────────────
 
 /// Set up a minimal git repo with user config and an initial commit.

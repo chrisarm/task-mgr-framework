@@ -132,7 +132,7 @@ fn grok_task_prompt_too_long_at_ceiling_falls_back_to_claude() {
     let action = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
         conn: &mut conn,
-        task_id: task_id,
+        task_id,
         effort: Some("high"),
         effective_model: // effort floor reached
         Some(GROK_MODEL),
@@ -213,7 +213,7 @@ fn grok_task_prompt_too_long_without_claude_fallback_model_returns_blocked() {
     let action = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
         conn: &mut conn,
-        task_id: task_id,
+        task_id,
         effort: Some("high"),
         effective_model: Some(GROK_MODEL),
         prompt_result: &pr,
@@ -278,7 +278,7 @@ fn grok_task_already_promoted_to_claude_returns_blocked_not_promoted_again() {
     let action = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
         conn: &mut conn,
-        task_id: task_id,
+        task_id,
         effort: Some("high"),
         effective_model: Some(GROK_MODEL),
         prompt_result: &pr,
@@ -335,7 +335,7 @@ fn after_inverse_overflow_fallback_next_iteration_resolves_claude_runner() {
     let action = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
         conn: &mut conn,
-        task_id: task_id,
+        task_id,
         effort: Some("high"),
         effective_model: Some(GROK_MODEL),
         prompt_result: &pr,
@@ -428,7 +428,7 @@ fn grok_runner_with_fallback_runner_configured_does_not_self_promote_to_grok() {
     let action = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
         conn: &mut conn,
-        task_id: task_id,
+        task_id,
         effort: Some("high"),
         effective_model: Some(GROK_MODEL),
         prompt_result: &pr,

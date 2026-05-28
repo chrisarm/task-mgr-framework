@@ -60,6 +60,7 @@ use crate::loop_engine::status_queries::read_prd_hints;
 use crate::loop_engine::wave_scheduler::classify_drained_queue;
 use crate::loop_engine::worktree;
 use crate::models::RunStatus;
+use crate::output::ui;
 
 use crate::loop_engine::engine::*;
 
@@ -102,27 +103,31 @@ fn check_global_skills(source_root: &Path) {
         .iter()
         .any(|name| repo_skill_dir.join(format!("{}.md", name)).exists());
 
-    eprintln!(
+    ui::emit(&format!(
         "Warning: {} task-mgr skill(s) not found in ~/.claude/commands/: {}",
         missing.len(),
         missing.join(", ")
-    );
+    ));
 
     if has_repo_copies {
-        eprintln!("  Install from this repo:");
+        ui::emit("  Install from this repo:");
         for name in &missing {
             let src = repo_skill_dir.join(format!("{}.md", name));
             if src.exists() {
-                eprintln!("    cp {} {}/", src.display(), global_dir.display());
+                ui::emit(&format!(
+                    "    cp {} {}/",
+                    src.display(),
+                    global_dir.display()
+                ));
             }
         }
     } else {
-        eprintln!(
-            "  These skills provide /tm-learn, /tm-recall, /tm-invalidate, /tm-status, /tm-next"
+        ui::emit(
+            "  These skills provide /tm-learn, /tm-recall, /tm-invalidate, /tm-status, /tm-next",
         );
-        eprintln!("  See the task-mgr README for installation instructions.");
+        ui::emit("  See the task-mgr README for installation instructions.");
     }
-    eprintln!();
+    ui::emit("");
 }
 
 /// Run the full autonomous agent loop.
@@ -152,8 +157,8 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
 
     // Step 2: Validate git repo (source_root is the original repo)
     if let Err(e) = env::validate_git_repo(&run_config.source_root) {
-        eprintln!("Error: {}", e);
-        eprintln!("Hint: Run task-mgr from within a git repository.");
+        ui::emit_err(&format!("Error: {}", e));
+        ui::emit("Hint: Run task-mgr from within a git repository.");
         return LoopResult {
             exit_code: 1,
             ..Default::default()
@@ -169,9 +174,9 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
     ) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("Error resolving paths: {}", e);
-            eprintln!(
-                "Hint: Check that the PRD file path is correct relative to your project root."
+            ui::emit_err(&format!("Error resolving paths: {}", e));
+            ui::emit(
+                "Hint: Check that the PRD file path is correct relative to your project root.",
             );
             return LoopResult {
                 exit_code: 1,
@@ -187,7 +192,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
 
     // Step 4: Ensure directories exist (in db_dir)
     if let Err(e) = env::ensure_directories(&run_config.db_dir) {
-        eprintln!("Error creating directories: {}", e);
+        ui::emit_err(&format!("Error creating directories: {}", e));
         return LoopResult {
             exit_code: 1,
             ..Default::default()
@@ -239,19 +244,19 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
         Err(e) => {
             match &pre_lock_prefix {
                 Some(p) => {
-                    eprintln!(
+                    ui::emit_err(&format!(
                         "Error: cannot start loop for {prd_display} — another loop is already running (prefix={p}). {e}"
-                    );
-                    eprintln!(
-                        "Hint: Each PRD gets its own lock file (loop-{{prefix}}.lock). If the other PRD is still running, wait for it to finish."
+                    ));
+                    ui::emit(
+                        "Hint: Each PRD gets its own lock file (loop-{prefix}.lock). If the other PRD is still running, wait for it to finish.",
                     );
                 }
                 None => {
-                    eprintln!(
+                    ui::emit_err(&format!(
                         "Error: cannot start loop for {prd_display} — another loop is already running on the global lock. {e}"
-                    );
-                    eprintln!(
-                        "Hint: Each PRD uses its own lock file (loop-{{prefix}}.lock). If both PRDs lack taskPrefix, they collide on the global lock."
+                    ));
+                    ui::emit(
+                        "Hint: Each PRD uses its own lock file (loop-{prefix}.lock). If both PRDs lack taskPrefix, they collide on the global lock.",
                     );
                 }
             }
@@ -269,10 +274,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
         run_config.working_root.to_str(),
         pre_lock_prefix.as_deref(),
     ) {
-        eprintln!(
-            "Warning: failed to write extended lock metadata: {} (continuing)",
-            e
-        );
+        tracing::warn!("failed to write extended lock metadata: {} (continuing)", e);
     }
 
     // Step 4.6: Detect branch change (archive previous PRD if branch switched)
@@ -284,14 +286,11 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
         pre_lock_prefix.as_deref(),
     ) {
         Ok(true) => {
-            eprintln!("Branch change handled, continuing with new branch setup");
+            ui::emit("Branch change handled, continuing with new branch setup");
         }
         Ok(false) => {} // No change or first run
         Err(e) => {
-            eprintln!(
-                "Warning: branch change detection failed: {} (continuing)",
-                e
-            );
+            tracing::warn!("branch change detection failed: {} (continuing)", e);
         }
     }
 
@@ -306,7 +305,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
         false, // dry_run
         run_config.prefix_mode.clone(),
     ) {
-        eprintln!("Error initializing PRD: {}", e);
+        ui::emit_err(&format!("Error initializing PRD: {}", e));
         return LoopResult {
             exit_code: 1,
             ..Default::default()
@@ -322,7 +321,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
     let mut conn = match crate::db::open_connection(&run_config.db_dir) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Error opening database: {}", e);
+            ui::emit_err(&format!("Error opening database: {}", e));
             return LoopResult {
                 exit_code: 1,
                 ..Default::default()
@@ -332,20 +331,20 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
 
     if run_config.config.verbose {
         let canonical = run_config.db_dir.join("tasks.db");
-        eprintln!("[verbose] Database path: {}", canonical.display());
-        eprintln!(
+        ui::emit(&format!("[verbose] Database path: {}", canonical.display()));
+        ui::emit(&format!(
             "[verbose] Source root:   {}",
             run_config.source_root.display()
-        );
-        eprintln!(
+        ));
+        ui::emit(&format!(
             "[verbose] Working root:  {}",
             run_config.working_root.display()
-        );
+        ));
     }
 
     // Step 6.5: Run any pending migrations (e.g. v4 adds external_git_repo column)
     if let Err(e) = crate::db::run_migrations(&mut conn) {
-        eprintln!("Warning: failed to run migrations: {} (continuing)", e);
+        tracing::warn!("failed to run migrations: {} (continuing)", e);
     }
 
     // Step 6.55: Reuse the prefix already determined at step 4.5 — no second file read.
@@ -360,15 +359,15 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
     match TaskLifecycle::new(&mut conn).recover_in_progress_for_prefix(early_task_prefix.as_deref())
     {
         Ok(count) if count > 0 => {
-            eprintln!(
+            ui::emit(&format!(
                 "Recovered {} stale in_progress task(s) from previous run",
                 count
-            );
+            ));
         }
         Ok(_) => {}
         Err(e) => {
             // Hard error: if recovery fails, the loop will deadlock on blocked dependencies
-            eprintln!("Error: failed to reset stale tasks: {}", e);
+            ui::emit_err(&format!("Error: failed to reset stale tasks: {}", e));
             return LoopResult {
                 exit_code: 1,
                 ..Default::default()
@@ -380,14 +379,14 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
     // is high from the first task. Uses default thresholds (90 days, 10 shows, 5% rate).
     match crate::commands::curate::curate_retire(&conn, Default::default()) {
         Ok(result) if result.learnings_retired > 0 => {
-            eprintln!(
+            ui::emit(&format!(
                 "Auto-retired {} stale learning(s) at session start",
                 result.learnings_retired
-            );
+            ));
         }
         Ok(_) => {} // nothing to retire
         Err(e) => {
-            eprintln!("Warning: auto-retire learnings failed: {} (continuing)", e);
+            tracing::warn!("auto-retire learnings failed: {} (continuing)", e);
         }
     }
 
@@ -395,7 +394,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
     let prd_metadata = match read_prd_metadata(&conn, early_task_prefix.as_deref()) {
         Ok(meta) => meta,
         Err(e) => {
-            eprintln!("Error reading PRD metadata: {}", e);
+            ui::emit_err(&format!("Error reading PRD metadata: {}", e));
             return LoopResult {
                 exit_code: 1,
                 ..Default::default()
@@ -460,19 +459,21 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                 .filter(|c| c.severity == SetupSeverity::Blocker)
                 .collect();
             if !blockers.is_empty() {
-                eprintln!(
-                    "\x1b[33m⚠ Setup warning: {} blocker(s) detected in ~/.claude/settings.json:\x1b[0m",
+                ui::emit(&ui::yellow(&format!(
+                    "⚠ Setup warning: {} blocker(s) detected in ~/.claude/settings.json:",
                     blockers.len()
-                );
+                )));
                 for b in &blockers {
-                    eprintln!("  \x1b[33m•\x1b[0m {}", b.message);
+                    ui::emit(&format!("  {} {}", ui::yellow("•"), b.message));
                     if let Some(ref fix) = b.fix_command {
-                        eprintln!("    Fix: {fix}");
+                        ui::emit(&format!("    Fix: {fix}"));
                     }
                 }
-                eprintln!("\x1b[33m  The loop will continue but tool calls may be blocked.\x1b[0m");
-                eprintln!("  Run `task-mgr doctor --setup` for a full audit.");
-                eprintln!();
+                ui::emit(&ui::yellow(
+                    "  The loop will continue but tool calls may be blocked.",
+                ));
+                ui::emit("  Run `task-mgr doctor --setup` for a full audit.");
+                ui::emit("");
             }
         }
     }
@@ -509,7 +510,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                     wt_path
                 }
                 Err(e) => {
-                    eprintln!("Error setting up worktree: {}", e);
+                    ui::emit_err(&format!("Error setting up worktree: {}", e));
                     return LoopResult {
                         exit_code: 1,
                         ..Default::default()
@@ -521,7 +522,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
             if let Err(e) =
                 env::ensure_branch(&run_config.source_root, branch, run_config.config.yes_mode)
             {
-                eprintln!("Error: {}", e);
+                ui::emit_err(&format!("Error: {}", e));
                 return LoopResult {
                     exit_code: 1,
                     ..Default::default()
@@ -551,13 +552,9 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                         let _ = std::fs::create_dir_all(parent);
                     }
                     if let Err(e) = std::fs::copy(src, &dest) {
-                        eprintln!(
-                            "Warning: failed to copy {} to worktree: {}",
-                            rel.display(),
-                            e
-                        );
+                        tracing::warn!("failed to copy {} to worktree: {}", rel.display(), e);
                     } else {
-                        eprintln!("Copied {} to worktree", rel.display());
+                        ui::emit(&format!("Copied {} to worktree", rel.display()));
                     }
                 }
             }
@@ -595,8 +592,8 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
         if let Ok(rel) = paths.prd_file.strip_prefix(&canonical_source) {
             working_root.join(rel)
         } else {
-            eprintln!(
-                "Warning: could not remap PRD to worktree (prd={}, source={})",
+            tracing::warn!(
+                "could not remap PRD to worktree (prd={}, source={})",
                 paths.prd_file.display(),
                 canonical_source.display()
             );
@@ -620,7 +617,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
             run_config.prefix_mode.clone(),
         )
     {
-        eprintln!("Warning: worktree PRD re-import failed: {} (continuing)", e);
+        tracing::warn!("worktree PRD re-import failed: {} (continuing)", e);
     }
     prd_hash = hash_file(&live_prd_file);
     // Override paths.prd_file so all iteration code (mark_task_done, reconcile, etc.)
@@ -629,7 +626,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
 
     // Step 9: Check uncommitted changes (in working_root)
     if let Err(e) = env::check_uncommitted_changes(&working_root, run_config.config.yes_mode) {
-        eprintln!("Error: {}", e);
+        ui::emit_err(&format!("Error: {}", e));
         return LoopResult {
             exit_code: 1,
             worktree_path: actual_worktree_path,
@@ -692,10 +689,10 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                     halt_threshold,
                     Some(&recovery_cfg),
                 ) {
-                    eprintln!(
+                    ui::emit_err(&format!(
                         "Error: stale ephemeral-slot reconcile aborted startup: {}",
                         e
-                    );
+                    ));
                     return LoopResult {
                         exit_code: 1,
                         worktree_path: actual_worktree_path,
@@ -708,34 +705,34 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                     run_config.config.parallel_slots,
                 ) {
                     Ok(paths) => {
-                        eprintln!(
+                        ui::emit(&format!(
                             "Parallel mode active: {} slots ({} ephemeral branches)",
                             run_config.config.parallel_slots,
                             run_config.config.parallel_slots.saturating_sub(1)
-                        );
+                        ));
                         (true, paths)
                     }
                     Err(e) => {
-                        eprintln!(
+                        ui::emit_err(&format!(
                             "Warning: failed to set up slot worktrees: {} — falling back to sequential",
                             e
-                        );
+                        ));
                         (false, Vec::new())
                     }
                 }
             }
             (None, _) => {
-                eprintln!(
+                ui::emit_err(&format!(
                     "Warning: --parallel {} requires a branchName in the PRD; falling back to sequential",
                     run_config.config.parallel_slots
-                );
+                ));
                 (false, Vec::new())
             }
             (Some(_), false) => {
-                eprintln!(
+                ui::emit_err(&format!(
                     "Warning: --parallel {} requires use_worktrees=true; falling back to sequential",
                     run_config.config.parallel_slots
-                );
+                ));
                 (false, Vec::new())
             }
         }
@@ -761,7 +758,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
     if let Some(hours) = run_config.config.hours
         && let Err(e) = deadline::create_deadline(&paths.tasks_dir, &prd_basename, hours)
     {
-        eprintln!("Error creating deadline: {}", e);
+        ui::emit_err(&format!("Error creating deadline: {}", e));
         return LoopResult {
             exit_code: 1,
             worktree_path: actual_worktree_path,
@@ -773,7 +770,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
     let begin_result = match run_cmd::begin(&conn) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("Error beginning run: {}", e);
+            ui::emit_err(&format!("Error beginning run: {}", e));
             deadline::cleanup_deadline(&paths.tasks_dir, &prd_basename);
             return LoopResult {
                 exit_code: 1,
@@ -797,35 +794,36 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
         )
         .len();
         if count > 0 {
-            eprintln!(
+            ui::emit(&format!(
                 "Startup reconciliation: marked {} task(s) done from external repo",
                 count
-            );
+            ));
         }
     }
 
     // Step 12.7: Display any deferred key decisions from previous sessions
     match key_decisions_db::get_all_pending_decisions(&conn) {
         Ok(decisions) if !decisions.is_empty() => {
-            eprintln!(
+            ui::emit(&format!(
                 "\n\x1b[33m⚑ {} deferred key decision(s) from previous sessions:\x1b[0m",
                 decisions.len()
-            );
+            ));
             for d in &decisions {
                 let task_ctx = d
                     .task_id
                     .as_deref()
                     .map(|t| format!(" [task: {}]", t))
                     .unwrap_or_default();
-                eprintln!("  • {}{}", d.title, task_ctx);
-                eprintln!("    {}", d.description);
+                ui::emit(&format!("  • {}{}", d.title, task_ctx));
+                ui::emit(&format!("    {}", d.description));
             }
-            eprintln!();
+            ui::emit("");
         }
         Ok(_) => {}
         Err(e) => {
-            // Non-fatal: pre-v12 DB won't have this table
-            eprintln!("Note: could not query deferred key decisions: {}", e);
+            // Non-fatal: pre-v12 DB won't have this table — an expected benign
+            // condition on old DBs, not an operator-actionable warning.
+            tracing::debug!("could not query deferred key decisions: {}", e);
         }
     }
 
@@ -846,7 +844,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
     let mut permission_mode = config::resolve_permission_mode(&run_config.db_dir);
 
     if run_config.config.verbose {
-        eprintln!("[verbose] Permission mode: {}", permission_mode);
+        ui::emit(&format!("[verbose] Permission mode: {}", permission_mode));
     }
 
     // Step 15.5: Print session banner
@@ -873,7 +871,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
         && config::parse_bool_value(&val) == Some(true)
         && !matches!(permission_mode, config::PermissionMode::Auto { .. })
     {
-        eprintln!("{}", AUTO_MODE_DEPRECATION_HINT);
+        ui::emit(AUTO_MODE_DEPRECATION_HINT);
     }
 
     // Step 15.7: Log requires_human task count so the user knows pauses are coming
@@ -886,7 +884,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
             )
             .unwrap_or(0);
         if review_count > 0 {
-            eprintln!("{} task(s) require human review", review_count);
+            ui::emit(&format!("{} task(s) require human review", review_count));
         }
     }
 
@@ -922,7 +920,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
 
         // Check deadline
         if deadline::check_deadline(&paths.tasks_dir, &prd_basename) {
-            eprintln!("Deadline reached, stopping loop");
+            ui::emit("Deadline reached, stopping loop");
             exit_reason = "deadline reached".to_string();
             exit_code = 0;
             break;
@@ -932,10 +930,10 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
         // edits mid-loop take effect without restarting.
         let iter_permission_mode = config::resolve_permission_mode(&run_config.db_dir);
         if iter_permission_mode != permission_mode {
-            eprintln!(
+            ui::emit(&format!(
                 "\x1b[36m[info]\x1b[0m Permission mode changed: {} → {}",
                 permission_mode, iter_permission_mode
-            );
+            ));
             permission_mode = iter_permission_mode;
         }
 
@@ -943,7 +941,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
         // Use live_prd_file (worktree copy) since Claude edits in the worktree.
         let current_hash = hash_file(&live_prd_file);
         if current_hash != prd_hash {
-            eprintln!("PRD file changed, re-importing tasks...");
+            ui::emit("PRD file changed, re-importing tasks...");
             if let Err(e) = crate::commands::init(
                 &run_config.db_dir,
                 &[&live_prd_file],
@@ -953,7 +951,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                 false, // dry_run
                 run_config.prefix_mode.clone(),
             ) {
-                eprintln!("Warning: PRD re-import failed: {} (continuing)", e);
+                tracing::warn!("PRD re-import failed: {} (continuing)", e);
             }
             prd_hash = current_hash;
         }
@@ -976,9 +974,9 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                 "parallel_active=true must imply branch_name is Some"
             );
             let Some(branch) = branch_name.as_deref() else {
-                eprintln!(
+                ui::emit_err(
                     "Warning: parallel_active=true but branch_name is None; \
-                     falling through to sequential iteration"
+                     falling through to sequential iteration",
                 );
                 parallel_active = false;
                 continue;
@@ -1103,7 +1101,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
         let mut result = match run_iteration(&mut ctx, &mut iteration_params) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("Iteration error: {}", e);
+                ui::emit_err(&format!("Iteration error: {}", e));
                 exit_code = 1;
                 exit_reason = format!("iteration error: {}", e);
                 break;
@@ -1130,7 +1128,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
             ctx.last_commit.as_deref(),
             Some(&result.files_modified),
         ) {
-            eprintln!("Warning: failed to update run: {}", e);
+            tracing::warn!("failed to update run: {}", e);
         }
 
         // Run the shared post-Claude pipeline: progress logging, key-decision
@@ -1227,10 +1225,10 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                 result.outcome = IterationOutcome::Completed;
                 ctx.crash_tracker.record_success();
 
-                eprintln!(
+                ui::emit(&format!(
                     "Post-iteration reconciliation: marked {} task(s) done",
                     count
-                );
+                ));
                 // Clear tracker if the claimed task was reconciled as done.
                 if let Some(ref claimed) = last_claimed_task {
                     let status: Option<String> = conn
@@ -1342,7 +1340,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                 project_config.primary_runner.as_ref(),
             )
         {
-            eprintln!("Warning: failed to start retry tracking transaction: {}", e);
+            tracing::warn!("failed to start retry tracking transaction: {}", e);
         }
 
         // Track consecutive stale iterations and abort if stuck
@@ -1355,7 +1353,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
             // already returns `Completed` for that case — but we apply whatever
             // it reports so the two paths share one source of truth.
             if let Some(drained) = classify_drained_queue(&conn, task_prefix.as_deref()) {
-                eprintln!("{}", drained.reason);
+                ui::emit(&drained.reason);
                 exit_code = drained.exit_code;
                 exit_reason = drained.reason;
                 final_run_status = drained.run_status;
@@ -1363,10 +1361,10 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
             }
             ctx.stale_tracker.check("stale", "stale"); // same hash → increment
             if ctx.stale_tracker.should_abort() {
-                eprintln!(
+                ui::emit_err(&format!(
                     "Aborting: no eligible tasks after {} consecutive stale iterations",
                     ctx.stale_tracker.count()
-                );
+                ));
                 exit_code = 1;
                 exit_reason = format!(
                     "no eligible tasks after {} consecutive stale iterations",
@@ -1451,7 +1449,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
 
     // Step 19: End run session
     if let Err(e) = run_cmd::end(&conn, &run_id, final_run_status) {
-        eprintln!("Warning: failed to end run: {}", e);
+        tracing::warn!("failed to end run: {}", e);
     }
 
     // Step 20: Recalibrate weights if completed
@@ -1475,8 +1473,8 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
             run_config.config.parallel_slots,
         )
     {
-        eprintln!(
-            "Warning: cleanup_slot_worktrees failed: {} — leaving slot worktrees intact",
+        tracing::warn!(
+            "cleanup_slot_worktrees failed: {} — leaving slot worktrees intact",
             e
         );
     }
@@ -1490,8 +1488,11 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
             // --yes without --cleanup-worktree: keep worktree (auto-keep)
             false
         } else {
-            // Interactive: prompt user
-            eprint!("Remove worktree at '{}'? [y/N] ", wt_path.display());
+            // Interactive: prompt user (no trailing newline — reply on same line)
+            ui::prompt(&format!(
+                "Remove worktree at '{}'? [y/N] ",
+                wt_path.display()
+            ));
             let mut response = String::new();
             let _ = std::io::stdin().read_line(&mut response);
             matches!(response.trim().to_lowercase().as_str(), "y" | "yes")
@@ -1499,16 +1500,16 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
 
         if should_cleanup {
             match worktree::remove_worktree(&run_config.source_root, wt_path) {
-                Ok(true) => eprintln!("Worktree '{}' removed.", wt_path.display()),
-                Ok(false) => eprintln!(
+                Ok(true) => ui::emit(&format!("Worktree '{}' removed.", wt_path.display())),
+                Ok(false) => ui::emit_err(&format!(
                     "Warning: worktree '{}' has uncommitted changes — not removed.",
                     wt_path.display()
-                ),
-                Err(e) => eprintln!(
+                )),
+                Err(e) => ui::emit_err(&format!(
                     "Warning: failed to remove worktree '{}': {} — continuing.",
                     wt_path.display(),
                     e
-                ),
+                )),
             }
         }
     }
@@ -1578,12 +1579,12 @@ pub(crate) fn query_human_review_tasks(
         }) {
             Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
             Err(e) => {
-                eprintln!("Warning: could not execute human review query: {}", e);
+                tracing::warn!("could not execute human review query: {}", e);
                 vec![]
             }
         },
         Err(e) => {
-            eprintln!("Warning: could not prepare human review query: {}", e);
+            tracing::warn!("could not prepare human review query: {}", e);
             vec![]
         }
     }
@@ -1654,7 +1655,7 @@ fn prompt_pending_key_decisions(conn: &Connection, run_id: &str, yes_mode: bool)
     let decisions = match key_decisions_db::get_pending_decisions(conn, run_id) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("Warning: failed to query pending key decisions: {}", e);
+            tracing::warn!("failed to query pending key decisions: {}", e);
             return;
         }
     };
@@ -1666,38 +1667,41 @@ fn prompt_pending_key_decisions(conn: &Connection, run_id: &str, yes_mode: bool)
     if yes_mode {
         for decision in &decisions {
             if let Err(e) = key_decisions_db::defer_decision(conn, decision.id) {
-                eprintln!("Warning: failed to defer decision {}: {}", decision.id, e);
+                tracing::warn!("failed to defer decision {}: {}", decision.id, e);
             }
         }
-        eprintln!(
+        ui::emit(&format!(
             "Auto-deferred {} key decision(s) (yes_mode).",
             decisions.len()
-        );
+        ));
         return;
     }
 
-    eprintln!(
+    ui::emit(
         "\n╔══════════════════════════════════════════════════╗\
          \n║         KEY DECISIONS REQUIRING YOUR INPUT        ║\
-         \n╚══════════════════════════════════════════════════╝"
+         \n╚══════════════════════════════════════════════════╝",
     );
 
     for decision in &decisions {
         loop {
-            eprintln!("\n┌─ Decision: {}", decision.title);
-            eprintln!("│  {}", decision.description);
-            eprintln!("│");
+            ui::emit(&format!("\n┌─ Decision: {}", decision.title));
+            ui::emit(&format!("│  {}", decision.description));
+            ui::emit("│");
             for (i, opt) in decision.options.iter().enumerate() {
                 let letter = (b'A' + i as u8) as char;
-                eprintln!("│  {}) {} — {}", letter, opt.label, opt.description);
+                ui::emit(&format!(
+                    "│  {}) {} — {}",
+                    letter, opt.label, opt.description
+                ));
             }
-            eprintln!("│  S) Skip (defer to next session)");
-            eprint!("└─ Your choice: ");
+            ui::emit("│  S) Skip (defer to next session)");
+            ui::prompt("└─ Your choice: ");
 
             let mut input = String::new();
             if std::io::stdin().read_line(&mut input).is_err() {
                 // stdin unavailable — defer
-                eprintln!("\nWarning: could not read stdin, deferring decision.");
+                ui::emit_err("\nWarning: could not read stdin, deferring decision.");
                 let _ = key_decisions_db::defer_decision(conn, decision.id);
                 break;
             }
@@ -1706,9 +1710,9 @@ fn prompt_pending_key_decisions(conn: &Connection, run_id: &str, yes_mode: bool)
 
             if trimmed.is_empty() || trimmed == "s" || trimmed == "skip" {
                 if let Err(e) = key_decisions_db::defer_decision(conn, decision.id) {
-                    eprintln!("Warning: failed to defer decision: {}", e);
+                    tracing::warn!("failed to defer decision: {}", e);
                 } else {
-                    eprintln!("Decision deferred.");
+                    ui::emit("Decision deferred.");
                 }
                 break;
             }
@@ -1720,17 +1724,17 @@ fn prompt_pending_key_decisions(conn: &Connection, run_id: &str, yes_mode: bool)
                     if let Err(e) =
                         key_decisions_db::resolve_decision(conn, decision.id, &resolution)
                     {
-                        eprintln!("Warning: failed to resolve decision: {}", e);
+                        tracing::warn!("failed to resolve decision: {}", e);
                     } else {
-                        eprintln!("Decision resolved: {}", resolution);
+                        ui::emit(&format!("Decision resolved: {}", resolution));
                     }
                     break;
                 }
                 Err(_) => {
-                    eprintln!(
+                    ui::emit_err(&format!(
                         "Invalid choice — enter a letter (A–{}) or S to skip.",
                         (b'A' + decision.options.len() as u8 - 1) as char
-                    );
+                    ));
                 }
             }
         }
@@ -1757,19 +1761,16 @@ fn setup_signal_handler(signal_flag: SignalFlag) {
         // `register_conditional_default` emulates the default handler when
         // the flag is already true.
         if let Err(e) = signal_hook::flag::register(SIGINT, flag.clone()) {
-            eprintln!("Warning: failed to install SIGINT handler: {}", e);
+            tracing::warn!("failed to install SIGINT handler: {}", e);
         }
         if let Err(e) = signal_hook::flag::register_conditional_default(SIGINT, flag.clone()) {
-            eprintln!(
-                "Warning: failed to install SIGINT conditional default: {}",
-                e
-            );
+            tracing::warn!("failed to install SIGINT conditional default: {}", e);
         }
         if let Err(e) = signal_hook::flag::register(SIGTERM, flag.clone()) {
-            eprintln!("Warning: failed to install SIGTERM handler: {}", e);
+            tracing::warn!("failed to install SIGTERM handler: {}", e);
         }
         if let Err(e) = signal_hook::flag::register(SIGQUIT, flag) {
-            eprintln!("Warning: failed to install SIGQUIT handler: {}", e);
+            tracing::warn!("failed to install SIGQUIT handler: {}", e);
         }
     }
 
@@ -1777,13 +1778,10 @@ fn setup_signal_handler(signal_flag: SignalFlag) {
     {
         use signal_hook::consts::SIGINT;
         if let Err(e) = signal_hook::flag::register(SIGINT, flag.clone()) {
-            eprintln!("Warning: failed to install SIGINT handler: {}", e);
+            tracing::warn!("failed to install SIGINT handler: {}", e);
         }
         if let Err(e) = signal_hook::flag::register_conditional_default(SIGINT, flag) {
-            eprintln!(
-                "Warning: failed to install SIGINT conditional default: {}",
-                e
-            );
+            tracing::warn!("failed to install SIGINT conditional default: {}", e);
         }
     }
 }
@@ -1797,14 +1795,14 @@ pub fn on_run_completed(conn: &Connection, task_prefix: Option<&str>) {
         Ok(weights) => {
             let defaults = calibrate::SelectionWeights::default();
             if weights != defaults {
-                eprintln!(
+                ui::emit(&format!(
                     "Calibrated selection weights: file_overlap={}, priority_base={}",
                     weights.file_overlap, weights.priority_base
-                );
+                ));
             }
         }
         Err(e) => {
-            eprintln!("Warning: weight calibration failed: {}", e);
+            tracing::warn!("weight calibration failed: {}", e);
         }
     }
 }
@@ -1821,19 +1819,19 @@ fn record_session_guidance(guidance: &SessionGuidance, progress_path: &Path, yes
 
     // In interactive mode, ask the user
     if !yes_mode {
-        eprint!("Session guidance was recorded. Save to progress.txt? (y/N) ");
+        ui::prompt("Session guidance was recorded. Save to progress.txt? (y/N) ");
         let mut input = String::new();
         match io::stdin().read_line(&mut input) {
             Ok(_) => {
                 let trimmed = input.trim().to_lowercase();
                 if trimmed != "y" && trimmed != "yes" {
-                    eprintln!("Session guidance discarded.");
+                    ui::emit("Session guidance discarded.");
                     return;
                 }
             }
             Err(_) => {
                 // stdin not available (non-interactive), skip
-                eprintln!("Warning: could not read stdin, skipping guidance recording");
+                tracing::warn!("could not read stdin, skipping guidance recording");
                 return;
             }
         }
@@ -1847,18 +1845,21 @@ fn record_session_guidance(guidance: &SessionGuidance, progress_path: &Path, yes
     {
         Ok(mut file) => {
             if let Err(e) = io::Write::write_all(&mut file, formatted.as_bytes()) {
-                eprintln!(
-                    "Warning: could not write session guidance to {}: {}",
+                tracing::warn!(
+                    "could not write session guidance to {}: {}",
                     progress_path.display(),
                     e
                 );
             } else {
-                eprintln!("Session guidance saved to {}", progress_path.display());
+                ui::emit(&format!(
+                    "Session guidance saved to {}",
+                    progress_path.display()
+                ));
             }
         }
         Err(e) => {
-            eprintln!(
-                "Warning: could not open progress file {}: {}",
+            tracing::warn!(
+                "could not open progress file {}: {}",
                 progress_path.display(),
                 e
             );

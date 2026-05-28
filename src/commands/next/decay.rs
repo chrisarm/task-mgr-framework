@@ -20,6 +20,7 @@ use rusqlite::Connection;
 use crate::TaskMgrResult;
 use crate::db::prefix::prefix_and;
 use crate::lifecycle::{DecayItem, DecayPlan, TaskLifecycle};
+use crate::output::ui;
 
 /// Apply automatic decay to blocked/skipped tasks that have exceeded the threshold.
 ///
@@ -56,10 +57,9 @@ pub fn apply_decay(
         .unwrap_or(0);
 
     if verbose {
-        eprintln!(
-            "[verbose] Checking for decayed tasks (threshold: {} iterations, current: {})",
-            threshold, current_iteration
-        );
+        ui::emit(&format!(
+            "[verbose] Checking for decayed tasks (threshold: {threshold} iterations, current: {current_iteration})"
+        ));
     }
 
     // Find tasks that need to decay:

@@ -8,6 +8,7 @@ pub mod learnings;
 pub mod lifecycle;
 pub mod loop_engine;
 pub mod models;
+pub mod observability;
 pub mod output;
 pub mod paths;
 pub mod util;

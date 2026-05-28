@@ -44,6 +44,7 @@ fn confidence_rank(s: &str) -> u8 {
 }
 use crate::TaskMgrResult;
 use crate::models::{Confidence, LearningOutcome};
+use crate::output::ui;
 
 /// Returns learning statistics: total, active, retired, and embedded counts.
 pub fn curate_count(conn: &Connection) -> TaskMgrResult<CountResult> {
@@ -639,29 +640,29 @@ fn process_batches_parallel(
                     },
                 ) {
                     Err(e) => {
-                        eprintln!(
+                        ui::emit_err(&format!(
                             "Warning: spawn_claude failed for batch {}: {}",
                             batch_idx + 1,
                             e
-                        );
+                        ));
                         Err(())
                     }
                     Ok(r) if r.exit_code != 0 => {
-                        eprintln!(
+                        ui::emit_err(&format!(
                             "Warning: claude exited with code {} for batch {}",
                             r.exit_code,
                             batch_idx + 1
-                        );
+                        ));
                         Err(())
                     }
                     Ok(r) => match parse_dedup_response(&r.output, &eligible_ids) {
                         Ok(clusters) => Ok(clusters),
                         Err(e) => {
-                            eprintln!(
+                            ui::emit_err(&format!(
                                 "Warning: failed to parse dedup response for batch {}: {}",
                                 batch_idx + 1,
                                 e
-                            );
+                            ));
                             Err(())
                         }
                     },
@@ -704,7 +705,9 @@ pub fn curate_dedup(conn: &Connection, params: DedupParams) -> TaskMgrResult<Ded
     if params.reset_dismissals {
         let removed = clear_dismissals(conn)?;
         if removed > 0 {
-            eprintln!("Cleared {removed} dismissal(s) from dedup_dismissals");
+            ui::emit(&format!(
+                "Cleared {removed} dismissal(s) from dedup_dismissals"
+            ));
         }
     }
 
@@ -782,7 +785,9 @@ pub fn curate_dedup(conn: &Connection, params: DedupParams) -> TaskMgrResult<Ded
         let emb_list = match load_all_active_embeddings(conn, &params.embed_model) {
             Ok(list) => list,
             Err(e) => {
-                eprintln!("Warning: failed to load embeddings for pre-filter: {e}");
+                ui::emit_err(&format!(
+                    "Warning: failed to load embeddings for pre-filter: {e}"
+                ));
                 Vec::new()
             }
         };
@@ -819,13 +824,13 @@ pub fn curate_dedup(conn: &Connection, params: DedupParams) -> TaskMgrResult<Ded
 
             let clustered_count: usize = clusters.iter().map(|c| c.len()).sum();
             let singleton_count = emb_pairs.len().saturating_sub(clustered_count);
-            eprintln!(
+            ui::emit(&format!(
                 "Embedding pre-filter: {} cluster(s) ({} items), {} singleton(s) skipped, {} unembedded",
                 clusters.len(),
                 clustered_count,
                 singleton_count,
                 without_emb.len(),
-            );
+            ));
 
             let mut batches: Vec<Vec<DeduplicateLearningItem>> = Vec::new();
 
@@ -945,7 +950,9 @@ pub fn curate_dedup(conn: &Connection, params: DedupParams) -> TaskMgrResult<Ded
         .collect();
 
     if clusters_skipped > 0 {
-        eprintln!("Skipped {clusters_skipped} cluster(s) (all pairs previously dismissed)");
+        ui::emit(&format!(
+            "Skipped {clusters_skipped} cluster(s) (all pairs previously dismissed)"
+        ));
     }
 
     // Capture the IDs per batch BEFORE `process_batches_parallel` consumes `batches`.
@@ -970,20 +977,20 @@ pub fn curate_dedup(conn: &Connection, params: DedupParams) -> TaskMgrResult<Ded
     // batch is exactly the re-run case the operator wants visibility into.
     if total_batches > 1 || partial_count > 0 {
         if pair_mode_count > 0 {
-            eprintln!(
+            ui::emit(&format!(
                 "Processing {total_batches} batch(es) (concurrency={}), {pair_mode_count} in pair-judgment mode",
                 params.concurrency
-            );
+            ));
         } else if partial_count > 0 {
-            eprintln!(
+            ui::emit(&format!(
                 "Processing {total_batches} batch(es) (concurrency={}), {partial_count} with already-judged pair hints",
                 params.concurrency
-            );
+            ));
         } else {
-            eprintln!(
+            ui::emit(&format!(
                 "Processing {total_batches} batch(es) (concurrency={})",
                 params.concurrency
-            );
+            ));
         }
     }
 
@@ -1090,7 +1097,7 @@ pub fn curate_dedup(conn: &Connection, params: DedupParams) -> TaskMgrResult<Ded
                         // dismissal block are NOT rewritten and NOT filtered out —
                         // which is correct: the LLM did examine them, they're still
                         // active, so a dismissal against the original ID is meaningful.
-                        eprintln!("Warning: merge_cluster failed: {}", e);
+                        tracing::warn!(error = %e, "merge_cluster failed");
                         continue;
                     }
                 }
@@ -1132,12 +1139,12 @@ pub fn curate_dedup(conn: &Connection, params: DedupParams) -> TaskMgrResult<Ded
             );
             if !to_dismiss.is_empty() {
                 if !merge_map.is_empty() {
-                    eprintln!(
+                    ui::emit(&format!(
                         "Recording {} dismissal pair(s) for batch {} (rewrote {} retired source(s) via merge_map)",
                         to_dismiss.len(),
                         batch_idx + 1,
                         merge_map.len(),
-                    );
+                    ));
                 }
                 record_dismissals(conn, &to_dismiss)?;
             }
@@ -1283,10 +1290,10 @@ pub fn curate_embed(conn: &Connection, params: EmbedParams) -> TaskMgrResult<Emb
         };
 
         if text.is_empty() {
-            eprintln!(
+            ui::emit_err(&format!(
                 "Warning: skipping learning {} '{}': zero-length content",
                 row.id, row.title
-            );
+            ));
             skipped_empty += 1;
             continue;
         }
@@ -1296,9 +1303,9 @@ pub fn curate_embed(conn: &Connection, params: EmbedParams) -> TaskMgrResult<Emb
 
     let total_to_embed = items.len();
     if total_to_embed == 0 {
-        eprintln!("No learnings to embed.");
+        ui::emit("No learnings to embed.");
     } else {
-        eprintln!("Embedding {} learning(s)...", total_to_embed);
+        ui::emit(&format!("Embedding {total_to_embed} learning(s)..."));
     }
 
     // Batch-embed and store; count errors without aborting.
@@ -1309,34 +1316,38 @@ pub fn curate_embed(conn: &Connection, params: EmbedParams) -> TaskMgrResult<Emb
 
     for chunk in items.chunks(BATCH_SIZE) {
         done += chunk.len();
-        eprintln!("  [{}/{}] embedding batch...", done, total_to_embed);
+        ui::emit(&format!("  [{done}/{total_to_embed}] embedding batch..."));
 
         let texts: Vec<&str> = chunk.iter().map(|i| i.text.as_str()).collect();
 
         match embedder.embed_batch(&texts) {
             Ok(embeddings) => {
                 if embeddings.len() != chunk.len() {
-                    eprintln!(
+                    ui::emit_err(&format!(
                         "Warning: Ollama returned {} embeddings for {} inputs; processing available",
                         embeddings.len(),
                         chunk.len()
-                    );
+                    ));
                 }
                 for (item, embedding) in chunk.iter().zip(embeddings.iter()) {
                     match store_embedding(conn, item.id, &params.model, embedding) {
                         Ok(()) => embedded_this_run += 1,
                         Err(e) => {
-                            eprintln!(
+                            ui::emit_err(&format!(
                                 "Warning: failed to store embedding for learning {}: {e}",
                                 item.id
-                            );
+                            ));
                             errors += 1;
                         }
                     }
                 }
             }
             Err(e) => {
-                eprintln!("Warning: embedding batch failed: {e}");
+                tracing::warn!(
+                    error = %e,
+                    chunk_size = chunk.len(),
+                    "embedding batch failed",
+                );
                 errors += chunk.len();
             }
         }

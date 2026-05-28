@@ -48,6 +48,7 @@ use crate::learnings::{
     DeleteLearningResult, EditLearningResult, format_delete_text, format_edit_text,
 };
 use crate::models::RunStatus;
+use crate::output::ui;
 
 // ============================================================================
 // TextFormattable trait + generic output
@@ -127,7 +128,7 @@ impl_text_formattable!(
     crate::loop_engine::status::format_text
 );
 
-// ApplyLearningResult: the original handler used println! (adds newline).
+// ApplyLearningResult: the original handler printed with a trailing newline.
 // The standalone format function does NOT include a trailing newline,
 // so we add one here to preserve identical output behavior.
 impl TextFormattable for ApplyLearningResult {
@@ -199,7 +200,7 @@ pub fn output_json<T: serde::Serialize>(result: &T) {
     match serde_json::to_string_pretty(result) {
         Ok(json) => write_stdout(&format!("{}\n", json)),
         Err(e) => {
-            eprintln!("Error: failed to serialize result to JSON: {}", e);
+            ui::emit_err(&format!("Error: failed to serialize result to JSON: {e}"));
             process::exit(1);
         }
     }
@@ -251,7 +252,7 @@ fn write_all_blocking<W: io::Write>(fd: libc::c_int, w: &mut W, bytes: &[u8]) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {}
         Err(e) => {
-            eprintln!("Error: failed to write to stdout: {}", e);
+            ui::emit_err(&format!("Error: failed to write to stdout: {e}"));
             process::exit(1);
         }
     }
@@ -282,7 +283,7 @@ fn write_stdout(s: &str) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {}
         Err(e) => {
-            eprintln!("Error: failed to write to stdout: {}", e);
+            ui::emit_err(&format!("Error: failed to write to stdout: {e}"));
             process::exit(1);
         }
     }
@@ -405,9 +406,9 @@ pub fn generate_man_pages(
 
     // List mode: just print names
     if list {
-        println!("Available man pages:");
+        ui::emit_data("Available man pages:");
         for n in &all_names {
-            println!("  {}.1", n);
+            ui::emit_data(&format!("  {n}.1"));
         }
         return Ok(());
     }
@@ -432,15 +433,19 @@ pub fn generate_man_pages(
             generated += 1;
         }
 
-        println!("Generated {} man pages in {}", generated, dir.display());
+        ui::emit_data(&format!(
+            "Generated {} man pages in {}",
+            generated,
+            dir.display()
+        ));
         return Ok(());
     }
 
     // No options provided - show help
-    eprintln!("Usage: task-mgr man-pages --output-dir <DIR> | --name <NAME> | --list");
-    eprintln!("       Use --output-dir to generate all man pages to a directory");
-    eprintln!("       Use --name to generate a single man page to stdout");
-    eprintln!("       Use --list to see available man page names");
+    ui::emit("Usage: task-mgr man-pages --output-dir <DIR> | --name <NAME> | --list");
+    ui::emit("       Use --output-dir to generate all man pages to a directory");
+    ui::emit("       Use --name to generate a single man page to stdout");
+    ui::emit("       Use --list to see available man page names");
     Ok(())
 }
 

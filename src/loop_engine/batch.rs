@@ -15,6 +15,7 @@ use crate::loop_engine::project_config::read_project_config;
 use crate::loop_engine::signals;
 use crate::loop_engine::status_queries;
 use crate::loop_engine::worktree;
+use crate::output::ui;
 
 /// Result of a batch run.
 #[derive(Debug)]
@@ -218,10 +219,10 @@ fn validate_chain_branches(pairs: &[(PathBuf, PathBuf)]) -> TaskMgrResult<()> {
 
     for (branch, count) in &seen {
         if *count > 1 {
-            eprintln!(
+            ui::emit_err(&format!(
                 "Warning: duplicate branchName '{}' found in {} PRDs — worktree will be reused",
                 branch, count
-            );
+            ));
         }
     }
 
@@ -253,7 +254,10 @@ impl WorktreeCleanupContext<'_> {
 
         if exit_code != 0 {
             // Keep worktrees from failed runs for debugging
-            eprintln!("Keeping worktree (PRD failed): {}", wt_path.display());
+            ui::emit(&format!(
+                "Keeping worktree (PRD failed): {}",
+                wt_path.display()
+            ));
             return;
         }
 
@@ -265,7 +269,7 @@ impl WorktreeCleanupContext<'_> {
             false
         } else {
             // Interactive: prompt user
-            eprint!("Remove worktree '{}'? [y/N] ", wt_path.display());
+            ui::prompt(&format!("Remove worktree '{}'? [y/N] ", wt_path.display()));
             let mut input = String::new();
             if std::io::stdin().read_line(&mut input).is_ok() {
                 matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
@@ -279,26 +283,26 @@ impl WorktreeCleanupContext<'_> {
                 Ok(true) => {
                     if self.chain {
                         if let Some(branch) = branch_name {
-                            eprintln!(
+                            ui::emit(&format!(
                                 "Worktree removed but branch {} retained for chaining",
                                 branch
-                            );
+                            ));
                         } else {
-                            eprintln!("Removed worktree: {}", wt_path.display());
+                            ui::emit(&format!("Removed worktree: {}", wt_path.display()));
                         }
                     } else {
-                        eprintln!("Removed worktree: {}", wt_path.display());
+                        ui::emit(&format!("Removed worktree: {}", wt_path.display()));
                     }
                 }
-                Ok(false) => eprintln!(
+                Ok(false) => ui::emit_err(&format!(
                     "Warning: worktree has uncommitted changes, kept: {}",
                     wt_path.display()
-                ),
-                Err(e) => eprintln!(
+                )),
+                Err(e) => ui::emit_err(&format!(
                     "Warning: failed to remove worktree '{}': {}",
                     wt_path.display(),
                     e
-                ),
+                )),
             }
         }
     }
@@ -363,11 +367,11 @@ fn collect_prd_files(patterns: &[String], project_root: &Path) -> TaskMgrResult<
                 for root in roots.iter() {
                     if let Ok(files) = expand_glob_from(root, pattern) {
                         if !found_any {
-                            eprintln!(
+                            ui::emit(&format!(
                                 "Note: '{}' not found locally; using files from worktree {}",
                                 pattern,
                                 root.display()
-                            );
+                            ));
                         }
                         found_any = true;
                         for file in files {
@@ -420,11 +424,11 @@ fn print_batch_summary(
     stopped: usize,
     chain: bool,
 ) {
-    eprintln!("\n=== Batch Summary ===");
-    eprintln!(
+    ui::emit("\n=== Batch Summary ===");
+    ui::emit(&format!(
         "{} succeeded, {} failed, {} stopped, {} skipped (of {} total)",
         succeeded, failed, stopped, skipped, total
-    );
+    ));
 
     for result in results {
         let status = if result.skipped {
@@ -439,20 +443,20 @@ fn print_batch_summary(
         if chain {
             let branch = result.branch_name.as_deref().unwrap_or("(unknown)");
             let from = result.chain_base.as_deref().unwrap_or("HEAD");
-            eprintln!(
+            ui::emit(&format!(
                 "  [{}] {} → {} (from {})",
                 status,
                 result.prd_file.display(),
                 branch,
                 from,
-            );
+            ));
         } else {
-            eprintln!(
+            ui::emit(&format!(
                 "  [{}] {} (exit: {})",
                 status,
                 result.prd_file.display(),
                 result.exit_code
-            );
+            ));
         }
     }
 }
@@ -502,7 +506,7 @@ pub async fn run_batch(
     let prd_files = match collect_prd_files(patterns, project_root) {
         Ok(files) => files,
         Err(e) => {
-            eprintln!("Error: {}", e);
+            ui::emit_err(&format!("Error: {}", e));
             return batch_fail_early();
         }
     };
@@ -516,17 +520,17 @@ pub async fn run_batch(
     } else {
         format!("{} pattern(s)", patterns.len())
     };
-    eprintln!(
+    ui::emit(&format!(
         "Batch mode: found {} PRD file(s) matching {}",
         prd_files.len(),
         pattern_display
-    );
+    ));
 
     // Step 2: Validate all prompt files exist
     let pairs = match validate_prompt_files(&prd_files) {
         Ok(pairs) => pairs,
         Err(e) => {
-            eprintln!("Error: {}", e);
+            ui::emit_err(&format!("Error: {}", e));
             return batch_fail_early();
         }
     };
@@ -549,16 +553,16 @@ pub async fn run_batch(
         }
         for (prefix, files) in &prefix_to_files {
             if files.len() > 1 {
-                eprintln!(
+                ui::emit_err(&format!(
                     "Warning: {} PRDs would share prefix '{}' (same filename + branchName):",
                     files.len(),
                     prefix
-                );
+                ));
                 for f in files {
-                    eprintln!("  - {}", f.display());
+                    ui::emit_err(&format!("  - {}", f.display()));
                 }
-                eprintln!(
-                    "Their tasks will collide. Consider renaming the PRD files to be unique."
+                ui::emit_err(
+                    "Their tasks will collide. Consider renaming the PRD files to be unique.",
                 );
             }
         }
@@ -567,7 +571,7 @@ pub async fn run_batch(
     // Step 3: Chain validation — all PRDs must have branchName when --chain is active.
     // This runs upfront so we fail fast before any work begins.
     if chain && let Err(e) = validate_chain_branches(&pairs) {
-        eprintln!("Error: {}", e);
+        ui::emit_err(&format!("Error: {}", e));
         return batch_fail_early();
     }
 
@@ -597,17 +601,17 @@ pub async fn run_batch(
         // Check .stop signal before each PRD (covers files placed between runs,
         // or before the batch even starts its first PRD).
         if signals::check_stop_signal(&tasks_dir, None) {
-            eprintln!("Stop signal detected, skipping remaining PRDs");
+            ui::emit("Stop signal detected, skipping remaining PRDs");
             push_remaining_skipped(&mut results, &pairs, i, &mut skipped);
             break;
         }
 
-        eprintln!(
+        ui::emit(&format!(
             "\n--- Batch [{}/{}]: {} ---",
             i + 1,
             pairs.len(),
             prd_file.display()
-        );
+        ));
 
         let mut config = LoopConfig::from_env();
         config.yes_mode = yes;
@@ -674,7 +678,7 @@ pub async fn run_batch(
                 cleanup_ctx.cleanup(wt_path, exit_code, result_branch_name.as_deref());
             }
 
-            eprintln!("Stop signal detected during PRD, skipping remaining PRDs");
+            ui::emit("Stop signal detected during PRD, skipping remaining PRDs");
             push_remaining_skipped(&mut results, &pairs, i + 1, &mut skipped);
             break;
         }
@@ -695,7 +699,7 @@ pub async fn run_batch(
         // Chain stop-on-failure: if this PRD failed, skip all remaining PRDs.
         // Downstream PRDs would build on a broken state, so we abort immediately.
         if chain && exit_code != 0 {
-            eprintln!("Chain stopped: PRD failed, skipping remaining PRDs");
+            ui::emit("Chain stopped: PRD failed, skipping remaining PRDs");
             push_remaining_skipped(&mut results, &pairs, i + 1, &mut skipped);
             break;
         }

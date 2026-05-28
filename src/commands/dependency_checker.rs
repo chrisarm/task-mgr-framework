@@ -48,10 +48,11 @@ pub fn are_dependencies_satisfied(conn: &Connection, task_id: &str) -> bool {
     match get_unsatisfied_deps(conn, task_id) {
         Ok(unsatisfied) => unsatisfied.is_empty(),
         Err(e) => {
-            eprintln!(
-                "Warning: dependency check failed for task {}, assuming unsatisfied: {}",
-                task_id, e
-            );
+            // Internal diagnostic (channel B): a query error here is an unexpected
+            // fault on a fail-closed helper, not deliberate CLI output. Route to
+            // tracing so it lands in the log / console-WARN without a human-facing
+            // ui:: line on every scheduling pass.
+            tracing::warn!("dependency check failed for task {task_id}, assuming unsatisfied: {e}");
             false
         }
     }

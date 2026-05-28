@@ -33,6 +33,7 @@ use rusqlite::Connection;
 use crate::TaskMgrResult;
 use crate::commands::next::find_decay_warnings;
 use crate::models::RunStatus;
+use crate::output::ui;
 
 use checks::{
     find_active_runs_without_end, find_git_reconciliation_tasks, find_orphaned_relationships,
@@ -86,7 +87,7 @@ pub fn doctor(
     // to a live loop and aborting them would crash the running session.
     let loop_is_running = has_active_loop_lock(dir);
     let active_runs = if loop_is_running {
-        eprintln!("Note: skipping active-run checks — a loop is currently running");
+        ui::emit("Note: skipping active-run checks — a loop is currently running");
         Vec::new()
     } else {
         find_active_runs_without_end(conn)?

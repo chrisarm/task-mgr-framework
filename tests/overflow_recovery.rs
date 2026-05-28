@@ -151,7 +151,7 @@ fn ladder_walk_sonnet_xhigh_to_blocked() {
     let a1 = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
         conn: &mut conn,
-        task_id: task_id,
+        task_id,
         effort: Some("xhigh"),
         effective_model: Some(SONNET_MODEL),
         prompt_result: &pr,
@@ -183,7 +183,7 @@ fn ladder_walk_sonnet_xhigh_to_blocked() {
     let a2 = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
         conn: &mut conn,
-        task_id: task_id,
+        task_id,
         effort: Some("high"),
         effective_model: Some(SONNET_MODEL),
         prompt_result: &pr,
@@ -214,7 +214,7 @@ fn ladder_walk_sonnet_xhigh_to_blocked() {
     let a3 = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
         conn: &mut conn,
-        task_id: task_id,
+        task_id,
         effort: Some("high"),
         effective_model: Some(OPUS_MODEL),
         prompt_result: &pr,
@@ -245,7 +245,7 @@ fn ladder_walk_sonnet_xhigh_to_blocked() {
     let a4 = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
         conn: &mut conn,
-        task_id: task_id,
+        task_id,
         effort: Some("high"),
         effective_model: Some(OPUS_MODEL_1M),
         prompt_result: &pr,
@@ -281,7 +281,7 @@ fn explicit_opus_at_floor_skips_to_1m_rung() {
     let action = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
         conn: &mut conn,
-        task_id: task_id,
+        task_id,
         effort: Some("high"),
         effective_model: Some(OPUS_MODEL),
         prompt_result: &pr,
@@ -319,7 +319,7 @@ fn filename_sanitization_neutralizes_traversal() {
     let _ = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
         conn: &mut conn,
-        task_id: task_id,
+        task_id,
         effort: Some("xhigh"),
         effective_model: Some(SONNET_MODEL),
         prompt_result: &pr,
@@ -385,7 +385,7 @@ fn dump_content_includes_breakdown_note_and_verbatim_prompt() {
     let _ = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
         conn: &mut conn,
-        task_id: task_id,
+        task_id,
         effort: Some("xhigh"),
         effective_model: Some(SONNET_MODEL),
         prompt_result: &pr,
@@ -454,7 +454,7 @@ fn jsonl_appends_one_line_per_iteration_with_matching_action() {
         let action = handle_overflow(HandleOverflowParams {
             ctx: &mut ctx,
             conn: &mut conn,
-            task_id: task_id,
+            task_id,
             effort: *effort,
             effective_model: *model,
             prompt_result: &pr,
@@ -509,7 +509,7 @@ fn rotation_keeps_only_newest_three_dumps() {
         let _ = handle_overflow(HandleOverflowParams {
             ctx: &mut ctx,
             conn: &mut conn,
-            task_id: task_id,
+            task_id,
             effort: Some("xhigh"),
             effective_model: Some(SONNET_MODEL),
             prompt_result: &pr,
@@ -579,7 +579,7 @@ fn overflow_recovered_set_populated_after_first_overflow() {
     let _ = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
         conn: &mut conn,
-        task_id: task_id,
+        task_id,
         effort: Some("xhigh"),
         effective_model: Some(SONNET_MODEL),
         prompt_result: &pr,
@@ -614,7 +614,7 @@ fn original_model_captured_on_first_overflow_only() {
     let _ = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
         conn: &mut conn,
-        task_id: task_id,
+        task_id,
         effort: Some("xhigh"),
         effective_model: Some(SONNET_MODEL),
         prompt_result: &pr,
@@ -647,7 +647,7 @@ fn original_model_captured_on_first_overflow_only() {
         let _ = handle_overflow(HandleOverflowParams {
             ctx: &mut ctx,
             conn: &mut conn,
-            task_id: task_id,
+            task_id,
             effort: *effort,
             effective_model: *model,
             prompt_result: &pr,
@@ -683,7 +683,7 @@ fn blocked_rung_writes_both_dump_and_jsonl() {
     let action = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
         conn: &mut conn,
-        task_id: task_id,
+        task_id,
         effort: Some("high"),
         effective_model: Some(OPUS_MODEL_1M),
         prompt_result: &pr,
@@ -730,7 +730,7 @@ fn no_pollution_outside_tempdir() {
     let _ = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
         conn: &mut conn,
-        task_id: task_id,
+        task_id,
         effort: Some("xhigh"),
         effective_model: Some(SONNET_MODEL),
         prompt_result: &pr,
@@ -790,7 +790,7 @@ fn override_persists_across_iterations() {
     let action = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
         conn: &mut conn,
-        task_id: task_id,
+        task_id,
         effort: Some("high"),
         effective_model: Some(SONNET_MODEL),
         prompt_result: &pr,
@@ -839,7 +839,7 @@ fn original_model_captured_first_overflow_only() {
     let a1 = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
         conn: &mut conn,
-        task_id: task_id,
+        task_id,
         effort: Some("xhigh"),
         effective_model: Some(SONNET_MODEL),
         prompt_result: &pr,
@@ -867,7 +867,7 @@ fn original_model_captured_first_overflow_only() {
     let a2 = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
         conn: &mut conn,
-        task_id: task_id,
+        task_id,
         effort: Some("high"),
         effective_model: Some(SONNET_MODEL),
         prompt_result: &pr,
@@ -896,7 +896,7 @@ fn original_model_captured_first_overflow_only() {
     let a3 = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
         conn: &mut conn,
-        task_id: task_id,
+        task_id,
         effort: Some("high"),
         effective_model: Some(OPUS_MODEL),
         prompt_result: &pr,
@@ -931,7 +931,7 @@ fn run_id_none_serializes_correctly() {
     let _ = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
         conn: &mut conn,
-        task_id: task_id,
+        task_id,
         effort: Some("xhigh"),
         effective_model: Some(SONNET_MODEL),
         prompt_result: &pr,
@@ -976,7 +976,7 @@ fn effective_model_none_dump_header() {
     let _ = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
         conn: &mut conn,
-        task_id: task_id,
+        task_id,
         effort: Some("xhigh"),
         effective_model: None,
         prompt_result: // <-- effective_model is None
@@ -1023,7 +1023,7 @@ fn rung_4_writes_observability() {
     let action = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
         conn: &mut conn,
-        task_id: task_id,
+        task_id,
         effort: Some("high"),
         effective_model: Some(OPUS_MODEL_1M),
         prompt_result: &pr,
@@ -1082,7 +1082,7 @@ fn dump_uses_sent_effort_not_resolved() {
     let action = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
         conn: &mut conn,
-        task_id: task_id,
+        task_id,
         effort: Some("xhigh"),
         effective_model: // sent effort
         Some(SONNET_MODEL),

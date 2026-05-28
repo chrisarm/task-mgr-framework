@@ -30,6 +30,7 @@ use task_mgr::handlers::{
     output_result,
 };
 use task_mgr::learnings::{EditLearningParams, delete_learning, edit_learning};
+use task_mgr::output::ui;
 
 /// Derive the project root from the git repository root.
 ///
@@ -52,6 +53,30 @@ fn get_project_root() -> Result<PathBuf, TaskMgrError> {
 
     let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
     Ok(PathBuf::from(root))
+}
+
+/// Resolve the active PRD task prefix for the diagnostics log filename,
+/// best-effort. Reuses the same active-PRD-context resolver `task-mgr current`
+/// uses (`resolve_context`: env `TASK_MGR_ACTIVE_PREFIX` → single-prefix
+/// fallback) so the log file is suffixed by the SAME prefix as
+/// `tasks/progress-<prefix>.txt`.
+///
+/// Guarded so logging setup has no surprising side effects:
+/// - skips when `tasks.db` is absent → never *creates* a database (e.g. during
+///   `task-mgr init` on a fresh repo);
+/// - uses `open_connection` (schema-only, idempotent), NOT `open_and_migrate`,
+///   so it never applies pending migrations behind `task-mgr migrate status`.
+///
+/// Any resolution error degrades to `None` → the unsuffixed `task-mgr.log`.
+fn resolve_active_prefix_for_logging(db_dir: &Path) -> Option<String> {
+    if !db_dir.join("tasks.db").exists() {
+        return None;
+    }
+    let conn = open_connection(db_dir).ok()?;
+    task_mgr::commands::add::resolve_context(&conn)
+        .ok()
+        .flatten()
+        .map(|ctx| ctx.prefix)
 }
 
 /// Args passed to [`dispatch_init`] — fields mirror `Commands::Init`'s clap
@@ -106,9 +131,9 @@ fn dispatch_init(
 ) -> Result<(), TaskMgrError> {
     // Mode 1: reject `--force` on project-level init before any disk write.
     if args.from_json.is_empty() && args.force {
-        eprintln!(
+        ui::emit_err(
             "error: `task-mgr init --force` is not supported. Project-level init has no \
-             destructive form. To reset, `rm -rf .task-mgr/` and re-run `task-mgr init`."
+             destructive form. To reset, `rm -rf .task-mgr/` and re-run `task-mgr init`.",
         );
         process::exit(2);
     }
@@ -144,15 +169,15 @@ fn dispatch_init_project(
             cwd: project_root,
         })?;
         if !enhance_result.no_errors() {
-            eprintln!(
+            ui::emit_err(
                 "warning: `task-mgr init --enhance` completed with one or more file \
-                 errors; see messages above"
+                 errors; see messages above",
             );
         }
     } else {
-        eprintln!(
+        ui::emit(
             "Initialized .task-mgr/. Run `task-mgr enhance agents` to add task-mgr \
-             workflow guidance to CLAUDE.md / AGENTS.md (or rerun with `--enhance`)."
+             workflow guidance to CLAUDE.md / AGENTS.md (or rerun with `--enhance`).",
         );
     }
 
@@ -171,15 +196,15 @@ fn dispatch_init_shim(
 ) -> Result<(), TaskMgrError> {
     use task_mgr::commands::init::init_project;
 
-    eprintln!(
+    ui::emit(
         "DEPRECATED: `task-mgr init --from-json X` keeps working indefinitely but the \
          canonical form is `task-mgr loop init X` (single PRD) or `task-mgr batch init \
-         <glob>...` (multi)."
+         <glob>...` (multi).",
     );
     if args.enhance {
-        eprintln!(
+        ui::emit(
             "note: --enhance is ignored on the deprecated --from-json path; run \
-             `task-mgr init --enhance` separately to update CLAUDE.md / AGENTS.md."
+             `task-mgr init --enhance` separately to update CLAUDE.md / AGENTS.md.",
         );
     }
 
@@ -205,7 +230,7 @@ fn dispatch_init_shim(
     )?;
 
     if verbose {
-        eprint!("{}", format_init_verbose(&result));
+        ui::prompt(&format_init_verbose(&result));
     }
     output_result(&result, format);
     Ok(())
@@ -224,7 +249,7 @@ fn main() {
 
             let _ = err.print();
             if let Some(hint_text) = hint {
-                eprintln!("{hint_text}");
+                ui::emit_err(hint_text);
             }
             process::exit(err.exit_code());
         }
@@ -267,20 +292,27 @@ fn main() {
     {
         let cwd_default = cwd.join(&cli.dir);
         if cwd_default != resolved.path && cwd_default.join("tasks.db").exists() {
-            eprintln!(
+            ui::emit_err(&format!(
                 "\x1b[33m[warn]\x1b[0m task-mgr: ignoring stray DB at {} \u{2014} \
                  using main-repo DB at {} instead. Move or delete the stray DB \
                  (or pass --dir / set TASK_MGR_DIR) to silence this warning.",
                 cwd_default.display(),
                 resolved.path.display(),
-            );
+            ));
         }
     }
 
     cli.dir = resolved.path.clone();
 
+    // Initialize diagnostics logging (CONTRACT-LOG-001 channel B) once, before
+    // any loop work. Best-effort: resolves the active PRD prefix the same way
+    // `task-mgr current` does so the log file is suffixed like
+    // `tasks/progress-<prefix>.txt`. Never aborts on failure.
+    let active_prefix = resolve_active_prefix_for_logging(&cli.dir);
+    let _ = task_mgr::observability::init(&cli.dir, active_prefix.as_deref());
+
     if let Err(e) = run(cli, resolved) {
-        eprintln!("Error: {}", e);
+        ui::emit_err(&format!("Error: {e}"));
         process::exit(1);
     }
 }
@@ -375,12 +407,12 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                     None,
                 )?;
                 if !decayed.is_empty() && cli.verbose {
-                    eprintln!(
+                    ui::emit(&format!(
                         "[verbose] Decayed {} blocked/skipped task(s) back to todo",
                         decayed.len()
-                    );
+                    ));
                     for (task_id, old_status) in &decayed {
-                        eprintln!("[verbose]   - {} (was {})", task_id, old_status);
+                        ui::emit(&format!("[verbose]   - {task_id} (was {old_status})"));
                     }
                 }
             }
@@ -396,7 +428,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
             )?;
 
             if cli.verbose {
-                eprint!("{}", format_next_verbose(&result));
+                ui::prompt(&format_next_verbose(&result));
             }
             output_result(&result, cli.format);
             Ok(())
@@ -536,7 +568,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                 )?;
 
                 if cli.verbose {
-                    eprint!("{}", format_doctor_verbose(&result));
+                    ui::prompt(&format_doctor_verbose(&result));
                 }
                 output_result(&result, cli.format);
             }
@@ -647,7 +679,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
             let result = recall(&conn, params)?;
 
             if cli.verbose {
-                eprint!("{}", format_recall_verbose(&result));
+                ui::prompt(&format_recall_verbose(&result));
             }
             output_result(&result, cli.format);
             Ok(())
@@ -734,11 +766,10 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                         return Ok(());
                     }
 
-                    eprintln!(
-                        "This will reset {} task(s) to todo status.\n\
-                        Use --yes (-y) to confirm.",
-                        count
-                    );
+                    ui::emit(&format!(
+                        "This will reset {count} task(s) to todo status.\n\
+                        Use --yes (-y) to confirm."
+                    ));
                     return Err(TaskMgrError::invalid_state(
                         "reset",
                         "--all",
@@ -815,11 +846,11 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                 let learning = task_mgr::learnings::get_learning(&conn, learning_id)?
                     .ok_or_else(|| TaskMgrError::learning_not_found(learning_id.to_string()))?;
 
-                eprintln!(
+                ui::emit(&format!(
                     "This will delete learning #{}: \"{}\"\n\
                     Use --yes (-y) to confirm.",
                     learning_id, learning.title
-                );
+                ));
                 return Err(TaskMgrError::invalid_state(
                     "delete-learning",
                     "confirmation",
@@ -1016,9 +1047,9 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
             ) {
                 LoopResolve::Nested(child) => child,
                 LoopResolve::Flat(child) => {
-                    eprintln!(
+                    ui::emit(
                         "DEPRECATED: prefer `task-mgr loop run ...`. \
-                         The flat form will continue to work indefinitely."
+                         The flat form will continue to work indefinitely.",
                     );
                     child
                 }
@@ -1053,7 +1084,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                         prefix_mode,
                     )?;
                     if cli.verbose {
-                        eprint!("{}", format_init_verbose(&result));
+                        ui::prompt(&format_init_verbose(&result));
                     }
                     output_result(&result, cli.format);
                     Ok(())
@@ -1195,9 +1226,9 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
             ) {
                 BatchResolve::Nested(child) => child,
                 BatchResolve::Flat(child) => {
-                    eprintln!(
+                    ui::emit(
                         "DEPRECATED: prefer `task-mgr batch run ...`. \
-                         The flat form will continue to work indefinitely."
+                         The flat form will continue to work indefinitely.",
                     );
                     child
                 }
@@ -1238,7 +1269,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                         prefix_mode,
                     )?;
                     if cli.verbose {
-                        eprint!("{}", format_init_verbose(&result));
+                        ui::prompt(&format_init_verbose(&result));
                     }
                     output_result(&result, cli.format);
                     Ok(())
@@ -1527,12 +1558,12 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
             )?;
 
             if result.learnings_extracted > 0 {
-                println!(
+                ui::emit_data(&format!(
                     "Extracted {} learning(s) with IDs: {:?}",
                     result.learnings_extracted, result.learning_ids
-                );
+                ));
             } else {
-                println!("No learnings extracted from output.");
+                ui::emit_data("No learnings extracted from output.");
             }
             Ok(())
         }

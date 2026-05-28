@@ -12,6 +12,7 @@ use crate::commands::curate::types::{EnrichCandidate, EnrichParams, EnrichPropos
 use crate::learnings::{EditLearningParams, edit_learning, get_learning, get_learning_tags};
 use crate::loop_engine::claude;
 use crate::loop_engine::config::PermissionMode;
+use crate::output::ui;
 
 use std::collections::HashSet;
 
@@ -108,14 +109,14 @@ pub fn parse_enrich_response(
     batch_ids: &[i64],
 ) -> TaskMgrResult<Vec<EnrichProposal>> {
     let Some(json_str) = extract_json_array(response) else {
-        eprintln!("Warning: enrich response contained no JSON array");
+        tracing::warn!("enrich response contained no JSON array");
         return Ok(Vec::new());
     };
 
     let raw: Vec<RawEnrichItem> = match serde_json::from_str(&json_str) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("Warning: failed to parse enrich response: {e}");
+            tracing::warn!(error = %e, "failed to parse enrich response");
             return Ok(Vec::new());
         }
     };
@@ -126,10 +127,10 @@ pub fn parse_enrich_response(
         .into_iter()
         .filter_map(|item| {
             if !valid_ids.contains(&item.learning_id) {
-                eprintln!(
+                ui::emit_err(&format!(
                     "Warning: enrich response contained hallucinated learning_id {}; skipping",
                     item.learning_id
-                );
+                ));
                 return None;
             }
             Some(EnrichProposal {
@@ -222,7 +223,11 @@ pub fn curate_enrich(conn: &Connection, params: EnrichParams) -> TaskMgrResult<E
     let mut batches_processed: usize = 0;
 
     for (batch_idx, chunk) in candidates.chunks(batch_size).enumerate() {
-        eprintln!("Processing batch {}/{}...", batch_idx + 1, total_batches);
+        ui::emit(&format!(
+            "Processing batch {}/{}...",
+            batch_idx + 1,
+            total_batches
+        ));
 
         let batch_items = build_batch_items(conn, chunk)?;
         if batch_items.is_empty() {
@@ -249,24 +254,24 @@ pub fn curate_enrich(conn: &Connection, params: EnrichParams) -> TaskMgrResult<E
         ) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!(
+                ui::emit_err(&format!(
                     "Warning: LLM call failed for batch {}/{}: {}",
                     batch_idx + 1,
                     total_batches,
                     e
-                );
+                ));
                 llm_errors += 1;
                 continue;
             }
         };
 
         if claude_result.exit_code != 0 {
-            eprintln!(
+            ui::emit_err(&format!(
                 "Warning: Claude exited with code {} for batch {}/{}",
                 claude_result.exit_code,
                 batch_idx + 1,
                 total_batches
-            );
+            ));
             llm_errors += 1;
             continue;
         }
@@ -287,12 +292,12 @@ pub fn curate_enrich(conn: &Connection, params: EnrichParams) -> TaskMgrResult<E
             match enriched {
                 Ok(n) => learnings_enriched += n,
                 Err(e) => {
-                    eprintln!(
+                    ui::emit_err(&format!(
                         "Warning: batch {}/{} transaction failed: {}",
                         batch_idx + 1,
                         total_batches,
                         e
-                    );
+                    ));
                     llm_errors += 1;
                 }
             }

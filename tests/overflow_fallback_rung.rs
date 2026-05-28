@@ -132,7 +132,7 @@ fn fallback_disabled_walks_existing_four_rung_to_blocked() {
     let action = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
         conn: &mut conn,
-        task_id: task_id,
+        task_id,
         effort: Some("high"),
         effective_model: Some(OPUS_MODEL_1M),
         prompt_result: &pr,
@@ -196,7 +196,7 @@ fn fallback_absent_matches_disabled_byte_for_byte() {
     let action = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
         conn: &mut conn,
-        task_id: task_id,
+        task_id,
         effort: Some("high"),
         effective_model: Some(OPUS_MODEL_1M),
         prompt_result: &pr,
@@ -232,7 +232,7 @@ fn fallback_enabled_claude_at_ceiling_promotes_to_grok() {
     let action = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
         conn: &mut conn,
-        task_id: task_id,
+        task_id,
         effort: Some("high"),
         effective_model: Some(OPUS_MODEL_1M),
         prompt_result: &pr,
@@ -307,7 +307,7 @@ fn fallback_enabled_task_already_on_grok_returns_blocked() {
     let action = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
         conn: &mut conn,
-        task_id: task_id,
+        task_id,
         effort: Some("high"),
         effective_model: Some(GROK_DEFAULT_MODEL),
         prompt_result: &pr,
@@ -378,7 +378,7 @@ fn grok_primary_overflow_with_claude_fallback_promotes_to_claude() {
     let action = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
         conn: &mut conn,
-        task_id: task_id,
+        task_id,
         effort: Some("high"),
         effective_model: Some(GROK_DEFAULT_MODEL),
         prompt_result: &pr,
@@ -449,7 +449,7 @@ fn grok_primary_overflow_without_claude_fallback_blocks() {
     let action = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
         conn: &mut conn,
-        task_id: task_id,
+        task_id,
         effort: Some("high"),
         effective_model: Some(GROK_DEFAULT_MODEL),
         prompt_result: &pr,
@@ -492,7 +492,7 @@ fn claude_to_grok_byte_identical_when_primary_runner_none() {
     let action = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
         conn: &mut conn,
-        task_id: task_id,
+        task_id,
         effort: Some("high"),
         effective_model: Some(OPUS_MODEL_1M),
         prompt_result: &pr,
@@ -545,7 +545,7 @@ fn grok_to_claude_promoted_task_overflows_again_blocks() {
     let action = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
         conn: &mut conn,
-        task_id: task_id,
+        task_id,
         effort: Some("high"),
         effective_model: Some(OPUS_MODEL_1M),
         prompt_result: &pr,
@@ -591,7 +591,7 @@ fn claude_to_grok_promoted_task_with_primary_runner_blocks() {
     let action = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
         conn: &mut conn,
-        task_id: task_id,
+        task_id,
         effort: Some("high"),
         effective_model: Some(GROK_DEFAULT_MODEL),
         prompt_result: &pr,

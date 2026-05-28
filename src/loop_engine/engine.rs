@@ -550,6 +550,9 @@ pub struct SlotIterationParams {
     /// Active PRD task prefix forwarded to every slot's `spawn_claude` call
     /// via `TASK_MGR_ACTIVE_PREFIX`. Mirrors `WaveIterationParams::task_prefix`.
     pub task_prefix: Option<String>,
+    /// Loop run ID forwarded to the per-slot grok stderr capture file name.
+    /// `None` for non-loop callers; the sniffer uses a placeholder fallback.
+    pub run_id: Option<String>,
 }
 
 /// Fields that vary between early-exit paths in `run_slot_iteration`.
@@ -919,10 +922,13 @@ pub fn apply_status_updates(
             // Legacy dispatch-failed warning. Format matches engine.rs's
             // pre-FEAT-003 emit at the previous line ~4821 byte-for-byte:
             // `Warning: <task-status>{id}:{Debug status}</task-status> dispatch failed: {err}`.
-            eprintln!(
+            // Migrated to `ui::emit_err` (channel A2): same wire bytes as the
+            // prior `eprintln!` (locked stderr + single writeln) so the
+            // `lifecycle_stderr_contract.rs` snapshot still passes unchanged.
+            crate::output::ui::emit_err(&format!(
                 "Warning: <task-status>{}:{:?}</task-status> dispatch failed: {}",
                 update.task_id, update.status, msg,
-            );
+            ));
         }
         results.push((update.task_id.clone(), update.status, outcome.applied));
     }

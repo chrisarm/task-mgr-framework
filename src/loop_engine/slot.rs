@@ -52,6 +52,7 @@ use crate::loop_engine::reactions;
 use crate::loop_engine::runner::{self, RunnerKind};
 use crate::loop_engine::watchdog;
 use crate::models::TaskStatus;
+use crate::output::ui;
 
 /// Build a slot-scoped early-exit `SlotResult`.
 ///
@@ -147,14 +148,14 @@ pub fn run_slot_iteration(
         .or_else(|| model::effort_for_difficulty(bundle.difficulty.as_deref()));
 
     if params.verbose {
-        eprintln!(
+        ui::emit(&format!(
             "[slot {}] task={} model={} effort={} cwd={}",
             slot.slot_index,
             task_id,
             effective_model.as_deref().unwrap_or("(default)"),
             effort.unwrap_or("(default)"),
             slot.working_root.display(),
-        );
+        ));
     }
 
     // Prefix every line of this slot's tee output with its slot index so
@@ -174,7 +175,7 @@ pub fn run_slot_iteration(
         effective_model.as_deref(),
         effort,
     );
-    claude::emit_prefixed_lines(Some(&slot_label_buf), banner.trim_start_matches('\n'));
+    ui::emit_prefixed(Some(&slot_label_buf), banner.trim_start_matches('\n'));
 
     // Per-slot activity monitor + timeout. Each slot gets its own monitor
     // polling its own working_root so heartbeats/change-tracking lines and
@@ -218,6 +219,8 @@ pub fn run_slot_iteration(
             cleanup_title_artifact: slot
                 .effective_runner
                 .supports(runner::RunnerCapability::TitleArtifactCleanup),
+            run_id: params.run_id.as_deref(),
+            iteration: Some(params.iteration),
             ..Default::default()
         },
     );
@@ -229,10 +232,10 @@ pub fn run_slot_iteration(
     let claude_result = match claude_result {
         Ok(r) => r,
         Err(crate::error::TaskMgrError::GrokAuthFailure { hint }) => {
-            eprintln!(
+            ui::emit(&format!(
                 "[slot {}] Grok auth failure for task {}: {}",
                 slot.slot_index, task_id, hint
-            );
+            ));
             return Ok(slot_early_exit(
                 slot,
                 SlotEarlyExit {
@@ -253,10 +256,10 @@ pub fn run_slot_iteration(
         // path, where `analyze_output` produces the same outcome). The
         // aggregator never counts a `TransientBackend` slot as crashed.
         Err(crate::error::TaskMgrError::TransientBackend { retry_after_secs }) => {
-            eprintln!(
+            ui::emit(&format!(
                 "[slot {}] Transient backend error for task {} (retry_after_secs: {:?}); will back off and retry",
                 slot.slot_index, task_id, retry_after_secs
-            );
+            ));
             return Ok(slot_early_exit(
                 slot,
                 SlotEarlyExit {
@@ -273,10 +276,10 @@ pub fn run_slot_iteration(
     };
 
     if claude_result.timed_out {
-        eprintln!(
+        ui::emit(&format!(
             "[slot {}] iteration timed out for task {}",
             slot.slot_index, task_id,
-        );
+        ));
         return Ok(slot_early_exit(
             slot,
             SlotEarlyExit {
@@ -379,10 +382,10 @@ pub(super) fn claim_slot_task(conn: &mut Connection, task_id: &str) -> bool {
     match TaskLifecycle::new(conn).try_claim(task_id, &[TaskStatus::Todo, TaskStatus::InProgress]) {
         Ok(claimed) => claimed,
         Err(e) => {
-            eprintln!(
+            ui::emit_err(&format!(
                 "Warning: failed to claim slot task {}: {} — skipping slot",
                 task_id, e,
-            );
+            ));
             false
         }
     }
@@ -627,7 +630,7 @@ pub(super) fn process_slot_result(
     // pass can drain them.
     if let IterationOutcome::Reorder(ref rid) = slot_result.iteration_result.outcome {
         ctx.pending_reorder_hints.push(rid.clone());
-        eprintln!("[slot {}] Queued reorder hint: {}", slot_idx, rid);
+        ui::emit(&format!("[slot {}] Queued reorder hint: {}", slot_idx, rid));
     }
 
     for f in &slot_result.iteration_result.files_modified {
@@ -670,6 +673,7 @@ mod tests {
             max_iterations: 1,
             elapsed_secs: 0,
             task_prefix: None,
+            run_id: None,
         }
     }
 
@@ -875,6 +879,7 @@ mod tests {
             max_iterations: 100,
             elapsed_secs: 42,
             task_prefix: None,
+            run_id: None,
         };
         let cloned = params.clone();
         assert_eq!(cloned.db_dir, params.db_dir);

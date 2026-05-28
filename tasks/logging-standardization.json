@@ -1,0 +1,487 @@
+{
+  "branchName": "feat/logging-standardization",
+  "description": "Standardize task-mgr's ~511 eprintln!/println! into a classified output model: a ui:: product channel (preserves exact bytes + audience FD, never decorated) for human-facing output and byte-locked operator contracts; a tracing subscriber + rolling file appender for internal diagnostics (console WARN+ via TASK_MGR_LOG, DEBUG+ to .task-mgr/logs/task-mgr-<prefix>.log, prefix-suffixed per task-list like progress-<prefix>.txt); and a per-slot-per-iteration capture file for child-agent (grok) raw stderr. Decided by /spike 2026-05-27 — see tasks/logging-standardization-spike.md. Full-repo migration. Stream-C is decoupled from reactions FEAT-014 (file + drop console now; classifier-flagged surfacing is a later task).",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "Rust: No warnings in `cargo check` output",
+      "Rust: No warnings in `cargo clippy -- -D warnings` output",
+      "Rust: scoped tests pass with `cargo test -p task-mgr <module>`",
+      "Rust: `cargo fmt --check` passes",
+      "Byte-locked operator-contract messages (lifecycle_stderr_contract.rs and any sibling) emit byte-identical output after migration — those snapshot tests pass UNCHANGED",
+      "No breaking changes to machine-readable stdout (list/show/export/stats data stays on stdout, same bytes)"
+    ],
+    "description": "These criteria apply to ALL implementation tasks"
+  },
+  "model": "claude-sonnet-4-6",
+  "priorityPhilosophy": {
+    "description": "Hierarchy of what matters most when implementing tasks",
+    "hierarchy": [
+      "1. PLAN — Classify each call site A/A2/B per the contract BEFORE editing",
+      "2. PHASE 2 FOUNDATION — the ui::/tracing boundary is the foundation 6 migrations build on; get it right once",
+      "3. FUNCTIONING CODE — output still appears where operators expect it",
+      "4. CORRECTNESS — byte-locked contracts stay byte-identical; scoped tests pass",
+      "5. CODE QUALITY — no raw eprintln!/println! left in migrated modules",
+      "6. POLISH — docs, formatting"
+    ],
+    "principles": [
+      "The boundary is a CLASSIFICATION rule, not a file-descriptor split (learning #4169)",
+      "A2 byte-preservation is non-negotiable — operators grep these lines and snapshot tests lock them",
+      "Edge cases = test cases — every byte-locked contract gets a regression assertion",
+      "Scoped per-iteration tests, full suite at REVIEW-001",
+      "Mechanical s/eprintln!/tracing/ is WRONG — it breaks operator grep + snapshot tests"
+    ]
+  },
+  "prohibitedOutcomes": [
+    "Mechanical s/eprintln!/tracing::warn!/ that decorates byte-locked operator lines with a WARN/timestamp prefix",
+    "Moving a human-facing banner or CLI data line into a DEBUG log file nobody watches",
+    "A tracing init that aborts the CLI when the log file can't be opened (must degrade to console-only)",
+    "Tests that only assert 'a line was logged' without checking the exact bytes for A2 contracts",
+    "Leaving raw eprintln!/println! in a module after marking it migrated (the CI guard must catch this)",
+    "Coupling this PRD's completion to reactions FEAT-014 (stream-C is decoupled by decision)"
+  ],
+  "project": "task-mgr",
+  "requires": [],
+  "taskPrefix": "147cf226",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "Positive: ui::emit/emit_err/emit_data/emit_prefixed exist in src/output/, each documenting its FD; ui::emit_prefixed reproduces emit_prefixed_lines semantics (empty text → one prefixed blank line; interior blanks preserved) — covered by a unit test that previously lived for write_prefixed_lines",
+        "Positive: src/observability.rs::init(active_prefix) builds an EnvFilter (env TASK_MGR_LOG, default WARN+ console) + tracing-appender daily file layer at DEBUG+ to <.task-mgr>/logs/task-mgr-<prefix>.log (prefix-suffixed like progress-<prefix>.txt); falls back to task-mgr.log when no prefix resolves; main.rs resolves the active prefix and calls init() once before loop work",
+        "Positive: the log filename is suffixed by the active PRD task prefix using the SAME prefix source as tasks/progress-<prefix>.txt — a test with prefix \"abc12345\" set asserts the appender targets task-mgr-abc12345.log, and with no prefix asserts it targets task-mgr.log",
+        "Positive: .task-mgr/logs/ is added to the managed .gitignore block by ensure_progress_gitignore",
+        "Positive: tests/no_raw_prints.rs exists, allow-lists every currently-unmigrated module, and PASSES at FEAT-001 (guard is green before any migration)",
+        "Negative: init() failure to open the log file does NOT abort — a unit test points the log dir at an unwritable path and asserts init() returns Ok / degrades to console-only",
+        "Negative: ui:: helpers add NO level or timestamp decoration (assert emitted bytes equal the input text + newline/prefix only)",
+        "Unit test: TASK_MGR_LOG unset → console filter is WARN+; TASK_MGR_LOG=\"debug\" → console filter is DEBUG+",
+        "Known-bad: an init() that .expect()s the file handle would crash the CLI on a read-only .task-mgr — the unwritable-path test catches it; init must use a fallible open + fallback",
+        "Known-bad: a guard test that greps for the literal string 'println!' would also match 'eprintln!' (substring) and mis-count — the guard must match on a word/macro boundary, and a unit test feeds it a line containing eprintln! to prove eprintln and println are distinguished",
+        "CONTRACT: the discriminator decision tree + ui:: signatures + observability init contract from tasks/logging-standardization-spike.md are recorded verbatim in tasks/progress-<prefix>.txt under ## CONTRACT-LOG-001 so FEAT-002..006 implement against one fixed spec",
+        "Failure mode: if tracing-appender guard (WorkerGuard) is dropped early, file writes are lost — init() must return/retain the guard for the process lifetime (store in a OnceLock/leaked static), verified by a test that logs then reads the file back"
+      ],
+      "dependsOn": [],
+      "description": "Establish the logging boundary the whole effort builds on (folds in CONTRACT-LOG-001 from the spike — the full contract text is in tasks/logging-standardization-spike.md; record it in the progress log on this iteration).\n\nDO:\n- Grow src/output/ into the ui:: product channel: ui::emit (human progress → stderr), ui::emit_err (errors → stderr), ui::emit_data (machine/CLI data → stdout), and re-home emit_prefixed_lines as ui::emit_prefixed (preserve its empty-text + interior-blank-line semantics, claude.rs:240). Each helper documents which FD it targets and that it NEVER adds level/timestamp. Reuse the existing should_color()/NO_COLOR/TTY discipline.\n- Add src/observability.rs with init(active_prefix: Option<&str>) that builds a tracing_subscriber::registry() with: (a) an EnvFilter from env var TASK_MGR_LOG defaulting to console WARN+; (b) a tracing-appender rolling-daily file layer at DEBUG+ writing to <.task-mgr>/logs/task-mgr-<prefix>.log — SUFFIXED by the active PRD task prefix, exactly the convention tasks/progress-<prefix>.txt uses, so concurrent loops / different PRDs never share one log file. Resolve <.task-mgr> via the paths:: module / TASK_MGR_DIR; resolve <prefix> from the SAME active-PRD-context source progress files use (the resolver behind `task-mgr current` / TASK_MGR_ACTIVE_PREFIX). When no prefix resolves (a bare CLI command outside any PRD context), fall back to <.task-mgr>/logs/task-mgr.log (unsuffixed). main.rs resolves the active prefix best-effort and passes it to init(). init() is idempotent and best-effort: if the log file/dir can't be opened, degrade to console-only and NEVER abort. Call init() ONCE from src/main.rs before any loop work.\n- Add tracing/tracing-subscriber/tracing-appender to Cargo.toml.\n- Extend the gitignore managed-block writer (src/commands/init/mod.rs::ensure_progress_gitignore) to also cover .task-mgr/logs/.\n- Add the CI guard test tests/no_raw_prints.rs (mirror tests/no_hardcoded_models.rs): fails if a raw eprintln!/println! appears OUTSIDE src/output/ in any module NOT on an allow-list. Seed the allow-list with EVERY module that still has raw prints (whole repo) so the guard is green at FEAT-001 and shrinks as each migration removes its modules.\n\nDO NOT:\n- Migrate any existing call site in this task (that's FEAT-002..005) — only add the new surface + guard.\n- Let tracing console output duplicate ui:: output (they are disjoint channels: ui:: = product, tracing = diagnostics).\n\nEdge cases:\n- .task-mgr/logs/ dir missing → create it; if creation fails → console-only, no panic.\n- TASK_MGR_LOG unset → console WARN+; malformed TASK_MGR_LOG → fall back to WARN+ with a one-time stderr note.\n- init() called twice (tests) → second call is a no-op, not an error.",
+      "edgeCases": [
+        "Unwritable .task-mgr/logs/: init degrades to console-only, no panic",
+        "TASK_MGR_LOG unset: console WARN+ default",
+        "Malformed TASK_MGR_LOG value: fall back to WARN+ with a one-time note",
+        "init() called twice: no-op second call",
+        "No active PRD prefix (bare CLI command outside a PRD context): log file is unsuffixed task-mgr.log",
+        "Batch mode (multiple PRD prefixes in one process): the global subscriber is set once — default to the prefix resolvable at init() time and document that per-PRD log switching is out of scope here (a follow-up can use a reload layer if needed)",
+        "Empty text to ui::emit_prefixed: emits one prefixed blank line (matches legacy)"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "log dir/file cannot be opened",
+          "expectedBehavior": "degrade to console-only, init returns Ok, no abort"
+        },
+        {
+          "cause": "WorkerGuard dropped early",
+          "expectedBehavior": "guard retained in a process-lifetime static so file writes are not lost"
+        },
+        {
+          "cause": "malformed TASK_MGR_LOG",
+          "expectedBehavior": "default WARN+ console with a one-time stderr note"
+        }
+      ],
+      "id": "FEAT-001",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "Folds CONTRACT-LOG-001 (spike artifact has full text). Reuse: src/output/mod.rs (warn/format_warn/should_color), emit_prefixed_lines/write_prefixed_lines (src/loop_engine/claude.rs:240), paths:: module for .task-mgr dir, ensure_progress_gitignore + untrack pattern (src/commands/init/mod.rs), tests/no_hardcoded_models.rs as the guard-test template. PREFIX SUFFIX: resolve the active PRD prefix with the SAME source progress-<prefix>.txt uses — grep for how the progress file path is built (the active-PRD-context resolver behind `task-mgr current` / TASK_MGR_ACTIVE_PREFIX) and reuse it; do NOT invent a parallel prefix resolver. Learning #4169: classification not FD-split. Learning #3295: libtest OUTPUT_CAPTURE intercepts eprintln! but a tracing writer to io::stderr() bypasses it — keep tracing console output at WARN+ so it stays out of normal test output, and keep A2 on ui::+dup2 snapshot tests. Learning #3855/#3874: log captures contain non-deterministic timestamps — any test that reads the log file back must normalize the timestamp before asserting.",
+      "passes": true,
+      "priority": 1,
+      "qualityDimensions": [
+        "init() is idempotent and best-effort — never aborts the CLI on a logging-setup failure",
+        "Log file is prefix-suffixed (task-mgr-<prefix>.log) via the SAME prefix source as progress-<prefix>.txt — no parallel resolver",
+        "ui:: helpers preserve exact bytes + audience FD; zero level/timestamp decoration",
+        "The WorkerGuard from tracing-appender is retained for process lifetime (dropped guard = silent log loss)",
+        "The CI guard distinguishes eprintln! from println! on a macro boundary (no substring false-positives)",
+        "Dependency-injection-friendly: filter construction and writer are testable without a real subscriber install"
+      ],
+      "taskType": "implementation",
+      "title": "Logging foundation: ui:: product channel + tracing subscriber + file appender + CI guard",
+      "touchesFiles": [
+        "Cargo.toml",
+        "src/output/mod.rs",
+        "src/observability.rs",
+        "src/main.rs",
+        "src/commands/init/mod.rs",
+        "tests/no_raw_prints.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: every eprintln!/println! in orchestrator.rs/iteration.rs/iteration_pipeline.rs/recovery.rs/overflow.rs is routed to ui:: (product) or tracing (diagnostic) per the decision tree",
+        "Positive: orchestrator/iteration modules removed from the no_raw_prints allow-list; `cargo test no_raw_prints` passes",
+        "Negative: the overflow-recovery banner and check_override_invalidation escape-valve line keep byte-identical text (no level/timestamp) — grep the strings post-migration to confirm",
+        "Negative: no behavior change to <task-status>/<completed>/<promise> detection or to the iteration banner an operator reads",
+        "Unit/scoped test: existing loop_engine tests that assert on banner/diagnostic text still pass (or are updated only where the line was a genuine diagnostic moved to tracing, with the assertion redirected appropriately)",
+        "Known-bad: routing the iteration banner to tracing::info! would bury it below the WARN+ console default and the loop would appear silent — banners are ui::emit, not tracing",
+        "Failure mode: if a line's classification is ambiguous, default to ui::emit (preserve visibility) and note it in the progress log for REVIEW-001"
+      ],
+      "dependsOn": [
+        "FEAT-001"
+      ],
+      "description": "Migrate the loop's central output modules to the FEAT-001 boundary. Highest mis-classification surface (orchestrator alone is 104 sites).\n\nModules: src/loop_engine/orchestrator.rs, iteration.rs, iteration_pipeline.rs, recovery.rs, overflow.rs.\n\nDO:\n- Classify each eprintln!/println! per the contract decision tree (in the prompt + progress log): human-facing banners/iteration headers/status summaries → ui::emit (preserve current FD = stderr + bytes); byte-locked/operator-grepped lines (e.g. overflow recovery announcements, the operator escape-valve line) → ui::emit (bytes EXACT); internal diagnostics nobody contracts on → tracing::{debug,info,warn}! at the level matching their noise floor (most 'FYI' lines → debug!).\n- Remove this task's modules from the tests/no_raw_prints.rs allow-list so the guard now enforces them.\n\nDO NOT:\n- Change the bytes or FD of any banner/announcement an operator or test reads.\n- Convert the byte-locked overflow/escape-valve lines to tracing (they get a level prefix → breaks grep).\n- Touch modules owned by FEAT-003/004/005.\n\nThis is modifiesBehavior: callers = operators watching the console + any snapshot test. After migration, pure-diagnostic lines move off the console (WARN+ only) into the log file; human banners and byte-locked lines are unchanged.",
+      "edgeCases": [
+        "Ambiguous line: default to ui::emit and flag for REVIEW-001",
+        "Line interpolating a slot label: use ui::emit_prefixed, not a bare tracing event"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "a diagnostic was actually an operator banner",
+          "expectedBehavior": "kept on console via ui::emit; REVIEW-001 confirms visibility"
+        }
+      ],
+      "id": "FEAT-002",
+      "modifiesBehavior": true,
+      "notes": "Reuse ui:: from FEAT-001. orchestrator.rs has the most sites (104). The overflow recovery banner + escape-valve line are byte-sensitive (see src/loop_engine/CLAUDE.md 'Overflow recovery'). Learning #4169: classification rule. The shared no_raw_prints.rs allow-list is touched by every migration → these tasks serialize on file overlap (intended).",
+      "passes": true,
+      "priority": 2,
+      "qualityDimensions": [
+        "Banners + byte-locked announcements unchanged in bytes and FD",
+        "Diagnostics demoted to tracing at an honest level (debug for FYI, warn for real problems)",
+        "Allow-list shrinks by exactly this task's modules"
+      ],
+      "taskType": "implementation",
+      "title": "Migrate loop orchestration core to ui:: / tracing",
+      "touchesFiles": [
+        "src/loop_engine/orchestrator.rs",
+        "src/loop_engine/iteration.rs",
+        "src/loop_engine/iteration_pipeline.rs",
+        "src/loop_engine/recovery.rs",
+        "src/loop_engine/overflow.rs",
+        "tests/no_raw_prints.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: every print in worktree.rs/wave_scheduler.rs/slot.rs/git_reconcile.rs/merge_resolver.rs routed to ui:: or tracing per the decision tree",
+        "Positive: these modules removed from the no_raw_prints allow-list; guard passes",
+        "Negative: halt-threshold abort message + merge-conflict file listings keep byte-identical operator-facing text",
+        "Negative: the slot-0 safety-guard / synthetic-deadlock diagnostics still print to console (they are operator banners, not debug)",
+        "Scoped test: wave_scheduler/worktree tests asserting on operator messages pass unchanged",
+        "Known-bad: demoting the 'consecutive merge-fail halt' line to tracing::debug! hides the reason a loop stopped — it is ui::emit",
+        "Failure mode: ambiguous line → ui::emit + progress-log note"
+      ],
+      "dependsOn": [
+        "FEAT-001"
+      ],
+      "description": "Migrate the parallel-slot / merge-back modules. Same classification rules as FEAT-002.\n\nModules: src/loop_engine/worktree.rs, wave_scheduler.rs, slot.rs, git_reconcile.rs, merge_resolver.rs.\n\nDO: classify each site (ui:: vs tracing); preserve byte-locked merge-conflict / halt-threshold operator messages; remove these modules from the no_raw_prints allow-list.\nDO NOT: alter the conflict-resolution diagnostics operators rely on to debug a stuck merge; don't touch other tasks' modules.\n\nmodifiesBehavior: pure diagnostics move to the log file; operator-facing merge/halt messages stay on console via ui::emit.",
+      "edgeCases": [
+        "Concurrent slot threads emitting at once: ui:: and tracing are both line-atomic — acceptable interleave at line granularity"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "halt reason demoted to debug",
+          "expectedBehavior": "kept on console via ui::emit"
+        }
+      ],
+      "id": "FEAT-003",
+      "modifiesBehavior": true,
+      "notes": "Reuse ui:: from FEAT-001. See src/loop_engine/CLAUDE.md 'Parallel-slot scheduling' for which messages are operator-facing (halt threshold, deadlock diagnostics, slot-0 guard). Learning #4169.",
+      "passes": true,
+      "priority": 3,
+      "qualityDimensions": [
+        "Merge/halt/deadlock operator messages unchanged in bytes + FD",
+        "Wave-internal trace demoted to tracing::debug",
+        "Allow-list shrinks by exactly this task's modules"
+      ],
+      "taskType": "implementation",
+      "title": "Migrate parallel-wave family to ui:: / tracing",
+      "touchesFiles": [
+        "src/loop_engine/worktree.rs",
+        "src/loop_engine/wave_scheduler.rs",
+        "src/loop_engine/slot.rs",
+        "src/loop_engine/git_reconcile.rs",
+        "src/loop_engine/merge_resolver.rs",
+        "tests/no_raw_prints.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: every print in prd_reconcile.rs/batch.rs/usage.rs/signals.rs/progress.rs routed to ui:: or tracing per the decision tree",
+        "Positive: tests/lifecycle_stderr_contract.rs passes UNCHANGED (the PRD-sync warning is byte-identical post-migration)",
+        "Positive: these modules removed from the no_raw_prints allow-list; guard passes",
+        "Negative: rate-limit wait / usage-reset operator messages keep byte-identical text on stderr",
+        "Known-bad: routing the PRD-sync warning through tracing::warn! prepends 'WARN task_mgr::...' + a timestamp → lifecycle_stderr_contract.rs FAILS; it must be ui::emit with the exact legacy bytes",
+        "Scoped test: `cargo test lifecycle_stderr_contract` and the loop_engine batch/usage tests pass",
+        "Failure mode: ambiguous line → ui::emit + progress-log note"
+      ],
+      "dependsOn": [
+        "FEAT-001"
+      ],
+      "description": "Migrate the remaining loop_engine support modules. Contains the most byte-locked operator contract (the PRD-sync warning locked by tests/lifecycle_stderr_contract.rs).\n\nModules: src/loop_engine/prd_reconcile.rs, batch.rs, usage.rs, signals.rs, progress.rs (+ any remaining loop_engine module still on the allow-list except runner.rs, which is FEAT-006).\n\nDO: classify per the decision tree; the PRD-sync failure warning and rate-limit/usage operator messages are A2 (byte-exact, operators grep them) → ui::emit, bytes UNCHANGED; remove migrated modules from the allow-list.\nDO NOT: reformat the PRD-sync warning — lifecycle_stderr_contract.rs will fail and operators' greps break. Don't touch runner.rs (FEAT-006).\n\nmodifiesBehavior: diagnostics move to log file; the byte-locked A2 messages are preserved exactly.",
+      "edgeCases": [
+        "PRD-sync warning fires after DB commit (order invariant): migration must not change the call site ordering, only the emit helper"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "PRD-sync warning reformatted",
+          "expectedBehavior": "lifecycle_stderr_contract fails — must keep exact bytes via ui::emit"
+        }
+      ],
+      "id": "FEAT-004",
+      "modifiesBehavior": true,
+      "notes": "Reuse ui:: from FEAT-001. tests/lifecycle_stderr_contract.rs uses libc::dup2 + harness=false to lock the engine.rs:4781 PRD-sync warning bytes (it greps stderr). Learnings #3416/#3435/#3456: operator-visible stderr is byte-locked by snapshot tests. Learning #4169: classification rule. Do NOT touch runner.rs here.",
+      "passes": true,
+      "priority": 4,
+      "qualityDimensions": [
+        "A2 byte-locked messages (PRD-sync warning, usage/rate-limit) preserved exactly",
+        "Support-module trace demoted to tracing",
+        "Allow-list shrinks by exactly this task's modules"
+      ],
+      "taskType": "implementation",
+      "title": "Migrate PRD-sync / batch / usage / signals / progress to ui:: / tracing",
+      "touchesFiles": [
+        "src/loop_engine/prd_reconcile.rs",
+        "src/loop_engine/batch.rs",
+        "src/loop_engine/usage.rs",
+        "src/loop_engine/signals.rs",
+        "src/loop_engine/progress.rs",
+        "tests/no_raw_prints.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: list/show/stats/export/curate machine-readable output goes through ui::emit_data on STDOUT with byte-identical content (a scoped test pipes `task-mgr list` output and asserts it parses)",
+        "Positive: CLI human notices use ui::emit (stderr); CLI internal diagnostics use tracing",
+        "Positive: src/main.rs, src/handlers.rs, and migrated src/commands/** removed from the no_raw_prints allow-list; guard passes",
+        "Negative: no data line moves from stdout to stderr or to the log file (stdout vs stderr split preserved)",
+        "Negative: completions / man-page / help output is untouched (not routed through ui:: or tracing)",
+        "Known-bad: routing `task-mgr show` table output through ui::emit (stderr) instead of ui::emit_data (stdout) breaks `task-mgr show ... | grep` pipelines — the test pipes stdout and asserts the data is there, NOT on stderr",
+        "Failure mode: ambiguous CLI line → if a script could consume it, ui::emit_data (stdout); else ui::emit (stderr)"
+      ],
+      "dependsOn": [
+        "FEAT-001"
+      ],
+      "description": "Migrate the CLI surface. This is where channel-A DATA lives: list/show/stats/export/curate println! emit machine-readable output to STDOUT and MUST stay on stdout, byte/stream-identical (pipes + scripts consume it).\n\nModules: src/main.rs (CLI dispatch diagnostics), src/handlers.rs, src/commands/** (curate/mod.rs is the largest at 19; also init, models, decisions, etc.).\n\nDO:\n- CLI data output (tables, JSON, IDs that scripts parse) → ui::emit_data (STDOUT, exact bytes). Human progress/notices on the CLI → ui::emit (stderr). CLI internal diagnostics → tracing.\n- Remove migrated command modules from the no_raw_prints allow-list.\n\nDO NOT:\n- Move any list/show/export/stats data line off stdout or change its bytes — downstream `jq`/pipes break.\n- Route the clap-generated help/usage or completions output through tracing.\n\nmodifiesBehavior: the stdout/stderr split for CLI output is now explicit via ui::; data bytes and FD are preserved.",
+      "edgeCases": [
+        "A command that prints both data (stdout) and a notice (stderr): split across emit_data + emit",
+        "--json / machine output flags: must remain pure stdout with no interleaved diagnostics"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "data line routed to stderr/log",
+          "expectedBehavior": "kept on stdout via ui::emit_data; pipe test catches regressions"
+        }
+      ],
+      "id": "FEAT-005",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": true,
+      "notes": "Reuse ui:: from FEAT-001. The subtlety here is the stdout-data vs stderr-progress split — getting it wrong silently breaks operator pipelines. Many commands already println! to stdout for data; those become ui::emit_data (bytes unchanged), they do NOT become tracing. Learning #4169. Check src/output existing 3 adopters first to match style.",
+      "passes": true,
+      "priority": 5,
+      "qualityDimensions": [
+        "Machine-readable CLI data stays on stdout, byte-identical (scripts/pipes unaffected)",
+        "Help/usage/completions output untouched",
+        "CLI diagnostics (not data) demoted to tracing",
+        "Allow-list shrinks by this task's modules"
+      ],
+      "taskType": "implementation",
+      "title": "Migrate CLI commands + handlers + main to ui:: / tracing",
+      "touchesFiles": [
+        "src/main.rs",
+        "src/handlers.rs",
+        "src/commands/curate/mod.rs",
+        "src/commands/init/mod.rs",
+        "tests/no_raw_prints.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: grok child stderr is written to <.task-mgr>/logs/<prefix>-<run>-slot<N>-iter<M>-grok-stderr.log (PRD-prefix-suffixed like progress-<prefix>.txt; exact scheme documented); the console tee at runner.rs:1037 is removed",
+        "Positive: GROK_TELEMETRY_TRACE_UPLOAD=0 is set on the grok child in apply_common_env (and NOT on Claude)",
+        "Positive: a single ui::emit line per iteration reports the capture-file path",
+        "Negative: the Arc<Mutex<String>> sniff buffer and GROK_STDERR_SNIFF_CAP_BYTES cap are byte-for-byte unchanged — a unit test asserts the buffer still fills from child stderr exactly as before",
+        "Negative: no console line-per-stderr-line tee remains for grok (the 502 Cloudflare HTML / telemetry dump no longer floods the console)",
+        "Negative: no reference to FEAT-014 or a cross-PRD requires[] added",
+        "Unit test: two concurrent slots produce two distinct capture files (no interleave) — slot index is in the path",
+        "Known-bad: writing all slots' grok stderr to one shared <.task-mgr>/logs/grok-stderr.log interleaves concurrent children AND collides across PRDs — the path MUST include both the PRD prefix and the slot index",
+        "CONTRACT: spawn_grok_stderr_sniffer still returns (Arc<Mutex<String>>, JoinHandle) with identical buffer semantics so GrokRunner's post-exit auth sniff (runner.rs:918) and FEAT-014 compile + behave unchanged (grep the return type + buffer fill)",
+        "Failure mode: if the capture file can't be opened, fall back to dropping the line (do NOT crash the sniffer thread or the loop), log one tracing::warn!"
+      ],
+      "dependsOn": [
+        "FEAT-001"
+      ],
+      "description": "Stop teeing every grok child stderr line to the console; capture it to a file and silence the telemetry export noise at the source. DECOUPLED from reactions FEAT-014 — drop from console unconditionally now; classifier-flagged surfacing is a later task once FEAT-014 lands.\n\nDO:\n- In spawn_grok_stderr_sniffer (src/loop_engine/runner.rs:1021), replace the per-line emit_prefixed_lines(label, &line) console tee (runner.rs:1037) with a write to a per-slot-per-iteration file under <.task-mgr>/logs/, path scheme keyed by PRD prefix + run + slot + iteration: <.task-mgr>/logs/<prefix>-<run>-slot<N>-iter<M>-grok-stderr.log. The <prefix> suffix matches the task-mgr-<prefix>.log and progress-<prefix>.txt convention so concurrent grok children AND different PRD efforts never interleave in one file. Keep the existing Arc<Mutex<String>> sniff buffer EXACTLY as-is — FEAT-014 (separate PRD) reads it for transient/auth classification.\n- In apply_common_env (runner.rs:1057), set GROK_TELEMETRY_TRACE_UPLOAD=0 on the grok child to cut BatchSpanProcessor.ExportError noise at the source.\n- Emit a single ui::emit notice per iteration pointing at the capture file path so operators know where grok stderr went.\n\nDO NOT:\n- Change the sniff buffer's contents, capacity (GROK_STDERR_SNIFF_CAP_BYTES), or the auth-failure sniff — FEAT-014 and the existing GrokAuthFailure path depend on it byte-for-byte.\n- Set GROK_TELEMETRY_TRACE_UPLOAD on the Claude child (grok-only).\n- Add any dependency on FEAT-014 / the reactions PRD.\n\nmodifiesBehavior: grok stderr no longer floods the loop console; it lands in a file. The sniff buffer (read by other code) is unchanged.",
+      "edgeCases": [
+        "Two concurrent slots: distinct per-slot files",
+        "Capture file open failure: drop line, warn once, keep going",
+        "grok child emits no stderr: empty/absent file is fine, no error"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "capture file cannot be opened",
+          "expectedBehavior": "drop the line, one tracing::warn!, sniffer thread survives"
+        },
+        {
+          "cause": "sniff buffer accidentally altered",
+          "expectedBehavior": "regression test fails — buffer fill must match legacy"
+        }
+      ],
+      "id": "FEAT-006",
+      "modifiesBehavior": true,
+      "notes": "runner.rs:1021 spawn_grok_stderr_sniffer (tee at 1037), runner.rs:1057 apply_common_env. The sniff buffer is read by GrokRunner auth sniff (runner.rs:918) AND by reactions FEAT-014 — leave it untouched. Memory project_grok_502_reactions_routing: this is the noise-reduction half deliberately split out of FEAT-014. Learning #4169. GROK_TELEMETRY_TRACE_UPLOAD=0 documented in ~/.grok config notes.",
+      "passes": true,
+      "priority": 6,
+      "qualityDimensions": [
+        "Sniff buffer semantics byte-for-byte preserved (other code depends on it)",
+        "Capture file path is slot-keyed (no concurrent interleave)",
+        "Telemetry silenced at source (env var), not by filtering output",
+        "Sniffer thread never panics on a file-open failure"
+      ],
+      "taskType": "implementation",
+      "title": "Stream-C: capture grok child stderr to a per-slot-per-iteration file + silence telemetry",
+      "touchesFiles": [
+        "src/loop_engine/runner.rs",
+        "tests/no_raw_prints.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No duplicated logging-helper logic (everyone uses ui:: + tracing, no per-module reinvention)",
+        "Classification applied consistently across FEAT-002..006 (spot-check a sample of each channel)",
+        "No functions >30 lines introduced by the migration without justification",
+        "Code follows existing project patterns (output module style, paths:: usage)",
+        "Any issues found spawn REFACTOR-FIX-xxx tasks via `task-mgr add --stdin --depended-on-by REVIEW-001`"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "FEAT-005",
+        "FEAT-006"
+      ],
+      "description": "Review all migration work for DRY violations, complexity, coupling, and maintainability.\n\nDO: Check that the ui:: vs tracing routing is consistent across modules (no module invented its own helper); confirm the classification was applied uniformly; flag any module that left a diagnostic on console that should be tracing or vice-versa; check functions >30 lines introduced by the migration.\nDO NOT: Skip — this catches inconsistent classification before the final review.",
+      "estimatedEffort": "high",
+      "id": "REFACTOR-001",
+      "model": "claude-opus-4-7",
+      "notes": "If issues found: `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001` for each (priority 50-97). If clean, invoke /simplify on any ugly touchpoint, then emit <task-status>REFACTOR-001:done</task-status>.",
+      "passes": true,
+      "priority": 98,
+      "qualityDimensions": [
+        "Consistent ui:: vs tracing classification across all migrated modules",
+        "No per-module reinvention of logging helpers",
+        "Single-responsibility functions"
+      ],
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Review for refactoring opportunities",
+      "touchesFiles": [
+        "all modified files"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: FULL cargo test, cargo clippy -- -D warnings, cargo fmt --check all clean (no scope filter)",
+        "Positive: tests/no_raw_prints.rs allow-list is empty (full-repo migration complete) OR every remaining entry has a documented justification",
+        "Positive: byte-locked operator-contract snapshot tests pass unchanged (lifecycle_stderr_contract.rs + any sibling)",
+        "Positive: manual smoke — `TASK_MGR_LOG=debug` shows debug on console; unset shows WARN+ only; .task-mgr/logs/task-mgr-<prefix>.log (prefix-suffixed) contains DEBUG lines",
+        "Positive: grok stderr no longer floods console; lands in the per-slot capture file (verify path)",
+        "Negative: no unwrap() in new logging code paths; no data line moved off stdout",
+        "Documentation: CLAUDE.md updated with the logging model (ui:: vs tracing, TASK_MGR_LOG, .task-mgr/logs/); src/loop_engine/CLAUDE.md note on stream-C capture; mention that classifier-flagged grok-stderr surfacing is a future task pending FEAT-014",
+        "Task update: if the migration changed any helper signature, update remaining task descriptions",
+        "Pre-existing test failures fixed (or spawned as FIX-xxx with verifyCommand if >~12 unrelated)",
+        "If issues found: FIX-xxx tasks spawned via `task-mgr add --stdin --depended-on-by REVIEW-001`"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "FEAT-005",
+        "FEAT-006",
+        "REFACTOR-001",
+        "FIX-001",
+        "REFACTOR-FIX-001",
+        "REFACTOR-FIX-002"
+      ],
+      "description": "Review all implementation for quality, security, integration wiring, and documentation. RUN THE FULL UNSCOPED QUALITY GATE.\n\nDO: Run full cargo test / clippy -D warnings / fmt --check. Verify the no_raw_prints allow-list is EMPTY (every module migrated) or that any remaining entry is a deliberate, documented exception. Verify byte-locked snapshot tests (lifecycle_stderr_contract + siblings) pass. Verify TASK_MGR_LOG actually controls console verbosity and the log file receives DEBUG. Check CLAUDE.md / docs need updating for the new logging model.\nDO NOT: Skip the full suite or leave the guard allow-list with undocumented entries.",
+      "estimatedEffort": "medium",
+      "id": "REVIEW-001",
+      "model": "grok-build",
+      "notes": "Spawn fixes via `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001`. If clean: emit <task-status>REVIEW-001:done</task-status> with 'Clean review'. Update memory project_logging_standardization_spike on completion. Record a learning that the migration shipped + the final ui::/tracing module locations.",
+      "passes": true,
+      "priority": 99,
+      "qualityDimensions": [
+        "Full suite green including pre-existing",
+        "no_raw_prints guard allow-list empty (or documented)",
+        "byte-locked contracts intact",
+        "logging model documented in CLAUDE.md"
+      ],
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Code review + final verification (full suite + guard empty)",
+      "touchesFiles": [
+        "all modified files",
+        "CLAUDE.md",
+        "src/loop_engine/CLAUDE.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "test_init_force_without_from_json_rejected passes",
+        "No stray .task-mgr/ created for commands run outside an initialized project",
+        "File logging still works when .task-mgr/ already exists (observability file-layer tests pass)",
+        "No new clippy/cargo warnings"
+      ],
+      "description": "Pre-existing FEAT-001 bug (fails identically at HEAD 3799b86, independent of FEAT-005 CLI migration). main() calls observability::init() for every command; its build_file_writer does std::fs::create_dir_all(logs_dir) where logs_dir=.task-mgr/logs, which creates .task-mgr/ from scratch for ANY command in ANY directory. This breaks the init --force no-disk-write-before-reject invariant (test_init_force_without_from_json_rejected) and silently creates stray .task-mgr/ dirs for read-only commands run outside a project.",
+      "id": "FIX-001",
+      "passes": true,
+      "priority": 60,
+      "title": "Fix: observability::init bootstraps stray .task-mgr/ before init --force rejects",
+      "touchesFiles": [
+        "src/observability.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "All 6 callers in runner.rs/stream.rs/slot.rs use ui::emit_prefixed",
+        "claude::emit_prefixed_lines and write_prefixed_lines are deleted along with the 7 duplicate tests",
+        "ui:: tests still pass (write_prefixed semantics covered by src/output/ui.rs tests)",
+        "lifecycle_stderr_contract passes UNCHANGED (slot-prefixed output not snapshotted there but verifies no contract regression)",
+        "no warnings under clippy -D warnings",
+        "cargo fmt --check clean"
+      ],
+      "description": "FEAT-001 introduced `ui::emit_prefixed` + `ui::write_prefixed` (src/output/ui.rs:89-200) as the SINGLE home for the per-slot tee, with rustdoc explicitly promising \"the original `claude::emit_prefixed_lines` stays in place until its callers migrate in FEAT-002/003.\" Those callers never migrated. The result: `claude::emit_prefixed_lines` + `write_prefixed_lines` (src/loop_engine/claude.rs:238-274) is a byte-identical duplicate of the ui:: implementation, with 7 duplicate tests (claude.rs:2983-3057) mirroring ui.rs:125-200. Two maintained copies + two parallel test suites will drift silently. This is a clear DRY/per-module-reinvention violation that REFACTOR-001 was asked to catch.",
+      "estimatedEffort": "low",
+      "id": "REFACTOR-FIX-001",
+      "passes": true,
+      "priority": 90,
+      "title": "Dedupe: replace claude::emit_prefixed_lines callers with ui::emit_prefixed + delete the duplicate",
+      "touchesFiles": [
+        "src/loop_engine/claude.rs",
+        "src/loop_engine/runner.rs",
+        "src/loop_engine/stream.rs",
+        "src/loop_engine/slot.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "wave_scheduler.rs Review-class routing emits via ui::emit, not tracing::debug!",
+        "The [slot N] prefix is retained on the wave variant",
+        "iteration.rs sequential path is unchanged (ui::emit at line 401-404)",
+        "review_model_routing tests pass",
+        "lifecycle_stderr_contract passes UNCHANGED",
+        "no warnings under clippy -D warnings"
+      ],
+      "description": "Same call into `apply_review_model_override`, opposite channel: sequential `iteration.rs:401` announces \"Review-class routing: <old> → <new> (reviewModel)\" via `ui::emit` (operator sees it on console at the default WARN+ floor); parallel-wave `wave_scheduler.rs:1005-1010` announces the identical event via `tracing::debug!` (file-only at default — wave-mode operators go blind to routing they would see in sequential mode). This is a real cross-module classification inconsistency that REFACTOR-001 was asked to catch. Either both should be ui::emit (operator visibility — what sequential operators see today) or both tracing::debug! (consistent suppression — but that regresses sequential UX). Recommendation: route the wave path through ui::emit so wave and sequential operators see the same routing announcement.",
+      "estimatedEffort": "low",
+      "id": "REFACTOR-FIX-002",
+      "passes": true,
+      "priority": 75,
+      "title": "Fix: Review-class routing channel asymmetry — wave silences what sequential announces",
+      "touchesFiles": [
+        "src/loop_engine/wave_scheduler.rs"
+      ]
+    }
+  ],
+  "version": "1.0"
+}

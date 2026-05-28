@@ -382,7 +382,7 @@ fn slot_index_omitted_for_sequential_jsonl_event() {
     let _ = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
         conn: &mut conn,
-        task_id: task_id,
+        task_id,
         effort: Some("xhigh"),
         effective_model: Some(SONNET_MODEL),
         prompt_result: &pr,
@@ -424,7 +424,7 @@ fn sequential_prompt_too_long_unchanged() {
     let action = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
         conn: &mut conn,
-        task_id: task_id,
+        task_id,
         effort: Some("xhigh"),
         effective_model: Some(SONNET_MODEL),
         prompt_result: &pr,

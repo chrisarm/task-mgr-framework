@@ -14,6 +14,7 @@ use crate::loop_engine::project_config::{
 use crate::loop_engine::user_config::{
     read_user_config, write_default_model as write_user_default,
 };
+use crate::output::ui;
 
 /// Options for `models list`.
 #[derive(Debug, Default, Clone, Copy)]
@@ -96,7 +97,9 @@ pub fn handle_list_to<W: io::Write>(
                 // Silent fallback per the design.
             }
             Err(e) => {
-                eprintln!("\x1b[33m[warn]\x1b[0m live model fetch failed: {e}; using offline list");
+                ui::emit_err(&format!(
+                    "\x1b[33m[warn]\x1b[0m live model fetch failed: {e}; using offline list"
+                ));
             }
         }
     }
@@ -132,15 +135,15 @@ pub fn handle_set_default(db_dir: &Path, opts: SetDefaultOpts) -> io::Result<()>
         }
     };
     let Some(id) = pick else {
-        println!("(no default set)");
+        ui::emit_data("(no default set)");
         return Ok(());
     };
     if opts.project {
         write_project_default(db_dir, Some(&id))?;
-        println!("Set project default model to {id}");
+        ui::emit_data(&format!("Set project default model to {id}"));
     } else {
         write_user_default(Some(&id))?;
-        println!("Set user default model to {id}");
+        ui::emit_data(&format!("Set user default model to {id}"));
     }
     Ok(())
 }
@@ -149,10 +152,10 @@ pub fn handle_set_default(db_dir: &Path, opts: SetDefaultOpts) -> io::Result<()>
 pub fn handle_unset_default(db_dir: &Path, opts: UnsetDefaultOpts) -> io::Result<()> {
     if opts.project {
         write_project_default(db_dir, None)?;
-        println!("Cleared project default model");
+        ui::emit_data("Cleared project default model");
     } else {
         write_user_default(None)?;
-        println!("Cleared user default model");
+        ui::emit_data("Cleared user default model");
     }
     Ok(())
 }
@@ -173,17 +176,17 @@ pub fn handle_show(db_dir: &Path, db_dir_source: crate::db::DbDirSource) -> io::
         (None, None) => (None, DefaultSource::None),
     };
     match model {
-        Some(m) => println!("Default model: {m}  (source: {})", source.label()),
-        None => println!(
+        Some(m) => ui::emit_data(&format!("Default model: {m}  (source: {})", source.label())),
+        None => ui::emit_data(
             "No default model set. Pick one with `task-mgr models set-default`, \
-             or rely on per-PRD / per-task overrides."
+             or rely on per-PRD / per-task overrides.",
         ),
     }
-    println!(
+    ui::emit_data(&format!(
         "db_dir: {}  (source: {})",
         db_dir.display(),
         db_dir_source.label(),
-    );
+    ));
     Ok(())
 }
 
