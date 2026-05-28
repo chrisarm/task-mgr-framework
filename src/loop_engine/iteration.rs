@@ -485,6 +485,8 @@ pub fn run_iteration(
             // with UnsupportedRunnerCapability. Gate on the selected runner.
             cleanup_title_artifact: effective_runner
                 .supports(runner::RunnerCapability::TitleArtifactCleanup),
+            run_id: Some(params.run_id),
+            iteration: Some(params.iteration),
             ..Default::default()
         },
     );

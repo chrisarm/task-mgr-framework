@@ -204,6 +204,8 @@ pub fn run_slot_iteration(
             cleanup_title_artifact: slot
                 .effective_runner
                 .supports(runner::RunnerCapability::TitleArtifactCleanup),
+            run_id: params.run_id.as_deref(),
+            iteration: Some(params.iteration),
             ..Default::default()
         },
     );
@@ -628,6 +630,7 @@ mod tests {
             max_iterations: 1,
             elapsed_secs: 0,
             task_prefix: None,
+            run_id: None,
         }
     }
 
@@ -832,6 +835,7 @@ mod tests {
             max_iterations: 100,
             elapsed_secs: 42,
             task_prefix: None,
+            run_id: None,
         };
         let cloned = params.clone();
         assert_eq!(cloned.db_dir, params.db_dir);

@@ -137,7 +137,7 @@
       "id": "FEAT-002",
       "modifiesBehavior": true,
       "notes": "Reuse ui:: from FEAT-001. orchestrator.rs has the most sites (104). The overflow recovery banner + escape-valve line are byte-sensitive (see src/loop_engine/CLAUDE.md 'Overflow recovery'). Learning #4169: classification rule. The shared no_raw_prints.rs allow-list is touched by every migration → these tasks serialize on file overlap (intended).",
-      "passes": false,
+      "passes": true,
       "priority": 2,
       "qualityDimensions": [
         "Banners + byte-locked announcements unchanged in bytes and FD",
@@ -227,7 +227,7 @@
       "id": "FEAT-004",
       "modifiesBehavior": true,
       "notes": "Reuse ui:: from FEAT-001. tests/lifecycle_stderr_contract.rs uses libc::dup2 + harness=false to lock the engine.rs:4781 PRD-sync warning bytes (it greps stderr). Learnings #3416/#3435/#3456: operator-visible stderr is byte-locked by snapshot tests. Learning #4169: classification rule. Do NOT touch runner.rs here.",
-      "passes": false,
+      "passes": true,
       "priority": 4,
       "qualityDimensions": [
         "A2 byte-locked messages (PRD-sync warning, usage/rate-limit) preserved exactly",

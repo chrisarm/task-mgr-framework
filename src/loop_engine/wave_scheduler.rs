@@ -551,6 +551,7 @@ fn build_shared_slot_params(params: &WaveIterationParams<'_>) -> Arc<SlotIterati
         max_iterations: params.max_iterations,
         elapsed_secs: params.elapsed_secs,
         task_prefix: params.task_prefix.map(|s| s.to_string()),
+        run_id: Some(params.run_id.to_string()),
     })
 }
 
@@ -1393,6 +1394,7 @@ mod tests {
             max_iterations: 1,
             elapsed_secs: 0,
             task_prefix: None,
+            run_id: None,
         }
     }
 

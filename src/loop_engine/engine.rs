@@ -525,6 +525,9 @@ pub struct SlotIterationParams {
     /// Active PRD task prefix forwarded to every slot's `spawn_claude` call
     /// via `TASK_MGR_ACTIVE_PREFIX`. Mirrors `WaveIterationParams::task_prefix`.
     pub task_prefix: Option<String>,
+    /// Loop run ID forwarded to the per-slot grok stderr capture file name.
+    /// `None` for non-loop callers; the sniffer uses a placeholder fallback.
+    pub run_id: Option<String>,
 }
 
 /// Fields that vary between early-exit paths in `run_slot_iteration`.
