@@ -80,6 +80,7 @@ fn make_params(project_root: PathBuf, base_prompt_path: PathBuf) -> SlotPromptPa
         permission_mode: PermissionMode::Dangerous,
         steering_path: None,
         session_guidance: "",
+        primary_runner: None,
     }
 }
 
@@ -344,6 +345,7 @@ fn slot_context_threads_bundle_task_id_through_run_slot_iteration() {
         elapsed_secs: 0,
         task_prefix: None,
         run_id: None,
+        protected_snapshot_active: false,
     };
 
     let result = run_slot_iteration(&slot, &params).expect("run_slot_iteration");
@@ -379,6 +381,7 @@ fn build_prompt_renders_steering_and_session_guidance_when_set() {
         permission_mode: PermissionMode::Dangerous,
         steering_path: Some(steering_file.as_path()),
         session_guidance: "operator note: focus on edge cases",
+        primary_runner: None,
     };
     let bundle = build_prompt(&conn, &task, &params);
 
@@ -576,6 +579,7 @@ fn build_prompt_oversize_drops_trimmable_sections_and_caps_total_budget() {
         permission_mode: PermissionMode::Dangerous,
         steering_path: None,
         session_guidance: "",
+        primary_runner: None,
     };
     let bundle = build_prompt(&conn, &task, &params);
 
@@ -658,6 +662,7 @@ fn build_prompt_clears_shown_learning_ids_when_learnings_dropped() {
         permission_mode: PermissionMode::Dangerous,
         steering_path: None,
         session_guidance: "",
+        primary_runner: None,
     };
     let bundle = build_prompt(&conn, &task, &params);
 
@@ -706,6 +711,7 @@ fn build_prompt_critical_only_oversize_returns_sentinel_bundle() {
         permission_mode: PermissionMode::Dangerous,
         steering_path: None,
         session_guidance: "",
+        primary_runner: None,
     };
     let bundle = build_prompt(&conn, &task, &params);
 

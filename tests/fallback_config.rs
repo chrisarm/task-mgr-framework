@@ -7,7 +7,8 @@ use std::sync::Mutex;
 use tempfile::TempDir;
 
 use task_mgr::loop_engine::project_config::{
-    FallbackRunnerConfig, ProjectConfig, check_fallback_runner_binary, read_project_config,
+    FallbackRunnerConfig, PrimaryRunnerConfig, ProjectConfig, RunnerSpec,
+    check_fallback_runner_binary, read_project_config, validate_runner_routing_config,
 };
 
 /// Serializes GROK_BINARY env-var mutations in this test binary.
@@ -152,6 +153,70 @@ fn fallback_runner_enabled_false_returns_some_not_none() {
     assert_eq!(
         fr.model, "grok-build-tuned",
         "operator's model override preserved"
+    );
+}
+
+#[test]
+fn codex_primary_runner_allows_provider_only_model() {
+    let (_dir, cfg) = write_config(
+        r#"{
+        "primaryRunner": {
+            "byTaskType": {
+                "review": { "provider": "codex" }
+            }
+        }
+    }"#,
+    );
+    validate_runner_routing_config(&cfg)
+        .expect("Codex primaryRunner routes may omit model for provider-only routing");
+    let primary = cfg.primary_runner.expect("primaryRunner parsed");
+    let spec = primary.by_task_type.get("review").expect("review route");
+    assert_eq!(spec.provider, "codex");
+    assert_eq!(spec.model, "");
+}
+
+#[test]
+fn non_codex_primary_runner_rejects_blank_model() {
+    let mut by_task_type = std::collections::HashMap::new();
+    by_task_type.insert(
+        "review".to_string(),
+        RunnerSpec {
+            provider: "grok".to_string(),
+            model: String::new(),
+        },
+    );
+    let cfg = ProjectConfig {
+        primary_runner: Some(PrimaryRunnerConfig {
+            claude_fallback_model: None,
+            runtime_error_threshold: 2,
+            by_task_type,
+            by_id_prefix: Default::default(),
+        }),
+        ..ProjectConfig::default()
+    };
+    let err = validate_runner_routing_config(&cfg)
+        .expect_err("non-Codex primaryRunner route must reject blank model");
+    assert!(
+        err.to_string().contains("model must not be blank"),
+        "unexpected error: {err}",
+    );
+}
+
+#[test]
+fn fallback_runner_rejects_codex_provider() {
+    let cfg = ProjectConfig {
+        fallback_runner: Some(FallbackRunnerConfig {
+            enabled: true,
+            provider: "codex".to_string(),
+            ..FallbackRunnerConfig::default()
+        }),
+        ..ProjectConfig::default()
+    };
+    let err = validate_runner_routing_config(&cfg)
+        .expect_err("v1 fallbackRunner must stay closed to non-Grok providers");
+    assert!(
+        err.to_string().contains("fallbackRunner only supports"),
+        "unexpected error: {err}",
     );
 }
 

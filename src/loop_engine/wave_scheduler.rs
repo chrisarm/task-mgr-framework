@@ -62,9 +62,9 @@ use crate::loop_engine::branch;
 use crate::loop_engine::config::{self, IterationOutcome};
 use crate::loop_engine::display;
 use crate::loop_engine::engine::{
-    FailedMerge, IterationContext, MergeFailHaltDecision, SlotContext, SlotIterationParams,
-    SlotResult, WaveAggregator, WaveIterationParams, WaveOutcome, WaveResult, WaveTerminal,
-    apply_review_model_override, resolve_effective_runner,
+    EffectiveRunnerInput, FailedMerge, IterationContext, MergeFailHaltDecision, SlotContext,
+    SlotIterationParams, SlotResult, WaveAggregator, WaveIterationParams, WaveOutcome, WaveResult,
+    WaveTerminal, apply_review_model_override, resolve_effective_runner,
 };
 use crate::loop_engine::git_reconcile::reconcile_merged_slot_completions;
 use crate::loop_engine::merge_resolver;
@@ -73,7 +73,7 @@ use crate::loop_engine::prd_reconcile::reconcile_passes_with_db;
 use crate::loop_engine::progress;
 use crate::loop_engine::prompt;
 use crate::loop_engine::reactions;
-use crate::loop_engine::recovery::handle_task_failure;
+use crate::loop_engine::recovery::handle_task_failure_with_runner;
 use crate::loop_engine::runner::RunnerKind;
 use crate::loop_engine::signals::{self, SignalFlag};
 use crate::loop_engine::usage::UsageCheckResult;
@@ -599,7 +599,10 @@ pub(super) fn build_slot_contexts(
 /// the base prompt content is baked into `SlotPromptBundle.prompt` at
 /// assembly time, so workers never need to read the file (and thus don't
 /// need a path that might race with a concurrent edit).
-fn build_shared_slot_params(params: &WaveIterationParams<'_>) -> Arc<SlotIterationParams> {
+fn build_shared_slot_params(
+    params: &WaveIterationParams<'_>,
+    protected_snapshot_active: bool,
+) -> Arc<SlotIterationParams> {
     Arc::new(SlotIterationParams {
         db_dir: params.db_dir.to_path_buf(),
         permission_mode: params.permission_mode.clone(),
@@ -611,6 +614,7 @@ fn build_shared_slot_params(params: &WaveIterationParams<'_>) -> Arc<SlotIterati
         elapsed_secs: params.elapsed_secs,
         task_prefix: params.task_prefix.map(|s| s.to_string()),
         run_id: Some(params.run_id.to_string()),
+        protected_snapshot_active,
     })
 }
 
@@ -628,6 +632,7 @@ fn build_slot_prompt_params<'a>(
         permission_mode: params.permission_mode.clone(),
         steering_path: params.steering_path,
         session_guidance: params.session_guidance,
+        primary_runner: params.project_config.primary_runner.as_ref(),
     }
 }
 
@@ -1115,6 +1120,7 @@ pub fn run_wave_iteration(
                 escalated,
             ));
             slot.prompt_bundle.resolved_model = Some(escalated);
+            slot.prompt_bundle.provider_hint = None;
         }
 
         // Apply the prior-overflow effort override per slot (audit #6-effort):
@@ -1147,6 +1153,7 @@ pub fn run_wave_iteration(
                 slot.slot_index, old, review_model_override,
             ));
             slot.prompt_bundle.resolved_model = Some(review_model_override);
+            slot.prompt_bundle.provider_hint = None;
         }
 
         // Resolve the runner over the FINAL model (post crash escalation +
@@ -1159,12 +1166,67 @@ pub fn run_wave_iteration(
             .resolved_model
             .as_deref()
             .or(params.default_model);
-        slot.effective_runner = resolve_effective_runner(ctx, &task_id, effective_model);
+        let provider_hint = if effective_model == slot.prompt_bundle.resolved_model.as_deref() {
+            slot.prompt_bundle.provider_hint
+        } else {
+            None
+        };
+        slot.effective_runner = resolve_effective_runner(
+            ctx,
+            &task_id,
+            EffectiveRunnerInput {
+                model: effective_model,
+                provider_hint,
+            },
+        );
     }
-    let slot_params = build_shared_slot_params(&params);
+    let codex_wave = slot_contexts
+        .iter()
+        .any(|slot| slot.effective_runner == RunnerKind::Codex);
+    let protected_snapshot = if codex_wave {
+        match crate::loop_engine::protected_state::ProtectedTaskStateSnapshot::capture(
+            params.db_dir,
+        ) {
+            Ok(snapshot) => Some(snapshot),
+            Err(e) => {
+                return WaveOutcome {
+                    tasks_completed: 0,
+                    iteration_consumed: true,
+                    terminal: Some(WaveTerminal {
+                        exit_code: 1,
+                        reason: format!("protected task-state snapshot failed: {e}"),
+                        run_status: None,
+                    }),
+                    was_stopped: true,
+                    failed_merges: Vec::new(),
+                    rate_limited_retry: false,
+                };
+            }
+        }
+    } else {
+        None
+    };
+    let slot_params = build_shared_slot_params(&params, codex_wave);
 
     // Run wave (blocks until every spawned slot thread joins).
     let mut wave_result = run_parallel_wave(params.conn, slot_contexts, slot_params);
+
+    if let Some(snapshot) = protected_snapshot.as_ref()
+        && let Err(e) = snapshot.verify_and_restore_text()
+    {
+        return WaveOutcome {
+            tasks_completed: 0,
+            iteration_consumed: true,
+            terminal: Some(WaveTerminal {
+                exit_code: 1,
+                reason: format!("protected task-state mutation detected: {e}"),
+                run_status: None,
+            }),
+            was_stopped: true,
+            failed_merges: Vec::new(),
+            rate_limited_retry: false,
+        };
+    }
 
     // Per-slot post-processing on the main thread. The pipeline mutates each
     // slot's `IterationOutcome` in place when retroactive completion is
@@ -1331,14 +1393,16 @@ pub fn run_wave_iteration(
                 | IterationOutcome::Reorder(_)
                 | IterationOutcome::RateLimit
                 | IterationOutcome::Crash(config::CrashType::GrokAuthFailure)
+                | IterationOutcome::Crash(config::CrashType::CodexAuthFailure)
         ) {
             continue;
         }
-        if let Err(e) = handle_task_failure(
+        if let Err(e) = handle_task_failure_with_runner(
             params.conn,
             task_id,
             params.iteration as i64,
             ctx,
+            Some(slot_result.effective_runner),
             params.project_config.fallback_runner.as_ref(),
             params.project_config.primary_runner.as_ref(),
         ) {
@@ -1714,6 +1778,7 @@ mod tests {
             elapsed_secs: 0,
             task_prefix: None,
             run_id: None,
+            protected_snapshot_active: false,
         }
     }
 
@@ -1726,6 +1791,7 @@ mod tests {
             shown_learning_ids: Vec::new(),
             resolved_model: None,
             difficulty: None,
+            provider_hint: None,
             section_sizes: Vec::new(),
             dropped_sections: Vec::new(),
         }
@@ -2393,6 +2459,7 @@ mod tests {
             permission_mode: PermissionMode::Dangerous,
             steering_path: None,
             session_guidance: "",
+            primary_runner: None,
         };
         let slot_paths = vec![tmp.path().to_path_buf()];
         let slots = build_slot_contexts(&conn, vec![scored], &slot_paths, &prompt_params);

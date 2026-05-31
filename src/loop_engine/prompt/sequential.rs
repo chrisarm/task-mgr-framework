@@ -37,7 +37,7 @@ use crate::loop_engine::prompt_sections::learnings::{
 use crate::loop_engine::prompt_sections::siblings::siblings_spec;
 #[cfg(test)]
 use crate::loop_engine::prompt_sections::synergy::build_synergy_section;
-use crate::loop_engine::prompt_sections::synergy::{resolve_synergy_cluster, synergy_spec};
+use crate::loop_engine::prompt_sections::synergy::synergy_spec;
 use crate::loop_engine::prompt_sections::task_ops::task_ops_spec;
 use crate::loop_engine::prompt_sections::truncate_to_budget;
 #[cfg(test)]
@@ -304,6 +304,10 @@ pub struct PromptResult {
     /// then elevated to the highest tier across the synergyWith cluster.
     /// Some("") is normalized to None — consumers never see empty strings.
     pub resolved_model: Option<String>,
+    /// Explicit provider intent from `primaryRunner`, when model resolution
+    /// selected that rung. `None` means runner selection must fall back to the
+    /// model string.
+    pub provider_hint: Option<crate::loop_engine::model::Provider>,
     /// Names of trimmable sections that were dropped because they exceeded the
     /// remaining budget. Empty when all sections fit. Useful for diagnostics and
     /// testing to distinguish "dropped due to budget" from "empty because no data".
@@ -367,6 +371,8 @@ pub struct BuildPromptParams<'a> {
     pub batch_sibling_prds: &'a [PathBuf],
     /// Resolved permission mode (for tool-awareness prompt section).
     pub permission_mode: &'a PermissionMode,
+    /// Primary runner routing configuration.
+    pub primary_runner: Option<&'a crate::loop_engine::project_config::PrimaryRunnerConfig>,
 }
 
 /// Build a prompt for the current iteration.
@@ -401,18 +407,24 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
         prd_default: params.default_model,
         project_default: params.project_default_model,
         user_default: params.user_default_model,
+        primary_runner: params.primary_runner,
         ..Default::default()
     };
-    // Derive cluster-wide model AND cluster-wide difficulty from a single
-    // synergy-partner SQL fetch, so both axes scale with the hardest task in
-    // the synergy cluster (not just the primary).
-    let (resolved_model, cluster_difficulty) = resolve_synergy_cluster(
-        params.conn,
-        &task_output.id,
-        task_output.model.as_deref(),
-        task_output.difficulty.as_deref(),
-        &defaults,
+    let target = crate::loop_engine::model::resolve_task_execution_target(
+        &crate::loop_engine::model::ModelResolutionContext {
+            task_model: task_output.model.as_deref(),
+            difficulty: task_output.difficulty.as_deref(),
+            task_id: Some(&task_output.id),
+            ..defaults
+        },
     );
+    let resolved_model = target.model.clone();
+    let provider_hint = target.provider_hint;
+    let cluster_difficulty = task_output
+        .difficulty
+        .as_deref()
+        .filter(|d| !d.trim().is_empty())
+        .map(str::to_string);
     let cluster_effort =
         crate::loop_engine::model::effort_for_difficulty(cluster_difficulty.as_deref());
 
@@ -650,6 +662,7 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
         task_files: task_output.files.clone(),
         shown_learning_ids,
         resolved_model,
+        provider_hint,
         dropped_sections,
         task_difficulty: task_output.difficulty.clone(),
         cluster_effort,
@@ -807,6 +820,7 @@ mod tests {
             task_prefix: None,
             batch_sibling_prds: &[],
             permission_mode: &DEFAULT_PERM,
+            primary_runner: None,
         }
     }
 
@@ -958,6 +972,7 @@ mod tests {
             dropped_sections: vec![],
             task_difficulty: None,
             cluster_effort: None,
+            provider_hint: None,
             section_sizes: Vec::new(),
         };
 
@@ -1019,6 +1034,7 @@ mod tests {
             task_prefix: None,
             batch_sibling_prds: &[],
             permission_mode: &DEFAULT_PERM,
+            primary_runner: None,
         };
 
         let result = build_prompt(&params)
@@ -1390,6 +1406,7 @@ pub enum ApiError {
             task_prefix: None,
             batch_sibling_prds: &[],
             permission_mode: &DEFAULT_PERM,
+            primary_runner: None,
         };
 
         let result = build_prompt(&params)
@@ -1510,6 +1527,7 @@ pub enum ApiError {
             task_prefix: None,
             batch_sibling_prds: &[],
             permission_mode: &DEFAULT_PERM,
+            primary_runner: None,
         };
 
         let result = build_prompt(&params)
@@ -1559,6 +1577,7 @@ pub enum ApiError {
             task_prefix: None,
             batch_sibling_prds: &[],
             permission_mode: &DEFAULT_PERM,
+            primary_runner: None,
         };
 
         let result = build_prompt(&params)
@@ -2092,6 +2111,7 @@ pub enum ApiError {
             task_prefix: None,
             batch_sibling_prds: &[],
             permission_mode: &DEFAULT_PERM,
+            primary_runner: None,
         };
 
         let result = build_prompt(&params)
@@ -2147,6 +2167,7 @@ pub enum ApiError {
             task_prefix: None,
             batch_sibling_prds: &[],
             permission_mode: &DEFAULT_PERM,
+            primary_runner: None,
         };
 
         let result = build_prompt(&params)
@@ -2194,6 +2215,7 @@ pub enum ApiError {
             task_prefix: None,
             batch_sibling_prds: &[],
             permission_mode: &DEFAULT_PERM,
+            primary_runner: None,
         };
 
         // next::next uses dir for DB access — task should be found
@@ -3085,6 +3107,7 @@ pub enum ApiError {
             task_prefix: None,
             batch_sibling_prds: &[],
             permission_mode: &DEFAULT_PERM,
+            primary_runner: None,
         };
 
         let result = build_prompt(&params)
@@ -3176,6 +3199,7 @@ pub enum ApiError {
             task_prefix: None,
             batch_sibling_prds: &[],
             permission_mode: &DEFAULT_PERM,
+            primary_runner: None,
         };
 
         let result = build_prompt(&params)
@@ -3327,6 +3351,7 @@ pub enum ApiError {
             task_prefix: None,
             batch_sibling_prds: &[],
             permission_mode: &DEFAULT_PERM,
+            primary_runner: None,
         };
 
         let result = build_prompt(&params)
@@ -3452,6 +3477,7 @@ pub enum ApiError {
             task_prefix: None,
             batch_sibling_prds: &[],
             permission_mode: &DEFAULT_PERM,
+            primary_runner: None,
         };
 
         let result = build_prompt(&params)

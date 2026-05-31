@@ -62,6 +62,7 @@ fn make_prompt_result(task_id: &str) -> PromptResult {
         dropped_sections: Vec::new(),
         task_difficulty: Some("medium".to_string()),
         cluster_effort: None,
+        provider_hint: None,
         section_sizes: vec![("task", 12), ("learnings", 17), ("base_prompt", 19)],
     }
 }
@@ -941,6 +942,7 @@ fn wave_overflow_jsonl_contains_task_difficulty_from_slot() {
         dropped_sections: Vec::new(),
         task_difficulty: Some("high".to_string()),
         cluster_effort: None,
+        provider_hint: None,
         section_sizes: vec![("task", 12), ("base_prompt", 5)],
     };
 

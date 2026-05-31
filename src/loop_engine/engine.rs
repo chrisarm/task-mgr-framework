@@ -189,6 +189,9 @@ pub struct IterationResult {
     /// Effective `--effort` level used for this iteration, derived from task difficulty.
     /// None when difficulty is unset/unknown or for early exits.
     pub effective_effort: Option<&'static str>,
+    /// Effective runner that executed this iteration.
+    /// None for pre-dispatch early exits.
+    pub effective_runner: Option<RunnerKind>,
     /// Number of key decisions extracted and stored this iteration.
     /// Always initialised to 0 by the iteration runners; filled in by the
     /// caller (`run_loop` / `process_slot_result`) after
@@ -365,18 +368,40 @@ impl IterationContext {
 /// The helper lives in `engine.rs` (not `runner.rs`) so `runner.rs` stays
 /// free of `IterationContext` coupling — the runner module remains
 /// provider-neutral.
-pub fn resolve_effective_runner(
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EffectiveRunnerInput<'a> {
+    pub model: Option<&'a str>,
+    pub provider_hint: Option<model::Provider>,
+}
+
+impl<'a> From<Option<&'a str>> for EffectiveRunnerInput<'a> {
+    fn from(model: Option<&'a str>) -> Self {
+        Self {
+            model,
+            provider_hint: None,
+        }
+    }
+}
+
+pub fn resolve_effective_runner<'a>(
     ctx: &IterationContext,
     task_id: &str,
-    effective_model: Option<&str>,
+    input: impl Into<EffectiveRunnerInput<'a>>,
 ) -> RunnerKind {
+    let input = input.into();
     ctx.runner_overrides
         .get(task_id)
         .copied()
         // kind-correct: identity translation — maps Provider enum to RunnerKind, two representations of the same provider concept
-        .unwrap_or_else(|| match model::provider_for_model(effective_model) {
-            model::Provider::Grok => RunnerKind::Grok,
-            model::Provider::Claude => RunnerKind::Claude,
+        .unwrap_or_else(|| {
+            match input
+                .provider_hint
+                .unwrap_or_else(|| model::provider_for_model(input.model))
+            {
+                model::Provider::Grok => RunnerKind::Grok,
+                model::Provider::Codex => RunnerKind::Codex,
+                model::Provider::Claude => RunnerKind::Claude,
+            }
         })
 }
 
@@ -553,6 +578,9 @@ pub struct SlotIterationParams {
     /// Loop run ID forwarded to the per-slot grok stderr capture file name.
     /// `None` for non-loop callers; the sniffer uses a placeholder fallback.
     pub run_id: Option<String>,
+    /// True when the wave scheduler owns a shared Codex protected-state
+    /// snapshot/verification barrier for this wave.
+    pub protected_snapshot_active: bool,
 }
 
 /// Fields that vary between early-exit paths in `run_slot_iteration`.
@@ -967,7 +995,7 @@ mod tests {
         let ctx = IterationContext::new(8);
         for model in &[OPUS_MODEL, SONNET_MODEL, HAIKU_MODEL] {
             assert_eq!(
-                resolve_effective_runner(&ctx, "TASK-001", Some(model)),
+                resolve_effective_runner(&ctx, "TASK-001", Some(*model)),
                 RunnerKind::Claude,
                 "Claude model {model} with empty runner_overrides MUST resolve to Claude",
             );
@@ -991,6 +1019,28 @@ mod tests {
             resolve_effective_runner(&ctx, "TASK-001", Some("groq-llama-3")),
             RunnerKind::Claude,
             "Groq Inc. model (different vendor) MUST NOT mis-route to Grok",
+        );
+    }
+
+    #[test]
+    fn codex_provider_hint_resolves_to_codex_without_model_auto_routing() {
+        let ctx = IterationContext::new(8);
+        assert_eq!(
+            resolve_effective_runner(
+                &ctx,
+                "TASK-CODEX",
+                EffectiveRunnerInput {
+                    model: None,
+                    provider_hint: Some(model::Provider::Codex),
+                },
+            ),
+            RunnerKind::Codex,
+            "explicit primaryRunner provider intent must route to Codex even when no model is set",
+        );
+        assert_eq!(
+            resolve_effective_runner(&ctx, "TASK-CODEX", Some("codex-mini-latest")),
+            RunnerKind::Claude,
+            "Codex-looking model strings must not auto-route to Codex without provider intent",
         );
     }
 
@@ -1208,6 +1258,7 @@ mod tests {
             output: String::new(),
             effective_model: None,
             effective_effort: None,
+            effective_runner: None,
             key_decisions_count: 0,
             conversation: None,
             shown_learning_ids: Vec::new(),

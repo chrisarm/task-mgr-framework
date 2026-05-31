@@ -1,0 +1,342 @@
+# Claude Code Agent Instructions
+
+You are an autonomous coding agent implementing **Codex Runner Support** for **task-mgr**.
+
+## Problem Statement
+
+task-mgr's loop engine routes every task to one of two runners — **Claude** (default) or **Grok** (overflow/RuntimeError fallback). We are adding a third provider, **Codex** (`codex-cli` 0.135.0+), reachable **only** through an explicit `primaryRunner` spec with `provider: "codex"`. The core problem: **provider intent is lost during model resolution.** `RunnerSpec` carries `{provider, model}` but `resolve_task_model` returns only the model string, and `resolve_effective_runner` re-derives the provider purely from that string via `provider_for_model`. That string-inference is correct for Grok (`grok` token) but **wrong for Codex** — we deliberately do NOT want `gpt-*`/`o*`/`codex` model strings to auto-route to Codex in v1. Provider intent must be carried explicitly from the config spec to the spawn site.
+
+Codex is an LLM CLI with real filesystem write access inside its sandbox (writes allowed in `--cd` cwd and `/tmp`; denied outside), so it can corrupt orchestrator state (task JSON, prompt files, `tasks.db`) — the integration must defend that.
+
+This work is grounded in the **committed code at HEAD**. A prior WIP attempt (including an untracked `src/loop_engine/protected_state.rs`) is **superseded** — discard it and build fresh on this branch.
+
+---
+
+## Non-Negotiable Process (Read Every Iteration)
+
+Before writing code:
+
+1. **Internalize quality targets** — Read `qualityDimensions`; that's what "done well" means for THIS task.
+2. **Plan edge-case handling** — For each `edgeCases` / `failureModes` entry on the task, decide how it'll be handled before coding.
+3. **Pick an approach** — State assumptions in your head. Only for `estimatedEffort: "high"` or `modifiesBehavior: true` tasks, name the one alternative you rejected and why.
+
+After writing code, the scoped quality gate is your critic — run it (Quality Checks § Per-iteration). Don't add a separate self-critique step; the linters, type-checker, and targeted tests catch more than a re-read does.
+
+---
+
+## Priority Philosophy
+
+In order: **PLAN** (anticipate edge cases) → **PHASE 2 FOUNDATION** (~1 day now to save ~2+ weeks later — take it, we're pre-launch) → **FUNCTIONING CODE** (pragmatic, reliable) → **CORRECTNESS** (compiles, type-checks, scoped tests pass deterministically) → **CODE QUALITY** (clean, no warnings) → **POLISH** (docs, formatting).
+
+Non-negotiables: tests drive implementation; satisfy every `qualityDimensions` entry; handle `Option`/`Result` explicitly (no `unwrap()` in production). For `estimatedEffort: "high"` or `modifiesBehavior: true` tasks, note the one alternative you rejected and why. For everything else, pick and go.
+
+**Prohibited outcomes:**
+
+- Tests that only assert 'no crash' or check type without verifying content
+- Tests that mirror implementation internals (break when refactoring)
+- Abstractions with only one concrete use
+- Error messages that don't identify what went wrong
+- Catch-all error handlers that swallow context
+- Wildcard match arms (`_ =>`) on `RunnerKind` / `Provider` / `CrashType` — exhaustive matching is the safety property that forces every new provider to be handled at every dispatch site
+- Re-deriving the runner inside recovery/overflow from the model string instead of threading the executed `RunnerKind` — the model string for a Codex task is `gpt-*` and re-derives to Claude (silent cross-provider escape)
+- Inferring Codex from `gpt-*`/`o*`/`codex` model strings — v1 routes to Codex ONLY via an explicit `primaryRunner` provider hint
+
+---
+
+## Global Acceptance Criteria
+
+These apply to **every** implementation task — the task-level `acceptanceCriteria` returned by `task-mgr next` are layered on top. If any of these fails, the task is not done.
+
+- Rust: No warnings in `cargo check` output
+- Rust: No warnings in `cargo clippy -- -D warnings` output
+- Rust: Scoped tests pass with `cargo test -p task-mgr <module>`
+- Rust: `cargo fmt --check` passes
+- No breaking changes to Claude/Grok behavior — a run with no Codex config must be byte-identical to HEAD (gate every Codex-specific branch on the provider/runner being Codex)
+- No literal model-string creep outside `src/loop_engine/model.rs` (`tests/no_hardcoded_models.rs` guards this)
+
+---
+
+## Task Files + CLI (IMPORTANT — context economy)
+
+**Never read or edit `tasks/*.json` directly.** Loading the JSON wastes context and editing corrupts loop-engine state. Everything the agent needs about a task is returned by `task-mgr next`; everything global (Priority Philosophy, Prohibited Outcomes, Global Acceptance Criteria, Key Learnings, CLAUDE.md Excerpts, Data Flow Contracts) is already embedded in **this prompt file** — that is the authoritative copy. If something here looks inconsistent with the JSON, trust this file and surface the discrepancy.
+
+### Getting your task prefix
+
+The `taskPrefix` is auto-generated by `task-mgr init` and written into the JSON. Fetch it once at the start of an iteration (don't hardcode it):
+
+```bash
+PREFIX=$(jq -r '.taskPrefix' .task-mgr/tasks/codex-runner.json)
+```
+
+Use `$PREFIX` in every CLI call below so you stay scoped to this task list.
+
+### Commands you'll actually run
+
+| Need                                    | Command                                                                                                                                                                           |
+| --------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Pick + claim the next eligible task     | `task-mgr next --prefix $PREFIX --claim`                                                                                                                                          |
+| Inspect one task (full acceptance etc.) | `task-mgr show $PREFIX-TASK-ID`                                                                                                                                                   |
+| List remaining tasks (debug only)       | `task-mgr list --prefix $PREFIX --status todo`                                                                                                                                    |
+| Recall learnings relevant to a task     | `task-mgr recall --for-task $PREFIX-TASK-ID` (also: `--query <text>`, `--tag <tag>`)                                                                                              |
+| Add a follow-up task (review spawns)    | `echo '{...}' \| task-mgr add --stdin --depended-on-by REVIEW-001` — priority auto-computed; DB + PRD JSON updated atomically                                                    |
+| Mark status                             | Emit `<task-status>$PREFIX-TASK-ID:done</task-status>` (statuses: `done`, `failed`, `skipped`, `irrelevant`, `blocked`) — loop engine routes through `task-mgr` and syncs the JSON |
+
+### Files you DO touch
+
+| File                                       | Purpose                                                                |
+| ------------------------------------------ | ---------------------------------------------------------------------- |
+| `.task-mgr/tasks/codex-runner-prompt.md`   | This prompt file (read-only)                                           |
+| `.task-mgr/tasks/progress-$PREFIX.txt`     | Progress log — **tail** for recent context, **append** after each task |
+
+**Reading progress** — sections are separated by `---` lines and each starts with `## <Date> - <TASK-ID>`. Never Read the whole log:
+
+```bash
+# Most recent section only (default recency check)
+tac .task-mgr/tasks/progress-$PREFIX.txt 2>/dev/null | awk '/^---$/{exit} {print}' | tac
+
+# Specific prior task (e.g. a dependsOn task you're building on)
+grep -n -A 40 '## .* - <TASK-ID>' .task-mgr/tasks/progress-$PREFIX.txt
+```
+
+Skip the read entirely on the first iteration (file won't exist).
+
+---
+
+## Your Task (every iteration)
+
+1. **Resolve prefix and claim the next task**:
+   ```bash
+   PREFIX=$(jq -r '.taskPrefix' .task-mgr/tasks/codex-runner.json)
+   task-mgr next --prefix $PREFIX --claim
+   ```
+   The output includes `id`, `title`, `description`, `acceptanceCriteria`, `qualityDimensions`, `edgeCases`, `touchesFiles`, `dependsOn`, `branchName`, and `notes`. If it reports no eligible task, output `<promise>BLOCKED</promise>` with the printed reason and stop.
+
+2. **Pull only the progress context you need** — most iterations want just the most recent section. Skip on the first iteration.
+
+3. **Recall focused learnings** — `task-mgr recall --for-task <TASK-ID>`. Do NOT Read `tasks/long-term-learnings.md` / `tasks/learnings.md` directly. Do NOT Read `CLAUDE.md` in full — the excerpts that matter are embedded below.
+
+4. **Verify branch** — `git branch --show-current` matches `feat/codex-runner`. Switch if wrong.
+
+5. **Think before coding** — state assumptions; plan each `edgeCases`/`failureModes` entry; for cross-module data access consult **Data Flow Contracts** below or grep 2-3 real call sites (never guess key types). Pick an approach; survey alternatives only for `high`/`modifiesBehavior` tasks.
+
+6. **Implement** — single task, code and tests in one coherent change.
+
+7. **Run the scoped quality gate** (Quality Checks below — scoped tests only). Fix failures before committing.
+
+8. **Commit**: `feat: <TASK-ID>-completed - [Title]` (or `refactor:`/`fix:`/`test:`).
+
+9. **Emit status**: `<task-status><TASK-ID>:done</task-status>` — the loop engine flips `passes` and syncs the JSON. Do NOT edit the JSON.
+
+10. **Append progress** — ONE block, format below, terminated with `---`.
+
+---
+
+## Behavior Modification Protocol (only when `modifiesBehavior: true`)
+
+FEAT-001, FEAT-003, FEAT-004, and FEAT-005 are `modifiesBehavior: true` (they change `resolve_effective_runner`'s signature/order, recovery/overflow signatures, config validation strictness, and add a state-verify barrier in the iteration/wave pipelines).
+
+1. Read the specific callers/consumers named in the task description.
+2. Decide per-caller: `OK` (proceed), `BREAKS` (split via `task-mgr add --stdin`, then `task-mgr skip` the original with reason "split into …"), or `NEEDS_REVIEW`.
+3. For FEAT-001 specifically: enumerate EVERY `resolve_effective_runner` caller (sequential spawn, wave pre-spawn, slot merge assertion, recovery) — each must pass an explicit `EffectiveRunnerInput`. A missed caller silently drops the provider hint.
+
+---
+
+## Quality Checks
+
+The full test suite is expensive. Per-iteration tasks run a **scoped** gate; **REVIEW-001** runs the full gate and must leave the repo fully green (including pre-existing failures).
+
+### Per-iteration scoped gate (FEAT / FIX / REFACTOR-FIX tasks)
+
+```bash
+cargo fmt --check
+cargo check
+cargo clippy -- -D warnings
+cargo test -p task-mgr <module_or_fn_name>   # scope to the touched module(s)
+```
+
+Scoping heuristic: start from `touchesFiles`; run `cargo test -p task-mgr <module>` for the touched module(s) (e.g. `model`, `runner`, `stream`, `recovery`, `project_config`, `protected_state`). **Per CLAUDE.md §3, always pipe to a temp file and grep results in the SAME command:**
+
+```bash
+cargo test -p task-mgr runner 2>&1 | tee /tmp/codex-test.txt | tail -3 && grep "FAILED\|error\[" /tmp/codex-test.txt | head -10
+cargo clippy -- -D warnings 2>&1 | tee /tmp/codex-clippy.txt | tail -3 && grep "^error" /tmp/codex-clippy.txt | head -10
+```
+
+**Do NOT** run the entire workspace test suite during regular iterations — that's REVIEW-001's job.
+
+### Full gate (REFACTOR-001 / REVIEW-001)
+
+```bash
+cargo fmt --check && cargo check && cargo clippy -- -D warnings && cargo test 2>&1 | tee /tmp/codex-full.txt | tail -5 && grep "FAILED\|error\[" /tmp/codex-full.txt | head -20
+```
+
+If ANY test fails — including pre-existing failures — REVIEW-001 fixes them. Default: attempt every failure. Escape hatch: if >~12 failures all clearly unrelated to this work, fix the diff-attributable ones inline and spawn a single `FIX-xxx` for the rest, then `<promise>BLOCKED</promise>` with that task ID.
+
+If any model constant in `src/loop_engine/model.rs` was touched, run `cargo run --bin gen-docs -- --check` (CI fails on a stale MODELS block).
+
+---
+
+## Common Wiring Failures (REVIEW-001 reference)
+
+New code must be reachable from production — REVIEW-001 verifies. Most common misses here:
+
+- `RunnerKind::Codex` variant added but never reachable (no `primaryRunner` route resolves to it) → verify the provider-hint path end-to-end with the dispatch mock.
+- `provider_hint` resolved but dropped before `resolve_effective_runner` (bare-`Option` call site) → grep for non-test bare-Option calls.
+- `executed_runner` not threaded into recovery → recovery re-derives from the model string → Codex task escalates to Opus.
+- `CodexStreamFormat` defined but not selected by `RunnerKind::Codex` in `CodexRunner::spawn`.
+- Protected-state verify barrier placed after merge-back → trips on the orchestrator's own writes.
+- Codex binary probe not called from `main.rs` → unverified binary spawns mid-run.
+
+---
+
+## Review Tasks
+
+| Review         | Priority | Spawns (priority)                  | Focus                                                                                                   |
+| -------------- | -------- | ---------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| REFACTOR-001   | 98       | `REFACTOR-FIX-xxx` (50-97)         | DRY (shared auth/binary helpers, not copies), complexity, coupling, exhaustive-match preservation       |
+| REVIEW-001     | 99       | `FIX-xxx` / `WIRE-FIX-xxx` (50-97) | Codex route reachable end-to-end, protected_state.rs security, no Claude-escalation on Codex crash, no `unwrap()`, full-suite green |
+
+Use the **rust-python-code-reviewer** agent for the security-sensitive `protected_state.rs` review.
+
+### Spawning follow-up tasks
+
+```sh
+echo '{
+  "id": "FIX-001",
+  "title": "Fix: <specific issue>",
+  "description": "From REVIEW-001: <details>",
+  "rootCause": "<file:line + issue>",
+  "exactFix": "<specific change>",
+  "verifyCommand": "<shell command that proves the fix>",
+  "acceptanceCriteria": ["Issue resolved", "No new warnings"],
+  "priority": 60,
+  "touchesFiles": ["affected/file.rs"]
+}' | task-mgr add --stdin --depended-on-by REVIEW-001
+```
+
+`--depended-on-by REVIEW-001` wires the new task into REVIEW-001's `dependsOn` AND syncs the PRD JSON atomically — don't edit the JSON yourself. Commit `chore: <REVIEW-ID> - Add <FIX|REFACTOR> tasks`, then emit `<task-status><REVIEW-ID>:done</task-status>`.
+
+---
+
+## Progress Report Format
+
+APPEND a block to `.task-mgr/tasks/progress-$PREFIX.txt` (create with a one-line header if missing). Keep it tight (~10 lines):
+
+```
+## [YYYY-MM-DD HH:MM] - [TASK-ID]
+Approach: [one sentence — what you chose and why]
+Files: [comma-separated paths touched]
+Learnings: [1-3 bullets, one line each]
+---
+```
+
+---
+
+## Learnings Guidelines
+
+Record learnings with `task-mgr learn` (indexed for recall). Do NOT append to `tasks/*-learnings.md` directly. Write concise (1-2 line) learnings.
+
+---
+
+## Stop and Blocked Conditions
+
+**Stop**: before `<promise>COMPLETE</promise>` verify ALL tasks `passes: true`, no new tasks created in final review, and REVIEW-001 passed with full suite green.
+
+**Blocked**: document the blocker in the progress file, create a clarification task via `task-mgr add --stdin --depended-on-by <blocked-task>` (priority 0), then output `<promise>BLOCKED</promise>`.
+
+---
+
+## Key Learnings (from task-mgr recall)
+
+These are pre-distilled learnings relevant to this task list. Treat them as authoritative — do NOT Read the learnings files. Use `task-mgr recall --for-task <ID>` for gaps.
+
+- **[3547]** RunnerKind resolution uses `ctx.runner_overrides.get(task_id)` with a `provider_for_model` fallback — keep this exact shape; just insert `provider_hint` between them.
+- **[3051 / 3733 / 3070]** Providers are dispatched via a static `enum RunnerKind` with an exhaustive `match` in a free `dispatch(kind, …)` fn — NOT trait objects. Adding a variant must force compile errors at every match. Never add a `_ =>` arm.
+- **[3110]** Drift sentinels for single-source-of-truth dispatch use **`assert!` (release), not `debug_assert!`**. The `slot.rs` merge re-derivation is therefore a production panic if it sees a mismatched runner — this is why the provider hint MUST be threaded into that assertion.
+- **[2889]** Copy-pasting agent-CLI argv when adding a second runner is extremely high-risk for flag-ordering bugs (a double `-p` bug shipped during Grok work even with the reference open). Write Codex argv FRESH against its CLI surface.
+- **[3853 / 673]** A mock runner must emit valid **stream-json JSONL**, not plain text — the engine parses JSONL. Use the `make_stream_json_result_script` helper pattern for the Codex dispatch mock; emit real Codex JSONL (`item.completed` agent_message, `turn.completed` usage).
+- **[3068]** `.expect()` is acceptable for guaranteed IO invariants in `runner.rs` **only when documented** why it's safe (e.g. "stdin is piped so unwrap cannot fail"). No bare `unwrap()` in production paths.
+- **[3220]** Provider-specific cleanup is done via a trait method (e.g. `cleanup_session`). Codex is `--ephemeral` and needs NO cleanup — leave `session_id` `None` so the dispatch cleanup branch is skipped.
+- **[3108]** A startup binary probe must mirror the runtime resolver exactly AND check the executable bit — paired correctness invariant. The Codex probe must use the same `$CODEX_BINARY → PATH` precedence and exec-bit check as `CodexRunner`.
+- **[3109]** Stderr-sniff / auth-failure substring lists need a maintenance runbook + **negative-control tests**. Add a negative control so agent output mentioning "401" is not misclassified as a (non-counting) auth failure.
+- **[2852]** Wave-mode PromptTooLong recovery uses the **shared** overflow ladder (not a wave-specific bypass). Codex overflow short-circuits to Blocked at the top of `handle_overflow` — don't fork the ladder.
+- **[1583]** A prior mechanism stops the *loop agent* from editing `tasks/*.json` via path-scoped Edit/Write permission **denials** (a Claude-permission feature). That does NOT cover Codex's own sandbox writes — the protected-state guard (FEAT-005) is the Codex-side complement (detect/revert).
+- **[1454]** task-mgr DB state can diverge from the PRD JSON in worktrees — relevant to why the protected-state guard treats `tasks.db` (integrity) and `tasks/*.json` (content) differently.
+
+---
+
+## CLAUDE.md Excerpts (only what applies to this change)
+
+These bullets were extracted from `CLAUDE.md` for the subsystems this change touches. Do NOT Read the full file.
+
+- **Model IDs** live only in `src/loop_engine/model.rs` (`OPUS_MODEL`/`SONNET_MODEL`/`HAIKU_MODEL` + `EFFORT_FOR_DIFFICULTY`). After bumping, run `cargo run --bin gen-docs`; CI runs `gen-docs -- --check`. `tests/no_hardcoded_models.rs` blocks literal model strings outside `model.rs`. **This work adds no model constants** — don't touch the MODELS block.
+- **Fallback runner config (Grok)** is the structural template for a Codex `primaryRunner` config block: `.task-mgr/config.json`, opt-in, `cliBinary` resolves bare binary on PATH when null, startup binary check before the first iteration when enabled. Config precedence (highest→lowest): explicit task `model` → `difficulty==high` → PRD `defaultModel` → project config → user config → none.
+- **Logging (CONTRACT-LOG-001)**: use `ui::*` for product UX / CLI data / byte-locked operator contracts; `tracing` for internal diagnostics only. Don't emit Codex diagnostics via `ui::`; use `tracing`.
+- **Parallel slots**: `--parallel N` (1-3) schedules non-conflicting tasks per wave; conflict detection uses `touchesFiles` overlap + a shared-infra heuristic. `--parallel 1` is byte-identical to sequential. The wave path has its own claim → pre-spawn → children → merge-back ordering (relevant to where the FEAT-005 verify barrier sits).
+- **`src/loop_engine/CLAUDE.md`** documents overflow recovery, auto-review, parallel slots, merge-back conflict resolution, and the shared iteration pipeline — FEAT-006 adds the Codex provider-intent / protected-state / sandbox / binary-resolution invariants there. `grep -n -A 10 '<header>' src/loop_engine/CLAUDE.md` to pull a specific section; don't read it whole.
+
+---
+
+## Data Flow Contracts
+
+Use these exactly — do NOT guess key types from variable names.
+
+**Provider routing chain (config → spawn):**
+```
+RunnerSpec { provider: String, model: String }            // project_config.rs:55 (under PrimaryRunnerConfig.byTaskType / byIdPrefix)
+  └─ parse_config_provider(spec.provider) -> Result<Provider,_>   // model.rs (NEW, FEAT-001): claude|grok|codex, else Err
+       └─ Provider { Claude, Grok, Codex }                 // model.rs:53 (Codex NEW)
+            └─ ResolvedExecutionTarget { model: Option<String>, provider_hint: Option<Provider> }  // model.rs (NEW)
+                 // provider_hint = Some(p) ONLY on the rung-2 primary_runner_match branch; None on all other rungs
+                 └─ EffectiveRunnerInput { model: Option<&str>, provider_hint: Option<Provider> }   // engine.rs (NEW)
+                      └─ resolve_effective_runner -> RunnerKind { Claude, Grok, Codex }              // engine.rs:368
+                           // order: runner_overrides -> provider_hint -> provider_for_model(model) -> Claude
+                           └─ dispatch(kind, prompt, perm, opts)                                     // runner.rs:1513 (exhaustive match)
+```
+Access pattern (FEAT-001, in resolve_task_execution_target):
+```rust
+// rung 2 — the ONLY place provider_hint is set:
+if let Some(spec) = primary_runner_match(cfg, ctx.task_id, ctx.task_type) {
+    let provider_hint = Some(parse_config_provider(&spec.provider)?); // strict
+    return ResolvedExecutionTarget { model: Some(spec.model.clone()), provider_hint };
+}
+// every other rung:
+ResolvedExecutionTarget { model: <resolved>, provider_hint: None }
+```
+
+**Executed-runner chain (spawn → recovery), FEAT-003:**
+```
+IterationResult.effective_runner: RunnerKind   // engine.rs:175 (NEW field, set at spawn for ALL runners)
+SlotResult.effective_runner: RunnerKind        // engine.rs:463 (already exists) + provider_hint (NEW, FEAT-001)
+  └─ handle_task_failure(..., executed_runner: RunnerKind)              // recovery.rs:378 (NEW param)
+       └─ escalate_task_model_if_needed_inner(..., executed_runner)     // recovery.rs:153 (NEW param)
+            // gate escalation/Grok-promotion on executed_runner != RunnerKind::Codex; NEVER call resolve_effective_runner here
+```
+
+**Protected-state paths (FEAT-005):**
+```
+db_dir/tasks/**/*.json, **/*-prompt.md, .last-branch   // text: content-hash + (dev,inode); verify+RESTORE on mismatch
+tasks.db, tasks.db-wal, tasks.db-shm                   // sqlite: PRAGMA integrity_check / quick_check + open + user_version
+                                                       //   -> integrity OK (incl. legitimate task-mgr CLI writes): ALLOW
+                                                       //   -> integrity FAIL: FATAL, stop loop, NO raw restore
+// tasks_dir + LAST_BRANCH_FILE resolution: src/loop_engine/env.rs ; sqlite trio dir: src/db/path.rs
+```
+
+---
+
+## Feature-Specific Checks
+
+- **Pure-Claude/Grok parity is the load-bearing invariant.** Every Codex branch is gated (on `Provider::Codex` / `RunnerKind::Codex` / the `runner_requires_state_guard` allowlist). A run with no Codex config must be byte-identical to HEAD. The existing routing/recovery/wave tests staying green is the proof.
+- **Codex is never a fallback *target*.** Overflow rung-4 returns `None` for Codex; recovery never promotes to Codex. No code path may insert `RunnerKind::Codex` into `ctx.runner_overrides` (FEAT-004 has an invariant test).
+- **Dispatch mock** (FEAT-002 / REVIEW-001): a fake `$CODEX_BINARY` echoing canned Codex JSONL must be invoked (not Claude) for a `provider:"codex"` route, with argv order, stdin prompt, cwd, and `-m` flag asserted.
+- **Spike-confirmed Codex facts**: prompt via stdin (`codex … exec … -`); JSONL = `thread.started`/`turn.started`/`item.completed` agent_message/`turn.completed` usage; auth failure = repeated 401s + exit 1 (NOT fast-fail — do not gate on Grok's 3s window); sandbox allows `--cd` cwd + `/tmp`, denies `/home/chris/…`.
+
+---
+
+## Important Rules
+
+- Work on **ONE task per iteration**
+- **Commit frequently** after each passing task
+- **Keep CI green** — never commit failing code
+- **Read before writing** — always read files first
+- **Minimal changes** — only implement what's required
+- Work on the correct branch: **feat/codex-runner**

@@ -87,6 +87,10 @@ pub enum TaskMgrError {
         actual: String,
     },
 
+    /// Project configuration is semantically invalid.
+    #[error("Invalid config for {field}: {message}")]
+    InvalidConfig { field: String, message: String },
+
     /// Task cannot be completed because its dependencies are not satisfied.
     #[error("Cannot complete task '{task_id}': unsatisfied dependencies: {unsatisfied}\n\n{hint}")]
     DependencyNotSatisfied {
@@ -203,6 +207,18 @@ pub enum TaskMgrError {
         /// Operator-friendly remediation hint (e.g., "Run `grok login` to
         /// authenticate, then retry the task.").
         hint: String,
+    },
+
+    /// Codex CLI failed to authenticate.
+    #[error("Codex authentication failed: {hint}")]
+    CodexAuthFailure { hint: String },
+
+    /// A Codex child process mutated task-mgr-owned state.
+    #[error("runner {runner_kind:?} mutated protected task state: {paths:?}")]
+    ProtectedTaskStateMutation {
+        runner_kind: RunnerKind,
+        paths: Vec<String>,
+        fatal: bool,
     },
 
     /// A transient backend failure (HTTP 502/503/504, "Bad Gateway",

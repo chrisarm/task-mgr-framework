@@ -479,6 +479,7 @@ fn slot_build_prompt_missing_base_prompt_path_degrades_gracefully() {
         permission_mode: PermissionMode::Dangerous,
         steering_path: None,
         session_guidance: "",
+        primary_runner: None,
     };
 
     let bundle: SlotPromptBundle =
@@ -518,6 +519,7 @@ fn slot_build_prompt_with_real_base_prompt_file_includes_content() {
         permission_mode: PermissionMode::Dangerous,
         steering_path: None,
         session_guidance: "",
+        primary_runner: None,
     };
 
     let bundle = task_mgr::loop_engine::prompt::slot::build_prompt(&conn, &task, &params);
@@ -545,6 +547,7 @@ fn slot_build_prompt_large_base_prompt_is_truncated() {
         permission_mode: PermissionMode::Dangerous,
         steering_path: None,
         session_guidance: "",
+        primary_runner: None,
     };
 
     let bundle = task_mgr::loop_engine::prompt::slot::build_prompt(&conn, &task, &params);

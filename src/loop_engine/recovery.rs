@@ -98,6 +98,7 @@ pub(crate) fn apply_pending_promotion(ctx: &mut IterationContext, p: &PendingPro
         let (runner_label, from_label) = match p.target_runner {
             RunnerKind::Grok => ("Grok", "Opus"),
             RunnerKind::Claude => ("Claude", "Grok"),
+            RunnerKind::Codex => ("Codex", "previous"),
         };
         ui::emit(&format!(
             "Promoted task {} to {} runner (model={}) after {} consecutive failures at {}",
@@ -121,6 +122,7 @@ pub(crate) fn escalate_task_model_if_needed_inner(
     task_id: &str,
     new_count: i32,
     ctx: &IterationContext,
+    executed_runner: Option<RunnerKind>,
     cfg: Option<&project_config::FallbackRunnerConfig>,
     primary_cfg: Option<&project_config::PrimaryRunnerConfig>,
 ) -> TaskMgrResult<(Option<String>, Option<PendingPromotion>)> {
@@ -131,6 +133,11 @@ pub(crate) fn escalate_task_model_if_needed_inner(
         conn.query_row("SELECT model FROM tasks WHERE id = ?", [task_id], |r| {
             r.get::<_, Option<String>>(0)
         })?;
+    let effective_runner = executed_runner
+        .unwrap_or_else(|| resolve_effective_runner(ctx, task_id, current_model.as_deref()));
+    if effective_runner == RunnerKind::Codex {
+        return Ok((None, None));
+    }
     // None / empty / whitespace model: assume sonnet baseline → escalate to opus.
     let escalated = match normalize_baseline(current_model.as_deref()) {
         None => Some(model::OPUS_MODEL.to_string()),
@@ -163,7 +170,6 @@ pub(crate) fn escalate_task_model_if_needed_inner(
     if ctx.runner_overrides.contains_key(task_id) {
         return Ok((escalated, None));
     }
-    let effective_runner = resolve_effective_runner(ctx, task_id, current_model.as_deref());
     match effective_runner {
         // kind-correct: Claude is the source side; Grok is the fallback target — provider identity, not capability.
         RunnerKind::Claude => {
@@ -250,6 +256,7 @@ pub(crate) fn escalate_task_model_if_needed_inner(
             };
             Ok((Some(claude_model.to_string()), Some(promotion)))
         }
+        RunnerKind::Codex => Ok((None, None)),
     }
 }
 
@@ -299,7 +306,7 @@ pub fn escalate_task_model_if_needed(
     primary_cfg: Option<&project_config::PrimaryRunnerConfig>,
 ) -> TaskMgrResult<Option<String>> {
     let (model, pending) =
-        escalate_task_model_if_needed_inner(conn, task_id, new_count, ctx, cfg, primary_cfg)?;
+        escalate_task_model_if_needed_inner(conn, task_id, new_count, ctx, None, cfg, primary_cfg)?;
     if let Some(p) = pending {
         apply_pending_promotion(ctx, &p);
     }
@@ -383,6 +390,26 @@ pub fn handle_task_failure(
     cfg: Option<&project_config::FallbackRunnerConfig>,
     primary_cfg: Option<&project_config::PrimaryRunnerConfig>,
 ) -> TaskMgrResult<()> {
+    handle_task_failure_with_runner(
+        conn,
+        task_id,
+        current_iteration,
+        ctx,
+        None,
+        cfg,
+        primary_cfg,
+    )
+}
+
+pub(crate) fn handle_task_failure_with_runner(
+    conn: &mut Connection,
+    task_id: &str,
+    current_iteration: i64,
+    ctx: &mut IterationContext,
+    executed_runner: Option<RunnerKind>,
+    cfg: Option<&project_config::FallbackRunnerConfig>,
+    primary_cfg: Option<&project_config::PrimaryRunnerConfig>,
+) -> TaskMgrResult<()> {
     // Phase 1: increment consecutive_failures + (conditional) model escalation
     // inside a single transaction so a mid-flight failure rolls both back.
     //
@@ -427,6 +454,7 @@ pub fn handle_task_failure(
                 task_id,
                 new_count,
                 ctx,
+                executed_runner,
                 cfg,
                 primary_cfg,
             ) {
@@ -484,6 +512,7 @@ pub(super) fn prompt_overflow_result(
         output: String::new(),
         effective_model: None,
         effective_effort: None,
+        effective_runner: None,
         key_decisions_count: 0,
         conversation: None,
         shown_learning_ids: Vec::new(),

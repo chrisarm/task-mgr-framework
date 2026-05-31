@@ -1,0 +1,476 @@
+{
+  "branchName": "feat/codex-runner",
+  "description": "Enable Codex (codex-cli 0.135.0+) as a third runner provider alongside Claude and Grok, reachable only via an explicit primaryRunner spec with provider: \"codex\". Carries provider intent from config to spawn site (no model-string inference), adds a CodexRunner + stream parser, preserves provider identity through recovery, validates+probes the Codex binary, and guards orchestrator state against Codex sandbox writes. v1 scope per the architect-reviewed plan at /home/chris/.claude/plans/plan-out-th-necessary-nifty-storm.md.",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "Rust: No warnings in `cargo check` output",
+      "Rust: No warnings in `cargo clippy -- -D warnings` output",
+      "Rust: Scoped tests pass with `cargo test -p task-mgr <module>`",
+      "Rust: `cargo fmt --check` passes",
+      "No breaking changes to Claude/Grok behavior — a run with no Codex config must be byte-identical to HEAD (gate every Codex-specific branch on the provider/runner being Codex)",
+      "No literal model-string creep outside src/loop_engine/model.rs (tests/no_hardcoded_models.rs guards this)"
+    ],
+    "description": "These criteria apply to ALL implementation tasks"
+  },
+  "model": "claude-sonnet-4-6",
+  "priorityPhilosophy": {
+    "description": "Hierarchy of what matters most when implementing tasks",
+    "hierarchy": [
+      "1. PLAN — Anticipate edge cases before coding",
+      "2. PHASE 2 FOUNDATION — ~1 day now to save ~2+ weeks later (1:10+ ratio); we are pre-launch, foundations compound",
+      "3. FUNCTIONING CODE — Pragmatic, reliable, wired in per plan",
+      "4. CORRECTNESS — Compiles, type-checks, scoped tests pass deterministically",
+      "5. CODE QUALITY — Clean code, qualityDimensions satisfied, no warnings",
+      "6. POLISH — Docs, formatting, minor improvements"
+    ],
+    "principles": [
+      "Quality dimensions explicit — qualityDimensions on every task tells you what 'good' looks like",
+      "Phase 2 foundation — prefer solutions that lay strong post-launch foundations (1:10+ savings ratio)",
+      "Edge cases = test cases — every known edge case must have a corresponding test",
+      "Scoped per-iteration tests, full suite at REVIEW-001 — REVIEW must leave the trunk green including pre-existing failures",
+      "Ship working code with tests to prove it; handle Option/Result explicitly; avoid unwrap() in production"
+    ]
+  },
+  "prohibitedOutcomes": [
+    "Tests that only assert 'no crash' or check type without verifying content",
+    "Tests that mirror implementation internals (break when refactoring)",
+    "Abstractions with only one concrete use",
+    "Error messages that don't identify what went wrong",
+    "Catch-all error handlers that swallow context",
+    "Wildcard match arms (_ =>) on RunnerKind / Provider / CrashType — exhaustive matching is the safety property that forces every new provider to be handled at every dispatch site",
+    "Re-deriving the runner inside recovery/overflow from the model string instead of threading the executed RunnerKind — the model string for a Codex task is gpt-* and re-derives to Claude (silent cross-provider escape)",
+    "Inferring Codex from gpt-*/o*/codex model strings — v1 routes to Codex ONLY via an explicit primaryRunner provider hint"
+  ],
+  "project": "task-mgr",
+  "requires": [
+    {
+      "prd": "models-routing-config.json",
+      "task": "REVIEW-001",
+      "reason": "models-routing-config lands the provider/model routing CLI + config setters that touch the same surfaces codex-runner extends (src/loop_engine/model.rs, src/loop_engine/project_config.rs, src/commands/models/). Sequencing it first avoids merge conflicts and lets Codex routing build on the settled config surface."
+    }
+  ],
+  "taskPrefix": "f0337891",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "Positive: resolve_task_execution_target sets provider_hint=Some(Codex) ONLY when a primaryRunner spec with provider:\"codex\" matches by task type or id prefix",
+        "Positive: resolve_effective_runner resolution order is runner_overrides -> provider_hint -> provider_for_model -> Claude",
+        "Negative: provider_for_model(Some(\"gpt-5\")) == Provider::Claude AND provider_for_model(Some(\"codex\")) == Provider::Claude AND provider_for_model(Some(\"o3\")) == Provider::Claude",
+        "Negative: explicit tasks.model present -> resolve_task_execution_target returns that model with provider_hint=None even if a primaryRunner spec would otherwise match",
+        "Unit test: parse_config_provider(\"  CODEX \") == Ok(Provider::Codex); parse_config_provider(\"openai\") is Err",
+        "Unit test: a Codex-routed SlotResult survives process_slot_result without panic (provider_hint threaded into the slot.rs:570 assertion)",
+        "Known-bad: a re-derivation at slot.rs:570 that passes only the model string (no hint) would assert_eq!(Claude, Codex) and panic — test must route a Codex slot through process_slot_result and assert no panic",
+        "Grep-test: no production (non-#[cfg(test)]) code calls the bare-Option From form of resolve_effective_runner",
+        "CONTRACT: parse_config_provider accepts exactly the provider strings RunnerSpec.provider can hold (grep RunnerSpec usage to confirm claude|grok|codex coverage)"
+      ],
+      "dependsOn": [],
+      "description": "Carry provider intent from the primaryRunner config spec to the spawn site instead of re-inferring it from the model string. This is the foundation every later task depends on.\n\nDO:\n- Add `Codex` to the `Provider` enum (model.rs:53). Handle the new variant at EVERY match (compile errors are the guard).\n- Add `parse_config_provider(s: &str) -> Result<Provider, String>` — the ONLY place a config provider string becomes a Provider (claude|grok|codex, trimmed, case-insensitive; else Err).\n- Add `ResolvedExecutionTarget { model: Option<String>, provider_hint: Option<Provider> }` and `resolve_task_execution_target(ctx) -> ResolvedExecutionTarget`. Mirror resolve_task_model's rung order, but set `provider_hint` ONLY on the rung-2 primary_runner_match branch (parsed via parse_config_provider). Every other rung yields provider_hint: None.\n- Reduce `resolve_task_model` to a thin wrapper returning `.model` so existing callers compile unchanged.\n- Change `resolve_effective_runner` (engine.rs:368) to take an explicit `EffectiveRunnerInput { model, provider_hint }`. New order: runner_overrides -> provider_hint -> provider_for_model(model) -> Claude.\n- Restrict the `From<Option<&str>>` ergonomic conversion (provider_hint=None) to `#[cfg(test)]`.\n- Update ALL call sites to pass explicit input: sequential spawn (iteration.rs:446), wave pre-spawn (wave_scheduler.rs:1162), and the merge re-derive assertion (slot.rs:570). For slot.rs:570, add `provider_hint: Option<Provider>` to SlotResult/SlotContext, populate it on the main thread at spawn, and rebuild EffectiveRunnerInput here so the re-derivation is byte-identical to spawn-time.\n\nDO NOT:\n- Change `provider_for_model` (model.rs:83) — it must keep returning only Claude/Grok. A codex/gpt-*/o* model string must NOT classify as Codex.\n- Leave any production call of the bare-Option `resolve_effective_runner` form.\n\nEdge cases:\n- gpt-*/o*/codex model string with no primaryRunner hint -> resolves to Claude (not Codex).\n- primaryRunner match + explicit tasks.model -> tasks.model wins (rung 1), provider_hint absent.\n- A Codex-routed wave slot reaching slot.rs:570 -> assertion passes (no panic).\n\nKnown-bad to guard against:\n- Threading only model and re-deriving the runner from it -> Codex slot (gpt-* model) mis-asserts as Claude and panics the wave worker (release assert_eq!, Learning 3110).",
+      "edgeCases": [
+        "gpt-*/o*/codex model string, no primaryRunner hint: routes to Claude",
+        "primaryRunner match AND explicit tasks.model: tasks.model wins, no hint",
+        "primaryRunner match by both byTaskType and byIdPrefix: byTaskType wins (existing precedence)",
+        "Codex-routed wave slot at slot.rs:570 merge assertion: passes, no panic"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "provider_hint dropped before resolve_effective_runner",
+          "expectedBehavior": "Compile error preferred (explicit EffectiveRunnerInput); test-only From shortcut means production cannot accidentally pass None"
+        },
+        {
+          "cause": "Codex slot reaches merge assertion with no hint",
+          "expectedBehavior": "Hint threaded via SlotResult so re-derivation matches spawn-time runner; no panic"
+        }
+      ],
+      "id": "FEAT-001",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": true,
+      "notes": "Reuse: model.rs primary_runner_match (rung-2 logic), ModelResolutionContext (model.rs:235 carries primary_runner). engine.rs:374 has the From<Option<&str>> conversion to restrict. Learning 3547/3733/3070: RunnerKind dispatch + provider_for_model fallback pattern — keep exhaustive matching. Learning 3110: drift sentinels at engine/slot are release assert! (NOT debug_assert!), so a hint mismatch is a production panic — this is exactly why the slot.rs:570 re-derivation must receive the hint. Data contract: RunnerSpec{provider:String, model:String} (project_config.rs:55) -> parse_config_provider -> Provider -> RunnerKind.",
+      "passes": false,
+      "priority": 1,
+      "qualityDimensions": [
+        "Exhaustive matching on Provider/RunnerKind — no wildcard arms",
+        "provider_hint set on exactly one rung (primary_runner_match); None everywhere else",
+        "resolve_task_model remains a behavior-preserving wrapper (existing callers untouched)",
+        "Hint cannot be silently dropped: production sites pass explicit EffectiveRunnerInput, From shortcut is test-only",
+        "Pure-Claude/Grok routing byte-identical to HEAD"
+      ],
+      "taskType": "implementation",
+      "title": "Provider-intent threading: Provider::Codex + ResolvedExecutionTarget + explicit EffectiveRunnerInput",
+      "touchesFiles": [
+        "src/loop_engine/model.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/iteration.rs",
+        "src/loop_engine/wave_scheduler.rs",
+        "src/loop_engine/slot.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: dispatch(RunnerKind::Codex, ...) spawns the Codex binary with the exact argv for the given PermissionMode (Scoped/Auto vs Dangerous shapes verified)",
+        "Positive: the prompt is delivered on stdin and stdin is closed; output is read only from accumulated agent_message",
+        "Positive: CodexRunner.supports() returns true only for StreamJson; false for Effort/Pty/DisallowedTools/TitleArtifactCleanup",
+        "Negative: enforce_capabilities rejects RunnerOpts with effort/use_pty/disallowed_tools/cleanup_title_artifact set for RunnerKind::Codex BEFORE spawn (UnsupportedRunnerCapability)",
+        "Negative: turn.completed lines contribute nothing to derive_output",
+        "Unit test (stream): normal (agent_message), tool (command_execution), type:\"error\", turn.failed, malformed line, split completion tag, tail cap — each parsed/accumulated as specified",
+        "Unit test (dispatch mock): a fake $CODEX_BINARY echoing canned JSONL is invoked (not Claude) for RunnerKind::Codex; argv order, stdin prompt, cwd, and -m flag presence/absence asserted",
+        "Known-bad: a mock that emits plain text instead of JSONL would silently yield empty output — the mock MUST emit valid Codex JSONL (Learning 3853)",
+        "Full RunnerKind x RunnerCapability matrix test includes all four Codex negative capabilities",
+        "CONTRACT: CodexStreamFormat StreamEvent variants match the StreamEvent enum in stream.rs (grep to verify)"
+      ],
+      "dependsOn": [
+        "FEAT-001"
+      ],
+      "description": "Add the Codex runner: a new RunnerKind variant, a CodexRunner implementing LlmRunner, exhaustive dispatch wiring, the capability matrix, and a CodexStreamFormat JSONL parser.\n\nDO:\n- Add `Codex` to RunnerKind (runner.rs:226). Fill the supports (:238) and dispatch (:1513) matches exhaustively — no wildcard arms.\n- Add `pub(crate) struct CodexRunner;` impl LlmRunner (runner.rs:298), modelled on GrokRunner (runner.rs:730) but written fresh (see Learning 2889 — do NOT copy-paste argv).\n- supports(): StreamJson => true; Effort, Pty, DisallowedTools, TitleArtifactCleanup => false.\n- Binary resolution: $CODEX_BINARY if nonempty/trimmed, else `codex` on PATH (mirror resolve_and_verify_grok_binary, project_config.rs:376).\n- Prompt via STDIN (codex ... exec ... -), not argv, not --prompt-file. Write the full prompt on a dedicated writer thread (or handle BrokenPipe) so an early Codex exit (auth failure) doesn't deadlock a blocking write_all to a full pipe.\n- argv (permission-mode dependent): Scoped/Auto -> `codex -a never exec --json --sandbox workspace-write --ephemeral --skip-git-repo-check --cd <cwd> [-m <model>] -`; Dangerous -> `codex exec --json --dangerously-bypass-approvals-and-sandbox --ephemeral --skip-git-repo-check --cd <cwd> [-m <model>] -`.\n- No session-id / no cleanup_session (Codex --ephemeral leaves no artifact; the dispatch cleanup branch only runs when session_id.is_some()).\n- Add `CodexStreamFormat` (stream.rs:70 trait, model on GrokStreamFormat stream.rs:371): item.completed agent_message -> AssistantText (sole authoritative output); command_execution start/complete (+aggregated_output) -> ToolUse/ToolResult (display only); type:\"error\"/turn.failed -> Error; thread.started/turn.started -> no-op; turn.completed -> IGNORE for output (usage only). derive_output = tail-capped accumulated agent_message (reuse tail_truncate / MAX_OUTPUT_BYTES). Set line_buffer_tee per observed granularity.\n\nDO NOT:\n- Use turn.completed as output (drops <task-status>/<completed> lifecycle tags that ride inside agent_message).\n- Copy GrokRunner's --prompt-file/argv prompt delivery (Codex uses stdin).\n- Add a wildcard dispatch arm.\n\nEdge cases:\n- Malformed JSONL line: skipped, parsing continues.\n- <task-status>/<completed> tag split across two agent_message chunks: extracted by shared drive_stream accumulation (no special handling).\n- type:\"error\" with invalid model: surfaced as Error, exit 1.\n\nKnown-bad to guard against:\n- Reusing GrokRunner argv construction wholesale -> flag-ordering bug (Learning 2889: a double -p bug shipped during Grok work even with the reference open).",
+      "edgeCases": [
+        "Malformed JSONL line: skip, continue parsing",
+        "Completion tag split across agent_message chunks: extracted by shared accumulation",
+        "type:\"error\" (invalid model): surfaced as Error event, exit 1",
+        "Codex exits before stdin drained: writer thread/BrokenPipe avoids deadlock"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "Blocking write_all to a full stdin pipe on a dead Codex child",
+          "expectedBehavior": "Dedicated writer thread or BrokenPipe handling prevents deadlock"
+        },
+        {
+          "cause": "Unshaped RunnerOpts (effort/pty/etc.) routed to Codex",
+          "expectedBehavior": "enforce_capabilities returns UnsupportedRunnerCapability before spawn"
+        }
+      ],
+      "id": "FEAT-002",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "Reuse: GrokRunner (runner.rs:730) as a STRUCTURAL reference only; LlmRunner trait (runner.rs:298); GrokStreamFormat (stream.rs:371); drive_stream (stream.rs:247); tail_truncate/MAX_OUTPUT_BYTES; CHECKS (runner.rs:1425) + enforce_capabilities (runner.rs:1460). Test helper: make_stream_json_result_script pattern (Learning 673) for mock JSONL. Learning 2889: write argv fresh, do NOT copy Grok's — flag ordering bugs are the #1 second-runner failure. Learning 3068: .expect() is acceptable for guaranteed IO invariants in runner.rs IF documented why it's safe. Learning 3220: provider-specific cleanup via trait method (Codex needs none — ephemeral).",
+      "passes": false,
+      "priority": 2,
+      "qualityDimensions": [
+        "Exhaustive RunnerKind dispatch — no wildcard arm",
+        "argv written fresh per Codex CLI surface, not copied from Grok",
+        "stdin prompt delivery is deadlock-safe (writer thread / BrokenPipe handled)",
+        "Output sourced ONLY from accumulated agent_message; turn.completed ignored",
+        "Capability matrix rejects unshaped RunnerOpts before spawn"
+      ],
+      "taskType": "implementation",
+      "title": "CodexRunner + RunnerKind::Codex dispatch + CodexStreamFormat",
+      "touchesFiles": [
+        "src/loop_engine/runner.rs",
+        "src/loop_engine/stream.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: handle_task_failure and escalate_task_model_if_needed_inner accept executed_runner and gate escalation/promotion on it != Codex",
+        "Positive: handle_overflow returns RecoveryAction::Blocked immediately for effective_runner == Codex, before any rung",
+        "Positive: CodexAuthFailure is non-counting via a shared helper used by BOTH sequential and wave paths",
+        "Negative: a Codex RuntimeError (NULL DB model) writes NO model to tasks.model and triggers NO Grok promotion (assert tasks.model unchanged)",
+        "Negative: a Codex PromptTooLong writes NO Claude model to tasks.model",
+        "Unit/body-grep test: escalate_task_model_if_needed_inner does NOT call resolve_effective_runner (mirror runtime_error_fallback.rs grep-test pattern)",
+        "Unit test (sequential + wave): Codex crash increments consecutive_failures only as intended; no wave assertion panic",
+        "Negative-control test: a task whose agent_message contains \"HTTP 401\" is NOT classified as CodexAuthFailure (structured signal required) so it still auto-blocks after max retries",
+        "CONTRACT: IterationResult.effective_runner is populated at the spawn site for ALL runners (grep the iteration/wave spawn paths to verify it is always set, not Option-defaulted)"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002"
+      ],
+      "description": "Stop a Codex crash from being treated as a Claude/Grok failure. Thread the EXECUTED runner out of the iteration and into recovery/overflow so escalation and promotion never fire for Codex.\n\nDO:\n- Add `effective_runner: RunnerKind` to IterationResult (engine.rs:175). SlotResult already has effective_runner (engine.rs:463); also carry the provider_hint added in FEAT-001 if needed by recovery.\n- Add `executed_runner: RunnerKind` params to handle_task_failure (recovery.rs:378) and escalate_task_model_if_needed_inner (recovery.rs:153), sourced from IterationResult.effective_runner at the sequential call site (orchestrator.rs:1335) and the wave call site (wave_scheduler.rs ~1386).\n- FORBID any internal resolve_effective_runner call inside recovery — gate escalation/Grok-promotion branches on `executed_runner != RunnerKind::Codex`.\n- Add `CrashType::CodexAuthFailure` (config.rs:461) modelled on GrokAuthFailure, and `TaskMgrError::CodexAuthFailure { hint }` (error.rs) modelled on GrokAuthFailure. Route it through a SHARED auth-skip-list helper so sequential and wave both treat it as non-counting (does not increment consecutive_failures).\n- Add explicit early short-circuit at the TOP of handle_overflow (reactions/post_output.rs:142): `if effective_runner == RunnerKind::Codex { return RecoveryAction::Blocked }` — before any rung walk. (select_fallback_target already returns None for Codex.)\n\nDO NOT:\n- Re-derive the runner from the model string anywhere in recovery/overflow (a Codex task's gpt-* model re-derives to Claude -> Opus escalation -> silent Claude route).\n- Rely on rung-1/2/3 preconditions happening to be false for Codex — rung-2 escalate_model keys off the model string and could write a Claude model for a gpt-* string.\n- Misclassify agent output mentioning \"401\" as an auth failure (must be a STRUCTURED signal: type:\"error\"+turn.failed, or stderr 401/missing-bearer).\n\nEdge cases:\n- Codex RuntimeError with NULL DB model: consecutive_failures increments, but NO Claude model write, NO Grok promotion.\n- Codex PromptTooLong overflow: straight to Blocked, no model written to tasks.model.\n- CodexAuthFailure (repeated 401s, exit 1 — NOT fast-fail like Grok): non-counting on both sequential and wave.\n- Wave Codex crash: no assertion panic, no wave-wide model corruption.\n\nKnown-bad to guard against:\n- A negative-control miss where a task whose agent OUTPUT discusses HTTP 401 gets classified non-counting -> it never auto-blocks and retries forever (Learning 3109).",
+      "edgeCases": [
+        "Codex RuntimeError, NULL DB model: counts toward retries; no escalation/promotion",
+        "Codex PromptTooLong: Blocked, no model write",
+        "CodexAuthFailure (repeated 401s, exit 1, not fast-fail): non-counting on both paths",
+        "Wave Codex crash: no assertion panic, no wave-wide model corruption"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "Recovery re-derives runner from gpt-* model string",
+          "expectedBehavior": "Forbidden — executed_runner is threaded; Codex gate fires reliably"
+        },
+        {
+          "cause": "Agent output mentions 401",
+          "expectedBehavior": "NOT classified as auth failure; only a structured type:error+turn.failed or stderr bearer signal counts"
+        }
+      ],
+      "id": "FEAT-003",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": true,
+      "notes": "Reuse: GrokAuthFailure handling (config.rs CrashType:461, error.rs, recovery skip-list), PendingPromotion (recovery.rs:49), select_fallback_target (post_output.rs:47 already returns None for Codex), handle_overflow 5-rung ladder (post_output.rs:142). Learning 3109: stderr-sniff/auth substring lists need a maintenance runbook + negative-control tests — add one. Learning 2852: wave PromptTooLong recovery uses the shared ladder (don't fork it). Learning 3110: the slot drift assertion is a release assert — recovery must not feed it a mismatched runner. Extract the auth-skip-list helper once; do not duplicate the skip condition across sequential and wave.",
+      "passes": false,
+      "priority": 3,
+      "qualityDimensions": [
+        "Executed runner is THREADED, never re-derived in recovery/overflow",
+        "Single shared auth-skip-list helper used by sequential and wave (DRY)",
+        "Codex overflow short-circuits to Blocked at the top, not by rung-precondition luck",
+        "Auth classification requires a structured signal, with a negative control",
+        "No Claude model string ever written to tasks.model for a Codex task"
+      ],
+      "taskType": "implementation",
+      "title": "Preserve provider identity through recovery + overflow + non-counting Codex auth crash",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/slot.rs",
+        "src/loop_engine/recovery.rs",
+        "src/loop_engine/config.rs",
+        "src/error.rs",
+        "src/loop_engine/reactions/post_output.rs",
+        "src/loop_engine/orchestrator.rs",
+        "src/loop_engine/wave_scheduler.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: config load rejects an unknown primaryRunner provider (e.g. \"openai\") and a blank provider/model with a clear error",
+        "Positive: config load rejects reviewModel set together with any Codex primaryRunner route",
+        "Positive: config load rejects enabled fallbackRunner with provider != \"grok\"",
+        "Positive: check_codex_primary_binary verifies the executable bit (mirrors runtime resolution exactly) and runs only when a Codex primary route exists",
+        "Negative: with no Codex primary route, the Codex binary is NOT probed (no PATH lookup)",
+        "Unit test: Codex binary probe for empty / whitespace / missing / non-executable / executable $CODEX_BINARY (5 cases)",
+        "Unit test: reviewModel + Codex primary route -> config load Err; reviewModel alone (no Codex route) -> Ok",
+        "Invariant test: no code path inserts RunnerKind::Codex into ctx.runner_overrides (Codex is a primary route only, never a fallback target — else the route-gated probe is skipped and an unverified binary spawns mid-run)",
+        "CONTRACT: resolve_and_verify_codex_binary uses the same $CODEX_BINARY -> PATH precedence and exec-bit check as CodexRunner's runtime resolution (grep both to confirm parity)"
+      ],
+      "dependsOn": [
+        "FEAT-001"
+      ],
+      "description": "Validate Codex-related config before the startup binary probe, and probe the Codex binary before the first iteration.\n\nDO:\n- Reject unknown/blank provider and blank model in every RunnerSpec under primaryRunner.byTaskType / byIdPrefix, using parse_config_provider (FEAT-001).\n- Reject reviewModel combined with any Codex primaryRunner route (reviewModel is string-only in v1 and clears the provider hint -> an operator setting both would silently get a non-Codex review). Fail config load with a clear message.\n- Reject enabled fallbackRunner.provider != \"grok\" (a provider:\"codex\" fallback would write a Codex model but still dispatch Grok at rung-4).\n- Add `check_codex_primary_binary(primary: Option<&PrimaryRunnerConfig>)` mirroring check_fallback_runner_binary (project_config.rs:408) + `resolve_and_verify_codex_binary` mirroring resolve_and_verify_grok_binary (project_config.rs:376): $CODEX_BINARY -> `codex` on PATH, check the executable bit. Probe ONLY when an explicit Codex primary route exists. Call it from src/main.rs alongside the existing fallback/review probes, before iteration 1.\n\nDO NOT:\n- Probe the Codex binary when no Codex primary route is configured (no surprise PATH lookups).\n- Accept a provider string the dispatcher can't route.\n\nEdge cases:\n- $CODEX_BINARY empty/whitespace: treated as unset, fall back to PATH.\n- $CODEX_BINARY set to a non-executable / missing file: probe fails with a helpful NotFound error before iteration 1.\n- primaryRunner present but no Codex spec: Codex probe skipped.\n\nKnown-bad to guard against:\n- A probe that checks file existence but NOT the executable bit (Learning 3108: probe must mirror the runtime resolver AND check the exec bit).",
+      "edgeCases": [
+        "$CODEX_BINARY empty/whitespace: treated as unset -> PATH",
+        "$CODEX_BINARY non-executable/missing: probe fails before iteration 1",
+        "primaryRunner present, no Codex spec: probe skipped"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Codex binary missing at startup with a Codex route configured",
+          "expectedBehavior": "Loop exits before iteration 1 with a helpful NotFound error"
+        },
+        {
+          "cause": "Operator sets reviewModel + Codex primary route",
+          "expectedBehavior": "Config load fails with an explicit message (string reviewModel would silently win)"
+        }
+      ],
+      "id": "FEAT-004",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": true,
+      "notes": "Reuse: check_fallback_runner_binary (project_config.rs:408), check_review_model_binary (project_config.rs:430), resolve_and_verify_grok_binary (project_config.rs:376), is_executable_path. main.rs binary-probe call site (alongside fallback/review probes, before iteration 1). Learning 3108: startup probe must mirror the runtime resolver AND check the executable bit — paired invariant. Learning 3109: validation error messages should be actionable (name the bad field + allowed values).",
+      "passes": false,
+      "priority": 4,
+      "qualityDimensions": [
+        "Probe mirrors runtime resolution exactly (same precedence + exec-bit check)",
+        "Probe runs only when a Codex primary route exists (no surprise PATH lookups)",
+        "Config errors name the offending field and allowed values",
+        "reviewModel + Codex and non-Grok fallback are rejected at load, not at spawn"
+      ],
+      "taskType": "implementation",
+      "title": "Config validation + Codex binary probe",
+      "touchesFiles": [
+        "src/loop_engine/project_config.rs",
+        "src/main.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: text artifact (tasks/*.json, *-prompt.md, .last-branch) mutated by a simulated Codex run is detected and restored to the snapshot content",
+        "Positive: a simulated integrity-PRESERVING SQLite change (e.g. a valid UPDATE mimicking a task-mgr write) is ALLOWED — loop continues, no fatal",
+        "Positive: SQLite corruption (truncated/garbage db/wal/shm) is detected via integrity check -> fatal, loop stops, NO raw restore performed",
+        "Negative: with the executed runner being Claude or Grok, the guard is a no-op (byte-identical to HEAD — verified by an existing sequential/wave test staying green)",
+        "Unit test: regular->symlink swap is detected via inode change AND restore removes the symlink before writing (assert the link TARGET was not written through)",
+        "Unit test: hardlink/inode-swap on a protected file is detected",
+        "Unit test: a NEW file matching a protected glob is detected",
+        "Unit test (wave): the protected window EXCLUDES the orchestrator's own merge-back/reconcile writes (a normal wave does not trip the guard)",
+        "Unit test (wave): a Codex SQLite corruption fails the whole wave THROUGH the cascade-halt sentinel (consecutive_merge_fail_waves is NOT reset)",
+        "Negative: no post-output mutation (tag processing/overflow/merge) runs before the verify barrier (ordering test)",
+        "CONTRACT: protected text globs and the db_dir/tasks path resolution match how env.rs/db path.rs compute tasks_dir and the SQLite trio location (grep to verify)"
+      ],
+      "dependsOn": [
+        "FEAT-002",
+        "FEAT-003"
+      ],
+      "description": "Guard orchestrator state against Codex sandbox writes. Codex can write inside --cd cwd and /tmp; the worktree cwd contains orchestrator state. This guard DETECTS AND REVERTS post-hoc — it does NOT prevent in-run corruption (state that explicitly).\n\nDO:\n- Create src/loop_engine/protected_state.rs and register it in src/loop_engine/mod.rs (absent at HEAD; DISCARD any untracked WIP file and build fresh).\n- Text artifacts under db_dir/tasks (**/*.json, **/*-prompt.md, .last-branch): snapshot (content hash + (dev, inode)) before, verify after, RESTORE on mismatch. These are not written by task-mgr CLI during a task run, so exact-match restore is correct.\n- SQLite files (tasks.db, tasks.db-wal, tasks.db-shm): INTEGRITY-based detection, NOT byte-hash. Codex (and other runners) MAY legitimately run `task-mgr` CLI commands that mutate the DB — those keep it valid. Detect CORRUPTION not CHANGE: PRAGMA quick_check/integrity_check passes, the DB still opens, schema/user_version has not regressed. On failure -> FATAL: suppress output processing, stop loop, NO raw restore. Integrity-preserving byte changes are allowed.\n- Escape protection (full dev/inode tracking): no-follow handling (symlink_metadata + no-follow reads); record (dev, inode) per protected file; on verify, a path that changed inode (regular->symlink swap or hardlink target swap) is a mutation/escape. De-symlink before restore (remove_file a symlink, then write a regular file — never fs::write through an unverified path). Canonicalize-and-contain the parent before create_dir_all. Detect NEW files matching protected globs, not just mutations.\n- Guard gate = positive allowlist: `fn runner_requires_state_guard(kind) -> bool` (true for Codex in v1). Claude/Grok return false -> byte-identical to today.\n- Sequential ordering (iteration.rs / iteration_pipeline.rs): snapshot before spawn; verify BEFORE tag processing, overflow, retry tracking, or any post-output mutation. On fatal SQLite corruption: suppress output, stop loop.\n- Wave ordering (wave_scheduler.rs): the verify barrier sits BETWEEN child completion and any orchestrator post-output work (before process_slot_result -> handle_overflow -> process_iteration_output -> merge_slot_branches_with_resolver/reconcile). Snapshot after all claims + pre-spawn writes, capturing state at that instant, so the orchestrator's own merge-back/reconcile/lifecycle writes are EXCLUDED from the protected window. On mutation: fail the whole wave, routed through the cascade-halt sentinel (apply_merge_fail_reset_and_halt_check semantics), NOT a bare early-return (which would zero consecutive_merge_fail_waves and defeat the synthetic-deadlock halt).\n\nDO NOT:\n- Byte-hash tasks.db (would trip on legitimate task-mgr CLI writes).\n- Raw-restore the SQLite trio (assumption 11 — risks worse corruption).\n- fs::write to a path you haven't re-verified is a regular file (restore would become an arbitrary-write primitive through an attacker symlink).\n- Gate on a bare `== Codex` (use the allowlist helper).\n\nEdge cases:\n- Codex replaces tasks/foo.json (regular) with a symlink to an out-of-tree file: detected via inode change; restore removes the symlink then writes the regular file (does NOT write through it).\n- Codex creates a NEW tasks/evil.json: detected as a new matching path.\n- Codex runs `task-mgr complete X` (legitimate DB mutation): integrity passes -> ALLOWED, loop continues.\n- Codex raw-corrupts tasks.db-wal: integrity fails -> fatal, loop stops, no restore.\n\nKnown-bad to guard against:\n- A guard that compares tasks.db bytes -> every legitimate task-mgr CLI write trips it (false fatal). Detect integrity, not change.\n- A restore that fs::write()s the snapshot through a path now pointing at a symlink -> arbitrary write to the link target.",
+      "edgeCases": [
+        "regular->symlink swap: detected via inode; restore de-symlinks first",
+        "new matching file created by Codex: detected",
+        "legitimate task-mgr CLI DB write: integrity passes, allowed",
+        "raw SQLite corruption: integrity fails, fatal, no restore"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "Codex corrupts tasks.db-wal",
+          "expectedBehavior": "Integrity check fails -> fatal: suppress output, stop loop (sequential) / fail wave via cascade-halt (wave); no raw restore"
+        },
+        {
+          "cause": "Codex swaps a JSON file for a symlink to /home/chris/.bashrc",
+          "expectedBehavior": "Inode change detected; symlink removed; regular file restored; link target untouched"
+        },
+        {
+          "cause": "Verify runs after orchestrator merge-back",
+          "expectedBehavior": "Must not — barrier sits before post-output work so legitimate orchestrator writes are excluded"
+        }
+      ],
+      "id": "FEAT-005",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": true,
+      "notes": "Reuse: env.rs path resolution (tasks_dir, LAST_BRANCH_FILE), db path resolution for the tasks.db trio, wave_scheduler merge-fail/cascade-halt helper (apply_merge_fail_reset_and_halt_check semantics), IterationResult.effective_runner (FEAT-003a) for the guard gate. Learning 1583: prior approach used path-scoped Edit/Write DENIALS in the agent permission config to stop loop-agent JSON mutation — that's a Claude-permission mechanism and does NOT cover Codex's own sandbox; this guard is the Codex-side complement (detect/revert), so document the distinction. SQLite detection = rusqlite PRAGMA quick_check + open + user_version, NOT a content hash. State in the module doc: TOCTOU between snapshot and verify is inherent; this detects/reverts, it does not prevent.",
+      "passes": false,
+      "priority": 5,
+      "qualityDimensions": [
+        "SQLite guard is integrity-based (permits legitimate task-mgr CLI writes); text guard is exact-match restore",
+        "Full dev/inode tracking closes symlink-swap and hardlink-escape; restore never writes through an unverified path",
+        "Positive runner allowlist gate (extensible), Claude/Grok no-op",
+        "Wave barrier excludes orchestrator's own writes; fatal routes through cascade-halt, not bare return",
+        "Module doc states detect-and-revert, not prevent (TOCTOU acknowledged)"
+      ],
+      "taskType": "implementation",
+      "title": "Protected-state guard for Codex (text snapshot/restore + SQLite integrity detect)",
+      "touchesFiles": [
+        "src/loop_engine/protected_state.rs",
+        "src/loop_engine/mod.rs",
+        "src/loop_engine/iteration.rs",
+        "src/loop_engine/iteration_pipeline.rs",
+        "src/loop_engine/wave_scheduler.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: src/loop_engine/CLAUDE.md documents the provider-intent, protected-state-barrier, Codex-sandbox, and binary-resolution invariants",
+        "Positive: user docs include a copy-pasteable primaryRunner Codex example + CODEX_BINARY + permission posture + 'no reviewModel provider object in v1'",
+        "Negative: no manual edits to the gen-docs-managed MODELS block; no model-constant changes",
+        "Documentation: a mixed-fleet (Claude+Grok+Codex) runbook note exists",
+        "CONTRACT: documented binary-resolution precedence matches FEAT-004's resolver and FEAT-002's runtime resolution"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "FEAT-005"
+      ],
+      "description": "Document the new provider so future sessions and operators understand the invariants.\n\nDO:\n- Update src/loop_engine/CLAUDE.md with invariants: provider-intent threading (carried via ResolvedExecutionTarget/provider_hint, NEVER inferred from model strings; recovery/overflow thread the executed runner); protected-state barrier ordering (sequential verify-before-post-output; wave verify-between-children-and-merge); Codex sandbox posture (Scoped & Auto both = workspace-write/noninteractive); binary resolution ($CODEX_BINARY -> PATH, exec-bit check); the future runner_overrides=Codex startup-probe requirement.\n- Update user-facing docs: a primaryRunner Codex config example, CODEX_BINARY, permission posture, the 'no reviewModel provider object in v1' note, and a mixed-fleet runbook.\n- Operator note: Codex Scoped and Auto both mean workspace-write/noninteractive in v1.\n\nDO NOT:\n- Duplicate the full plan; link/summarize the invariants that affect future code changes.\n- Touch the gen-docs-managed MODELS block by hand (regenerate via gen-docs only if model constants changed — they did not).\n\nEdge cases:\n- If src/loop_engine/CLAUDE.md is auto-loaded when its module files are read, keep additions concise (it costs context every read).",
+      "edgeCases": [
+        "Module CLAUDE.md auto-loads: keep additions minimal"
+      ],
+      "estimatedEffort": "low",
+      "failureModes": [
+        {
+          "cause": "Docs drift from the implemented binary-resolution precedence",
+          "expectedBehavior": "Doc CONTRACT criterion forces cross-check against FEAT-002/FEAT-004"
+        }
+      ],
+      "id": "FEAT-006",
+      "modifiesBehavior": false,
+      "notes": "Reuse: existing src/loop_engine/CLAUDE.md structure (overflow recovery / parallel slots / provider routing sections). The project CLAUDE.md 'Fallback runner config (Grok)' block is the template for a Codex config example. Keep module CLAUDE.md additions tight — it auto-loads on module reads.",
+      "passes": false,
+      "priority": 6,
+      "qualityDimensions": [
+        "Invariants stated as enforceable rules a future change can be checked against",
+        "Concise — module CLAUDE.md costs context on every read",
+        "Config example is copy-pasteable and matches the actual parsed schema"
+      ],
+      "taskType": "implementation",
+      "title": "Documentation & sentinels for Codex provider",
+      "touchesFiles": [
+        "src/loop_engine/CLAUDE.md",
+        "CLAUDE.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No code duplication (DRY) — auth-skip-list and binary-resolution helpers are shared, not copy-pasted across providers",
+        "Functions under 30 lines (flag complex ones, especially in protected_state.rs and CodexRunner::spawn)",
+        "Clear separation of concerns (runner / recovery / overflow / protected_state)",
+        "Exhaustive matching preserved (no wildcard arms introduced)",
+        "Any issues found spawn REFACTOR-FIX-xxx tasks via `task-mgr add --stdin --depended-on-by REVIEW-001`"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "FEAT-005",
+        "FEAT-006"
+      ],
+      "description": "Review all Codex-runner implementation for DRY violations, complexity, coupling, and maintainability.\n\nDO: Check for duplicated logic (especially CodexRunner vs GrokRunner argv/stream code, and the auth-skip-list helper actually being shared, not copied), functions >30 lines, tight coupling between runner/recovery/protected_state modules. Verify the provider-hint threading didn't leave dead Option-defaulting paths.\nDO NOT: Skip — this gate catches issues before the final review. Do NOT collapse the exhaustive RunnerKind/Provider matches into wildcards in the name of DRY.",
+      "estimatedEffort": "high",
+      "id": "REFACTOR-001",
+      "model": "claude-opus-4-7",
+      "notes": "If issues found: `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001` for each (priority 50-97) — atomic DB+JSON sync, no manual JSON edit. If no issues, invoke /simplify on any ugly touchpoint (likely CodexRunner::spawn or protected_state walk), then emit `<task-status>REFACTOR-001:done</task-status>` with a one-line progress note. Learning 2889: scrutinize CodexRunner argv vs GrokRunner for accidental flag-order divergence.",
+      "passes": false,
+      "priority": 98,
+      "qualityDimensions": [
+        "DRY across providers (shared helpers, not copies)",
+        "Single-responsibility functions",
+        "Exhaustive matching preserved",
+        "Pattern consistency with existing runner/recovery code"
+      ],
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Review for refactoring opportunities",
+      "touchesFiles": [
+        "src/loop_engine/model.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/runner.rs",
+        "src/loop_engine/stream.rs",
+        "src/loop_engine/recovery.rs",
+        "src/loop_engine/reactions/post_output.rs",
+        "src/loop_engine/project_config.rs",
+        "src/loop_engine/protected_state.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: a provider:\"codex\" primaryRunner route invokes the Codex mock binary (grep + dispatch-mock verified), proving the provider hint reaches the spawn site",
+        "Positive: all new code reachable from production entry points (no orphan RunnerKind::Codex arm)",
+        "Positive: FULL cargo test, cargo clippy -- -D warnings, cargo fmt --check all clean (no scope filter)",
+        "Positive: security review of protected_state.rs — symlink/inode escape detected, restore never writes through an unverified path, SQLite is integrity-checked not byte-hashed",
+        "Negative: no unwrap() in production code paths (expect() only where documented per Learning 3068)",
+        "Negative: a run with no Codex config is byte-identical to HEAD behavior (existing routing/recovery/wave tests green)",
+        "Negative: no Claude model written to tasks.model and no Grok promotion on a Codex crash (overflow + recovery)",
+        "Documentation: src/loop_engine/CLAUDE.md + user docs updated (FEAT-006) and accurate vs the implementation",
+        "Task update: remaining tasks reviewed/updated if implementation changed APIs/assumptions",
+        "Pre-existing test failures fixed (or spawned as FIX-xxx with verifyCommand if >~12 unrelated)",
+        "If issues found: FIX-xxx / WIRE-FIX-xxx tasks spawned via `task-mgr add --stdin --depended-on-by REVIEW-001`"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "FEAT-005",
+        "FEAT-006",
+        "REFACTOR-001"
+      ],
+      "description": "Review all Codex-runner implementation for quality, security, integration wiring, and documentation needs. RUN THE FULL QUALITY GATE (unscoped test suite).\n\nDO: Verify Codex routing is reachable end-to-end (a provider:\"codex\" primary route actually spawns CodexRunner, not Claude) via the dispatch mock; verify the protected-state guard's security properties (symlink/inode escape, no write-through, SQLite integrity-not-byte-hash); verify no Claude-model write or Grok promotion on Codex crash; confirm pure-Claude/Grok runs are byte-identical to HEAD. Run full cargo test / clippy -D warnings / fmt --check (no scope filter). Run `cargo run --bin gen-docs -- --check` if any model constant was touched.\nDO NOT: Skip the integration wiring check — unconnected Codex code (variant added but never reachable) is the #1 failure mode. Do NOT scope the test suite — this is THE place the full suite runs.",
+      "estimatedEffort": "medium",
+      "id": "REVIEW-001",
+      "model": "grok-build",
+      "notes": "Spawn fixes via `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001` — DB + PRD JSON synced atomically, no manual edit. If no issues: emit `<task-status>REVIEW-001:done</task-status>` with 'Clean review' note. Use the rust-python-code-reviewer agent for the security-sensitive protected_state.rs review. Decisions to record post-loop (per plan): provider intent carried as ResolvedExecutionTarget not inferred; Codex SQLite guard is integrity-based fatal-detect (no raw restore); guard is a positive runner allowlist that detects/reverts (not prevents). Verify the no_hardcoded_models.rs test still passes (no literal model strings outside model.rs).",
+      "passes": false,
+      "priority": 99,
+      "qualityDimensions": [
+        "Codex route wired end-to-end (provider hint -> CodexRunner spawn), proven by mock",
+        "protected_state.rs security properties hold (escape detection, no write-through, integrity-not-hash)",
+        "No unwrap in production; expect only where documented",
+        "Pure-Claude/Grok byte-identical to HEAD",
+        "Full suite green including pre-existing"
+      ],
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Code review + final verification",
+      "touchesFiles": [
+        "src/loop_engine/model.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/runner.rs",
+        "src/loop_engine/stream.rs",
+        "src/loop_engine/recovery.rs",
+        "src/loop_engine/reactions/post_output.rs",
+        "src/loop_engine/project_config.rs",
+        "src/loop_engine/protected_state.rs",
+        "src/main.rs"
+      ]
+    }
+  ],
+  "version": "1.0"
+}

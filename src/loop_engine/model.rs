@@ -55,6 +55,29 @@ pub enum Provider {
     Claude,
     /// xAI Grok models (`grok-build`, `grok-code-fast-1`, …).
     Grok,
+    /// OpenAI Codex CLI models. In v1 this is selected only by explicit
+    /// `primaryRunner.provider = "codex"`; model-name inference is forbidden.
+    Codex,
+}
+
+impl Provider {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Provider::Claude => "claude",
+            Provider::Grok => "grok",
+            Provider::Codex => "codex",
+        }
+    }
+}
+
+/// Parse a provider name from runner-routing config.
+pub fn parse_runner_provider(provider: &str) -> Option<Provider> {
+    match provider.trim().to_ascii_lowercase().as_str() {
+        "claude" => Some(Provider::Claude),
+        "grok" => Some(Provider::Grok),
+        "codex" => Some(Provider::Codex),
+        _ => None,
+    }
 }
 
 /// Classify a model id as a provider.
@@ -87,6 +110,13 @@ pub fn provider_for_model(model: Option<&str>) -> Provider {
     } else {
         Provider::Claude
     }
+}
+
+/// Resolved model plus optional explicit provider intent.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ResolvedExecutionTarget {
+    pub model: Option<String>,
+    pub provider_hint: Option<Provider>,
 }
 
 /// Strip the leading 8-lowercase-hex project prefix from a task ID.
@@ -317,32 +347,52 @@ pub fn primary_runner_match<'a>(
 /// Empty / whitespace-only strings in any field are normalized to `None` so
 /// missing config values don't override real ones.
 pub fn resolve_task_model(ctx: &ModelResolutionContext<'_>) -> Option<String> {
+    resolve_task_execution_target(ctx).model
+}
+
+/// Resolve the model and any explicit provider intent for a single task.
+///
+/// Only a `primaryRunner` match produces `provider_hint`. All model-string
+/// rungs remain provider-agnostic so v1 cannot accidentally route Codex from a
+/// generic OpenAI-looking model name.
+pub fn resolve_task_execution_target(ctx: &ModelResolutionContext<'_>) -> ResolvedExecutionTarget {
     // Rung 1: explicit model on the task.
     if let Some(m) = normalize(ctx.task_model) {
-        return Some(m.to_string());
+        return ResolvedExecutionTarget {
+            model: Some(m.to_string()),
+            provider_hint: None,
+        };
     }
     // Rung 2: primary runner match (byTaskType wins over byIdPrefix).
-    if let Some(model) = ctx
+    if let Some(spec) = ctx
         .primary_runner
         .and_then(|cfg| primary_runner_match(cfg, ctx.task_id, ctx.task_type))
-        .map(|spec| spec.model.clone())
     {
-        return Some(model);
+        return ResolvedExecutionTarget {
+            model: normalize(Some(&spec.model)).map(str::to_string),
+            provider_hint: parse_runner_provider(&spec.provider),
+        };
     }
     // Rung 3: difficulty=high forces OPUS_MODEL.
     if ctx
         .difficulty
         .is_some_and(|d| d.eq_ignore_ascii_case("high"))
     {
-        return Some(OPUS_MODEL.to_string());
+        return ResolvedExecutionTarget {
+            model: Some(OPUS_MODEL.to_string()),
+            provider_hint: None,
+        };
     }
     // Rungs 4-6: project/user defaults in precedence order.
     for fallback in [ctx.prd_default, ctx.project_default, ctx.user_default] {
         if let Some(m) = normalize(fallback) {
-            return Some(m.to_string());
+            return ResolvedExecutionTarget {
+                model: Some(m.to_string()),
+                provider_hint: None,
+            };
         }
     }
-    None
+    ResolvedExecutionTarget::default()
 }
 
 fn normalize(s: Option<&str>) -> Option<&str> {
@@ -725,6 +775,59 @@ mod tests {
             ..ctx()
         });
         assert_eq!(result, Some(OPUS_MODEL.to_string()));
+    }
+
+    #[test]
+    fn test_primary_runner_codex_provider_only_preserves_provider_hint() {
+        use std::collections::HashMap;
+        let mut by_task_type = HashMap::new();
+        by_task_type.insert(
+            "review".to_string(),
+            RunnerSpec {
+                provider: "codex".to_string(),
+                model: String::new(),
+            },
+        );
+        let cfg = PrimaryRunnerConfig {
+            claude_fallback_model: None,
+            runtime_error_threshold: 2,
+            by_task_type,
+            by_id_prefix: HashMap::new(),
+        };
+        let result = resolve_task_execution_target(&ModelResolutionContext {
+            task_type: Some("review"),
+            primary_runner: Some(&cfg),
+            ..ctx()
+        });
+        assert_eq!(result.model, None);
+        assert_eq!(result.provider_hint, Some(Provider::Codex));
+    }
+
+    #[test]
+    fn test_explicit_task_model_suppresses_codex_primary_runner_hint() {
+        use std::collections::HashMap;
+        let mut by_task_type = HashMap::new();
+        by_task_type.insert(
+            "review".to_string(),
+            RunnerSpec {
+                provider: "codex".to_string(),
+                model: String::new(),
+            },
+        );
+        let cfg = PrimaryRunnerConfig {
+            claude_fallback_model: None,
+            runtime_error_threshold: 2,
+            by_task_type,
+            by_id_prefix: HashMap::new(),
+        };
+        let result = resolve_task_execution_target(&ModelResolutionContext {
+            task_model: Some(OPUS_MODEL),
+            task_type: Some("review"),
+            primary_runner: Some(&cfg),
+            ..ctx()
+        });
+        assert_eq!(result.model, Some(OPUS_MODEL.to_string()));
+        assert_eq!(result.provider_hint, None);
     }
 
     /// AC: difficulty='high' on a review task → resolves to 'grok-build'

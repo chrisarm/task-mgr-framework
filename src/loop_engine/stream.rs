@@ -400,6 +400,79 @@ impl StreamFormat for GrokStreamFormat {
     }
 }
 
+/// Codex CLI `exec --json` stream format.
+///
+/// Output is accumulated from completed assistant messages. Terminal
+/// `turn.completed` usage records are intentionally ignored for output.
+pub(crate) struct CodexStreamFormat;
+
+impl StreamFormat for CodexStreamFormat {
+    fn parse_value(&self, val: &Value, sink: &mut dyn FnMut(StreamEvent)) {
+        match val.get("type").and_then(|t| t.as_str()) {
+            Some("item.completed") => {
+                let Some(item) = val.get("item") else {
+                    return;
+                };
+                match item.get("type").and_then(|t| t.as_str()) {
+                    Some("agent_message") => {
+                        if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                            sink(StreamEvent::AssistantText(text.to_string()));
+                        }
+                    }
+                    Some("command_execution") => {
+                        let command = item
+                            .get("command")
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("command_execution");
+                        let output = item
+                            .get("aggregated_output")
+                            .and_then(|o| o.as_str())
+                            .unwrap_or("");
+                        sink(StreamEvent::ToolUse {
+                            name: "command_execution".to_string(),
+                            input: command.to_string(),
+                        });
+                        sink(StreamEvent::ToolResult(output.to_string()));
+                    }
+                    _ => {}
+                }
+            }
+            Some("item.started") => {
+                if let Some(item) = val.get("item")
+                    && item.get("type").and_then(|t| t.as_str()) == Some("command_execution")
+                {
+                    let command = item
+                        .get("command")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("command_execution");
+                    sink(StreamEvent::ToolUse {
+                        name: "command_execution".to_string(),
+                        input: command.to_string(),
+                    });
+                }
+            }
+            Some("error") => {
+                if let Some(message) = val.get("message").and_then(|m| m.as_str()) {
+                    sink(StreamEvent::Error(message.to_string()));
+                }
+            }
+            Some("turn.failed") => {
+                let message = val
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("turn failed");
+                sink(StreamEvent::Error(message.to_string()));
+            }
+            _ => {}
+        }
+    }
+
+    fn derive_output(&self, acc: &Accumulator) -> String {
+        tail_truncate(&acc.assistant_buf, MAX_OUTPUT_BYTES)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -575,6 +648,38 @@ mod tests {
             output.ends_with("<task-status>REVIEW-1:done</task-status>"),
             "tail (with the completion tag) must survive truncation"
         );
+    }
+
+    #[test]
+    fn codex_agent_messages_accumulate_into_output_and_preserve_completion_tags() {
+        let lines = [
+            r#"{"type":"thread.started","thread_id":"abc"}"#,
+            r#"{"type":"turn.started"}"#,
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"partial "}}"#,
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"<task-status>CODEX-1:done</task-status>\n<completed>CODEX-1</completed>"}}"#,
+            r#"{"type":"turn.completed","usage":{"input_tokens":1}}"#,
+        ];
+        let (output, _conv, _d) = run_format(&CodexStreamFormat, &lines);
+        assert!(output.contains("<task-status>CODEX-1:done</task-status>"));
+        assert!(output.contains("<completed>CODEX-1</completed>"));
+    }
+
+    #[test]
+    fn codex_turn_completed_text_is_not_authoritative_output() {
+        let lines = [
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"assistant text"}}"#,
+            r#"{"type":"turn.completed","text":"wrong final"}"#,
+        ];
+        let (output, _conv, _d) = run_format(&CodexStreamFormat, &lines);
+        assert_eq!(output, "assistant text");
+    }
+
+    #[test]
+    fn codex_error_events_enter_transcript_not_output() {
+        let lines = [r#"{"type":"turn.failed","error":{"message":"auth failed"}}"#];
+        let (output, conv, _d) = run_format(&CodexStreamFormat, &lines);
+        assert_eq!(output, "");
+        assert!(conv.contains("[Error: auth failed]"));
     }
 
     #[test]

@@ -77,6 +77,7 @@ fn make_prompt_result(task_id: &str) -> PromptResult {
         dropped_sections: vec!["progress".to_string()],
         task_difficulty: Some("medium".to_string()),
         cluster_effort: None,
+        provider_hint: None,
         section_sizes: vec![("task", 12), ("learnings", 17), ("base_prompt", 19)],
     }
 }

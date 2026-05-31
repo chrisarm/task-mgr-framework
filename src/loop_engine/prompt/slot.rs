@@ -197,6 +197,8 @@ pub struct SlotPromptParams<'a> {
     /// Operator pause feedback rendered as a `## Session Guidance` block.
     /// Empty string omits the section entirely (no header).
     pub session_guidance: &'a str,
+    /// Primary runner routing configuration.
+    pub primary_runner: Option<&'a crate::loop_engine::project_config::PrimaryRunnerConfig>,
 }
 
 /// Send-safe bundle of everything a slot worker needs to invoke Claude and
@@ -224,6 +226,8 @@ pub struct SlotPromptBundle {
     /// Resolved model for the slot (mirrors `PromptResult::resolved_model`).
     /// `None` means "use CLI default"; `Some("")` is normalized to `None`.
     pub resolved_model: Option<String>,
+    /// Explicit provider intent from `primaryRunner`, when present.
+    pub provider_hint: Option<crate::loop_engine::model::Provider>,
     /// Task difficulty at bundle-build time. The slot worker derives effort
     /// (`model::effort_for_difficulty`) and watchdog timeout
     /// (`watchdog::TimeoutConfig::from_difficulty`) from this without needing
@@ -315,11 +319,17 @@ pub fn build_prompt(
 ) -> SlotPromptBundle {
     let task_files = load_task_files(conn, &task.id);
 
-    let resolved_model = task
-        .model
-        .as_deref()
-        .filter(|m| !m.is_empty())
-        .map(str::to_owned);
+    let target = crate::loop_engine::model::resolve_task_execution_target(
+        &crate::loop_engine::model::ModelResolutionContext {
+            task_model: task.model.as_deref(),
+            difficulty: task.difficulty.as_deref(),
+            task_id: Some(&task.id),
+            primary_runner: params.primary_runner,
+            ..Default::default()
+        },
+    );
+    let resolved_model = target.model;
+    let provider_hint = target.provider_hint;
 
     // The `&Connection` lives only in this main-thread `PromptContext`, which is
     // dropped before the bundle crosses the worker boundary — no `&Connection`
@@ -379,6 +389,7 @@ pub fn build_prompt(
             task_files,
             shown_learning_ids: Vec::new(),
             resolved_model,
+            provider_hint,
             difficulty: task.difficulty.clone(),
             // `assemble` populates `section_sizes` on overflow (criticals in
             // roster order), the same breakdown the legacy sentinel reported.
@@ -509,6 +520,7 @@ pub fn build_prompt(
         task_files,
         shown_learning_ids,
         resolved_model,
+        provider_hint,
         difficulty: task.difficulty.clone(),
         section_sizes,
         dropped_sections,

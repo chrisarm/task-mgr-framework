@@ -29,7 +29,7 @@ use crate::loop_engine::claude::open_pty_for_child_output;
 use crate::loop_engine::claude::{ACTIVE_PREFIX_ENV, ClaudeStreamFormat, is_pty_read_eof};
 use crate::loop_engine::config::PermissionMode;
 use crate::loop_engine::signals::SignalFlag;
-use crate::loop_engine::stream::{GrokStreamFormat, drive_stream};
+use crate::loop_engine::stream::{CodexStreamFormat, GrokStreamFormat, drive_stream};
 use crate::loop_engine::watchdog::{TimeoutConfig, exit_code_from_status, watchdog_loop};
 use crate::output::ui;
 
@@ -86,6 +86,15 @@ const GROK_AUTH_FAILURE_SUBSTRINGS: &[&str] = &[
 /// Operator hint surfaced via [`TaskMgrError::GrokAuthFailure`]. Single source
 /// of truth so the loop's auth short-circuit hint stays consistent.
 const GROK_AUTH_FAILURE_HINT: &str = "Run `grok login` to authenticate, then retry the task.";
+const CODEX_AUTH_FAILURE_HINT: &str = "Run `codex login` to authenticate, then retry the task.";
+const CODEX_AUTH_FAILURE_SUBSTRINGS: &[&str] = &[
+    "401 unauthorized",
+    "missing bearer or basic authentication",
+    "not logged in",
+    "login required",
+    "authentication required",
+    "authentication failed",
+];
 
 /// Cap on stderr bytes buffered for the auth-failure sniff. Stderr beyond this
 /// cap is still tee'd live but not retained for substring scanning — auth
@@ -226,6 +235,7 @@ pub struct RunnerOpts<'a> {
 pub enum RunnerKind {
     Claude,
     Grok,
+    Codex,
 }
 
 impl RunnerKind {
@@ -239,6 +249,7 @@ impl RunnerKind {
         match self {
             RunnerKind::Claude => ClaudeRunner.supports(cap),
             RunnerKind::Grok => GrokRunner.supports(cap),
+            RunnerKind::Codex => CodexRunner.supports(cap),
         }
     }
 }
@@ -1005,6 +1016,141 @@ impl LlmRunner for GrokRunner {
     }
 }
 
+pub(crate) struct CodexRunner;
+
+impl LlmRunner for CodexRunner {
+    fn supports(&self, cap: RunnerCapability) -> bool {
+        match cap {
+            RunnerCapability::Effort => false,
+            RunnerCapability::StreamJson => true,
+            RunnerCapability::Pty => false,
+            RunnerCapability::DisallowedTools => false,
+            RunnerCapability::TitleArtifactCleanup => false,
+        }
+    }
+
+    fn spawn(
+        &self,
+        prompt: &str,
+        permission_mode: &PermissionMode,
+        opts: RunnerOpts<'_>,
+    ) -> TaskMgrResult<RunnerResult> {
+        let RunnerOpts {
+            signal_flag,
+            working_dir,
+            model,
+            timeout,
+            stream_json,
+            db_dir,
+            target_task_id,
+            slot_label,
+            active_prefix,
+            ..
+        } = opts;
+
+        let binary = resolve_codex_binary();
+        let mut args: Vec<String> = Vec::new();
+        match permission_mode {
+            PermissionMode::Dangerous => {
+                args.push("exec".to_string());
+                args.push("--json".to_string());
+                args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
+            }
+            PermissionMode::Scoped { .. } | PermissionMode::Auto { .. } => {
+                args.push("-a".to_string());
+                args.push("never".to_string());
+                args.push("exec".to_string());
+                args.push("--json".to_string());
+                args.push("--sandbox".to_string());
+                args.push("workspace-write".to_string());
+            }
+        }
+        args.push("--ephemeral".to_string());
+        args.push("--skip-git-repo-check".to_string());
+        if let Some(cwd) = working_dir {
+            args.push("--cd".to_string());
+            args.push(cwd.to_string_lossy().into_owned());
+        }
+        push_optional_flag(&mut args, "-m", model);
+        args.push("-".to_string());
+
+        let mut cmd = Command::new(&binary);
+        cmd.args(&args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        apply_common_env(
+            &mut cmd,
+            db_dir,
+            active_prefix,
+            working_dir,
+            RunnerKind::Codex,
+        );
+        let mut child = spawn_with_context(&mut cmd, &binary, "Codex")?;
+        write_prompt_to_stdin(&mut child, prompt, &binary, "Codex")?;
+        let watchdog = spawn_watchdog(child.id(), signal_flag, timeout, target_task_id);
+
+        let stderr_buf = Arc::new(Mutex::new(String::new()));
+        let stderr_handle = spawn_stderr_sniffer(&mut child, Arc::clone(&stderr_buf), "Codex");
+        let reader = BufReader::new(
+            child
+                .stdout
+                .take()
+                .expect("stdout should be piped (Stdio::piped() was set on spawn)"),
+        );
+        let (output, conversation, permission_denials) = if stream_json {
+            drive_stream(
+                reader,
+                &CodexStreamFormat,
+                target_task_id,
+                &watchdog.completion_epoch,
+                slot_label,
+            )
+        } else {
+            (
+                read_plain_stdout(reader, slot_label, "Codex"),
+                None,
+                Vec::new(),
+            )
+        };
+        let status = child.wait().map_err(|e| TaskMgrError::IoErrorWithContext {
+            file_path: binary.clone(),
+            operation: "waiting for Codex subprocess to exit".to_string(),
+            source: e,
+        })?;
+        let (timed_out, completion_killed) = watchdog.teardown();
+        let _ = stderr_handle.join();
+        let exit_code = exit_code_from_status(status);
+
+        if exit_code != 0 {
+            let stderr_str = stderr_buf.lock().map(|b| b.clone()).unwrap_or_default();
+            let auth_source = format!("{}\n{}", stderr_str, conversation.as_deref().unwrap_or(""));
+            if contains_codex_auth_failure(&auth_source) {
+                return Err(TaskMgrError::CodexAuthFailure {
+                    hint: CODEX_AUTH_FAILURE_HINT.to_string(),
+                });
+            }
+            if crate::loop_engine::detection::is_transient_backend(&stderr_str) {
+                return Err(TaskMgrError::TransientBackend {
+                    retry_after_secs: crate::loop_engine::detection::parse_retry_after_secs(
+                        &stderr_str,
+                    ),
+                });
+            }
+        }
+
+        Ok(RunnerResult {
+            exit_code,
+            output,
+            conversation,
+            timed_out,
+            completion_killed,
+            permission_denials,
+            session_id: None,
+        })
+    }
+}
+
 /// Resolve the grok binary path. PRD §2.5: config-independent chain
 /// `$GROK_BINARY` → `opts.fallback_cli_binary` → bare `"grok"` on PATH.
 /// Empty / whitespace-only `$GROK_BINARY` falls through to the next link
@@ -1021,6 +1167,22 @@ fn resolve_grok_binary(fallback_cli_binary: Option<&str>) -> String {
         return path.to_string();
     }
     "grok".to_string()
+}
+
+fn resolve_codex_binary() -> String {
+    if let Ok(env_path) = std::env::var("CODEX_BINARY")
+        && !env_path.trim().is_empty()
+    {
+        return env_path;
+    }
+    "codex".to_string()
+}
+
+fn contains_codex_auth_failure(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    CODEX_AUTH_FAILURE_SUBSTRINGS
+        .iter()
+        .any(|needle| lower.contains(needle))
 }
 
 /// Case-insensitive scan for any of [`GROK_AUTH_FAILURE_SUBSTRINGS`] in the
@@ -1119,6 +1281,34 @@ fn spawn_grok_stderr_sniffer(
         }
     });
     (stderr_buf, handle)
+}
+
+fn spawn_stderr_sniffer(
+    child: &mut std::process::Child,
+    stderr_buf: Arc<Mutex<String>>,
+    label: &'static str,
+) -> std::thread::JoinHandle<()> {
+    let stderr_pipe = child
+        .stderr
+        .take()
+        .expect("stderr should be piped (Stdio::piped() was set on spawn)");
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stderr_pipe);
+        for line_result in reader.lines() {
+            match line_result {
+                Ok(line) => {
+                    ui::emit_err(&format!("{label} stderr: {line}"));
+                    if let Ok(mut b) = stderr_buf.lock()
+                        && b.len() < GROK_STDERR_SNIFF_CAP_BYTES
+                    {
+                        b.push_str(&line);
+                        b.push('\n');
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    })
 }
 
 /// Compute the per-slot-per-iteration capture file path for grok stderr.
@@ -1533,6 +1723,10 @@ pub fn dispatch(
             enforce_capabilities(&GrokRunner, kind, &opts)?;
             GrokRunner.spawn(prompt, permission_mode, opts)
         }
+        RunnerKind::Codex => {
+            enforce_capabilities(&CodexRunner, kind, &opts)?;
+            CodexRunner.spawn(prompt, permission_mode, opts)
+        }
     };
     if let Ok(ref r) = result
         && let Some(sid) = r.session_id
@@ -1540,6 +1734,7 @@ pub fn dispatch(
         let cleanup_result = match kind {
             RunnerKind::Claude => ClaudeRunner.cleanup_session(sid, &cwd),
             RunnerKind::Grok => GrokRunner.cleanup_session(sid, &cwd),
+            RunnerKind::Codex => CodexRunner.cleanup_session(sid, &cwd),
         };
         if let Err(ref e) = cleanup_result
             && !CLEANUP_WARN_ONCE.swap(true, Ordering::Relaxed)
@@ -1547,6 +1742,7 @@ pub fn dispatch(
             let provider = match kind {
                 RunnerKind::Claude => "claude",
                 RunnerKind::Grok => "grok",
+                RunnerKind::Codex => "codex",
             };
             tracing::warn!(
                 provider = %provider,

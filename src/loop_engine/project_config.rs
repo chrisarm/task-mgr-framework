@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::error::{TaskMgrError, TaskMgrResult};
+use crate::loop_engine::model::{Provider, parse_runner_provider};
 
 /// Configuration for the Grok fallback runner (US-005, FR-006).
 ///
@@ -49,13 +50,15 @@ impl Default for FallbackRunnerConfig {
     }
 }
 
-/// A provider + model pair used as a routing target in `PrimaryRunnerConfig`.
+/// A provider + optional model pair used as a routing target in `PrimaryRunnerConfig`.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct RunnerSpec {
     /// Provider name (e.g. `"grok"`, `"claude"`).
     pub provider: String,
     /// Model identifier passed to the provider CLI (e.g. `"grok-build"`).
+    /// Codex v1 may omit this field to route by explicit provider intent only.
+    #[serde(default)]
     pub model: String,
 }
 
@@ -400,6 +403,27 @@ fn resolve_and_verify_grok_binary(fallback_cli_binary: Option<&str>) -> Result<(
     if found { Ok(()) } else { Err(binary) }
 }
 
+fn resolve_and_verify_codex_binary() -> Result<(), String> {
+    let env_bin = std::env::var("CODEX_BINARY")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+
+    let (binary, found) = if let Some(env_bin) = env_bin {
+        let exec = is_executable_path(std::path::Path::new(&env_bin));
+        (env_bin, exec)
+    } else {
+        let name = "codex";
+        let found = std::env::var_os("PATH")
+            .map(|path_var| {
+                std::env::split_paths(&path_var).any(|dir| is_executable_path(&dir.join(name)))
+            })
+            .unwrap_or(false);
+        (name.to_string(), found)
+    };
+
+    if found { Ok(()) } else { Err(binary) }
+}
+
 /// Verify that the Grok fallback binary is reachable at loop startup.
 ///
 /// Returns `Ok(())` when `cfg` is `None` or `cfg.enabled` is `false`.
@@ -419,6 +443,106 @@ pub fn check_fallback_runner_binary(cfg: Option<&FallbackRunnerConfig>) -> TaskM
                  correct path (must be an executable file), then retry"
             ),
         }
+    })
+}
+
+pub fn validate_runner_routing_config(cfg: &ProjectConfig) -> TaskMgrResult<()> {
+    if let Some(fallback) = cfg.fallback_runner.as_ref()
+        && fallback.enabled
+        && fallback.provider.trim().to_ascii_lowercase() != "grok"
+    {
+        return Err(TaskMgrError::InvalidConfig {
+            field: "fallbackRunner.provider".to_string(),
+            message: "v1 fallbackRunner only supports provider \"grok\"".to_string(),
+        });
+    }
+    if let Some(primary) = cfg.primary_runner.as_ref() {
+        for (map_name, key, spec) in primary_runner_specs(primary) {
+            if spec.provider.trim().is_empty() {
+                return Err(TaskMgrError::InvalidConfig {
+                    field: format!("primaryRunner.{map_name}.{key}.provider"),
+                    message: "provider must not be blank".to_string(),
+                });
+            }
+            let provider = parse_runner_provider(&spec.provider);
+            if spec.model.trim().is_empty() && provider != Some(Provider::Codex) {
+                return Err(TaskMgrError::InvalidConfig {
+                    field: format!("primaryRunner.{map_name}.{key}.model"),
+                    message: "model must not be blank unless provider is codex".to_string(),
+                });
+            }
+            if provider.is_none() {
+                return Err(TaskMgrError::InvalidConfig {
+                    field: format!("primaryRunner.{map_name}.{key}.provider"),
+                    message: format!(
+                        "unknown provider {:?}; expected claude, grok, or codex",
+                        spec.provider
+                    ),
+                });
+            }
+        }
+        if cfg
+            .review_model
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+            && primary_runner_contains_codex_review_route(primary)
+        {
+            return Err(TaskMgrError::InvalidConfig {
+                field: "reviewModel".to_string(),
+                message: "reviewModel is string-only in v1 and overrides primaryRunner Codex review routes; unset reviewModel or remove the Codex review route".to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+pub fn check_codex_runner_binary(primary: Option<&PrimaryRunnerConfig>) -> TaskMgrResult<()> {
+    let Some(primary) = primary else {
+        return Ok(());
+    };
+    if !primary_runner_specs(primary)
+        .any(|(_, _, spec)| parse_runner_provider(&spec.provider) == Some(Provider::Codex))
+    {
+        return Ok(());
+    }
+    resolve_and_verify_codex_binary().map_err(|binary| TaskMgrError::NotFound {
+        resource_type: "Codex CLI binary required by primaryRunner".to_string(),
+        id: format!(
+            "{binary} — install Codex CLI or set CODEX_BINARY to an executable file, then retry"
+        ),
+    })
+}
+
+fn primary_runner_specs(
+    primary: &PrimaryRunnerConfig,
+) -> impl Iterator<Item = (&'static str, &String, &RunnerSpec)> {
+    primary
+        .by_task_type
+        .iter()
+        .map(|(k, v)| ("byTaskType", k, v))
+        .chain(
+            primary
+                .by_id_prefix
+                .iter()
+                .map(|(k, v)| ("byIdPrefix", k, v)),
+        )
+}
+
+fn primary_runner_contains_codex_review_route(primary: &PrimaryRunnerConfig) -> bool {
+    primary_runner_specs(primary).any(|(map_name, key, spec)| {
+        parse_runner_provider(&spec.provider) == Some(Provider::Codex)
+            && match map_name {
+                "byTaskType" => {
+                    key.eq_ignore_ascii_case("review")
+                        || key.eq_ignore_ascii_case("code-review")
+                        || key.eq_ignore_ascii_case("milestone-final")
+                }
+                "byIdPrefix" => {
+                    let k = key.trim_end_matches('-').to_ascii_uppercase();
+                    matches!(k.as_str(), "CODE-REVIEW" | "REVIEW" | "MILESTONE-FINAL")
+                }
+                _ => false,
+            }
     })
 }
 

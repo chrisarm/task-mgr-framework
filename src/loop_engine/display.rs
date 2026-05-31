@@ -236,10 +236,10 @@ pub fn format_iteration_banner_with_recovery(
         String::new()
     };
     // kind-correct: UI annotation of provider identity for operator visibility — not a capability check
-    let grok_suffix = if effective_runner == crate::loop_engine::runner::RunnerKind::Grok {
-        " (via grok)"
-    } else {
-        ""
+    let grok_suffix = match effective_runner {
+        crate::loop_engine::runner::RunnerKind::Grok => " (via grok)",
+        crate::loop_engine::runner::RunnerKind::Codex => " (via codex)",
+        crate::loop_engine::runner::RunnerKind::Claude => "",
     };
     let effort_display = effort.unwrap_or("(default)");
     format!(
