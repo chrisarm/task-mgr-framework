@@ -234,7 +234,9 @@
         "FEAT-001",
         "FEAT-002",
         "FEAT-003",
-        "REFACTOR-001"
+        "REFACTOR-001",
+        "REFACTOR-FIX-001",
+        "REFACTOR-FIX-002"
       ],
       "description": "Review all changes for quality, security, integration wiring, and docs. RUN THE FULL QUALITY GATE (unscoped suite).\n\nDO: Verify the new subcommands are registered and reachable (clap dispatch → handler); verify key-preservation on every config write (the load-bearing property); verify probe-before-write; verify show reads the real ProjectConfig. Run full cargo test / clippy -D warnings / fmt --check (no scope filter). Update CLAUDE.md (the `task-mgr models` section) + the command-reference table for the new subcommands.\nDO NOT: scope the suite — this is where the full suite runs. Do NOT stamp a model on this task (runtime reviewModel governs the reviewer).",
       "estimatedEffort": "medium",
@@ -258,6 +260,44 @@
         "src/commands/init/mod.rs",
         "src/loop_engine/project_config.rs",
         "CLAUDE.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Exactly one Value-round-trip atomic key-writer implementation exists in the crate (grep for the tempfile + persist + insert/remove pattern returns a single function body)",
+        "All six setters (write_default_model + write_review_model + write_fallback_runner across project_config + user_config) delegate to the shared helper",
+        "Each setter function is under 30 lines",
+        "Existing key-preservation tests pass unmodified: set_review_model_project_scope_writes_key_and_preserves_others, unset_review_model_project_scope_removes_key_preserves_others, set_fallback_writes_all_provided_fields_and_preserves_unrelated_keys, unset_fallback_removes_block_preserves_other_keys",
+        "No behavior change: project setters still seed {\"version\":1} on absent file, user setters still seed {}, atomic tempfile-persist still produces a trailing newline"
+      ],
+      "description": "Two near-identical write_config_key_at impls exist (src/loop_engine/project_config.rs:692-740 and src/loop_engine/user_config.rs:122-168), differing only in the empty-file seed default ({\"version\":1} vs {}). Additionally write_default_model in BOTH files (project_config.rs:641-684, user_config.rs:75-115) reimplements the same Value round-trip logic instead of calling the existing per-file helper. Net: four implementations of the same atomic Value-round-trip writer pattern. The acceptance criterion for REFACTOR-001 is that this core be shared across reviewModel/fallbackRunner/default writers. Extracting one helper with six real call sites (default + review + fallback across project + user) is well within the 'no one-use abstraction' guardrail.",
+      "estimatedEffort": "medium",
+      "id": "REFACTOR-FIX-001",
+      "passes": false,
+      "priority": 85,
+      "title": "Extract one shared Value-round-trip atomic key writer for all six config setters",
+      "touchesFiles": [
+        "src/loop_engine/config_io.rs",
+        "src/loop_engine/mod.rs",
+        "src/loop_engine/project_config.rs",
+        "src/loop_engine/user_config.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "handle_show_to is under 30 lines",
+        "Per-section render helpers are each under 30 lines",
+        "Every existing show_tests assertion passes unchanged (exact strings: 'reviewModel:    {model} (provider: ...)', 'fallbackRunner: enabled, provider=...', 'byIdPrefix[FIX] -> Grok/grok-build', '(unset)', 'disabled', '(no routes)')",
+        "Provider-label rendering pattern (parse_config_provider + map + unwrap_or) appears exactly once in the primary-runner section, shared across byTaskType and byIdPrefix"
+      ],
+      "description": "handle_show_to in src/commands/models/handlers.rs:185-272 is 88 lines, well over the 30-line ceiling REFACTOR-001 set as an acceptance criterion. It already breaks into four logical render sections (default model + db_dir header, reviewModel, fallbackRunner, primaryRunner). Extracting one helper per section keeps the function flat and readable while satisfying the AC. The provider-label pattern (parse_config_provider(...).map(provider_label).unwrap_or(spec.provider.as_str()) + writeln) repeats inside the primaryRunner branch for byTaskType and byIdPrefix — fold it through a tiny inner helper or a single loop over the two maps to remove the repetition.",
+      "estimatedEffort": "low",
+      "id": "REFACTOR-FIX-002",
+      "passes": false,
+      "priority": 70,
+      "title": "Split handle_show_to into per-section render helpers to drop under 30 lines",
+      "touchesFiles": [
+        "src/commands/models/handlers.rs"
       ]
     }
   ],
