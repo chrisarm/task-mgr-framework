@@ -233,7 +233,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": true,
       "notes": "Source: V1 preflight_validate_and_probe ~src/loop_engine/project_config.rs:648-659; check_codex_primary_binary ~514; resolve_and_verify_codex_binary ~463; batch call site ~batch.rs:509; loop-run call in main.rs. V2: batch.rs ~503 only reads config; main.rs ~1126-1141 has scattered checks. Learning [4482]: the validate+probe block MUST run on EVERY loop entry point, not just loop run — this is exactly that fix. Route-gating is essential (no PATH probe for pure-Claude).",
-      "passes": false,
+      "passes": true,
       "priority": 4,
       "qualityDimensions": [
         "Single shared preflight helper called from every loop entry point (loop run + batch run)",
