@@ -131,7 +131,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": true,
       "notes": "Source: V1 worktree ~/projects/task-mgr-worktrees/feat-codex-runner/src/loop_engine/protected_state.rs (check_sqlite_integrity ~602-687, verify_and_restore_one ~244-359, ensure_contained_parent ~399-447, remove_escaped_intermediate ~368-392, walk_protected ~471-519). V2 call sites: iteration.rs:493/554, wave_scheduler.rs:1190/1218, slot.rs:197/257. Learning [4445]/[4438]: defend orchestrator state post-hoc for sandbox-confined runners (Codex --cd cwd + /tmp). Learning [4470]: runner_requires_state_guard uses a positive allowlist (only Codex true). TOCTOU is acknowledged — this DETECTS+REVERTS post-hoc, it does not prevent in-run corruption; document that in rustdoc.",
-      "passes": false,
+      "passes": true,
       "priority": 2,
       "qualityDimensions": [
         "Integrity-based SQLite check (quick_check + schema_version), never byte-restore a live WAL",
