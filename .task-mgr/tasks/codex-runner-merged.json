@@ -340,7 +340,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": true,
       "notes": "Source: V1 parse_config_provider ~src/loop_engine/model.rs:104-114; V1 #[cfg(test)]-gated From + explicit resolve_effective_runner ~engine.rs:382-400. V2: parse_runner_provider ~model.rs:74-81; unconditional From ~engine.rs:372-406; provider-only rule to KEEP ~project_config.rs:468. Suspect bare-Option prod call: reactions/pre_spawn.rs:125 — verify and fix. Learning [4435]: provider-intent threading avoids accidental re-routing; [3110]: drift sentinels use assert! not debug_assert!. Depends on FEAT-005 to serialize project_config.rs edits.",
-      "passes": false,
+      "passes": true,
       "priority": 6,
       "qualityDimensions": [
         "Strict provider parsing (Result, typos rejected — never silent Claude)",
