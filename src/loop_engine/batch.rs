@@ -11,7 +11,7 @@ use crate::error::{TaskMgrError, TaskMgrResult};
 use crate::loop_engine::auto_review::{self, Decision};
 use crate::loop_engine::config::LoopConfig;
 use crate::loop_engine::engine::{self, LoopResult, LoopRunConfig};
-use crate::loop_engine::project_config::read_project_config;
+use crate::loop_engine::project_config::{preflight_validate_and_probe, read_project_config};
 use crate::loop_engine::signals;
 use crate::loop_engine::status_queries;
 use crate::loop_engine::worktree;
@@ -501,6 +501,14 @@ pub async fn run_batch(
     // convention (CLAUDE.md): mid-loop edits to .task-mgr/config.json do NOT take
     // effect; operators must restart to apply config changes.
     let project_config = read_project_config(dir);
+    // FR-006 parity (FEAT-004): batch must run the same validation + binary
+    // probe loop run does, BEFORE the first PRD. A failure here aborts the
+    // whole batch — config and binaries are project-level so the failure
+    // applies uniformly to every PRD.
+    if let Err(e) = preflight_validate_and_probe(&project_config) {
+        ui::emit_err(&format!("Error: {}", e));
+        return batch_fail_early();
+    }
     let decision = auto_review::resolve_decision(&project_config, cli_force_on, cli_force_off);
     // Step 1: Expand all patterns, deduplicate, and sort
     let prd_files = match collect_prd_files(patterns, project_root) {

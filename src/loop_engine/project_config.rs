@@ -571,6 +571,42 @@ pub fn check_review_model_binary(
     })
 }
 
+/// Startup pre-flight: validate the project config, then probe every runner
+/// binary the config will need, BEFORE the first iteration.
+///
+/// This is the single source of truth for "is this project safe to run?" and
+/// MUST be called from every loop entry point — both `loop run` (single PRD)
+/// and `batch run` (N PRDs). Hoisting it here closes the parity gap where a
+/// misconfigured provider string or a missing `codex`/`grok` binary would
+/// surface only on `loop run`, but run unvalidated under `batch run`.
+///
+/// Ordering matches `loop run`'s historical block: validation runs BEFORE the
+/// binary probes so an operator who mis-typed a provider string sees the
+/// structured config error, not a misleading "binary missing" message from a
+/// downstream probe that wouldn't have fired anyway.
+///
+/// Codex binary probe is route-gated by `check_codex_runner_binary`: a
+/// pure-Claude / pure-Grok project triggers no PATH lookup for `codex`.
+///
+/// Failure semantics for `batch run`: a failure here aborts the WHOLE batch
+/// before any PRD runs. Config validity and binary availability are
+/// project-level (every PRD in the batch shares the same `.task-mgr/config.json`
+/// and `$PATH`), so a failure affects every PRD equally — failing fast up-front
+/// mirrors `loop run`'s fail-before-iteration-1 contract and avoids burning N
+/// partial runs on a uniformly-broken environment.
+pub fn preflight_validate_and_probe(cfg: &ProjectConfig) -> TaskMgrResult<()> {
+    validate_runner_routing_config(cfg)?;
+    check_fallback_runner_binary(cfg.fallback_runner.as_ref())?;
+    check_review_model_binary(
+        cfg.review_model.as_deref(),
+        cfg.fallback_runner
+            .as_ref()
+            .and_then(|fr| fr.cli_binary.as_deref()),
+    )?;
+    check_codex_runner_binary(cfg.primary_runner.as_ref())?;
+    Ok(())
+}
+
 /// Read project config from `<db_dir>/config.json`.
 ///
 /// Returns default (empty) config if the file doesn't exist.
@@ -1338,5 +1374,118 @@ mod tests {
     #[test]
     fn test_primary_runner_default_impl_is_none() {
         assert!(ProjectConfig::default().primary_runner.is_none());
+    }
+
+    // ---- preflight_validate_and_probe tests (FEAT-004) ----
+
+    fn primary_with_one_task_route(
+        task_key: &str,
+        provider: &str,
+        model: &str,
+    ) -> PrimaryRunnerConfig {
+        let mut by_task_type = HashMap::new();
+        by_task_type.insert(
+            task_key.to_string(),
+            RunnerSpec {
+                provider: provider.to_string(),
+                model: model.to_string(),
+            },
+        );
+        PrimaryRunnerConfig {
+            claude_fallback_model: None,
+            runtime_error_threshold: 2,
+            by_task_type,
+            by_id_prefix: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn test_preflight_passes_pure_claude_config_without_codex_probe() {
+        // Acceptance: a pure-Claude config triggers no PATH lookup for codex.
+        // We verify by setting CODEX_BINARY to a path that DOES NOT exist —
+        // if preflight ever resolved the Codex binary on a pure-Claude config
+        // it would fail. The default config has neither a Codex primaryRunner
+        // route nor a fallbackRunner, so check_codex_runner_binary must
+        // short-circuit on `primary.is_none()` before any path probe runs.
+        let prev = std::env::var_os("CODEX_BINARY");
+        let bogus = "/tmp/task-mgr-test-nonexistent-codex-binary-feat004";
+        unsafe { std::env::set_var("CODEX_BINARY", bogus) };
+        let result = preflight_validate_and_probe(&ProjectConfig::default());
+        match prev {
+            Some(v) => unsafe { std::env::set_var("CODEX_BINARY", v) },
+            None => unsafe { std::env::remove_var("CODEX_BINARY") },
+        }
+        assert!(
+            result.is_ok(),
+            "pure-Claude config must pass preflight with codex absent from PATH: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_preflight_codex_route_missing_binary_returns_err() {
+        // Acceptance: Codex route + CODEX_BINARY pointing at a nonexistent
+        // path returns Err — exactly the failure batch_run must surface
+        // BEFORE expanding PRD files.
+        let prev = std::env::var_os("CODEX_BINARY");
+        let bogus = "/tmp/task-mgr-test-nonexistent-codex-binary-feat004-route";
+        unsafe { std::env::set_var("CODEX_BINARY", bogus) };
+        let cfg = ProjectConfig {
+            primary_runner: Some(primary_with_one_task_route(
+                "spike", "codex", "", // codex provider permits blank model
+            )),
+            ..Default::default()
+        };
+        let result = preflight_validate_and_probe(&cfg);
+        match prev {
+            Some(v) => unsafe { std::env::set_var("CODEX_BINARY", v) },
+            None => unsafe { std::env::remove_var("CODEX_BINARY") },
+        }
+        let err = result.expect_err("missing codex binary must return Err");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Codex") || msg.contains("codex"),
+            "error should mention codex: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_preflight_runs_validation_not_just_probes() {
+        // Regression: preflight must run config VALIDATION, not only binary
+        // probes. The poison reviewModel⨯Codex combo has no binary to probe,
+        // so a probe-only preflight would wave it through — exactly the
+        // batch-run parity gap this helper closes.
+        let cfg = ProjectConfig {
+            review_model: Some("grok-build".to_string()),
+            primary_runner: Some(primary_with_one_task_route("review", "codex", "")),
+            ..Default::default()
+        };
+        let err = preflight_validate_and_probe(&cfg).expect_err("preflight must reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("reviewModel"),
+            "preflight must reject via validation, naming reviewModel: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_preflight_rejects_invalid_fallback_provider() {
+        // Acceptance failure-mode: fallbackRunner.provider != "grok" aborts
+        // preflight with the same structured error from validate_runner_routing_config.
+        let cfg = ProjectConfig {
+            fallback_runner: Some(FallbackRunnerConfig {
+                enabled: true,
+                provider: "codex".to_string(),
+                model: "gpt-5-codex".to_string(),
+                cli_binary: None,
+                runtime_error_threshold: 2,
+            }),
+            ..Default::default()
+        };
+        let err = preflight_validate_and_probe(&cfg).expect_err("invalid fallback provider");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("fallbackRunner.provider") || msg.contains("grok"),
+            "error must name fallbackRunner.provider: {msg}"
+        );
     }
 }
