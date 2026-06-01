@@ -23,19 +23,19 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 
 # Error handling
-thiserror = "1"
+thiserror = "2"
 
 # File locking
 fs2 = "0.4"
 
 # Man page generation
-clap_mangen = "0.2"
+clap_mangen = "0.3"
 
 # Async runtime (used for loop engine orchestration)
 tokio = { version = "1", features = ["rt", "macros", "time"] }
 
 # Signal handling (OS-level, works even when tokio runtime is blocked)
-signal-hook = "0.3"
+signal-hook = "0.4"
 
 # POSIX process control (kill(2) for child termination)
 libc = "0.2"
@@ -44,7 +44,7 @@ libc = "0.2"
 ureq = { version = "2", features = ["json"] }
 
 # Hashing (stale detection)
-md5 = "0.7"
+md5 = "0.8"
 
 # Environment variable loading
 dotenvy = "0.15"
