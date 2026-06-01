@@ -508,7 +508,10 @@
         "FEAT-006",
         "FEAT-007",
         "FEAT-008",
-        "REFACTOR-001"
+        "REFACTOR-001",
+        "WIRE-FIX-001",
+        "REFACTOR-FIX-001",
+        "REFACTOR-FIX-002"
       ],
       "description": "Review all merged Codex code for quality, security, integration wiring, and documentation needs. RUN THE FULL QUALITY GATE (unscoped test suite).\n\nDO: Verify the preflight is wired into BOTH loop run and batch run; verify protected_state serves all three call sites (iteration/wave/slot); verify the Codex→Claude fallback inserts Claude (never Codex) and is auth-excluded; verify Codex is never inferred from a model string. Run the FULL cargo test / clippy -D warnings / fmt --check (no scope filter). Update src/loop_engine/CLAUDE.md and the root CLAUDE.md with the merged Codex provider section (capability matrix, threading rules, binary-probe contract, protected-state rationale, the new fallbackToClaude flag, prohibited outcomes). Run `cargo run --bin gen-docs` if any model/effort table changed.\nDO NOT: skip the integration-wiring check (unconnected code is the #1 failure mode). DO NOT scope the test suite — this is THE place the full suite runs.",
       "estimatedEffort": "medium",
@@ -527,6 +530,62 @@
       "title": "Code review + final verification",
       "touchesFiles": [
         "all modified files"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Provider-only Codex spec {provider:'codex',model:''} routes to RunnerKind::Codex in BOTH sequential and wave paths when a project defaultModel is also set",
+        "slot.rs:574-593 drift sentinel re-derives with the same formula the wave uses (no parallel formula carrying provider_hint:None)",
+        "Regression test exercises the {model:''} + defaultModel:Some scenario in both paths and pins them to identical RunnerKind::Codex",
+        "Existing codex_provider_hint_threading.rs tests still pass (no behaviour change for the {provider:'codex', model:'gpt-4'} shape)",
+        "No new clippy warnings; no model literal outside model.rs"
+      ],
+      "description": "Wave-path silent misroute: a provider-only Codex spec routes to Claude in wave mode (but Codex in sequential) when a project defaultModel is configured. ROOT CAUSE: wave_scheduler.rs:1165-1174 widens effective_model to params.default_model when bundle.resolved_model is None (line 1169 .or(params.default_model)), then drops provider_hint on the equality check at 1170 (effective_model != bundle.resolved_model -> hint=None). For the v1-blessed Codex provider-only shape {provider:'codex',model:''} (project_config.rs:1598, accepted by validation), resolve_task_execution_target returns {model:None, provider_hint:Some(Codex)} (model.rs:382-396 — normalize empties to None, parse_config_provider.ok() supplies the hint). With defaultModel=Some('sonnet'), the wave widens None -> Some('sonnet'), equality fails, hint dropped, resolve_effective_runner routes to Claude. PARITY VIOLATION: iteration.rs:455-466 (sequential) does the equality check but never widens with default_model — effective_model starts from resolved_model directly. Same input, different output. DEFEATS FEAT-006: the strict provider parser was meant to make Codex unreachable from a generic OpenAI-looking model name AND keep the validated hint live to the spawn boundary. Dropping it silently at the wave site undoes that for the exact shape the docs steer operators to. FIX: in wave_scheduler.rs:1170, stop clearing the hint based on the widening equality. The only legitimate rewrite site is the reviewModel branch at 1157, which already clears the hint at the bundle. Use provider_hint = slot.prompt_bundle.provider_hint after the bundle is finalized. Then update the drift-sentinel re-derivation at slot.rs:574-593 (currently passes provider_hint:None, with a comment claiming this mirrors the wave's pre-dispatch formula — true today only because the wave drops the hint via the bug; once fixed, the sentinel must thread the same hint the wave used). REGRESSION TEST: extend tests/codex_provider_hint_threading.rs (or add a new file) covering primary_runner={byTaskType:{spike:{provider:'codex',model:''}}} with project_default=Some('claude-sonnet-4-6'); assert RunnerKind::Codex in both sequential and wave formulas.",
+      "estimatedEffort": "medium",
+      "id": "WIRE-FIX-001",
+      "passes": false,
+      "priority": 96,
+      "title": "Preserve Codex provider_hint in wave path when defaultModel is set",
+      "touchesFiles": [
+        "src/loop_engine/wave_scheduler.rs",
+        "src/loop_engine/slot.rs",
+        "tests/codex_provider_hint_threading.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "CodexRunner::spawn drops to ~85 lines (orchestration only)",
+        "build_codex_argv is pure (no Command, no env, no IO) and unit-tested for all three PermissionMode variants",
+        "classify_codex_exit is unit-tested for the three branches (auth via structured [Error: ], transient-backend, generic non-zero exit)",
+        "All existing codex_*.rs tests pass without modification",
+        "No new clippy warnings; cargo fmt --check clean; no model literal outside model.rs"
+      ],
+      "description": "CodexRunner::spawn at src/loop_engine/runner.rs:1041-1192 is ~151 lines, mixing five concerns: (a) argv assembly per permission mode (1061-1084), (b) command/env setup (1086-1098), (c) writer-thread spawn (1106-1119), (d) watchdog + stderr-sniffer + stdout-pump (1121-1145), (e) wait + thread joins + post-exit classification (1146-1191). Peer ClaudeRunner::spawn (~522-695) and GrokRunner::spawn (~767-1003) push more into helpers. Two clean extracts bring CodexRunner::spawn in line: (1) build_codex_argv(permission_mode: &PermissionMode, working_dir: Option<&Path>, model: Option<&str>) -> Vec<String> — pure, no IO. (2) classify_codex_exit(exit_code: i32, conversation: &str, stderr_str: &str) -> Option<TaskMgrError>. Constraints: do NOT change argv ordering or the structured [Error: ] auth match (FEAT-003); do NOT introduce a model literal outside model.rs; do NOT introduce a bare-Option resolve_effective_runner call. After extraction CodexRunner::spawn should drop to ~85 lines. Tests: existing codex_*.rs tests must pass unchanged; add unit tests on the two pure extractions covering all three PermissionMode variants and the three exit-classification branches (auth via structured prefix, transient-backend via stderr, generic non-zero).",
+      "estimatedEffort": "medium",
+      "id": "REFACTOR-FIX-001",
+      "passes": false,
+      "priority": 70,
+      "title": "Extract build_codex_argv and classify_codex_exit from CodexRunner::spawn",
+      "touchesFiles": [
+        "src/loop_engine/runner.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Module rustdoc explicitly names the TOCTOU window bounds (snapshot -> spawn -> verify, plus post-verify gap)",
+        "Module rustdoc surfaces the walk_protected EACCES fail-open with file:line reference",
+        "No existing prose contradicted or weakened; the detect-vs-prevent contract remains explicit",
+        "cargo doc builds clean (no broken intra-doc links)",
+        "No code changes; rustdoc only"
+      ],
+      "description": "src/loop_engine/protected_state.rs module rustdoc is fundamentally honest on load-bearing concerns (detect-and-revert not prevent, WHY via the Codex sandbox shape, no byte-restore on SQLite WAL/SHM trio). Two PARTIAL gaps: (D) the TOCTOU window note at L6 is terse — it says 'TOCTOU between snapshot and verify is inherent' but doesn't unpack the practical consequence: any reader observing the worktree DURING the Codex run sees mutated state, and mutations landing AFTER verify but BEFORE the next snapshot are not attributable to a guarded run. (E) the 'Escape protection' section covers symlink-swap defenses positively but does NOT mention the documented fail-open at walk_protected (~lines 540-564): an EACCES on canonicalize() (e.g. Codex chmod 000 on a subdir) emits a tracing::warn! and skips descent, so planted files beneath an unreadable directory escape new-file detection (dev/inode/content checks on snapshotted files still fire). A future maintainer reading only the module header would believe containment is absolute. FIX: append ~3-4 sentences to the module-level rustdoc covering both gaps. Do NOT rewrite existing prose; do NOT relax any contract; just document what is already in code.",
+      "estimatedEffort": "low",
+      "id": "REFACTOR-FIX-002",
+      "passes": false,
+      "priority": 55,
+      "title": "Tighten protected_state.rs rustdoc on TOCTOU window and walk_protected fail-open",
+      "touchesFiles": [
+        "src/loop_engine/protected_state.rs"
       ]
     }
   ],
