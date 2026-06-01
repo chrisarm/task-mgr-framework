@@ -389,7 +389,7 @@
       "id": "FEAT-007",
       "modifiesBehavior": false,
       "notes": "Source files in V1 worktree tests/: codex_recovery.rs (~496, negative-control fn codex_conversation_indicates_auth_failure_is_structured_only ~302-354), codex_provider_hint_threading.rs (~265), codex_runner_overrides_invariant.rs (~91), no_bare_option_resolve_effective_runner.rs (~411). Scanners grep src/ — they assume the explicit posture from FEAT-006 and the Claude-only fallback from FEAT-005. If a scanner fails, the fix belongs in the source task, not here.",
-      "passes": false,
+      "passes": true,
       "priority": 7,
       "qualityDimensions": [
         "Invariant scanners ported intact (not weakened)",
