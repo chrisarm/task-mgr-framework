@@ -7,7 +7,10 @@ use super::api::{ApiError, check_opt_in, fetch_models, sort_newest_first};
 use super::cache;
 use super::ensure_default::{fallback_choices, prompt_with_choices};
 use super::picker::ModelChoice;
-use crate::loop_engine::model::{EFFORT_FOR_DIFFICULTY, HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL};
+use crate::loop_engine::model::{
+    EFFORT_FOR_DIFFICULTY, HAIKU_MODEL, OPUS_MODEL, Provider, SONNET_MODEL, parse_config_provider,
+    provider_for_model,
+};
 use crate::loop_engine::project_config::{
     FallbackRunnerConfig, check_fallback_runner_binary, check_review_model_binary,
     read_project_config, write_default_model as write_project_default,
@@ -173,26 +176,108 @@ pub fn handle_unset_default(db_dir: &Path, opts: UnsetDefaultOpts) -> io::Result
 /// `task-mgr` invocation in a worktree shell is reading a different DB
 /// than they expected.
 pub fn handle_show(db_dir: &Path, db_dir_source: crate::db::DbDirSource) -> io::Result<()> {
-    let project = read_project_config(db_dir).default_model;
-    let user = read_user_config().default_model;
-    let (model, source) = match (project.as_ref(), user.as_ref()) {
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    handle_show_to(&mut out, db_dir, db_dir_source)
+}
+
+/// Testable variant of `handle_show` that writes to an arbitrary `Write`.
+pub fn handle_show_to<W: io::Write>(
+    writer: &mut W,
+    db_dir: &Path,
+    db_dir_source: crate::db::DbDirSource,
+) -> io::Result<()> {
+    let project_cfg = read_project_config(db_dir);
+    let user_cfg = read_user_config();
+
+    let (model, source) = match (
+        project_cfg.default_model.as_ref(),
+        user_cfg.default_model.as_ref(),
+    ) {
         (Some(p), _) => (Some(p.clone()), DefaultSource::Project),
         (None, Some(u)) => (Some(u.clone()), DefaultSource::User),
         (None, None) => (None, DefaultSource::None),
     };
     match model {
-        Some(m) => ui::emit_data(&format!("Default model: {m}  (source: {})", source.label())),
-        None => ui::emit_data(
+        Some(m) => writeln!(writer, "Default model: {m}  (source: {})", source.label())?,
+        None => writeln!(
+            writer,
             "No default model set. Pick one with `task-mgr models set-default`, \
-             or rely on per-PRD / per-task overrides.",
-        ),
+             or rely on per-PRD / per-task overrides."
+        )?,
     }
-    ui::emit_data(&format!(
+    writeln!(
+        writer,
         "db_dir: {}  (source: {})",
         db_dir.display(),
-        db_dir_source.label(),
-    ));
+        db_dir_source.label()
+    )?;
+
+    writeln!(writer)?;
+    writeln!(writer, "Routing:")?;
+
+    // reviewModel
+    match &project_cfg.review_model {
+        Some(m) => {
+            let pname = provider_label(provider_for_model(Some(m)));
+            writeln!(writer, "  reviewModel:    {m} (provider: {pname})")?;
+        }
+        None => writeln!(writer, "  reviewModel:    (unset)")?,
+    }
+
+    // fallbackRunner
+    match &project_cfg.fallback_runner {
+        Some(fr) if fr.enabled => {
+            writeln!(
+                writer,
+                "  fallbackRunner: enabled, provider={}, model={}, threshold={}",
+                fr.provider, fr.model, fr.runtime_error_threshold
+            )?;
+        }
+        _ => writeln!(writer, "  fallbackRunner: disabled")?,
+    }
+
+    // primaryRunner
+    match &project_cfg.primary_runner {
+        None => writeln!(writer, "  primaryRunner:  (no routes)")?,
+        Some(pr) if pr.by_task_type.is_empty() && pr.by_id_prefix.is_empty() => {
+            writeln!(writer, "  primaryRunner:  (no routes)")?;
+        }
+        Some(pr) => {
+            writeln!(writer, "  primaryRunner:")?;
+            let mut by_task_type: Vec<_> = pr.by_task_type.iter().collect();
+            by_task_type.sort_by_key(|(k, _)| k.as_str());
+            for (task_type, spec) in &by_task_type {
+                let pname = parse_config_provider(&spec.provider)
+                    .map(provider_label)
+                    .unwrap_or(spec.provider.as_str());
+                writeln!(
+                    writer,
+                    "    byTaskType[{task_type}] -> {pname}/{}",
+                    spec.model
+                )?;
+            }
+            let mut by_id_prefix: Vec<_> = pr.by_id_prefix.iter().collect();
+            by_id_prefix.sort_by_key(|(k, _)| k.as_str());
+            for (prefix, spec) in &by_id_prefix {
+                let pname = parse_config_provider(&spec.provider)
+                    .map(provider_label)
+                    .unwrap_or(spec.provider.as_str());
+                writeln!(writer, "    byIdPrefix[{prefix}] -> {pname}/{}", spec.model)?;
+            }
+        }
+    }
+
     Ok(())
+}
+
+/// Human-readable display name for a [`Provider`].
+fn provider_label(p: Provider) -> &'static str {
+    match p {
+        Provider::Claude => "Claude",
+        Provider::Grok => "Grok",
+        Provider::Codex => "Codex",
+    }
 }
 
 /// Build the choice list used by the prompt: live if opt-in and fetch
@@ -385,6 +470,149 @@ pub fn handle_unset_fallback(db_dir: &Path, project: bool) -> io::Result<()> {
         ui::emit_data("Cleared user fallbackRunner");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod show_tests {
+    use super::*;
+    use crate::db::DbDirSource;
+    use crate::loop_engine::model::OPUS_MODEL;
+    use std::fs;
+    use std::io::Cursor;
+
+    fn show_output(db_dir: &std::path::Path) -> String {
+        let mut buf = Cursor::new(Vec::new());
+        handle_show_to(&mut buf, db_dir, DbDirSource::CwdDefault).unwrap();
+        String::from_utf8(buf.into_inner()).unwrap()
+    }
+
+    #[test]
+    fn show_full_routing_config_renders_all_sections() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            format!(
+                r#"{{
+                    "version": 1,
+                    "reviewModel": "{OPUS_MODEL}",
+                    "fallbackRunner": {{
+                        "enabled": true,
+                        "provider": "grok",
+                        "model": "grok-build",
+                        "runtimeErrorThreshold": 2
+                    }},
+                    "primaryRunner": {{
+                        "byIdPrefix": {{
+                            "FIX": {{ "provider": "grok", "model": "grok-build" }}
+                        }}
+                    }}
+                }}"#
+            ),
+        )
+        .unwrap();
+
+        let out = show_output(dir.path());
+
+        assert!(
+            out.contains(&format!("reviewModel:    {OPUS_MODEL} (provider: Claude)")),
+            "reviewModel section missing or wrong; got:\n{out}"
+        );
+        assert!(
+            out.contains("fallbackRunner: enabled, provider=grok, model=grok-build, threshold=2"),
+            "fallbackRunner section missing or wrong; got:\n{out}"
+        );
+        assert!(
+            out.contains("byIdPrefix[FIX] -> Grok/grok-build"),
+            "primaryRunner byIdPrefix section missing or wrong; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn show_empty_config_renders_explicit_empty_states() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let out = show_output(dir.path());
+
+        assert!(
+            out.contains("reviewModel:    (unset)"),
+            "empty reviewModel must print (unset); got:\n{out}"
+        );
+        assert!(
+            out.contains("fallbackRunner: disabled"),
+            "absent fallbackRunner must print disabled; got:\n{out}"
+        );
+        assert!(
+            out.contains("primaryRunner:  (no routes)"),
+            "absent primaryRunner must print (no routes); got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn show_grok_review_model_shows_grok_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{"version":1,"reviewModel":"grok-build"}"#,
+        )
+        .unwrap();
+
+        let out = show_output(dir.path());
+        assert!(
+            out.contains("reviewModel:    grok-build (provider: Grok)"),
+            "Grok reviewModel must show Grok provider; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn show_disabled_fallback_runner_prints_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{"version":1,"fallbackRunner":{"enabled":false,"provider":"grok","model":"grok-build","runtimeErrorThreshold":2}}"#,
+        )
+        .unwrap();
+
+        let out = show_output(dir.path());
+        assert!(
+            out.contains("fallbackRunner: disabled"),
+            "disabled fallbackRunner must print disabled; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn show_primary_runner_by_task_type_and_prefix_sorted() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{
+                "version": 1,
+                "primaryRunner": {
+                    "byTaskType": {
+                        "review": { "provider": "grok", "model": "grok-build" },
+                        "milestone": { "provider": "grok", "model": "grok-build" }
+                    },
+                    "byIdPrefix": {
+                        "REVIEW-": { "provider": "grok", "model": "grok-build" }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let out = show_output(dir.path());
+        assert!(
+            out.contains("byTaskType[milestone] -> Grok/grok-build"),
+            "byTaskType milestone missing; got:\n{out}"
+        );
+        assert!(
+            out.contains("byTaskType[review] -> Grok/grok-build"),
+            "byTaskType review missing; got:\n{out}"
+        );
+        assert!(
+            out.contains("byIdPrefix[REVIEW-] -> Grok/grok-build"),
+            "byIdPrefix REVIEW- missing; got:\n{out}"
+        );
+    }
 }
 
 #[cfg(test)]
