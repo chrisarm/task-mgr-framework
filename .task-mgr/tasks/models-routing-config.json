@@ -273,7 +273,7 @@
       "description": "Two near-identical write_config_key_at impls exist (src/loop_engine/project_config.rs:692-740 and src/loop_engine/user_config.rs:122-168), differing only in the empty-file seed default ({\"version\":1} vs {}). Additionally write_default_model in BOTH files (project_config.rs:641-684, user_config.rs:75-115) reimplements the same Value round-trip logic instead of calling the existing per-file helper. Net: four implementations of the same atomic Value-round-trip writer pattern. The acceptance criterion for REFACTOR-001 is that this core be shared across reviewModel/fallbackRunner/default writers. Extracting one helper with six real call sites (default + review + fallback across project + user) is well within the 'no one-use abstraction' guardrail.",
       "estimatedEffort": "medium",
       "id": "REFACTOR-FIX-001",
-      "passes": false,
+      "passes": true,
       "priority": 85,
       "title": "Extract one shared Value-round-trip atomic key writer for all six config setters",
       "touchesFiles": [

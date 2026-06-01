@@ -270,7 +270,11 @@ fn render_primary_runner<W: io::Write>(
     by_task_type.sort_by_key(|(k, _)| k.as_str());
     for (task_type, spec) in &by_task_type {
         let pname = runner_spec_provider_label(spec);
-        writeln!(writer, "    byTaskType[{task_type}] -> {pname}/{}", spec.model)?;
+        writeln!(
+            writer,
+            "    byTaskType[{task_type}] -> {pname}/{}",
+            spec.model
+        )?;
     }
     let mut by_id_prefix: Vec<_> = pr.by_id_prefix.iter().collect();
     by_id_prefix.sort_by_key(|(k, _)| k.as_str());
