@@ -597,7 +597,7 @@
       ],
       "description": "FEAT-007 ported V1 tests/codex_recovery.rs which calls handle_task_failure_with_runner from an integration test binary. Integration tests cannot reach pub(crate) items in src/, so the function was widened from `pub(crate) fn` to `pub fn` in src/loop_engine/recovery.rs:585. The earlier pin test in tests/runtime_error_fallback.rs:612 still searches for the literal string `pub(crate) fn handle_task_failure_with_runner(` as its body-locating anchor and now panics with `expected pub(crate) fn handle_task_failure_with_runner( to be defined in recovery.rs`. The anchor is purely a search string for byte-locating the function body; the semantic invariants the test enforces (deferred-apply + tx.commit ordering) are not visibility related.",
       "id": "FIX-001",
-      "passes": false,
+      "passes": true,
       "priority": 60,
       "title": "Fix stale pub(crate) anchor in handle_task_failure_defers_promotion_ctx_writes_until_after_commit",
       "touchesFiles": [
