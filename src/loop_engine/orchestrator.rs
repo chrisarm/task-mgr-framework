@@ -1330,12 +1330,14 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                     | IterationOutcome::RateLimit
                     | IterationOutcome::TransientBackend { .. }
                     | IterationOutcome::Crash(config::CrashType::GrokAuthFailure)
+                    | IterationOutcome::Crash(config::CrashType::CodexAuthFailure)
             )
-            && let Err(e) = handle_task_failure(
+            && let Err(e) = crate::loop_engine::recovery::handle_task_failure_with_runner(
                 &mut conn,
                 task_id,
                 iteration as i64,
                 &mut ctx,
+                result.effective_runner,
                 project_config.fallback_runner.as_ref(),
                 project_config.primary_runner.as_ref(),
             )

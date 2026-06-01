@@ -29,7 +29,9 @@ use std::collections::HashMap;
 
 use rusqlite::Connection;
 
-use crate::loop_engine::engine::{IterationContext, resolve_effective_runner};
+use crate::loop_engine::engine::{
+    EffectiveRunnerInput, IterationContext, resolve_effective_runner,
+};
 use crate::loop_engine::model;
 use crate::loop_engine::recovery::normalize_baseline;
 use crate::loop_engine::runner::RunnerKind;
@@ -120,9 +122,23 @@ pub fn resolve_task_execution(params: ResolveTaskExecutionParams<'_>) -> TaskExe
     // 3. Prior-overflow effort override, read AFTER invalidation.
     let effort = ctx.effort_overrides.get(task_id).copied();
 
-    // 4. Runner over the post-escalation effective model.
+    // 4. Runner over the post-escalation effective model. `provider_hint`
+    //    is intentionally `None` here — primaryRunner provider intent is
+    //    threaded through to the dispatcher's re-resolution at the final
+    //    spawn site (iteration.rs / wave_scheduler.rs), and this pre-spawn
+    //    plan only reflects the pre-rewrite baseline runner. Construct the
+    //    input explicitly so a missed-thread bug is a compile error rather
+    //    than a silent Codex→Claude misroute (the `From<Option<&str>>` impl
+    //    is `#[cfg(test)]`-gated).
     let effective_model = model.as_deref().or(resolved_model);
-    let runner = resolve_effective_runner(ctx, task_id, effective_model);
+    let runner = resolve_effective_runner(
+        ctx,
+        task_id,
+        EffectiveRunnerInput {
+            model: effective_model,
+            provider_hint: None,
+        },
+    );
 
     TaskExecutionPlan {
         model,

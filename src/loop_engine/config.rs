@@ -476,6 +476,15 @@ pub enum CrashType {
     /// must NOT count as a task failure (no `consecutive_failures` increment,
     /// no model promotion). Recovery is operator-driven (`grok login`).
     GrokAuthFailure,
+    /// Codex CLI returned `TaskMgrError::CodexAuthFailure`.
+    CodexAuthFailure,
+}
+
+pub fn crash_counts_as_task_failure(crash_type: &CrashType) -> bool {
+    !matches!(
+        crash_type,
+        CrashType::GrokAuthFailure | CrashType::CodexAuthFailure
+    )
 }
 
 /// Outcome of a single loop iteration, determined by analyzing Claude's output.

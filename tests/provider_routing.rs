@@ -131,6 +131,7 @@ fn provider_for_model_default_cases_route_to_claude() {
         Some(""),
         Some("   "),
         Some("gpt-4"),
+        Some("codex-mini-latest"),
         Some("gemini-pro"),
         Some("llama-3-70b"),
         None,
@@ -140,6 +141,22 @@ fn provider_for_model_default_cases_route_to_claude() {
             provider_for_model(*m),
             Provider::Claude,
             "{m:?} should default to Provider::Claude",
+        );
+    }
+}
+
+#[test]
+fn provider_for_model_does_not_auto_route_codex_from_model_names() {
+    for m in [
+        "codex",
+        "codex-mini-latest",
+        "gpt-5-codex",
+        "o4-codex-preview",
+    ] {
+        assert_eq!(
+            provider_for_model(Some(m)),
+            Provider::Claude,
+            "{m:?} must not route to Codex from the model string; Codex is primaryRunner provider intent only",
         );
     }
 }

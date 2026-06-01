@@ -223,6 +223,7 @@ fn render_prompt(conn: &Connection, base_prompt_path: &Path) -> String {
         task_prefix: None,
         batch_sibling_prds: &[],
         permission_mode: &permission_mode,
+        primary_runner: None,
     };
 
     let result = build_prompt(&params)

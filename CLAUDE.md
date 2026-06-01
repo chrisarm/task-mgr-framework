@@ -48,7 +48,7 @@ in outside `model.rs`.
 
 ## `task-mgr models` subcommand
 
-List and pin Claude models:
+List and pin Claude models, and manage the provider/model routing surfaces:
 
 ```sh
 task-mgr models list                     # offline — built-in model IDs + effort table
@@ -57,8 +57,29 @@ task-mgr models list --refresh           # busts cache before fetch; implies --r
 task-mgr models set-default [<model>]    # prompts interactively when model omitted
 task-mgr models set-default <id> --project   # writes .task-mgr/config.json instead
 task-mgr models unset-default [--project]
-task-mgr models show                     # resolved default + source label
+task-mgr models show                     # default + reviewModel/fallbackRunner/primaryRunner routing table
+
+# Reviewer (review-class tasks: CODE-REVIEW-*, MILESTONE-FINAL, REVIEW-*)
+task-mgr models set-review-model <id> [--project]   # plain model string; provider inferred (grok-build → Grok)
+task-mgr models unset-review-model [--project]
+
+# Fallback runner (Grok overflow/RuntimeError escape; v1 provider must be grok)
+task-mgr models set-fallback --enable --model grok-build [--cli-binary /path/grok] [--runtime-error-threshold N] [--project]
+task-mgr models set-fallback --disable [--project]
+task-mgr models unset-fallback [--project]
 ```
+
+`set-review-model` / `set-fallback` write the **config** routing surfaces
+(`reviewModel` / `fallbackRunner` in `.task-mgr/config.json`, or the user
+config without `--project`); they never stamp a per-task `model`. Every setter
+round-trips the config file via `serde_json::Value` so unrelated keys
+(`additionalAllowedTools`, `embeddingModel`, …) are preserved, and probes the
+target binary **before** writing when a Grok model/runner is involved (same
+resolver the loop startup probe uses). `set-fallback` rejects any provider other
+than `grok` in v1. `models show` reads the resolved `ProjectConfig` and prints
+the full routing table with explicit empty states — `(unset)`, `disabled`,
+`(no routes)` — so an unset surface is never confused with one that simply
+wasn't printed.
 
 **Remote opt-in** (prevents surprise HTTP calls on a globally-exported SDK key):
 
@@ -281,6 +302,10 @@ yourself.
 | `task-mgr models set-default` | Pin a default model (user config by default, `--project` for project) |
 | `task-mgr models unset-default` | Clear the pinned default model |
 | `task-mgr models show` | Show the currently resolved default model and where it came from |
+| `task-mgr models set-review-model` | Set the reviewModel (routes CODE-REVIEW-*, MILESTONE-FINAL, REVIEW-* tasks) |
+| `task-mgr models unset-review-model` | Clear the reviewModel |
+| `task-mgr models set-fallback` | Set the fallbackRunner block (Grok overflow-fallback configuration) |
+| `task-mgr models unset-fallback` | Remove the fallbackRunner block entirely |
 | `task-mgr current` | Show the currently resolved active PRD context (prefix, source, target path) |
 | `task-mgr enhance` | Manage the task-mgr-fenced block in CLAUDE.md / AGENTS.md |
 | `task-mgr enhance agents` | Write or update the marker-fenced workflow block in target files |
@@ -289,6 +314,41 @@ yourself.
 | `task-mgr cheatsheet` | Print the curated cheat sheet + clap-generated command reference |
 | `task-mgr how` | Map a natural-language intent to canonical task-mgr commands |
 <!-- TASK_MGR:END -->
+
+### Codex runner (provider-only routing)
+
+The loop engine supports OpenAI Codex as a third `RunnerKind` reachable
+EXCLUSIVELY through `primaryRunner` entries with `provider: "codex"`.
+Codex is NEVER inferred from a model string. The merged path adds three
+load-bearing defenses: (1) `preflight_validate_and_probe` runs from BOTH
+`task-mgr loop run` AND `task-mgr batch run` to fail fast on a missing
+`codex` binary when any route requires it; (2) `protected_state` snapshots
+orchestrator-owned files pre-spawn and verify-and-restore post-spawn for
+every Codex iteration (sequential + per-slot + wave); (3)
+`CodexAuthFailure` is excluded from `handle_task_failure` at both callers
+so an auth lapse never pushes healthy tasks toward auto-block.
+
+Opt-in Codex→Claude RuntimeError fallback (separate from the Claude/Grok
+overflow rung-4 pivot):
+
+```json
+{
+  "primaryRunner": {
+    "claudeFallbackModel": "<claude model id>",
+    "byIdPrefix": {
+      "FEAT-": { "provider": "codex", "fallbackToClaude": true }
+    }
+  }
+}
+```
+
+When `fallbackToClaude: true` AND consecutive RuntimeErrors reach
+`primaryRunner.runtimeErrorThreshold`, the task is promoted to Claude
+(`runner_overrides[id] = Claude`, never Codex) — once per loop run.
+Field defaults: `fallbackToClaude=false`; absent → no Codex→Claude
+promotion. See `src/loop_engine/CLAUDE.md` "Codex provider integration"
+for the full design notes (schema, auth detection, protected-state guard,
+binary probe contract, prohibited outcomes).
 
 ### Fallback runner config (Grok)
 

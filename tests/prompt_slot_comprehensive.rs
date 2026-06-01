@@ -72,6 +72,7 @@ fn make_params(project_root: PathBuf, base_prompt_path: PathBuf) -> SlotPromptPa
         permission_mode: PermissionMode::Dangerous,
         steering_path: None,
         session_guidance: "",
+        primary_runner: None,
     }
 }
 

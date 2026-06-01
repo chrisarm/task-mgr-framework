@@ -359,11 +359,29 @@ task-mgr models unset-default [--project]
 **Resolution precedence** (highest to lowest):
 
 1. `task.model` — explicit override on the task
-2. `difficulty == "high"` → always escalates to Opus
-3. PRD `model` (in the PRD JSON)
-4. `.task-mgr/config.json` `defaultModel` (per-project)
-5. `$XDG_CONFIG_HOME/task-mgr/config.json` `defaultModel` (per-user, follows across worktrees)
-6. None (CLI default)
+2. `.task-mgr/config.json` `primaryRunner` match
+3. `difficulty == "high"` → always escalates to Opus
+4. PRD `model` (in the PRD JSON)
+5. `.task-mgr/config.json` `defaultModel` (per-project)
+6. `$XDG_CONFIG_HOME/task-mgr/config.json` `defaultModel` (per-user, follows across worktrees)
+7. None (CLI default)
+
+Route selected task classes to Codex with `primaryRunner`. Codex routing is explicit only; model names such as `gpt-*`, `o*`, or `codex-*` do not auto-select Codex.
+
+```json
+{
+  "primaryRunner": {
+    "byTaskType": {
+      "spike": { "provider": "codex" }
+    },
+    "byIdPrefix": {
+      "CODEX-": { "provider": "codex" }
+    }
+  }
+}
+```
+
+Codex uses the `codex` binary on `PATH`, or `CODEX_BINARY` when set to a non-empty executable path. `reviewModel` is still a string model override; do not combine it with a Codex review route in v1.
 
 **Remote opt-in** (prevents surprise HTTP calls on a globally-exported SDK key):
 

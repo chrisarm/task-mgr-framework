@@ -11,9 +11,10 @@
 //! - Atomic same-directory tempfile + rename to avoid half-written reads.
 
 use serde::Deserialize;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use crate::loop_engine::config_io::{OnCorruptJson, write_config_key_at};
+use crate::loop_engine::project_config::FallbackRunnerConfig;
 use crate::paths::user_config_dir;
 
 /// Per-user configuration.
@@ -72,45 +73,72 @@ pub fn write_default_model(model: Option<&str>) -> std::io::Result<()> {
 
 /// Testable variant of [`write_default_model`] that writes to an explicit path.
 pub fn write_default_model_at(path: &Path, model: Option<&str>) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    write_config_key_at(
+        path,
+        "defaultModel",
+        model.map(|m| serde_json::Value::String(m.to_string())),
+        serde_json::json!({}),
+        OnCorruptJson::UseSeed,
+    )
+}
 
-    let mut value: serde_json::Value = match std::fs::read_to_string(path) {
-        Ok(s) if !s.trim().is_empty() => {
-            serde_json::from_str(&s).unwrap_or_else(|_| serde_json::json!({}))
-        }
-        _ => serde_json::json!({}),
-    };
-    let obj = value.as_object_mut().ok_or_else(|| {
+/// Set (or clear) the `reviewModel` field in the user config.
+///
+/// Pass `Some(model)` to set, `None` to remove the key.
+/// Returns `Err` if the existing file contains malformed JSON.
+pub fn write_review_model(model: Option<&str>) -> std::io::Result<()> {
+    let path = user_config_path().ok_or_else(|| {
         std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "user config.json is not a JSON object",
+            std::io::ErrorKind::NotFound,
+            "cannot resolve user config path (XDG_CONFIG_HOME and HOME both unset)",
         )
     })?;
-    match model {
-        Some(m) => {
-            obj.insert(
-                "defaultModel".to_string(),
-                serde_json::Value::String(m.to_string()),
-            );
-        }
-        None => {
-            obj.remove("defaultModel");
-        }
-    }
+    write_review_model_at(&path, model)
+}
 
-    let contents = serde_json::to_string_pretty(&value)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut tmp = tempfile::Builder::new()
-        .prefix(".config-")
-        .suffix(".json")
-        .tempfile_in(dir)?;
-    tmp.write_all(contents.as_bytes())?;
-    tmp.write_all(b"\n")?;
-    tmp.persist(path).map_err(|e| e.error)?;
-    Ok(())
+/// Testable variant of [`write_review_model`] that writes to an explicit path.
+pub fn write_review_model_at(path: &Path, model: Option<&str>) -> std::io::Result<()> {
+    write_config_key_at(
+        path,
+        "reviewModel",
+        model.map(|m| serde_json::Value::String(m.to_string())),
+        serde_json::json!({}),
+        OnCorruptJson::ReturnError,
+    )
+}
+
+/// Set (or clear) the `fallbackRunner` block in the user config.
+///
+/// Pass `Some(cfg)` to set, `None` to remove the key.
+/// Returns `Err` if the existing file contains malformed JSON.
+pub fn write_fallback_runner(cfg: Option<&FallbackRunnerConfig>) -> std::io::Result<()> {
+    let path = user_config_path().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "cannot resolve user config path (XDG_CONFIG_HOME and HOME both unset)",
+        )
+    })?;
+    write_fallback_runner_at(&path, cfg)
+}
+
+/// Testable variant of [`write_fallback_runner`] that writes to an explicit path.
+pub fn write_fallback_runner_at(
+    path: &Path,
+    cfg: Option<&FallbackRunnerConfig>,
+) -> std::io::Result<()> {
+    let v = cfg
+        .map(|c| {
+            serde_json::to_value(c)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        })
+        .transpose()?;
+    write_config_key_at(
+        path,
+        "fallbackRunner",
+        v,
+        serde_json::json!({}),
+        OnCorruptJson::ReturnError,
+    )
 }
 
 #[cfg(test)]
@@ -194,5 +222,152 @@ mod tests {
         // it can only do when the tempfile and target share a filesystem.
         write_default_model_at(&path, Some(SONNET_MODEL)).unwrap();
         assert!(path.is_file());
+    }
+
+    // ---- write_review_model_at tests ----
+
+    #[test]
+    fn write_review_model_sets_key() {
+        let (_dir, path) = test_config_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"{"defaultModel":"some-model","additionalAllowedTools":["Bash(docker:*)"]}"#,
+        )
+        .unwrap();
+        write_review_model_at(&path, Some("grok-build")).unwrap();
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("\"reviewModel\""), "key should be set");
+        assert!(raw.contains("grok-build"), "value should be present");
+        // load-bearing: unrelated key must survive
+        assert!(
+            raw.contains("additionalAllowedTools"),
+            "additionalAllowedTools lost"
+        );
+        assert!(raw.contains("defaultModel"), "defaultModel lost");
+    }
+
+    #[test]
+    fn write_review_model_removes_key_when_none() {
+        let (_dir, path) = test_config_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, r#"{"reviewModel":"grok-build"}"#).unwrap();
+        write_review_model_at(&path, None).unwrap();
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("reviewModel"), "key should be removed: {raw}");
+    }
+
+    #[test]
+    fn write_review_model_none_on_absent_key_is_noop() {
+        let (_dir, path) = test_config_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, r#"{"defaultModel":"x"}"#).unwrap();
+        write_review_model_at(&path, None).unwrap();
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(
+            !raw.contains("reviewModel"),
+            "key should stay absent: {raw}"
+        );
+    }
+
+    #[test]
+    fn write_review_model_creates_file_when_absent() {
+        let (_dir, path) = test_config_path();
+        write_review_model_at(&path, Some("grok-build")).unwrap();
+        assert!(path.is_file());
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("grok-build"));
+    }
+
+    #[test]
+    fn write_review_model_malformed_json_returns_err() {
+        let (_dir, path) = test_config_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "not json at all").unwrap();
+        let result = write_review_model_at(&path, Some("grok-build"));
+        assert!(result.is_err(), "malformed JSON must return Err");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("config.json"),
+            "error must name the file: {msg}"
+        );
+    }
+
+    // ---- write_fallback_runner_at tests ----
+
+    #[test]
+    fn write_fallback_runner_sets_key() {
+        let (_dir, path) = test_config_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, r#"{"additionalAllowedTools":["Bash(docker:*)"]}"#).unwrap();
+        let cfg = FallbackRunnerConfig {
+            enabled: true,
+            provider: "grok".to_string(),
+            model: "grok-build".to_string(),
+            cli_binary: None,
+            runtime_error_threshold: 2,
+        };
+        write_fallback_runner_at(&path, Some(&cfg)).unwrap();
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("\"fallbackRunner\""), "key should be set");
+        // load-bearing: unrelated key must survive
+        assert!(
+            raw.contains("additionalAllowedTools"),
+            "additionalAllowedTools lost"
+        );
+    }
+
+    #[test]
+    fn write_fallback_runner_removes_key_when_none() {
+        let (_dir, path) = test_config_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"{"fallbackRunner":{"enabled":true,"provider":"grok","model":"grok-build","runtimeErrorThreshold":2}}"#,
+        )
+        .unwrap();
+        write_fallback_runner_at(&path, None).unwrap();
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(
+            !raw.contains("fallbackRunner"),
+            "key should be removed: {raw}"
+        );
+    }
+
+    #[test]
+    fn write_fallback_runner_none_on_absent_key_is_noop() {
+        let (_dir, path) = test_config_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, r#"{}"#).unwrap();
+        write_fallback_runner_at(&path, None).unwrap();
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(
+            !raw.contains("fallbackRunner"),
+            "key should stay absent: {raw}"
+        );
+    }
+
+    #[test]
+    fn write_fallback_runner_creates_file_when_absent() {
+        let (_dir, path) = test_config_path();
+        let cfg = FallbackRunnerConfig::default();
+        write_fallback_runner_at(&path, Some(&cfg)).unwrap();
+        assert!(path.is_file());
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("\"fallbackRunner\""));
+    }
+
+    #[test]
+    fn write_fallback_runner_malformed_json_returns_err() {
+        let (_dir, path) = test_config_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "{{bad json").unwrap();
+        let result = write_fallback_runner_at(&path, Some(&FallbackRunnerConfig::default()));
+        assert!(result.is_err(), "malformed JSON must return Err");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("config.json"),
+            "error must name the file: {msg}"
+        );
     }
 }

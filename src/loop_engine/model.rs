@@ -55,6 +55,44 @@ pub enum Provider {
     Claude,
     /// xAI Grok models (`grok-build`, `grok-code-fast-1`, …).
     Grok,
+    /// OpenAI Codex CLI models. In v1 this is selected only by explicit
+    /// `primaryRunner.provider = "codex"`; model-name inference is forbidden.
+    Codex,
+}
+
+impl Provider {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Provider::Claude => "claude",
+            Provider::Grok => "grok",
+            Provider::Codex => "codex",
+        }
+    }
+}
+
+/// Parse a provider name from runner-routing config.
+///
+/// Strict, returns [`Result`] so that a typo or vendor look-alike
+/// (`"openai"`, `"codex-cli"`, `"groq"`) produces a CONFIG ERROR at
+/// validation time rather than a silent fall-through to Claude. Re-implementing
+/// the mapping at another site risks accepting a substring like `"groq"` for
+/// Grok or `"openai"` for Codex — keep all callers funneling through here.
+///
+/// # Contract
+///
+/// The accepted set is the exact set of values [`Provider::as_str`] returns,
+/// so a `Provider` round-trips through `as_str → parse_config_provider`
+/// unchanged. Whitespace and case are normalized before matching.
+pub fn parse_config_provider(s: &str) -> Result<Provider, String> {
+    let trimmed = s.trim();
+    match trimmed.to_ascii_lowercase().as_str() {
+        "claude" => Ok(Provider::Claude),
+        "grok" => Ok(Provider::Grok),
+        "codex" => Ok(Provider::Codex),
+        _ => Err(format!(
+            "unknown provider {trimmed:?} (expected one of: claude, grok, codex)"
+        )),
+    }
 }
 
 /// Classify a model id as a provider.
@@ -87,6 +125,13 @@ pub fn provider_for_model(model: Option<&str>) -> Provider {
     } else {
         Provider::Claude
     }
+}
+
+/// Resolved model plus optional explicit provider intent.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ResolvedExecutionTarget {
+    pub model: Option<String>,
+    pub provider_hint: Option<Provider>,
 }
 
 /// Strip the leading 8-lowercase-hex project prefix from a task ID.
@@ -317,32 +362,58 @@ pub fn primary_runner_match<'a>(
 /// Empty / whitespace-only strings in any field are normalized to `None` so
 /// missing config values don't override real ones.
 pub fn resolve_task_model(ctx: &ModelResolutionContext<'_>) -> Option<String> {
+    resolve_task_execution_target(ctx).model
+}
+
+/// Resolve the model and any explicit provider intent for a single task.
+///
+/// Only a `primaryRunner` match produces `provider_hint`. All model-string
+/// rungs remain provider-agnostic so v1 cannot accidentally route Codex from a
+/// generic OpenAI-looking model name.
+pub fn resolve_task_execution_target(ctx: &ModelResolutionContext<'_>) -> ResolvedExecutionTarget {
     // Rung 1: explicit model on the task.
     if let Some(m) = normalize(ctx.task_model) {
-        return Some(m.to_string());
+        return ResolvedExecutionTarget {
+            model: Some(m.to_string()),
+            provider_hint: None,
+        };
     }
     // Rung 2: primary runner match (byTaskType wins over byIdPrefix).
-    if let Some(model) = ctx
+    if let Some(spec) = ctx
         .primary_runner
         .and_then(|cfg| primary_runner_match(cfg, ctx.task_id, ctx.task_type))
-        .map(|spec| spec.model.clone())
     {
-        return Some(model);
+        return ResolvedExecutionTarget {
+            model: normalize(Some(&spec.model)).map(str::to_string),
+            // Config validation rejects unknown providers up-front via
+            // `parse_config_provider`, so by the time we reach the
+            // dispatcher a malformed string would have already exited
+            // with an error. `.ok()` here means "if we somehow got past
+            // validation with a malformed provider, leave the hint empty
+            // and let `provider_for_model` classify" — a safe degrade.
+            provider_hint: parse_config_provider(&spec.provider).ok(),
+        };
     }
     // Rung 3: difficulty=high forces OPUS_MODEL.
     if ctx
         .difficulty
         .is_some_and(|d| d.eq_ignore_ascii_case("high"))
     {
-        return Some(OPUS_MODEL.to_string());
+        return ResolvedExecutionTarget {
+            model: Some(OPUS_MODEL.to_string()),
+            provider_hint: None,
+        };
     }
     // Rungs 4-6: project/user defaults in precedence order.
     for fallback in [ctx.prd_default, ctx.project_default, ctx.user_default] {
         if let Some(m) = normalize(fallback) {
-            return Some(m.to_string());
+            return ResolvedExecutionTarget {
+                model: Some(m.to_string()),
+                provider_hint: None,
+            };
         }
     }
-    None
+    ResolvedExecutionTarget::default()
 }
 
 fn normalize(s: Option<&str>) -> Option<&str> {
@@ -647,6 +718,7 @@ mod tests {
         let grok_spec = RunnerSpec {
             provider: "grok".to_string(),
             model: "grok-build".to_string(),
+            ..Default::default()
         };
         let mut by_task_type = HashMap::new();
         by_task_type.insert("review".to_string(), grok_spec.clone());
@@ -727,6 +799,61 @@ mod tests {
         assert_eq!(result, Some(OPUS_MODEL.to_string()));
     }
 
+    #[test]
+    fn test_primary_runner_codex_provider_only_preserves_provider_hint() {
+        use std::collections::HashMap;
+        let mut by_task_type = HashMap::new();
+        by_task_type.insert(
+            "review".to_string(),
+            RunnerSpec {
+                provider: "codex".to_string(),
+                model: String::new(),
+                ..Default::default()
+            },
+        );
+        let cfg = PrimaryRunnerConfig {
+            claude_fallback_model: None,
+            runtime_error_threshold: 2,
+            by_task_type,
+            by_id_prefix: HashMap::new(),
+        };
+        let result = resolve_task_execution_target(&ModelResolutionContext {
+            task_type: Some("review"),
+            primary_runner: Some(&cfg),
+            ..ctx()
+        });
+        assert_eq!(result.model, None);
+        assert_eq!(result.provider_hint, Some(Provider::Codex));
+    }
+
+    #[test]
+    fn test_explicit_task_model_suppresses_codex_primary_runner_hint() {
+        use std::collections::HashMap;
+        let mut by_task_type = HashMap::new();
+        by_task_type.insert(
+            "review".to_string(),
+            RunnerSpec {
+                provider: "codex".to_string(),
+                model: String::new(),
+                ..Default::default()
+            },
+        );
+        let cfg = PrimaryRunnerConfig {
+            claude_fallback_model: None,
+            runtime_error_threshold: 2,
+            by_task_type,
+            by_id_prefix: HashMap::new(),
+        };
+        let result = resolve_task_execution_target(&ModelResolutionContext {
+            task_model: Some(OPUS_MODEL),
+            task_type: Some("review"),
+            primary_runner: Some(&cfg),
+            ..ctx()
+        });
+        assert_eq!(result.model, Some(OPUS_MODEL.to_string()));
+        assert_eq!(result.provider_hint, None);
+    }
+
     /// AC: difficulty='high' on a review task → resolves to 'grok-build'
     /// (primaryRunner rung 2 wins over difficulty=high rung 3).
     #[test]
@@ -799,6 +926,7 @@ mod tests {
             RunnerSpec {
                 provider: "grok".to_string(),
                 model: "grok-type-winner".to_string(),
+                ..Default::default()
             },
         );
         let mut by_id_prefix = HashMap::new();
@@ -807,6 +935,7 @@ mod tests {
             RunnerSpec {
                 provider: "grok".to_string(),
                 model: "grok-prefix-loser".to_string(),
+                ..Default::default()
             },
         );
         let cfg = PrimaryRunnerConfig {
@@ -1663,5 +1792,64 @@ mod tests {
     #[test]
     fn test_escalate_below_opus_none_returns_none() {
         assert_eq!(escalate_below_opus(None), None);
+    }
+
+    // ============ parse_config_provider tests (FEAT-006) ============
+    //
+    // Hard-fails on unknown providers so a config typo (`"openai"`,
+    // `"codex-cli"`, `"groq"`) surfaces as a validation error instead of
+    // silently routing the task to Claude. The "Known-bad" AC: an
+    // Option-returning parser silently routes a typo to Claude — these
+    // tests assert the typo produces an Err.
+
+    #[test]
+    fn test_parse_config_provider_canonical_lowercase() {
+        assert_eq!(parse_config_provider("claude"), Ok(Provider::Claude));
+        assert_eq!(parse_config_provider("grok"), Ok(Provider::Grok));
+        assert_eq!(parse_config_provider("codex"), Ok(Provider::Codex));
+    }
+
+    #[test]
+    fn test_parse_config_provider_trim_and_case_insensitive() {
+        assert_eq!(parse_config_provider("  CODEX "), Ok(Provider::Codex));
+        assert_eq!(parse_config_provider("\tGrok\n"), Ok(Provider::Grok));
+        assert_eq!(parse_config_provider("CLAUDE"), Ok(Provider::Claude));
+        assert_eq!(parse_config_provider("CoDeX"), Ok(Provider::Codex));
+    }
+
+    #[test]
+    fn test_parse_config_provider_rejects_lookalikes_and_unknowns() {
+        // Vendor look-alikes that an Option-returning parser would silently
+        // drop to None (and therefore route to Claude). The strict variant
+        // surfaces the error.
+        assert!(parse_config_provider("openai").is_err());
+        assert!(parse_config_provider("codex-cli").is_err());
+        assert!(parse_config_provider("groq").is_err()); // Groq Inc. ≠ xAI Grok
+        assert!(parse_config_provider("anthropic").is_err());
+        assert!(parse_config_provider("gpt").is_err());
+        assert!(parse_config_provider("").is_err());
+        assert!(parse_config_provider("   ").is_err());
+        let err = parse_config_provider("openai").unwrap_err();
+        assert!(
+            err.contains("openai")
+                && err.contains("claude")
+                && err.contains("grok")
+                && err.contains("codex"),
+            "error message must name the rejected value and the allowed set: {err:?}",
+        );
+    }
+
+    #[test]
+    fn test_parse_config_provider_round_trips_through_as_str() {
+        // Contract: every Provider value round-trips losslessly through
+        // `as_str → parse_config_provider`. The accepted set is EXACTLY the
+        // `as_str` image.
+        for p in [Provider::Claude, Provider::Grok, Provider::Codex] {
+            assert_eq!(
+                parse_config_provider(p.as_str()),
+                Ok(p),
+                "round-trip through as_str → parse_config_provider must be lossless for {p:?}",
+            );
+        }
     }
 }

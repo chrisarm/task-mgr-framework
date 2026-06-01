@@ -87,6 +87,7 @@ pub fn run_iteration(
             output: String::new(),
             effective_model: None,
             effective_effort: None,
+            effective_runner: None,
             key_decisions_count: 0,
             conversation: None,
             shown_learning_ids: Vec::new(),
@@ -104,6 +105,7 @@ pub fn run_iteration(
             output: String::new(),
             effective_model: None,
             effective_effort: None,
+            effective_runner: None,
             key_decisions_count: 0,
             conversation: None,
             shown_learning_ids: Vec::new(),
@@ -143,6 +145,7 @@ pub fn run_iteration(
                     output: String::new(),
                     effective_model: None,
                     effective_effort: None,
+                    effective_runner: None,
                     key_decisions_count: 0,
                     conversation: None,
                     shown_learning_ids: Vec::new(),
@@ -178,6 +181,7 @@ pub fn run_iteration(
             output: String::new(),
             effective_model: None,
             effective_effort: None,
+            effective_runner: None,
             key_decisions_count: 0,
             conversation: None,
             shown_learning_ids: Vec::new(),
@@ -227,6 +231,7 @@ pub fn run_iteration(
         task_prefix: params.task_prefix,
         batch_sibling_prds: params.batch_sibling_prds,
         permission_mode: params.permission_mode,
+        primary_runner: params.project_config.primary_runner.as_ref(),
     });
 
     let prompt_result = match first_attempt {
@@ -255,6 +260,7 @@ pub fn run_iteration(
                     output: String::new(),
                     effective_model: None,
                     effective_effort: None,
+                    effective_runner: None,
                     key_decisions_count: 0,
                     conversation: None,
                     shown_learning_ids: Vec::new(),
@@ -304,6 +310,7 @@ pub fn run_iteration(
                     task_prefix: params.task_prefix,
                     batch_sibling_prds: params.batch_sibling_prds,
                     permission_mode: params.permission_mode,
+                    primary_runner: params.project_config.primary_runner.as_ref(),
                 });
                 match retry_attempt {
                     Ok(Some(result)) => result,
@@ -320,6 +327,7 @@ pub fn run_iteration(
                             output: String::new(),
                             effective_model: None,
                             effective_effort: None,
+                            effective_runner: None,
                             key_decisions_count: 0,
                             conversation: None,
                             shown_learning_ids: Vec::new(),
@@ -347,6 +355,7 @@ pub fn run_iteration(
                     output: String::new(),
                     effective_model: None,
                     effective_effort: None,
+                    effective_runner: None,
                     key_decisions_count: 0,
                     conversation: None,
                     shown_learning_ids: Vec::new(),
@@ -443,7 +452,18 @@ pub fn run_iteration(
     // pre-rewrite baseline, so this re-resolution is the authoritative spawn
     // discriminant. Placed before the banner so the "(via grok)" annotation
     // can be included in the iteration header.
-    let effective_runner = resolve_effective_runner(ctx, &task_id, effective_model.as_deref());
+    let mut provider_hint = prompt_result.provider_hint;
+    if effective_model != prompt_result.resolved_model {
+        provider_hint = None;
+    }
+    let effective_runner = resolve_effective_runner(
+        ctx,
+        &task_id,
+        crate::loop_engine::engine::EffectiveRunnerInput {
+            model: effective_model.as_deref(),
+            provider_hint,
+        },
+    );
 
     // Step 5: Print iteration header (with post-escalation effective_model + effort).
     // The iteration banner is product output (CONTRACT-LOG-001 channel A) — it
@@ -470,6 +490,22 @@ pub fn run_iteration(
         prompt_result.task_difficulty.as_deref(),
         Arc::clone(&monitor_handle.last_activity_epoch),
     );
+    let protected_snapshot = crate::loop_engine::protected_state::Snapshot::take(
+        params.db_dir,
+        params.tasks_dir,
+        effective_runner,
+    );
+    let runner_effort = if effective_runner.supports(runner::RunnerCapability::Effort) {
+        effort
+    } else {
+        None
+    };
+    let runner_disallowed_tools =
+        if effective_runner.supports(runner::RunnerCapability::DisallowedTools) {
+            Some(TASKS_JSON_DISALLOWED_TOOLS)
+        } else {
+            None
+        };
     let claude_result = runner::dispatch(
         effective_runner,
         &prompt_result.prompt,
@@ -480,8 +516,8 @@ pub fn run_iteration(
             model: effective_model.as_deref(),
             timeout: Some(timeout_config),
             stream_json: true,
-            effort,
-            disallowed_tools: Some(TASKS_JSON_DISALLOWED_TOOLS),
+            effort: runner_effort,
+            disallowed_tools: runner_disallowed_tools,
             db_dir: Some(params.db_dir),
             // PTY disabled: when Claude sees isatty(1)==true it switches to
             // "interactive" handling of rate limits (internal wait + retry)
@@ -510,6 +546,9 @@ pub fn run_iteration(
     );
     monitor::stop_monitor(monitor_handle);
     claude::cleanup_ghost_sessions();
+    if let Some(snapshot) = protected_snapshot.as_ref() {
+        crate::loop_engine::protected_state::apply_verify_outcome(snapshot, "iteration")?;
+    }
     // FEAT-007: surface TaskMgrError::GrokAuthFailure as a Crash(GrokAuthFailure)
     // outcome instead of bubbling out of the iteration. The retry-tracking site
     // in `run_loop` skips this variant so an xAI auth lapse never pushes a
@@ -526,6 +565,26 @@ pub fn run_iteration(
                 output: hint,
                 effective_model,
                 effective_effort: effort,
+                effective_runner: Some(effective_runner),
+                key_decisions_count: 0,
+                conversation: None,
+                shown_learning_ids: Vec::new(),
+            });
+        }
+        Err(crate::error::TaskMgrError::CodexAuthFailure { hint }) => {
+            ui::emit_err(&format!(
+                "Codex auth failure for task {}: {}",
+                task_id, hint
+            ));
+            return Ok(IterationResult {
+                outcome: IterationOutcome::Crash(config::CrashType::CodexAuthFailure),
+                task_id: Some(task_id),
+                files_modified: task_files,
+                should_stop: false,
+                output: hint,
+                effective_model,
+                effective_effort: effort,
+                effective_runner: Some(effective_runner),
                 key_decisions_count: 0,
                 conversation: None,
                 shown_learning_ids: Vec::new(),
@@ -552,6 +611,7 @@ pub fn run_iteration(
                 output: String::new(),
                 effective_model,
                 effective_effort: effort,
+                effective_runner: Some(effective_runner),
                 key_decisions_count: 0,
                 conversation: None,
                 shown_learning_ids: Vec::new(),
@@ -633,6 +693,7 @@ pub fn run_iteration(
             output: claude_result.output,
             effective_model,
             effective_effort: effort,
+            effective_runner: Some(effective_runner),
             key_decisions_count: 0,
             conversation: None,
             shown_learning_ids: Vec::new(),
@@ -663,6 +724,7 @@ pub fn run_iteration(
             output: claude_result.output,
             effective_model: None,
             effective_effort: None,
+            effective_runner: Some(effective_runner),
             key_decisions_count: 0,
             conversation: None,
             shown_learning_ids: Vec::new(),
@@ -709,6 +771,7 @@ pub fn run_iteration(
                 output: String::new(),
                 effective_model: None,
                 effective_effort: None,
+                effective_runner: Some(effective_runner),
                 key_decisions_count: 0,
                 conversation: None,
                 shown_learning_ids: Vec::new(),
@@ -803,6 +866,7 @@ pub fn run_iteration(
         output: claude_output,
         effective_model,
         effective_effort: effort,
+        effective_runner: Some(effective_runner),
         key_decisions_count: 0,
         conversation: claude_conversation,
         shown_learning_ids,

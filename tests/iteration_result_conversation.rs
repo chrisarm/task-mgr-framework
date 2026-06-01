@@ -56,6 +56,7 @@ fn iteration_result_carries_optional_conversation_transcript() {
         output: "raw stdout".into(),
         effective_model: Some(OPUS_MODEL.into()),
         effective_effort: Some("high"),
+        effective_runner: None,
         key_decisions_count: 0,
         conversation: Some("[user] go\n[assistant] done\n".into()),
         shown_learning_ids: Vec::new(),
@@ -75,6 +76,7 @@ fn iteration_result_carries_optional_conversation_transcript() {
         output: String::new(),
         effective_model: None,
         effective_effort: None,
+        effective_runner: None,
         key_decisions_count: 0,
         conversation: None,
         shown_learning_ids: Vec::new(),
@@ -115,6 +117,7 @@ fn slot_result_conversation_borrows_into_processing_params_shape() {
             output: "raw output".into(),
             effective_model: None,
             effective_effort: None,
+            effective_runner: None,
             key_decisions_count: 0,
             conversation: Some(transcript.into()),
             shown_learning_ids: Vec::new(),
@@ -126,6 +129,7 @@ fn slot_result_conversation_borrows_into_processing_params_shape() {
         dropped_sections: Vec::new(),
         task_difficulty: None,
         effective_runner: task_mgr::loop_engine::runner::RunnerKind::Claude,
+        pre_dispatch_provider_hint: None,
     };
     // The exact borrow shape `process_slot_result` will use when it builds
     // `ProcessingParams { conversation: ..., .. }`. Type-checked here, not in
@@ -149,6 +153,7 @@ fn slot_result_conversation_borrows_into_processing_params_shape() {
             output: String::new(),
             effective_model: None,
             effective_effort: None,
+            effective_runner: None,
             key_decisions_count: 0,
             conversation: None,
             shown_learning_ids: Vec::new(),
@@ -160,6 +165,7 @@ fn slot_result_conversation_borrows_into_processing_params_shape() {
         dropped_sections: Vec::new(),
         task_difficulty: None,
         effective_runner: task_mgr::loop_engine::runner::RunnerKind::Claude,
+        pre_dispatch_provider_hint: None,
     };
     let param_none: Option<&str> = slot_none.iteration_result.conversation.as_deref();
     assert!(
@@ -240,6 +246,7 @@ fn dropping_conversation_at_caller_is_observably_different_from_threading_it() {
         output: "raw output that should NOT be the learning source".into(),
         effective_model: None,
         effective_effort: None,
+        effective_runner: None,
         key_decisions_count: 0,
         conversation: Some(transcript.into()),
         shown_learning_ids: Vec::new(),
@@ -273,6 +280,7 @@ fn dropping_conversation_at_caller_is_observably_different_from_threading_it() {
         output: String::new(),
         effective_model: None,
         effective_effort: None,
+        effective_runner: None,
         key_decisions_count: 0,
         conversation: None,
         shown_learning_ids: Vec::new(),

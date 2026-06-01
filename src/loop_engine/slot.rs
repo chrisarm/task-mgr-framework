@@ -42,8 +42,8 @@ use crate::loop_engine::config::{self, IterationOutcome, TASKS_JSON_DISALLOWED_T
 use crate::loop_engine::detection;
 use crate::loop_engine::display;
 use crate::loop_engine::engine::{
-    IterationContext, IterationResult, SlotContext, SlotEarlyExit, SlotIterationParams, SlotResult,
-    WaveAggregator, WaveIterationParams, resolve_effective_runner,
+    EffectiveRunnerInput, IterationContext, IterationResult, SlotContext, SlotEarlyExit,
+    SlotIterationParams, SlotResult, WaveAggregator, WaveIterationParams, resolve_effective_runner,
 };
 use crate::loop_engine::iteration_pipeline;
 use crate::loop_engine::model;
@@ -72,6 +72,7 @@ fn slot_early_exit(slot: &SlotContext, exit: SlotEarlyExit) -> SlotResult {
             output: exit.output,
             effective_model: exit.effective_model,
             effective_effort: exit.effective_effort,
+            effective_runner: Some(slot.effective_runner),
             key_decisions_count: 0,
             conversation: None,
             shown_learning_ids: Vec::new(),
@@ -86,6 +87,7 @@ fn slot_early_exit(slot: &SlotContext, exit: SlotEarlyExit) -> SlotResult {
         dropped_sections: slot.prompt_bundle.dropped_sections.clone(),
         task_difficulty: slot.prompt_bundle.difficulty.clone(),
         effective_runner: slot.effective_runner,
+        pre_dispatch_provider_hint: slot.prompt_bundle.provider_hint,
     }
 }
 
@@ -193,6 +195,31 @@ pub fn run_slot_iteration(
     // The slot body MUST NOT read the IterationContext override maps
     // directly (Learning #1810; enforced by the source-sniff test in
     // tests/runtime_error_fallback.rs).
+    let protected_snapshot = if params.protected_snapshot_active {
+        None
+    } else {
+        crate::loop_engine::protected_state::Snapshot::take(
+            &params.db_dir,
+            &params.tasks_dir,
+            slot.effective_runner,
+        )
+    };
+    let runner_effort = if slot
+        .effective_runner
+        .supports(runner::RunnerCapability::Effort)
+    {
+        effort
+    } else {
+        None
+    };
+    let runner_disallowed_tools = if slot
+        .effective_runner
+        .supports(runner::RunnerCapability::DisallowedTools)
+    {
+        Some(TASKS_JSON_DISALLOWED_TOOLS)
+    } else {
+        None
+    };
     let claude_result = runner::dispatch(
         slot.effective_runner,
         &bundle.prompt,
@@ -203,8 +230,8 @@ pub fn run_slot_iteration(
             model: effective_model.as_deref(),
             timeout: Some(timeout_config),
             stream_json: true,
-            effort,
-            disallowed_tools: Some(TASKS_JSON_DISALLOWED_TOOLS),
+            effort: runner_effort,
+            disallowed_tools: runner_disallowed_tools,
             db_dir: Some(&params.db_dir),
             use_pty: false,
             target_task_id: Some(task_id),
@@ -225,6 +252,9 @@ pub fn run_slot_iteration(
         },
     );
     monitor::stop_monitor(monitor_handle);
+    if let Some(snapshot) = protected_snapshot.as_ref() {
+        crate::loop_engine::protected_state::apply_verify_outcome(snapshot, "slot")?;
+    }
     // FEAT-007: route TaskMgrError::GrokAuthFailure into a Crash(GrokAuthFailure)
     // outcome instead of propagating out of the slot. The post-wave aggregator
     // detects this variant and skips both the failure-counter increment AND
@@ -240,6 +270,23 @@ pub fn run_slot_iteration(
                 slot,
                 SlotEarlyExit {
                     outcome: IterationOutcome::Crash(config::CrashType::GrokAuthFailure),
+                    files_modified: task_files,
+                    should_stop: false,
+                    output: hint,
+                    effective_model,
+                    effective_effort: effort,
+                },
+            ));
+        }
+        Err(crate::error::TaskMgrError::CodexAuthFailure { hint }) => {
+            ui::emit(&format!(
+                "[slot {}] Codex auth failure for task {}: {}",
+                slot.slot_index, task_id, hint
+            ));
+            return Ok(slot_early_exit(
+                slot,
+                SlotEarlyExit {
+                    outcome: IterationOutcome::Crash(config::CrashType::CodexAuthFailure),
                     files_modified: task_files,
                     should_stop: false,
                     output: hint,
@@ -345,6 +392,7 @@ pub fn run_slot_iteration(
             output: claude_result.output,
             effective_model,
             effective_effort: effort,
+            effective_runner: Some(slot.effective_runner),
             key_decisions_count: 0,
             conversation,
             shown_learning_ids: bundle.shown_learning_ids.clone(),
@@ -356,6 +404,7 @@ pub fn run_slot_iteration(
         dropped_sections: bundle.dropped_sections.clone(),
         task_difficulty: bundle.difficulty.clone(),
         effective_runner: slot.effective_runner,
+        pre_dispatch_provider_hint: bundle.provider_hint,
     })
 }
 
@@ -421,6 +470,7 @@ pub(super) fn slot_failure_result(
             output: reason,
             effective_model: None,
             effective_effort: None,
+            effective_runner: None,
             key_decisions_count: 0,
             conversation: None,
             shown_learning_ids: Vec::new(),
@@ -432,6 +482,7 @@ pub(super) fn slot_failure_result(
         dropped_sections: Vec::new(),
         task_difficulty: None,
         effective_runner: RunnerKind::Claude, // kind-correct: sentinel default; main-thread enrichment overwrites with resolved provider before slot spawn
+        pre_dispatch_provider_hint: None,
     }
 }
 
@@ -511,6 +562,7 @@ pub(super) fn process_slot_result(
             dropped_sections: slot_result.dropped_sections.clone(),
             task_difficulty: slot_result.task_difficulty.clone(),
             cluster_effort: slot_result.iteration_result.effective_effort,
+            provider_hint: None,
             section_sizes: slot_result.section_sizes.clone(),
         };
         // FEAT-005/H3: use the pre-dispatch runner threaded from SlotContext
@@ -526,7 +578,16 @@ pub(super) fn process_slot_result(
             resolve_effective_runner(
                 ctx,
                 tid,
-                slot_result.iteration_result.effective_model.as_deref()
+                // Thread the pre-dispatch provider_hint so the sentinel
+                // re-derives via the SAME formula the wave used. Before
+                // WIRE-FIX-001 the wave dropped the hint when defaultModel
+                // widened resolved_model, so `None` was correct then;
+                // after the fix the wave always carries the bundle's hint,
+                // and the sentinel must match.
+                EffectiveRunnerInput {
+                    model: slot_result.iteration_result.effective_model.as_deref(),
+                    provider_hint: slot_result.pre_dispatch_provider_hint,
+                },
             ),
             effective_runner,
             "effective_runner drift: process_slot_result re-derivation diverged from pre-dispatch value"
@@ -665,6 +726,7 @@ mod tests {
     fn make_slot_params(db_dir: &Path, signal_flag: SignalFlag) -> SlotIterationParams {
         SlotIterationParams {
             db_dir: db_dir.to_path_buf(),
+            tasks_dir: db_dir.join("tasks"),
             permission_mode: PermissionMode::Dangerous,
             signal_flag,
             default_model: None,
@@ -674,6 +736,7 @@ mod tests {
             elapsed_secs: 0,
             task_prefix: None,
             run_id: None,
+            protected_snapshot_active: false,
         }
     }
 
@@ -688,6 +751,7 @@ mod tests {
             permission_mode: PermissionMode::Dangerous,
             steering_path: None,
             session_guidance: "",
+            primary_runner: None,
         }
     }
 
@@ -702,6 +766,7 @@ mod tests {
             shown_learning_ids: Vec::new(),
             resolved_model: None,
             difficulty: None,
+            provider_hint: None,
             section_sizes: Vec::new(),
             dropped_sections: Vec::new(),
         }
@@ -747,6 +812,7 @@ mod tests {
                 output: String::new(),
                 effective_model: None,
                 effective_effort: None,
+                effective_runner: None,
                 key_decisions_count: 0,
                 conversation: None,
                 shown_learning_ids: Vec::new(),
@@ -758,6 +824,7 @@ mod tests {
             dropped_sections: Vec::new(),
             task_difficulty: None,
             effective_runner: RunnerKind::Claude,
+            pre_dispatch_provider_hint: None,
         };
         assert_eq!(sr.slot_index, 1);
         assert!(matches!(
@@ -871,6 +938,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let params = SlotIterationParams {
             db_dir: tmp.path().to_path_buf(),
+            tasks_dir: tmp.path().join("tasks"),
             permission_mode: PermissionMode::Dangerous,
             signal_flag: SignalFlag::new(),
             default_model: Some(OPUS_MODEL.to_string()),
@@ -880,6 +948,7 @@ mod tests {
             elapsed_secs: 42,
             task_prefix: None,
             run_id: None,
+            protected_snapshot_active: false,
         };
         let cloned = params.clone();
         assert_eq!(cloned.db_dir, params.db_dir);

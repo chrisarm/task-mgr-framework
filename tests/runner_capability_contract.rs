@@ -63,7 +63,7 @@ fn opts_for_field(field: &str) -> RunnerOpts<'static> {
 fn capability_matrix_dispatch_contract() {
     let _guard = BINARY_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
 
-    // Point both CLI envs at a nonexistent path. Supported (runner × capability)
+    // Point all CLI envs at a nonexistent path. Supported (runner × capability)
     // pairs pass the gate then fail at spawn; unsupported pairs never reach
     // spawn. Either way no subprocess actually runs — keeps the test fast and
     // independent of PTY / stream-json subprocess interaction.
@@ -72,29 +72,32 @@ fn capability_matrix_dispatch_contract() {
     // SAFETY: process-global env mutation, serialized via BINARY_MUTEX.
     unsafe { std::env::set_var("CLAUDE_BINARY", bogus_binary.to_str().unwrap()) };
     unsafe { std::env::set_var("GROK_BINARY", bogus_binary.to_str().unwrap()) };
+    unsafe { std::env::set_var("CODEX_BINARY", bogus_binary.to_str().unwrap()) };
 
-    // (capability_name, field_name, claude_supports, grok_supports)
+    // (capability_name, field_name, claude_supports, grok_supports, codex_supports)
     // Mirrors the production support table in
     // src/loop_engine/CLAUDE.md → "Capability surface".
-    let matrix: &[(&str, &str, bool, bool)] = &[
-        ("Effort", "effort", true, true),
-        ("StreamJson", "stream_json", true, true),
-        ("Pty", "use_pty", true, false),
-        ("DisallowedTools", "disallowed_tools", true, true),
+    let matrix: &[(&str, &str, bool, bool, bool)] = &[
+        ("Effort", "effort", true, true, false),
+        ("StreamJson", "stream_json", true, true, true),
+        ("Pty", "use_pty", true, false, false),
+        ("DisallowedTools", "disallowed_tools", true, true, false),
         (
             "TitleArtifactCleanup",
             "cleanup_title_artifact",
             true,
+            false,
             false,
         ),
     ];
 
     let perm = scoped_coding();
 
-    for (cap_name, field_name, claude_ok, grok_ok) in matrix {
+    for (cap_name, field_name, claude_ok, grok_ok, codex_ok) in matrix {
         for (kind, supported) in [
             (RunnerKind::Claude, *claude_ok),
             (RunnerKind::Grok, *grok_ok),
+            (RunnerKind::Codex, *codex_ok),
         ] {
             let opts = opts_for_field(field_name);
             let result = dispatch(kind, "cap-contract-prompt", &perm, opts);
@@ -127,7 +130,7 @@ fn capability_matrix_dispatch_contract() {
     }
 
     // RunnerOpts::default() must never trigger the capability gate.
-    for kind in [RunnerKind::Claude, RunnerKind::Grok] {
+    for kind in [RunnerKind::Claude, RunnerKind::Grok, RunnerKind::Codex] {
         let result = dispatch(kind, "default-opts", &perm, RunnerOpts::default());
         assert!(
             !matches!(
@@ -140,4 +143,5 @@ fn capability_matrix_dispatch_contract() {
 
     unsafe { std::env::remove_var("CLAUDE_BINARY") };
     unsafe { std::env::remove_var("GROK_BINARY") };
+    unsafe { std::env::remove_var("CODEX_BINARY") };
 }

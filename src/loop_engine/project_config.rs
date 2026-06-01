@@ -1,8 +1,10 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 
 use crate::error::{TaskMgrError, TaskMgrResult};
+use crate::loop_engine::config_io::{OnCorruptJson, write_config_key_at};
+use crate::loop_engine::model::{Provider, parse_config_provider};
 
 /// Configuration for the Grok fallback runner (US-005, FR-006).
 ///
@@ -10,7 +12,7 @@ use crate::error::{TaskMgrError, TaskMgrResult};
 /// after the Claude overflow ladder is exhausted (rung 4) or after
 /// `runtime_error_threshold` consecutive `RuntimeError` rounds. Absent or
 /// `enabled = false` → no change to the existing 4-rung ladder.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FallbackRunnerConfig {
     /// Whether the Grok fallback runner is active. Default: `false`.
@@ -28,7 +30,7 @@ pub struct FallbackRunnerConfig {
 
     /// Absolute path to the Grok CLI binary. When `None`, the binary is
     /// resolved as `"grok"` on the system PATH.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cli_binary: Option<String>,
 
     /// Number of consecutive `RuntimeError` rounds on a task before the
@@ -49,14 +51,25 @@ impl Default for FallbackRunnerConfig {
     }
 }
 
-/// A provider + model pair used as a routing target in `PrimaryRunnerConfig`.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+/// A provider + optional model pair used as a routing target in `PrimaryRunnerConfig`.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct RunnerSpec {
     /// Provider name (e.g. `"grok"`, `"claude"`).
     pub provider: String,
     /// Model identifier passed to the provider CLI (e.g. `"grok-build"`).
+    /// Codex v1 may omit this field to route by explicit provider intent only.
+    #[serde(default)]
     pub model: String,
+    /// Opt-in: when the route's provider is `"codex"` AND this is `true`, a
+    /// Codex RUNTIME failure (not auth) promotes the task to the Claude
+    /// runner instead of auto-blocking after `runtimeErrorThreshold` rounds.
+    /// One-shot per task — once promoted, normal Claude recovery applies and
+    /// the task never returns to Codex. Default: `false` (legacy auto-block).
+    /// Ignored on non-codex routes — Claude/Grok runners already have their
+    /// own cross-provider promotion paths (`fallbackRunner` / `claudeFallbackModel`).
+    #[serde(default)]
+    pub fallback_to_claude: bool,
 }
 
 /// Per-task-type and per-id-prefix routing for the primary runner.
@@ -400,6 +413,27 @@ fn resolve_and_verify_grok_binary(fallback_cli_binary: Option<&str>) -> Result<(
     if found { Ok(()) } else { Err(binary) }
 }
 
+fn resolve_and_verify_codex_binary() -> Result<(), String> {
+    let env_bin = std::env::var("CODEX_BINARY")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+
+    let (binary, found) = if let Some(env_bin) = env_bin {
+        let exec = is_executable_path(std::path::Path::new(&env_bin));
+        (env_bin, exec)
+    } else {
+        let name = "codex";
+        let found = std::env::var_os("PATH")
+            .map(|path_var| {
+                std::env::split_paths(&path_var).any(|dir| is_executable_path(&dir.join(name)))
+            })
+            .unwrap_or(false);
+        (name.to_string(), found)
+    };
+
+    if found { Ok(()) } else { Err(binary) }
+}
+
 /// Verify that the Grok fallback binary is reachable at loop startup.
 ///
 /// Returns `Ok(())` when `cfg` is `None` or `cfg.enabled` is `false`.
@@ -419,6 +453,107 @@ pub fn check_fallback_runner_binary(cfg: Option<&FallbackRunnerConfig>) -> TaskM
                  correct path (must be an executable file), then retry"
             ),
         }
+    })
+}
+
+pub fn validate_runner_routing_config(cfg: &ProjectConfig) -> TaskMgrResult<()> {
+    if let Some(fallback) = cfg.fallback_runner.as_ref()
+        && fallback.enabled
+        && !fallback.provider.trim().eq_ignore_ascii_case("grok")
+    {
+        return Err(TaskMgrError::InvalidConfig {
+            field: "fallbackRunner.provider".to_string(),
+            message: "v1 fallbackRunner only supports provider \"grok\"".to_string(),
+        });
+    }
+    if let Some(primary) = cfg.primary_runner.as_ref() {
+        for (map_name, key, spec) in primary_runner_specs(primary) {
+            if spec.provider.trim().is_empty() {
+                return Err(TaskMgrError::InvalidConfig {
+                    field: format!("primaryRunner.{map_name}.{key}.provider"),
+                    message: "provider must not be blank".to_string(),
+                });
+            }
+            // Strict parse: surface the error from `parse_config_provider`
+            // (typos like "openai" / "codex-cli" / "groq") so a misspelled
+            // provider hard-fails at validation instead of silently routing
+            // the task to Claude. Returning `Option::None` from a parser is
+            // the exact silent-fallback footgun this branch defends against.
+            let provider = parse_config_provider(&spec.provider).map_err(|message| {
+                TaskMgrError::InvalidConfig {
+                    field: format!("primaryRunner.{map_name}.{key}.provider"),
+                    message,
+                }
+            })?;
+            if spec.model.trim().is_empty() && provider != Provider::Codex {
+                return Err(TaskMgrError::InvalidConfig {
+                    field: format!("primaryRunner.{map_name}.{key}.model"),
+                    message: "model must not be blank unless provider is codex".to_string(),
+                });
+            }
+        }
+        if cfg
+            .review_model
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+            && primary_runner_contains_codex_review_route(primary)
+        {
+            return Err(TaskMgrError::InvalidConfig {
+                field: "reviewModel".to_string(),
+                message: "reviewModel is string-only in v1 and overrides primaryRunner Codex review routes; unset reviewModel or remove the Codex review route".to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+pub fn check_codex_runner_binary(primary: Option<&PrimaryRunnerConfig>) -> TaskMgrResult<()> {
+    let Some(primary) = primary else {
+        return Ok(());
+    };
+    if !primary_runner_specs(primary)
+        .any(|(_, _, spec)| parse_config_provider(&spec.provider).ok() == Some(Provider::Codex))
+    {
+        return Ok(());
+    }
+    resolve_and_verify_codex_binary().map_err(|binary| TaskMgrError::NotFound {
+        resource_type: "Codex CLI binary required by primaryRunner".to_string(),
+        id: format!(
+            "{binary} — install Codex CLI or set CODEX_BINARY to an executable file, then retry"
+        ),
+    })
+}
+
+fn primary_runner_specs(
+    primary: &PrimaryRunnerConfig,
+) -> impl Iterator<Item = (&'static str, &String, &RunnerSpec)> {
+    primary
+        .by_task_type
+        .iter()
+        .map(|(k, v)| ("byTaskType", k, v))
+        .chain(
+            primary
+                .by_id_prefix
+                .iter()
+                .map(|(k, v)| ("byIdPrefix", k, v)),
+        )
+}
+
+fn primary_runner_contains_codex_review_route(primary: &PrimaryRunnerConfig) -> bool {
+    primary_runner_specs(primary).any(|(map_name, key, spec)| {
+        parse_config_provider(&spec.provider).ok() == Some(Provider::Codex)
+            && match map_name {
+                "byTaskType" => {
+                    key.eq_ignore_ascii_case("review")
+                        || key.eq_ignore_ascii_case("code-review")
+                        || key.eq_ignore_ascii_case("milestone-final")
+                }
+                "byIdPrefix" => {
+                    let k = key.trim_end_matches('-').to_ascii_uppercase();
+                    matches!(k.as_str(), "CODE-REVIEW" | "REVIEW" | "MILESTONE-FINAL")
+                }
+                _ => false,
+            }
     })
 }
 
@@ -447,6 +582,42 @@ pub fn check_review_model_binary(
     })
 }
 
+/// Startup pre-flight: validate the project config, then probe every runner
+/// binary the config will need, BEFORE the first iteration.
+///
+/// This is the single source of truth for "is this project safe to run?" and
+/// MUST be called from every loop entry point — both `loop run` (single PRD)
+/// and `batch run` (N PRDs). Hoisting it here closes the parity gap where a
+/// misconfigured provider string or a missing `codex`/`grok` binary would
+/// surface only on `loop run`, but run unvalidated under `batch run`.
+///
+/// Ordering matches `loop run`'s historical block: validation runs BEFORE the
+/// binary probes so an operator who mis-typed a provider string sees the
+/// structured config error, not a misleading "binary missing" message from a
+/// downstream probe that wouldn't have fired anyway.
+///
+/// Codex binary probe is route-gated by `check_codex_runner_binary`: a
+/// pure-Claude / pure-Grok project triggers no PATH lookup for `codex`.
+///
+/// Failure semantics for `batch run`: a failure here aborts the WHOLE batch
+/// before any PRD runs. Config validity and binary availability are
+/// project-level (every PRD in the batch shares the same `.task-mgr/config.json`
+/// and `$PATH`), so a failure affects every PRD equally — failing fast up-front
+/// mirrors `loop run`'s fail-before-iteration-1 contract and avoids burning N
+/// partial runs on a uniformly-broken environment.
+pub fn preflight_validate_and_probe(cfg: &ProjectConfig) -> TaskMgrResult<()> {
+    validate_runner_routing_config(cfg)?;
+    check_fallback_runner_binary(cfg.fallback_runner.as_ref())?;
+    check_review_model_binary(
+        cfg.review_model.as_deref(),
+        cfg.fallback_runner
+            .as_ref()
+            .and_then(|fr| fr.cli_binary.as_deref()),
+    )?;
+    check_codex_runner_binary(cfg.primary_runner.as_ref())?;
+    Ok(())
+}
+
 /// Read project config from `<db_dir>/config.json`.
 ///
 /// Returns default (empty) config if the file doesn't exist.
@@ -468,49 +639,59 @@ pub fn read_project_config(db_dir: &Path) -> ProjectConfig {
 /// Pass `Some(model)` to set, `None` to remove the key entirely.
 /// Creates the file and parent dir if needed. Writes atomically via a
 /// same-directory tempfile + rename so readers never see a half-written JSON.
+/// Tolerant: malformed JSON is silently replaced by the `{"version":1}` seed.
 pub fn write_default_model(db_dir: &Path, model: Option<&str>) -> std::io::Result<()> {
-    use std::io::Write;
-
     let path = db_dir.join("config.json");
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    write_config_key_at(
+        &path,
+        "defaultModel",
+        model.map(|m| serde_json::Value::String(m.to_string())),
+        serde_json::json!({ "version": 1 }),
+        OnCorruptJson::UseSeed,
+    )
+}
 
-    let mut value: serde_json::Value = match std::fs::read_to_string(&path) {
-        Ok(s) if !s.trim().is_empty() => {
-            serde_json::from_str(&s).unwrap_or_else(|_| serde_json::json!({ "version": 1 }))
-        }
-        _ => serde_json::json!({ "version": 1 }),
-    };
-    let obj = value.as_object_mut().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "config.json is not a JSON object",
-        )
-    })?;
-    match model {
-        Some(m) => {
-            obj.insert(
-                "defaultModel".to_string(),
-                serde_json::Value::String(m.to_string()),
-            );
-        }
-        None => {
-            obj.remove("defaultModel");
-        }
-    }
+/// Set (or clear) the `reviewModel` field in `<db_dir>/config.json` without
+/// clobbering other fields.
+///
+/// Pass `Some(model)` to set, `None` to remove the key.
+/// Creates the file if absent (`{"version":1}` + the target key).
+/// Returns `Err` if the existing file contains malformed JSON (path named in message).
+pub fn write_review_model(db_dir: &Path, model: Option<&str>) -> std::io::Result<()> {
+    let path = db_dir.join("config.json");
+    write_config_key_at(
+        &path,
+        "reviewModel",
+        model.map(|m| serde_json::Value::String(m.to_string())),
+        serde_json::json!({ "version": 1 }),
+        OnCorruptJson::ReturnError,
+    )
+}
 
-    let contents = serde_json::to_string_pretty(&value)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut tmp = tempfile::Builder::new()
-        .prefix(".config-")
-        .suffix(".json")
-        .tempfile_in(dir)?;
-    tmp.write_all(contents.as_bytes())?;
-    tmp.write_all(b"\n")?;
-    tmp.persist(&path).map_err(|e| e.error)?;
-    Ok(())
+/// Set (or clear) the `fallbackRunner` block in `<db_dir>/config.json` without
+/// clobbering other fields.
+///
+/// Pass `Some(cfg)` to set, `None` to remove the key.
+/// Creates the file if absent (`{"version":1}` + the target key).
+/// Returns `Err` if the existing file contains malformed JSON (path named in message).
+pub fn write_fallback_runner(
+    db_dir: &Path,
+    cfg: Option<&FallbackRunnerConfig>,
+) -> std::io::Result<()> {
+    let path = db_dir.join("config.json");
+    let v = cfg
+        .map(|c| {
+            serde_json::to_value(c)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        })
+        .transpose()?;
+    write_config_key_at(
+        &path,
+        "fallbackRunner",
+        v,
+        serde_json::json!({ "version": 1 }),
+        OnCorruptJson::ReturnError,
+    )
 }
 
 #[cfg(test)]
@@ -1214,5 +1395,568 @@ mod tests {
     #[test]
     fn test_primary_runner_default_impl_is_none() {
         assert!(ProjectConfig::default().primary_runner.is_none());
+    }
+
+    // ---- preflight_validate_and_probe tests (FEAT-004) ----
+
+    fn primary_with_one_task_route(
+        task_key: &str,
+        provider: &str,
+        model: &str,
+    ) -> PrimaryRunnerConfig {
+        let mut by_task_type = HashMap::new();
+        by_task_type.insert(
+            task_key.to_string(),
+            RunnerSpec {
+                provider: provider.to_string(),
+                model: model.to_string(),
+                ..Default::default()
+            },
+        );
+        PrimaryRunnerConfig {
+            claude_fallback_model: None,
+            runtime_error_threshold: 2,
+            by_task_type,
+            by_id_prefix: HashMap::new(),
+        }
+    }
+
+    // ---- RunnerSpec.fallback_to_claude serde tests (FEAT-005) ----
+
+    #[test]
+    fn test_runner_spec_fallback_to_claude_absent_defaults_to_false() {
+        // AC: fallbackToClaude defaults to false; an absent field deserializes
+        // to false. Existing Codex projects keep the legacy auto-block path.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{
+                "primaryRunner": {
+                    "byTaskType": {
+                        "spike": { "provider": "codex" }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let cfg = read_project_config(dir.path());
+        let spec = cfg
+            .primary_runner
+            .expect("primaryRunner present")
+            .by_task_type
+            .remove("spike")
+            .expect("spike key present");
+        assert!(
+            !spec.fallback_to_claude,
+            "absent fallbackToClaude must deserialize to false"
+        );
+    }
+
+    #[test]
+    fn test_runner_spec_fallback_to_claude_true_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{
+                "primaryRunner": {
+                    "byIdPrefix": {
+                        "SPIKE-": { "provider": "codex", "fallbackToClaude": true }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let cfg = read_project_config(dir.path());
+        let spec = cfg
+            .primary_runner
+            .expect("primaryRunner present")
+            .by_id_prefix
+            .remove("SPIKE-")
+            .expect("SPIKE- key present");
+        assert!(
+            spec.fallback_to_claude,
+            "fallbackToClaude=true must round-trip"
+        );
+    }
+
+    #[test]
+    fn test_runner_spec_fallback_to_claude_snake_case_rejected() {
+        // CONTRACT: the field name on the wire is camelCase (fallbackToClaude),
+        // matching the rest of RunnerSpec's serde rename_all. snake_case must
+        // NOT silently set the field.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{
+                "primaryRunner": {
+                    "byTaskType": {
+                        "spike": { "provider": "codex", "fallback_to_claude": true }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let cfg = read_project_config(dir.path());
+        let spec = cfg
+            .primary_runner
+            .expect("primaryRunner present")
+            .by_task_type
+            .remove("spike")
+            .expect("spike key present");
+        assert!(
+            !spec.fallback_to_claude,
+            "snake_case key must not set fallback_to_claude"
+        );
+    }
+
+    #[test]
+    fn test_preflight_passes_pure_claude_config_without_codex_probe() {
+        // Acceptance: a pure-Claude config triggers no PATH lookup for codex.
+        // We verify by setting CODEX_BINARY to a path that DOES NOT exist —
+        // if preflight ever resolved the Codex binary on a pure-Claude config
+        // it would fail. The default config has neither a Codex primaryRunner
+        // route nor a fallbackRunner, so check_codex_runner_binary must
+        // short-circuit on `primary.is_none()` before any path probe runs.
+        let prev = std::env::var_os("CODEX_BINARY");
+        let bogus = "/tmp/task-mgr-test-nonexistent-codex-binary-feat004";
+        unsafe { std::env::set_var("CODEX_BINARY", bogus) };
+        let result = preflight_validate_and_probe(&ProjectConfig::default());
+        match prev {
+            Some(v) => unsafe { std::env::set_var("CODEX_BINARY", v) },
+            None => unsafe { std::env::remove_var("CODEX_BINARY") },
+        }
+        assert!(
+            result.is_ok(),
+            "pure-Claude config must pass preflight with codex absent from PATH: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_preflight_codex_route_missing_binary_returns_err() {
+        // Acceptance: Codex route + CODEX_BINARY pointing at a nonexistent
+        // path returns Err — exactly the failure batch_run must surface
+        // BEFORE expanding PRD files.
+        let prev = std::env::var_os("CODEX_BINARY");
+        let bogus = "/tmp/task-mgr-test-nonexistent-codex-binary-feat004-route";
+        unsafe { std::env::set_var("CODEX_BINARY", bogus) };
+        let cfg = ProjectConfig {
+            primary_runner: Some(primary_with_one_task_route(
+                "spike", "codex", "", // codex provider permits blank model
+            )),
+            ..Default::default()
+        };
+        let result = preflight_validate_and_probe(&cfg);
+        match prev {
+            Some(v) => unsafe { std::env::set_var("CODEX_BINARY", v) },
+            None => unsafe { std::env::remove_var("CODEX_BINARY") },
+        }
+        let err = result.expect_err("missing codex binary must return Err");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Codex") || msg.contains("codex"),
+            "error should mention codex: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_preflight_runs_validation_not_just_probes() {
+        // Regression: preflight must run config VALIDATION, not only binary
+        // probes. The poison reviewModel⨯Codex combo has no binary to probe,
+        // so a probe-only preflight would wave it through — exactly the
+        // batch-run parity gap this helper closes.
+        let cfg = ProjectConfig {
+            review_model: Some("grok-build".to_string()),
+            primary_runner: Some(primary_with_one_task_route("review", "codex", "")),
+            ..Default::default()
+        };
+        let err = preflight_validate_and_probe(&cfg).expect_err("preflight must reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("reviewModel"),
+            "preflight must reject via validation, naming reviewModel: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_preflight_rejects_invalid_fallback_provider() {
+        // Acceptance failure-mode: fallbackRunner.provider != "grok" aborts
+        // preflight with the same structured error from validate_runner_routing_config.
+        let cfg = ProjectConfig {
+            fallback_runner: Some(FallbackRunnerConfig {
+                enabled: true,
+                provider: "codex".to_string(),
+                model: "gpt-5-codex".to_string(),
+                cli_binary: None,
+                runtime_error_threshold: 2,
+            }),
+            ..Default::default()
+        };
+        let err = preflight_validate_and_probe(&cfg).expect_err("invalid fallback provider");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("fallbackRunner.provider") || msg.contains("grok"),
+            "error must name fallbackRunner.provider: {msg}"
+        );
+    }
+
+    // ============ FEAT-006: strict provider parser + provider-only Codex ============
+
+    /// AC (positive): the provider-only Codex rule from V2 is preserved —
+    /// `{provider:"codex", model:""}` validates OK. Removing this allowance
+    /// would re-introduce a hand-written model-id that the dispatcher's
+    /// provider-hint routing now makes unnecessary.
+    #[test]
+    fn test_validate_accepts_codex_provider_with_blank_model() {
+        let mut by_type = HashMap::new();
+        by_type.insert(
+            "spike".to_string(),
+            RunnerSpec {
+                provider: "codex".to_string(),
+                model: "".to_string(),
+                ..Default::default()
+            },
+        );
+        let cfg = ProjectConfig {
+            primary_runner: Some(PrimaryRunnerConfig {
+                by_task_type: by_type,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        validate_runner_routing_config(&cfg).expect("codex provider-only must validate");
+    }
+
+    /// AC (negative): a non-Codex route with a blank model is still rejected.
+    /// The Codex allowance must be provider-specific — no quiet widening to
+    /// other providers.
+    #[test]
+    fn test_validate_rejects_claude_provider_with_blank_model() {
+        let mut by_type = HashMap::new();
+        by_type.insert(
+            "review".to_string(),
+            RunnerSpec {
+                provider: "claude".to_string(),
+                model: "".to_string(),
+                ..Default::default()
+            },
+        );
+        let cfg = ProjectConfig {
+            primary_runner: Some(PrimaryRunnerConfig {
+                by_task_type: by_type,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err = validate_runner_routing_config(&cfg).expect_err("blank model must reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("model must not be blank") || msg.contains(".model"),
+            "error must call out the blank-model rule: {msg}",
+        );
+    }
+
+    /// Known-bad (the load-bearing AC): an unknown provider typo MUST hard-fail
+    /// at validation. With the old `Option`-returning parser, `"groq"` would
+    /// silently produce `None`, and the dispatcher would route the task to
+    /// Claude (the silent-fallback footgun). The strict parser surfaces it.
+    #[test]
+    fn test_validate_rejects_unknown_provider_typo() {
+        for bad in ["groq", "openai", "codex-cli", "anthropic"] {
+            let mut by_id = HashMap::new();
+            by_id.insert(
+                "TYPO-".to_string(),
+                RunnerSpec {
+                    provider: bad.to_string(),
+                    model: "some-model".to_string(),
+                    ..Default::default()
+                },
+            );
+            let cfg = ProjectConfig {
+                primary_runner: Some(PrimaryRunnerConfig {
+                    by_id_prefix: by_id,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let err = validate_runner_routing_config(&cfg)
+                .expect_err(&format!("typo {bad:?} must reject"));
+            let msg = format!("{err}");
+            assert!(
+                msg.contains(bad)
+                    && msg.contains("claude")
+                    && msg.contains("grok")
+                    && msg.contains("codex"),
+                "error must name the bad provider {bad:?} AND the allowed set: {msg}",
+            );
+            // Same value must NOT cause a Codex fallback to fire — verifies
+            // the validation hard-fail comes BEFORE any model-based fallback.
+            assert!(
+                !msg.to_ascii_lowercase().contains("blank"),
+                "the typo path must surface the unknown-provider error, not the blank-model rule: {msg}",
+            );
+        }
+    }
+
+    /// CONTRACT: `EffectiveRunnerInput` field names match the struct in
+    /// `engine.rs` exactly — `model` and `provider_hint`. A rename in
+    /// `engine.rs` without a matching rename here (or downstream) would
+    /// break the production drift guard. Grep the engine source rather
+    /// than re-importing so this test cannot be silently weakened by an
+    /// `impl Into` shim.
+    #[test]
+    fn test_effective_runner_input_field_names_in_engine_rs() {
+        let src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/loop_engine/engine.rs"
+        ))
+        .expect("engine.rs must be readable for the CONTRACT check");
+        assert!(
+            src.contains("pub struct EffectiveRunnerInput"),
+            "engine.rs must define `pub struct EffectiveRunnerInput`",
+        );
+        assert!(
+            src.contains("pub model: Option<&'a str>"),
+            "EffectiveRunnerInput::model field name/type must be `pub model: Option<&'a str>`",
+        );
+        assert!(
+            src.contains("pub provider_hint: Option<model::Provider>"),
+            "EffectiveRunnerInput::provider_hint field name/type must be \
+             `pub provider_hint: Option<model::Provider>`",
+        );
+    }
+
+    // ---- write_review_model tests ----
+
+    #[test]
+    fn test_write_review_model_sets_key() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{"version":1,"additionalAllowedTools":["Bash(docker:*)"]}"#,
+        )
+        .unwrap();
+        write_review_model(dir.path(), Some("grok-build")).unwrap();
+        let raw = fs::read_to_string(dir.path().join("config.json")).unwrap();
+        assert!(raw.contains("\"reviewModel\""), "key should be set");
+        assert!(raw.contains("grok-build"), "value should be present");
+        // load-bearing: unrelated key must survive
+        assert!(
+            raw.contains("additionalAllowedTools"),
+            "additionalAllowedTools lost"
+        );
+        assert!(
+            raw.contains("Bash(docker:*)"),
+            "additionalAllowedTools value lost"
+        );
+    }
+
+    #[test]
+    fn test_write_review_model_removes_key_when_none() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{"version":1,"reviewModel":"grok-build"}"#,
+        )
+        .unwrap();
+        write_review_model(dir.path(), None).unwrap();
+        let raw = fs::read_to_string(dir.path().join("config.json")).unwrap();
+        assert!(!raw.contains("reviewModel"), "key should be removed: {raw}");
+    }
+
+    #[test]
+    fn test_write_review_model_none_on_absent_key_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.json"), r#"{"version":1}"#).unwrap();
+        write_review_model(dir.path(), None).unwrap();
+        let raw = fs::read_to_string(dir.path().join("config.json")).unwrap();
+        assert!(
+            !raw.contains("reviewModel"),
+            "key should stay absent: {raw}"
+        );
+    }
+
+    #[test]
+    fn test_write_review_model_creates_file_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        write_review_model(dir.path(), Some("grok-build")).unwrap();
+        let config = read_project_config(dir.path());
+        assert_eq!(config.review_model.as_deref(), Some("grok-build"));
+        let raw = fs::read_to_string(dir.path().join("config.json")).unwrap();
+        assert!(
+            raw.contains("\"version\""),
+            "version key must be present on new file"
+        );
+    }
+
+    #[test]
+    fn test_write_review_model_preserves_all_unrelated_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{"version":1,"additionalAllowedTools":["Bash(docker:*)"],"embeddingModel":"x","ollamaUrl":"http://x","rerankerModel":"m"}"#,
+        )
+        .unwrap();
+        write_review_model(dir.path(), Some("grok-build")).unwrap();
+        let raw = fs::read_to_string(dir.path().join("config.json")).unwrap();
+        assert!(
+            raw.contains("additionalAllowedTools"),
+            "additionalAllowedTools lost"
+        );
+        assert!(
+            raw.contains("Bash(docker:*)"),
+            "additionalAllowedTools value lost"
+        );
+        assert!(raw.contains("embeddingModel"), "embeddingModel lost");
+        assert!(raw.contains("ollamaUrl"), "ollamaUrl lost");
+        assert!(raw.contains("rerankerModel"), "rerankerModel lost");
+        assert!(raw.contains("grok-build"), "reviewModel not set");
+    }
+
+    #[test]
+    fn test_write_review_model_malformed_json_returns_err() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.json"), "not json at all").unwrap();
+        let result = write_review_model(dir.path(), Some("grok-build"));
+        assert!(result.is_err(), "malformed JSON must return Err");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("config.json"),
+            "error must name the file: {msg}"
+        );
+    }
+
+    // ---- write_fallback_runner tests ----
+
+    #[test]
+    fn test_write_fallback_runner_sets_key() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{"version":1,"additionalAllowedTools":["Bash(docker:*)"]}"#,
+        )
+        .unwrap();
+        let cfg = FallbackRunnerConfig {
+            enabled: true,
+            provider: "grok".to_string(),
+            model: "grok-build".to_string(),
+            cli_binary: None,
+            runtime_error_threshold: 2,
+        };
+        write_fallback_runner(dir.path(), Some(&cfg)).unwrap();
+        let raw = fs::read_to_string(dir.path().join("config.json")).unwrap();
+        assert!(raw.contains("\"fallbackRunner\""), "key should be set");
+        assert!(raw.contains("\"enabled\""), "enabled field must be present");
+        // load-bearing: unrelated key must survive
+        assert!(
+            raw.contains("additionalAllowedTools"),
+            "additionalAllowedTools lost"
+        );
+        assert!(
+            raw.contains("Bash(docker:*)"),
+            "additionalAllowedTools value lost"
+        );
+        let config = read_project_config(dir.path());
+        let fr = config
+            .fallback_runner
+            .expect("fallbackRunner should be Some");
+        assert!(fr.enabled);
+        assert_eq!(fr.provider, "grok");
+        assert_eq!(fr.model, "grok-build");
+        assert!(fr.cli_binary.is_none());
+    }
+
+    #[test]
+    fn test_write_fallback_runner_with_cli_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = FallbackRunnerConfig {
+            enabled: true,
+            provider: "grok".to_string(),
+            model: "grok-build".to_string(),
+            cli_binary: Some("/usr/local/bin/grok".to_string()),
+            runtime_error_threshold: 3,
+        };
+        write_fallback_runner(dir.path(), Some(&cfg)).unwrap();
+        let config = read_project_config(dir.path());
+        let fr = config
+            .fallback_runner
+            .expect("fallbackRunner should be Some");
+        assert_eq!(fr.cli_binary.as_deref(), Some("/usr/local/bin/grok"));
+        assert_eq!(fr.runtime_error_threshold, 3);
+    }
+
+    #[test]
+    fn test_write_fallback_runner_removes_key_when_none() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{"version":1,"fallbackRunner":{"enabled":true,"provider":"grok","model":"grok-build","runtimeErrorThreshold":2}}"#,
+        )
+        .unwrap();
+        write_fallback_runner(dir.path(), None).unwrap();
+        let raw = fs::read_to_string(dir.path().join("config.json")).unwrap();
+        assert!(
+            !raw.contains("fallbackRunner"),
+            "key should be removed: {raw}"
+        );
+    }
+
+    #[test]
+    fn test_write_fallback_runner_none_on_absent_key_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.json"), r#"{"version":1}"#).unwrap();
+        write_fallback_runner(dir.path(), None).unwrap();
+        let raw = fs::read_to_string(dir.path().join("config.json")).unwrap();
+        assert!(
+            !raw.contains("fallbackRunner"),
+            "key should stay absent: {raw}"
+        );
+    }
+
+    #[test]
+    fn test_write_fallback_runner_creates_file_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = FallbackRunnerConfig::default();
+        write_fallback_runner(dir.path(), Some(&cfg)).unwrap();
+        let config = read_project_config(dir.path());
+        assert!(
+            config.fallback_runner.is_some(),
+            "fallbackRunner should be set"
+        );
+        let raw = fs::read_to_string(dir.path().join("config.json")).unwrap();
+        assert!(
+            raw.contains("\"version\""),
+            "version key must be present on new file"
+        );
+    }
+
+    #[test]
+    fn test_write_fallback_runner_malformed_json_returns_err() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.json"), "{{bad json").unwrap();
+        let result = write_fallback_runner(dir.path(), Some(&FallbackRunnerConfig::default()));
+        assert!(result.is_err(), "malformed JSON must return Err");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("config.json"),
+            "error must name the file: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_write_fallback_runner_cli_binary_none_not_serialized_as_null() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = FallbackRunnerConfig {
+            enabled: false,
+            provider: "grok".to_string(),
+            model: "grok-build".to_string(),
+            cli_binary: None,
+            runtime_error_threshold: 2,
+        };
+        write_fallback_runner(dir.path(), Some(&cfg)).unwrap();
+        let raw = fs::read_to_string(dir.path().join("config.json")).unwrap();
+        assert!(
+            !raw.contains("\"cliBinary\""),
+            "None cli_binary should be omitted, not null"
+        );
     }
 }

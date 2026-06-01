@@ -609,8 +609,8 @@ fn handle_task_failure_defers_promotion_ctx_writes_until_after_commit() {
         .expect("could not read src/loop_engine/recovery.rs from tests/ cwd");
 
     let start = source
-        .find("pub fn handle_task_failure(")
-        .expect("expected `pub fn handle_task_failure(` to be defined in recovery.rs");
+        .find("pub fn handle_task_failure_with_runner(")
+        .expect("expected `pub fn handle_task_failure_with_runner(` to be defined in recovery.rs");
     // The next top-level definition after handle_task_failure marks the
     // function body end. Use a search past the opening `{` to find the next
     // `\nfn ` or `\npub fn ` or `\npub(crate) fn ` declaration.
@@ -626,7 +626,8 @@ fn handle_task_failure_defers_promotion_ctx_writes_until_after_commit() {
         .expect("expected another top-level fn after handle_task_failure");
     let body = &after_open[..body_end_rel];
 
-    // The body MUST call the deferred-apply pair.
+    // The runner-aware body MUST call the deferred-apply pair. The public
+    // handle_task_failure wrapper delegates to this body with executed_runner=None.
     assert!(
         body.contains("escalate_task_model_if_needed_inner"),
         "handle_task_failure MUST call escalate_task_model_if_needed_inner (the \

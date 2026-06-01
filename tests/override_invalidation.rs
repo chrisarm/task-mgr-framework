@@ -23,7 +23,9 @@ use rusqlite::Connection;
 use tempfile::TempDir;
 
 use task_mgr::db::{create_schema, open_connection, run_migrations};
-use task_mgr::loop_engine::engine::{IterationContext, resolve_effective_runner};
+use task_mgr::loop_engine::engine::{
+    EffectiveRunnerInput, IterationContext, resolve_effective_runner,
+};
 use task_mgr::loop_engine::model::{HAIKU_MODEL, OPUS_MODEL};
 use task_mgr::loop_engine::reactions::pre_spawn::invalidate_stale_overrides;
 use task_mgr::loop_engine::runner::RunnerKind;
@@ -139,7 +141,14 @@ fn post_invalidation_dispatch_uses_operator_model_via_claude() {
     invalidate_stale_overrides(&mut ctx, &conn, "INVAL-DISP-001");
 
     // After clearing, no runner_override exists; haiku is a Claude model.
-    let runner = resolve_effective_runner(&ctx, "INVAL-DISP-001", Some(HAIKU_MODEL));
+    let runner = resolve_effective_runner(
+        &ctx,
+        "INVAL-DISP-001",
+        EffectiveRunnerInput {
+            model: Some(HAIKU_MODEL),
+            provider_hint: None,
+        },
+    );
     assert_eq!(
         runner,
         RunnerKind::Claude,

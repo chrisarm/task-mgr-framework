@@ -66,6 +66,7 @@ pub fn synergy_spec() -> SectionSpec {
 /// automatically benefit from primary-runner routing without a signature change.
 ///
 /// Signature preserved so call sites in `prompt.rs` do not change.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn resolve_synergy_cluster(
     _conn: &Connection,
     task_id: &str,

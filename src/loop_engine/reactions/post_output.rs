@@ -79,6 +79,7 @@ fn select_fallback_target(
                 RunnerKind::Claude,
             ))
         }
+        RunnerKind::Codex => None,
     }
 }
 
@@ -326,6 +327,7 @@ pub fn handle_overflow(params: HandleOverflowParams<'_>) -> RecoveryAction {
             match effective_runner {
                 RunnerKind::Claude => "claude",
                 RunnerKind::Grok => "grok",
+                RunnerKind::Codex => "codex",
             }
             .to_string(),
         ),
