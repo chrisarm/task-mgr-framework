@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::error::{TaskMgrError, TaskMgrResult};
-use crate::loop_engine::model::{Provider, parse_runner_provider};
+use crate::loop_engine::model::{Provider, parse_config_provider};
 
 /// Configuration for the Grok fallback runner (US-005, FR-006).
 ///
@@ -473,20 +473,21 @@ pub fn validate_runner_routing_config(cfg: &ProjectConfig) -> TaskMgrResult<()> 
                     message: "provider must not be blank".to_string(),
                 });
             }
-            let provider = parse_runner_provider(&spec.provider);
-            if spec.model.trim().is_empty() && provider != Some(Provider::Codex) {
+            // Strict parse: surface the error from `parse_config_provider`
+            // (typos like "openai" / "codex-cli" / "groq") so a misspelled
+            // provider hard-fails at validation instead of silently routing
+            // the task to Claude. Returning `Option::None` from a parser is
+            // the exact silent-fallback footgun this branch defends against.
+            let provider = parse_config_provider(&spec.provider).map_err(|message| {
+                TaskMgrError::InvalidConfig {
+                    field: format!("primaryRunner.{map_name}.{key}.provider"),
+                    message,
+                }
+            })?;
+            if spec.model.trim().is_empty() && provider != Provider::Codex {
                 return Err(TaskMgrError::InvalidConfig {
                     field: format!("primaryRunner.{map_name}.{key}.model"),
                     message: "model must not be blank unless provider is codex".to_string(),
-                });
-            }
-            if provider.is_none() {
-                return Err(TaskMgrError::InvalidConfig {
-                    field: format!("primaryRunner.{map_name}.{key}.provider"),
-                    message: format!(
-                        "unknown provider {:?}; expected claude, grok, or codex",
-                        spec.provider
-                    ),
                 });
             }
         }
@@ -510,7 +511,7 @@ pub fn check_codex_runner_binary(primary: Option<&PrimaryRunnerConfig>) -> TaskM
         return Ok(());
     };
     if !primary_runner_specs(primary)
-        .any(|(_, _, spec)| parse_runner_provider(&spec.provider) == Some(Provider::Codex))
+        .any(|(_, _, spec)| parse_config_provider(&spec.provider).ok() == Some(Provider::Codex))
     {
         return Ok(());
     }
@@ -539,7 +540,7 @@ fn primary_runner_specs(
 
 fn primary_runner_contains_codex_review_route(primary: &PrimaryRunnerConfig) -> bool {
     primary_runner_specs(primary).any(|(map_name, key, spec)| {
-        parse_runner_provider(&spec.provider) == Some(Provider::Codex)
+        parse_config_provider(&spec.provider).ok() == Some(Provider::Codex)
             && match map_name {
                 "byTaskType" => {
                     key.eq_ignore_ascii_case("review")
@@ -1584,6 +1585,132 @@ mod tests {
         assert!(
             msg.contains("fallbackRunner.provider") || msg.contains("grok"),
             "error must name fallbackRunner.provider: {msg}"
+        );
+    }
+
+    // ============ FEAT-006: strict provider parser + provider-only Codex ============
+
+    /// AC (positive): the provider-only Codex rule from V2 is preserved —
+    /// `{provider:"codex", model:""}` validates OK. Removing this allowance
+    /// would re-introduce a hand-written model-id that the dispatcher's
+    /// provider-hint routing now makes unnecessary.
+    #[test]
+    fn test_validate_accepts_codex_provider_with_blank_model() {
+        let mut by_type = HashMap::new();
+        by_type.insert(
+            "spike".to_string(),
+            RunnerSpec {
+                provider: "codex".to_string(),
+                model: "".to_string(),
+                ..Default::default()
+            },
+        );
+        let cfg = ProjectConfig {
+            primary_runner: Some(PrimaryRunnerConfig {
+                by_task_type: by_type,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        validate_runner_routing_config(&cfg).expect("codex provider-only must validate");
+    }
+
+    /// AC (negative): a non-Codex route with a blank model is still rejected.
+    /// The Codex allowance must be provider-specific — no quiet widening to
+    /// other providers.
+    #[test]
+    fn test_validate_rejects_claude_provider_with_blank_model() {
+        let mut by_type = HashMap::new();
+        by_type.insert(
+            "review".to_string(),
+            RunnerSpec {
+                provider: "claude".to_string(),
+                model: "".to_string(),
+                ..Default::default()
+            },
+        );
+        let cfg = ProjectConfig {
+            primary_runner: Some(PrimaryRunnerConfig {
+                by_task_type: by_type,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err = validate_runner_routing_config(&cfg).expect_err("blank model must reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("model must not be blank") || msg.contains(".model"),
+            "error must call out the blank-model rule: {msg}",
+        );
+    }
+
+    /// Known-bad (the load-bearing AC): an unknown provider typo MUST hard-fail
+    /// at validation. With the old `Option`-returning parser, `"groq"` would
+    /// silently produce `None`, and the dispatcher would route the task to
+    /// Claude (the silent-fallback footgun). The strict parser surfaces it.
+    #[test]
+    fn test_validate_rejects_unknown_provider_typo() {
+        for bad in ["groq", "openai", "codex-cli", "anthropic"] {
+            let mut by_id = HashMap::new();
+            by_id.insert(
+                "TYPO-".to_string(),
+                RunnerSpec {
+                    provider: bad.to_string(),
+                    model: "some-model".to_string(),
+                    ..Default::default()
+                },
+            );
+            let cfg = ProjectConfig {
+                primary_runner: Some(PrimaryRunnerConfig {
+                    by_id_prefix: by_id,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let err = validate_runner_routing_config(&cfg)
+                .expect_err(&format!("typo {bad:?} must reject"));
+            let msg = format!("{err}");
+            assert!(
+                msg.contains(bad)
+                    && msg.contains("claude")
+                    && msg.contains("grok")
+                    && msg.contains("codex"),
+                "error must name the bad provider {bad:?} AND the allowed set: {msg}",
+            );
+            // Same value must NOT cause a Codex fallback to fire — verifies
+            // the validation hard-fail comes BEFORE any model-based fallback.
+            assert!(
+                !msg.to_ascii_lowercase().contains("blank"),
+                "the typo path must surface the unknown-provider error, not the blank-model rule: {msg}",
+            );
+        }
+    }
+
+    /// CONTRACT: `EffectiveRunnerInput` field names match the struct in
+    /// `engine.rs` exactly — `model` and `provider_hint`. A rename in
+    /// `engine.rs` without a matching rename here (or downstream) would
+    /// break the production drift guard. Grep the engine source rather
+    /// than re-importing so this test cannot be silently weakened by an
+    /// `impl Into` shim.
+    #[test]
+    fn test_effective_runner_input_field_names_in_engine_rs() {
+        let src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/loop_engine/engine.rs"
+        ))
+        .expect("engine.rs must be readable for the CONTRACT check");
+        assert!(
+            src.contains("pub struct EffectiveRunnerInput"),
+            "engine.rs must define `pub struct EffectiveRunnerInput`",
+        );
+        assert!(
+            src.contains("pub model: Option<&'a str>"),
+            "EffectiveRunnerInput::model field name/type must be `pub model: Option<&'a str>`",
+        );
+        assert!(
+            src.contains("pub provider_hint: Option<model::Provider>"),
+            "EffectiveRunnerInput::provider_hint field name/type must be \
+             `pub provider_hint: Option<model::Provider>`",
         );
     }
 }

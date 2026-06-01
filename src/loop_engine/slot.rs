@@ -42,8 +42,8 @@ use crate::loop_engine::config::{self, IterationOutcome, TASKS_JSON_DISALLOWED_T
 use crate::loop_engine::detection;
 use crate::loop_engine::display;
 use crate::loop_engine::engine::{
-    IterationContext, IterationResult, SlotContext, SlotEarlyExit, SlotIterationParams, SlotResult,
-    WaveAggregator, WaveIterationParams, resolve_effective_runner,
+    EffectiveRunnerInput, IterationContext, IterationResult, SlotContext, SlotEarlyExit,
+    SlotIterationParams, SlotResult, WaveAggregator, WaveIterationParams, resolve_effective_runner,
 };
 use crate::loop_engine::iteration_pipeline;
 use crate::loop_engine::model;
@@ -575,7 +575,18 @@ pub(super) fn process_slot_result(
             resolve_effective_runner(
                 ctx,
                 tid,
-                slot_result.iteration_result.effective_model.as_deref()
+                // `provider_hint: None` mirrors the slot's pre-dispatch
+                // resolution path: `slot_result.effective_runner` was set
+                // from the same input (model + None hint) earlier in the
+                // wave, and the drift sentinel re-derives via the same
+                // formula. Carrying a non-None hint here would change the
+                // input and defeat the cross-check. The explicit struct
+                // form is required because the `From<Option<&str>>` impl
+                // is `#[cfg(test)]`-gated and slot.rs is production code.
+                EffectiveRunnerInput {
+                    model: slot_result.iteration_result.effective_model.as_deref(),
+                    provider_hint: None,
+                },
             ),
             effective_runner,
             "effective_runner drift: process_slot_result re-derivation diverged from pre-dispatch value"

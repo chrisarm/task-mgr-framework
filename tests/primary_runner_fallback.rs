@@ -21,7 +21,8 @@ use tempfile::TempDir;
 
 use task_mgr::db::{create_schema, open_connection, run_migrations};
 use task_mgr::loop_engine::engine::{
-    IterationContext, escalate_task_model_if_needed, handle_task_failure, resolve_effective_runner,
+    EffectiveRunnerInput, IterationContext, escalate_task_model_if_needed, handle_task_failure,
+    resolve_effective_runner,
 };
 use task_mgr::loop_engine::model::SONNET_MODEL;
 use task_mgr::loop_engine::project_config::PrimaryRunnerConfig;
@@ -175,13 +176,27 @@ fn after_inverse_promotion_next_iteration_resolves_claude_runner() {
     // Next iteration resolves the runner from the post-promotion DB model.
     let next_model = read_model(&conn, "GROK-NEXT-001");
     assert_eq!(
-        resolve_effective_runner(&ctx, "GROK-NEXT-001", next_model.as_deref()),
+        resolve_effective_runner(
+            &ctx,
+            "GROK-NEXT-001",
+            EffectiveRunnerInput {
+                model: next_model.as_deref(),
+                provider_hint: None,
+            },
+        ),
         RunnerKind::Claude,
         "post-promotion, the task must spawn via ClaudeRunner using claude_fallback_model",
     );
     // The override must win even if the resolver were handed the old Grok id.
     assert_eq!(
-        resolve_effective_runner(&ctx, "GROK-NEXT-001", Some(GROK_MODEL)),
+        resolve_effective_runner(
+            &ctx,
+            "GROK-NEXT-001",
+            EffectiveRunnerInput {
+                model: Some(GROK_MODEL),
+                provider_hint: None,
+            },
+        ),
         RunnerKind::Claude,
         "runner_overrides[id] = Claude must win over a stale Grok model id",
     );

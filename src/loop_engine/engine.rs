@@ -356,24 +356,31 @@ impl IterationContext {
     }
 }
 
-/// Compute the effective runner for a task: per-task override → provider of
-/// the effective model → default Claude.
+/// Explicit input to [`resolve_effective_runner`].
 ///
-/// Single source of truth (PRD §2.5): every spawn site MUST resolve runner
-/// kind through this helper, never via an OR-style fallback. Re-deriving
-/// the formula independently in two places risks silent drift if either
-/// branch updates without the other (the prohibition is explicit in the
-/// PRD "Prohibited outcomes" list).
+/// Carries both the effective model string AND the optional `provider_hint`
+/// that flowed from a `primaryRunner` spec match (see
+/// [`model::resolve_task_execution_target`]). Production callers MUST
+/// construct this struct explicitly so a missed-thread (model-only) call
+/// site is a compile-time error rather than a silent Codex→Claude misroute.
 ///
-/// The helper lives in `engine.rs` (not `runner.rs`) so `runner.rs` stays
-/// free of `IterationContext` coupling — the runner module remains
-/// provider-neutral.
+/// The `From<Option<&str>>` ergonomic conversion (`provider_hint = None`) is
+/// `#[cfg(test)]`-gated so tests can stay terse without weakening the
+/// production drift guard. Integration tests in the `tests/` crate cannot
+/// see `#[cfg(test)]` items in the library and must construct the struct
+/// explicitly.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EffectiveRunnerInput<'a> {
+    /// The final model string after escalation / overrides / review-class
+    /// routing — the same string that flows into `--model` at the spawn site.
     pub model: Option<&'a str>,
+    /// Explicit provider intent carried from a `primaryRunner` spec match.
+    /// `Some(Provider::Codex)` is today the ONLY way Codex is reached.
+    /// `None` means "let `provider_for_model(model)` decide".
     pub provider_hint: Option<model::Provider>,
 }
 
+#[cfg(test)]
 impl<'a> From<Option<&'a str>> for EffectiveRunnerInput<'a> {
     fn from(model: Option<&'a str>) -> Self {
         Self {
@@ -383,26 +390,52 @@ impl<'a> From<Option<&'a str>> for EffectiveRunnerInput<'a> {
     }
 }
 
-pub fn resolve_effective_runner<'a>(
+/// Compute the effective runner for a task: per-task override →
+/// `provider_hint` → provider of the effective model → default Claude.
+///
+/// Single source of truth (PRD §2.5): every spawn site MUST resolve runner
+/// kind through this helper, never via an OR-style fallback. Re-deriving
+/// the formula independently in two places risks silent drift if either
+/// branch updates without the other (the prohibition is explicit in the
+/// PRD "Prohibited outcomes" list).
+///
+/// Resolution order (highest → lowest precedence):
+/// 1. `ctx.runner_overrides[task_id]` — auto-recovery promotion.
+/// 2. `input.provider_hint` — explicit `primaryRunner` intent. **This is the
+///    only path that selects [`RunnerKind::Codex`].**
+/// 3. `provider_for_model(input.model)` — token-equality classification on the
+///    lowercased, hyphen-split model id. Returns only Claude or Grok by
+///    design — a `gpt-*`/`o*`/`codex` model id falls through to Claude
+///    unless rung 2 already carried a hint.
+/// 4. `RunnerKind::Claude` — default for the empty case.
+///
+/// The helper lives in `engine.rs` (not `runner.rs`) so `runner.rs` stays
+/// free of `IterationContext` coupling — the runner module remains
+/// provider-neutral.
+///
+/// The third parameter is `EffectiveRunnerInput<'_>` rather than
+/// `impl Into<...>` to make a bare-`Option<&str>` call site a compile error
+/// in production — that gap is the silent Codex→Claude misroute vector we
+/// defend against (a caller that forgot to thread `provider_hint` would
+/// otherwise compile and silently degrade to Claude for a Codex-routed task).
+pub fn resolve_effective_runner(
     ctx: &IterationContext,
     task_id: &str,
-    input: impl Into<EffectiveRunnerInput<'a>>,
+    input: EffectiveRunnerInput<'_>,
 ) -> RunnerKind {
-    let input = input.into();
-    ctx.runner_overrides
-        .get(task_id)
-        .copied()
-        // kind-correct: identity translation — maps Provider enum to RunnerKind, two representations of the same provider concept
-        .unwrap_or_else(|| {
-            match input
-                .provider_hint
-                .unwrap_or_else(|| model::provider_for_model(input.model))
-            {
-                model::Provider::Grok => RunnerKind::Grok,
-                model::Provider::Codex => RunnerKind::Codex,
-                model::Provider::Claude => RunnerKind::Claude,
-            }
-        })
+    if let Some(kind) = ctx.runner_overrides.get(task_id).copied() {
+        return kind;
+    }
+    let provider = input
+        .provider_hint
+        .unwrap_or_else(|| model::provider_for_model(input.model));
+    // kind-correct: identity translation — maps Provider enum to RunnerKind,
+    // two representations of the same provider concept.
+    match provider {
+        model::Provider::Grok => RunnerKind::Grok,
+        model::Provider::Codex => RunnerKind::Codex,
+        model::Provider::Claude => RunnerKind::Claude,
+    }
 }
 
 /// Compute the `reviewModel` routing override for a single task.
@@ -987,7 +1020,7 @@ mod tests {
     fn feat_005_default_empty_ctx_with_no_model_resolves_to_claude() {
         let ctx = IterationContext::new(8);
         assert_eq!(
-            resolve_effective_runner(&ctx, "ANY-TASK-001", None),
+            resolve_effective_runner(&ctx, "ANY-TASK-001", None.into()),
             RunnerKind::Claude,
             "default-empty IterationContext with effective_model=None MUST \
              default to ClaudeRunner — preserves pre-FEAT-005 behavior",
@@ -999,7 +1032,7 @@ mod tests {
         let ctx = IterationContext::new(8);
         for model in &[OPUS_MODEL, SONNET_MODEL, HAIKU_MODEL] {
             assert_eq!(
-                resolve_effective_runner(&ctx, "TASK-001", Some(*model)),
+                resolve_effective_runner(&ctx, "TASK-001", Some(*model).into()),
                 RunnerKind::Claude,
                 "Claude model {model} with empty runner_overrides MUST resolve to Claude",
             );
@@ -1011,7 +1044,7 @@ mod tests {
         let ctx = IterationContext::new(8);
         // Token-equality on `-` splits — `grok-build` has token `grok`.
         assert_eq!(
-            resolve_effective_runner(&ctx, "TASK-001", Some("grok-build")),
+            resolve_effective_runner(&ctx, "TASK-001", Some("grok-build").into()),
             RunnerKind::Grok,
             "Grok model with empty runner_overrides MUST resolve to Grok via \
              provider_for_model token-equality",
@@ -1020,7 +1053,7 @@ mod tests {
         // would catch `groq-llama-3` because `grok` is a substring of `groq`;
         // token-equality correctly rejects it.
         assert_eq!(
-            resolve_effective_runner(&ctx, "TASK-001", Some("groq-llama-3")),
+            resolve_effective_runner(&ctx, "TASK-001", Some("groq-llama-3").into()),
             RunnerKind::Claude,
             "Groq Inc. model (different vendor) MUST NOT mis-route to Grok",
         );
@@ -1042,7 +1075,7 @@ mod tests {
             "explicit primaryRunner provider intent must route to Codex even when no model is set",
         );
         assert_eq!(
-            resolve_effective_runner(&ctx, "TASK-CODEX", Some("codex-mini-latest")),
+            resolve_effective_runner(&ctx, "TASK-CODEX", Some("codex-mini-latest").into()),
             RunnerKind::Claude,
             "Codex-looking model strings must not auto-route to Codex without provider intent",
         );
@@ -1055,14 +1088,14 @@ mod tests {
             .insert("TASK-PINNED".to_string(), RunnerKind::Grok);
         // Model says Claude (Opus), but the override pins to Grok — override wins.
         assert_eq!(
-            resolve_effective_runner(&ctx, "TASK-PINNED", Some(OPUS_MODEL)),
+            resolve_effective_runner(&ctx, "TASK-PINNED", Some(OPUS_MODEL).into()),
             RunnerKind::Grok,
             "explicit runner_overrides entry MUST win over the model-derived \
              provider — that's how FEAT-007/FEAT-008 pin a task post-fallback",
         );
         // A different task with no override falls through to the model's provider.
         assert_eq!(
-            resolve_effective_runner(&ctx, "TASK-OTHER", Some(OPUS_MODEL)),
+            resolve_effective_runner(&ctx, "TASK-OTHER", Some(OPUS_MODEL).into()),
             RunnerKind::Claude,
             "other tasks without overrides MUST still resolve via the model",
         );
@@ -1187,7 +1220,7 @@ mod tests {
         let effective_model = apply_review_model_override(Some("grok-build"), task_id);
         assert_eq!(effective_model.as_deref(), Some("grok-build"));
         assert_eq!(
-            resolve_effective_runner(&ctx, task_id, effective_model.as_deref()),
+            resolve_effective_runner(&ctx, task_id, effective_model.as_deref().into()),
             RunnerKind::Grok,
         );
     }
@@ -1204,7 +1237,7 @@ mod tests {
         // Caller keeps the baked-in model — here, Opus.
         let effective_model = override_model.or(Some(OPUS_MODEL.to_string()));
         assert_eq!(
-            resolve_effective_runner(&ctx, task_id, effective_model.as_deref()),
+            resolve_effective_runner(&ctx, task_id, effective_model.as_deref().into()),
             RunnerKind::Claude,
         );
     }

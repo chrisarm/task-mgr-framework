@@ -24,7 +24,9 @@
 
 use std::collections::HashMap;
 
-use task_mgr::loop_engine::engine::{IterationContext, resolve_effective_runner};
+use task_mgr::loop_engine::engine::{
+    EffectiveRunnerInput, IterationContext, resolve_effective_runner,
+};
 use task_mgr::loop_engine::model::{
     ModelResolutionContext, OPUS_MODEL, SONNET_MODEL, resolve_task_model,
 };
@@ -301,7 +303,14 @@ fn end_to_end_primary_runner_matched_task_resolves_grok_runner() {
     );
 
     // Step 2: runner resolution (what the loop's dispatch site does).
-    let runner = resolve_effective_runner(&ctx, "8d71d1f7-REVIEW-001", effective_model.as_deref());
+    let runner = resolve_effective_runner(
+        &ctx,
+        "8d71d1f7-REVIEW-001",
+        EffectiveRunnerInput {
+            model: effective_model.as_deref(),
+            provider_hint: None,
+        },
+    );
     assert_eq!(
         runner,
         RunnerKind::Grok,
@@ -317,7 +326,14 @@ fn end_to_end_primary_runner_matched_task_resolves_grok_runner() {
         project_default: Some(SONNET_MODEL),
         ..Default::default()
     });
-    let feat_runner = resolve_effective_runner(&ctx, "8d71d1f7-FEAT-001", feat_model.as_deref());
+    let feat_runner = resolve_effective_runner(
+        &ctx,
+        "8d71d1f7-FEAT-001",
+        EffectiveRunnerInput {
+            model: feat_model.as_deref(),
+            provider_hint: None,
+        },
+    );
     assert_eq!(
         feat_runner,
         RunnerKind::Claude,

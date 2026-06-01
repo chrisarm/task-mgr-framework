@@ -28,7 +28,7 @@ use tempfile::TempDir;
 use task_mgr::db::{create_schema, open_connection, run_migrations};
 use task_mgr::loop_engine::config::PermissionMode;
 use task_mgr::loop_engine::engine::{
-    IterationContext, apply_review_model_override, resolve_effective_runner,
+    EffectiveRunnerInput, IterationContext, apply_review_model_override, resolve_effective_runner,
 };
 use task_mgr::loop_engine::model::OPUS_MODEL;
 use task_mgr::loop_engine::prompt::slot::{SlotPromptParams, build_prompt};
@@ -60,7 +60,14 @@ fn sequential_review_class_routes_to_grok_build() {
              when reviewModel is grok-build — same string flows to the `--model` flag",
         );
         assert_eq!(
-            resolve_effective_runner(&ctx, task_id, effective_model.as_deref()),
+            resolve_effective_runner(
+                &ctx,
+                task_id,
+                EffectiveRunnerInput {
+                    model: effective_model.as_deref(),
+                    provider_hint: None,
+                },
+            ),
             RunnerKind::Grok,
             "review-class id {task_id} resolves to RunnerKind::Grok via \
              provider_for_model token-equality",
@@ -82,7 +89,14 @@ fn sequential_review_model_unset_leaves_review_task_on_baked_model() {
     );
     let effective_model = override_model.or(Some(OPUS_MODEL.to_string()));
     assert_eq!(
-        resolve_effective_runner(&ctx, task_id, effective_model.as_deref()),
+        resolve_effective_runner(
+            &ctx,
+            task_id,
+            EffectiveRunnerInput {
+                model: effective_model.as_deref(),
+                provider_hint: None,
+            },
+        ),
         RunnerKind::Claude,
         "without reviewModel, review-class tasks stay on Claude (Opus by default)",
     );
@@ -113,7 +127,14 @@ fn non_review_tasks_are_not_routed_when_review_model_is_set() {
         let effective_model = apply_review_model_override(Some("grok-build"), task_id)
             .or(Some(OPUS_MODEL.to_string()));
         assert_eq!(
-            resolve_effective_runner(&ctx, task_id, effective_model.as_deref()),
+            resolve_effective_runner(
+                &ctx,
+                task_id,
+                EffectiveRunnerInput {
+                    model: effective_model.as_deref(),
+                    provider_hint: None,
+                },
+            ),
             RunnerKind::Claude,
             "non-review {task_id} stays on Claude runner",
         );
@@ -204,7 +225,14 @@ fn wave_review_class_slot_bundle_resolved_model_is_rewritten_to_grok_build() {
     // And resolving the runner from this same string picks Grok.
     let ctx = IterationContext::new(8);
     assert_eq!(
-        resolve_effective_runner(&ctx, &bundle.task_id, bundle.resolved_model.as_deref()),
+        resolve_effective_runner(
+            &ctx,
+            &bundle.task_id,
+            EffectiveRunnerInput {
+                model: bundle.resolved_model.as_deref(),
+                provider_hint: None,
+            },
+        ),
         RunnerKind::Grok,
         "with the bundle rewritten, the wave loop's resolve_effective_runner \
          step selects RunnerKind::Grok",

@@ -21,7 +21,9 @@
 use rusqlite::Connection;
 use tempfile::TempDir;
 
-use task_mgr::loop_engine::engine::{IterationContext, resolve_effective_runner};
+use task_mgr::loop_engine::engine::{
+    EffectiveRunnerInput, IterationContext, resolve_effective_runner,
+};
 use task_mgr::loop_engine::model::{OPUS_MODEL_1M, SONNET_MODEL};
 use task_mgr::loop_engine::overflow::RecoveryAction;
 use task_mgr::loop_engine::project_config::{
@@ -364,7 +366,14 @@ fn after_inverse_overflow_fallback_next_iteration_resolves_claude_runner() {
     // runner_overrides takes precedence over both the db_model and any stale
     // Grok model string we might pass in (guards against a silent drift where
     // the caller re-reads the stale model before the DB write is visible).
-    let runner_from_db_model = resolve_effective_runner(&ctx, task_id, db_model.as_deref());
+    let runner_from_db_model = resolve_effective_runner(
+        &ctx,
+        task_id,
+        EffectiveRunnerInput {
+            model: db_model.as_deref(),
+            provider_hint: None,
+        },
+    );
     assert_eq!(
         runner_from_db_model,
         RunnerKind::Claude,
@@ -373,7 +382,14 @@ fn after_inverse_overflow_fallback_next_iteration_resolves_claude_runner() {
     );
 
     // Stale Grok model id must not pull the task back to Grok.
-    let runner_from_stale_grok = resolve_effective_runner(&ctx, task_id, Some(GROK_MODEL));
+    let runner_from_stale_grok = resolve_effective_runner(
+        &ctx,
+        task_id,
+        EffectiveRunnerInput {
+            model: Some(GROK_MODEL),
+            provider_hint: None,
+        },
+    );
     assert_eq!(
         runner_from_stale_grok,
         RunnerKind::Claude,
@@ -382,7 +398,14 @@ fn after_inverse_overflow_fallback_next_iteration_resolves_claude_runner() {
     );
 
     // Also verify against the 1M-context Claude model if it were somehow in play.
-    let runner_from_opus_1m = resolve_effective_runner(&ctx, task_id, Some(OPUS_MODEL_1M));
+    let runner_from_opus_1m = resolve_effective_runner(
+        &ctx,
+        task_id,
+        EffectiveRunnerInput {
+            model: Some(OPUS_MODEL_1M),
+            provider_hint: None,
+        },
+    );
     assert_eq!(
         runner_from_opus_1m,
         RunnerKind::Claude,

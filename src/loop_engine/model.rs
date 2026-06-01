@@ -71,12 +71,27 @@ impl Provider {
 }
 
 /// Parse a provider name from runner-routing config.
-pub fn parse_runner_provider(provider: &str) -> Option<Provider> {
-    match provider.trim().to_ascii_lowercase().as_str() {
-        "claude" => Some(Provider::Claude),
-        "grok" => Some(Provider::Grok),
-        "codex" => Some(Provider::Codex),
-        _ => None,
+///
+/// Strict, returns [`Result`] so that a typo or vendor look-alike
+/// (`"openai"`, `"codex-cli"`, `"groq"`) produces a CONFIG ERROR at
+/// validation time rather than a silent fall-through to Claude. Re-implementing
+/// the mapping at another site risks accepting a substring like `"groq"` for
+/// Grok or `"openai"` for Codex — keep all callers funneling through here.
+///
+/// # Contract
+///
+/// The accepted set is the exact set of values [`Provider::as_str`] returns,
+/// so a `Provider` round-trips through `as_str → parse_config_provider`
+/// unchanged. Whitespace and case are normalized before matching.
+pub fn parse_config_provider(s: &str) -> Result<Provider, String> {
+    let trimmed = s.trim();
+    match trimmed.to_ascii_lowercase().as_str() {
+        "claude" => Ok(Provider::Claude),
+        "grok" => Ok(Provider::Grok),
+        "codex" => Ok(Provider::Codex),
+        _ => Err(format!(
+            "unknown provider {trimmed:?} (expected one of: claude, grok, codex)"
+        )),
     }
 }
 
@@ -370,7 +385,13 @@ pub fn resolve_task_execution_target(ctx: &ModelResolutionContext<'_>) -> Resolv
     {
         return ResolvedExecutionTarget {
             model: normalize(Some(&spec.model)).map(str::to_string),
-            provider_hint: parse_runner_provider(&spec.provider),
+            // Config validation rejects unknown providers up-front via
+            // `parse_config_provider`, so by the time we reach the
+            // dispatcher a malformed string would have already exited
+            // with an error. `.ok()` here means "if we somehow got past
+            // validation with a malformed provider, leave the hint empty
+            // and let `provider_for_model` classify" — a safe degrade.
+            provider_hint: parse_config_provider(&spec.provider).ok(),
         };
     }
     // Rung 3: difficulty=high forces OPUS_MODEL.
@@ -1771,5 +1792,64 @@ mod tests {
     #[test]
     fn test_escalate_below_opus_none_returns_none() {
         assert_eq!(escalate_below_opus(None), None);
+    }
+
+    // ============ parse_config_provider tests (FEAT-006) ============
+    //
+    // Hard-fails on unknown providers so a config typo (`"openai"`,
+    // `"codex-cli"`, `"groq"`) surfaces as a validation error instead of
+    // silently routing the task to Claude. The "Known-bad" AC: an
+    // Option-returning parser silently routes a typo to Claude — these
+    // tests assert the typo produces an Err.
+
+    #[test]
+    fn test_parse_config_provider_canonical_lowercase() {
+        assert_eq!(parse_config_provider("claude"), Ok(Provider::Claude));
+        assert_eq!(parse_config_provider("grok"), Ok(Provider::Grok));
+        assert_eq!(parse_config_provider("codex"), Ok(Provider::Codex));
+    }
+
+    #[test]
+    fn test_parse_config_provider_trim_and_case_insensitive() {
+        assert_eq!(parse_config_provider("  CODEX "), Ok(Provider::Codex));
+        assert_eq!(parse_config_provider("\tGrok\n"), Ok(Provider::Grok));
+        assert_eq!(parse_config_provider("CLAUDE"), Ok(Provider::Claude));
+        assert_eq!(parse_config_provider("CoDeX"), Ok(Provider::Codex));
+    }
+
+    #[test]
+    fn test_parse_config_provider_rejects_lookalikes_and_unknowns() {
+        // Vendor look-alikes that an Option-returning parser would silently
+        // drop to None (and therefore route to Claude). The strict variant
+        // surfaces the error.
+        assert!(parse_config_provider("openai").is_err());
+        assert!(parse_config_provider("codex-cli").is_err());
+        assert!(parse_config_provider("groq").is_err()); // Groq Inc. ≠ xAI Grok
+        assert!(parse_config_provider("anthropic").is_err());
+        assert!(parse_config_provider("gpt").is_err());
+        assert!(parse_config_provider("").is_err());
+        assert!(parse_config_provider("   ").is_err());
+        let err = parse_config_provider("openai").unwrap_err();
+        assert!(
+            err.contains("openai")
+                && err.contains("claude")
+                && err.contains("grok")
+                && err.contains("codex"),
+            "error message must name the rejected value and the allowed set: {err:?}",
+        );
+    }
+
+    #[test]
+    fn test_parse_config_provider_round_trips_through_as_str() {
+        // Contract: every Provider value round-trips losslessly through
+        // `as_str → parse_config_provider`. The accepted set is EXACTLY the
+        // `as_str` image.
+        for p in [Provider::Claude, Provider::Grok, Provider::Codex] {
+            assert_eq!(
+                parse_config_provider(p.as_str()),
+                Ok(p),
+                "round-trip through as_str → parse_config_provider must be lossless for {p:?}",
+            );
+        }
     }
 }

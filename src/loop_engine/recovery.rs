@@ -146,8 +146,16 @@ pub(crate) fn escalate_task_model_if_needed_inner(
         conn.query_row("SELECT model FROM tasks WHERE id = ?", [task_id], |r| {
             r.get::<_, Option<String>>(0)
         })?;
-    let effective_runner = executed_runner
-        .unwrap_or_else(|| resolve_effective_runner(ctx, task_id, current_model.as_deref()));
+    let effective_runner = executed_runner.unwrap_or_else(|| {
+        resolve_effective_runner(
+            ctx,
+            task_id,
+            crate::loop_engine::engine::EffectiveRunnerInput {
+                model: current_model.as_deref(),
+                provider_hint: None,
+            },
+        )
+    });
     if effective_runner == RunnerKind::Codex {
         // FEAT-005: opt-in Codex→Claude fallback on RUNTIME failure. Auth
         // failures (CodexAuthFailure) never reach `handle_task_failure` (the
@@ -302,7 +310,7 @@ fn maybe_codex_fallback_to_claude(
     ctx: &IterationContext,
     primary_cfg: Option<&project_config::PrimaryRunnerConfig>,
 ) -> TaskMgrResult<(Option<String>, Option<PendingPromotion>)> {
-    use crate::loop_engine::model::{Provider, parse_runner_provider, primary_runner_match};
+    use crate::loop_engine::model::{Provider, parse_config_provider, primary_runner_match};
 
     if ctx.runner_overrides.contains_key(task_id) {
         return Ok((None, None));
@@ -324,7 +332,7 @@ fn maybe_codex_fallback_to_claude(
     // Guard against misconfiguration: the field is only meaningful on Codex
     // routes. Treating a Grok/Claude route with `fallbackToClaude:true` as a
     // promotion trigger would silently override the existing fallback paths.
-    if parse_runner_provider(&spec.provider) != Some(Provider::Codex) {
+    if parse_config_provider(&spec.provider).ok() != Some(Provider::Codex) {
         return Ok((None, None));
     }
 
