@@ -581,7 +581,7 @@
       "description": "src/loop_engine/protected_state.rs module rustdoc is fundamentally honest on load-bearing concerns (detect-and-revert not prevent, WHY via the Codex sandbox shape, no byte-restore on SQLite WAL/SHM trio). Two PARTIAL gaps: (D) the TOCTOU window note at L6 is terse — it says 'TOCTOU between snapshot and verify is inherent' but doesn't unpack the practical consequence: any reader observing the worktree DURING the Codex run sees mutated state, and mutations landing AFTER verify but BEFORE the next snapshot are not attributable to a guarded run. (E) the 'Escape protection' section covers symlink-swap defenses positively but does NOT mention the documented fail-open at walk_protected (~lines 540-564): an EACCES on canonicalize() (e.g. Codex chmod 000 on a subdir) emits a tracing::warn! and skips descent, so planted files beneath an unreadable directory escape new-file detection (dev/inode/content checks on snapshotted files still fire). A future maintainer reading only the module header would believe containment is absolute. FIX: append ~3-4 sentences to the module-level rustdoc covering both gaps. Do NOT rewrite existing prose; do NOT relax any contract; just document what is already in code.",
       "estimatedEffort": "low",
       "id": "REFACTOR-FIX-002",
-      "passes": false,
+      "passes": true,
       "priority": 55,
       "title": "Tighten protected_state.rs rustdoc on TOCTOU window and walk_protected fail-open",
       "touchesFiles": [
