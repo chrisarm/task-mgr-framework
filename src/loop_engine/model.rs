@@ -34,8 +34,8 @@
 use crate::loop_engine::project_config::{PrimaryRunnerConfig, RunnerSpec};
 
 /// Well-known model identifiers.
-pub const OPUS_MODEL: &str = "claude-opus-4-7";
-pub const OPUS_MODEL_1M: &str = "claude-opus-4-7[1m]";
+pub const OPUS_MODEL: &str = "claude-opus-4-8";
+pub const OPUS_MODEL_1M: &str = "claude-opus-4-8[1m]";
 pub const SONNET_MODEL: &str = "claude-sonnet-4-6";
 pub const HAIKU_MODEL: &str = "claude-haiku-4-5-20251001";
 
