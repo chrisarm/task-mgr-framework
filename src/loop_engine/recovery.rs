@@ -1713,7 +1713,7 @@ mod tests {
             task_id,
             new_count,
             ctx,
-            Some(RunnerKind::Codex),
+            RunnerKind::Codex,
             None,
             primary_cfg,
         )
@@ -1878,7 +1878,7 @@ mod tests {
             "SPIKE-006",
             2,
             &ctx,
-            Some(RunnerKind::Codex),
+            RunnerKind::Codex,
             None,
             None,
         )
@@ -1927,7 +1927,7 @@ mod tests {
             "SPIKE-007",
             2,
             &ctx,
-            Some(RunnerKind::Codex),
+            RunnerKind::Codex,
             None,
             Some(&cfg),
         )
@@ -1958,7 +1958,7 @@ mod tests {
             "SPIKE-008",
             3,
             &ctx,
-            Some(RunnerKind::Codex),
+            RunnerKind::Codex,
             None,
             Some(&cfg),
         )

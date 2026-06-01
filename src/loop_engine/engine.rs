@@ -566,6 +566,13 @@ pub struct SlotResult {
     /// rule). Defaults to `RunnerKind::Claude` for failure entries where no
     /// slot was actually dispatched.
     pub effective_runner: RunnerKind,
+    /// Provider hint carried from `SlotPromptBundle::provider_hint` at the
+    /// moment `SlotContext::effective_runner` was resolved on the main thread.
+    /// Used by the drift-sentinel re-derivation in `process_slot_result` so
+    /// the sentinel re-derives via the SAME formula the wave used — not the
+    /// bugged formula that dropped the hint when `defaultModel` widened
+    /// `resolved_model`. `None` for `slot_failure_result` entries (no bundle).
+    pub pre_dispatch_provider_hint: Option<model::Provider>,
 }
 
 /// Aggregate result of a parallel wave.

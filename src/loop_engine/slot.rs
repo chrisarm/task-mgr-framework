@@ -87,6 +87,7 @@ fn slot_early_exit(slot: &SlotContext, exit: SlotEarlyExit) -> SlotResult {
         dropped_sections: slot.prompt_bundle.dropped_sections.clone(),
         task_difficulty: slot.prompt_bundle.difficulty.clone(),
         effective_runner: slot.effective_runner,
+        pre_dispatch_provider_hint: slot.prompt_bundle.provider_hint,
     }
 }
 
@@ -403,6 +404,7 @@ pub fn run_slot_iteration(
         dropped_sections: bundle.dropped_sections.clone(),
         task_difficulty: bundle.difficulty.clone(),
         effective_runner: slot.effective_runner,
+        pre_dispatch_provider_hint: bundle.provider_hint,
     })
 }
 
@@ -480,6 +482,7 @@ pub(super) fn slot_failure_result(
         dropped_sections: Vec::new(),
         task_difficulty: None,
         effective_runner: RunnerKind::Claude, // kind-correct: sentinel default; main-thread enrichment overwrites with resolved provider before slot spawn
+        pre_dispatch_provider_hint: None,
     }
 }
 
@@ -575,17 +578,15 @@ pub(super) fn process_slot_result(
             resolve_effective_runner(
                 ctx,
                 tid,
-                // `provider_hint: None` mirrors the slot's pre-dispatch
-                // resolution path: `slot_result.effective_runner` was set
-                // from the same input (model + None hint) earlier in the
-                // wave, and the drift sentinel re-derives via the same
-                // formula. Carrying a non-None hint here would change the
-                // input and defeat the cross-check. The explicit struct
-                // form is required because the `From<Option<&str>>` impl
-                // is `#[cfg(test)]`-gated and slot.rs is production code.
+                // Thread the pre-dispatch provider_hint so the sentinel
+                // re-derives via the SAME formula the wave used. Before
+                // WIRE-FIX-001 the wave dropped the hint when defaultModel
+                // widened resolved_model, so `None` was correct then;
+                // after the fix the wave always carries the bundle's hint,
+                // and the sentinel must match.
                 EffectiveRunnerInput {
                     model: slot_result.iteration_result.effective_model.as_deref(),
-                    provider_hint: None,
+                    provider_hint: slot_result.pre_dispatch_provider_hint,
                 },
             ),
             effective_runner,
@@ -823,6 +824,7 @@ mod tests {
             dropped_sections: Vec::new(),
             task_difficulty: None,
             effective_runner: RunnerKind::Claude,
+            pre_dispatch_provider_hint: None,
         };
         assert_eq!(sr.slot_index, 1);
         assert!(matches!(

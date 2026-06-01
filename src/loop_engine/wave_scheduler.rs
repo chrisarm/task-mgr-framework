@@ -1162,16 +1162,20 @@ pub fn run_wave_iteration(
         // baseline, so this re-resolution is the authoritative spawn
         // discriminant — identical in shape to the sequential path's single
         // `resolve_effective_runner` at the end of its pre-spawn block.
+        //
+        // `effective_model` widens to `default_model` when `resolved_model`
+        // is None (provider-only Codex spec: {provider:"codex",model:""}
+        // normalises to resolved_model=None). The hint MUST NOT be dropped
+        // based on this widening — crash escalation (line 1124) and review
+        // routing (line 1157) already clear `slot.prompt_bundle.provider_hint`
+        // when a rewrite fires. Any remaining hint is intentional provider
+        // intent that must survive to the spawn boundary (WIRE-FIX-001).
         let effective_model = slot
             .prompt_bundle
             .resolved_model
             .as_deref()
             .or(params.default_model);
-        let provider_hint = if effective_model == slot.prompt_bundle.resolved_model.as_deref() {
-            slot.prompt_bundle.provider_hint
-        } else {
-            None
-        };
+        let provider_hint = slot.prompt_bundle.provider_hint;
         slot.effective_runner = resolve_effective_runner(
             ctx,
             &task_id,

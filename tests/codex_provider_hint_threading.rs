@@ -17,7 +17,9 @@ use std::collections::HashMap;
 use task_mgr::loop_engine::engine::{
     EffectiveRunnerInput, IterationContext, apply_review_model_override, resolve_effective_runner,
 };
-use task_mgr::loop_engine::model::{self, ModelResolutionContext, resolve_task_execution_target};
+use task_mgr::loop_engine::model::{
+    self, ModelResolutionContext, SONNET_MODEL, resolve_task_execution_target,
+};
 use task_mgr::loop_engine::project_config::{PrimaryRunnerConfig, RunnerSpec};
 use task_mgr::loop_engine::runner::RunnerKind;
 
@@ -259,5 +261,96 @@ fn non_review_task_keeps_hint_even_with_review_model_config() {
         runner,
         RunnerKind::Codex,
         "non-review tasks MUST preserve the cluster's provider_hint regardless of reviewModel config"
+    );
+}
+
+/// WIRE-FIX-001 regression: provider-only Codex spec {provider:"codex", model:""}
+/// with a project defaultModel set MUST route to RunnerKind::Codex in BOTH
+/// sequential and wave formulas.
+///
+/// Root cause: the wave widened `resolved_model=None` → `defaultModel` then
+/// dropped `provider_hint` on the equality mismatch. Sequential path never
+/// widened with defaultModel, so it kept the hint. This test pins both formulas
+/// to the same RunnerKind::Codex result.
+#[test]
+fn provider_only_codex_with_default_model_routes_to_codex_in_both_paths() {
+    let ctx = IterationContext::new(8);
+
+    // Provider-only Codex spec: model="" normalises to None in resolve_task_execution_target.
+    let mut by_task_type = HashMap::new();
+    by_task_type.insert(
+        "spike".to_string(),
+        RunnerSpec {
+            provider: "codex".to_string(),
+            model: String::new(), // v1-blessed provider-only shape
+            fallback_to_claude: false,
+        },
+    );
+    let cfg = PrimaryRunnerConfig {
+        by_task_type,
+        ..Default::default()
+    };
+
+    let task_id = "SPIKE-001";
+
+    // resolve_task_execution_target: model="" normalises to None, hint=Some(Codex).
+    // task_type="spike" is required so byTaskType lookup can match.
+    let target = resolve_task_execution_target(&ModelResolutionContext {
+        task_id: Some(task_id),
+        task_type: Some("spike"),
+        primary_runner: Some(&cfg),
+        project_default: Some(SONNET_MODEL),
+        ..Default::default()
+    });
+    assert_eq!(
+        target.model, None,
+        "empty model string must normalise to None"
+    );
+    assert_eq!(
+        target.provider_hint,
+        Some(model::Provider::Codex),
+        "provider-only Codex spec must emit Some(Codex) hint"
+    );
+
+    // Sequential formula: effective_model starts from resolved_model (None),
+    // no crash escalation or review override fires → hint preserved, routes Codex.
+    let seq_effective_model = target.model.clone(); // None
+    let seq_hint = target.provider_hint; // Some(Codex)
+    let seq_runner = resolve_effective_runner(
+        &ctx,
+        task_id,
+        EffectiveRunnerInput {
+            model: seq_effective_model.as_deref(),
+            provider_hint: seq_hint,
+        },
+    );
+
+    // Wave formula (WIRE-FIX-001): effective_model widened to defaultModel, but
+    // hint MUST be preserved (not dropped on the mismatch). The fix: always carry
+    // slot.prompt_bundle.provider_hint regardless of the widening.
+    let wave_effective_model = target.model.as_deref().or(Some(SONNET_MODEL)); // None → Some(SONNET_MODEL)
+    let wave_hint = target.provider_hint; // Some(Codex) — not dropped by widening
+    let wave_runner = resolve_effective_runner(
+        &ctx,
+        task_id,
+        EffectiveRunnerInput {
+            model: wave_effective_model,
+            provider_hint: wave_hint,
+        },
+    );
+
+    assert_eq!(
+        seq_runner,
+        RunnerKind::Codex,
+        "sequential: provider-only Codex with defaultModel MUST route to Codex"
+    );
+    assert_eq!(
+        wave_runner,
+        RunnerKind::Codex,
+        "wave (WIRE-FIX-001): provider-only Codex with defaultModel MUST route to Codex, not Claude"
+    );
+    assert_eq!(
+        seq_runner, wave_runner,
+        "sequential and wave MUST produce identical RunnerKind for the same input"
     );
 }
