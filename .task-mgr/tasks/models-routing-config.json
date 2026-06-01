@@ -1,10 +1,18 @@
 {
-  "version": "1.0",
-  "project": "task-mgr",
-  "model": "claude-sonnet-4-6",
   "branchName": "feat/models-routing-config",
   "description": "Close the provider/model-routing config gap: add `task-mgr models set-review-model`/`unset-review-model` and `set-fallback`/`unset-fallback` subcommands (today reviewModel and fallbackRunner are hand-edited JSON only), and extend `task-mgr models show` to print the full routing table (default+source, reviewModel, fallbackRunner, primaryRunner byTaskType/byIdPrefix routes). Makes 'where does each task class route?' answerable and safely settable from the CLI. Aligns with the config-first principle (config owns class/role routing; per-task model stamps are exceptions).",
-  "requires": [],
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "Rust: No warnings in `cargo check`",
+      "Rust: No warnings in `cargo clippy -- -D warnings`",
+      "Rust: Scoped tests pass with `cargo test -p task-mgr <module>`",
+      "Rust: `cargo fmt --check` passes",
+      "No literal model-string creep outside src/loop_engine/model.rs (tests/no_hardcoded_models.rs guards this) — read model IDs from the model.rs constants",
+      "Config writes preserve ALL pre-existing keys (round-trip via serde_json::Value, never a typed reserialize)"
+    ],
+    "description": "These criteria apply to ALL implementation tasks"
+  },
+  "model": "claude-sonnet-4-6",
   "priorityPhilosophy": {
     "description": "Hierarchy of what matters most when implementing tasks",
     "hierarchy": [
@@ -30,23 +38,11 @@
     "Error messages that don't identify the bad value or the allowed set",
     "A startup probe / validation that diverges from the runtime resolver (binary resolution must mirror exactly)"
   ],
-  "globalAcceptanceCriteria": {
-    "description": "These criteria apply to ALL implementation tasks",
-    "criteria": [
-      "Rust: No warnings in `cargo check`",
-      "Rust: No warnings in `cargo clippy -- -D warnings`",
-      "Rust: Scoped tests pass with `cargo test -p task-mgr <module>`",
-      "Rust: `cargo fmt --check` passes",
-      "No literal model-string creep outside src/loop_engine/model.rs (tests/no_hardcoded_models.rs guards this) — read model IDs from the model.rs constants",
-      "Config writes preserve ALL pre-existing keys (round-trip via serde_json::Value, never a typed reserialize)"
-    ]
-  },
+  "project": "task-mgr",
+  "requires": [],
+  "taskPrefix": "b1e77fb2",
   "userStories": [
     {
-      "id": "FEAT-001",
-      "title": "Config write/unset helpers for reviewModel + fallbackRunner (project + user level)",
-      "taskType": "implementation",
-      "description": "Add key-preserving config setters that write/clear `reviewModel` and `fallbackRunner`, mirroring the existing default-model writers.\n\nDO:\n- Reuse the pattern of `write_project_default` / `write_user_default` (src/commands/init/mod.rs). Add `write_project_review_model(Option<&str>)`, `write_user_review_model(Option<&str>)`, and `write_project_fallback_runner(Option<&FallbackRunnerConfig>)` / user equivalent. `None` clears the key.\n- Read the existing config file as `serde_json::Value`, mutate ONLY the target key (insert or remove), and write back with stable formatting. This preserves additionalAllowedTools/embeddingModel/ollamaUrl/etc.\n- Resolve the project config path the same way the loader does (project `.task-mgr/config.json`) and the user config path the same way (`$XDG_CONFIG_HOME/task-mgr/config.json`). Create parent dirs if missing.\n\nDO NOT:\n- Deserialize into ProjectConfig and reserialize — that drops unknown keys (PROHIBITED).\n- Duplicate path-resolution logic — reuse the loader's path helpers.\n\nEdge cases:\n- Config file absent: create it with just the target key (+ version).\n- Config file present with unrelated keys: those survive untouched.\n- Clearing a key that isn't present: no-op, success.\n- Malformed existing JSON: return a clear error, do not silently overwrite.\n\nKnown-bad to guard against:\n- A round-trip through the typed ProjectConfig struct that compiles and passes a naive 'reviewModel set' assertion but silently deletes additionalAllowedTools.",
       "acceptanceCriteria": [
         "Positive: write_project_review_model(Some(\"claude-opus-4-7\")) sets reviewModel and leaves every other key byte-intact",
         "Positive: write_*_review_model(None) and write_*_fallback_runner(None) remove the key and succeed even if it was absent",
@@ -56,38 +52,44 @@
         "Known-bad: a typed-struct reserialize would pass a 'reviewModel == opus' assertion but drop additionalAllowedTools — the test must assert a pre-seeded additionalAllowedTools array survives",
         "CONTRACT: project/user config paths resolved via the same helper the config loader uses (grep the loader to confirm parity)"
       ],
-      "priority": 1,
-      "estimatedEffort": "medium",
-      "passes": false,
-      "notes": "Reuse: write_project_default/write_user_default (src/commands/init/mod.rs) — check whether they already round-trip via Value (mirror it); ProjectConfig/FallbackRunnerConfig (src/loop_engine/project_config.rs). Config path resolution: src/db/path.rs + the project_config loader. Learning 3108-adjacent: keep writer/reader path resolution in lockstep.",
-      "qualityDimensions": [
-        "Round-trip via serde_json::Value — never drop unknown keys",
-        "Path resolution shared with the loader (no divergence)",
-        "None clears; absent file creates; malformed errors clearly",
-        "Functions <30 lines, DI-friendly (path injectable for tests)"
-      ],
+      "dependsOn": [],
+      "description": "Add key-preserving config setters that write/clear `reviewModel` and `fallbackRunner`, mirroring the existing default-model writers.\n\nDO:\n- Reuse the pattern of `write_project_default` / `write_user_default` (src/commands/init/mod.rs). Add `write_project_review_model(Option<&str>)`, `write_user_review_model(Option<&str>)`, and `write_project_fallback_runner(Option<&FallbackRunnerConfig>)` / user equivalent. `None` clears the key.\n- Read the existing config file as `serde_json::Value`, mutate ONLY the target key (insert or remove), and write back with stable formatting. This preserves additionalAllowedTools/embeddingModel/ollamaUrl/etc.\n- Resolve the project config path the same way the loader does (project `.task-mgr/config.json`) and the user config path the same way (`$XDG_CONFIG_HOME/task-mgr/config.json`). Create parent dirs if missing.\n\nDO NOT:\n- Deserialize into ProjectConfig and reserialize — that drops unknown keys (PROHIBITED).\n- Duplicate path-resolution logic — reuse the loader's path helpers.\n\nEdge cases:\n- Config file absent: create it with just the target key (+ version).\n- Config file present with unrelated keys: those survive untouched.\n- Clearing a key that isn't present: no-op, success.\n- Malformed existing JSON: return a clear error, do not silently overwrite.\n\nKnown-bad to guard against:\n- A round-trip through the typed ProjectConfig struct that compiles and passes a naive 'reviewModel set' assertion but silently deletes additionalAllowedTools.",
       "edgeCases": [
         "Config absent: create with target key + version",
         "Unrelated keys present: preserved",
         "Clearing absent key: no-op success",
         "Malformed JSON: clear error, no overwrite"
       ],
+      "estimatedEffort": "medium",
       "failureModes": [
-        { "cause": "Typed reserialize drops unknown keys", "expectedBehavior": "Forbidden — Value round-trip preserves them" },
-        { "cause": "Malformed existing config", "expectedBehavior": "Err with file path; original file untouched" }
+        {
+          "cause": "Typed reserialize drops unknown keys",
+          "expectedBehavior": "Forbidden — Value round-trip preserves them"
+        },
+        {
+          "cause": "Malformed existing config",
+          "expectedBehavior": "Err with file path; original file untouched"
+        }
       ],
+      "id": "FEAT-001",
+      "modifiesBehavior": false,
+      "notes": "Reuse: write_project_default/write_user_default (src/commands/init/mod.rs) — check whether they already round-trip via Value (mirror it); ProjectConfig/FallbackRunnerConfig (src/loop_engine/project_config.rs). Config path resolution: src/db/path.rs + the project_config loader. Learning 3108-adjacent: keep writer/reader path resolution in lockstep.",
+      "passes": true,
+      "priority": 1,
+      "qualityDimensions": [
+        "Round-trip via serde_json::Value — never drop unknown keys",
+        "Path resolution shared with the loader (no divergence)",
+        "None clears; absent file creates; malformed errors clearly",
+        "Functions <30 lines, DI-friendly (path injectable for tests)"
+      ],
+      "taskType": "implementation",
+      "title": "Config write/unset helpers for reviewModel + fallbackRunner (project + user level)",
       "touchesFiles": [
         "src/commands/init/mod.rs",
         "src/loop_engine/project_config.rs"
-      ],
-      "dependsOn": [],
-      "modifiesBehavior": false
+      ]
     },
     {
-      "id": "FEAT-002",
-      "title": "`models set-review-model`/`unset-review-model` + `set-fallback`/`unset-fallback` subcommands",
-      "taskType": "implementation",
-      "description": "Add CLI subcommands that write the routing config via FEAT-001 helpers, with validation that mirrors runtime.\n\nDO:\n- Extend the models subcommand enum (src/cli/commands.rs) and handlers (src/commands/models/handlers.rs), mirroring handle_set_default. `--project` writes project config, default writes user config (match set-default's convention).\n- `set-review-model <id>` / `unset-review-model`: validate the id is a known/plausible model; if `provider_for_model(id) == Grok`, probe the Grok binary (reuse resolve_and_verify_grok_binary / check_review_model_binary, project_config.rs) and fail with a helpful error if absent.\n- `set-fallback`: flags `--enable/--disable`, `--provider <grok>`, `--model <id>`, `--cli-binary <path>`, `--runtime-error-threshold <n>`. In v1 reject `--provider` other than `grok` (matches the engine's v1 contract). When enabling, probe the binary. `unset-fallback` removes the block.\n- Emit a confirmation line via ui::emit_data naming what was set and the scope (project/user), matching set-default's output style.\n\nDO NOT:\n- Bypass FEAT-001 helpers (no inline JSON writing here).\n- Probe a binary the runtime wouldn't (mirror the resolver exactly).\n- Accept a non-grok fallback provider in v1.\n\nEdge cases:\n- set-review-model to a grok model with grok binary missing: error before writing (don't persist an unusable config).\n- set-fallback --enable without --model: default to grok-build (the engine default) or require it — require it and error clearly if absent.\n- unset on an already-absent key: success no-op.\n- A primaryRunner Codex route present + setting reviewModel: surface a warning (the engine rejects this combo at load) — non-fatal here, but warn.\n\nKnown-bad to guard against:\n- Writing the config FIRST then probing — a missing binary would leave a persisted config that fails at next loop startup. Probe BEFORE write.",
       "acceptanceCriteria": [
         "Positive: `models set-review-model claude-opus-4-7` writes reviewModel (user scope) and prints a confirmation; `--project` writes project scope",
         "Positive: `models set-fallback --enable --provider grok --model grok-build` writes the fallbackRunner block; `unset-fallback` removes it",
@@ -98,10 +100,32 @@
         "Edge: setting reviewModel while a primaryRunner provider:\"codex\" route exists prints a warning that the engine will reject the combo at load",
         "CONTRACT: the grok-binary probe here calls the SAME resolver as the loop startup probe (grep both to confirm)"
       ],
-      "priority": 2,
+      "dependsOn": [
+        "FEAT-001"
+      ],
+      "description": "Add CLI subcommands that write the routing config via FEAT-001 helpers, with validation that mirrors runtime.\n\nDO:\n- Extend the models subcommand enum (src/cli/commands.rs) and handlers (src/commands/models/handlers.rs), mirroring handle_set_default. `--project` writes project config, default writes user config (match set-default's convention).\n- `set-review-model <id>` / `unset-review-model`: validate the id is a known/plausible model; if `provider_for_model(id) == Grok`, probe the Grok binary (reuse resolve_and_verify_grok_binary / check_review_model_binary, project_config.rs) and fail with a helpful error if absent.\n- `set-fallback`: flags `--enable/--disable`, `--provider <grok>`, `--model <id>`, `--cli-binary <path>`, `--runtime-error-threshold <n>`. In v1 reject `--provider` other than `grok` (matches the engine's v1 contract). When enabling, probe the binary. `unset-fallback` removes the block.\n- Emit a confirmation line via ui::emit_data naming what was set and the scope (project/user), matching set-default's output style.\n\nDO NOT:\n- Bypass FEAT-001 helpers (no inline JSON writing here).\n- Probe a binary the runtime wouldn't (mirror the resolver exactly).\n- Accept a non-grok fallback provider in v1.\n\nEdge cases:\n- set-review-model to a grok model with grok binary missing: error before writing (don't persist an unusable config).\n- set-fallback --enable without --model: default to grok-build (the engine default) or require it — require it and error clearly if absent.\n- unset on an already-absent key: success no-op.\n- A primaryRunner Codex route present + setting reviewModel: surface a warning (the engine rejects this combo at load) — non-fatal here, but warn.\n\nKnown-bad to guard against:\n- Writing the config FIRST then probing — a missing binary would leave a persisted config that fails at next loop startup. Probe BEFORE write.",
+      "edgeCases": [
+        "grok model + missing binary: error before write",
+        "set-fallback --enable without --model: require it, clear error",
+        "unset already-absent: success no-op",
+        "reviewModel set while codex primary route present: warn (engine rejects at load)"
+      ],
       "estimatedEffort": "medium",
-      "passes": false,
+      "failureModes": [
+        {
+          "cause": "Write before probe with missing binary",
+          "expectedBehavior": "Forbidden — probe first; config left unchanged on probe failure"
+        },
+        {
+          "cause": "Non-grok fallback provider in v1",
+          "expectedBehavior": "Rejected with explicit message, no write"
+        }
+      ],
+      "id": "FEAT-002",
+      "modifiesBehavior": false,
       "notes": "Reuse: handle_set_default (src/commands/models/handlers.rs:~140), the models subcommand enum (src/cli/commands.rs), provider_for_model + resolve_and_verify_grok_binary + check_review_model_binary (src/loop_engine/project_config.rs:376/430), FEAT-001 setters. Model IDs from model.rs constants (no literals). Note the v1 'fallback provider must be grok' rule matches the in-flight codex-runner PRD's config validation — keep the message consistent.",
+      "passes": false,
+      "priority": 2,
       "qualityDimensions": [
         "Probe BEFORE write (never persist an unusable config)",
         "Validation mirrors runtime resolver exactly (shared helpers)",
@@ -109,29 +133,15 @@
         "Output style matches existing set-default",
         "No inline JSON writing — delegates to FEAT-001"
       ],
-      "edgeCases": [
-        "grok model + missing binary: error before write",
-        "set-fallback --enable without --model: require it, clear error",
-        "unset already-absent: success no-op",
-        "reviewModel set while codex primary route present: warn (engine rejects at load)"
-      ],
-      "failureModes": [
-        { "cause": "Write before probe with missing binary", "expectedBehavior": "Forbidden — probe first; config left unchanged on probe failure" },
-        { "cause": "Non-grok fallback provider in v1", "expectedBehavior": "Rejected with explicit message, no write" }
-      ],
+      "taskType": "implementation",
+      "title": "`models set-review-model`/`unset-review-model` + `set-fallback`/`unset-fallback` subcommands",
       "touchesFiles": [
         "src/cli/commands.rs",
         "src/commands/models/handlers.rs",
         "src/commands/models/mod.rs"
-      ],
-      "dependsOn": ["FEAT-001"],
-      "modifiesBehavior": false
+      ]
     },
     {
-      "id": "FEAT-003",
-      "title": "`models show` routing-table view",
-      "taskType": "implementation",
-      "description": "Extend `task-mgr models show` to answer 'where does each task class route?' in one command.\n\nDO:\n- Keep the existing 'resolved default + source' output, then append a Routing section: reviewModel (and resolved provider via provider_for_model), fallbackRunner (enabled/provider/model/threshold or 'disabled'), and every primaryRunner route (byTaskType entries and byIdPrefix entries, each showing prefix/type -> provider+model).\n- Render via ui::emit_data (CLI data on stdout) consistent with the existing show output; stable, greppable formatting.\n- Show 'unset'/'disabled'/'(none)' explicitly so absence is visible, not silently empty.\n\nDO NOT:\n- Recompute routing with bespoke logic — read the same ProjectConfig the loader produces and label provider via provider_for_model / parse_config_provider so the display matches actual runtime routing.\n- Emit via tracing (this is CLI data, use ui::emit_data per CONTRACT-LOG-001).\n\nEdge cases:\n- No routing config at all: print 'reviewModel: (unset)', 'fallbackRunner: disabled', 'primaryRunner: (no routes)'.\n- primaryRunner with overlapping byIdPrefix keys: show them as configured (don't try to resolve the overlap; note matching is byTaskType-first then byIdPrefix).\n- reviewModel set to a grok model: show 'reviewModel: grok-build (provider: Grok)'.\n\nKnown-bad to guard against:\n- A view that prints only set keys and omits unset ones — the operator can't tell 'unset' from 'forgot to print'. Always print every row with an explicit empty state.",
       "acceptanceCriteria": [
         "Positive: `models show` prints the resolved default+source AND a routing block with reviewModel, fallbackRunner, and primaryRunner routes",
         "Positive: reviewModel row shows the resolved provider (provider_for_model) e.g. 'claude-opus-4-7 (provider: Claude)'",
@@ -142,65 +152,74 @@
         "Unit test: an empty config renders explicit (unset)/disabled/(no routes) rows",
         "CONTRACT: routing display reads the same ProjectConfig fields the loop loads (grep ProjectConfig to confirm field names)"
       ],
-      "priority": 3,
+      "dependsOn": [
+        "FEAT-001"
+      ],
+      "description": "Extend `task-mgr models show` to answer 'where does each task class route?' in one command.\n\nDO:\n- Keep the existing 'resolved default + source' output, then append a Routing section: reviewModel (and resolved provider via provider_for_model), fallbackRunner (enabled/provider/model/threshold or 'disabled'), and every primaryRunner route (byTaskType entries and byIdPrefix entries, each showing prefix/type -> provider+model).\n- Render via ui::emit_data (CLI data on stdout) consistent with the existing show output; stable, greppable formatting.\n- Show 'unset'/'disabled'/'(none)' explicitly so absence is visible, not silently empty.\n\nDO NOT:\n- Recompute routing with bespoke logic — read the same ProjectConfig the loader produces and label provider via provider_for_model / parse_config_provider so the display matches actual runtime routing.\n- Emit via tracing (this is CLI data, use ui::emit_data per CONTRACT-LOG-001).\n\nEdge cases:\n- No routing config at all: print 'reviewModel: (unset)', 'fallbackRunner: disabled', 'primaryRunner: (no routes)'.\n- primaryRunner with overlapping byIdPrefix keys: show them as configured (don't try to resolve the overlap; note matching is byTaskType-first then byIdPrefix).\n- reviewModel set to a grok model: show 'reviewModel: grok-build (provider: Grok)'.\n\nKnown-bad to guard against:\n- A view that prints only set keys and omits unset ones — the operator can't tell 'unset' from 'forgot to print'. Always print every row with an explicit empty state.",
+      "edgeCases": [
+        "No routing config: explicit (unset)/disabled/(no routes)",
+        "Overlapping byIdPrefix keys: shown as configured, note byTaskType-first",
+        "grok reviewModel: shows provider Grok"
+      ],
       "estimatedEffort": "medium",
-      "passes": false,
+      "failureModes": [
+        {
+          "cause": "Only set keys printed",
+          "expectedBehavior": "Forbidden — every row prints with an explicit empty state"
+        }
+      ],
+      "id": "FEAT-003",
+      "modifiesBehavior": false,
       "notes": "Reuse: handle_show (src/commands/models/handlers.rs), ProjectConfig (src/loop_engine/project_config.rs), provider_for_model (src/loop_engine/model.rs:83), ui::emit_data (CONTRACT-LOG-001). Mirror the existing show formatting. If the in-flight codex-runner PRD lands a parse_config_provider, label providers with it for codex-awareness; otherwise provider_for_model is fine.",
+      "passes": false,
+      "priority": 3,
       "qualityDimensions": [
         "Reads the same ProjectConfig the loop loads (no bespoke routing recompute)",
         "Explicit empty states (unset/disabled/none) — absence is visible",
         "ui::emit_data stdout, greppable/stable formatting",
         "Provider labels match runtime classification"
       ],
-      "edgeCases": [
-        "No routing config: explicit (unset)/disabled/(no routes)",
-        "Overlapping byIdPrefix keys: shown as configured, note byTaskType-first",
-        "grok reviewModel: shows provider Grok"
-      ],
-      "failureModes": [
-        { "cause": "Only set keys printed", "expectedBehavior": "Forbidden — every row prints with an explicit empty state" }
-      ],
+      "taskType": "implementation",
+      "title": "`models show` routing-table view",
       "touchesFiles": [
         "src/commands/models/handlers.rs",
         "src/commands/models/mod.rs"
-      ],
-      "dependsOn": ["FEAT-001"],
-      "modifiesBehavior": false
+      ]
     },
     {
-      "id": "REFACTOR-001",
-      "title": "Review for refactoring opportunities",
-      "taskType": "review",
-      "description": "Review the config setters + show extension for DRY, complexity, coupling.\n\nDO: Check the three config-write helpers share one Value-round-trip core (not three copies); check CLI handler validation reuses the same resolver helpers; check show formatting isn't duplicating ProjectConfig field access.\nDO NOT: Skip. Do NOT introduce a config-write abstraction with only one real use.",
       "acceptanceCriteria": [
         "No code duplication — the Value-round-trip write core is shared across reviewModel/fallbackRunner/default writers",
         "Functions under 30 lines",
         "Validation reuses provider_for_model + the grok-binary resolver (no reimplementation)",
         "Any issues found spawn REFACTOR-FIX-xxx via `task-mgr add --stdin --depended-on-by REVIEW-001`"
       ],
-      "priority": 98,
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003"
+      ],
+      "description": "Review the config setters + show extension for DRY, complexity, coupling.\n\nDO: Check the three config-write helpers share one Value-round-trip core (not three copies); check CLI handler validation reuses the same resolver helpers; check show formatting isn't duplicating ProjectConfig field access.\nDO NOT: Skip. Do NOT introduce a config-write abstraction with only one real use.",
       "estimatedEffort": "high",
-      "passes": false,
+      "id": "REFACTOR-001",
       "model": "claude-opus-4-7",
-      "timeoutSecs": 1800,
       "notes": "If issues found: `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001` (priority 50-97). If clean, invoke /simplify on any ugly touchpoint, then emit `<task-status>REFACTOR-001:done</task-status>`. Do NOT stamp model on spawned fixups — primaryRunner.byIdPrefix config routes them.",
+      "passes": false,
+      "priority": 98,
       "qualityDimensions": [
         "Shared Value-round-trip core (DRY)",
         "Validation reuses runtime resolvers",
         "Single-responsibility functions"
       ],
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Review for refactoring opportunities",
       "touchesFiles": [
         "src/commands/init/mod.rs",
         "src/commands/models/handlers.rs",
         "src/loop_engine/project_config.rs"
-      ],
-      "dependsOn": ["FEAT-001", "FEAT-002", "FEAT-003"]
+      ]
     },
     {
-      "id": "REVIEW-001",
-      "title": "Code review + final verification",
-      "taskType": "review",
-      "description": "Review all changes for quality, security, integration wiring, and docs. RUN THE FULL QUALITY GATE (unscoped suite).\n\nDO: Verify the new subcommands are registered and reachable (clap dispatch → handler); verify key-preservation on every config write (the load-bearing property); verify probe-before-write; verify show reads the real ProjectConfig. Run full cargo test / clippy -D warnings / fmt --check (no scope filter). Update CLAUDE.md (the `task-mgr models` section) + the command-reference table for the new subcommands.\nDO NOT: scope the suite — this is where the full suite runs. Do NOT stamp a model on this task (runtime reviewModel governs the reviewer).",
       "acceptanceCriteria": [
         "Positive: new subcommands dispatch from the clap enum to their handlers (grep-verified, not just defined)",
         "Positive: FULL cargo test, cargo clippy -- -D warnings, cargo fmt --check all clean",
@@ -211,11 +230,18 @@
         "Pre-existing test failures fixed (or spawned as FIX-xxx with verifyCommand if >~12 unrelated)",
         "If issues found: FIX-xxx/WIRE-FIX-xxx spawned via `task-mgr add --stdin --depended-on-by REVIEW-001`"
       ],
-      "priority": 99,
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "REFACTOR-001"
+      ],
+      "description": "Review all changes for quality, security, integration wiring, and docs. RUN THE FULL QUALITY GATE (unscoped suite).\n\nDO: Verify the new subcommands are registered and reachable (clap dispatch → handler); verify key-preservation on every config write (the load-bearing property); verify probe-before-write; verify show reads the real ProjectConfig. Run full cargo test / clippy -D warnings / fmt --check (no scope filter). Update CLAUDE.md (the `task-mgr models` section) + the command-reference table for the new subcommands.\nDO NOT: scope the suite — this is where the full suite runs. Do NOT stamp a model on this task (runtime reviewModel governs the reviewer).",
       "estimatedEffort": "medium",
-      "passes": false,
-      "timeoutSecs": 1800,
+      "id": "REVIEW-001",
       "notes": "Do NOT stamp `model` here — runtime `reviewModel` config (currently claude-opus-4-7) owns the reviewer. Spawn fixes via `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001` (no model stamp on them — primaryRunner config routes them). If clean: `<task-status>REVIEW-001:done</task-status>` 'Clean review'. If gen-docs covers the command-reference table, run `cargo run --bin gen-docs` and verify `gen-docs -- --check` is green.",
+      "passes": false,
+      "priority": 99,
       "qualityDimensions": [
         "New subcommands wired clap→handler (reachable)",
         "Key-preservation holds end-to-end",
@@ -223,14 +249,17 @@
         "Docs + command reference updated",
         "Full suite green including pre-existing"
       ],
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Code review + final verification",
       "touchesFiles": [
         "src/cli/commands.rs",
         "src/commands/models/handlers.rs",
         "src/commands/init/mod.rs",
         "src/loop_engine/project_config.rs",
         "CLAUDE.md"
-      ],
-      "dependsOn": ["FEAT-001", "FEAT-002", "FEAT-003", "REFACTOR-001"]
+      ]
     }
-  ]
+  ],
+  "version": "1.0"
 }
