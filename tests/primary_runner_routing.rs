@@ -43,6 +43,7 @@ fn make_cfg() -> PrimaryRunnerConfig {
     let grok_spec = || RunnerSpec {
         provider: "grok".to_string(),
         model: GROK_MODEL.to_string(),
+        ..Default::default()
     };
     let mut by_task_type = HashMap::new();
     by_task_type.insert("review".to_string(), grok_spec());
@@ -144,6 +145,7 @@ fn by_task_type_wins_over_by_id_prefix_when_both_match() {
         RunnerSpec {
             provider: "grok".to_string(),
             model: GROK_MODEL.to_string(), // "grok-build"
+            ..Default::default()
         },
     );
     let mut by_id_prefix = HashMap::new();
@@ -152,6 +154,7 @@ fn by_task_type_wins_over_by_id_prefix_when_both_match() {
         RunnerSpec {
             provider: "grok".to_string(),
             model: grok_prefix_model.to_string(), // "grok-code-fast-1" — different
+            ..Default::default()
         },
     );
     let cfg = PrimaryRunnerConfig {
@@ -355,6 +358,7 @@ fn by_id_prefix_key_without_trailing_dash_is_normalized() {
     let grok_spec = RunnerSpec {
         provider: "grok".to_string(),
         model: GROK_MODEL.to_string(),
+        ..Default::default()
     };
     let mut by_id_prefix = HashMap::new();
     by_id_prefix.insert("REVIEW".to_string(), grok_spec); // no trailing '-'

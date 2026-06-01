@@ -51,7 +51,7 @@ impl Default for FallbackRunnerConfig {
 }
 
 /// A provider + optional model pair used as a routing target in `PrimaryRunnerConfig`.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct RunnerSpec {
     /// Provider name (e.g. `"grok"`, `"claude"`).
@@ -60,6 +60,15 @@ pub struct RunnerSpec {
     /// Codex v1 may omit this field to route by explicit provider intent only.
     #[serde(default)]
     pub model: String,
+    /// Opt-in: when the route's provider is `"codex"` AND this is `true`, a
+    /// Codex RUNTIME failure (not auth) promotes the task to the Claude
+    /// runner instead of auto-blocking after `runtimeErrorThreshold` rounds.
+    /// One-shot per task — once promoted, normal Claude recovery applies and
+    /// the task never returns to Codex. Default: `false` (legacy auto-block).
+    /// Ignored on non-codex routes — Claude/Grok runners already have their
+    /// own cross-provider promotion paths (`fallbackRunner` / `claudeFallbackModel`).
+    #[serde(default)]
+    pub fallback_to_claude: bool,
 }
 
 /// Per-task-type and per-id-prefix routing for the primary runner.
@@ -1389,6 +1398,7 @@ mod tests {
             RunnerSpec {
                 provider: provider.to_string(),
                 model: model.to_string(),
+                ..Default::default()
             },
         );
         PrimaryRunnerConfig {
@@ -1397,6 +1407,94 @@ mod tests {
             by_task_type,
             by_id_prefix: HashMap::new(),
         }
+    }
+
+    // ---- RunnerSpec.fallback_to_claude serde tests (FEAT-005) ----
+
+    #[test]
+    fn test_runner_spec_fallback_to_claude_absent_defaults_to_false() {
+        // AC: fallbackToClaude defaults to false; an absent field deserializes
+        // to false. Existing Codex projects keep the legacy auto-block path.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{
+                "primaryRunner": {
+                    "byTaskType": {
+                        "spike": { "provider": "codex" }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let cfg = read_project_config(dir.path());
+        let spec = cfg
+            .primary_runner
+            .expect("primaryRunner present")
+            .by_task_type
+            .remove("spike")
+            .expect("spike key present");
+        assert!(
+            !spec.fallback_to_claude,
+            "absent fallbackToClaude must deserialize to false"
+        );
+    }
+
+    #[test]
+    fn test_runner_spec_fallback_to_claude_true_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{
+                "primaryRunner": {
+                    "byIdPrefix": {
+                        "SPIKE-": { "provider": "codex", "fallbackToClaude": true }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let cfg = read_project_config(dir.path());
+        let spec = cfg
+            .primary_runner
+            .expect("primaryRunner present")
+            .by_id_prefix
+            .remove("SPIKE-")
+            .expect("SPIKE- key present");
+        assert!(
+            spec.fallback_to_claude,
+            "fallbackToClaude=true must round-trip"
+        );
+    }
+
+    #[test]
+    fn test_runner_spec_fallback_to_claude_snake_case_rejected() {
+        // CONTRACT: the field name on the wire is camelCase (fallbackToClaude),
+        // matching the rest of RunnerSpec's serde rename_all. snake_case must
+        // NOT silently set the field.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{
+                "primaryRunner": {
+                    "byTaskType": {
+                        "spike": { "provider": "codex", "fallback_to_claude": true }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let cfg = read_project_config(dir.path());
+        let spec = cfg
+            .primary_runner
+            .expect("primaryRunner present")
+            .by_task_type
+            .remove("spike")
+            .expect("spike key present");
+        assert!(
+            !spec.fallback_to_claude,
+            "snake_case key must not set fallback_to_claude"
+        );
     }
 
     #[test]

@@ -183,6 +183,7 @@ fn non_codex_primary_runner_rejects_blank_model() {
         RunnerSpec {
             provider: "grok".to_string(),
             model: String::new(),
+            ..Default::default()
         },
     );
     let cfg = ProjectConfig {

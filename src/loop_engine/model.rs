@@ -697,6 +697,7 @@ mod tests {
         let grok_spec = RunnerSpec {
             provider: "grok".to_string(),
             model: "grok-build".to_string(),
+            ..Default::default()
         };
         let mut by_task_type = HashMap::new();
         by_task_type.insert("review".to_string(), grok_spec.clone());
@@ -786,6 +787,7 @@ mod tests {
             RunnerSpec {
                 provider: "codex".to_string(),
                 model: String::new(),
+                ..Default::default()
             },
         );
         let cfg = PrimaryRunnerConfig {
@@ -812,6 +814,7 @@ mod tests {
             RunnerSpec {
                 provider: "codex".to_string(),
                 model: String::new(),
+                ..Default::default()
             },
         );
         let cfg = PrimaryRunnerConfig {
@@ -902,6 +905,7 @@ mod tests {
             RunnerSpec {
                 provider: "grok".to_string(),
                 model: "grok-type-winner".to_string(),
+                ..Default::default()
             },
         );
         let mut by_id_prefix = HashMap::new();
@@ -910,6 +914,7 @@ mod tests {
             RunnerSpec {
                 provider: "grok".to_string(),
                 model: "grok-prefix-loser".to_string(),
+                ..Default::default()
             },
         );
         let cfg = PrimaryRunnerConfig {
