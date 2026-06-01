@@ -11,9 +11,9 @@
 //! - Atomic same-directory tempfile + rename to avoid half-written reads.
 
 use serde::Deserialize;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use crate::loop_engine::config_io::{OnCorruptJson, write_config_key_at};
 use crate::loop_engine::project_config::FallbackRunnerConfig;
 use crate::paths::user_config_dir;
 
@@ -73,98 +73,13 @@ pub fn write_default_model(model: Option<&str>) -> std::io::Result<()> {
 
 /// Testable variant of [`write_default_model`] that writes to an explicit path.
 pub fn write_default_model_at(path: &Path, model: Option<&str>) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let mut value: serde_json::Value = match std::fs::read_to_string(path) {
-        Ok(s) if !s.trim().is_empty() => {
-            serde_json::from_str(&s).unwrap_or_else(|_| serde_json::json!({}))
-        }
-        _ => serde_json::json!({}),
-    };
-    let obj = value.as_object_mut().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "user config.json is not a JSON object",
-        )
-    })?;
-    match model {
-        Some(m) => {
-            obj.insert(
-                "defaultModel".to_string(),
-                serde_json::Value::String(m.to_string()),
-            );
-        }
-        None => {
-            obj.remove("defaultModel");
-        }
-    }
-
-    let contents = serde_json::to_string_pretty(&value)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut tmp = tempfile::Builder::new()
-        .prefix(".config-")
-        .suffix(".json")
-        .tempfile_in(dir)?;
-    tmp.write_all(contents.as_bytes())?;
-    tmp.write_all(b"\n")?;
-    tmp.persist(path).map_err(|e| e.error)?;
-    Ok(())
-}
-
-/// Key-preserving writer for the user config: read `path` as
-/// `serde_json::Value`, mutate one `key`, and write back atomically.
-///
-/// Returns `Err` on malformed JSON (with path in message); creates `{}`
-/// when the file is absent (user config has no version field).
-fn write_config_key_at(
-    path: &Path,
-    key: &str,
-    value: Option<serde_json::Value>,
-) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let mut json: serde_json::Value = match std::fs::read_to_string(path) {
-        Ok(s) if !s.trim().is_empty() => serde_json::from_str(&s).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("{}: malformed JSON: {e}", path.display()),
-            )
-        })?,
-        _ => serde_json::json!({}),
-    };
-
-    let obj = json.as_object_mut().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("{}: config is not a JSON object", path.display()),
-        )
-    })?;
-
-    match value {
-        Some(v) => {
-            obj.insert(key.to_string(), v);
-        }
-        None => {
-            obj.remove(key);
-        }
-    }
-
-    let contents = serde_json::to_string_pretty(&json)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut tmp = tempfile::Builder::new()
-        .prefix(".config-")
-        .suffix(".json")
-        .tempfile_in(dir)?;
-    tmp.write_all(contents.as_bytes())?;
-    tmp.write_all(b"\n")?;
-    tmp.persist(path).map_err(|e| e.error)?;
-    Ok(())
+    write_config_key_at(
+        path,
+        "defaultModel",
+        model.map(|m| serde_json::Value::String(m.to_string())),
+        serde_json::json!({}),
+        OnCorruptJson::UseSeed,
+    )
 }
 
 /// Set (or clear) the `reviewModel` field in the user config.
@@ -187,6 +102,8 @@ pub fn write_review_model_at(path: &Path, model: Option<&str>) -> std::io::Resul
         path,
         "reviewModel",
         model.map(|m| serde_json::Value::String(m.to_string())),
+        serde_json::json!({}),
+        OnCorruptJson::ReturnError,
     )
 }
 
@@ -215,7 +132,13 @@ pub fn write_fallback_runner_at(
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
         })
         .transpose()?;
-    write_config_key_at(path, "fallbackRunner", v)
+    write_config_key_at(
+        path,
+        "fallbackRunner",
+        v,
+        serde_json::json!({}),
+        OnCorruptJson::ReturnError,
+    )
 }
 
 #[cfg(test)]

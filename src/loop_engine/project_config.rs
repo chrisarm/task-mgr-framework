@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::error::{TaskMgrError, TaskMgrResult};
+use crate::loop_engine::config_io::{OnCorruptJson, write_config_key_at};
 use crate::loop_engine::model::{Provider, parse_config_provider};
 
 /// Configuration for the Grok fallback runner (US-005, FR-006).
@@ -638,105 +639,16 @@ pub fn read_project_config(db_dir: &Path) -> ProjectConfig {
 /// Pass `Some(model)` to set, `None` to remove the key entirely.
 /// Creates the file and parent dir if needed. Writes atomically via a
 /// same-directory tempfile + rename so readers never see a half-written JSON.
+/// Tolerant: malformed JSON is silently replaced by the `{"version":1}` seed.
 pub fn write_default_model(db_dir: &Path, model: Option<&str>) -> std::io::Result<()> {
-    use std::io::Write;
-
     let path = db_dir.join("config.json");
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let mut value: serde_json::Value = match std::fs::read_to_string(&path) {
-        Ok(s) if !s.trim().is_empty() => {
-            serde_json::from_str(&s).unwrap_or_else(|_| serde_json::json!({ "version": 1 }))
-        }
-        _ => serde_json::json!({ "version": 1 }),
-    };
-    let obj = value.as_object_mut().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "config.json is not a JSON object",
-        )
-    })?;
-    match model {
-        Some(m) => {
-            obj.insert(
-                "defaultModel".to_string(),
-                serde_json::Value::String(m.to_string()),
-            );
-        }
-        None => {
-            obj.remove("defaultModel");
-        }
-    }
-
-    let contents = serde_json::to_string_pretty(&value)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut tmp = tempfile::Builder::new()
-        .prefix(".config-")
-        .suffix(".json")
-        .tempfile_in(dir)?;
-    tmp.write_all(contents.as_bytes())?;
-    tmp.write_all(b"\n")?;
-    tmp.persist(&path).map_err(|e| e.error)?;
-    Ok(())
-}
-
-/// Key-preserving config writer: read `path` as `serde_json::Value`, mutate
-/// one `key` (insert `value` or remove when `None`), and write back atomically.
-///
-/// Unlike `write_default_model`, returns `Err` on malformed JSON rather than
-/// silently overwriting — the path is named in the error for operator diagnostics.
-/// Creates parent directories and seeds `{"version":1}` when the file is absent.
-fn write_config_key_at(
-    path: &Path,
-    key: &str,
-    value: Option<serde_json::Value>,
-) -> std::io::Result<()> {
-    use std::io::Write;
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let mut json: serde_json::Value = match std::fs::read_to_string(path) {
-        Ok(s) if !s.trim().is_empty() => serde_json::from_str(&s).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("{}: malformed JSON: {e}", path.display()),
-            )
-        })?,
-        _ => serde_json::json!({ "version": 1 }),
-    };
-
-    let obj = json.as_object_mut().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("{}: config is not a JSON object", path.display()),
-        )
-    })?;
-
-    match value {
-        Some(v) => {
-            obj.insert(key.to_string(), v);
-        }
-        None => {
-            obj.remove(key);
-        }
-    }
-
-    let contents = serde_json::to_string_pretty(&json)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut tmp = tempfile::Builder::new()
-        .prefix(".config-")
-        .suffix(".json")
-        .tempfile_in(dir)?;
-    tmp.write_all(contents.as_bytes())?;
-    tmp.write_all(b"\n")?;
-    tmp.persist(path).map_err(|e| e.error)?;
-    Ok(())
+    write_config_key_at(
+        &path,
+        "defaultModel",
+        model.map(|m| serde_json::Value::String(m.to_string())),
+        serde_json::json!({ "version": 1 }),
+        OnCorruptJson::UseSeed,
+    )
 }
 
 /// Set (or clear) the `reviewModel` field in `<db_dir>/config.json` without
@@ -751,6 +663,8 @@ pub fn write_review_model(db_dir: &Path, model: Option<&str>) -> std::io::Result
         &path,
         "reviewModel",
         model.map(|m| serde_json::Value::String(m.to_string())),
+        serde_json::json!({ "version": 1 }),
+        OnCorruptJson::ReturnError,
     )
 }
 
@@ -771,7 +685,13 @@ pub fn write_fallback_runner(
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
         })
         .transpose()?;
-    write_config_key_at(&path, "fallbackRunner", v)
+    write_config_key_at(
+        &path,
+        "fallbackRunner",
+        v,
+        serde_json::json!({ "version": 1 }),
+        OnCorruptJson::ReturnError,
+    )
 }
 
 #[cfg(test)]

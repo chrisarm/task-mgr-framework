@@ -7,6 +7,7 @@ pub mod calibrate;
 pub mod calibrate_math;
 pub mod claude;
 pub mod config;
+pub mod config_io;
 pub mod context;
 pub mod crash;
 pub mod deadline;
