@@ -511,7 +511,8 @@
         "REFACTOR-001",
         "WIRE-FIX-001",
         "REFACTOR-FIX-001",
-        "REFACTOR-FIX-002"
+        "REFACTOR-FIX-002",
+        "FIX-001"
       ],
       "description": "Review all merged Codex code for quality, security, integration wiring, and documentation needs. RUN THE FULL QUALITY GATE (unscoped test suite).\n\nDO: Verify the preflight is wired into BOTH loop run and batch run; verify protected_state serves all three call sites (iteration/wave/slot); verify the Codex→Claude fallback inserts Claude (never Codex) and is auth-excluded; verify Codex is never inferred from a model string. Run the FULL cargo test / clippy -D warnings / fmt --check (no scope filter). Update src/loop_engine/CLAUDE.md and the root CLAUDE.md with the merged Codex provider section (capability matrix, threading rules, binary-probe contract, protected-state rationale, the new fallbackToClaude flag, prohibited outcomes). Run `cargo run --bin gen-docs` if any model/effort table changed.\nDO NOT: skip the integration-wiring check (unconnected code is the #1 failure mode). DO NOT scope the test suite — this is THE place the full suite runs.",
       "estimatedEffort": "medium",
@@ -586,6 +587,21 @@
       "title": "Tighten protected_state.rs rustdoc on TOCTOU window and walk_protected fail-open",
       "touchesFiles": [
         "src/loop_engine/protected_state.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "cargo test --test runtime_error_fallback handle_task_failure_defers_promotion_ctx_writes_until_after_commit passes",
+        "Full cargo test still passes",
+        "Semantic body assertions (escalate_task_model_if_needed_inner, apply_pending_promotion AFTER tx.commit) preserved"
+      ],
+      "description": "FEAT-007 ported V1 tests/codex_recovery.rs which calls handle_task_failure_with_runner from an integration test binary. Integration tests cannot reach pub(crate) items in src/, so the function was widened from `pub(crate) fn` to `pub fn` in src/loop_engine/recovery.rs:585. The earlier pin test in tests/runtime_error_fallback.rs:612 still searches for the literal string `pub(crate) fn handle_task_failure_with_runner(` as its body-locating anchor and now panics with `expected pub(crate) fn handle_task_failure_with_runner( to be defined in recovery.rs`. The anchor is purely a search string for byte-locating the function body; the semantic invariants the test enforces (deferred-apply + tx.commit ordering) are not visibility related.",
+      "id": "FIX-001",
+      "passes": false,
+      "priority": 60,
+      "title": "Fix stale pub(crate) anchor in handle_task_failure_defers_promotion_ctx_writes_until_after_commit",
+      "touchesFiles": [
+        "tests/runtime_error_fallback.rs"
       ]
     }
   ],

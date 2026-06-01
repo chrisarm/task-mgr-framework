@@ -931,6 +931,159 @@ dangerous sandbox-bypass flag only for dangerous mode. Do not add Codex flags
 by checking `RunnerKind` at call sites; add a capability and let dispatch reject
 unsupported `RunnerOpts`.
 
+## Codex provider integration
+
+Codex (OpenAI `codex` CLI) is the third runner alongside Claude and Grok. The
+merged Codex path layers four load-bearing defenses on top of the V2 base:
+
+### Selection — explicit provider intent only
+
+Codex is reachable EXCLUSIVELY through `primaryRunner` entries with
+`provider: "codex"` (the `model` field may be empty). `provider_for_model`
+classifies model strings into `Provider::Claude` or `Provider::Grok` and NEVER
+returns `Provider::Codex`; no `gpt-*` / `o*` / `codex-mini` / "openai"
+substring is ever interpreted as Codex intent. The strict parser
+(`parse_config_provider`) rejects misspellings (`"openai"`, `"codex-cli"`,
+`"groq"`) at config-load time so a typo hard-fails preflight instead of
+silently routing to Claude. `resolve_effective_runner` consumes
+`EffectiveRunnerInput { model, provider_hint }` as an explicit struct (no
+`Option<&str>` shorthand in production) so the dispatch site cannot drop a
+validated `provider_hint` (the `From<Option<&str>>` impl is `#[cfg(test)]`-gated
+to keep the production drift surface narrow). Scanner test:
+`tests/no_bare_option_resolve_effective_runner.rs`.
+
+### Stream — confirmed JSONL schema (codex-cli 0.135.0)
+
+`CodexStreamFormat` parses top-level events `thread.started` /
+`turn.started` / `item.started` / `item.completed` / `turn.completed`, plus
+errors as `{type:"error", message}` or `{type:"turn.failed", error.message}`.
+Per-item kind is `item.type` (NOT `item_type`). A single `command_execution`
+emits two events — `item.started` carries `ToolUse`, `item.completed` carries
+`ToolResult`; never duplicate either. `agent_message` arrives in one
+`item.completed` block via `text`. Source: live capture against
+codex-cli 0.135.0.
+
+### Auth-failure detection — structured `[Error: ]` lines only
+
+`codex_conversation_indicates_auth_failure` walks the assistant transcript
+line-by-line and only matches auth markers against bodies that
+`trim_start().strip_prefix("[Error: ")` returns. A naive full-text substring
+scan over the transcript would false-positive on `agent_message` text or tool
+output containing strings like "HTTP 401". The `[Error: ` prefix is produced
+centrally by the stream accumulator from any `StreamEvent::Error` (top-level
+`type:"error"` or `turn.failed`), so structured detection is reliable.
+
+`CodexAuthFailure` is excluded from `handle_task_failure` at BOTH callers —
+`orchestrator.rs` (sequential) and `wave_scheduler.rs` (wave) — so auth lapses
+never push healthy tasks toward `auto_block_after_failures` or the
+RuntimeError escalation path. A sentinel test
+(`test_codex_auth_failure_excluded_at_callers`) reads both files and asserts
+the `CrashType::CodexAuthFailure` pattern is still listed; deleting the
+exclusion fails at unit-test time.
+
+### Opt-in Codex→Claude RuntimeError fallback (`fallbackToClaude`)
+
+Codex is closed in v1 to the overflow rung-4 cross-provider pivot. The
+SEPARATE RuntimeError repeated-crash escalation, however, supports an opt-in
+promotion via `primaryRunner.<route>.fallbackToClaude: true`:
+
+```json
+{
+  "primaryRunner": {
+    "claudeFallbackModel": "<sonnet/opus id>",
+    "byIdPrefix": {
+      "FEAT-": { "provider": "codex", "fallbackToClaude": true }
+    }
+  }
+}
+```
+
+When `fallbackToClaude` is `true` on a Codex route AND the matching task
+accumulates RuntimeError crashes past `runtimeErrorThreshold`,
+`maybe_codex_fallback_to_claude` (in `recovery.rs`) writes a
+`PendingPromotion { source_runner: Codex, target_runner: Claude }` to
+`tasks.model` and threads it into `ctx.runner_overrides` AFTER `tx.commit()`
+returns Ok (same deferred-apply pattern as the Claude↔Grok promotions). The
+promotion ALWAYS inserts `RunnerKind::Claude` into `runner_overrides`, never
+`RunnerKind::Codex` — a once-promoted task cannot route back to Codex
+within the same loop run (idempotency via `runner_overrides.contains_key`).
+
+Target Claude model: `difficulty=high` → `OPUS_MODEL`; else
+`primary.claude_fallback_model` if set, else `OPUS_MODEL` baseline (unlike
+the Grok→Claude branch, which bails when `claudeFallbackModel` is absent —
+the per-route `fallbackToClaude:true` is an explicit operator opt-in, so we
+resolve a safe Opus default rather than silently auto-blocking).
+
+Field defaults: `fallbackToClaude=false`. Absent → no Codex→Claude promotion;
+loop behavior is byte-identical to a pure-Claude or Codex-without-fallback
+run. The flag is meaningful ONLY on routes whose `provider` parses to
+`Codex` — set on a Grok/Claude route, it is silently ignored.
+`tests/codex_runner_overrides_invariant.rs` pins the never-insert-Codex
+invariant.
+
+### Protected-state guard — post-hoc detect-and-revert
+
+Codex runs with confined write access (`--cd <cwd>` plus its own scratch),
+and an adversarial or buggy Codex prompt could still mutate orchestrator
+state (`tasks/*.json`, `*-prompt.md`, `.last-branch`, the SQLite trio) via
+`/tmp` symlinks or sandbox-escape attempts. The defense is POST-HOC: capture
+a snapshot pre-spawn (read-only, `immutable=1` for SQLite — never opens
+read-write, never replays the WAL), run Codex, then verify-and-restore. The
+guard lives in `src/loop_engine/protected_state.rs` and is wired at three
+call sites:
+
+| Path | Call site | Snapshot ctor |
+|---|---|---|
+| Sequential | `iteration.rs:493 / :550` | `Snapshot::take(.., RunnerKind)` (no-op for non-Codex) |
+| Per-slot (wave) | `slot.rs:201 / :256` | `Snapshot::take(.., RunnerKind)` (no-op for non-Codex) |
+| Wave-level (synthetic FailedMerge on corruption) | `wave_scheduler.rs:1198 / :1212` | `Snapshot::take_unconditional` (already gated by `codex_wave`) |
+
+`runner_requires_state_guard()` is the SSoT for the gate
+(`RunnerKind::Codex => true`; Claude/Grok return false and the snapshot is
+`None`, byte-identical to the pre-guard build). `VerifyOutcome` is tri-state:
+`Clean` → no-op; `Reverted` → ui::emit one line per restored/removed path;
+`FatalSqliteCorruption` → per-task sites fail the iteration via
+`apply_verify_outcome`, wave sites synthesize a `FailedMerge` so
+`apply_merge_fail_reset_and_halt_check` preserves the cascade-halt streak.
+
+**Intentionally detect, not prevent.** The TOCTOU window between
+`Snapshot::take` and `Snapshot::verify_and_restore` is acknowledged in the
+module rustdoc — a concurrent reader between capture and revert sees the
+mutated state momentarily. Defending the orchestrator AFTER the Codex
+process exits is the load-bearing guarantee; prevention would require a
+heavier sandbox (separate uid, bind mounts) that v1 explicitly punts on.
+`walk_protected` fails OPEN on `EACCES` (a permission-denied subtree
+contributes nothing to the snapshot) so a hostile chmod cannot mask a
+mutation by hiding the directory — restoration just won't touch what it
+couldn't see.
+
+### Binary probe — route-gated, BOTH entry points
+
+`preflight_validate_and_probe` runs from `main.rs::loop run` AND
+`batch.rs::run_batch` before any PRD work. It composes
+`validate_runner_routing_config` (strict provider parse, model presence,
+fallback-runner shape) with `check_codex_runner_binary` (PATH lookup of
+`CODEX_BINARY` / bare `codex`, executable-bit check on Unix). The probe is
+ROUTE-GATED: a pure-Claude config (no Codex route anywhere in
+`primaryRunner`) returns Ok before the env var or PATH is touched, so
+operators without `codex` installed never see a probe failure. Batch failure
+of preflight short-circuits the entire batch with `succeeded:0, failed:1,
+results:[]` — identical to the existing `collect_prd_files` Err shape.
+
+### Prohibited outcomes (compile-time + test-time)
+
+- `Provider::Codex` returned from `provider_for_model` (test-asserted; the
+  function signature returns Claude/Grok only)
+- `RunnerKind::Codex` inserted into `IterationContext::runner_overrides`
+  (sentinel test `tests/codex_runner_overrides_invariant.rs`)
+- Full-text substring scan over the assistant transcript for auth markers
+  (must walk lines and match only `[Error: ` prefixes)
+- Byte-restoring a live SQLite WAL/SHM trio (integrity-check only; fatal on
+  corruption; never overwrite)
+- Inferring Codex from a model string (`gpt-*` / `o*` / `codex-mini` etc.)
+- Stamping a per-task `model` on `REVIEW-` / `REFACTOR-` / fixup tasks —
+  routing is config-owned via `primaryRunner.byIdPrefix`
+
 ## Status mutations — use TaskLifecycle
 
 All `tasks.status` writes inside `loop_engine/` go through `TaskLifecycle`

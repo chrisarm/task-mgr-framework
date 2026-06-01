@@ -290,6 +290,41 @@ yourself.
 | `task-mgr how` | Map a natural-language intent to canonical task-mgr commands |
 <!-- TASK_MGR:END -->
 
+### Codex runner (provider-only routing)
+
+The loop engine supports OpenAI Codex as a third `RunnerKind` reachable
+EXCLUSIVELY through `primaryRunner` entries with `provider: "codex"`.
+Codex is NEVER inferred from a model string. The merged path adds three
+load-bearing defenses: (1) `preflight_validate_and_probe` runs from BOTH
+`task-mgr loop run` AND `task-mgr batch run` to fail fast on a missing
+`codex` binary when any route requires it; (2) `protected_state` snapshots
+orchestrator-owned files pre-spawn and verify-and-restore post-spawn for
+every Codex iteration (sequential + per-slot + wave); (3)
+`CodexAuthFailure` is excluded from `handle_task_failure` at both callers
+so an auth lapse never pushes healthy tasks toward auto-block.
+
+Opt-in Codex→Claude RuntimeError fallback (separate from the Claude/Grok
+overflow rung-4 pivot):
+
+```json
+{
+  "primaryRunner": {
+    "claudeFallbackModel": "<claude model id>",
+    "byIdPrefix": {
+      "FEAT-": { "provider": "codex", "fallbackToClaude": true }
+    }
+  }
+}
+```
+
+When `fallbackToClaude: true` AND consecutive RuntimeErrors reach
+`primaryRunner.runtimeErrorThreshold`, the task is promoted to Claude
+(`runner_overrides[id] = Claude`, never Codex) — once per loop run.
+Field defaults: `fallbackToClaude=false`; absent → no Codex→Claude
+promotion. See `src/loop_engine/CLAUDE.md` "Codex provider integration"
+for the full design notes (schema, auth detection, protected-state guard,
+binary probe contract, prohibited outcomes).
+
 ### Fallback runner config (Grok)
 
 The loop engine supports a Grok CLI fallback that promotes a stuck task off
