@@ -605,6 +605,7 @@ fn build_shared_slot_params(
 ) -> Arc<SlotIterationParams> {
     Arc::new(SlotIterationParams {
         db_dir: params.db_dir.to_path_buf(),
+        tasks_dir: params.tasks_dir.to_path_buf(),
         permission_mode: params.permission_mode.clone(),
         signal_flag: params.signal_flag.clone(),
         default_model: params.default_model.map(|s| s.to_string()),
@@ -1183,26 +1184,18 @@ pub fn run_wave_iteration(
     let codex_wave = slot_contexts
         .iter()
         .any(|slot| slot.effective_runner == RunnerKind::Codex);
+    // FEAT-002: protected-state verify barrier for Codex waves. Snapshot
+    // captures pre-spawn; verify runs immediately after `run_parallel_wave`
+    // joins and BEFORE `process_slot_result` / merge-back. Non-Codex waves
+    // route through `None` and the barrier is a no-op (byte-identical to
+    // HEAD on pure-Claude/Grok runs).
     let protected_snapshot = if codex_wave {
-        match crate::loop_engine::protected_state::ProtectedTaskStateSnapshot::capture(
-            params.db_dir,
-        ) {
-            Ok(snapshot) => Some(snapshot),
-            Err(e) => {
-                return WaveOutcome {
-                    tasks_completed: 0,
-                    iteration_consumed: true,
-                    terminal: Some(WaveTerminal {
-                        exit_code: 1,
-                        reason: format!("protected task-state snapshot failed: {e}"),
-                        run_status: None,
-                    }),
-                    was_stopped: true,
-                    failed_merges: Vec::new(),
-                    rate_limited_retry: false,
-                };
-            }
-        }
+        Some(
+            crate::loop_engine::protected_state::Snapshot::take_unconditional(
+                params.db_dir,
+                params.tasks_dir,
+            ),
+        )
     } else {
         None
     };
@@ -1211,21 +1204,64 @@ pub fn run_wave_iteration(
     // Run wave (blocks until every spawned slot thread joins).
     let mut wave_result = run_parallel_wave(params.conn, slot_contexts, slot_params);
 
-    if let Some(snapshot) = protected_snapshot.as_ref()
-        && let Err(e) = snapshot.verify_and_restore_text()
-    {
-        return WaveOutcome {
-            tasks_completed: 0,
-            iteration_consumed: true,
-            terminal: Some(WaveTerminal {
-                exit_code: 1,
-                reason: format!("protected task-state mutation detected: {e}"),
-                run_status: None,
-            }),
-            was_stopped: true,
-            failed_merges: Vec::new(),
-            rate_limited_retry: false,
-        };
+    if let Some(snapshot) = protected_snapshot.as_ref() {
+        match snapshot.verify_and_restore() {
+            crate::loop_engine::protected_state::VerifyOutcome::Clean => {}
+            crate::loop_engine::protected_state::VerifyOutcome::Reverted {
+                restored,
+                removed_new_files,
+                errors,
+            } => {
+                ui::emit(&format!(
+                    "[protected-state] Codex wave mutated task state: restored {} file(s), removed {} planted file(s), {} restore error(s)",
+                    restored.len(),
+                    removed_new_files.len(),
+                    errors.len()
+                ));
+                for p in &restored {
+                    ui::emit(&format!("[protected-state]   restored: {}", p.display()));
+                }
+                for p in &removed_new_files {
+                    ui::emit(&format!("[protected-state]   removed:  {}", p.display()));
+                }
+                for e in &errors {
+                    ui::emit(&format!(
+                        "[protected-state]   restore-error {}: {}",
+                        e.path.display(),
+                        e.message
+                    ));
+                }
+            }
+            crate::loop_engine::protected_state::VerifyOutcome::FatalSqliteCorruption {
+                path,
+                reason,
+            } => {
+                // Fatal SQLite corruption — halt this wave AND preserve the
+                // cascade-halt streak by emitting a synthetic FailedMerge so
+                // `apply_merge_fail_reset_and_halt_check` does not reset
+                // `consecutive_merge_fail_waves`. Path/reason carry the
+                // operator-actionable detail.
+                return WaveOutcome {
+                    tasks_completed: 0,
+                    iteration_consumed: true,
+                    terminal: Some(WaveTerminal {
+                        exit_code: 1,
+                        reason: format!(
+                            "protected task-state fatal SQLite corruption at {}: {}",
+                            path.display(),
+                            reason
+                        ),
+                        run_status: None,
+                    }),
+                    was_stopped: true,
+                    failed_merges: vec![FailedMerge {
+                        slot: SYNTHETIC_DEADLOCK_SLOT,
+                        task_id: None,
+                    }],
+                    rate_limited_retry: false,
+                };
+            }
+        }
     }
 
     // Per-slot post-processing on the main thread. The pipeline mutates each
@@ -1769,6 +1805,7 @@ mod tests {
     fn make_slot_params(db_dir: &Path, signal_flag: SignalFlag) -> SlotIterationParams {
         SlotIterationParams {
             db_dir: db_dir.to_path_buf(),
+            tasks_dir: db_dir.join("tasks"),
             permission_mode: PermissionMode::Dangerous,
             signal_flag,
             default_model: None,

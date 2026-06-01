@@ -449,7 +449,7 @@ pub fn check_fallback_runner_binary(cfg: Option<&FallbackRunnerConfig>) -> TaskM
 pub fn validate_runner_routing_config(cfg: &ProjectConfig) -> TaskMgrResult<()> {
     if let Some(fallback) = cfg.fallback_runner.as_ref()
         && fallback.enabled
-        && fallback.provider.trim().to_ascii_lowercase() != "grok"
+        && !fallback.provider.trim().eq_ignore_ascii_case("grok")
     {
         return Err(TaskMgrError::InvalidConfig {
             field: "fallbackRunner.provider".to_string(),

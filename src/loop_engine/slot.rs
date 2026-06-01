@@ -194,16 +194,14 @@ pub fn run_slot_iteration(
     // The slot body MUST NOT read the IterationContext override maps
     // directly (Learning #1810; enforced by the source-sniff test in
     // tests/runtime_error_fallback.rs).
-    let protected_snapshot = if slot.effective_runner == runner::RunnerKind::Codex
-        && !params.protected_snapshot_active
-    {
-        Some(
-            crate::loop_engine::protected_state::ProtectedTaskStateSnapshot::capture(
-                &params.db_dir,
-            )?,
-        )
-    } else {
+    let protected_snapshot = if params.protected_snapshot_active {
         None
+    } else {
+        crate::loop_engine::protected_state::Snapshot::take(
+            &params.db_dir,
+            &params.tasks_dir,
+            slot.effective_runner,
+        )
     };
     let runner_effort = if slot
         .effective_runner
@@ -254,7 +252,7 @@ pub fn run_slot_iteration(
     );
     monitor::stop_monitor(monitor_handle);
     if let Some(snapshot) = protected_snapshot.as_ref() {
-        snapshot.verify_and_restore_text()?;
+        crate::loop_engine::protected_state::apply_verify_outcome(snapshot, "slot")?;
     }
     // FEAT-007: route TaskMgrError::GrokAuthFailure into a Crash(GrokAuthFailure)
     // outcome instead of propagating out of the slot. The post-wave aggregator
@@ -716,6 +714,7 @@ mod tests {
     fn make_slot_params(db_dir: &Path, signal_flag: SignalFlag) -> SlotIterationParams {
         SlotIterationParams {
             db_dir: db_dir.to_path_buf(),
+            tasks_dir: db_dir.join("tasks"),
             permission_mode: PermissionMode::Dangerous,
             signal_flag,
             default_model: None,
@@ -926,6 +925,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let params = SlotIterationParams {
             db_dir: tmp.path().to_path_buf(),
+            tasks_dir: tmp.path().join("tasks"),
             permission_mode: PermissionMode::Dangerous,
             signal_flag: SignalFlag::new(),
             default_model: Some(OPUS_MODEL.to_string()),

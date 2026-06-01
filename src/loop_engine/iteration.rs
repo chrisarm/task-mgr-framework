@@ -490,15 +490,11 @@ pub fn run_iteration(
         prompt_result.task_difficulty.as_deref(),
         Arc::clone(&monitor_handle.last_activity_epoch),
     );
-    let protected_snapshot = if effective_runner == runner::RunnerKind::Codex {
-        Some(
-            crate::loop_engine::protected_state::ProtectedTaskStateSnapshot::capture(
-                params.db_dir,
-            )?,
-        )
-    } else {
-        None
-    };
+    let protected_snapshot = crate::loop_engine::protected_state::Snapshot::take(
+        params.db_dir,
+        params.tasks_dir,
+        effective_runner,
+    );
     let runner_effort = if effective_runner.supports(runner::RunnerCapability::Effort) {
         effort
     } else {
@@ -551,7 +547,7 @@ pub fn run_iteration(
     monitor::stop_monitor(monitor_handle);
     claude::cleanup_ghost_sessions();
     if let Some(snapshot) = protected_snapshot.as_ref() {
-        snapshot.verify_and_restore_text()?;
+        crate::loop_engine::protected_state::apply_verify_outcome(snapshot, "iteration")?;
     }
     // FEAT-007: surface TaskMgrError::GrokAuthFailure as a Crash(GrokAuthFailure)
     // outcome instead of bubbling out of the iteration. The retry-tracking site

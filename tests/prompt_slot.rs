@@ -336,6 +336,7 @@ fn slot_context_threads_bundle_task_id_through_run_slot_iteration() {
     };
     let params = SlotIterationParams {
         db_dir: temp.path().to_path_buf(),
+        tasks_dir: temp.path().join("tasks"),
         permission_mode: PermissionMode::Dangerous,
         signal_flag: signal,
         default_model: None,

@@ -557,6 +557,10 @@ pub struct WaveResult {
 pub struct SlotIterationParams {
     /// Database directory (each slot opens its own connection here).
     pub db_dir: PathBuf,
+    /// Tasks directory (where PRD JSON / prompt files live). Threaded to
+    /// the protected-state guard so it can confine restore writes to this
+    /// root — `db_dir.join("tasks")` is only correct in the common case.
+    pub tasks_dir: PathBuf,
     /// Permission mode for Claude subprocess invocation.
     pub permission_mode: PermissionMode,
     /// Shared signal flag (Arc-backed) for SIGINT/SIGTERM coordination.
