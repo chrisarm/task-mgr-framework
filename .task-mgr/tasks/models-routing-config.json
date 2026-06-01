@@ -242,7 +242,7 @@
       "estimatedEffort": "medium",
       "id": "REVIEW-001",
       "notes": "Do NOT stamp `model` here — runtime `reviewModel` config (currently claude-opus-4-7) owns the reviewer. Spawn fixes via `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001` (no model stamp on them — primaryRunner config routes them). If clean: `<task-status>REVIEW-001:done</task-status>` 'Clean review'. If gen-docs covers the command-reference table, run `cargo run --bin gen-docs` and verify `gen-docs -- --check` is green.",
-      "passes": false,
+      "passes": true,
       "priority": 99,
       "qualityDimensions": [
         "New subcommands wired clap→handler (reachable)",
