@@ -124,7 +124,7 @@
       "id": "FEAT-002",
       "modifiesBehavior": false,
       "notes": "Reuse: handle_set_default (src/commands/models/handlers.rs:~140), the models subcommand enum (src/cli/commands.rs), provider_for_model + resolve_and_verify_grok_binary + check_review_model_binary (src/loop_engine/project_config.rs:376/430), FEAT-001 setters. Model IDs from model.rs constants (no literals). Note the v1 'fallback provider must be grok' rule matches the in-flight codex-runner PRD's config validation — keep the message consistent.",
-      "passes": false,
+      "passes": true,
       "priority": 2,
       "qualityDimensions": [
         "Probe BEFORE write (never persist an unusable config)",
