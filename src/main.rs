@@ -1379,8 +1379,9 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
 
         Commands::Models { action } => {
             use task_mgr::commands::models::{
-                ListOpts, SetDefaultOpts, UnsetDefaultOpts, handle_list, handle_set_default,
-                handle_show, handle_unset_default,
+                ListOpts, SetDefaultOpts, SetFallbackOpts, UnsetDefaultOpts, handle_list,
+                handle_set_default, handle_set_fallback, handle_set_review_model, handle_show,
+                handle_unset_default, handle_unset_fallback, handle_unset_review_model,
             };
             match action {
                 ModelsAction::List { remote, refresh } => {
@@ -1394,6 +1395,37 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                 }
                 ModelsAction::Show => {
                     handle_show(&cli.dir, resolved_db_dir.source)?;
+                }
+                ModelsAction::SetReviewModel { model, project } => {
+                    handle_set_review_model(&cli.dir, &model, project)?;
+                }
+                ModelsAction::UnsetReviewModel { project } => {
+                    handle_unset_review_model(&cli.dir, project)?;
+                }
+                ModelsAction::SetFallback {
+                    enable,
+                    disable,
+                    provider,
+                    model,
+                    cli_binary,
+                    runtime_error_threshold,
+                    project,
+                } => {
+                    handle_set_fallback(
+                        &cli.dir,
+                        SetFallbackOpts {
+                            enable,
+                            disable,
+                            provider,
+                            model,
+                            cli_binary,
+                            runtime_error_threshold,
+                            project,
+                        },
+                    )?;
+                }
+                ModelsAction::UnsetFallback { project } => {
+                    handle_unset_fallback(&cli.dir, project)?;
                 }
             }
             Ok(())

@@ -1633,6 +1633,78 @@ pub enum ModelsAction {
 
     /// Show the currently resolved default model and where it came from
     Show,
+
+    /// Set the reviewModel (routes CODE-REVIEW-*, MILESTONE-FINAL, REVIEW-* tasks)
+    ///
+    /// User scope by default; `--project` writes to `.task-mgr/config.json`.
+    /// When the model routes to Grok, the Grok binary is probed before the
+    /// config is written — a missing binary exits non-zero with no write.
+    #[command(name = "set-review-model")]
+    SetReviewModel {
+        /// Model id to use for review-class tasks (e.g. "grok-build")
+        model: String,
+        /// Write to `.task-mgr/config.json` instead of the per-user config
+        #[arg(long)]
+        project: bool,
+    },
+
+    /// Clear the reviewModel
+    #[command(name = "unset-review-model")]
+    UnsetReviewModel {
+        /// Remove from the project config instead of the per-user config
+        #[arg(long)]
+        project: bool,
+    },
+
+    /// Set the fallbackRunner block (Grok overflow-fallback configuration)
+    ///
+    /// Creates or replaces the entire `fallbackRunner` block.  Pass `--enable`
+    /// to activate it; `--disable` to write a disabled template.  When
+    /// `--enable` is used, the Grok binary is probed BEFORE the config is
+    /// written — a missing binary exits non-zero with no write.
+    ///
+    /// Only `--provider grok` is accepted in v1.
+    #[command(
+        name = "set-fallback",
+        after_help = "\
+EXAMPLES:
+    task-mgr models set-fallback --enable --provider grok --model grok-build
+    task-mgr models set-fallback --enable --model grok-build --cli-binary /usr/local/bin/grok
+    task-mgr models set-fallback --enable --model grok-build --project
+    task-mgr models set-fallback --disable
+"
+    )]
+    SetFallback {
+        /// Enable the fallback runner
+        #[arg(long, conflicts_with = "disable")]
+        enable: bool,
+        /// Disable the fallback runner (leaves other fields at their defaults)
+        #[arg(long, conflicts_with = "enable")]
+        disable: bool,
+        /// Provider name (only "grok" is supported in v1)
+        #[arg(long)]
+        provider: Option<String>,
+        /// Model id passed to the fallback runner (required when --enable)
+        #[arg(long)]
+        model: Option<String>,
+        /// Absolute path to the Grok CLI binary (default: resolved from PATH)
+        #[arg(long = "cli-binary")]
+        cli_binary: Option<String>,
+        /// Consecutive RuntimeError rounds before the fallback fires (default: 2)
+        #[arg(long = "runtime-error-threshold")]
+        runtime_error_threshold: Option<u32>,
+        /// Write to `.task-mgr/config.json` instead of the per-user config
+        #[arg(long)]
+        project: bool,
+    },
+
+    /// Remove the fallbackRunner block entirely
+    #[command(name = "unset-fallback")]
+    UnsetFallback {
+        /// Remove from the project config instead of the per-user config
+        #[arg(long)]
+        project: bool,
+    },
 }
 
 /// Decisions subcommand actions
