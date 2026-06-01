@@ -609,10 +609,8 @@ fn handle_task_failure_defers_promotion_ctx_writes_until_after_commit() {
         .expect("could not read src/loop_engine/recovery.rs from tests/ cwd");
 
     let start = source
-        .find("pub(crate) fn handle_task_failure_with_runner(")
-        .expect(
-            "expected `pub(crate) fn handle_task_failure_with_runner(` to be defined in recovery.rs",
-        );
+        .find("pub fn handle_task_failure_with_runner(")
+        .expect("expected `pub fn handle_task_failure_with_runner(` to be defined in recovery.rs");
     // The next top-level definition after handle_task_failure marks the
     // function body end. Use a search past the opening `{` to find the next
     // `\nfn ` or `\npub fn ` or `\npub(crate) fn ` declaration.
