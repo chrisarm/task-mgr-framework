@@ -171,7 +171,7 @@
       "id": "FEAT-003",
       "modifiesBehavior": false,
       "notes": "Reuse: handle_show (src/commands/models/handlers.rs), ProjectConfig (src/loop_engine/project_config.rs), provider_for_model (src/loop_engine/model.rs:83), ui::emit_data (CONTRACT-LOG-001). Mirror the existing show formatting. If the in-flight codex-runner PRD lands a parse_config_provider, label providers with it for codex-awareness; otherwise provider_for_model is fine.",
-      "passes": false,
+      "passes": true,
       "priority": 3,
       "qualityDimensions": [
         "Reads the same ProjectConfig the loop loads (no bespoke routing recompute)",
