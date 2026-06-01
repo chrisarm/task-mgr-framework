@@ -189,7 +189,21 @@ pub fn handle_show_to<W: io::Write>(
 ) -> io::Result<()> {
     let project_cfg = read_project_config(db_dir);
     let user_cfg = read_user_config();
+    render_default_header(writer, db_dir, db_dir_source, &project_cfg, &user_cfg)?;
+    writeln!(writer)?;
+    writeln!(writer, "Routing:")?;
+    render_review_model(writer, &project_cfg)?;
+    render_fallback_runner(writer, &project_cfg)?;
+    render_primary_runner(writer, &project_cfg)
+}
 
+fn render_default_header<W: io::Write>(
+    writer: &mut W,
+    db_dir: &Path,
+    db_dir_source: crate::db::DbDirSource,
+    project_cfg: &crate::loop_engine::project_config::ProjectConfig,
+    user_cfg: &crate::loop_engine::user_config::UserConfig,
+) -> io::Result<()> {
     let (model, source) = match (
         project_cfg.default_model.as_ref(),
         user_cfg.default_model.as_ref(),
@@ -211,64 +225,66 @@ pub fn handle_show_to<W: io::Write>(
         "db_dir: {}  (source: {})",
         db_dir.display(),
         db_dir_source.label()
-    )?;
+    )
+}
 
-    writeln!(writer)?;
-    writeln!(writer, "Routing:")?;
-
-    // reviewModel
+fn render_review_model<W: io::Write>(
+    writer: &mut W,
+    project_cfg: &crate::loop_engine::project_config::ProjectConfig,
+) -> io::Result<()> {
     match &project_cfg.review_model {
         Some(m) => {
             let pname = provider_label(provider_for_model(Some(m)));
-            writeln!(writer, "  reviewModel:    {m} (provider: {pname})")?;
+            writeln!(writer, "  reviewModel:    {m} (provider: {pname})")
         }
-        None => writeln!(writer, "  reviewModel:    (unset)")?,
+        None => writeln!(writer, "  reviewModel:    (unset)"),
     }
+}
 
-    // fallbackRunner
+fn render_fallback_runner<W: io::Write>(
+    writer: &mut W,
+    project_cfg: &crate::loop_engine::project_config::ProjectConfig,
+) -> io::Result<()> {
     match &project_cfg.fallback_runner {
-        Some(fr) if fr.enabled => {
-            writeln!(
-                writer,
-                "  fallbackRunner: enabled, provider={}, model={}, threshold={}",
-                fr.provider, fr.model, fr.runtime_error_threshold
-            )?;
-        }
-        _ => writeln!(writer, "  fallbackRunner: disabled")?,
+        Some(fr) if fr.enabled => writeln!(
+            writer,
+            "  fallbackRunner: enabled, provider={}, model={}, threshold={}",
+            fr.provider, fr.model, fr.runtime_error_threshold
+        ),
+        _ => writeln!(writer, "  fallbackRunner: disabled"),
     }
+}
 
-    // primaryRunner
-    match &project_cfg.primary_runner {
-        None => writeln!(writer, "  primaryRunner:  (no routes)")?,
-        Some(pr) if pr.by_task_type.is_empty() && pr.by_id_prefix.is_empty() => {
-            writeln!(writer, "  primaryRunner:  (no routes)")?;
-        }
-        Some(pr) => {
-            writeln!(writer, "  primaryRunner:")?;
-            let mut by_task_type: Vec<_> = pr.by_task_type.iter().collect();
-            by_task_type.sort_by_key(|(k, _)| k.as_str());
-            for (task_type, spec) in &by_task_type {
-                let pname = parse_config_provider(&spec.provider)
-                    .map(provider_label)
-                    .unwrap_or(spec.provider.as_str());
-                writeln!(
-                    writer,
-                    "    byTaskType[{task_type}] -> {pname}/{}",
-                    spec.model
-                )?;
-            }
-            let mut by_id_prefix: Vec<_> = pr.by_id_prefix.iter().collect();
-            by_id_prefix.sort_by_key(|(k, _)| k.as_str());
-            for (prefix, spec) in &by_id_prefix {
-                let pname = parse_config_provider(&spec.provider)
-                    .map(provider_label)
-                    .unwrap_or(spec.provider.as_str());
-                writeln!(writer, "    byIdPrefix[{prefix}] -> {pname}/{}", spec.model)?;
-            }
-        }
+fn render_primary_runner<W: io::Write>(
+    writer: &mut W,
+    project_cfg: &crate::loop_engine::project_config::ProjectConfig,
+) -> io::Result<()> {
+    let Some(pr) = &project_cfg.primary_runner else {
+        return writeln!(writer, "  primaryRunner:  (no routes)");
+    };
+    if pr.by_task_type.is_empty() && pr.by_id_prefix.is_empty() {
+        return writeln!(writer, "  primaryRunner:  (no routes)");
     }
-
+    writeln!(writer, "  primaryRunner:")?;
+    let mut by_task_type: Vec<_> = pr.by_task_type.iter().collect();
+    by_task_type.sort_by_key(|(k, _)| k.as_str());
+    for (task_type, spec) in &by_task_type {
+        let pname = runner_spec_provider_label(spec);
+        writeln!(writer, "    byTaskType[{task_type}] -> {pname}/{}", spec.model)?;
+    }
+    let mut by_id_prefix: Vec<_> = pr.by_id_prefix.iter().collect();
+    by_id_prefix.sort_by_key(|(k, _)| k.as_str());
+    for (prefix, spec) in &by_id_prefix {
+        let pname = runner_spec_provider_label(spec);
+        writeln!(writer, "    byIdPrefix[{prefix}] -> {pname}/{}", spec.model)?;
+    }
     Ok(())
+}
+
+fn runner_spec_provider_label(spec: &crate::loop_engine::project_config::RunnerSpec) -> &str {
+    parse_config_provider(&spec.provider)
+        .map(provider_label)
+        .unwrap_or(spec.provider.as_str())
 }
 
 /// Human-readable display name for a [`Provider`].
