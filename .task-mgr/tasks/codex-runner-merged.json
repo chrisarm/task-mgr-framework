@@ -563,7 +563,7 @@
       "description": "CodexRunner::spawn at src/loop_engine/runner.rs:1041-1192 is ~151 lines, mixing five concerns: (a) argv assembly per permission mode (1061-1084), (b) command/env setup (1086-1098), (c) writer-thread spawn (1106-1119), (d) watchdog + stderr-sniffer + stdout-pump (1121-1145), (e) wait + thread joins + post-exit classification (1146-1191). Peer ClaudeRunner::spawn (~522-695) and GrokRunner::spawn (~767-1003) push more into helpers. Two clean extracts bring CodexRunner::spawn in line: (1) build_codex_argv(permission_mode: &PermissionMode, working_dir: Option<&Path>, model: Option<&str>) -> Vec<String> — pure, no IO. (2) classify_codex_exit(exit_code: i32, conversation: &str, stderr_str: &str) -> Option<TaskMgrError>. Constraints: do NOT change argv ordering or the structured [Error: ] auth match (FEAT-003); do NOT introduce a model literal outside model.rs; do NOT introduce a bare-Option resolve_effective_runner call. After extraction CodexRunner::spawn should drop to ~85 lines. Tests: existing codex_*.rs tests must pass unchanged; add unit tests on the two pure extractions covering all three PermissionMode variants and the three exit-classification branches (auth via structured prefix, transient-backend via stderr, generic non-zero).",
       "estimatedEffort": "medium",
       "id": "REFACTOR-FIX-001",
-      "passes": false,
+      "passes": true,
       "priority": 70,
       "title": "Extract build_codex_argv and classify_codex_exit from CodexRunner::spawn",
       "touchesFiles": [
