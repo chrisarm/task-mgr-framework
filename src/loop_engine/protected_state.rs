@@ -35,6 +35,28 @@
 //! at an intermediate component cannot redirect a write outside the protected
 //! tree.
 //!
+//! # TOCTOU window bounds
+//!
+//! The TOCTOU window spans three phases: **snapshot** (state captured before
+//! spawn), the **Codex run** (any observer or racing writer can see mutated
+//! state here), and **verify** (deltas compared post-exit). A fourth gap
+//! exists **after** verify but **before** the next snapshot: mutations landing
+//! in that window — e.g. a background process or a concurrent loop iteration
+//! writing to the worktree — are not attributable to the guarded Codex run and
+//! will not be reverted by the current guard cycle.
+//!
+//! # walk_protected fail-open on unreadable directories
+//!
+//! [`walk_protected`] (used during snapshot and new-file detection) calls
+//! [`std::path::Path::canonicalize`] on every subdirectory to verify
+//! containment before descending. If `canonicalize` returns an error — for
+//! example, `EACCES` because Codex `chmod 000`'d a subdirectory — the
+//! function emits a [`tracing::warn!`] and **skips descent** (see
+//! `protected_state.rs` lines 550–564). Files planted beneath an unreadable
+//! directory therefore **escape new-file detection**; the inode/dev/content
+//! checks on already-snapshotted files still fire, but a brand-new file added
+//! under the chmod'd tree will not be caught or reverted.
+//!
 //! # Guard gate
 //!
 //! [`runner_requires_state_guard`] is a positive allowlist — `true` only for
