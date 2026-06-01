@@ -41,7 +41,7 @@ Do **not** hardcode model IDs — they change with each Claude release and must 
 
 **Current model IDs** (bumped in `src/loop_engine/model.rs`):
 
-- **Opus** → `OPUS_MODEL` = `claude-opus-4-7`
+- **Opus** → `OPUS_MODEL` = `claude-opus-4-8`
 - **Sonnet** → `SONNET_MODEL` = `claude-sonnet-4-6`
 - **Haiku** → `HAIKU_MODEL` = `claude-haiku-4-5-20251001`
 
