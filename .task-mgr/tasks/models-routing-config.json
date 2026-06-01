@@ -293,7 +293,7 @@
       "description": "handle_show_to in src/commands/models/handlers.rs:185-272 is 88 lines, well over the 30-line ceiling REFACTOR-001 set as an acceptance criterion. It already breaks into four logical render sections (default model + db_dir header, reviewModel, fallbackRunner, primaryRunner). Extracting one helper per section keeps the function flat and readable while satisfying the AC. The provider-label pattern (parse_config_provider(...).map(provider_label).unwrap_or(spec.provider.as_str()) + writeln) repeats inside the primaryRunner branch for byTaskType and byIdPrefix — fold it through a tiny inner helper or a single loop over the two maps to remove the repetition.",
       "estimatedEffort": "low",
       "id": "REFACTOR-FIX-002",
-      "passes": false,
+      "passes": true,
       "priority": 70,
       "title": "Split handle_show_to into per-section render helpers to drop under 30 lines",
       "touchesFiles": [
