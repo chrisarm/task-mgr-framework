@@ -433,7 +433,7 @@
       "id": "FEAT-008",
       "modifiesBehavior": false,
       "notes": "Harness pattern: tests/runner_trait_dispatch.rs make_marker_script (writes a chmod +x shell script to temp dir that echoes stdin); tests/grok_runner_integration.rs for the env-var + prompt-pipe shape and the #[ignore] real-binary convention. Schema MUST match FEAT-001's confirmed event field names. Depends on FEAT-001.",
-      "passes": false,
+      "passes": true,
       "priority": 8,
       "qualityDimensions": [
         "Exercises the real parse path via a stub binary (not a unit-only mock)",
