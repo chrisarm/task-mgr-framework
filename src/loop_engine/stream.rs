@@ -402,8 +402,30 @@ impl StreamFormat for GrokStreamFormat {
 
 /// Codex CLI `exec --json` stream format.
 ///
-/// Output is accumulated from completed assistant messages. Terminal
-/// `turn.completed` usage records are intentionally ignored for output.
+/// Schema confirmed against a live `codex exec --json --skip-git-repo-check`
+/// capture (codex-cli 0.135.0, 2026-05-31): the per-item kind is carried as
+/// the `type` field INSIDE the `item` object (NOT `item_type`), and a single
+/// `command_execution` produces exactly two events — `item.started` (with an
+/// empty `aggregated_output`) and `item.completed` (with the final stdout +
+/// `exit_code`). We emit `ToolUse` ONLY on `item.started` so each command
+/// surfaces as a single tool-use event; `ToolResult` is emitted ONLY on
+/// `item.completed`. Emitting `ToolUse` on both sites would double-count.
+///
+/// `agent_message` items arrive as one complete block via `item.completed`
+/// (line_buffer_tee default of `false` is correct — there is nothing to
+/// buffer up to a newline). Their `text` field is appended to the
+/// assistant buffer; `derive_output` returns the tail-truncated buffer.
+///
+/// Failures: `type: "error"` (top-level `message`) and `type: "turn.failed"`
+/// (nested `error.message`) both surface as `StreamEvent::Error`, which the
+/// shared accumulator records as `[Error: ...]` in the conversation
+/// transcript. That literal prefix is the contract the auth-failure
+/// detector (FEAT-003) scans for; do NOT reshape it without updating that
+/// matcher in lockstep.
+///
+/// Unknown `type` values, unknown item kinds, and malformed JSON-shape
+/// inputs (e.g. `item.completed` with no `item`) are dropped silently for
+/// forward compatibility with future Codex CLI revisions.
 pub(crate) struct CodexStreamFormat;
 
 impl StreamFormat for CodexStreamFormat {
@@ -420,18 +442,13 @@ impl StreamFormat for CodexStreamFormat {
                         }
                     }
                     Some("command_execution") => {
-                        let command = item
-                            .get("command")
-                            .and_then(|c| c.as_str())
-                            .unwrap_or("command_execution");
+                        // ToolUse fires on item.started; here we record only
+                        // the captured output. Duplicating ToolUse here would
+                        // double-count one command as two tool events.
                         let output = item
                             .get("aggregated_output")
                             .and_then(|o| o.as_str())
                             .unwrap_or("");
-                        sink(StreamEvent::ToolUse {
-                            name: "command_execution".to_string(),
-                            input: command.to_string(),
-                        });
                         sink(StreamEvent::ToolResult(output.to_string()));
                     }
                     _ => {}
@@ -680,6 +697,138 @@ mod tests {
         let (output, conv, _d) = run_format(&CodexStreamFormat, &lines);
         assert_eq!(output, "");
         assert!(conv.contains("[Error: auth failed]"));
+    }
+
+    /// Capture raw events so tests can assert on the event stream itself
+    /// (e.g. exactly one `ToolUse` per command execution).
+    fn collect_events<F: StreamFormat>(format: &F, lines: &[&str]) -> Vec<StreamEvent> {
+        let mut events = Vec::new();
+        let mut sink = |ev| events.push(ev);
+        for line in lines {
+            let val: Value = serde_json::from_str(line).expect("valid JSON fixture line");
+            format.parse_value(&val, &mut sink);
+        }
+        events
+    }
+
+    /// Confirmed against `codex exec --json --skip-git-repo-check` capture
+    /// (codex-cli 0.135.0): a single `/bin/zsh -lc 'echo hi'` produces
+    /// `item.started` (empty `aggregated_output`) followed by
+    /// `item.completed` (output `"hi\n"`). `ToolUse` MUST fire exactly
+    /// once across the pair — emitting it on both sites doubles tool
+    /// counts and corrupts transcripts.
+    #[test]
+    fn codex_command_execution_emits_exactly_one_tool_use() {
+        let lines = [
+            r#"{"type":"item.started","item":{"id":"item_0","type":"command_execution","command":"/bin/zsh -lc 'echo hi'","aggregated_output":"","exit_code":null,"status":"in_progress"}}"#,
+            r#"{"type":"item.completed","item":{"id":"item_0","type":"command_execution","command":"/bin/zsh -lc 'echo hi'","aggregated_output":"hi\n","exit_code":0,"status":"completed"}}"#,
+        ];
+        let events = collect_events(&CodexStreamFormat, &lines);
+
+        let tool_use_count = events
+            .iter()
+            .filter(|e| matches!(e, StreamEvent::ToolUse { .. }))
+            .count();
+        assert_eq!(
+            tool_use_count, 1,
+            "one command_execution must surface as exactly one ToolUse event"
+        );
+
+        let tool_result_count = events
+            .iter()
+            .filter(|e| matches!(e, StreamEvent::ToolResult(_)))
+            .count();
+        assert_eq!(
+            tool_result_count, 1,
+            "one command_execution must surface as exactly one ToolResult event"
+        );
+
+        let result_text = events
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::ToolResult(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            result_text, "hi\n",
+            "ToolResult must carry the completed item's aggregated_output"
+        );
+    }
+
+    /// `agent_message` arrives as one complete block via `item.completed`
+    /// (line_buffer_tee=false is correct); its `text` accumulates into the
+    /// assistant buffer and `derive_output` returns the tail-truncated
+    /// buffer. Confirmed against codex-cli 0.135.0 transcript.
+    #[test]
+    fn codex_agent_message_yields_assistant_text() {
+        let lines = [
+            r#"{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"Hello."}}"#,
+        ];
+        let events = collect_events(&CodexStreamFormat, &lines);
+        assert_eq!(events.len(), 1, "expected one AssistantText event");
+        match &events[0] {
+            StreamEvent::AssistantText(t) => assert_eq!(t, "Hello."),
+            _ => panic!("agent_message must produce AssistantText"),
+        }
+        let (output, _conv, _d) = run_format(&CodexStreamFormat, &lines);
+        assert_eq!(
+            output, "Hello.",
+            "derive_output must return the accumulated assistant text"
+        );
+    }
+
+    /// `type: "turn.failed"` with a nested `error.message` surfaces as
+    /// `StreamEvent::Error(message)` — the body the FEAT-003 auth detector
+    /// scans for via the shared `[Error: …]` accumulator wrapping.
+    #[test]
+    fn codex_turn_failed_yields_error_with_nested_message() {
+        let lines = [r#"{"type":"turn.failed","error":{"message":"x"}}"#];
+        let events = collect_events(&CodexStreamFormat, &lines);
+        assert_eq!(events.len(), 1, "expected one Error event");
+        match &events[0] {
+            StreamEvent::Error(m) => assert_eq!(m, "x"),
+            _ => panic!("turn.failed must yield Error with nested error.message"),
+        }
+    }
+
+    /// `type: "error"` with a top-level `message` surfaces as
+    /// `StreamEvent::Error(message)`. Distinct shape from `turn.failed`;
+    /// both must route through the same `[Error: …]` transcript line.
+    #[test]
+    fn codex_error_type_yields_error_with_top_level_message() {
+        let lines = [r#"{"type":"error","message":"y"}"#];
+        let events = collect_events(&CodexStreamFormat, &lines);
+        assert_eq!(events.len(), 1, "expected one Error event");
+        match &events[0] {
+            StreamEvent::Error(m) => assert_eq!(m, "y"),
+            _ => panic!("type:error must yield Error with top-level message"),
+        }
+    }
+
+    /// Forward-compat: unknown top-level `type`, unknown item kinds, and
+    /// shape-malformed lines (e.g. `item.completed` with no `item`,
+    /// `item.started` with no `item`) must all be dropped silently — no
+    /// events, no panics.
+    #[test]
+    fn codex_unknown_or_malformed_lines_are_ignored() {
+        let lines = [
+            r#"{"type":"thread.started","thread_id":"abc"}"#,
+            r#"{"type":"turn.started"}"#,
+            r#"{"type":"some_future_event","payload":{"x":1}}"#,
+            r#"{"type":"item.completed"}"#,
+            r#"{"type":"item.started"}"#,
+            r#"{"type":"item.completed","item":{"type":"future_kind","data":"x"}}"#,
+            r#"{"type":"item.started","item":{"type":"future_kind"}}"#,
+            r#"{}"#,
+        ];
+        let events = collect_events(&CodexStreamFormat, &lines);
+        assert_eq!(
+            events.len(),
+            0,
+            "unknown and malformed lines must be dropped silently (got {} events)",
+            events.len()
+        );
     }
 
     #[test]
