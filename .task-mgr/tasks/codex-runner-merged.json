@@ -287,7 +287,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": true,
       "notes": "Touch point: recovery.rs Codex early-return — V1 ~src/loop_engine/recovery.rs:174-176 (returns Ok((None,None))), V2 ~recovery.rs:138-140. The promotion inserts Claude (allowed) — NOT Codex. Model resolution: reuse the difficulty→model path in src/loop_engine/model.rs (difficulty high → OPUS_MODEL). Learning [4435]: provider-intent threading — the promotion clears any Codex provider_hint so the task runs as Claude. Depends on FEAT-004 to serialize project_config.rs edits (both add/validate primaryRunner fields).",
-      "passes": false,
+      "passes": true,
       "priority": 5,
       "qualityDimensions": [
         "Opt-in (default false) — no behavior change for existing Codex projects",
