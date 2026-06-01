@@ -1058,30 +1058,7 @@ impl LlmRunner for CodexRunner {
         } = opts;
 
         let binary = resolve_codex_binary();
-        let mut args: Vec<String> = Vec::new();
-        match permission_mode {
-            PermissionMode::Dangerous => {
-                args.push("exec".to_string());
-                args.push("--json".to_string());
-                args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
-            }
-            PermissionMode::Scoped { .. } | PermissionMode::Auto { .. } => {
-                args.push("-a".to_string());
-                args.push("never".to_string());
-                args.push("exec".to_string());
-                args.push("--json".to_string());
-                args.push("--sandbox".to_string());
-                args.push("workspace-write".to_string());
-            }
-        }
-        args.push("--ephemeral".to_string());
-        args.push("--skip-git-repo-check".to_string());
-        if let Some(cwd) = working_dir {
-            args.push("--cd".to_string());
-            args.push(cwd.to_string_lossy().into_owned());
-        }
-        push_optional_flag(&mut args, "-m", model);
-        args.push("-".to_string());
+        let args = build_codex_argv(permission_mode, working_dir, model);
 
         let mut cmd = Command::new(&binary);
         cmd.args(&args)
@@ -1156,28 +1133,17 @@ impl LlmRunner for CodexRunner {
         let _ = writer_handle.join();
         let exit_code = exit_code_from_status(status);
 
-        if exit_code != 0 {
-            let stderr_str = stderr_buf.lock().map(|b| b.clone()).unwrap_or_default();
-            // Post-exit auth-failure classification matches markers ONLY on
-            // structured `[Error: ...]` lines emitted by the stream parser's
-            // `type:"error"` / `type:"turn.failed"` handler. An
-            // `agent_message` that quotes "HTTP 401" lands in `assistant_buf`
-            // (and thus `output`), NOT in the conversation transcript with
-            // the `[Error: ` prefix — so it is NOT misclassified.
-            if let Some(ref conv) = conversation
-                && codex_conversation_indicates_auth_failure(conv)
-            {
-                return Err(TaskMgrError::CodexAuthFailure {
-                    hint: CODEX_AUTH_FAILURE_HINT.to_string(),
-                });
-            }
-            if crate::loop_engine::detection::is_transient_backend(&stderr_str) {
-                return Err(TaskMgrError::TransientBackend {
-                    retry_after_secs: crate::loop_engine::detection::parse_retry_after_secs(
-                        &stderr_str,
-                    ),
-                });
-            }
+        let stderr_str = if exit_code != 0 {
+            stderr_buf.lock().map(|b| b.clone()).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        if let Some(err) = classify_codex_exit(
+            exit_code,
+            conversation.as_deref().unwrap_or(""),
+            &stderr_str,
+        ) {
+            return Err(err);
         }
 
         Ok(RunnerResult {
@@ -1217,6 +1183,80 @@ fn resolve_codex_binary() -> String {
         return env_path;
     }
     "codex".to_string()
+}
+
+/// Assemble the Codex CLI argv for a run. Pure — no `Command`, no env
+/// mutations, no IO. Extracted from `CodexRunner::spawn` to enable unit
+/// testing all three `PermissionMode` branches without spawning a subprocess.
+fn build_codex_argv(
+    permission_mode: &PermissionMode,
+    working_dir: Option<&std::path::Path>,
+    model: Option<&str>,
+) -> Vec<String> {
+    let mut args: Vec<String> = Vec::new();
+    match permission_mode {
+        PermissionMode::Dangerous => {
+            args.push("exec".to_string());
+            args.push("--json".to_string());
+            args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
+        }
+        PermissionMode::Scoped { .. } | PermissionMode::Auto { .. } => {
+            args.push("-a".to_string());
+            args.push("never".to_string());
+            args.push("exec".to_string());
+            args.push("--json".to_string());
+            args.push("--sandbox".to_string());
+            args.push("workspace-write".to_string());
+        }
+    }
+    args.push("--ephemeral".to_string());
+    args.push("--skip-git-repo-check".to_string());
+    if let Some(cwd) = working_dir {
+        args.push("--cd".to_string());
+        args.push(cwd.to_string_lossy().into_owned());
+    }
+    push_optional_flag(&mut args, "-m", model);
+    args.push("-".to_string());
+    args
+}
+
+/// Classify a Codex exit and return the appropriate error, or `None` when the
+/// caller should continue normally (zero exit or unclassified non-zero).
+///
+/// Three branches:
+/// - Auth failure: structured `[Error: …]` line in `conversation` matching
+///   [`CODEX_AUTH_FAILURE_MARKERS`] → `CodexAuthFailure`.
+/// - Transient backend: 5xx / Bad-Gateway pattern in `stderr_str` →
+///   `TransientBackend`.
+/// - Generic non-zero (or zero): `None` — caller records `exit_code` in
+///   `RunnerResult` and continues normally.
+///
+/// `stderr_str` is only populated by the caller when `exit_code != 0`, so
+/// this function re-checks the exit code as a fast-path guard.
+fn classify_codex_exit(
+    exit_code: i32,
+    conversation: &str,
+    stderr_str: &str,
+) -> Option<TaskMgrError> {
+    if exit_code == 0 {
+        return None;
+    }
+    // Post-exit auth-failure classification matches markers ONLY on
+    // structured `[Error: ...]` lines emitted by the stream parser's
+    // `type:"error"` / `type:"turn.failed"` handler. An `agent_message`
+    // that quotes "HTTP 401" lands in `output`, NOT in the conversation
+    // transcript with the `[Error: ` prefix — so it is NOT misclassified.
+    if codex_conversation_indicates_auth_failure(conversation) {
+        return Some(TaskMgrError::CodexAuthFailure {
+            hint: CODEX_AUTH_FAILURE_HINT.to_string(),
+        });
+    }
+    if crate::loop_engine::detection::is_transient_backend(stderr_str) {
+        return Some(TaskMgrError::TransientBackend {
+            retry_after_secs: crate::loop_engine::detection::parse_retry_after_secs(stderr_str),
+        });
+    }
+    None
 }
 
 /// Returns `true` when the Codex stream-json transcript contains a structured
@@ -2648,6 +2688,138 @@ Assistant: I'll retry with credentials.\n";
         assert!(codex_conversation_indicates_auth_failure(
             "\t[Error: Login Required to continue]"
         ));
+    }
+
+    // ------------------------------------------------------------------
+    // build_codex_argv — pure-function unit tests (all three PermissionMode
+    // variants; no subprocess overhead).
+    // ------------------------------------------------------------------
+
+    /// Dangerous mode emits the bypass flag instead of the sandbox chain.
+    #[test]
+    fn build_codex_argv_dangerous_mode() {
+        let argv = build_codex_argv(&PermissionMode::Dangerous, None, None);
+        assert_eq!(argv[0], "exec");
+        assert_eq!(argv[1], "--json");
+        assert_eq!(argv[2], "--dangerously-bypass-approvals-and-sandbox");
+        assert!(argv.contains(&"--ephemeral".to_string()));
+        assert!(argv.contains(&"--skip-git-repo-check".to_string()));
+        assert_eq!(argv.last().map(String::as_str), Some("-"));
+        assert!(!argv.contains(&"-a".to_string()));
+        assert!(!argv.contains(&"--sandbox".to_string()));
+    }
+
+    /// Scoped mode emits the approval-never + sandbox chain.
+    #[test]
+    fn build_codex_argv_scoped_mode() {
+        let argv = build_codex_argv(
+            &PermissionMode::Scoped {
+                allowed_tools: None,
+            },
+            None,
+            None,
+        );
+        assert_eq!(argv[0], "-a");
+        assert_eq!(argv[1], "never");
+        assert_eq!(argv[2], "exec");
+        assert_eq!(argv[3], "--json");
+        assert_eq!(argv[4], "--sandbox");
+        assert_eq!(argv[5], "workspace-write");
+        assert!(argv.contains(&"--ephemeral".to_string()));
+        assert!(argv.contains(&"--skip-git-repo-check".to_string()));
+        assert_eq!(argv.last().map(String::as_str), Some("-"));
+        assert!(!argv.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
+    }
+
+    /// Auto mode is byte-identical to Scoped for the argv shape Codex sees.
+    #[test]
+    fn build_codex_argv_auto_mode() {
+        let auto_argv = build_codex_argv(
+            &PermissionMode::Auto {
+                allowed_tools: None,
+            },
+            None,
+            None,
+        );
+        let scoped_argv = build_codex_argv(
+            &PermissionMode::Scoped {
+                allowed_tools: None,
+            },
+            None,
+            None,
+        );
+        assert_eq!(
+            auto_argv, scoped_argv,
+            "auto and scoped produce identical Codex argv"
+        );
+    }
+
+    /// --cd and -m flags are injected when working_dir / model are Some.
+    #[test]
+    fn build_codex_argv_injects_cd_and_model() {
+        let argv = build_codex_argv(
+            &PermissionMode::Scoped {
+                allowed_tools: None,
+            },
+            Some(std::path::Path::new("/workspace/project")),
+            Some("codex-mini-latest"),
+        );
+        let cd_pos = argv.iter().position(|a| a == "--cd").expect("--cd present");
+        assert_eq!(argv[cd_pos + 1], "/workspace/project");
+        let m_pos = argv.iter().position(|a| a == "-m").expect("-m present");
+        assert_eq!(argv[m_pos + 1], "codex-mini-latest");
+    }
+
+    // ------------------------------------------------------------------
+    // classify_codex_exit — unit tests for the three exit branches.
+    // ------------------------------------------------------------------
+
+    /// Zero exit always returns None (fast path; no string scanning).
+    #[test]
+    fn classify_codex_exit_zero_is_none() {
+        assert!(classify_codex_exit(0, "", "").is_none());
+        assert!(classify_codex_exit(0, "[Error: 401 unauthorized]", "").is_none());
+    }
+
+    /// Non-zero exit with a structured auth-failure line → CodexAuthFailure.
+    #[test]
+    fn classify_codex_exit_auth_failure() {
+        let err = classify_codex_exit(1, "[Error: 401 unauthorized]", "")
+            .expect("auth conversation → Some");
+        assert!(
+            matches!(err, TaskMgrError::CodexAuthFailure { .. }),
+            "expected CodexAuthFailure, got {err:?}"
+        );
+    }
+
+    /// Non-zero exit with a transient-backend stderr → TransientBackend.
+    #[test]
+    fn classify_codex_exit_transient_backend() {
+        let err =
+            classify_codex_exit(1, "", "HTTP 502 Bad Gateway").expect("transient stderr → Some");
+        assert!(
+            matches!(err, TaskMgrError::TransientBackend { .. }),
+            "expected TransientBackend, got {err:?}"
+        );
+    }
+
+    /// Non-zero exit with no special markers → None (generic failure).
+    #[test]
+    fn classify_codex_exit_generic_nonzero_is_none() {
+        assert!(classify_codex_exit(1, "", "").is_none());
+        assert!(classify_codex_exit(2, "some assistant output", "some stderr").is_none());
+    }
+
+    /// Auth takes priority over transient: when both signals are present, the
+    /// auth branch fires first (consistent with the original spawn ordering).
+    #[test]
+    fn classify_codex_exit_auth_beats_transient() {
+        let err = classify_codex_exit(1, "[Error: 401 unauthorized]", "HTTP 502 Bad Gateway")
+            .expect("both signals → Some");
+        assert!(
+            matches!(err, TaskMgrError::CodexAuthFailure { .. }),
+            "auth must win over transient, got {err:?}"
+        );
     }
 
     /// Unit: case-insensitive sniff covers every documented auth phrase.
