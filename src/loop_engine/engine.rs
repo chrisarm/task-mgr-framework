@@ -53,8 +53,9 @@ pub use crate::loop_engine::recovery::auto_block_task;
 // re-export is dropped entirely.
 pub use crate::loop_engine::reactions::pre_spawn::crash_escalated_model as check_crash_escalation;
 pub use crate::loop_engine::recovery::{
-    escalate_task_model_if_needed, handle_task_failure, increment_consecutive_failures,
-    reset_consecutive_failures, should_auto_block, should_escalate_for_consecutive_failures,
+    escalate_task_model_if_needed, escalate_task_model_if_needed_for_runner, handle_task_failure,
+    handle_task_failure_with_runner, increment_consecutive_failures, reset_consecutive_failures,
+    should_auto_block, should_escalate_for_consecutive_failures,
 };
 
 // Parallel-wave scheduling + merge-back orchestration was carved into

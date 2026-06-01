@@ -1229,7 +1229,7 @@ fn resolve_codex_binary() -> String {
 /// `[Error: ` prefix, while plain `agent_message` text goes to the output
 /// channel. Matching only on `[Error: ` lines means a model reply that
 /// quotes "HTTP 401" in agent text is NOT classified as an auth failure.
-fn codex_conversation_indicates_auth_failure(conversation: &str) -> bool {
+pub fn codex_conversation_indicates_auth_failure(conversation: &str) -> bool {
     for line in conversation.lines() {
         let trimmed = line.trim_start();
         let Some(rest) = trimmed.strip_prefix("[Error: ") else {

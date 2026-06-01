@@ -135,7 +135,7 @@ pub(crate) fn escalate_task_model_if_needed_inner(
     task_id: &str,
     new_count: i32,
     ctx: &IterationContext,
-    executed_runner: Option<RunnerKind>,
+    executed_runner: RunnerKind,
     cfg: Option<&project_config::FallbackRunnerConfig>,
     primary_cfg: Option<&project_config::PrimaryRunnerConfig>,
 ) -> TaskMgrResult<(Option<String>, Option<PendingPromotion>)> {
@@ -146,16 +146,7 @@ pub(crate) fn escalate_task_model_if_needed_inner(
         conn.query_row("SELECT model FROM tasks WHERE id = ?", [task_id], |r| {
             r.get::<_, Option<String>>(0)
         })?;
-    let effective_runner = executed_runner.unwrap_or_else(|| {
-        resolve_effective_runner(
-            ctx,
-            task_id,
-            crate::loop_engine::engine::EffectiveRunnerInput {
-                model: current_model.as_deref(),
-                provider_hint: None,
-            },
-        )
-    });
+    let effective_runner = executed_runner;
     if effective_runner == RunnerKind::Codex {
         // FEAT-005: opt-in Codex→Claude fallback on RUNTIME failure. Auth
         // failures (CodexAuthFailure) never reach `handle_task_failure` (the
@@ -435,8 +426,68 @@ pub fn escalate_task_model_if_needed(
     cfg: Option<&project_config::FallbackRunnerConfig>,
     primary_cfg: Option<&project_config::PrimaryRunnerConfig>,
 ) -> TaskMgrResult<Option<String>> {
-    let (model, pending) =
-        escalate_task_model_if_needed_inner(conn, task_id, new_count, ctx, None, cfg, primary_cfg)?;
+    // Derive the runner from the DB model before entering the inner helper.
+    // The inner function requires an explicit runner; callers that DO know the
+    // executed runner (production paths) should use
+    // `escalate_task_model_if_needed_for_runner` to avoid this pre-read.
+    // For Codex tasks this derivation produces Claude (gpt-* has no provider
+    // hint here), which is safe: the non-Codex escalation path is benign for
+    // Claude and Grok tasks; Codex callers must use the explicit-runner variant.
+    let current_model: Option<String> = conn
+        .query_row("SELECT model FROM tasks WHERE id = ?", [task_id], |r| {
+            r.get::<_, Option<String>>(0)
+        })
+        .ok()
+        .flatten();
+    let runner = resolve_effective_runner(
+        ctx,
+        task_id,
+        crate::loop_engine::engine::EffectiveRunnerInput {
+            model: current_model.as_deref(),
+            provider_hint: None,
+        },
+    );
+    let (model, pending) = escalate_task_model_if_needed_inner(
+        conn,
+        task_id,
+        new_count,
+        ctx,
+        runner,
+        cfg,
+        primary_cfg,
+    )?;
+    if let Some(p) = pending {
+        apply_pending_promotion(ctx, &p);
+    }
+    Ok(model)
+}
+
+/// Variant of [`escalate_task_model_if_needed`] for callers that know the
+/// executed runner at the call site.
+///
+/// The explicit `executed_runner` bypasses the model-string re-derivation
+/// that the plain `escalate_task_model_if_needed` uses when the runner is not
+/// known. This is critical for Codex tasks: their `gpt-*` model would
+/// otherwise re-classify as Claude and miss the Codex-specific early-return
+/// path. Used in integration tests and by `handle_task_failure_with_runner`.
+pub fn escalate_task_model_if_needed_for_runner(
+    conn: &Connection,
+    task_id: &str,
+    new_count: i32,
+    executed_runner: RunnerKind,
+    ctx: &mut IterationContext,
+    cfg: Option<&project_config::FallbackRunnerConfig>,
+    primary_cfg: Option<&project_config::PrimaryRunnerConfig>,
+) -> TaskMgrResult<Option<String>> {
+    let (model, pending) = escalate_task_model_if_needed_inner(
+        conn,
+        task_id,
+        new_count,
+        ctx,
+        executed_runner,
+        cfg,
+        primary_cfg,
+    )?;
     if let Some(p) = pending {
         apply_pending_promotion(ctx, &p);
     }
@@ -531,7 +582,7 @@ pub fn handle_task_failure(
     )
 }
 
-pub(crate) fn handle_task_failure_with_runner(
+pub fn handle_task_failure_with_runner(
     conn: &mut Connection,
     task_id: &str,
     current_iteration: i64,
@@ -540,6 +591,32 @@ pub(crate) fn handle_task_failure_with_runner(
     cfg: Option<&project_config::FallbackRunnerConfig>,
     primary_cfg: Option<&project_config::PrimaryRunnerConfig>,
 ) -> TaskMgrResult<()> {
+    // Resolve the effective runner before entering the transaction.
+    // `escalate_task_model_if_needed_inner` requires an explicit RunnerKind;
+    // callers that know the executed runner (production paths) thread it via
+    // `executed_runner`. When None (legacy/non-Codex callers), derive from the
+    // current DB model snapshot. For Codex tasks this derivation produces Claude
+    // (gpt-* has no provider hint), but Codex tasks always arrive with
+    // `executed_runner = Some(RunnerKind::Codex)` from the production engine.
+    let runner = match executed_runner {
+        Some(r) => r,
+        None => {
+            let current_model: Option<String> = conn
+                .query_row("SELECT model FROM tasks WHERE id = ?", [task_id], |r| {
+                    r.get::<_, Option<String>>(0)
+                })
+                .ok()
+                .flatten();
+            resolve_effective_runner(
+                ctx,
+                task_id,
+                crate::loop_engine::engine::EffectiveRunnerInput {
+                    model: current_model.as_deref(),
+                    provider_hint: None,
+                },
+            )
+        }
+    };
     // Phase 1: increment consecutive_failures + (conditional) model escalation
     // inside a single transaction so a mid-flight failure rolls both back.
     //
@@ -584,7 +661,7 @@ pub(crate) fn handle_task_failure_with_runner(
                 task_id,
                 new_count,
                 ctx,
-                executed_runner,
+                runner,
                 cfg,
                 primary_cfg,
             ) {
