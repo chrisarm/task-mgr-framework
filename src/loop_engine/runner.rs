@@ -87,13 +87,22 @@ const GROK_AUTH_FAILURE_SUBSTRINGS: &[&str] = &[
 /// of truth so the loop's auth short-circuit hint stays consistent.
 const GROK_AUTH_FAILURE_HINT: &str = "Run `grok login` to authenticate, then retry the task.";
 const CODEX_AUTH_FAILURE_HINT: &str = "Run `codex login` to authenticate, then retry the task.";
-const CODEX_AUTH_FAILURE_SUBSTRINGS: &[&str] = &[
-    "401 unauthorized",
-    "missing bearer or basic authentication",
-    "not logged in",
-    "login required",
-    "authentication required",
+/// Auth-marker substrings (case-insensitive) that, combined with an
+/// `[Error: ...]` line in the Codex conversation transcript, indicate an
+/// authentication failure. Comparison is against a lowercased copy of the
+/// transcript line. Matched only against STRUCTURED `[Error: ` lines so a
+/// substring hidden in agent text does not trip a false positive.
+const CODEX_AUTH_FAILURE_MARKERS: &[&str] = &[
+    "401",
+    "unauthorized",
+    "missing bearer",
+    "missing-bearer",
+    "invalid api key",
+    "invalid bearer",
     "authentication failed",
+    "authentication required",
+    "not authenticated",
+    "login required",
 ];
 
 /// Cap on stderr bytes buffered for the auth-failure sniff. Stderr beyond this
@@ -1087,7 +1096,28 @@ impl LlmRunner for CodexRunner {
             RunnerKind::Codex,
         );
         let mut child = spawn_with_context(&mut cmd, &binary, "Codex")?;
-        write_prompt_to_stdin(&mut child, prompt, &binary, "Codex")?;
+
+        // Writer thread: a blocking write_all on the main thread would deadlock
+        // when the OS pipe buffer fills (~64 KiB) and Codex is busy with the
+        // request — parent blocks on write while Codex blocks producing output.
+        // The thread tolerates an early Codex exit (BrokenPipe / any other IO
+        // error is non-fatal): stdout-read + exit_code at the bottom of this
+        // function are authoritative for the spawn result.
+        let stdin_pipe = child
+            .stdin
+            .take()
+            .expect("stdin should be piped (Stdio::piped() was set on spawn)");
+        let prompt_owned = prompt.to_string();
+        let writer_handle = std::thread::spawn(move || {
+            use std::io::Write as _;
+            let mut stdin = stdin_pipe;
+            // Best-effort: BrokenPipe is the expected error on early child
+            // exit. Explicit drop closes the write side of the pipe so Codex
+            // observes stdin EOF and proceeds with the captured prompt.
+            let _ = stdin.write_all(prompt_owned.as_bytes());
+            drop(stdin);
+        });
+
         let watchdog = spawn_watchdog(child.id(), signal_flag, timeout, target_task_id);
 
         let stderr_buf = Arc::new(Mutex::new(String::new()));
@@ -1120,12 +1150,23 @@ impl LlmRunner for CodexRunner {
         })?;
         let (timed_out, completion_killed) = watchdog.teardown();
         let _ = stderr_handle.join();
+        // Join the writer thread AFTER the child has exited so we don't hold
+        // onto the stdin pipe past child reaping. join() failures are
+        // non-fatal — the stdin write is best-effort by design.
+        let _ = writer_handle.join();
         let exit_code = exit_code_from_status(status);
 
         if exit_code != 0 {
             let stderr_str = stderr_buf.lock().map(|b| b.clone()).unwrap_or_default();
-            let auth_source = format!("{}\n{}", stderr_str, conversation.as_deref().unwrap_or(""));
-            if contains_codex_auth_failure(&auth_source) {
+            // Post-exit auth-failure classification matches markers ONLY on
+            // structured `[Error: ...]` lines emitted by the stream parser's
+            // `type:"error"` / `type:"turn.failed"` handler. An
+            // `agent_message` that quotes "HTTP 401" lands in `assistant_buf`
+            // (and thus `output`), NOT in the conversation transcript with
+            // the `[Error: ` prefix — so it is NOT misclassified.
+            if let Some(ref conv) = conversation
+                && codex_conversation_indicates_auth_failure(conv)
+            {
                 return Err(TaskMgrError::CodexAuthFailure {
                     hint: CODEX_AUTH_FAILURE_HINT.to_string(),
                 });
@@ -1178,11 +1219,32 @@ fn resolve_codex_binary() -> String {
     "codex".to_string()
 }
 
-fn contains_codex_auth_failure(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    CODEX_AUTH_FAILURE_SUBSTRINGS
-        .iter()
-        .any(|needle| lower.contains(needle))
+/// Returns `true` when the Codex stream-json transcript contains a structured
+/// auth-failure signal: an `[Error: ...]` line (emitted from a `type:"error"`
+/// or `type:"turn.failed"` stream event) whose message contains a marker from
+/// [`CODEX_AUTH_FAILURE_MARKERS`].
+///
+/// **Why structured-only**: the Codex stream parser routes `type:"error"` and
+/// `type:"turn.failed"` events to the conversation transcript with the
+/// `[Error: ` prefix, while plain `agent_message` text goes to the output
+/// channel. Matching only on `[Error: ` lines means a model reply that
+/// quotes "HTTP 401" in agent text is NOT classified as an auth failure.
+fn codex_conversation_indicates_auth_failure(conversation: &str) -> bool {
+    for line in conversation.lines() {
+        let trimmed = line.trim_start();
+        let Some(rest) = trimmed.strip_prefix("[Error: ") else {
+            continue;
+        };
+        let body = rest.strip_suffix(']').unwrap_or(rest);
+        let lower = body.to_ascii_lowercase();
+        if CODEX_AUTH_FAILURE_MARKERS
+            .iter()
+            .any(|marker| lower.contains(marker))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Case-insensitive scan for any of [`GROK_AUTH_FAILURE_SUBSTRINGS`] in the
@@ -2513,6 +2575,79 @@ mod tests {
             Ok(r) => assert_eq!(r.exit_code, 0),
             Err(other) => panic!("expected Ok(success), got Err({other:?})"),
         }
+    }
+
+    /// AC #7 (positive): a structured `[Error: 401 unauthorized]` line in the
+    /// conversation transcript MUST classify as auth failure.
+    #[test]
+    fn codex_conversation_auth_positive_structured_401() {
+        assert!(codex_conversation_indicates_auth_failure(
+            "[Error: 401 unauthorized]"
+        ));
+    }
+
+    /// AC #9 (positive): the broader marker list (V1's 10) covers bearer /
+    /// api-key phrasings that V2's 6-marker list missed.
+    #[test]
+    fn codex_conversation_auth_positive_bearer_and_api_key() {
+        assert!(codex_conversation_indicates_auth_failure(
+            "[Error: missing bearer]"
+        ));
+        assert!(codex_conversation_indicates_auth_failure(
+            "[Error: invalid api key]"
+        ));
+        assert!(codex_conversation_indicates_auth_failure(
+            "[Error: invalid bearer token]"
+        ));
+        assert!(codex_conversation_indicates_auth_failure(
+            "[Error: not authenticated]"
+        ));
+        assert!(codex_conversation_indicates_auth_failure(
+            "[Error: missing-bearer]"
+        ));
+    }
+
+    /// AC #5 + #10 (negative-control): a transcript whose AGENT TEXT mentions
+    /// "HTTP 401" must NOT be classified as auth failure. A naive substring
+    /// scan over the full transcript would return true; the structured
+    /// `[Error: ` matcher correctly returns false because agent text lacks
+    /// the `[Error: ` prefix.
+    #[test]
+    fn codex_conversation_auth_negative_agent_text_quoting_401() {
+        let conversation = "\
+Assistant: I received an HTTP 401 response from the upstream service.\n\
+[ToolResult] Curl returned: HTTP/1.1 401 Unauthorized\n\
+Assistant: I'll retry with credentials.\n";
+        assert!(!codex_conversation_indicates_auth_failure(conversation));
+    }
+
+    /// Negative: empty conversation and a transcript with no `[Error: ]`
+    /// lines must both classify as non-auth.
+    #[test]
+    fn codex_conversation_auth_negative_empty_and_no_error_lines() {
+        assert!(!codex_conversation_indicates_auth_failure(""));
+        assert!(!codex_conversation_indicates_auth_failure(
+            "Assistant: nothing structured here\n"
+        ));
+        // An `[Error: ]` line whose body is unrelated must NOT trip.
+        assert!(!codex_conversation_indicates_auth_failure(
+            "[Error: file not found]"
+        ));
+        assert!(!codex_conversation_indicates_auth_failure(
+            "[Error: rate limit exceeded]"
+        ));
+    }
+
+    /// Case-insensitivity + leading whitespace tolerance: the matcher
+    /// trim_start's each line and lowercases the body before scanning.
+    #[test]
+    fn codex_conversation_auth_case_and_whitespace() {
+        assert!(codex_conversation_indicates_auth_failure(
+            "  [Error: AUTHENTICATION REQUIRED]"
+        ));
+        assert!(codex_conversation_indicates_auth_failure(
+            "\t[Error: Login Required to continue]"
+        ));
     }
 
     /// Unit: case-insensitive sniff covers every documented auth phrase.
