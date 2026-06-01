@@ -186,7 +186,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": true,
       "notes": "Source: V1 runner.rs writer thread ~1157-1172 (join ~1211); structured matcher codex_conversation_indicates_auth_failure ~1291-1309; markers ~1267-1278. V2 to replace: synchronous write_prompt_to_stdin ~1089-1091/1490; contains_codex_auth_failure ~1181 (called ~1125-1132). KEEP V2 transient-backend ~runner.rs:1133. The negative-control test is also ported in FEAT-007 (codex_recovery.rs) — adding the inline unit test here is fine and complementary.",
-      "passes": false,
+      "passes": true,
       "priority": 3,
       "qualityDimensions": [
         "No deadlock on large prompts (async writer thread, concurrent drain)",
