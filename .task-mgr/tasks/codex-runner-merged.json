@@ -518,7 +518,7 @@
       "estimatedEffort": "medium",
       "id": "REVIEW-001",
       "notes": "Do NOT stamp `model` here — the runtime reviewModel config owns the reviewer (it overrides any stamp for review-class tasks). Spawn fixes via `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001` — DB + JSON synced atomically. Do NOT put a model on spawned FIX/WIRE-FIX tasks — primaryRunner.byIdPrefix config routes them. Learning [4481]: config-first routing — don't stamp role models on generated review/fixup tasks. Separately (housekeeping, not a task here): the models-routing-config feature from V1 stays OUT of this branch — it is a separate PR.",
-      "passes": false,
+      "passes": true,
       "priority": 99,
       "qualityDimensions": [
         "No unwrap in production",
