@@ -199,6 +199,19 @@ pub struct SlotPromptParams<'a> {
     pub session_guidance: &'a str,
     /// Primary runner routing configuration.
     pub primary_runner: Option<&'a crate::loop_engine::project_config::PrimaryRunnerConfig>,
+    /// Engine-cached PRD default model (`prd_metadata.default_model`). Threaded
+    /// from `WaveIterationParams::default_model` into the slot's
+    /// `ModelResolutionContext` so the wave baseline tier equals the sequential
+    /// baseline tier for the same task+config (WIRE-FIX-001). Without it,
+    /// `compute_baseline_model` only escalates `difficulty==high`, so non-high
+    /// `baselineTierRoutes` never fire in wave mode.
+    pub prd_default: Option<&'a str>,
+    /// Engine-cached project default model (`.task-mgr/config.json`). See
+    /// [`Self::prd_default`].
+    pub project_default: Option<&'a str>,
+    /// Engine-cached user default model (`$XDG_CONFIG_HOME/task-mgr/config.json`).
+    /// See [`Self::prd_default`].
+    pub user_default: Option<&'a str>,
 }
 
 /// Send-safe bundle of everything a slot worker needs to invoke Claude and
@@ -325,6 +338,9 @@ pub fn build_prompt(
             difficulty: task.difficulty.as_deref(),
             task_id: Some(&task.id),
             primary_runner: params.primary_runner,
+            prd_default: params.prd_default,
+            project_default: params.project_default,
+            user_default: params.user_default,
             ..Default::default()
         },
     );

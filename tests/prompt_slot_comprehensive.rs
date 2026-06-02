@@ -73,6 +73,9 @@ fn make_params(project_root: PathBuf, base_prompt_path: PathBuf) -> SlotPromptPa
         steering_path: None,
         session_guidance: "",
         primary_runner: None,
+        prd_default: None,
+        project_default: None,
+        user_default: None,
     }
 }
 

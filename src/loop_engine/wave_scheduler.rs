@@ -634,6 +634,9 @@ fn build_slot_prompt_params<'a>(
         steering_path: params.steering_path,
         session_guidance: params.session_guidance,
         primary_runner: params.project_config.primary_runner.as_ref(),
+        prd_default: params.default_model,
+        project_default: params.project_default_model,
+        user_default: params.user_default_model,
     }
 }
 
@@ -2507,6 +2510,9 @@ mod tests {
             steering_path: None,
             session_guidance: "",
             primary_runner: None,
+            prd_default: None,
+            project_default: None,
+            user_default: None,
         };
         let slot_paths = vec![tmp.path().to_path_buf()];
         let slots = build_slot_contexts(&conn, vec![scored], &slot_paths, &prompt_params);

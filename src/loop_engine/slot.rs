@@ -752,6 +752,9 @@ mod tests {
             steering_path: None,
             session_guidance: "",
             primary_runner: None,
+            prd_default: None,
+            project_default: None,
+            user_default: None,
         }
     }
 

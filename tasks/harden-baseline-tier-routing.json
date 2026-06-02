@@ -526,7 +526,7 @@
       "id": "MILESTONE-1",
       "modifiesBehavior": false,
       "notes": "The ONE place the full suite runs in the fixes phase. Trunk-green is the invariant.",
-      "passes": false,
+      "passes": true,
       "priority": 20,
       "qualityDimensions": [
         "Whole workspace compiles + tests green, including any pre-existing failures",
@@ -553,7 +553,7 @@
       "id": "TEST-001",
       "modifiesBehavior": false,
       "notes": "Reuse production-shaped fixtures. tests/codex_runner_overrides_invariant.rs already pins never-insert-Codex; extend rather than duplicate.",
-      "passes": false,
+      "passes": true,
       "priority": 25,
       "qualityDimensions": [
         "Covers all three promotion directions' guard behavior through the single primitive's inputs",
@@ -582,7 +582,7 @@
       "estimatedEffort": "high",
       "id": "MILESTONE-2",
       "modifiesBehavior": false,
-      "passes": false,
+      "passes": true,
       "priority": 50,
       "qualityDimensions": [
         "Whole workspace green before the refactor phase begins"
@@ -608,7 +608,7 @@
       "id": "INT-001",
       "modifiesBehavior": false,
       "notes": "This is the one cross-boundary path the PRD introduces (engine ↔ recovery ↔ model). Data contract: typed Option<&str> at every hop — no key-type transition, but the value SOURCE must be identical to the primary site or the divergence reopens.",
-      "passes": false,
+      "passes": true,
       "priority": 55,
       "qualityDimensions": [
         "Confirms value identity (same source) end-to-end, not just type compatibility",
