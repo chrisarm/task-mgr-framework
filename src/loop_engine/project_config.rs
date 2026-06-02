@@ -726,6 +726,17 @@ pub fn update_project_config_format(db_dir: &Path) -> std::io::Result<bool> {
         .tempfile_in(dir)?;
     tmp.write_all(contents.as_bytes())?;
     tmp.write_all(b"\n")?;
+    // The tempfile is created 0o600; persist preserves that, which would narrow
+    // an originally group/world-readable config. Re-apply the original file's
+    // mode before persisting so the migration is permission-neutral.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(orig) = std::fs::metadata(&path) {
+            tmp.as_file()
+                .set_permissions(std::fs::Permissions::from_mode(orig.permissions().mode()))?;
+        }
+    }
     tmp.persist(&path).map_err(|e| e.error)?;
     Ok(true)
 }
@@ -753,6 +764,10 @@ fn migrate_project_config_value(value: &mut serde_json::Value) -> bool {
     changed
 }
 
+/// Fold a legacy `byBaselineTier` map into the canonical `baselineTierRoutes`.
+/// On collision (same prefix + same canonical tier key) the existing canonical
+/// entry wins — legacy values only fill gaps (`entry().or_insert`), never
+/// overwrite a route the operator already expressed in the canonical form.
 fn merge_baseline_tier_routes(
     primary: &mut serde_json::Map<String, serde_json::Value>,
     legacy: serde_json::Value,
@@ -2592,6 +2607,39 @@ mod tests {
         assert!(
             !raw.contains("legacy-loser"),
             "the dropped legacy spec value must not survive anywhere in the file"
+        );
+    }
+
+    /// FIX-003: the rewrite must be permission-neutral. The atomic tempfile is
+    /// created 0o600; without re-applying the original mode, a group/world
+    /// readable config (0o644) would be silently narrowed by `persist`.
+    #[cfg(unix)]
+    #[test]
+    fn test_update_format_preserves_original_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        fs::write(
+            &path,
+            r#"{
+                "primaryRunner": {
+                    "byBaselineTier": {
+                        "FEAT": { "opus": { "provider": "codex" } }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let changed = update_project_config_format(dir.path()).unwrap();
+        assert!(changed, "legacy key must trigger a rewrite");
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o644,
+            "rewrite must preserve the original 0o644 mode, not narrow to the 0o600 tempfile default"
         );
     }
 }
