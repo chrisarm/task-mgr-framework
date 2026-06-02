@@ -131,12 +131,13 @@ pub(crate) fn apply_pending_promotion(ctx: &mut IterationContext, p: &PendingPro
 /// second time; otherwise `Some(PendingPromotion)` built from the args
 /// verbatim.
 ///
-/// This is the THIRD cross-provider promotion site the symmetric-fallback
-/// contract anticipated — see `src/loop_engine/CLAUDE.md` → "Symmetric
-/// Claude↔Grok fallback contract": *"When you add a THIRD cross-provider
-/// promotion site, replicate the `contains_key` guard there too."* The three
-/// existing branches (Claude→Grok, Grok→Claude, Codex→Claude) each inline the
-/// same check today; REFACTOR-001 routes them through this single guard.
+/// This is the single guard the symmetric-fallback contract anticipated — see
+/// `src/loop_engine/CLAUDE.md` → "Symmetric Claude↔Grok fallback contract":
+/// *"When you add a THIRD cross-provider promotion site, replicate the
+/// `contains_key` guard there too."* All four cross-provider branches —
+/// Claude→Grok, Grok→Claude, Codex→Claude (RuntimeError escalation) and the
+/// overflow rung-4 pivot — now route their idempotency check through here
+/// (REFACTOR-001) instead of inlining their own `contains_key` snapshot.
 ///
 /// Contract (compiler- and test-enforced):
 /// - Reads `ctx` IMMUTABLY (`&IterationContext`) → performs NO ctx mutation.
@@ -153,11 +154,6 @@ pub(crate) fn apply_pending_promotion(ctx: &mut IterationContext, p: &PendingPro
 ///   insert is insert-safe (learning [4553]); `source` disambiguates
 ///   Grok→Claude vs. Codex→Claude for the direction-neutral banner
 ///   (learning [4532]).
-//
-// `#[allow(dead_code)]`: REFACTOR-001 adopts this at the three promotion call
-// sites and removes the attribute. Until then the only callers are the unit
-// tests below, so the non-test lib build sees it as unused.
-#[allow(dead_code)]
 pub(crate) fn promote_once(
     ctx: &IterationContext,
     task_id: &str,
@@ -258,17 +254,16 @@ pub(crate) fn escalate_task_model_if_needed_inner(
     //   - Claude→Grok (FEAT-007) when the task is still on Claude.
     //   - Grok→Claude (FEAT-PRIMARY-003) when the task is on Grok.
     //
-    // FEAT-PRIMARY-004 idempotency: a task that has ALREADY been promoted in
-    // either direction carries a `runner_overrides` entry. Promoting it again
-    // would flip it into the OPPOSITE branch (Grok→Claude then Claude→Grok …),
-    // producing an infinite Claude↔Grok ping-pong bounded only by max_retries.
-    // Mirror the `was_already_promoted` guard in `handle_prompt_too_long`
-    // (overflow.rs): once a task has pivoted providers once, no further
-    // cross-provider promotion fires — it falls through to normal failure
-    // accounting → `auto_block_task` per `max_retries`.
-    if ctx.runner_overrides.contains_key(task_id) {
-        return Ok((escalated, None));
-    }
+    // FEAT-PRIMARY-004 idempotency is now owned by `promote_once`
+    // (CONTRACT-PROMO-001): each branch resolves its target and calls
+    // `promote_once`, which returns `None` when a prior promotion already
+    // recorded a `runner_overrides` entry (in EITHER direction). That `None`
+    // makes the branch fall through to `Ok((escalated, None))` — normal failure
+    // accounting → `auto_block_task` — instead of flipping into the OPPOSITE
+    // branch and ping-ponging Claude↔Grok. The per-branch gates below are
+    // side-effect-free, so running them for an already-promoted task before
+    // `promote_once` short-circuits is behavior-neutral; the `tasks.model`
+    // UPDATE fires only when `promote_once` returns `Some`.
     match effective_runner {
         // kind-correct: Claude is the source side; Grok is the fallback target — provider identity, not capability.
         RunnerKind::Claude => {
@@ -297,24 +292,32 @@ pub(crate) fn escalate_task_model_if_needed_inner(
                 return Ok((escalated, None));
             }
 
-            // All gates passed — promote to Grok. DB write happens here; ctx
-            // mutations are bundled into a `PendingPromotion` for the caller to
-            // apply after commit. The pre-promotion snapshot of `tasks.model` is
-            // captured BEFORE the UPDATE rewrites it so the FEAT-008 override-
-            // invalidation detector sees the original value on next iteration.
-            conn.execute(
-                "UPDATE tasks SET model = ? WHERE id = ?",
-                rusqlite::params![fallback.model, task_id],
-            )?;
-            let promotion = PendingPromotion {
-                task_id: task_id.to_string(),
-                pre_promotion_model: current_model,
-                source_runner: RunnerKind::Claude,
-                target_runner: RunnerKind::Grok,
-                target_model: fallback.model.clone(),
+            // All gates passed — promote to Grok via `promote_once` (it owns the
+            // idempotency guard + `PendingPromotion` construction). The DB write
+            // and the deferred ctx apply (post-commit, via
+            // `apply_pending_promotion`) are still owned here. The pre-promotion
+            // snapshot of `tasks.model` (`current_model`) is captured BEFORE the
+            // UPDATE rewrites it so the FEAT-008 override-invalidation detector
+            // sees the original value on next iteration. The UPDATE fires only
+            // when the promotion actually fires (`Some`).
+            match promote_once(
+                ctx,
+                task_id,
+                RunnerKind::Claude,
+                RunnerKind::Grok,
+                fallback.model.clone(),
+                current_model,
                 new_count,
-            };
-            Ok((Some(fallback.model.clone()), Some(promotion)))
+            ) {
+                Some(promotion) => {
+                    conn.execute(
+                        "UPDATE tasks SET model = ? WHERE id = ?",
+                        rusqlite::params![fallback.model, task_id],
+                    )?;
+                    Ok((Some(fallback.model.clone()), Some(promotion)))
+                }
+                None => Ok((escalated, None)),
+            }
         }
         // FEAT-PRIMARY-003: inverse Grok→Claude fallback. A task routed to the
         // Grok primary runner that keeps hitting RuntimeErrors is promoted onto
@@ -341,21 +344,27 @@ pub(crate) fn escalate_task_model_if_needed_inner(
             }
 
             // All gates passed — promote to Claude. Mirror of the FEAT-007 step:
-            // capture the pre-promotion (Grok) model BEFORE the UPDATE, then
-            // bundle the ctx mutations into a `PendingPromotion`.
-            conn.execute(
-                "UPDATE tasks SET model = ? WHERE id = ?",
-                rusqlite::params![claude_model, task_id],
-            )?;
-            let promotion = PendingPromotion {
-                task_id: task_id.to_string(),
-                pre_promotion_model: current_model,
-                source_runner: RunnerKind::Grok,
-                target_runner: RunnerKind::Claude,
-                target_model: claude_model.to_string(),
+            // capture the pre-promotion (Grok) model BEFORE the UPDATE via
+            // `promote_once` (the single idempotency guard + `PendingPromotion`
+            // constructor). The UPDATE fires only when the promotion fires.
+            match promote_once(
+                ctx,
+                task_id,
+                RunnerKind::Grok,
+                RunnerKind::Claude,
+                claude_model.to_string(),
+                current_model,
                 new_count,
-            };
-            Ok((Some(claude_model.to_string()), Some(promotion)))
+            ) {
+                Some(promotion) => {
+                    conn.execute(
+                        "UPDATE tasks SET model = ? WHERE id = ?",
+                        rusqlite::params![claude_model, task_id],
+                    )?;
+                    Ok((Some(claude_model.to_string()), Some(promotion)))
+                }
+                None => Ok((escalated, None)),
+            }
         }
         RunnerKind::Codex => Ok((None, None)),
     }
@@ -364,8 +373,9 @@ pub(crate) fn escalate_task_model_if_needed_inner(
 /// FEAT-005: Codex→Claude opt-in promotion helper. Returns `(None, None)`
 /// (auto-block) unless the matching `primaryRunner` Codex route opted in via
 /// `runtimeErrorFallback: true`, in which case the task is promoted onto a Claude
-/// model. Bound to one promotion per task — re-entry while
-/// `ctx.runner_overrides` already holds the task short-circuits.
+/// model. Bound to one promotion per task via [`promote_once`], which returns
+/// `None` (→ auto-block) when `ctx.runner_overrides` already holds the task —
+/// the single cross-provider idempotency guard, no longer inlined here.
 ///
 /// Auth failures must never reach this function — the sequential and wave
 /// callers exclude `Crash(CodexAuthFailure)` before invoking
@@ -393,9 +403,8 @@ fn maybe_codex_fallback_to_claude(
         Provider, parse_config_provider, primary_runner_baseline_tier_match, primary_runner_match,
     };
 
-    if ctx.runner_overrides.contains_key(task_id) {
-        return Ok((None, None));
-    }
+    // Idempotency is enforced by `promote_once` below (the single
+    // `runner_overrides.contains_key` guard); it is no longer inlined here.
     let Some(primary) = primary_cfg else {
         return Ok((None, None));
     };
@@ -469,19 +478,28 @@ fn maybe_codex_fallback_to_claude(
         conn.query_row("SELECT model FROM tasks WHERE id = ?", [task_id], |r| {
             r.get::<_, Option<String>>(0)
         })?;
-    conn.execute(
-        "UPDATE tasks SET model = ? WHERE id = ?",
-        rusqlite::params![target_model, task_id],
-    )?;
-    let promotion = PendingPromotion {
-        task_id: task_id.to_string(),
+    // `promote_once` owns the idempotency guard + `PendingPromotion`
+    // construction (insert-safe: `target = RunnerKind::Claude`, never Codex,
+    // per learning [4553]). The UPDATE fires only when it returns `Some`; the
+    // caller applies the promotion post-commit via `apply_pending_promotion`.
+    match promote_once(
+        ctx,
+        task_id,
+        RunnerKind::Codex,
+        RunnerKind::Claude,
+        target_model.clone(),
         pre_promotion_model,
-        source_runner: RunnerKind::Codex,
-        target_runner: RunnerKind::Claude,
-        target_model: target_model.clone(),
         new_count,
-    };
-    Ok((Some(target_model), Some(promotion)))
+    ) {
+        Some(promotion) => {
+            conn.execute(
+                "UPDATE tasks SET model = ? WHERE id = ?",
+                rusqlite::params![target_model, task_id],
+            )?;
+            Ok((Some(target_model), Some(promotion)))
+        }
+        None => Ok((None, None)),
+    }
 }
 
 /// Escalate the model for a task in the DB when consecutive failures reach the threshold.

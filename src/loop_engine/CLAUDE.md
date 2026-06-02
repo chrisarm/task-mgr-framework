@@ -165,20 +165,31 @@ Do NOT re-implement the prefix-matching logic anywhere else.
 | Grok → Claude | `primaryRunner.claudeFallbackModel` set | Grok overflow-ladder exhausted (rung 4) OR consecutive RuntimeErrors ≥ `primaryRunner.runtimeErrorThreshold` |
 
 Both paths share the same idempotency guard, and it is the SAME mechanism at
-both sites: a single `ctx.runner_overrides.contains_key(task_id)` snapshot taken
+every site: a single `ctx.runner_overrides.contains_key(task_id)` check taken
 BEFORE the promotion branch. If an override already exists (in EITHER direction),
 the site bails to normal failure accounting (→ `auto_block_task`) instead of
 promoting. A task can only cross the provider boundary ONCE per loop run
-(in-memory override; clears on restart).
+(in-memory override; clears on restart). That check is no longer hand-replicated
+per site: `recovery::promote_once` (CONTRACT-PROMO-001) owns the single
+`contains_key` guard and constructs the `PendingPromotion`. All four
+cross-provider branches call it — Claude→Grok and Grok→Claude (RuntimeError
+escalation, `recovery::escalate_task_model_if_needed_inner`), Codex→Claude
+(`recovery::maybe_codex_fallback_to_claude`), and the overflow rung-4 pivot
+(`reactions::post_output::handle_overflow`). The recovery sites defer the apply
+to `apply_pending_promotion` after `tx.commit()?`; the overflow site applies
+immediately (its own `runner_overrides`/`model_overrides` inserts + the rung-4
+`tasks.model` UPDATE) and keeps its own banner, so it adopts `promote_once`
+purely for the guard and discards the returned `PendingPromotion`.
 
 > ⚠️ Footgun: do NOT gate idempotency on a re-derivation like
 > `provider_for_model(effective_model)` alone. Because a Grok→Claude promotion
 > sets `runner_overrides[id]=Claude`, the next failure would otherwise enter the
 > OPPOSITE (Claude→Grok) branch and flap providers every iteration (bounded only
 > by `max_retries`, each flip spawning a real CLI subprocess). The RuntimeError
-> escalation path shipped without this guard and ping-ponged; it now mirrors the
-> overflow rung-4 `was_already_promoted` snapshot. When you add a THIRD
-> cross-provider promotion site, replicate the `contains_key` guard there too.
+> escalation path shipped without this guard and ping-ponged; it now shares the
+> overflow rung-4 guard via `promote_once`. When you add a FURTHER cross-provider
+> promotion site, route its idempotency check through `promote_once` too — do
+> not re-inline a `contains_key` snapshot.
 
 `claudeFallbackModel` absent → no Grok→Claude fallback. The Grok task
 dead-ends on `blocked` exactly as a Claude task without `fallbackRunner` does.

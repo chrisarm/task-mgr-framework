@@ -41,6 +41,7 @@ use crate::loop_engine::overflow::{
 };
 use crate::loop_engine::project_config::ProjectConfig;
 use crate::loop_engine::prompt::PromptResult;
+use crate::loop_engine::recovery::promote_once;
 use crate::loop_engine::runner::RunnerKind;
 
 /// Select the rung-4 fallback target for the given effective runner, or
@@ -163,11 +164,6 @@ pub fn handle_overflow(params: HandleOverflowParams<'_>) -> RecoveryAction {
         project_config,
     } = params;
 
-    // M2: snapshot whether this task already has a Grok promotion recorded
-    // BEFORE the rung-4 arm can insert one. Used below to suppress a duplicate
-    // banner when the RuntimeError hook fires in the same wave for the same task.
-    let was_already_promoted = ctx.runner_overrides.contains_key(task_id);
-
     // Step 1: pick recovery rung. Rung 4 (FallbackToProvider) sits between
     // rung 3 (to_1m_model) and rung 5 (Blocked); its precondition is a
     // SINGLE-predicate guard (PRD §2.5): the computed `effective_runner`
@@ -196,14 +192,32 @@ pub fn handle_overflow(params: HandleOverflowParams<'_>) -> RecoveryAction {
         }
     // kind-correct: rung 4 gate — a task NOT yet promoted is eligible for a
     // cross-provider pivot whose direction follows `effective_runner`
-    // (Claude→Grok via fallback_runner, Grok→Claude via primary_runner). The
-    // single `!was_already_promoted` predicate is the idempotency guard: a
-    // task already carrying a promotion override (in EITHER direction) skips
-    // rung 4 and falls through to rung 5 (Blocked), so it never bounces back
-    // to the runner it came from.
-    } else if !was_already_promoted
-        && let Some((provider, model, target_runner)) =
-            select_fallback_target(effective_runner, project_config)
+    // (Claude→Grok via fallback_runner, Grok→Claude via primary_runner).
+    // `promote_once` (CONTRACT-PROMO-001) is the single idempotency guard: it
+    // returns `None` when a promotion override already exists (in EITHER
+    // direction), so an already-promoted task skips rung 4 and falls through to
+    // rung 5 (Blocked) and never bounces back to the runner it came from. The
+    // overflow path applies IMMEDIATELY (the `runner_overrides` / `model_overrides`
+    // inserts below + the Step-3 `tasks.model` UPDATE) rather than deferring to
+    // `apply_pending_promotion`, so it keeps its own Step-4 banner and does NOT
+    // consume the returned `PendingPromotion`'s payload (`pre_promotion_model`
+    // is snapshotted separately in Step 2; there is no consecutive-failure
+    // `new_count` in an overflow). Hence the construction inputs are `None` / `0`
+    // and the value is discarded — `promote_once` is adopted here purely for the
+    // centralized `contains_key` guard. Do NOT collapse this into
+    // `apply_pending_promotion` (it emits a different banner keyed on `new_count`).
+    } else if let Some((provider, model, target_runner)) =
+        select_fallback_target(effective_runner, project_config)
+        && promote_once(
+            ctx,
+            task_id,
+            effective_runner,
+            target_runner,
+            model.clone(),
+            None,
+            0,
+        )
+        .is_some()
     {
         // kind-correct: writes the promoted provider identity into the override map — the VALUE is the provider, not a capability flag
         ctx.runner_overrides
@@ -270,13 +284,15 @@ pub fn handle_overflow(params: HandleOverflowParams<'_>) -> RecoveryAction {
         }
     }
 
-    // Step 4: rung-specific stderr message. For FallbackToProvider, suppress
-    // the banner when this task was already promoted (was_already_promoted ==
-    // true) so a wave-mode task that triggers BOTH the overflow rung-4 path
-    // and the RuntimeError hook in the same wave emits exactly one banner.
-    if !matches!(action, RecoveryAction::FallbackToProvider { .. }) || !was_already_promoted {
-        eprintln!("{}", action.user_message(task_id, effort, effective_model));
-    }
+    // Step 4: rung-specific stderr message, emitted once per overflow. The
+    // former `was_already_promoted` suppression for FallbackToProvider was
+    // unreachable: rung 4 now fires only when `promote_once` returned `Some`,
+    // i.e. the task carried no promotion override, so a FallbackToProvider
+    // action implies the task was NOT already promoted. The duplicate-banner
+    // coordination with the RuntimeError hook lives where it belongs — in
+    // `apply_pending_promotion`, which gates its own banner on the standing
+    // `runner_overrides` entry.
+    eprintln!("{}", action.user_message(task_id, effort, effective_model));
 
     // Step 5: best-effort prompt dump.
     let dumps_dir = base_dir.join("overflow-dumps");
