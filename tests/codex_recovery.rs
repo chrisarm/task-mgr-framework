@@ -1044,7 +1044,7 @@ fn recovery_baseline_tier_parity_low_difficulty_no_defaults() {
          no matching Codex route → no promotion"
     );
     assert!(
-        ctx.runner_overrides.get(task_id).is_none(),
+        !ctx.runner_overrides.contains_key(task_id),
         "no promotion means no runner override inserted",
     );
 }
