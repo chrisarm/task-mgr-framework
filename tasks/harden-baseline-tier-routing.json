@@ -704,7 +704,7 @@
       "id": "REFACTOR-003",
       "modifiesBehavior": false,
       "notes": "Learning [1484]: extract loop bodies with enum return types for clean orchestration — WaveDecision { Proceed, EmptyGroup, Deadlock, ... } is the seam. Preserve the FEAT-002 reset/halt contract and the synthetic-deadlock sentinel exactly. [3914]: diff moved block vs original.",
-      "passes": false,
+      "passes": true,
       "priority": 64,
       "qualityDimensions": [
         "Hot path untouched; only decision logic relocated",

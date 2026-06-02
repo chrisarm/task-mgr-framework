@@ -39,6 +39,7 @@ pub mod runner;
 pub mod signals;
 pub(crate) mod slot;
 pub mod stale;
+pub(crate) mod startup;
 pub mod status;
 pub mod status_display;
 pub mod status_queries;
