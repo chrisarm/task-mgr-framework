@@ -501,6 +501,16 @@ pub fn validate_runner_routing_config(cfg: &ProjectConfig) -> TaskMgrResult<()> 
                     message: "model must not be blank unless provider is codex".to_string(),
                 });
             }
+            if spec.model.trim().starts_with('-') {
+                return Err(TaskMgrError::InvalidConfig {
+                    field: format!("primaryRunner.{map_name}.{key}.model"),
+                    message: format!(
+                        "model must not start with `-` (got {:?}); a leading `-` would be \
+                         interpreted as a CLI flag by the child runner",
+                        spec.model.trim(),
+                    ),
+                });
+            }
         }
         for (prefix, tier_map) in &primary.baseline_tier_routes {
             for tier_key in tier_map.keys() {
@@ -2052,6 +2062,58 @@ mod tests {
             msg.contains("baselineTierRoutes.FEAT.superopus") && msg.contains("low"),
             "error must name the bad tier and allowed tiers: {msg}"
         );
+    }
+
+    /// AC (WS-2.2): a route model that starts with `-` (after trim) is rejected
+    /// with an error naming the offending route key, so it cannot be argv-flag-
+    /// confused on the child CLI. Codex routes with an empty model are still valid.
+    #[test]
+    fn test_validate_rejects_model_starting_with_dash() {
+        // Positive: dash-prefixed model on a Grok route must be rejected.
+        let mut by_id = HashMap::new();
+        by_id.insert(
+            "FEAT-".to_string(),
+            RunnerSpec {
+                provider: "grok".to_string(),
+                model: "--flag-injection".to_string(),
+                ..Default::default()
+            },
+        );
+        let cfg = ProjectConfig {
+            primary_runner: Some(PrimaryRunnerConfig {
+                by_id_prefix: by_id,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err =
+            validate_runner_routing_config(&cfg).expect_err("dash-prefixed model must reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("byIdPrefix.FEAT-.model") && msg.contains('-'),
+            "error must name the offending route key and the offending value: {msg}",
+        );
+
+        // Negative: Codex route with empty model must still validate (the check
+        // only fires on a non-empty model starting with `-`).
+        let mut by_type = HashMap::new();
+        by_type.insert(
+            "spike".to_string(),
+            RunnerSpec {
+                provider: "codex".to_string(),
+                model: String::new(),
+                ..Default::default()
+            },
+        );
+        let cfg_codex = ProjectConfig {
+            primary_runner: Some(PrimaryRunnerConfig {
+                by_task_type: by_type,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        validate_runner_routing_config(&cfg_codex)
+            .expect("codex route with empty model must not trigger the dash guard");
     }
 
     /// CONTRACT: `EffectiveRunnerInput` field names match the struct in
