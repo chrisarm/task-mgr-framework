@@ -262,7 +262,10 @@ fn render_primary_runner<W: io::Write>(
     let Some(pr) = &project_cfg.primary_runner else {
         return writeln!(writer, "  primaryRunner:  (no routes)");
     };
-    if pr.by_task_type.is_empty() && pr.by_id_prefix.is_empty() && pr.by_baseline_tier.is_empty() {
+    if pr.by_task_type.is_empty()
+        && pr.by_id_prefix.is_empty()
+        && pr.baseline_tier_routes.is_empty()
+    {
         return writeln!(writer, "  primaryRunner:  (no routes)");
     }
     writeln!(writer, "  primaryRunner:")?;
@@ -282,16 +285,16 @@ fn render_primary_runner<W: io::Write>(
         let pname = runner_spec_provider_label(spec);
         writeln!(writer, "    byIdPrefix[{prefix}] -> {pname}/{}", spec.model)?;
     }
-    let mut by_baseline_tier: Vec<_> = pr.by_baseline_tier.iter().collect();
-    by_baseline_tier.sort_by_key(|(prefix, _)| prefix.as_str());
-    for (prefix, tiers) in &by_baseline_tier {
+    let mut baseline_tier_routes: Vec<_> = pr.baseline_tier_routes.iter().collect();
+    baseline_tier_routes.sort_by_key(|(prefix, _)| prefix.as_str());
+    for (prefix, tiers) in &baseline_tier_routes {
         let mut tier_entries: Vec<_> = tiers.iter().collect();
         tier_entries.sort_by_key(|(tier, _)| tier.as_str());
         for (tier, spec) in tier_entries {
             let pname = runner_spec_provider_label(spec);
             writeln!(
                 writer,
-                "    byBaselineTier[{prefix}][{tier}] -> {pname}/{}",
+                "    baselineTierRoutes[{prefix}][{tier}] -> {pname}/{}",
                 spec.model
             )?;
         }
@@ -403,7 +406,7 @@ pub fn handle_set_review_model(db_dir: &Path, model: &str, project: bool) -> io:
             pr.by_task_type.values().any(|s| s.provider == "codex")
                 || pr.by_id_prefix.values().any(|s| s.provider == "codex")
                 || pr
-                    .by_baseline_tier
+                    .baseline_tier_routes
                     .values()
                     .any(|tiers| tiers.values().any(|s| s.provider == "codex"))
         })
@@ -540,10 +543,10 @@ mod show_tests {
                         "runtimeErrorThreshold": 2
                     }},
                     "primaryRunner": {{
-                        "byBaselineTier": {{
+                        "baselineTierRoutes": {{
                             "FEAT": {{
-                                "opus": {{ "provider": "codex", "fallbackToClaude": true }},
-                                "sonnet": {{ "provider": "grok", "model": "grok-build" }}
+                                "high": {{ "provider": "codex", "runtimeErrorFallback": true }},
+                                "standard": {{ "provider": "grok", "model": "grok-build" }}
                             }}
                         }},
                         "byIdPrefix": {{
@@ -570,12 +573,12 @@ mod show_tests {
             "primaryRunner byIdPrefix section missing or wrong; got:\n{out}"
         );
         assert!(
-            out.contains("byBaselineTier[FEAT][opus] -> Codex/"),
-            "primaryRunner byBaselineTier opus section missing or wrong; got:\n{out}"
+            out.contains("baselineTierRoutes[FEAT][high] -> Codex/"),
+            "primaryRunner baselineTierRoutes high section missing or wrong; got:\n{out}"
         );
         assert!(
-            out.contains("byBaselineTier[FEAT][sonnet] -> Grok/grok-build"),
-            "primaryRunner byBaselineTier sonnet section missing or wrong; got:\n{out}"
+            out.contains("baselineTierRoutes[FEAT][standard] -> Grok/grok-build"),
+            "primaryRunner baselineTierRoutes standard section missing or wrong; got:\n{out}"
         );
     }
 
@@ -646,10 +649,10 @@ mod show_tests {
                     "byIdPrefix": {
                         "REVIEW-": { "provider": "grok", "model": "grok-build" }
                     },
-                    "byBaselineTier": {
+                    "baselineTierRoutes": {
                         "FEAT": {
-                            "opus": { "provider": "codex" },
-                            "sonnet": { "provider": "grok", "model": "grok-build" }
+                            "high": { "provider": "codex" },
+                            "standard": { "provider": "grok", "model": "grok-build" }
                         }
                     }
                 }
@@ -671,12 +674,12 @@ mod show_tests {
             "byIdPrefix REVIEW- missing; got:\n{out}"
         );
         assert!(
-            out.contains("byBaselineTier[FEAT][opus] -> Codex/"),
-            "byBaselineTier FEAT opus missing; got:\n{out}"
+            out.contains("baselineTierRoutes[FEAT][high] -> Codex/"),
+            "baselineTierRoutes FEAT high missing; got:\n{out}"
         );
         assert!(
-            out.contains("byBaselineTier[FEAT][sonnet] -> Grok/grok-build"),
-            "byBaselineTier FEAT sonnet missing; got:\n{out}"
+            out.contains("baselineTierRoutes[FEAT][standard] -> Grok/grok-build"),
+            "baselineTierRoutes FEAT standard missing; got:\n{out}"
         );
     }
 }

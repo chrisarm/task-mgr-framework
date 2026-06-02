@@ -67,25 +67,25 @@ fn make_cfg() -> PrimaryRunnerConfig {
 fn make_baseline_tier_cfg() -> PrimaryRunnerConfig {
     let mut tiers = HashMap::new();
     tiers.insert(
-        "opus".to_string(),
+        "high".to_string(),
         RunnerSpec {
             provider: "codex".to_string(),
             model: String::new(),
-            fallback_to_claude: true,
+            runtime_error_fallback: true,
         },
     );
     tiers.insert(
-        "sonnet".to_string(),
+        "standard".to_string(),
         RunnerSpec {
             provider: "grok".to_string(),
             model: GROK_MODEL.to_string(),
             ..Default::default()
         },
     );
-    let mut by_baseline_tier = HashMap::new();
-    by_baseline_tier.insert("FEAT".to_string(), tiers);
+    let mut baseline_tier_routes = HashMap::new();
+    baseline_tier_routes.insert("FEAT".to_string(), tiers);
     PrimaryRunnerConfig {
-        by_baseline_tier,
+        baseline_tier_routes,
         ..Default::default()
     }
 }
@@ -114,7 +114,7 @@ fn by_task_type_review_routes_to_grok() {
 }
 
 #[test]
-fn feat_baseline_tier_routes_sonnet_to_grok_and_opus_to_codex() {
+fn feat_baseline_tier_routes_standard_to_grok_and_high_to_codex() {
     let cfg = make_baseline_tier_cfg();
 
     let sonnet_target = resolve_task_execution_target(&ModelResolutionContext {

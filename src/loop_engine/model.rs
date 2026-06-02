@@ -272,20 +272,21 @@ pub fn model_tier(model: Option<&str>) -> ModelTier {
     }
 }
 
-/// Parse a baseline-tier key from `primaryRunner.byBaselineTier`.
+/// Parse a baseline-tier key from `primaryRunner.baselineTierRoutes`.
 ///
-/// Accepted keys are the stable lowercase tier names used by
-/// `ModelTier` display in config: `haiku`, `sonnet`, and `opus`.
+/// Accepted keys are the stable provider-neutral tier names used in config:
+/// `low`, `standard`, and `high`. The older Claude-family keys (`haiku`,
+/// `sonnet`, `opus`) remain accepted as aliases for backward compatibility.
 /// `default` is intentionally rejected because an unknown/no-model baseline
 /// is not a useful routing policy input.
 pub fn parse_baseline_tier_key(s: &str) -> Result<ModelTier, String> {
     let trimmed = s.trim();
     match trimmed.to_ascii_lowercase().as_str() {
-        "haiku" => Ok(ModelTier::Haiku),
-        "sonnet" => Ok(ModelTier::Sonnet),
-        "opus" => Ok(ModelTier::Opus),
+        "low" | "haiku" => Ok(ModelTier::Haiku),
+        "standard" | "sonnet" => Ok(ModelTier::Sonnet),
+        "high" | "opus" => Ok(ModelTier::Opus),
         _ => Err(format!(
-            "unknown baseline tier {trimmed:?} (expected one of: haiku, sonnet, opus)"
+            "unknown baseline tier {trimmed:?} (expected one of: low, standard, high)"
         )),
     }
 }
@@ -369,10 +370,10 @@ fn id_body_matches_prefix(body: &str, prefix: &str) -> bool {
 
 /// Return a baseline-tier remap for a task ID and Claude baseline model.
 ///
-/// `byBaselineTier` is intentionally checked after direct primary-runner
-/// routes. It gives projects a way to say "for FEAT work, if the normal Claude
-/// baseline would have been Opus, use Codex; if Sonnet, use Grok" without
-/// overriding explicit per-task `model` fields.
+/// `baselineTierRoutes` is intentionally checked after direct primary-runner
+/// routes. It gives projects a way to say "for FEAT work, if the normal
+/// baseline is high capability, use Codex; if standard capability, use Grok"
+/// without overriding explicit per-task `model` fields.
 pub fn primary_runner_baseline_tier_match<'a>(
     cfg: &'a PrimaryRunnerConfig,
     task_id: Option<&str>,
@@ -383,7 +384,7 @@ pub fn primary_runner_baseline_tier_match<'a>(
         return None;
     }
     let body = strip_prd_prefix(task_id?);
-    for (prefix, tier_map) in &cfg.by_baseline_tier {
+    for (prefix, tier_map) in &cfg.baseline_tier_routes {
         if !id_body_matches_prefix(body, prefix) {
             continue;
         }
@@ -936,21 +937,21 @@ mod tests {
     }
 
     #[test]
-    fn test_primary_runner_baseline_tier_feat_opus_routes_to_codex_hint() {
+    fn test_primary_runner_baseline_tier_feat_high_routes_to_codex_hint() {
         use std::collections::HashMap;
         let mut tiers = HashMap::new();
         tiers.insert(
-            "opus".to_string(),
+            "high".to_string(),
             RunnerSpec {
                 provider: "codex".to_string(),
                 model: String::new(),
-                fallback_to_claude: true,
+                runtime_error_fallback: true,
             },
         );
-        let mut by_baseline_tier = HashMap::new();
-        by_baseline_tier.insert("FEAT".to_string(), tiers);
+        let mut baseline_tier_routes = HashMap::new();
+        baseline_tier_routes.insert("FEAT".to_string(), tiers);
         let cfg = PrimaryRunnerConfig {
-            by_baseline_tier,
+            baseline_tier_routes,
             ..Default::default()
         };
 
@@ -967,21 +968,21 @@ mod tests {
     }
 
     #[test]
-    fn test_primary_runner_baseline_tier_feat_sonnet_routes_to_grok() {
+    fn test_primary_runner_baseline_tier_feat_standard_routes_to_grok() {
         use std::collections::HashMap;
         let mut tiers = HashMap::new();
         tiers.insert(
-            "sonnet".to_string(),
+            "standard".to_string(),
             RunnerSpec {
                 provider: "grok".to_string(),
                 model: "grok-build".to_string(),
                 ..Default::default()
             },
         );
-        let mut by_baseline_tier = HashMap::new();
-        by_baseline_tier.insert("FEAT".to_string(), tiers);
+        let mut baseline_tier_routes = HashMap::new();
+        baseline_tier_routes.insert("FEAT".to_string(), tiers);
         let cfg = PrimaryRunnerConfig {
-            by_baseline_tier,
+            baseline_tier_routes,
             ..Default::default()
         };
 
@@ -1001,17 +1002,17 @@ mod tests {
         use std::collections::HashMap;
         let mut tiers = HashMap::new();
         tiers.insert(
-            "opus".to_string(),
+            "high".to_string(),
             RunnerSpec {
                 provider: "codex".to_string(),
                 model: String::new(),
                 ..Default::default()
             },
         );
-        let mut by_baseline_tier = HashMap::new();
-        by_baseline_tier.insert("FEAT".to_string(), tiers);
+        let mut baseline_tier_routes = HashMap::new();
+        baseline_tier_routes.insert("FEAT".to_string(), tiers);
         let cfg = PrimaryRunnerConfig {
-            by_baseline_tier,
+            baseline_tier_routes,
             ..Default::default()
         };
 

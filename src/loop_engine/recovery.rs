@@ -156,7 +156,7 @@ pub(crate) fn escalate_task_model_if_needed_inner(
         //   1. No prior promotion exists for this task (idempotency — mirrors
         //      the symmetric Claude↔Grok ping-pong guard below).
         //   2. The matching `primaryRunner` Codex route has
-        //      `fallbackToClaude: true`.
+        //      `runtimeErrorFallback: true`.
         // Otherwise return `(None, None)` so the legacy auto-block ladder runs
         // (existing Codex projects without the opt-in see unchanged behavior).
         return maybe_codex_fallback_to_claude(conn, task_id, new_count, ctx, primary_cfg);
@@ -287,7 +287,7 @@ pub(crate) fn escalate_task_model_if_needed_inner(
 
 /// FEAT-005: Codex→Claude opt-in promotion helper. Returns `(None, None)`
 /// (auto-block) unless the matching `primaryRunner` Codex route opted in via
-/// `fallbackToClaude: true`, in which case the task is promoted onto a Claude
+/// `runtimeErrorFallback: true`, in which case the task is promoted onto a Claude
 /// model. Bound to one promotion per task — re-entry while
 /// `ctx.runner_overrides` already holds the task short-circuits.
 ///
@@ -335,17 +335,17 @@ fn maybe_codex_fallback_to_claude(
         ..Default::default()
     });
     // `task_type` is not threaded into recovery; production Codex routing is
-    // dominated by `byIdPrefix` and `byBaselineTier`.
+    // dominated by `byIdPrefix` and `baselineTierRoutes`.
     let Some(spec) = primary_runner_match(primary, Some(task_id), None).or_else(|| {
         primary_runner_baseline_tier_match(primary, Some(task_id), baseline_model.as_deref())
     }) else {
         return Ok((None, None));
     };
-    if !spec.fallback_to_claude {
+    if !spec.runtime_error_fallback {
         return Ok((None, None));
     }
     // Guard against misconfiguration: the field is only meaningful on Codex
-    // routes. Treating a Grok/Claude route with `fallbackToClaude:true` as a
+    // routes. Treating a Grok/Claude route with `runtimeErrorFallback:true` as a
     // promotion trigger would silently override the existing fallback paths.
     if parse_config_provider(&spec.provider).ok() != Some(Provider::Codex) {
         return Ok((None, None));
@@ -356,7 +356,7 @@ fn maybe_codex_fallback_to_claude(
     //   - high → OPUS_MODEL (matches `resolve_task_model` rung 3 semantics)
     //   - else → `primary.claude_fallback_model` if set (mirrors the
     //     symmetric Grok→Claude branch's source of truth), else OPUS_MODEL
-    //     as the safe baseline. Opting in via `fallbackToClaude:true` makes
+    //     as the safe baseline. Opting in via `runtimeErrorFallback:true` makes
     //     the operator's intent explicit, so we never bail on a missing
     //     `claudeFallbackModel` (unlike the Grok→Claude branch which is
     //     project-level rather than per-route).
@@ -1675,14 +1675,14 @@ mod tests {
 
     use crate::loop_engine::project_config::{PrimaryRunnerConfig, RunnerSpec};
 
-    fn primary_with_codex_route(prefix: &str, fallback_to_claude: bool) -> PrimaryRunnerConfig {
+    fn primary_with_codex_route(prefix: &str, runtime_error_fallback: bool) -> PrimaryRunnerConfig {
         let mut by_id_prefix = std::collections::HashMap::new();
         by_id_prefix.insert(
             prefix.to_string(),
             RunnerSpec {
                 provider: "codex".to_string(),
                 model: String::new(),
-                fallback_to_claude,
+                runtime_error_fallback,
             },
         );
         PrimaryRunnerConfig {
@@ -1741,7 +1741,7 @@ mod tests {
         model
     }
 
-    /// Positive AC: fallbackToClaude:true + Codex RUNTIME failure →
+    /// Positive AC: runtimeErrorFallback:true + Codex RUNTIME failure →
     /// runner_overrides[id] == RunnerKind::Claude with a Claude model, exactly once.
     #[test]
     fn test_codex_fallback_to_claude_true_promotes_to_claude_once() {
@@ -1829,7 +1829,7 @@ mod tests {
         );
     }
 
-    /// Negative AC: fallbackToClaude:false → no promotion, auto-block (legacy).
+    /// Negative AC: runtimeErrorFallback:false → no promotion, auto-block (legacy).
     #[test]
     fn test_codex_fallback_to_claude_false_yields_no_promotion() {
         let (_dir, conn) = setup_test_db();
@@ -1840,7 +1840,7 @@ mod tests {
         let result = run_codex_escalation(&conn, "SPIKE-004", 2, &mut ctx, Some(&cfg));
         assert_eq!(
             result, None,
-            "fallbackToClaude:false must return None (auto-block path)",
+            "runtimeErrorFallback:false must return None (auto-block path)",
         );
         assert!(
             !ctx.runner_overrides.contains_key("SPIKE-004"),
@@ -1857,7 +1857,7 @@ mod tests {
         );
     }
 
-    /// Negative AC: fallbackToClaude absent → defaults to false (serde).
+    /// Negative AC: runtimeErrorFallback absent → defaults to false (serde).
     /// Tests deserialization path end-to-end.
     #[test]
     fn test_codex_fallback_to_claude_absent_defaults_to_false() {
@@ -1875,7 +1875,7 @@ mod tests {
         let mut ctx = IterationContext::new(8);
 
         let result = run_codex_escalation(&conn, "SPIKE-005", 2, &mut ctx, Some(&cfg));
-        assert_eq!(result, None, "absent fallbackToClaude must auto-block");
+        assert_eq!(result, None, "absent runtimeErrorFallback must auto-block");
         assert!(!ctx.runner_overrides.contains_key("SPIKE-005"));
     }
 
@@ -1907,7 +1907,7 @@ mod tests {
         assert!(result.1.is_none(), "no PendingPromotion must be returned",);
     }
 
-    /// Negative: non-Codex route with fallbackToClaude:true must be ignored.
+    /// Negative: non-Codex route with runtimeErrorFallback:true must be ignored.
     /// The field is only meaningful on Codex routes; a Grok route with the
     /// flag set must not accidentally trigger a Codex→Claude promotion path.
     #[test]
@@ -1920,7 +1920,7 @@ mod tests {
             RunnerSpec {
                 provider: "grok".to_string(),
                 model: "grok-build".to_string(),
-                fallback_to_claude: true, // set on a non-Codex route
+                runtime_error_fallback: true, // set on a non-Codex route
             },
         );
         let cfg = PrimaryRunnerConfig {
@@ -1952,7 +1952,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             result.0, None,
-            "non-Codex route with fallbackToClaude:true must NOT promote",
+            "non-Codex route with runtimeErrorFallback:true must NOT promote",
         );
     }
 
@@ -2015,7 +2015,7 @@ mod tests {
     /// Known-bad regression: confirms `handle_task_failure_with_runner` is
     /// NEVER called for `Crash(CodexAuthFailure)` at either caller, so the
     /// promotion path is unreachable for auth failures even when
-    /// fallbackToClaude:true. Both sequential (orchestrator.rs) and wave
+    /// runtimeErrorFallback:true. Both sequential (orchestrator.rs) and wave
     /// (wave_scheduler.rs) gates must list `CodexAuthFailure` in the
     /// exclusion match — if a future refactor drops it, this test fails.
     #[test]

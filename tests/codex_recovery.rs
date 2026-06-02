@@ -10,7 +10,7 @@
 //!  - `escalate_task_model_if_needed_for_runner` (explicit runner variant)
 //!  - `handle_task_failure_with_runner` (explicit runner variant)
 //!  - `crash_counts_as_task_failure` replaces V1's `is_non_counting_auth_failure`
-//!  - FEAT-005 fallback test added (not in V1): Codex + fallbackToClaude:true
+//!  - FEAT-005 fallback test added (not in V1): Codex + runtimeErrorFallback:true
 //!    → exactly one Claude promotion in `runner_overrides`.
 
 use std::collections::HashMap;
@@ -469,10 +469,10 @@ fn iteration_result_effective_runner_populated_at_spawn_sites() {
     }
 }
 
-// ── NEW: FEAT-005 fallback test — Codex runtime failure + fallbackToClaude:true
+// ── NEW: FEAT-005 fallback test — Codex runtime failure + runtimeErrorFallback:true
 // → runner_overrides carries RunnerKind::Claude exactly once ──────────────────
 
-/// A Codex task whose `primaryRunner` spec has `fallbackToClaude: true` MUST
+/// A Codex task whose `primaryRunner` spec has `runtimeErrorFallback: true` MUST
 /// be promoted to `RunnerKind::Claude` on the first runtime failure at threshold.
 ///
 /// Known-bad negative: a test that only checks `runner_overrides` is NOT Codex
@@ -500,7 +500,7 @@ fn codex_runtime_failure_with_fallback_to_claude_promotes_to_claude_once() {
         RunnerSpec {
             provider: "codex".to_string(),
             model: String::new(),
-            fallback_to_claude: true,
+            runtime_error_fallback: true,
         },
     );
     let primary_cfg = PrimaryRunnerConfig {
@@ -522,7 +522,7 @@ fn codex_runtime_failure_with_fallback_to_claude_promotes_to_claude_once() {
 
     assert!(
         result.is_some(),
-        "fallbackToClaude:true at threshold MUST return Some(target_model)"
+        "runtimeErrorFallback:true at threshold MUST return Some(target_model)"
     );
     assert_eq!(
         ctx.runner_overrides.get("SPIKE-FALLBACK-001").copied(),
@@ -580,17 +580,17 @@ fn codex_baseline_tier_route_with_fallback_to_claude_promotes() {
 
     let mut tiers = HashMap::new();
     tiers.insert(
-        "opus".to_string(),
+        "high".to_string(),
         RunnerSpec {
             provider: "codex".to_string(),
             model: String::new(),
-            fallback_to_claude: true,
+            runtime_error_fallback: true,
         },
     );
-    let mut by_baseline_tier = HashMap::new();
-    by_baseline_tier.insert("FEAT".to_string(), tiers);
+    let mut baseline_tier_routes = HashMap::new();
+    baseline_tier_routes.insert("FEAT".to_string(), tiers);
     let primary_cfg = PrimaryRunnerConfig {
-        by_baseline_tier,
+        baseline_tier_routes,
         ..Default::default()
     };
     let mut ctx = IterationContext::new(8);
@@ -610,7 +610,7 @@ fn codex_baseline_tier_route_with_fallback_to_claude_promotes() {
     assert_eq!(
         ctx.runner_overrides.get("FEAT-TIER-001").copied(),
         Some(RunnerKind::Claude),
-        "byBaselineTier Codex route with fallbackToClaude must promote to Claude"
+        "baselineTierRoutes Codex route with runtimeErrorFallback must promote to Claude"
     );
     assert_eq!(
         ctx.model_overrides.get("FEAT-TIER-001").map(String::as_str),

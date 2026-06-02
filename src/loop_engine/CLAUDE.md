@@ -97,10 +97,10 @@ only in v1; it is not part of the Claude↔Grok fallback pair.
       "REVIEW-":    { "provider": "grok", "model": "grok-build" },
       "MILESTONE-": { "provider": "grok", "model": "grok-build" }
     },
-    "byBaselineTier": {
+    "baselineTierRoutes": {
       "FEAT": {
-        "opus":   { "provider": "codex", "fallbackToClaude": true },
-        "sonnet": { "provider": "grok", "model": "grok-build" }
+        "high":     { "provider": "codex", "runtimeErrorFallback": true },
+        "standard": { "provider": "grok", "model": "grok-build" }
       }
     }
   }
@@ -108,10 +108,11 @@ only in v1; it is not part of the Claude↔Grok fallback pair.
 ```
 
 Field defaults: `claudeFallbackModel=null`, `runtimeErrorThreshold=2`,
-`byTaskType={}`, `byIdPrefix={}`, `byBaselineTier={}`. `RunnerSpec.model`
+`byTaskType={}`, `byIdPrefix={}`, `baselineTierRoutes={}`. `RunnerSpec.model`
 defaults to `""` and is valid only for `provider: "codex"`; Grok and Claude
-routes must provide a nonblank model. `byBaselineTier` is keyed by task prefix,
-then by baseline Claude tier (`haiku`, `sonnet`, `opus`). Absent or `null` →
+routes must provide a nonblank model. `baselineTierRoutes` is keyed by task prefix,
+then by provider-neutral baseline tier (`low`, `standard`, `high`; legacy
+aliases `haiku`, `sonnet`, `opus` still deserialize). Absent or `null` →
 `primary_runner = None` in `ProjectConfig`; loop behavior is byte-identical to
 a pure-Claude run.
 
@@ -125,7 +126,7 @@ explicit task model   (tasks.model DB column / model_overrides override; provide
         → prd default     (prd_metadata.default_model)
           → project default (.task-mgr/config.json defaultModel)
             → user default  ($XDG_CONFIG_HOME/task-mgr/config.json defaultModel)
-    → primaryRunner.byBaselineTier remap for the task prefix + baseline tier
+    → primaryRunner.baselineTierRoutes remap for the task prefix + baseline tier
       → baseline Claude model
         → None
 ```
@@ -145,9 +146,9 @@ for EVERY task):
    (e.g. `"review"`, `"milestone"`).
 2. `byIdPrefix` — the task ID body (after stripping the 8-hex project prefix)
    starts with the map key, OR the body contains `"-<key>"`.
-3. `byBaselineTier` — checked after the normal Claude baseline is computed;
+3. `baselineTierRoutes` — checked after the normal baseline is computed;
    uses the same task-ID prefix matching, then selects the route matching the
-   baseline tier.
+   provider-neutral baseline tier.
 
 When both produce a match, `byTaskType` wins.
 
@@ -995,24 +996,24 @@ RuntimeError escalation path. A sentinel test
 the `CrashType::CodexAuthFailure` pattern is still listed; deleting the
 exclusion fails at unit-test time.
 
-### Opt-in Codex→Claude RuntimeError fallback (`fallbackToClaude`)
+### Opt-in Codex→Claude RuntimeError fallback (`runtimeErrorFallback`)
 
 Codex is closed in v1 to the overflow rung-4 cross-provider pivot. The
 SEPARATE RuntimeError repeated-crash escalation, however, supports an opt-in
-promotion via `primaryRunner.<route>.fallbackToClaude: true`:
+promotion via `primaryRunner.<route>.runtimeErrorFallback: true`:
 
 ```json
 {
   "primaryRunner": {
     "claudeFallbackModel": "<sonnet/opus id>",
     "byIdPrefix": {
-      "FEAT-": { "provider": "codex", "fallbackToClaude": true }
+      "FEAT-": { "provider": "codex", "runtimeErrorFallback": true }
     }
   }
 }
 ```
 
-When `fallbackToClaude` is `true` on a Codex route AND the matching task
+When `runtimeErrorFallback` is `true` on a Codex route AND the matching task
 accumulates RuntimeError crashes past `runtimeErrorThreshold`,
 `maybe_codex_fallback_to_claude` (in `recovery.rs`) writes a
 `PendingPromotion { source_runner: Codex, target_runner: Claude }` to
@@ -1025,10 +1026,10 @@ within the same loop run (idempotency via `runner_overrides.contains_key`).
 Target Claude model: `difficulty=high` → `OPUS_MODEL`; else
 `primary.claude_fallback_model` if set, else `OPUS_MODEL` baseline (unlike
 the Grok→Claude branch, which bails when `claudeFallbackModel` is absent —
-the per-route `fallbackToClaude:true` is an explicit operator opt-in, so we
+the per-route `runtimeErrorFallback:true` is an explicit operator opt-in, so we
 resolve a safe Opus default rather than silently auto-blocking).
 
-Field defaults: `fallbackToClaude=false`. Absent → no Codex→Claude promotion;
+Field defaults: `runtimeErrorFallback=false`. Absent → no Codex→Claude promotion;
 loop behavior is byte-identical to a pure-Claude or Codex-without-fallback
 run. The flag is meaningful ONLY on routes whose `provider` parses to
 `Codex` — set on a Grok/Claude route, it is silently ignored.

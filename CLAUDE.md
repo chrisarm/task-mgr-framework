@@ -90,9 +90,9 @@ wasn't printed.
 Cache: `$XDG_CACHE_HOME/task-mgr/models-cache.json` (24h TTL, stale treated as miss).
 
 **Config locations & precedence** (highest to lowest): explicit task `model` →
-direct `primaryRunner` match → baseline Claude model (`difficulty==high` or
-PRD/project/user default) → `primaryRunner.byBaselineTier` remap → baseline
-Claude model → none.
+direct `primaryRunner` match → baseline model (`difficulty==high` or
+PRD/project/user default) → `primaryRunner.baselineTierRoutes` remap using the
+provider-neutral baseline tier (`low`/`standard`/`high`) → baseline model → none.
 `difficulty==high` always escalates to `OPUS_MODEL`, independent of any
 default.
 
@@ -337,16 +337,16 @@ overflow rung-4 pivot):
   "primaryRunner": {
     "claudeFallbackModel": "<claude model id>",
     "byIdPrefix": {
-      "FEAT-": { "provider": "codex", "fallbackToClaude": true }
+      "FEAT-": { "provider": "codex", "runtimeErrorFallback": true }
     }
   }
 }
 ```
 
-When `fallbackToClaude: true` AND consecutive RuntimeErrors reach
+When `runtimeErrorFallback: true` AND consecutive RuntimeErrors reach
 `primaryRunner.runtimeErrorThreshold`, the task is promoted to Claude
 (`runner_overrides[id] = Claude`, never Codex) — once per loop run.
-Field defaults: `fallbackToClaude=false`; absent → no Codex→Claude
+Field defaults: `runtimeErrorFallback=false`; absent → no Codex→Claude
 promotion. See `src/loop_engine/CLAUDE.md` "Codex provider integration"
 for the full design notes (schema, auth detection, protected-state guard,
 binary probe contract, prohibited outcomes).

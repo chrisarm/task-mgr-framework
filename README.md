@@ -361,7 +361,7 @@ task-mgr models unset-default [--project]
 1. `task.model` — explicit override on the task
 2. `.task-mgr/config.json` direct `primaryRunner` match (`byTaskType` / `byIdPrefix`)
 3. Baseline Claude model (`difficulty == "high"` → Opus, else PRD/project/user default)
-4. `.task-mgr/config.json` `primaryRunner.byBaselineTier` remap, if configured
+4. `.task-mgr/config.json` `primaryRunner.baselineTierRoutes` remap, if configured
 5. The baseline Claude model from step 3
 6. None (CLI default)
 
@@ -380,16 +380,16 @@ Route selected task classes to Codex with `primaryRunner`. Codex routing is expl
 }
 ```
 
-Route by task prefix plus the baseline Claude tier with `byBaselineTier`. This lets a project keep Sonnet as its PRD default while routing ordinary FEAT work to Grok and Opus-baseline FEAT work to Codex:
+Route by task prefix plus the provider-neutral baseline tier with `baselineTierRoutes`. This lets a project keep Sonnet as its PRD default while routing ordinary FEAT work to Grok and high-tier FEAT work to Codex:
 
 ```json
 {
   "primaryRunner": {
     "claudeFallbackModel": "claude-opus-4-8",
-    "byBaselineTier": {
+    "baselineTierRoutes": {
       "FEAT": {
-        "opus": { "provider": "codex", "fallbackToClaude": true },
-        "sonnet": { "provider": "grok", "model": "grok-build" }
+        "high": { "provider": "codex", "runtimeErrorFallback": true },
+        "standard": { "provider": "grok", "model": "grok-build" }
       }
     }
   }

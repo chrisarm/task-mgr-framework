@@ -68,8 +68,8 @@ pub struct RunnerSpec {
     /// the task never returns to Codex. Default: `false` (legacy auto-block).
     /// Ignored on non-codex routes — Claude/Grok runners already have their
     /// own cross-provider promotion paths (`fallbackRunner` / `claudeFallbackModel`).
-    #[serde(default)]
-    pub fallback_to_claude: bool,
+    #[serde(default, alias = "fallbackToClaude")]
+    pub runtime_error_fallback: bool,
 }
 
 /// Per-task-type and per-id-prefix routing for the primary runner.
@@ -101,13 +101,14 @@ pub struct PrimaryRunnerConfig {
     #[serde(default)]
     pub by_id_prefix: HashMap<String, RunnerSpec>,
 
-    /// Task-ID-prefix → baseline Claude tier → `RunnerSpec` routing map.
+    /// Task-ID-prefix → baseline capability tier → `RunnerSpec` routing map.
     ///
     /// Used when a task has no explicit `model`, after its baseline Claude
-    /// tier is known from difficulty/default resolution. Tier keys are
-    /// validated by `model::parse_baseline_tier_key`.
-    #[serde(default)]
-    pub by_baseline_tier: HashMap<String, HashMap<String, RunnerSpec>>,
+    /// model is known from difficulty/default resolution and normalized into
+    /// a provider-neutral tier. Tier keys are validated by
+    /// `model::parse_baseline_tier_key`.
+    #[serde(default, alias = "byBaselineTier")]
+    pub baseline_tier_routes: HashMap<String, HashMap<String, RunnerSpec>>,
 }
 
 impl Default for PrimaryRunnerConfig {
@@ -117,7 +118,7 @@ impl Default for PrimaryRunnerConfig {
             runtime_error_threshold: default_primary_runtime_error_threshold(),
             by_task_type: HashMap::new(),
             by_id_prefix: HashMap::new(),
-            by_baseline_tier: HashMap::new(),
+            baseline_tier_routes: HashMap::new(),
         }
     }
 }
@@ -501,11 +502,11 @@ pub fn validate_runner_routing_config(cfg: &ProjectConfig) -> TaskMgrResult<()> 
                 });
             }
         }
-        for (prefix, tier_map) in &primary.by_baseline_tier {
+        for (prefix, tier_map) in &primary.baseline_tier_routes {
             for tier_key in tier_map.keys() {
                 crate::loop_engine::model::parse_baseline_tier_key(tier_key).map_err(
                     |message| TaskMgrError::InvalidConfig {
-                        field: format!("primaryRunner.byBaselineTier.{prefix}.{tier_key}"),
+                        field: format!("primaryRunner.baselineTierRoutes.{prefix}.{tier_key}"),
                         message,
                     },
                 )?;
@@ -556,11 +557,16 @@ fn primary_runner_specs(
                 .iter()
                 .map(|(k, v)| ("byIdPrefix", k.clone(), v)),
         )
-        .chain(primary.by_baseline_tier.iter().flat_map(|(prefix, tiers)| {
-            tiers
+        .chain(
+            primary
+                .baseline_tier_routes
                 .iter()
-                .map(move |(tier, spec)| ("byBaselineTier", format!("{prefix}.{tier}"), spec))
-        }))
+                .flat_map(|(prefix, tiers)| {
+                    tiers.iter().map(move |(tier, spec)| {
+                        ("baselineTierRoutes", format!("{prefix}.{tier}"), spec)
+                    })
+                }),
+        )
 }
 
 fn primary_runner_contains_codex_review_route(primary: &PrimaryRunnerConfig) -> bool {
@@ -576,7 +582,7 @@ fn primary_runner_contains_codex_review_route(primary: &PrimaryRunnerConfig) -> 
                     let k = key.trim_end_matches('-').to_ascii_uppercase();
                     matches!(k.as_str(), "CODE-REVIEW" | "REVIEW" | "MILESTONE-FINAL")
                 }
-                "byBaselineTier" => {
+                "baselineTierRoutes" => {
                     let prefix = key
                         .split_once('.')
                         .map(|(prefix, _)| prefix)
@@ -657,11 +663,174 @@ pub fn preflight_validate_and_probe(cfg: &ProjectConfig) -> TaskMgrResult<()> {
 pub fn read_project_config(db_dir: &Path) -> ProjectConfig {
     let path = db_dir.join("config.json");
     match std::fs::read_to_string(&path) {
-        Ok(contents) => serde_json::from_str(&contents).unwrap_or_else(|e| {
-            eprintln!("\x1b[33m[warn]\x1b[0m Invalid .task-mgr/config.json: {e}");
-            ProjectConfig::default()
-        }),
+        Ok(contents) => {
+            let value: serde_json::Value = match serde_json::from_str(&contents) {
+                Ok(value) => value,
+                Err(e) => {
+                    crate::output::warn(&format!("Invalid .task-mgr/config.json: {e}"));
+                    return ProjectConfig::default();
+                }
+            };
+            let mut migrated = value.clone();
+            if migrate_project_config_value(&mut migrated) {
+                crate::output::warn(
+                    ".task-mgr/config.json uses legacy model routing keys; run `task-mgr init` \
+                     to update it to baselineTierRoutes/runtimeErrorFallback",
+                );
+            }
+            serde_json::from_value(value).unwrap_or_else(|e| {
+                crate::output::warn(&format!("Invalid .task-mgr/config.json: {e}"));
+                ProjectConfig::default()
+            })
+        }
         Err(_) => ProjectConfig::default(),
+    }
+}
+
+/// Rewrite `<db_dir>/config.json` from legacy routing keys to the current
+/// canonical shape. Returns `true` when the file was changed.
+pub fn update_project_config_format(db_dir: &Path) -> std::io::Result<bool> {
+    use std::io::Write;
+
+    let path = db_dir.join("config.json");
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(contents) if !contents.trim().is_empty() => contents,
+        _ => return Ok(false),
+    };
+    let mut value: serde_json::Value = serde_json::from_str(&contents).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{}: malformed JSON: {e}", path.display()),
+        )
+    })?;
+    if !value.is_object() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{}: config is not a JSON object", path.display()),
+        ));
+    }
+    if !migrate_project_config_value(&mut value) {
+        return Ok(false);
+    }
+
+    let contents = serde_json::to_string_pretty(&value)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let dir = path.parent().unwrap_or(db_dir);
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".config-")
+        .suffix(".json")
+        .tempfile_in(dir)?;
+    tmp.write_all(contents.as_bytes())?;
+    tmp.write_all(b"\n")?;
+    tmp.persist(&path).map_err(|e| e.error)?;
+    Ok(true)
+}
+
+fn migrate_project_config_value(value: &mut serde_json::Value) -> bool {
+    let Some(root) = value.as_object_mut() else {
+        return false;
+    };
+    let Some(primary) = root
+        .get_mut("primaryRunner")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return false;
+    };
+
+    let mut changed = false;
+    changed |= migrate_runner_spec_map(primary.get_mut("byTaskType"));
+    changed |= migrate_runner_spec_map(primary.get_mut("byIdPrefix"));
+
+    if let Some(legacy) = primary.remove("byBaselineTier") {
+        changed = true;
+        merge_baseline_tier_routes(primary, legacy);
+    }
+    changed |= migrate_baseline_tier_routes(primary.get_mut("baselineTierRoutes"));
+    changed
+}
+
+fn merge_baseline_tier_routes(
+    primary: &mut serde_json::Map<String, serde_json::Value>,
+    legacy: serde_json::Value,
+) {
+    let canonical = primary
+        .entry("baselineTierRoutes".to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let Some(canonical_obj) = canonical.as_object_mut() else {
+        return;
+    };
+    let serde_json::Value::Object(legacy_prefixes) = legacy else {
+        return;
+    };
+    for (prefix, legacy_tiers) in legacy_prefixes {
+        let target = canonical_obj
+            .entry(prefix)
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        let Some(target_tiers) = target.as_object_mut() else {
+            continue;
+        };
+        let serde_json::Value::Object(legacy_tiers) = legacy_tiers else {
+            continue;
+        };
+        for (tier, spec) in legacy_tiers {
+            target_tiers
+                .entry(canonical_baseline_tier_key(&tier).to_string())
+                .or_insert(spec);
+        }
+    }
+}
+
+fn migrate_baseline_tier_routes(value: Option<&mut serde_json::Value>) -> bool {
+    let Some(prefixes) = value.and_then(serde_json::Value::as_object_mut) else {
+        return false;
+    };
+    let mut changed = false;
+    for tiers in prefixes.values_mut() {
+        let Some(tiers) = tiers.as_object_mut() else {
+            continue;
+        };
+        let old = std::mem::take(tiers);
+        for (tier, mut spec) in old {
+            let canonical = canonical_baseline_tier_key(&tier).to_string();
+            if canonical != tier {
+                changed = true;
+            }
+            changed |= migrate_runner_spec(&mut spec);
+            tiers.entry(canonical).or_insert(spec);
+        }
+    }
+    changed
+}
+
+fn migrate_runner_spec_map(value: Option<&mut serde_json::Value>) -> bool {
+    let Some(map) = value.and_then(serde_json::Value::as_object_mut) else {
+        return false;
+    };
+    map.values_mut()
+        .fold(false, |changed, spec| migrate_runner_spec(spec) || changed)
+}
+
+fn migrate_runner_spec(spec: &mut serde_json::Value) -> bool {
+    let Some(obj) = spec.as_object_mut() else {
+        return false;
+    };
+    let Some(legacy) = obj.remove("fallbackToClaude") else {
+        return false;
+    };
+    obj.entry("runtimeErrorFallback".to_string())
+        .or_insert(legacy);
+    true
+}
+
+fn canonical_baseline_tier_key(key: &str) -> &str {
+    match key.trim().to_ascii_lowercase().as_str() {
+        "haiku" => "low",
+        "sonnet" => "standard",
+        "opus" => "high",
+        "low" => "low",
+        "standard" => "standard",
+        "high" => "high",
+        _ => key,
     }
 }
 
@@ -1324,7 +1493,7 @@ mod tests {
         assert_eq!(pr.runtime_error_threshold, 2);
         assert!(pr.by_task_type.is_empty());
         assert!(pr.by_id_prefix.is_empty());
-        assert!(pr.by_baseline_tier.is_empty());
+        assert!(pr.baseline_tier_routes.is_empty());
     }
 
     #[test]
@@ -1347,10 +1516,10 @@ mod tests {
                         "REVIEW-":    {{ "provider": "grok", "model": "grok-build" }},
                         "MILESTONE-": {{ "provider": "grok", "model": "grok-build" }}
                     }},
-                    "byBaselineTier": {{
+                    "baselineTierRoutes": {{
                         "FEAT": {{
-                            "opus": {{ "provider": "codex", "fallbackToClaude": true }},
-                            "sonnet": {{ "provider": "grok", "model": "grok-build" }}
+                            "high": {{ "provider": "codex", "runtimeErrorFallback": true }},
+                            "standard": {{ "provider": "grok", "model": "grok-build" }}
                         }}
                     }}
                 }}
@@ -1385,13 +1554,43 @@ mod tests {
         assert_eq!(ms_prefix_spec.provider, "grok");
         assert_eq!(ms_prefix_spec.model, "grok-build");
 
-        let feat_tiers = pr.by_baseline_tier.get("FEAT").expect("FEAT key missing");
-        let opus_spec = feat_tiers.get("opus").expect("opus key missing");
-        assert_eq!(opus_spec.provider, "codex");
-        assert!(opus_spec.fallback_to_claude);
-        let sonnet_spec = feat_tiers.get("sonnet").expect("sonnet key missing");
-        assert_eq!(sonnet_spec.provider, "grok");
-        assert_eq!(sonnet_spec.model, "grok-build");
+        let feat_tiers = pr
+            .baseline_tier_routes
+            .get("FEAT")
+            .expect("FEAT key missing");
+        let high_spec = feat_tiers.get("high").expect("high key missing");
+        assert_eq!(high_spec.provider, "codex");
+        assert!(high_spec.runtime_error_fallback);
+        let standard_spec = feat_tiers.get("standard").expect("standard key missing");
+        assert_eq!(standard_spec.provider, "grok");
+        assert_eq!(standard_spec.model, "grok-build");
+    }
+
+    #[test]
+    fn test_primary_runner_accepts_legacy_baseline_tier_routes_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{
+                "primaryRunner": {
+                    "byBaselineTier": {
+                        "FEAT": {
+                            "opus": { "provider": "codex", "fallbackToClaude": true },
+                            "sonnet": { "provider": "grok", "model": "grok-build" }
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let config = read_project_config(dir.path());
+        let pr = config.primary_runner.expect("primaryRunner present");
+        let feat_tiers = pr
+            .baseline_tier_routes
+            .get("FEAT")
+            .expect("FEAT key missing");
+        assert!(feat_tiers["opus"].runtime_error_fallback);
+        assert_eq!(feat_tiers["sonnet"].model, "grok-build");
     }
 
     #[test]
@@ -1419,8 +1618,8 @@ mod tests {
         assert_eq!(pr.runtime_error_threshold, 2, "default threshold is 2");
         assert!(pr.by_id_prefix.is_empty(), "byIdPrefix absent → empty map");
         assert!(
-            pr.by_baseline_tier.is_empty(),
-            "byBaselineTier absent → empty map"
+            pr.baseline_tier_routes.is_empty(),
+            "baselineTierRoutes absent → empty map"
         );
         let spec = pr.by_task_type.get("review").expect("review key missing");
         assert_eq!(spec.model, "grok-build");
@@ -1473,11 +1672,11 @@ mod tests {
         }
     }
 
-    // ---- RunnerSpec.fallback_to_claude serde tests (FEAT-005) ----
+    // ---- RunnerSpec.runtime_error_fallback serde tests (FEAT-005) ----
 
     #[test]
     fn test_runner_spec_fallback_to_claude_absent_defaults_to_false() {
-        // AC: fallbackToClaude defaults to false; an absent field deserializes
+        // AC: runtimeErrorFallback defaults to false; an absent field deserializes
         // to false. Existing Codex projects keep the legacy auto-block path.
         let dir = tempfile::tempdir().unwrap();
         fs::write(
@@ -1499,13 +1698,40 @@ mod tests {
             .remove("spike")
             .expect("spike key present");
         assert!(
-            !spec.fallback_to_claude,
-            "absent fallbackToClaude must deserialize to false"
+            !spec.runtime_error_fallback,
+            "absent runtimeErrorFallback must deserialize to false"
         );
     }
 
     #[test]
-    fn test_runner_spec_fallback_to_claude_true_round_trips() {
+    fn test_runner_spec_runtime_error_fallback_true_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{
+                "primaryRunner": {
+                    "byIdPrefix": {
+                        "SPIKE-": { "provider": "codex", "runtimeErrorFallback": true }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let cfg = read_project_config(dir.path());
+        let spec = cfg
+            .primary_runner
+            .expect("primaryRunner present")
+            .by_id_prefix
+            .remove("SPIKE-")
+            .expect("SPIKE- key present");
+        assert!(
+            spec.runtime_error_fallback,
+            "runtimeErrorFallback=true must round-trip"
+        );
+    }
+
+    #[test]
+    fn test_runner_spec_runtime_error_fallback_accepts_legacy_alias() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(
             dir.path().join("config.json"),
@@ -1526,14 +1752,14 @@ mod tests {
             .remove("SPIKE-")
             .expect("SPIKE- key present");
         assert!(
-            spec.fallback_to_claude,
-            "fallbackToClaude=true must round-trip"
+            spec.runtime_error_fallback,
+            "legacy fallbackToClaude alias must deserialize to runtimeErrorFallback"
         );
     }
 
     #[test]
-    fn test_runner_spec_fallback_to_claude_snake_case_rejected() {
-        // CONTRACT: the field name on the wire is camelCase (fallbackToClaude),
+    fn test_runner_spec_runtime_error_fallback_snake_case_rejected() {
+        // CONTRACT: the field name on the wire is camelCase (runtimeErrorFallback),
         // matching the rest of RunnerSpec's serde rename_all. snake_case must
         // NOT silently set the field.
         let dir = tempfile::tempdir().unwrap();
@@ -1556,8 +1782,8 @@ mod tests {
             .remove("spike")
             .expect("spike key present");
         assert!(
-            !spec.fallback_to_claude,
-            "snake_case key must not set fallback_to_claude"
+            !spec.runtime_error_fallback,
+            "snake_case key must not set runtime_error_fallback"
         );
     }
 
@@ -1760,11 +1986,11 @@ mod tests {
                 ..Default::default()
             },
         );
-        let mut by_baseline_tier = HashMap::new();
-        by_baseline_tier.insert("FEAT".to_string(), tiers);
+        let mut baseline_tier_routes = HashMap::new();
+        baseline_tier_routes.insert("FEAT".to_string(), tiers);
         let cfg = ProjectConfig {
             primary_runner: Some(PrimaryRunnerConfig {
-                by_baseline_tier,
+                baseline_tier_routes,
                 ..Default::default()
             }),
             ..Default::default()
@@ -1772,7 +1998,7 @@ mod tests {
         let err = validate_runner_routing_config(&cfg).expect_err("unknown tier must reject");
         let msg = format!("{err}");
         assert!(
-            msg.contains("byBaselineTier.FEAT.superopus") && msg.contains("haiku"),
+            msg.contains("baselineTierRoutes.FEAT.superopus") && msg.contains("low"),
             "error must name the bad tier and allowed tiers: {msg}"
         );
     }

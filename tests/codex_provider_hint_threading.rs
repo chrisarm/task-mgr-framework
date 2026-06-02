@@ -32,7 +32,7 @@ fn codex_cfg_for_feat() -> PrimaryRunnerConfig {
         RunnerSpec {
             provider: "codex".to_string(),
             model: GPT_MODEL.to_string(),
-            fallback_to_claude: false,
+            runtime_error_fallback: false,
         },
     );
     PrimaryRunnerConfig {
@@ -48,7 +48,7 @@ fn codex_cfg_for_review() -> PrimaryRunnerConfig {
         RunnerSpec {
             provider: "codex".to_string(),
             model: GPT_MODEL.to_string(),
-            fallback_to_claude: false,
+            runtime_error_fallback: false,
         },
     );
     PrimaryRunnerConfig {
@@ -283,7 +283,7 @@ fn provider_only_codex_with_default_model_routes_to_codex_in_both_paths() {
         RunnerSpec {
             provider: "codex".to_string(),
             model: String::new(), // v1-blessed provider-only shape
-            fallback_to_claude: false,
+            runtime_error_fallback: false,
         },
     );
     let cfg = PrimaryRunnerConfig {

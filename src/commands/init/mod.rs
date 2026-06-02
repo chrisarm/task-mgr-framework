@@ -798,6 +798,8 @@ pub fn init_project(dir: &Path) -> TaskMgrResult<InitResult> {
 
     // Write default config, preserving any existing fields.
     let created_config = write_project_defaults(&db_dir).map_err(TaskMgrError::IoError)?;
+    crate::loop_engine::project_config::update_project_config_format(&db_dir)
+        .map_err(TaskMgrError::IoError)?;
 
     // Fire model picker only when stdin+stderr are both TTYs; skip silently otherwise.
     let _ = crate::commands::models::ensure_default::ensure_default_model(&db_dir, false);

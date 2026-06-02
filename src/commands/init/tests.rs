@@ -2595,6 +2595,83 @@ fn test_init_project_preserves_existing_config_fields() {
 }
 
 #[test]
+fn test_init_project_updates_legacy_model_routing_config() {
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = project_dir.path().join(".task-mgr");
+    fs::create_dir_all(&db_dir).unwrap();
+    fs::write(
+        db_dir.join("config.json"),
+        r#"{
+            "customField": "keepme",
+            "primaryRunner": {
+                "byBaselineTier": {
+                    "FEAT": {
+                        "opus": { "provider": "codex", "fallbackToClaude": true },
+                        "sonnet": { "provider": "grok", "model": "grok-build" }
+                    }
+                },
+                "byIdPrefix": {
+                    "SPIKE-": { "provider": "codex", "fallbackToClaude": true }
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+
+    super::init_project(project_dir.path()).unwrap();
+
+    let config_str = fs::read_to_string(db_dir.join("config.json")).unwrap();
+    let config: serde_json::Value = serde_json::from_str(&config_str).unwrap();
+    assert_eq!(
+        config.get("customField").and_then(|v| v.as_str()),
+        Some("keepme"),
+        "unrelated config fields must be preserved"
+    );
+    let primary = config
+        .get("primaryRunner")
+        .and_then(|v| v.as_object())
+        .expect("primaryRunner object");
+    assert!(
+        !primary.contains_key("byBaselineTier"),
+        "legacy byBaselineTier key must be removed"
+    );
+    let routes = primary
+        .get("baselineTierRoutes")
+        .and_then(|v| v.get("FEAT"))
+        .and_then(|v| v.as_object())
+        .expect("FEAT baselineTierRoutes object");
+    assert!(
+        routes
+            .get("high")
+            .and_then(|v| v.get("runtimeErrorFallback"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        "opus/fallbackToClaude must migrate to high/runtimeErrorFallback"
+    );
+    assert!(
+        routes.get("opus").is_none(),
+        "legacy opus tier key must be removed"
+    );
+    assert_eq!(
+        routes
+            .get("standard")
+            .and_then(|v| v.get("model"))
+            .and_then(|v| v.as_str()),
+        Some("grok-build"),
+        "sonnet tier must migrate to standard"
+    );
+    assert!(
+        primary
+            .get("byIdPrefix")
+            .and_then(|v| v.get("SPIKE-"))
+            .and_then(|v| v.get("runtimeErrorFallback"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        "fallbackToClaude in direct routes must migrate to runtimeErrorFallback"
+    );
+}
+
+#[test]
 fn test_init_project_idempotent() {
     let project_dir = TempDir::new().unwrap();
 
