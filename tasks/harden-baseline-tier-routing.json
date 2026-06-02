@@ -68,7 +68,7 @@
       "id": "ANALYSIS-001",
       "modifiesBehavior": false,
       "notes": "PRD already contains the Consumers + Semantic Distinctions tables (section 6). Use them; do not re-run /analyze from scratch. Learning [4418]: provider identity / baseline must thread from spawn through recovery, not be re-derived — this analysis confirms the threading targets.",
-      "passes": false,
+      "passes": true,
       "priority": 0,
       "qualityDimensions": [
         "Every caller of the five failure-handler functions enumerated with file:line — none missed (a missed caller is a compile error, but enumerate anyway for review)",
@@ -98,7 +98,7 @@
       "id": "CONTRACT-BASE-001",
       "modifiesBehavior": false,
       "notes": "Foundational SSoT consumed by FIX-001. Learning [4049]: precedence chain is explicit task model > primaryRunner match > difficulty=high > prd > project > user. Learning [3057]/[9]: layered resolution. Keep the function total (never panics).",
-      "passes": false,
+      "passes": true,
       "priority": 1,
       "qualityDimensions": [
         "Byte-identical behavior to the prior inline computation — pinned by existing resolution tests passing unchanged",
@@ -125,7 +125,7 @@
       "id": "CONTRACT-PROMO-001",
       "modifiesBehavior": false,
       "notes": "Learning [4553]: insert-safe-provider — Codex→Claude inserts Claude, never Codex (the target arg the caller passes must be RunnerKind::Claude for that path). Learning [4532]: source_runner disambiguates Grok→Claude vs Codex→Claude (both target Claude) for the banner. The primitive only constructs PendingPromotion; the caller still owns apply timing (deferred post-commit vs immediate) — do NOT collapse that.",
-      "passes": false,
+      "passes": true,
       "priority": 2,
       "qualityDimensions": [
         "No ctx mutation, no DB write — purely guard + construct; preserves the deferred-commit transaction boundary",
@@ -176,7 +176,7 @@
       ],
       "modifiesBehavior": false,
       "notes": "Use production-shaped inputs (real ModelResolutionContext / DB rows), not hand-built maps. Data contract: project_default/user_default are typed Option<&str> threaded from the engine cache (engine.rs:159-161), prd_default from `SELECT default_model FROM prd_metadata WHERE id=1`.",
-      "passes": false,
+      "passes": true,
       "priority": 3,
       "qualityDimensions": [
         "Parity asserted on tier (the routing-relevant projection), not just the raw model string",
@@ -227,7 +227,7 @@
       ],
       "modifiesBehavior": false,
       "notes": "Learnings [4393]/[4396]/[4378]/[4561]: key-preserving config writers MUST round-trip through serde_json::Value and mutate one key, never reserialize a typed struct. Use real config.json fixtures on disk (tempdir), not in-memory Value only, so the atomic-write path is exercised.",
-      "passes": false,
+      "passes": true,
       "priority": 4,
       "qualityDimensions": [
         "Asserts unrelated-key survival explicitly (the project's stated SSoT bar for config writers)",
@@ -270,7 +270,7 @@
       ],
       "modifiesBehavior": false,
       "notes": "Learning [2954]: the overflow dump-filename sanitizer already collapses `..` before allowlist filtering — mirror that approach (neutralize the `.`/`..` COMPONENT, do not blanket-strip all dots). Containment assertion is the backstop even if sanitization is later loosened.",
-      "passes": false,
+      "passes": true,
       "priority": 5,
       "qualityDimensions": [
         "Tests both the sanitizer and the computed-path containment (defense in depth)",
@@ -339,7 +339,7 @@
       "id": "FIX-001",
       "modifiesBehavior": true,
       "notes": "Data contract: project_default_model: Option<&'a str> + user_default_model: Option<&'a str> are typed fields on the engine's cached run config (engine.rs:159-161). prd_default = `SELECT default_model FROM prd_metadata WHERE id=1`. Pass as Option<&str> straight into compute_baseline_model. Learning [4418]: thread identity through recovery, do not re-derive. Do NOT touch the target_model branch — it is a distinct concern (decides WHICH model to promote to, not the tier).",
-      "passes": false,
+      "passes": true,
       "priority": 7,
       "qualityDimensions": [
         "Recovery and primary derive the baseline tier from identical inputs — divergence eliminated, not merely narrowed",
@@ -371,7 +371,7 @@
       "id": "FIX-002",
       "modifiesBehavior": false,
       "notes": "read_project_config is on the loop hot path — keep it to one deserialize. The migrated clone already exists; deserializing it instead of the original removes the invisible 'serde aliases must cover every rewrite' invariant.",
-      "passes": false,
+      "passes": true,
       "priority": 8,
       "qualityDimensions": [
         "Migrator becomes the single read-path normalizer (no reliance on serde-alias coincidence)",
@@ -399,7 +399,7 @@
       "id": "FIX-003",
       "modifiesBehavior": false,
       "notes": "Use std::os::unix::fs::PermissionsExt behind cfg(unix). Read the original mode BEFORE writing the temp file; apply before tmp.persist(&path).",
-      "passes": false,
+      "passes": true,
       "priority": 9,
       "qualityDimensions": [
         "No silent permission narrowing of a tracked config file",
@@ -736,7 +736,6 @@
       "estimatedEffort": "high",
       "id": "REFACTOR-REVIEW-FINAL",
       "modifiesBehavior": false,
-      "timeoutSecs": 1800,
       "notes": "Use the rust-python-code-reviewer agent with full context. This is the final pre-merge quality pass.",
       "passes": false,
       "priority": 70,
@@ -746,6 +745,7 @@
       ],
       "requiresHuman": false,
       "taskType": "review",
+      "timeoutSecs": 1800,
       "title": "Full-context final review of all code + tests",
       "touchesFiles": [
         "src/loop_engine/recovery.rs",

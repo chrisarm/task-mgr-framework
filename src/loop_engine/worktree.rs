@@ -28,14 +28,57 @@ fn cleanup_empty_dir(path: &Path) {
 }
 
 /// Replace `/`, spaces, and other problematic characters with `-`.
+///
+/// Neutralizes any `/`-separated segment that is exactly `.` or `..` by mapping
+/// it to an equal-length dash token BEFORE the `/`-to-`-` collapse, so a branch-
+/// or PRD-derived name can never contribute a `CurDir`/`ParentDir` path
+/// component to a computed worktree path. Intra-segment dots (e.g. the version
+/// dots in `release/1.0.0`) are preserved — only whole-component `.`/`..` are
+/// collapsed. Mirrors the overflow dump-filename sanitizer (learning [2954]);
+/// `compute_worktree_path` keeps an independent containment assertion as a
+/// defense-in-depth backstop even if this sanitizer is later loosened.
+///
+/// Idempotent: the dash token (`-`/`--`) is not itself `.`/`..`, so a second
+/// pass is a no-op.
 fn sanitize_branch_name(branch_name: &str) -> String {
     branch_name
+        .split('/')
+        .map(|segment| match segment {
+            "." | ".." => "-".repeat(segment.len()),
+            other => other.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("/")
         .chars()
         .map(|c| match c {
             '/' | ' ' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '-',
             _ => c,
         })
         .collect()
+}
+
+/// Lexically resolve `.`/`..` path components WITHOUT touching the filesystem.
+///
+/// Used by `compute_worktree_path`'s containment backstop: the computed path may
+/// not exist on disk yet, so `Path::canonicalize` is unavailable. A `..` pops a
+/// preceding *normal* component; a `..` with nothing normal to pop is retained
+/// so an escape past the worktrees parent stays visible to the assertion.
+fn lexical_normalize(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut stack: Vec<Component> = Vec::new();
+    for comp in p.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => match stack.last() {
+                Some(Component::Normal(_)) => {
+                    stack.pop();
+                }
+                _ => stack.push(Component::ParentDir),
+            },
+            other => stack.push(other),
+        }
+    }
+    stack.iter().collect()
 }
 
 /// Return `{repo-parent}/{repo-name}-worktrees/{sanitized-branch-name}/`.
@@ -48,8 +91,22 @@ pub(crate) fn compute_worktree_path(project_root: &Path, branch_name: &str) -> P
     let parent = project_root.parent().unwrap_or(project_root);
     let worktrees_dir = parent.join(format!("{}-worktrees", repo_name));
     let sanitized = sanitize_branch_name(branch_name);
+    let result = worktrees_dir.join(sanitized);
 
-    worktrees_dir.join(sanitized)
+    // Defense-in-depth: the result must resolve under the worktrees parent even
+    // after lexical `.`/`..` collapse. `sanitize_branch_name` already neutralizes
+    // traversal segments; this `assert!` (release-build drift sentinel, NOT
+    // `debug_assert!`) guarantees a future looser sanitizer can't silently let a
+    // worktree escape and clobber a sibling directory. `compute_slot_worktree_path`
+    // routes every slot through here, so it inherits the same guarantee.
+    assert!(
+        lexical_normalize(&result).starts_with(&worktrees_dir),
+        "branch-derived worktree path escaped the worktrees parent: {} (branch {:?})",
+        result.display(),
+        branch_name,
+    );
+
+    result
 }
 
 fn is_inside_worktree(dir: &Path) -> TaskMgrResult<bool> {
@@ -2699,14 +2756,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "known-bad until 2c53f8d1-FIX-004 collapses `..` in sanitize_branch_name; \
-                the bare `..` case escapes the worktrees parent on the current sanitizer"]
     fn test_worktree_path_traversal_contained() {
         // AC: branch names `..`, `..foo`, `a/../b` must not produce a worktree
-        // path resolving outside `<repo>-worktrees/`. KNOWN-BAD DISCRIMINATOR:
-        // the bare `..` case FAILS on the current sanitizer (it survives as a
-        // `ParentDir` component → `…/myproject-worktrees/..` → `…/`), and PASSES
-        // once FIX-004 neutralizes the `..` component.
+        // path resolving outside `<repo>-worktrees/`. FIX-004 neutralizes the
+        // bare `..` component (previously it survived as a `ParentDir` component
+        // → `…/myproject-worktrees/..` → `…/`); the other cases already
+        // collapsed to safe in-dir names.
         let project_root = Path::new("/home/user/myproject");
         let hostile = ["..", "..foo", "a/../b", "../escape", "....//.."];
 
