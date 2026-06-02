@@ -2689,10 +2689,6 @@ mod tests {
         );
     }
 
-    /// FIX-003: the rewrite must be permission-neutral. The atomic tempfile is
-    /// created 0o600; without re-applying the original mode, a group/world
-    /// readable config (0o644) would be silently narrowed by `persist`.
-    #[cfg(unix)]
     /// AC2 migration round-trip: write legacy config → `update_project_config_format`
     /// → `read_project_config` yields the same `ProjectConfig` as writing the
     /// canonical config directly and reading it.
@@ -2765,6 +2761,10 @@ mod tests {
         );
     }
 
+    /// FIX-003: the rewrite must be permission-neutral. The atomic tempfile is
+    /// created 0o600; without re-applying the original mode, a group/world
+    /// readable config (0o644) would be silently narrowed by `persist`.
+    #[cfg(unix)]
     #[test]
     fn test_update_format_preserves_original_mode() {
         use std::os::unix::fs::PermissionsExt;
