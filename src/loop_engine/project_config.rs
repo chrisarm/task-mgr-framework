@@ -664,15 +664,19 @@ pub fn read_project_config(db_dir: &Path) -> ProjectConfig {
     let path = db_dir.join("config.json");
     match std::fs::read_to_string(&path) {
         Ok(contents) => {
-            let value: serde_json::Value = match serde_json::from_str(&contents) {
+            let mut value: serde_json::Value = match serde_json::from_str(&contents) {
                 Ok(value) => value,
                 Err(e) => {
                     crate::output::warn(&format!("Invalid .task-mgr/config.json: {e}"));
                     return ProjectConfig::default();
                 }
             };
-            let mut migrated = value.clone();
-            if migrate_project_config_value(&mut migrated) {
+            // Normalize legacy routing keys in place, then deserialize from the
+            // SAME migrated value we just normalized. Deserializing the original
+            // would rely on serde aliases covering every rewrite — a silent
+            // wrong-value risk the moment a future legacy->canonical rename lands
+            // in migrate_project_config_value without a matching alias.
+            if migrate_project_config_value(&mut value) {
                 crate::output::warn(
                     ".task-mgr/config.json uses legacy model routing keys; run `task-mgr init` \
                      to update it to baselineTierRoutes/runtimeErrorFallback",
@@ -1592,8 +1596,11 @@ mod tests {
             .baseline_tier_routes
             .get("FEAT")
             .expect("FEAT key missing");
-        assert!(feat_tiers["opus"].runtime_error_fallback);
-        assert_eq!(feat_tiers["sonnet"].model, "grok-build");
+        // read_project_config runs the on-disk migrator as its read normalizer
+        // (FIX-002), so legacy tier-key spellings are canonicalized in memory:
+        // opus -> high, sonnet -> standard. The legacy keys no longer survive.
+        assert!(feat_tiers["high"].runtime_error_fallback);
+        assert_eq!(feat_tiers["standard"].model, "grok-build");
     }
 
     #[test]
@@ -2309,17 +2316,17 @@ mod tests {
     /// AC1: a legacy-key config (`byBaselineTier` + `fallbackToClaude`)
     /// deserializes into a `ProjectConfig` structurally EQUAL to the same
     /// config written with the canonical top-level keys (`baselineTierRoutes`
-    /// + `runtimeErrorFallback`). The serde `alias` attributes are the ONLY
-    /// thing making this hold — drop `alias = "byBaselineTier"` or
-    /// `alias = "fallbackToClaude"` and this assertion breaks.
+    /// + `runtimeErrorFallback`).
     ///
-    /// Tier keys (`opus`/`sonnet`) are held IDENTICAL on both sides on purpose:
-    /// `read_project_config` deserializes from the original `Value` and does
-    /// NOT canonicalize HashMap tier keys (that happens at lookup time via
-    /// `model::parse_baseline_tier_key`, and on disk via
-    /// `update_project_config_format` — exercised below). Comparing legacy
-    /// `opus` against canonical `high` would therefore NOT be structurally
-    /// equal, which is exactly why the on-disk migration is needed.
+    /// Post FIX-002 the mechanism making this hold is the in-memory MIGRATOR,
+    /// not the serde `alias` attributes: `read_project_config` runs
+    /// `migrate_project_config_value` as its read normalizer and deserializes
+    /// from the MIGRATED `Value`. The migrator both renames the legacy keys
+    /// AND canonicalizes the HashMap tier keys (`opus` -> `high`,
+    /// `sonnet` -> `standard`). Both inputs therefore normalize to the same
+    /// canonical tier keys in memory, so equality no longer depends on the two
+    /// fixtures spelling the tier keys identically — it is true canonical
+    /// equivalence (the sanity assertions below index the canonical `high` key).
     #[test]
     fn test_read_legacy_keys_equal_canonical_equivalent() {
         let legacy_dir = tempfile::tempdir().unwrap();
@@ -2375,8 +2382,9 @@ mod tests {
         // pass where the alias silently dropped and both sides became empty
         // (the index below would also panic in that case).
         let pr = legacy.primary_runner.expect("primaryRunner present");
+        // The read normalizer (FIX-002) canonicalizes tier keys: opus -> high.
         assert!(
-            pr.baseline_tier_routes["FEAT"]["opus"].runtime_error_fallback,
+            pr.baseline_tier_routes["FEAT"]["high"].runtime_error_fallback,
             "byBaselineTier→baseline_tier_routes alias must populate the tier route"
         );
         assert!(
