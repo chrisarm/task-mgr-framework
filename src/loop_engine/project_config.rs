@@ -932,6 +932,21 @@ mod tests {
     use super::*;
     use std::fs;
 
+    /// Serializes tests that mutate the process-global `CODEX_BINARY` env var
+    /// and then probe it (directly or via `preflight_validate_and_probe`).
+    ///
+    /// Under `cargo test`'s default multi-threaded runner these tests race on
+    /// the shared env var and against the PATH-reading binary probe: a sibling
+    /// test removing/restoring `CODEX_BINARY` mid-flight can make the probe fall
+    /// through to a real `codex` on PATH and flip an `expect_err` to a pass.
+    /// A module-local `Mutex` is the minimal, dependency-free serializer
+    /// (no `serial_test` crate). `GROK_BINARY`-mutating tests in this module
+    /// use the cross-file [`crate::loop_engine::test_utils::GROK_BINARY_MUTEX`]
+    /// instead, because `GROK_BINARY` is also mutated by tests in other lib
+    /// modules (`runner.rs`, `commands::models::handlers`) that share this test
+    /// binary; a module-local lock would not serialize against those.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_read_missing_file_returns_default() {
         let dir = tempfile::tempdir().unwrap();
@@ -1856,6 +1871,7 @@ mod tests {
         // it would fail. The default config has neither a Codex primaryRunner
         // route nor a fallbackRunner, so check_codex_runner_binary must
         // short-circuit on `primary.is_none()` before any path probe runs.
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var_os("CODEX_BINARY");
         let bogus = "/tmp/task-mgr-test-nonexistent-codex-binary-feat004";
         unsafe { std::env::set_var("CODEX_BINARY", bogus) };
@@ -1875,6 +1891,7 @@ mod tests {
         // Acceptance: Codex route + CODEX_BINARY pointing at a nonexistent
         // path returns Err — exactly the failure batch_run must surface
         // BEFORE expanding PRD files.
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var_os("CODEX_BINARY");
         let bogus = "/tmp/task-mgr-test-nonexistent-codex-binary-feat004-route";
         unsafe { std::env::set_var("CODEX_BINARY", bogus) };

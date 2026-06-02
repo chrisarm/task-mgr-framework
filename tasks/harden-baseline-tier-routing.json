@@ -428,7 +428,7 @@
       "id": "FIX-004",
       "modifiesBehavior": false,
       "notes": "Learning [2954]: mirror the overflow dump-filename sanitizer — collapse the `.`/`..` COMPONENT before/after the existing allowlist map; don't strip all dots. The containment assert is defense-in-depth: even a future looser sanitizer can't escape the worktrees dir.",
-      "passes": false,
+      "passes": true,
       "priority": 10,
       "qualityDimensions": [
         "Neutralizes only the traversal component — valid dotted branch names keep working",
@@ -453,7 +453,7 @@
       "id": "FEAT-005",
       "modifiesBehavior": false,
       "notes": "Defense-in-depth; the model already reaches the child as a discrete argv element (no shell), so this is hardening, not a live exploit fix. Keep it to the one guard + one test; if it grows, defer (see PRD open question).",
-      "passes": false,
+      "passes": true,
       "priority": 11,
       "qualityDimensions": [
         "Mirrors the existing nonblank-model validation shape (consistency)",
@@ -488,7 +488,7 @@
       "id": "CODE-REVIEW-1",
       "modifiesBehavior": false,
       "notes": "Use the rust-python-code-reviewer agent. Review-class / gate: no per-task \"model\" (rung-1 bypass avoided); routing via reviewModel (if set in .task-mgr/config.json) + primaryRunner.byIdPrefix (REVIEW/MILESTONE/REFACTOR etc. entries) + difficulty=high / baselineTierRoutes. For each issue: echo '{...}' | task-mgr add --stdin --depended-on-by MILESTONE-1. If no issues, emit <task-status>CODE-REVIEW-1:done</task-status> with a one-line note.",
-      "passes": false,
+      "passes": true,
       "priority": 13,
       "qualityDimensions": [
         "Confirms the two load-bearing invariants (no-ctx-mutation, insert-safe-provider) hold in code, not just in tests",
