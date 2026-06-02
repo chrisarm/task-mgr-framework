@@ -120,6 +120,66 @@ pub(crate) fn apply_pending_promotion(ctx: &mut IterationContext, p: &PendingPro
     }
 }
 
+/// CONTRACT-PROMO-001: the cross-provider promotion idempotency primitive.
+///
+/// Owns the single `ctx.runner_overrides.contains_key(task_id)` snapshot that
+/// bounds every cross-provider promotion to ONCE per loop run, and constructs
+/// the [`PendingPromotion`] the caller applies post-commit via
+/// [`apply_pending_promotion`]. Returns `None` when the task already carries a
+/// promotion override (in EITHER direction) so the caller falls through to
+/// normal failure accounting (→ `auto_block_task`) instead of pivoting a
+/// second time; otherwise `Some(PendingPromotion)` built from the args
+/// verbatim.
+///
+/// This is the THIRD cross-provider promotion site the symmetric-fallback
+/// contract anticipated — see `src/loop_engine/CLAUDE.md` → "Symmetric
+/// Claude↔Grok fallback contract": *"When you add a THIRD cross-provider
+/// promotion site, replicate the `contains_key` guard there too."* The three
+/// existing branches (Claude→Grok, Grok→Claude, Codex→Claude) each inline the
+/// same check today; REFACTOR-001 routes them through this single guard.
+///
+/// Contract (compiler- and test-enforced):
+/// - Reads `ctx` IMMUTABLY (`&IterationContext`) → performs NO ctx mutation.
+///   The `runner_overrides` / `model_overrides` inserts stay in
+///   `apply_pending_promotion`, preserving the deferred-apply split that keeps
+///   ctx consistent with a rolled-back DB on commit failure.
+/// - Takes no `Connection` → performs NO DB write. The caller's inner helper
+///   still owns the `UPDATE tasks SET model` step and the apply *timing*
+///   (deferred post-commit vs. immediate); this primitive does NOT collapse
+///   that split.
+/// - `source` / `target` are written verbatim into the `PendingPromotion`.
+///   For the Codex→Claude path the caller MUST pass `target =
+///   RunnerKind::Claude` (never Codex) so the eventual `runner_overrides`
+///   insert is insert-safe (learning [4553]); `source` disambiguates
+///   Grok→Claude vs. Codex→Claude for the direction-neutral banner
+///   (learning [4532]).
+//
+// `#[allow(dead_code)]`: REFACTOR-001 adopts this at the three promotion call
+// sites and removes the attribute. Until then the only callers are the unit
+// tests below, so the non-test lib build sees it as unused.
+#[allow(dead_code)]
+pub(crate) fn promote_once(
+    ctx: &IterationContext,
+    task_id: &str,
+    source: RunnerKind,
+    target: RunnerKind,
+    target_model: String,
+    pre_promotion_model: Option<String>,
+    new_count: i32,
+) -> Option<PendingPromotion> {
+    if ctx.runner_overrides.contains_key(task_id) {
+        return None;
+    }
+    Some(PendingPromotion {
+        task_id: task_id.to_string(),
+        pre_promotion_model,
+        source_runner: source,
+        target_runner: target,
+        target_model,
+        new_count,
+    })
+}
+
 /// Inner helper: performs the DB writes for escalation/promotion but does
 /// **not** mutate `ctx`. Returns the escalated model AND an optional
 /// `PendingPromotion` the caller must apply via `apply_pending_promotion`
@@ -2322,6 +2382,168 @@ mod tests {
         assert_eq!(
             fix_status, "in_progress",
             "cross-PRD id must be skipped at the boundary",
+        );
+    }
+
+    // --- CONTRACT-PROMO-001: promote_once cross-provider idempotency primitive ---
+
+    /// AC: already-promoted task → None. A `runner_overrides` entry (in EITHER
+    /// direction) is the single snapshot that bounds a task to one cross-provider
+    /// pivot per run; promote_once must bail on it.
+    #[test]
+    fn promote_once_already_promoted_returns_none() {
+        let mut ctx = IterationContext::new(8);
+        ctx.runner_overrides
+            .insert("FEAT-1".to_string(), RunnerKind::Claude);
+
+        let result = promote_once(
+            &ctx,
+            "FEAT-1",
+            RunnerKind::Grok,
+            RunnerKind::Claude,
+            SONNET_MODEL.to_string(),
+            Some(SONNET_MODEL.to_string()),
+            2,
+        );
+        assert!(
+            result.is_none(),
+            "a task already carrying a promotion override must not promote again",
+        );
+    }
+
+    /// AC: fresh task → Some(PendingPromotion) carrying every arg verbatim. The
+    /// source/target fields are what keep the `apply_pending_promotion` banner
+    /// direction-correct ([4532]); model/pre/count flow straight through.
+    #[test]
+    fn promote_once_fresh_returns_some_with_verbatim_fields() {
+        let ctx = IterationContext::new(8);
+
+        let p = promote_once(
+            &ctx,
+            "FEAT-2",
+            RunnerKind::Grok,
+            RunnerKind::Claude,
+            OPUS_MODEL.to_string(),
+            Some(SONNET_MODEL.to_string()),
+            3,
+        )
+        .expect("fresh task must promote");
+
+        assert_eq!(p.task_id, "FEAT-2");
+        assert_eq!(
+            p.source_runner,
+            RunnerKind::Grok,
+            "source drives the banner 'from' label"
+        );
+        assert_eq!(
+            p.target_runner,
+            RunnerKind::Claude,
+            "target is written into runner_overrides"
+        );
+        assert_eq!(p.target_model, OPUS_MODEL);
+        assert_eq!(p.pre_promotion_model.as_deref(), Some(SONNET_MODEL));
+        assert_eq!(p.new_count, 3);
+    }
+
+    /// AC: a Some return performs NO ctx mutation. The `&IterationContext`
+    /// signature makes mutation a compile error; this pins the behavioral
+    /// contract so a future refactor to `&mut` can't silently start writing the
+    /// override maps here (that insert belongs to `apply_pending_promotion`).
+    #[test]
+    fn promote_once_does_not_mutate_ctx_on_some() {
+        let ctx = IterationContext::new(8);
+        let before_runner = ctx.runner_overrides.clone();
+        let before_model = ctx.model_overrides.clone();
+        let before_orig = ctx.overflow_original_task_model.clone();
+
+        let p = promote_once(
+            &ctx,
+            "FEAT-3",
+            RunnerKind::Codex,
+            RunnerKind::Claude,
+            OPUS_MODEL.to_string(),
+            None,
+            2,
+        );
+        assert!(p.is_some(), "fresh task promotes (Some path under test)");
+
+        assert_eq!(
+            ctx.runner_overrides, before_runner,
+            "promote_once must NOT touch runner_overrides — the apply step owns the insert",
+        );
+        assert_eq!(
+            ctx.model_overrides, before_model,
+            "promote_once must NOT touch model_overrides",
+        );
+        assert_eq!(
+            ctx.overflow_original_task_model, before_orig,
+            "promote_once must NOT touch overflow_original_task_model",
+        );
+    }
+
+    /// Known-bad discriminator: all three cross-provider directions construct a
+    /// PendingPromotion whose source/target match the caller's intent, and none
+    /// ever target Codex. An implementation that hard-coded a single direction
+    /// (or swapped source/target) would fail one of these rows.
+    #[test]
+    fn promote_once_preserves_all_cross_provider_directions() {
+        let ctx = IterationContext::new(8);
+        let cases = [
+            ("CLAUDE-GROK", RunnerKind::Claude, RunnerKind::Grok),
+            ("GROK-CLAUDE", RunnerKind::Grok, RunnerKind::Claude),
+            ("CODEX-CLAUDE", RunnerKind::Codex, RunnerKind::Claude),
+        ];
+        for (id, source, target) in cases {
+            let p = promote_once(&ctx, id, source, target, OPUS_MODEL.to_string(), None, 2)
+                .expect("fresh task must promote");
+            assert_eq!(p.source_runner, source, "{id}: source preserved");
+            assert_eq!(p.target_runner, target, "{id}: target preserved");
+            assert_ne!(
+                p.target_runner,
+                RunnerKind::Codex,
+                "{id}: a promotion never targets Codex within a run",
+            );
+        }
+    }
+
+    /// Composition check across the construct+apply boundary: promote_once for
+    /// Codex→Claude (caller passes target=Claude) then apply inserts Claude —
+    /// NEVER Codex ([4553]) — and the now-present `runner_overrides` entry makes
+    /// the next promote_once a no-op (the full idempotency loop).
+    #[test]
+    fn promote_once_then_apply_codex_to_claude_inserts_claude_and_then_blocks() {
+        let mut ctx = IterationContext::new(8);
+
+        let p = promote_once(
+            &ctx,
+            "SPIKE-1",
+            RunnerKind::Codex,
+            RunnerKind::Claude,
+            OPUS_MODEL.to_string(),
+            None,
+            2,
+        )
+        .expect("fresh Codex task promotes");
+        apply_pending_promotion(&mut ctx, &p);
+
+        assert_eq!(
+            ctx.runner_overrides.get("SPIKE-1"),
+            Some(&RunnerKind::Claude),
+            "Codex→Claude must insert Claude into runner_overrides, never Codex",
+        );
+
+        let again = promote_once(
+            &ctx,
+            "SPIKE-1",
+            RunnerKind::Codex,
+            RunnerKind::Claude,
+            OPUS_MODEL.to_string(),
+            None,
+            3,
+        );
+        assert!(
+            again.is_none(),
+            "post-apply, the contains_key guard blocks re-promotion",
         );
     }
 }
