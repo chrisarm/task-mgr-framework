@@ -2580,6 +2580,152 @@ mod tests {
         assert_eq!(path, PathBuf::from("/home/user/myproject-worktrees/main"));
     }
 
+    // ---- sanitize_branch_name path-traversal containment (2c53f8d1-TEST-INIT-003) ----
+    //
+    // These tests pin the contract FIX-004 hardens: no branch- or PRD-derived
+    // name may produce a `compute_worktree_path` / `compute_slot_worktree_path`
+    // result that resolves OUTSIDE the `<repo>-worktrees/` parent. The
+    // containment test is the load-bearing backstop — it stays meaningful even
+    // if `sanitize_branch_name` is later loosened, because it asserts the
+    // resolved-path property rather than the spelling of the sanitizer output
+    // (learning [2954]: mirror the overflow dump sanitizer — neutralize the
+    // `..` COMPONENT, do not blanket-strip every `.`).
+
+    /// Lexically resolve `.`/`..` path components WITHOUT touching the
+    /// filesystem. The synthetic worktree paths under test never exist on disk,
+    /// so `Path::canonicalize` is unavailable; this collapses traversal segments
+    /// purely from the component stream. A `..` pops a preceding *normal*
+    /// component; a `..` with nothing normal to pop is retained so an escape
+    /// past the root stays visible to the containment assertion.
+    fn lexical_normalize(p: &Path) -> PathBuf {
+        use std::path::Component;
+        let mut stack: Vec<Component> = Vec::new();
+        for comp in p.components() {
+            match comp {
+                Component::CurDir => {}
+                Component::ParentDir => match stack.last() {
+                    Some(Component::Normal(_)) => {
+                        stack.pop();
+                    }
+                    _ => stack.push(Component::ParentDir),
+                },
+                other => stack.push(other),
+            }
+        }
+        stack.iter().collect()
+    }
+
+    /// Assert that `computed`, once its `.`/`..` segments are lexically
+    /// resolved, still lives under `<repo>-worktrees/` for the given root.
+    fn assert_contained(project_root: &Path, computed: &Path) {
+        let repo = project_root.file_name().unwrap().to_string_lossy();
+        let worktrees_dir = project_root
+            .parent()
+            .unwrap()
+            .join(format!("{}-worktrees", repo));
+        let normalized = lexical_normalize(computed);
+        assert!(
+            normalized.starts_with(&worktrees_dir),
+            "branch-derived worktree path escaped the worktrees parent:\n  \
+             computed:   {}\n  normalized: {}\n  must be under: {}",
+            computed.display(),
+            normalized.display(),
+            worktrees_dir.display(),
+        );
+    }
+
+    #[test]
+    fn test_lexical_normalize_resolves_traversal() {
+        // Self-check: the test helper must actually catch an escape, otherwise
+        // the containment assertion below would be vacuously true.
+        assert_eq!(
+            lexical_normalize(Path::new("/a/b/c-worktrees/..")),
+            PathBuf::from("/a/b")
+        );
+        assert_eq!(
+            lexical_normalize(Path::new("/a/b/c-worktrees/--")),
+            PathBuf::from("/a/b/c-worktrees/--")
+        );
+        assert_eq!(
+            lexical_normalize(Path::new("/a/b/c-worktrees/..foo")),
+            PathBuf::from("/a/b/c-worktrees/..foo")
+        );
+    }
+
+    #[test]
+    fn test_sanitize_branch_name_idempotent() {
+        // sanitize(sanitize(x)) == sanitize(x) for traversal-ish and ordinary
+        // inputs. Holds for the current sanitizer and must hold for FIX-004's
+        // `..`-collapsing variant too — a non-idempotent fix is a bug.
+        for input in [
+            "..",
+            "..foo",
+            "a/../b",
+            "release/1.0.0",
+            "feat/user/auth-v2",
+            "my  branch",
+            "...",
+            "....",
+            "simple-branch",
+        ] {
+            let once = sanitize_branch_name(input);
+            let twice = sanitize_branch_name(&once);
+            assert_eq!(once, twice, "sanitize not idempotent for {input:?}");
+        }
+    }
+
+    #[test]
+    fn test_compute_worktree_path_preserves_intra_segment_dots() {
+        // A dotted release branch must map to a STABLE in-dir path: the version
+        // dots are preserved (not over-sanitized away) and the result is a
+        // single directory directly under `<repo>-worktrees/`.
+        let project_root = Path::new("/home/user/myproject");
+        let path = compute_worktree_path(project_root, "release/1.0.0");
+
+        assert_eq!(
+            path,
+            PathBuf::from("/home/user/myproject-worktrees/release-1.0.0"),
+        );
+        // Intra-segment dots survive (not blanket-stripped).
+        assert!(
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains("1.0.0"),
+            "version dots were over-sanitized: {}",
+            path.display()
+        );
+        assert_contained(project_root, &path);
+    }
+
+    #[test]
+    #[ignore = "known-bad until 2c53f8d1-FIX-004 collapses `..` in sanitize_branch_name; \
+                the bare `..` case escapes the worktrees parent on the current sanitizer"]
+    fn test_worktree_path_traversal_contained() {
+        // AC: branch names `..`, `..foo`, `a/../b` must not produce a worktree
+        // path resolving outside `<repo>-worktrees/`. KNOWN-BAD DISCRIMINATOR:
+        // the bare `..` case FAILS on the current sanitizer (it survives as a
+        // `ParentDir` component → `…/myproject-worktrees/..` → `…/`), and PASSES
+        // once FIX-004 neutralizes the `..` component.
+        let project_root = Path::new("/home/user/myproject");
+        let hostile = ["..", "..foo", "a/../b", "../escape", "....//.."];
+
+        for branch in hostile {
+            assert_contained(project_root, &compute_worktree_path(project_root, branch));
+            // Slot 0 delegates to compute_worktree_path — same escape surface.
+            assert_contained(
+                project_root,
+                &compute_slot_worktree_path(project_root, branch, 0),
+            );
+            // Slots 1+ suffix `-slot-N`; assert containment as a regression
+            // backstop in case sanitization is later loosened.
+            assert_contained(
+                project_root,
+                &compute_slot_worktree_path(project_root, branch, 1),
+            );
+        }
+    }
+
     #[test]
     fn test_parse_worktree_list_empty() {
         let output = "";
