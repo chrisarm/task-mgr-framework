@@ -2476,6 +2476,32 @@ mod tests {
         );
     }
 
+    /// AC: already-promoted task → None for the Claude→Grok direction. When the
+    /// existing override is `Grok` (meaning Claude already promoted to Grok), a
+    /// subsequent Claude→Grok call must return None — the guard is
+    /// `runner_overrides.contains_key`, independent of which direction the
+    /// NEW attempt targets.
+    #[test]
+    fn promote_once_already_promoted_claude_to_grok_returns_none() {
+        let mut ctx = IterationContext::new(8);
+        ctx.runner_overrides
+            .insert("FEAT-5".to_string(), RunnerKind::Grok);
+
+        let result = promote_once(
+            &ctx,
+            "FEAT-5",
+            RunnerKind::Claude,
+            RunnerKind::Grok,
+            "grok-build".to_string(),
+            Some(SONNET_MODEL.to_string()),
+            2,
+        );
+        assert!(
+            result.is_none(),
+            "Claude→Grok direction: a Grok override already present must block re-promotion",
+        );
+    }
+
     /// AC: fresh task → Some(PendingPromotion) carrying every arg verbatim. The
     /// source/target fields are what keep the `apply_pending_promotion` banner
     /// direction-correct ([4532]); model/pre/count flow straight through.

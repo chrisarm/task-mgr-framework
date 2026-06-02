@@ -22,7 +22,8 @@ use task_mgr::loop_engine::engine::{
     IterationContext, escalate_task_model_if_needed_for_runner, handle_task_failure_with_runner,
 };
 use task_mgr::loop_engine::model::{
-    HAIKU_MODEL, ModelResolutionContext, OPUS_MODEL, Provider, resolve_task_execution_target,
+    HAIKU_MODEL, ModelResolutionContext, OPUS_MODEL, Provider, SONNET_MODEL,
+    resolve_task_execution_target,
 };
 use task_mgr::loop_engine::project_config::{
     FallbackRunnerConfig, PrimaryRunnerConfig, RunnerSpec,
@@ -861,4 +862,189 @@ fn recovery_baseline_tier_parity_non_high_codex() {
             Some(RunnerKind::Claude),
         );
     }
+}
+
+// ── AC#3: recovery default-permutation matrix (additional cells) ─────────────
+//
+// The existing `recovery_baseline_tier_parity_non_high_codex` covers:
+//   low x project_default=Some  (sub-case A)
+//   low x user_default=Some     (sub-case B)
+//
+// The following tests fill the remaining matrix cells to prove parity
+// between the primary site (`resolve_task_execution_target`) and the
+// recovery path (`escalate_task_model_if_needed_for_runner`) across ALL
+// four {difficulty high/low} x {defaults present/absent} combinations.
+
+/// AC#3 — recovery matrix: high difficulty.
+///
+/// `compute_baseline_model(Some("high"), …) == OPUS_MODEL` regardless of
+/// project/user defaults. Sub-case C verifies that even when
+/// `project_default=SONNET` (standard tier), both paths route through the
+/// OPUS/`high` tier — the high-difficulty short-circuit must not be shadowed
+/// by a lower-tier project default. Sub-case E verifies the all-absent form.
+#[test]
+fn recovery_baseline_tier_parity_high_difficulty() {
+    // --- Sub-case C: high difficulty + project_default=SONNET (standard tier) --
+    {
+        let (_tmp, conn) = setup_db();
+        let task_id = "8d71d1f7-FEAT-HIGH-001";
+        insert_feat_task(&conn, task_id, "high");
+        let cfg = feat_codex_tier_cfg();
+
+        // project_default is SONNET (standard tier), but high difficulty must
+        // force OPUS regardless — `compute_baseline_model` short-circuits.
+        let project_default: Option<&str> = Some(SONNET_MODEL);
+        let user_default: Option<&str> = None;
+
+        let primary = resolve_task_execution_target(&ModelResolutionContext {
+            task_id: Some(task_id),
+            difficulty: Some("high"),
+            project_default,
+            user_default,
+            primary_runner: Some(&cfg),
+            ..Default::default()
+        });
+        assert_eq!(
+            primary.provider_hint,
+            Some(Provider::Codex),
+            "anchor: high difficulty → OPUS baseline → `high` tier → Codex, \
+             even when project_default is a lower-tier model"
+        );
+
+        let mut ctx = IterationContext::new(8);
+        let result = escalate_task_model_if_needed_for_runner(
+            &conn,
+            task_id,
+            2,
+            RunnerKind::Codex,
+            &mut ctx,
+            None,
+            Some(&cfg),
+            project_default,
+            user_default,
+        )
+        .expect("escalate (high difficulty, project_default=SONNET)");
+
+        assert!(
+            result.is_some(),
+            "high difficulty → OPUS/high tier Codex route fires in recovery \
+             (project_default is irrelevant when difficulty=high)"
+        );
+        assert_eq!(
+            ctx.runner_overrides.get(task_id).copied(),
+            Some(RunnerKind::Claude),
+        );
+        assert_eq!(
+            ctx.model_overrides.get(task_id).map(String::as_str),
+            Some(OPUS_MODEL),
+            "high difficulty always promotes to OPUS regardless of project_default",
+        );
+    }
+
+    // --- Sub-case E: high difficulty + no defaults --------------------------
+    {
+        let (_tmp, conn) = setup_db();
+        let task_id = "8d71d1f7-FEAT-HIGH-002";
+        insert_feat_task(&conn, task_id, "high");
+        let cfg = feat_codex_tier_cfg();
+
+        // No defaults at all: high still forces OPUS, so the `high` tier route fires.
+        let project_default: Option<&str> = None;
+        let user_default: Option<&str> = None;
+
+        let primary = resolve_task_execution_target(&ModelResolutionContext {
+            task_id: Some(task_id),
+            difficulty: Some("high"),
+            project_default,
+            user_default,
+            primary_runner: Some(&cfg),
+            ..Default::default()
+        });
+        assert_eq!(
+            primary.provider_hint,
+            Some(Provider::Codex),
+            "anchor: high difficulty + no defaults still routes through OPUS → `high` tier → Codex"
+        );
+
+        let mut ctx = IterationContext::new(8);
+        let result = escalate_task_model_if_needed_for_runner(
+            &conn,
+            task_id,
+            2,
+            RunnerKind::Codex,
+            &mut ctx,
+            None,
+            Some(&cfg),
+            project_default,
+            user_default,
+        )
+        .expect("escalate (high difficulty, no defaults)");
+
+        assert!(
+            result.is_some(),
+            "high difficulty + no defaults → OPUS baseline → `high` tier → promotes to Claude"
+        );
+        assert_eq!(
+            ctx.runner_overrides.get(task_id).copied(),
+            Some(RunnerKind::Claude),
+        );
+    }
+}
+
+/// AC#3 — recovery matrix: low difficulty, both defaults absent.
+///
+/// `compute_baseline_model(Some("low"), None, None, None) == None`.
+/// `model_tier(None) == ModelTier::Default`, and
+/// `primary_runner_baseline_tier_match` returns `None` immediately for the
+/// `Default` tier. Result: BOTH the primary site (no `provider_hint`) and
+/// the recovery path (no promotion) agree that no Codex tier route applies.
+#[test]
+fn recovery_baseline_tier_parity_low_difficulty_no_defaults() {
+    let (_tmp, conn) = setup_db();
+    let task_id = "8d71d1f7-FEAT-NODEF-001";
+    insert_feat_task(&conn, task_id, "low");
+    let cfg = feat_codex_tier_cfg();
+
+    // No prd/project/user defaults → baseline=None → Default tier → no tier route.
+    let project_default: Option<&str> = None;
+    let user_default: Option<&str> = None;
+
+    let primary = resolve_task_execution_target(&ModelResolutionContext {
+        task_id: Some(task_id),
+        difficulty: Some("low"),
+        project_default,
+        user_default,
+        primary_runner: Some(&cfg),
+        ..Default::default()
+    });
+    assert_eq!(
+        primary.provider_hint, None,
+        "anchor: low difficulty + no defaults → baseline=None → Default tier → \
+         no baselineTierRoutes entry → no Codex provider_hint"
+    );
+
+    let mut ctx = IterationContext::new(8);
+    let result = escalate_task_model_if_needed_for_runner(
+        &conn,
+        task_id,
+        2,
+        RunnerKind::Codex,
+        &mut ctx,
+        None,
+        Some(&cfg),
+        project_default,
+        user_default,
+    )
+    .expect("escalate (low difficulty, no defaults)");
+
+    // Parity: primary has no Codex hint → recovery fires no promotion.
+    assert!(
+        result.is_none(),
+        "low difficulty + no defaults → baseline=None → Default tier → \
+         no matching Codex route → no promotion"
+    );
+    assert!(
+        ctx.runner_overrides.get(task_id).is_none(),
+        "no promotion means no runner override inserted",
+    );
 }

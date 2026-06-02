@@ -2693,6 +2693,78 @@ mod tests {
     /// created 0o600; without re-applying the original mode, a group/world
     /// readable config (0o644) would be silently narrowed by `persist`.
     #[cfg(unix)]
+    /// AC2 migration round-trip: write legacy config → `update_project_config_format`
+    /// → `read_project_config` yields the same `ProjectConfig` as writing the
+    /// canonical config directly and reading it.
+    ///
+    /// Known-bad discriminator: if `read_project_config` relied ONLY on its own
+    /// in-memory migration (rather than consuming the already-migrated on-disk
+    /// form), both paths would pass even if `update_project_config_format` wrote
+    /// something subtly wrong — the in-memory normaliser would paper over it.
+    /// This test catches the case where the on-disk write and the in-memory read
+    /// disagree (a canonical read of the freshly-written file must equal a
+    /// direct read of the reference canonical form).
+    #[test]
+    fn test_migration_round_trip_legacy_update_read_equals_canonical() {
+        let legacy_dir = tempfile::tempdir().unwrap();
+        let canonical_dir = tempfile::tempdir().unwrap();
+
+        // Legacy form: byBaselineTier + fallbackToClaude + alias tier keys.
+        fs::write(
+            legacy_dir.path().join("config.json"),
+            r#"{
+                "version": 1,
+                "additionalAllowedTools": ["Bash(docker:*)"],
+                "primaryRunner": {
+                    "byBaselineTier": {
+                        "FEAT": {
+                            "opus": { "provider": "codex", "fallbackToClaude": true },
+                            "sonnet": { "provider": "grok", "model": "grok-build" }
+                        }
+                    },
+                    "byIdPrefix": {
+                        "SPIKE-": { "provider": "codex", "fallbackToClaude": true }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        // Canonical equivalent: baselineTierRoutes + runtimeErrorFallback + canonical tier keys.
+        fs::write(
+            canonical_dir.path().join("config.json"),
+            r#"{
+                "version": 1,
+                "additionalAllowedTools": ["Bash(docker:*)"],
+                "primaryRunner": {
+                    "baselineTierRoutes": {
+                        "FEAT": {
+                            "high": { "provider": "codex", "runtimeErrorFallback": true },
+                            "standard": { "provider": "grok", "model": "grok-build" }
+                        }
+                    },
+                    "byIdPrefix": {
+                        "SPIKE-": { "provider": "codex", "runtimeErrorFallback": true }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        // Step: rewrite legacy file to canonical shape on disk.
+        let changed = update_project_config_format(legacy_dir.path()).unwrap();
+        assert!(changed, "legacy keys must trigger a rewrite");
+
+        // Post-migration read must equal a clean read of the canonical form.
+        let after_migration = read_project_config(legacy_dir.path());
+        let direct_canonical = read_project_config(canonical_dir.path());
+        assert_eq!(
+            after_migration, direct_canonical,
+            "write legacy → update_project_config_format → read_project_config must yield \
+             the same ProjectConfig as writing the canonical config directly"
+        );
+    }
+
     #[test]
     fn test_update_format_preserves_original_mode() {
         use std::os::unix::fs::PermissionsExt;
