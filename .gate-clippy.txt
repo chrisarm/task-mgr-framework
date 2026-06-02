@@ -1,2 +1,0 @@
-    Checking task-mgr v0.2.0-a (/home/chris/Documents/startat0/Projects/task-mgr-worktrees/feat-harden-baseline-tier-routing)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.23s
