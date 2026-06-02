@@ -999,6 +999,8 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                 permission_mode: &permission_mode,
                 signal_flag: &signal_flag,
                 default_model: default_model.as_deref(),
+                project_default_model: project_default_model.as_deref(),
+                user_default_model: user_default_model.as_deref(),
                 verbose: run_config.config.verbose,
                 task_prefix: task_prefix.as_deref(),
                 prd_path: paths.prd_file.as_path(),
@@ -1340,6 +1342,8 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                 result.effective_runner,
                 project_config.fallback_runner.as_ref(),
                 project_config.primary_runner.as_ref(),
+                project_default_model.as_deref(),
+                user_default_model.as_deref(),
             )
         {
             tracing::warn!("failed to start retry tracking transaction: {}", e);

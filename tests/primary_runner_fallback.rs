@@ -107,6 +107,8 @@ fn inverse_promotion_fires_at_grok_and_threshold_with_claude_fallback() {
         &mut ctx,
         None,
         Some(&primary),
+        None,
+        None,
     )
     .unwrap();
 
@@ -170,6 +172,8 @@ fn after_inverse_promotion_next_iteration_resolves_claude_runner() {
         &mut ctx,
         None,
         Some(&primary),
+        None,
+        None,
     )
     .unwrap();
 
@@ -233,6 +237,8 @@ fn no_inverse_promotion_when_claude_fallback_model_absent() {
         &mut ctx,
         None,
         Some(&primary),
+        None,
+        None,
     )
     .unwrap();
 
@@ -269,6 +275,8 @@ fn no_inverse_promotion_when_primary_runner_absent() {
         "GROK-NOPR-001",
         PRIMARY_THRESHOLD,
         &mut ctx,
+        None,
+        None,
         None,
         None,
     )
@@ -329,6 +337,8 @@ fn grok_auth_failure_does_not_increment_consecutive_failures_for_primary_task() 
         &mut ctx,
         None,
         Some(&primary),
+        None,
+        None,
     )
     .unwrap();
     assert_eq!(
@@ -379,6 +389,8 @@ fn already_promoted_grok_task_does_not_ping_pong_back_to_grok() {
             &mut ctx,
             Some(&fb),
             Some(&primary),
+            None,
+            None,
         )
         .unwrap();
         models.push(read_model(&conn, "GROK-PP-001"));

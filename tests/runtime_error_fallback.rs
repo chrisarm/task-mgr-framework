@@ -104,6 +104,8 @@ fn promotion_fires_at_opus_and_threshold_with_fallback_enabled() {
         &mut ctx,
         Some(&cfg),
         None,
+        None,
+        None,
     )
     .unwrap();
 
@@ -147,7 +149,8 @@ fn no_promotion_when_consecutive_failures_below_threshold() {
 
     let mut ctx = IterationContext::new(8);
     let result =
-        escalate_task_model_if_needed(&conn, "BELOW-001", 1, &mut ctx, None, None).unwrap();
+        escalate_task_model_if_needed(&conn, "BELOW-001", 1, &mut ctx, None, None, None, None)
+            .unwrap();
     assert_eq!(
         result, None,
         "consecutive_failures=1 must not trigger escalation OR promotion",
@@ -183,6 +186,8 @@ fn sonnet_at_threshold_escalates_to_opus_first_not_grok() {
         FALLBACK_THRESHOLD,
         &mut ctx,
         Some(&cfg),
+        None,
+        None,
         None,
     )
     .unwrap();
@@ -232,6 +237,8 @@ fn fallback_disabled_keeps_existing_opus_ceiling_byte_for_byte() {
         FALLBACK_THRESHOLD,
         &mut ctx,
         Some(&cfg),
+        None,
+        None,
         None,
     )
     .unwrap();
@@ -287,6 +294,8 @@ fn escalate_task_model_does_not_mutate_consecutive_failures_column() {
         &mut ctx,
         None,
         None,
+        None,
+        None,
     )
     .unwrap();
 
@@ -331,6 +340,8 @@ fn grok_promotion_preserves_consecutive_failures_count() {
         FALLBACK_THRESHOLD,
         &mut ctx,
         Some(&cfg),
+        None,
+        None,
         None,
     )
     .unwrap();
@@ -475,7 +486,17 @@ fn grok_auth_failure_does_not_increment_consecutive_failures() {
     // sibling assertion catches it: a direct call DOES increment, so the only
     // thing keeping the counter stable is the caller's filter.
     let mut ctx = IterationContext::new(8);
-    handle_task_failure(&mut conn, "AUTH-FAIL-001", 1, &mut ctx, None, None).unwrap();
+    handle_task_failure(
+        &mut conn,
+        "AUTH-FAIL-001",
+        1,
+        &mut ctx,
+        None,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
     let after_unfiltered_call = read_consecutive_failures(&conn, "AUTH-FAIL-001");
     assert_eq!(
         after_unfiltered_call,
@@ -515,6 +536,8 @@ fn task_already_at_grok_is_idempotent_no_second_promotion() {
         FALLBACK_THRESHOLD,
         &mut ctx,
         Some(&cfg),
+        None,
+        None,
         None,
     )
     .unwrap();
@@ -564,6 +587,8 @@ fn promotion_fires_at_opus_1m_and_threshold() {
         FALLBACK_THRESHOLD,
         &mut ctx,
         Some(&cfg),
+        None,
+        None,
         None,
     )
     .unwrap();

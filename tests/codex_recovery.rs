@@ -102,6 +102,8 @@ fn codex_runtime_error_null_db_model_writes_no_model_and_no_promotion() {
         &mut ctx,
         Some(&cfg),
         None,
+        None,
+        None,
     )
     .expect("escalate_task_model_if_needed_for_runner");
 
@@ -154,6 +156,8 @@ fn codex_runtime_error_populated_gpt_model_writes_no_model_and_no_promotion() {
         &mut ctx,
         Some(&cfg),
         None,
+        None,
+        None,
     )
     .expect("escalate_task_model_if_needed_for_runner");
 
@@ -202,6 +206,8 @@ fn handle_task_failure_codex_increments_counter_but_does_not_promote() {
         Some(RunnerKind::Codex),
         Some(&cfg),
         None,
+        None,
+        None,
     )
     .expect("handle_task_failure_with_runner 1");
     assert_eq!(read_consecutive_failures(&conn, "CODEX-RT-001"), 1);
@@ -220,6 +226,8 @@ fn handle_task_failure_codex_increments_counter_but_does_not_promote() {
         &mut ctx,
         Some(RunnerKind::Codex),
         Some(&cfg),
+        None,
+        None,
         None,
     )
     .expect("handle_task_failure_with_runner 2");
@@ -242,6 +250,8 @@ fn handle_task_failure_codex_increments_counter_but_does_not_promote() {
         &mut ctx,
         Some(RunnerKind::Codex),
         Some(&cfg),
+        None,
+        None,
         None,
     )
     .expect("handle_task_failure_with_runner 3");
@@ -519,6 +529,8 @@ fn codex_runtime_failure_with_fallback_to_claude_promotes_to_claude_once() {
         &mut ctx,
         None,
         Some(&primary_cfg),
+        None,
+        None,
     )
     .expect("escalate first failure");
 
@@ -554,6 +566,8 @@ fn codex_runtime_failure_with_fallback_to_claude_promotes_to_claude_once() {
         &mut ctx,
         None,
         Some(&primary_cfg),
+        None,
+        None,
     )
     .expect("escalate second failure");
 
@@ -605,6 +619,8 @@ fn codex_baseline_tier_route_with_fallback_to_claude_promotes() {
         &mut ctx,
         None,
         Some(&primary_cfg),
+        None,
+        None,
     )
     .expect("baseline-tier codex fallback");
 
@@ -728,8 +744,6 @@ fn primary_high_difficulty_routes_to_codex_high_tier() {
 /// discriminate. We therefore drop prd_default (no `prd_metadata` row) so the
 /// baseline is driven by project/user — exactly the inputs the bug mishandles.
 /// The progress log records this surfaced discrepancy.
-#[ignore = "RED until FIX-001 threads project_default/user_default into the \
-            recovery failure-handler chain; see in-body FIX-001 markers"]
 #[test]
 fn recovery_baseline_tier_parity_non_high_codex() {
     // -- Sub-case A: baseline driven by project_default --------------------------
@@ -760,8 +774,8 @@ fn recovery_baseline_tier_parity_non_high_codex() {
         );
 
         // Recovery side: a RuntimeError at threshold must promote via the SAME
-        // route. FIX-001: append `, project_default, user_default` to this call
-        // and remove the #[ignore] above.
+        // route. FIX-001 threads the engine-cached project/user defaults so the
+        // recovery baseline derivation matches the primary site's.
         let mut ctx = IterationContext::new(8);
         let result = escalate_task_model_if_needed_for_runner(
             &conn,
@@ -771,6 +785,8 @@ fn recovery_baseline_tier_parity_non_high_codex() {
             &mut ctx,
             None,
             Some(&cfg),
+            project_default,
+            user_default,
         )
         .expect("escalate (project-default baseline)");
 
@@ -820,7 +836,8 @@ fn recovery_baseline_tier_parity_non_high_codex() {
         );
 
         let mut ctx = IterationContext::new(8);
-        // FIX-001: append `, project_default, user_default` to this call.
+        // FIX-001 threads project_default/user_default through; user_default
+        // alone now reaches the recovery baseline derivation.
         let result = escalate_task_model_if_needed_for_runner(
             &conn,
             task_id,
@@ -829,6 +846,8 @@ fn recovery_baseline_tier_parity_non_high_codex() {
             &mut ctx,
             None,
             Some(&cfg),
+            project_default,
+            user_default,
         )
         .expect("escalate (user-default baseline)");
 

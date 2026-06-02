@@ -190,6 +190,12 @@ pub(crate) fn promote_once(
 /// Reads `ctx` immutably to resolve the effective runner (for the
 /// idempotency guard). Does not capture override-snapshot state — that is
 /// part of the deferred apply.
+///
+/// `project_default` / `user_default` are the engine-cached config defaults
+/// (`engine.rs` run-config fields), threaded straight through to
+/// `maybe_codex_fallback_to_claude` so a recovering Codex task derives its
+/// baseline tier from the SAME four inputs the primary spawn-site uses (FIX-001).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn escalate_task_model_if_needed_inner(
     conn: &Connection,
     task_id: &str,
@@ -198,6 +204,8 @@ pub(crate) fn escalate_task_model_if_needed_inner(
     executed_runner: RunnerKind,
     cfg: Option<&project_config::FallbackRunnerConfig>,
     primary_cfg: Option<&project_config::PrimaryRunnerConfig>,
+    project_default: Option<&str>,
+    user_default: Option<&str>,
 ) -> TaskMgrResult<(Option<String>, Option<PendingPromotion>)> {
     if !should_escalate_for_consecutive_failures(new_count) {
         return Ok((None, None));
@@ -219,7 +227,15 @@ pub(crate) fn escalate_task_model_if_needed_inner(
         //      `runtimeErrorFallback: true`.
         // Otherwise return `(None, None)` so the legacy auto-block ladder runs
         // (existing Codex projects without the opt-in see unchanged behavior).
-        return maybe_codex_fallback_to_claude(conn, task_id, new_count, ctx, primary_cfg);
+        return maybe_codex_fallback_to_claude(
+            conn,
+            task_id,
+            new_count,
+            ctx,
+            primary_cfg,
+            project_default,
+            user_default,
+        );
     }
     // None / empty / whitespace model: assume sonnet baseline → escalate to opus.
     let escalated = match normalize_baseline(current_model.as_deref()) {
@@ -354,16 +370,27 @@ pub(crate) fn escalate_task_model_if_needed_inner(
 /// Auth failures must never reach this function — the sequential and wave
 /// callers exclude `Crash(CodexAuthFailure)` before invoking
 /// `handle_task_failure`. Treat any reached call as a runtime fault.
+///
+/// FIX-001: `project_default` / `user_default` are the engine-cached config
+/// defaults threaded from the failure-handler chain. The baseline tier (used to
+/// match a `baselineTierRoutes` route) is derived via
+/// [`model::compute_baseline_model`] from the SAME four inputs the primary
+/// spawn-site (`resolve_task_execution_target`) uses — `difficulty`,
+/// `prd_default`, `project_default`, `user_default` — so a recovering Codex task
+/// matches the route it was originally routed by. Earlier this site substituted
+/// `primary.claude_fallback_model` for `project_default` and omitted
+/// `user_default`, causing a confirmed recovery↔primary divergence.
 fn maybe_codex_fallback_to_claude(
     conn: &Connection,
     task_id: &str,
     new_count: i32,
     ctx: &IterationContext,
     primary_cfg: Option<&project_config::PrimaryRunnerConfig>,
+    project_default: Option<&str>,
+    user_default: Option<&str>,
 ) -> TaskMgrResult<(Option<String>, Option<PendingPromotion>)> {
     use crate::loop_engine::model::{
-        ModelResolutionContext, Provider, parse_config_provider,
-        primary_runner_baseline_tier_match, primary_runner_match, resolve_task_model,
+        Provider, parse_config_provider, primary_runner_baseline_tier_match, primary_runner_match,
     };
 
     if ctx.runner_overrides.contains_key(task_id) {
@@ -388,12 +415,12 @@ fn maybe_codex_fallback_to_claude(
         )
         .ok()
         .flatten();
-    let baseline_model = resolve_task_model(&ModelResolutionContext {
-        difficulty: difficulty.as_deref(),
-        prd_default: prd_default.as_deref(),
-        project_default: primary.claude_fallback_model.as_deref(),
-        ..Default::default()
-    });
+    let baseline_model = model::compute_baseline_model(
+        difficulty.as_deref(),
+        prd_default.as_deref(),
+        project_default,
+        user_default,
+    );
     // `task_type` is not threaded into recovery; production Codex routing is
     // dominated by `byIdPrefix` and `baselineTierRoutes`.
     let Some(spec) = primary_runner_match(primary, Some(task_id), None).or_else(|| {
@@ -494,6 +521,7 @@ fn maybe_codex_fallback_to_claude(
 /// This is the convenience variant — DB and ctx writes happen back-to-back.
 /// Transactional callers should prefer `escalate_task_model_if_needed_inner`
 /// + `apply_pending_promotion` (see W5).
+#[allow(clippy::too_many_arguments)]
 pub fn escalate_task_model_if_needed(
     conn: &Connection,
     task_id: &str,
@@ -501,6 +529,8 @@ pub fn escalate_task_model_if_needed(
     ctx: &mut IterationContext,
     cfg: Option<&project_config::FallbackRunnerConfig>,
     primary_cfg: Option<&project_config::PrimaryRunnerConfig>,
+    project_default: Option<&str>,
+    user_default: Option<&str>,
 ) -> TaskMgrResult<Option<String>> {
     // Derive the runner from the DB model before entering the inner helper.
     // The inner function requires an explicit runner; callers that DO know the
@@ -531,6 +561,8 @@ pub fn escalate_task_model_if_needed(
         runner,
         cfg,
         primary_cfg,
+        project_default,
+        user_default,
     )?;
     if let Some(p) = pending {
         apply_pending_promotion(ctx, &p);
@@ -546,6 +578,7 @@ pub fn escalate_task_model_if_needed(
 /// known. This is critical for Codex tasks: their `gpt-*` model would
 /// otherwise re-classify as Claude and miss the Codex-specific early-return
 /// path. Used in integration tests and by `handle_task_failure_with_runner`.
+#[allow(clippy::too_many_arguments)]
 pub fn escalate_task_model_if_needed_for_runner(
     conn: &Connection,
     task_id: &str,
@@ -554,6 +587,8 @@ pub fn escalate_task_model_if_needed_for_runner(
     ctx: &mut IterationContext,
     cfg: Option<&project_config::FallbackRunnerConfig>,
     primary_cfg: Option<&project_config::PrimaryRunnerConfig>,
+    project_default: Option<&str>,
+    user_default: Option<&str>,
 ) -> TaskMgrResult<Option<String>> {
     let (model, pending) = escalate_task_model_if_needed_inner(
         conn,
@@ -563,6 +598,8 @@ pub fn escalate_task_model_if_needed_for_runner(
         executed_runner,
         cfg,
         primary_cfg,
+        project_default,
+        user_default,
     )?;
     if let Some(p) = pending {
         apply_pending_promotion(ctx, &p);
@@ -639,6 +676,13 @@ pub fn auto_block_task(
 /// **FEAT-PRIMARY-003**: `primary_cfg` carries the optional primary-runner
 /// configuration so the embedded escalation call can fire the inverse
 /// Grok→Claude promotion. Pass `None` to suppress the inverse branch.
+///
+/// **FIX-001**: `project_default` / `user_default` are the engine-cached config
+/// defaults (`engine.rs` run-config fields), threaded through to the embedded
+/// `escalate_task_model_if_needed_inner` → `maybe_codex_fallback_to_claude`
+/// baseline derivation so a recovering Codex task matches the same
+/// `baselineTierRoutes` route the primary spawn-site routed it by.
+#[allow(clippy::too_many_arguments)]
 pub fn handle_task_failure(
     conn: &mut Connection,
     task_id: &str,
@@ -646,6 +690,8 @@ pub fn handle_task_failure(
     ctx: &mut IterationContext,
     cfg: Option<&project_config::FallbackRunnerConfig>,
     primary_cfg: Option<&project_config::PrimaryRunnerConfig>,
+    project_default: Option<&str>,
+    user_default: Option<&str>,
 ) -> TaskMgrResult<()> {
     handle_task_failure_with_runner(
         conn,
@@ -655,9 +701,12 @@ pub fn handle_task_failure(
         None,
         cfg,
         primary_cfg,
+        project_default,
+        user_default,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn handle_task_failure_with_runner(
     conn: &mut Connection,
     task_id: &str,
@@ -666,6 +715,8 @@ pub fn handle_task_failure_with_runner(
     executed_runner: Option<RunnerKind>,
     cfg: Option<&project_config::FallbackRunnerConfig>,
     primary_cfg: Option<&project_config::PrimaryRunnerConfig>,
+    project_default: Option<&str>,
+    user_default: Option<&str>,
 ) -> TaskMgrResult<()> {
     // Resolve the effective runner before entering the transaction.
     // `escalate_task_model_if_needed_inner` requires an explicit RunnerKind;
@@ -740,6 +791,8 @@ pub fn handle_task_failure_with_runner(
                 runner,
                 cfg,
                 primary_cfg,
+                project_default,
+                user_default,
             ) {
                 Ok((_model, promotion)) => {
                     pending_promotion = promotion;
@@ -1627,7 +1680,8 @@ mod tests {
 
         let mut ctx = IterationContext::new(8);
         let result =
-            escalate_task_model_if_needed(&conn, "T-001", 2, &mut ctx, None, None).unwrap();
+            escalate_task_model_if_needed(&conn, "T-001", 2, &mut ctx, None, None, None, None)
+                .unwrap();
         assert_eq!(
             result,
             Some(OPUS_MODEL.to_string()),
@@ -1657,7 +1711,8 @@ mod tests {
 
         let mut ctx = IterationContext::new(8);
         let result =
-            escalate_task_model_if_needed(&conn, "T-001", 2, &mut ctx, None, None).unwrap();
+            escalate_task_model_if_needed(&conn, "T-001", 2, &mut ctx, None, None, None, None)
+                .unwrap();
         assert_eq!(
             result,
             Some(OPUS_MODEL.to_string()),
@@ -1687,7 +1742,8 @@ mod tests {
 
         let mut ctx = IterationContext::new(8);
         let result =
-            escalate_task_model_if_needed(&conn, "T-001", 2, &mut ctx, None, None).unwrap();
+            escalate_task_model_if_needed(&conn, "T-001", 2, &mut ctx, None, None, None, None)
+                .unwrap();
         assert_eq!(
             result,
             Some(OPUS_MODEL.to_string()),
@@ -1717,7 +1773,8 @@ mod tests {
 
         let mut ctx = IterationContext::new(8);
         let result =
-            escalate_task_model_if_needed(&conn, "T-001", 1, &mut ctx, None, None).unwrap();
+            escalate_task_model_if_needed(&conn, "T-001", 1, &mut ctx, None, None, None, None)
+                .unwrap();
         assert_eq!(result, None, "no escalation at 1 failure (threshold is 2)");
         let model: Option<String> = conn
             .query_row("SELECT model FROM tasks WHERE id = 'T-001'", [], |r| {
@@ -1793,6 +1850,8 @@ mod tests {
             RunnerKind::Codex,
             None,
             primary_cfg,
+            None,
+            None,
         )
         .unwrap();
         if let Some(p) = pending {
@@ -1958,6 +2017,8 @@ mod tests {
             RunnerKind::Codex,
             None,
             None,
+            None,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -2008,6 +2069,8 @@ mod tests {
             RunnerKind::Codex,
             None,
             Some(&cfg),
+            None,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -2039,6 +2102,8 @@ mod tests {
             RunnerKind::Codex,
             None,
             Some(&cfg),
+            None,
+            None,
         )
         .unwrap();
         assert_eq!(
