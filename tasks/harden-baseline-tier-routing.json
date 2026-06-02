@@ -642,7 +642,7 @@
       "id": "REFACTOR-001",
       "modifiesBehavior": false,
       "notes": "Behavior-neutral refactor — its own commit, no logic edits beyond delegating to the primitive. Learning [4553]/[4532]: preserve insert-safe + source_runner banner semantics. Do NOT collapse the two apply contexts into promote_once.",
-      "passes": false,
+      "passes": true,
       "priority": 60,
       "qualityDimensions": [
         "Single guard implementation now backs all three sites; no copy-pasted contains_key",
@@ -673,7 +673,7 @@
       "id": "REFACTOR-002",
       "modifiesBehavior": false,
       "notes": "Learning [3914]: byte-identical extraction validates carving correctness — diff the moved block against the original to prove no logic changed. Learning [1484]/[880]: inline orchestrator blocks are the real refactoring targets; enum/struct return types give a clean boundary. Decide LoopInitContext struct-vs-tuple by how many fields run_loop threads forward (PRD open question).",
-      "passes": false,
+      "passes": true,
       "priority": 62,
       "qualityDimensions": [
         "Behavior-neutral move — no logic edits in the same commit",
@@ -737,7 +737,7 @@
       "id": "REFACTOR-REVIEW-FINAL",
       "modifiesBehavior": false,
       "notes": "Use the rust-python-code-reviewer agent with full context. This is the final pre-merge quality pass.",
-      "passes": false,
+      "passes": true,
       "priority": 70,
       "qualityDimensions": [
         "Verifies behavior-neutrality of the refactors with evidence (diffs), not assertion",
@@ -776,7 +776,7 @@
       "id": "VERIFY-001",
       "modifiesBehavior": false,
       "notes": "Documentation updates land here (not earlier) so they describe the final shape. Record a task-mgr learn for the divergence fix + promote_once extraction so /compound can surface them later.",
-      "passes": false,
+      "passes": true,
       "priority": 90,
       "qualityDimensions": [
         "Trunk fully green + docs match the final code",
@@ -810,7 +810,7 @@
       "id": "MILESTONE-FINAL",
       "modifiesBehavior": false,
       "notes": "Review-class final gate: no per-task \"model\" (rung-1 bypass avoided); routing via reviewModel (if set) + primaryRunner.byIdPrefix + difficulty=high. Trunk must be green including any pre-existing failures.",
-      "passes": false,
+      "passes": true,
       "priority": 99,
       "qualityDimensions": [
         "Merge-ready: whole workspace green, docs current, no open spawned fixes"
