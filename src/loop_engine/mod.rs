@@ -46,6 +46,7 @@ pub(crate) mod stream;
 pub mod usage;
 pub mod user_config;
 pub mod watchdog;
+pub(crate) mod wave_orchestration;
 pub(crate) mod wave_scheduler;
 pub mod worktree;
 
