@@ -417,6 +417,35 @@ pub fn resolve_task_model(ctx: &ModelResolutionContext<'_>) -> Option<String> {
     resolve_task_execution_target(ctx).model
 }
 
+/// Compute the baseline Claude model from difficulty + the three default rungs.
+///
+/// This is the single source of truth for the lower half of the routing
+/// precedence chain (rungs 3-6 in [`resolve_task_execution_target`]):
+///
+/// 1. `difficulty == "high"` (ASCII case-insensitive) → `OPUS_MODEL`.
+/// 2. Otherwise the first non-blank of `prd_default`, `project_default`,
+///    `user_default` (in that order), each filtered through [`normalize`] so
+///    empty / whitespace-only config values don't shadow a real one.
+/// 3. All `None`/blank → `None`.
+///
+/// Total function: every input combination returns; it never panics. Recovery
+/// (`recovery.rs`) and the primary resolution path both call this so a
+/// recovering task derives the same baseline tier it was originally routed by.
+pub fn compute_baseline_model(
+    difficulty: Option<&str>,
+    prd_default: Option<&str>,
+    project_default: Option<&str>,
+    user_default: Option<&str>,
+) -> Option<String> {
+    if difficulty.is_some_and(|d| d.eq_ignore_ascii_case("high")) {
+        Some(OPUS_MODEL.to_string())
+    } else {
+        [prd_default, project_default, user_default]
+            .into_iter()
+            .find_map(|fallback| normalize(fallback).map(str::to_string))
+    }
+}
+
 /// Resolve the model and any explicit provider intent for a single task.
 ///
 /// Only a `primaryRunner` match produces `provider_hint`. All model-string
@@ -447,16 +476,12 @@ pub fn resolve_task_execution_target(ctx: &ModelResolutionContext<'_>) -> Resolv
         };
     }
 
-    let baseline_model = if ctx
-        .difficulty
-        .is_some_and(|d| d.eq_ignore_ascii_case("high"))
-    {
-        Some(OPUS_MODEL.to_string())
-    } else {
-        [ctx.prd_default, ctx.project_default, ctx.user_default]
-            .into_iter()
-            .find_map(|fallback| normalize(fallback).map(str::to_string))
-    };
+    let baseline_model = compute_baseline_model(
+        ctx.difficulty,
+        ctx.prd_default,
+        ctx.project_default,
+        ctx.user_default,
+    );
 
     // Rung 3: baseline-tier remap after the normal Claude baseline is known.
     if let Some(spec) = ctx.primary_runner.and_then(|cfg| {
@@ -673,6 +698,86 @@ mod tests {
         assert!(ModelTier::Opus > ModelTier::Sonnet);
         assert!(ModelTier::Sonnet > ModelTier::Haiku);
         assert!(ModelTier::Haiku > ModelTier::Default);
+    }
+
+    // ============ compute_baseline_model tests ============
+
+    #[test]
+    fn compute_baseline_high_difficulty_short_circuits_to_opus() {
+        // difficulty=high wins over every default, regardless of their values.
+        assert_eq!(
+            compute_baseline_model(
+                Some("high"),
+                Some(SONNET_MODEL),
+                Some(HAIKU_MODEL),
+                Some(HAIKU_MODEL),
+            ),
+            Some(OPUS_MODEL.to_string())
+        );
+        // ...and with no defaults set at all.
+        assert_eq!(
+            compute_baseline_model(Some("high"), None, None, None),
+            Some(OPUS_MODEL.to_string())
+        );
+    }
+
+    #[test]
+    fn compute_baseline_high_difficulty_is_ascii_case_insensitive() {
+        for variant in ["HIGH", "High", "hIgH"] {
+            assert_eq!(
+                compute_baseline_model(Some(variant), None, None, None),
+                Some(OPUS_MODEL.to_string()),
+                "difficulty={variant:?} should short-circuit to OPUS_MODEL"
+            );
+        }
+    }
+
+    #[test]
+    fn compute_baseline_default_precedence_is_prd_then_project_then_user() {
+        // All three present → prd wins.
+        assert_eq!(
+            compute_baseline_model(
+                None,
+                Some(SONNET_MODEL),
+                Some(HAIKU_MODEL),
+                Some(OPUS_MODEL),
+            ),
+            Some(SONNET_MODEL.to_string())
+        );
+        // prd absent → project wins over user.
+        assert_eq!(
+            compute_baseline_model(None, None, Some(HAIKU_MODEL), Some(OPUS_MODEL)),
+            Some(HAIKU_MODEL.to_string())
+        );
+        // prd + project absent → user wins.
+        assert_eq!(
+            compute_baseline_model(None, None, None, Some(OPUS_MODEL)),
+            Some(OPUS_MODEL.to_string())
+        );
+    }
+
+    #[test]
+    fn compute_baseline_all_none_returns_none() {
+        assert_eq!(compute_baseline_model(None, None, None, None), None);
+        // A non-high difficulty with no defaults is still None.
+        assert_eq!(
+            compute_baseline_model(Some("medium"), None, None, None),
+            None
+        );
+    }
+
+    #[test]
+    fn compute_baseline_blank_defaults_skipped_via_normalize() {
+        // Blank / whitespace-only earlier rungs are skipped, not propagated.
+        assert_eq!(
+            compute_baseline_model(None, Some("   "), Some("\t"), Some(HAIKU_MODEL)),
+            Some(HAIKU_MODEL.to_string())
+        );
+        // All-blank defaults collapse to None.
+        assert_eq!(
+            compute_baseline_model(None, Some(""), Some("  "), Some("\t")),
+            None
+        );
     }
 
     // ============ resolve_task_model tests ============
