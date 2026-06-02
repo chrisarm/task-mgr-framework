@@ -37,14 +37,18 @@ pub struct OllamaEmbedder {
 impl OllamaEmbedder {
     /// Create a new embedder pointing at the given Ollama server and model.
     pub fn new(base_url: &str, model: &str) -> Self {
-        let health_agent = ureq::AgentBuilder::new()
-            .timeout_connect(std::time::Duration::from_secs(3))
-            .timeout_read(std::time::Duration::from_secs(3))
-            .build();
-        let embed_agent = ureq::AgentBuilder::new()
-            .timeout_connect(std::time::Duration::from_secs(3))
-            .timeout_read(std::time::Duration::from_secs(30))
-            .build();
+        let health_agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_connect(Some(std::time::Duration::from_secs(3)))
+            .timeout_recv_response(Some(std::time::Duration::from_secs(3)))
+            .timeout_recv_body(Some(std::time::Duration::from_secs(3)))
+            .build()
+            .into();
+        let embed_agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_connect(Some(std::time::Duration::from_secs(3)))
+            .timeout_recv_response(Some(std::time::Duration::from_secs(30)))
+            .timeout_recv_body(Some(std::time::Duration::from_secs(30)))
+            .build()
+            .into();
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             model: model.to_string(),
@@ -74,13 +78,14 @@ impl OllamaEmbedder {
     pub fn is_available(&self) -> Result<bool, String> {
         let url = format!("{}/api/tags", self.base_url);
 
-        let resp = match self.health_agent.get(&url).call() {
+        let mut resp = match self.health_agent.get(&url).call() {
             Ok(r) => r,
             Err(e) => return Err(format!("Ollama not reachable at {}: {e}", self.base_url)),
         };
 
         let body: serde_json::Value = resp
-            .into_json()
+            .body_mut()
+            .read_json()
             .map_err(|e| format!("Failed to parse /api/tags response: {e}"))?;
 
         let models = body["models"]
@@ -123,7 +128,7 @@ impl OllamaEmbedder {
             "input": texts,
         });
 
-        let resp = self
+        let mut resp = self
             .embed_agent
             .post(&url)
             .send_json(&payload)
@@ -134,7 +139,7 @@ impl OllamaEmbedder {
                 )
             })?;
 
-        let body: serde_json::Value = resp.into_json().map_err(|e| {
+        let body: serde_json::Value = resp.body_mut().read_json().map_err(|e| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("Failed to parse Ollama embed response: {e}"),

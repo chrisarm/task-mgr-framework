@@ -4,7 +4,7 @@ Welcome to **task-mgr** — a CLI tool that helps AI coding agents (like Claude 
 
 ## Prerequisites
 
-- **Rust toolchain**: Install via [rustup](https://rustup.rs/) if you don't have it
+- **Rust 1.95+ toolchain**: Install via [rustup](https://rustup.rs/) if you don't have it
 - **Git**: task-mgr uses git for branching and worktrees
 - **Claude Code** (optional): Required only if you want to run the autonomous loop
 

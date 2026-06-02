@@ -76,12 +76,14 @@ pub fn list_learnings(
     let total: usize = conn.query_row(
         "SELECT COUNT(*) FROM learnings WHERE retired_at IS NULL",
         [],
-        |row| row.get(0),
+        |row| Ok(row.get::<_, i64>(0)? as usize),
     )?;
 
     // Get total count including retired
     let total_including_retired: usize =
-        conn.query_row("SELECT COUNT(*) FROM learnings", [], |row| row.get(0))?;
+        conn.query_row("SELECT COUNT(*) FROM learnings", [], |row| {
+            Ok(row.get::<_, i64>(0)? as usize)
+        })?;
 
     // Build query with optional LIMIT
     // Use id DESC as secondary sort to ensure deterministic ordering when timestamps are equal

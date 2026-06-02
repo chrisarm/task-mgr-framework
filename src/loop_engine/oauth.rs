@@ -82,17 +82,17 @@ pub fn is_token_expiring(creds: &Credentials, buffer_minutes: u64) -> bool {
 ///
 /// Returns sanitized error message on failure (never includes tokens).
 pub fn refresh_token(creds_path: &PathBuf, creds: &Credentials) -> Result<Credentials, String> {
-    let response = ureq::post(OAUTH_REFRESH_URL)
-        .set("Content-Type", "application/x-www-form-urlencoded")
-        .send_form(&[
+    let mut response = ureq::post(OAUTH_REFRESH_URL)
+        .send_form([
             ("grant_type", "refresh_token"),
-            ("refresh_token", &creds.refresh_token),
+            ("refresh_token", creds.refresh_token.as_str()),
         ])
         .map_err(|e| sanitize_oauth_error(&e.to_string()))?;
 
     // Parse response
     let response_json: serde_json::Value = response
-        .into_json()
+        .body_mut()
+        .read_json()
         .map_err(|e| format!("Failed to parse OAuth response: {}", e))?;
 
     let access_token = response_json["access_token"]

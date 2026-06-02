@@ -6,7 +6,7 @@ task-mgr works extremely well, but its internal structure has become difficult t
 
 The symptoms are well-known to maintainers:
 
-- `src/loop_engine/engine.rs` is ~9.6k lines and acts as the integration hub for almost everything.
+- `src/loop_engine/engine.rs` is ~9.6k lines and acts as the integration hub for almost everything. *(Post-Phase-1: now 1.2k lines; see §Phase 1 Retrospective.)*
 - `src/loop_engine/worktree.rs` (~6.3k) contains many layers of hardening (synthetic slots, ephemeral overlays, stash preflights, slot-0 guards, reconcile paths) added after cascade failures.
 - Direct `UPDATE tasks SET status` writes are scattered across **~15 sites in 13+ files** — not the "seven command modules" first reported. `TaskStatus::can_transition_to` in `src/models/task.rs` is documented as the single source of truth but is currently consulted by **only 2 of those ~15 sites** (`complete.rs`, `fail/transition.rs`). The remaining sites (`skip.rs`, `irrelevant.rs`, `unblock.rs`, `reset.rs`, `review.rs`, `doctor/fixes.rs`, `init/mod.rs`, `next/mod.rs`, `prd_reconcile.rs`, `overflow.rs`, and roughly a dozen UPDATE sites inside `engine.rs` itself) write status with raw SQL. The "SSoT" is aspirational, not enforced. The full audit is in §"Status-Write Site Audit" below. The refactoring case is *stronger* than the original framing suggested.
 - Prompt construction is split across `prompt/core.rs` (shared helpers) plus two compositions in `prompt/sequential.rs` and `prompt/slot.rs`, with a manual "any new section MUST also be wired through `slot`" contract documented in `prompt/mod.rs`. Less "three parallel builders" than "two compositions over a shared kit with a hand-enforced wiring rule," but the hazard is the same.
@@ -39,11 +39,15 @@ The Phase 1 PRD's acceptance criteria depend on an honest count of every site th
 
 This audit becomes the Phase 1 PRD's literal checklist — every row must either route through `TaskLifecycle` or have a written rationale for staying out. See §"TaskLifecycle Scope Decision" for the resolution policy.
 
+> **Post-Phase-1 note**: this audit is now historical. The live mapping — every UPDATE site → its lifecycle verb and `TransitionSource` — is the **FR-006 site→verb mapping** table in `src/lifecycle/CLAUDE.md`. Use that as the source of truth when adding a new mutation site; this section is preserved for the design rationale.
+
 ## Proposed Refactorings
 
 These six areas were identified during the 2026 coherence review. They are not equally sized or equally urgent.
 
-### 1. TaskLifecycle Service / Aggregate (Highest ROI)
+### 1. TaskLifecycle Service / Aggregate (Highest ROI) ✅ SHIPPED (Phase 1, PRD 1 of 2 — landed pre-2026-05-28)
+
+Landed as `src/lifecycle/` with six verbs (`apply`, `try_claim`, `recover_in_progress_for_prefix`, `auto_block_after_failures`, `resurrect_for_iteration`, `reconcile_from_prd`, `repair_stale`). All 25 raw `UPDATE tasks SET status` sites were audited in ANALYSIS-001 and routed through the appropriate verb; the only retained raw-SQL site is `commands/init/mod.rs:518`, marked `LIFECYCLE-EXCEPTION` (bootstrap ingest, no run context to attach). See `src/lifecycle/CLAUDE.md` for the live FR-006 site→verb table, the five hard invariants, and the Recovery-vs-plan-driven distinction. The remaining design content below is preserved for the rationale that drove the implementation.
 
 Introduce a single service (proposed names: `TaskLifecycle`, `TaskService`, or `TaskAggregate` in a new `domain/` or `commands/lifecycle/` module) that is the *only* place allowed to perform status transitions.
 
@@ -80,7 +84,15 @@ These are lifted from current implicit behavior in `apply_status_updates` and th
 - **`run_tasks` row bookkeeping moves into the service.** Today the engine wraps each command call with `run_tasks` inserts (engine.rs ~L4736–4749); the command modules do not. After the refactor, the service owns this. Callers do not need to know `run_tasks` exists.
 - **Conditional-WHERE predicates are part of the API.** `claim_slot_task` (engine.rs ~L787) uses `WHERE id = ? AND status IN ('todo', 'in_progress')` deliberately for slot-resumption idempotency. The corresponding `try_claim` API exposes this set explicitly.
 
-### 2. Break Up `engine.rs` + Clear Orchestration Boundaries
+### 2. Break Up `engine.rs` + Clear Orchestration Boundaries ✅ SHIPPED (Phase 1, PRD 2 of 2 — landed pre-2026-05-28)
+
+`engine.rs` is now 1225 lines (down from ~9.6k). New peer modules in `src/loop_engine/`:
+- `orchestrator.rs` (~2993 lines) — outer `run_loop`, batch lifecycle, signal handling, run begin/end, config loading, worktree setup/teardown
+- `iteration.rs` (~878 lines) — sequential iteration path
+- `wave_scheduler.rs` (~3823 lines) — parallel-slot wave pipeline (preflight, eligible-group selection, fan-out, merge-back orchestration)
+- `iteration_pipeline.rs` (~555 lines) — shared post-Claude processing contract called from both sequential and wave paths
+
+`worktree.rs` was not split in Phase 1; its layered defenses are still concentrated there. The earlier unification work (FEAT-001..007 in `2026-05-16-unify-execution-paths`) had already prepared the shared pipeline; the carve completed the surrounding decomposition. The remaining design content below is preserved as design rationale.
 
 Carve the 9k-line `engine.rs` along the seams that already partially exist:
 
@@ -328,3 +340,40 @@ This keeps individual efforts inside the 5–15 task range that the loop engine 
 9. After each phase lands, append a short "retrospective" section here and feed the concrete learnings into `task-mgr learn` so future efforts inherit the knowledge.
 
 This document is intended to be the stable context for a sequence of smaller, well-scoped PRD efforts rather than a single heroic rewrite. The bet is that centralizing the lifecycle and clarifying the orchestration boundaries will make every subsequent change (including items 3, 4, and the Item 6 research) cheaper and safer than they would be on the current structure.
+
+## Phase 1 Retrospective (recorded 2026-05-28)
+
+### What shipped
+
+- **Item 1 — TaskLifecycle service**: `src/lifecycle/` with six verbs (`apply`, `try_claim`, `recover_in_progress_for_prefix`, `auto_block_after_failures`, `resurrect_for_iteration`, `reconcile_from_prd`, `repair_stale`). All 25 raw `UPDATE tasks SET status` sites audited (ANALYSIS-001) and routed through the appropriate verb. The sole retained raw-SQL site is `commands/init/mod.rs:518`, marked `LIFECYCLE-EXCEPTION` per the original design intent.
+- **Item 2 — Engine carve**: `engine.rs` went from ~9.6k → 1225 lines. New peer modules: `orchestrator.rs` (2993), `wave_scheduler.rs` (3823), `iteration.rs` (878), `iteration_pipeline.rs` (555). The pre-existing `iteration_pipeline.rs` from the earlier unification work (`2026-05-16-unify-execution-paths`) served as the shared post-Claude pipeline the carve was built around.
+
+Both items were sequenced as the doc prescribed (TaskLifecycle first, then engine-carve), and the FR-006 site→verb table in `src/lifecycle/CLAUDE.md` is the live successor to the §Status-Write Site Audit in this doc.
+
+### What worked
+
+- **Serialized Cluster A** avoided the "two surgeries on the same patient" failure mode. Doing them in parallel would have required reconciling overlapping `apply_status_updates` edits between the two PRDs — the doc's risk assessment was correct.
+- **Recovery verbs deliberately bypass the plan path.** `recover_in_progress_for_prefix`, `auto_block_after_failures`, and `resurrect_for_iteration` carry `TransitionSource::Recovery` and own their `WHERE status = 'in_progress'` guards inline (matching the original SQL). Folding them into the plan/matrix path used by `reconcile_from_prd` / `repair_stale` would have changed observable failure-tolerance semantics; keeping them distinct preserved bit-identical behavior.
+- **`repair_stale` kept distinct from `reconcile_from_prd`** per the doctor sub-decision in Item 1's design. `DoctorRepair` has a narrower source-allowance set (cannot flip `Done → Irrelevant`) that the matrix enforces — folding the two would have silently widened doctor's power.
+- **Live FR-006 table beats a frozen audit table.** Future audits (e.g. "did the new mid-loop recovery path get a verb?") consult `src/lifecycle/CLAUDE.md`, which is read whenever lifecycle code is touched. This doc's audit table stayed accurate up to landing, but its half-life was always "until the next refactor."
+
+### What surprised us
+
+- **`resurrect_for_iteration` deliberately omits the `WHERE status = 'in_progress'` guard** its sibling Recovery verbs carry. This was a conscious contract relaxation during extraction — callers (wave FEAT-002, overflow rungs) need to force arbitrary task IDs back to `todo` regardless of current status. Worth flagging because a future audit might "fix" this asymmetry and silently break the resurrection paths.
+- **Auto-claim on `<task-status>:done` from `Todo` had to be encoded inside `apply()` itself.** The natural "validate transition → write" factoring rejects the bare `Todo → Done` jump. The matrix carries the rule via `TransitionSource::LoopStatusTag` as an explicit exception. Phase 1 design called this out as an invariant; the implementation had to honor it in the validator, not the caller.
+- **The reactions framework convergence** (PRD `2026-05-27-reactions-framework`, prefix 31342c85) shipped in the same window as Phase 1. It's structurally the sibling of TaskLifecycle for the "after the runner returns" boundary (rate-limit, overflow, human-review, transient-backend collapsed into a single `reactions::` module called identically from sequential and wave paths). Treat both as the established pattern for the remaining "fewer patch surfaces" work.
+
+### Decisions that became moot
+
+- **Dogfood concurrency policy (`N` iterations across two PRDs)**: queued as a Phase 1 pre-decision but never formalized as a numeric gate. Phase 1 shipped via the natural cadence of live loop runs against `parallel-task-execution` (ab55fca5), `reactions-framework-convergence` (31342c85), and `logging-standardization` (147cf226). Each effort exercised the new lifecycle and engine seams under real load. Policy was observed-in-practice rather than pre-declared; the absence of a hard gate did not produce corrupted task DBs or broken iterations.
+- **TaskLifecycle module location** (Next Steps #4): resolved to `src/lifecycle/` (top-level under `src/`), not `domain/` or `commands/lifecycle/`. The choice mirrors `src/loop_engine/` and keeps the module name short.
+
+### Implications for the remaining phases
+
+- **Phase 0 (Item 5 — shim isolation)** can lean on the Item 1 template: declare the module's contract in its CLAUDE.md, route call sites through it, leave a precise audit table. The shim-prelude policy choice (options 1 vs. 2 in §Item 5) is still open and must be made before the Phase 0 PRD is authored.
+- **Phase 2 (Item 4 — learnings retrieval abstraction)** has the same shape as Item 1: a `RecallQuery` / `RecallPlan` type plus per-backend strategies, with the supersession + retirement + UCB filter contract centralized rather than copy-pasted across `fts5.rs:142,209,268`, `patterns.rs:300`, and the vector backend's parallel `HashSet::contains` post-filter. Use `src/lifecycle/CLAUDE.md` as the template for the new module's design notes.
+- **Phase 3 (Item 6 — event journal)**: the §6 obstacles (non-idempotent milestone summaries, PRD JSON writes) are unchanged by Phase 1's landing. Either a separate design pass to make those idempotent, or stay deferred indefinitely.
+
+### Pre-Phase 1 coverage gates — what actually landed
+
+The doc prescribed three gates (transition shadow test harness, Category C unit tests, stderr snapshot tests). The lifecycle module ships with extensive unit coverage on the matrix, claim, recovery, and reconcile verbs; the integration safety net was the live loop runs noted under "Decisions that became moot." A formal "transition shadow test" harness comparing legacy raw-SQL diffs to new lifecycle diffs was *not* built — the migration relied on the per-site review during extraction plus the live-load shakedown. Worth noting because future similar extractions (Item 4, Item 5) should decide explicitly whether to build the shadow harness or rely on the same approach.

@@ -146,7 +146,7 @@ fn archive_single_prd(
         conn.query_row(
             "SELECT COUNT(*) FROM tasks WHERE id LIKE ? ESCAPE '\\' AND archived_at IS NULL",
             rusqlite::params![like_pattern],
-            |row| row.get::<_, usize>(0),
+            |row| Ok(row.get::<_, i64>(0)? as usize),
         )?
     } else {
         if !items.is_empty() {

@@ -102,17 +102,17 @@ pub fn get_delete_preview(
             let tasks: usize = conn.query_row(
                 "SELECT COUNT(*) FROM tasks WHERE id LIKE ? ESCAPE '\\' AND archived_at IS NULL",
                 [&pattern],
-                |row| row.get(0),
+                |row| Ok(row.get::<_, i64>(0)? as usize),
             )?;
             let files: usize = conn.query_row(
                 "SELECT COUNT(*) FROM task_files WHERE task_id LIKE ? ESCAPE '\\'",
                 [&pattern],
-                |row| row.get(0),
+                |row| Ok(row.get::<_, i64>(0)? as usize),
             )?;
             let relationships: usize = conn.query_row(
                 "SELECT COUNT(*) FROM task_relationships WHERE task_id LIKE ? ESCAPE '\\'",
                 [&pattern],
-                |row| row.get(0),
+                |row| Ok(row.get::<_, i64>(0)? as usize),
             )?;
             Ok(DryRunDeletePreview {
                 tasks,
@@ -126,20 +126,24 @@ pub fn get_delete_preview(
             let tasks: usize = conn.query_row(
                 "SELECT COUNT(*) FROM tasks WHERE archived_at IS NULL",
                 [],
-                |row| row.get(0),
+                |row| Ok(row.get::<_, i64>(0)? as usize),
             )?;
-            let files: usize =
-                conn.query_row("SELECT COUNT(*) FROM task_files", [], |row| row.get(0))?;
+            let files: usize = conn.query_row("SELECT COUNT(*) FROM task_files", [], |row| {
+                Ok(row.get::<_, i64>(0)? as usize)
+            })?;
             let relationships: usize =
                 conn.query_row("SELECT COUNT(*) FROM task_relationships", [], |row| {
-                    row.get(0)
+                    Ok(row.get::<_, i64>(0)? as usize)
                 })?;
-            let learnings: usize =
-                conn.query_row("SELECT COUNT(*) FROM learnings", [], |row| row.get(0))?;
+            let learnings: usize = conn.query_row("SELECT COUNT(*) FROM learnings", [], |row| {
+                Ok(row.get::<_, i64>(0)? as usize)
+            })?;
             // Count ALL runs (including archived) since the global wipe DELETE FROM runs
             // removes everything. Tasks are filtered by archived_at IS NULL because
             // archived tasks are invisible to users and the count reflects "active" state.
-            let runs: usize = conn.query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))?;
+            let runs: usize = conn.query_row("SELECT COUNT(*) FROM runs", [], |row| {
+                Ok(row.get::<_, i64>(0)? as usize)
+            })?;
             Ok(DryRunDeletePreview {
                 tasks,
                 files,

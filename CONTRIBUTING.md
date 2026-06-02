@@ -16,7 +16,7 @@ Thank you for your interest in contributing to task-mgr! This guide will help yo
 
 ### Prerequisites
 
-- **Rust 1.70+** (stable toolchain)
+- **Rust 1.95+** (stable toolchain)
 - **SQLite** (bundled via rusqlite, no system install required)
 
 ### Clone and Build

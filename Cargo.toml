@@ -2,6 +2,7 @@
 name = "task-mgr"
 version = "0.2.0-a"
 edition = "2024"
+rust-version = "1.95"
 description = "A standalone CLI tool for managing AI agent loop tasks with SQLite as working state"
 license = "MIT"
 
@@ -12,7 +13,7 @@ clap_complete = "4"
 
 # Database
 # Note: bundled includes FTS5 by default in SQLite 3.9+
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -41,7 +42,7 @@ signal-hook = "0.4"
 libc = "0.2"
 
 # HTTP client (sync, for OAuth + usage API)
-ureq = { version = "2", features = ["json"] }
+ureq = { version = "3", features = ["json"] }
 
 # Hashing (stale detection)
 md5 = "0.8"

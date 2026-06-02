@@ -42,9 +42,9 @@ pub enum UsageCheckResult {
 /// Makes a GET request to the Anthropic usage endpoint.
 /// Returns `None` if the API call fails (logged to stderr).
 pub fn check_usage_api(access_token: &str) -> Option<UsageInfo> {
-    let response = match ureq::get(USAGE_API_URL)
-        .set("Authorization", &format!("Bearer {}", access_token))
-        .set("Content-Type", "application/json")
+    let mut response = match ureq::get(USAGE_API_URL)
+        .header("Authorization", format!("Bearer {}", access_token))
+        .header("Content-Type", "application/json")
         .call()
     {
         Ok(resp) => resp,
@@ -57,7 +57,7 @@ pub fn check_usage_api(access_token: &str) -> Option<UsageInfo> {
         }
     };
 
-    let json: serde_json::Value = match response.into_json() {
+    let json: serde_json::Value = match response.body_mut().read_json() {
         Ok(j) => j,
         Err(e) => {
             tracing::warn!(error = %e, "failed to parse usage API response");

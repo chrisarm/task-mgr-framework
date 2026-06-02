@@ -38,7 +38,7 @@
     ".unwrap() in production code paths — use ? with TaskMgrResult"
   ],
   "project": "task-mgr",
-  "taskPrefix": "99ae54f7",
+  "taskPrefix": "ab71bd73",
   "userStories": [
     {
       "acceptanceCriteria": [

@@ -114,24 +114,27 @@ pub fn fetch_models() -> Result<Vec<RemoteModel>, ApiError> {
 /// Perform the HTTP call with an explicit key. Split out so tests can
 /// inject a mock server URL via an env override in the future if needed.
 fn fetch_models_with_key(api_key: &str) -> Result<Vec<RemoteModel>, ApiError> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(5))
-        .timeout_read(Duration::from_secs(10))
-        .build();
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_connect(Some(Duration::from_secs(5)))
+        .timeout_recv_response(Some(Duration::from_secs(10)))
+        .timeout_recv_body(Some(Duration::from_secs(10)))
+        .build()
+        .into();
 
-    let response = agent
+    let mut response = agent
         .get(MODELS_URL)
-        .set("x-api-key", api_key)
-        .set("anthropic-version", ANTHROPIC_VERSION)
-        .set("Accept", "application/json")
+        .header("x-api-key", api_key)
+        .header("anthropic-version", ANTHROPIC_VERSION)
+        .header("Accept", "application/json")
         .call()
         .map_err(|e| match e {
-            ureq::Error::Status(code, _) => ApiError::Http(code),
-            ureq::Error::Transport(t) => ApiError::Transport(t.to_string()),
+            ureq::Error::StatusCode(code) => ApiError::Http(code),
+            other => ApiError::Transport(other.to_string()),
         })?;
 
     let body = response
-        .into_string()
+        .body_mut()
+        .read_to_string()
         .map_err(|e| ApiError::Transport(e.to_string()))?;
     parse_models_response(&body)
 }

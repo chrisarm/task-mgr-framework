@@ -73,7 +73,7 @@ fn count_by_status(conn: &Connection, status: &str) -> usize {
     conn.query_row(
         "SELECT COUNT(*) FROM tasks WHERE status = ?1",
         [status],
-        |row| row.get::<_, usize>(0),
+        |row| Ok(row.get::<_, i64>(0)? as usize),
     )
     .expect("count query")
 }

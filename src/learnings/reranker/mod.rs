@@ -87,10 +87,13 @@ impl LlamaBoxReranker {
     /// because the first rerank after a cold model load can take 20–30 s for
     /// GPU warmup; subsequent calls are typically sub-second.
     pub fn new(base_url: &str, model: &str) -> Self {
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(3))
-            .timeout_read(Duration::from_secs(60))
-            .build();
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .timeout_connect(Some(Duration::from_secs(3)))
+            .timeout_recv_response(Some(Duration::from_secs(60)))
+            .timeout_recv_body(Some(Duration::from_secs(60)))
+            .build()
+            .into();
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             model: model.to_string(),
@@ -155,34 +158,39 @@ impl Reranker for LlamaBoxReranker {
             "top_n": documents.len(),
         });
 
-        let resp = match self.agent.post(&url).send_json(&payload) {
+        let mut resp = match self.agent.post(&url).send_json(&payload) {
             Ok(r) => r,
-            Err(ureq::Error::Status(code, r)) => {
-                let body = r.into_string().unwrap_or_default();
-                return Err(TaskMgrError::IoError(std::io::Error::other(format!(
-                    "rerank request to {url} failed: HTTP {code}: {body}"
-                ))));
-            }
-            Err(ureq::Error::Transport(t)) => {
-                let kind = match t.kind() {
-                    ureq::ErrorKind::ConnectionFailed => std::io::ErrorKind::ConnectionRefused,
+            Err(e) => {
+                let kind = match &e {
+                    ureq::Error::Io(t) if t.kind() == std::io::ErrorKind::ConnectionRefused => {
+                        std::io::ErrorKind::ConnectionRefused
+                    }
+                    ureq::Error::ConnectionFailed => std::io::ErrorKind::ConnectionRefused,
                     _ => std::io::ErrorKind::Other,
                 };
                 return Err(TaskMgrError::IoError(std::io::Error::new(
                     kind,
-                    format!("rerank request to {url} failed: {t}"),
+                    format!("rerank request to {url} failed: {e}"),
                 )));
             }
         };
 
+        let code = resp.status().as_u16();
+
         // Read the body as a string first so we can include a snippet in any
-        // parse-error message. into_string() is bounded by ureq's default cap.
-        let body = resp.into_string().map_err(|e| {
+        // parse-error message. read_to_string() is bounded by ureq's default cap.
+        let body = resp.body_mut().read_to_string().map_err(|e| {
             TaskMgrError::IoError(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("failed to read rerank response from {url}: {e}"),
             ))
         })?;
+
+        if !(200..300).contains(&code) {
+            return Err(TaskMgrError::IoError(std::io::Error::other(format!(
+                "rerank request to {url} failed: HTTP {code}: {body}"
+            ))));
+        }
 
         let parsed: RerankResponse = serde_json::from_str(&body)
             .map_err(|e| malformed_response_err(&url, &format!("malformed JSON ({e})"), &body))?;
