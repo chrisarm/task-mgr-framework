@@ -121,7 +121,7 @@ a pure-Claude run.
 ```
 explicit task model   (tasks.model DB column / model_overrides override; provider hint cleared)
   → direct primaryRunner match  (byTaskType wins over byIdPrefix; may carry provider hint)
-    → compute baseline Claude model
+    → compute baseline Claude model  (`model::compute_baseline_model`)
       → difficulty=high   (forces OPUS_MODEL)
         → prd default     (prd_metadata.default_model)
           → project default (.task-mgr/config.json defaultModel)
@@ -152,8 +152,19 @@ for EVERY task):
 
 When both produce a match, `byTaskType` wins.
 
-**SSoT**: `model::primary_runner_match` is the single implementation.
-Do NOT re-implement the prefix-matching logic anywhere else.
+**SSoT**: `model::primary_runner_match` is the single prefix-matching impl —
+do NOT re-implement the prefix-matching logic anywhere else.
+`model::compute_baseline_model` is the single home for the baseline subtree
+(`difficulty=high → OPUS_MODEL`, else the first non-blank of prd → project →
+user default through `normalize`). Both the primary resolution site
+(`resolve_task_execution_target`) **and** the recovery path
+(`recovery::maybe_codex_fallback_to_claude`) call `compute_baseline_model` with
+the SAME four inputs (difficulty, prd/project/user defaults), so a recovering
+Codex task derives the exact baseline tier it was originally routed by. This
+closed the FIX-001 divergence where recovery re-derived the baseline from
+`claude_fallback_model` and omitted `user_default`, letting it match a different
+`baselineTierRoutes` route than the spawn site. Never re-derive either formula
+inline.
 
 ### Symmetric Claude↔Grok fallback contract
 
@@ -200,7 +211,15 @@ dead-ends on `blocked` exactly as a Claude task without `fallbackRunner` does.
 
 The loop engine has two execution paths — **sequential**
 (`iteration.rs::run_iteration` driven by `orchestrator.rs::run_loop`) and
-**parallel-wave** (`wave_scheduler.rs::run_wave_iteration` + `slot.rs`). Every
+**parallel-wave** (`wave_scheduler.rs::run_wave_iteration` + `slot.rs`). Two
+WS-3 carves split the largest of those modules along behavior-neutral seams:
+`run_loop`'s linear startup phase (Steps 1–16) now lives in
+`startup.rs::initialize_loop` (returns a `LoopInitContext` the orchestrator
+destructures once), and `wave_scheduler`'s non-hot-path wave-decision trio
+(`wave_preflight_check`, `handle_no_eligible_tasks`, `handle_ephemeral_deadlock`)
+now lives in `wave_orchestration.rs`. Both moves are byte-for-byte relocations —
+`run_loop` and `run_wave_iteration` stay the entry points and call across the
+new module boundary. Every
 main-thread *reaction* that is NOT path-specific — the work the main thread does
 before dispatching Claude and after Claude returns — lives in
 `src/loop_engine/reactions/` and is called by BOTH paths. The wave path folds
@@ -1132,8 +1151,10 @@ For the full site→verb audit table and source-allowance matrix see
 | --- | --- | --- |
 | Status mutation SSoT | `src/lifecycle/mod.rs` | `TaskLifecycle`, six public verbs |
 | Outer loop entry point | `src/loop_engine/orchestrator.rs` | `run_loop`, `on_run_completed` |
+| Linear startup phase (WS-3.2 carve) | `src/loop_engine/startup.rs` | `initialize_loop`, `LoopInitContext` |
 | Sequential iteration body | `src/loop_engine/iteration.rs` | `run_iteration` |
 | Wave scheduling + merge-back | `src/loop_engine/wave_scheduler.rs` | `run_wave_iteration`, `run_parallel_wave` |
+| Wave decision helpers (WS-3.3 carve) | `src/loop_engine/wave_orchestration.rs` | `wave_preflight_check`, `handle_no_eligible_tasks`, `handle_ephemeral_deadlock` |
 | Per-slot lifecycle + result | `src/loop_engine/slot.rs` | `run_slot_iteration`, `process_slot_result` |
 | Per-task recovery cluster | `src/loop_engine/recovery.rs` | `check_crash_escalation`, `check_override_invalidation`, `handle_task_failure` |
 | Slot path threading | `src/loop_engine/worktree.rs` | `merge_slot_branches_with_resolver` |
