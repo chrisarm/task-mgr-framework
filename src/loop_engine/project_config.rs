@@ -806,6 +806,9 @@ fn migrate_runner_spec_map(value: Option<&mut serde_json::Value>) -> bool {
     let Some(map) = value.and_then(serde_json::Value::as_object_mut) else {
         return false;
     };
+    // migrate_runner_spec mutates each spec; run it on EVERY entry (no `.any()`
+    // short-circuit, which would stop migrating after the first hit).
+    #[allow(clippy::unnecessary_fold)]
     map.values_mut()
         .fold(false, |changed, spec| migrate_runner_spec(spec) || changed)
 }
@@ -1755,6 +1758,32 @@ mod tests {
             spec.runtime_error_fallback,
             "legacy fallbackToClaude alias must deserialize to runtimeErrorFallback"
         );
+    }
+
+    #[test]
+    fn test_migrate_runner_spec_map_migrates_every_legacy_spec() {
+        // Guards the `unnecessary_fold` allow at migrate_runner_spec_map: the
+        // fold must call migrate_runner_spec on EVERY entry. A `.any()`
+        // short-circuit would stop after the first spec returning true, leaving
+        // the second `fallbackToClaude` un-rewritten. Two legacy specs prove it.
+        let mut map = serde_json::json!({
+            "FEAT-": { "provider": "codex", "fallbackToClaude": true },
+            "FIX-":  { "provider": "codex", "fallbackToClaude": true }
+        });
+        let changed = migrate_runner_spec_map(Some(&mut map));
+        assert!(changed, "migration must report a change");
+        for key in ["FEAT-", "FIX-"] {
+            let spec = &map[key];
+            assert!(
+                spec.get("fallbackToClaude").is_none(),
+                "{key}: legacy fallbackToClaude must be removed"
+            );
+            assert_eq!(
+                spec["runtimeErrorFallback"],
+                serde_json::json!(true),
+                "{key}: must be rewritten to runtimeErrorFallback"
+            );
+        }
     }
 
     #[test]
