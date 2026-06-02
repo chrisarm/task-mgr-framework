@@ -262,7 +262,7 @@ fn render_primary_runner<W: io::Write>(
     let Some(pr) = &project_cfg.primary_runner else {
         return writeln!(writer, "  primaryRunner:  (no routes)");
     };
-    if pr.by_task_type.is_empty() && pr.by_id_prefix.is_empty() {
+    if pr.by_task_type.is_empty() && pr.by_id_prefix.is_empty() && pr.by_baseline_tier.is_empty() {
         return writeln!(writer, "  primaryRunner:  (no routes)");
     }
     writeln!(writer, "  primaryRunner:")?;
@@ -281,6 +281,20 @@ fn render_primary_runner<W: io::Write>(
     for (prefix, spec) in &by_id_prefix {
         let pname = runner_spec_provider_label(spec);
         writeln!(writer, "    byIdPrefix[{prefix}] -> {pname}/{}", spec.model)?;
+    }
+    let mut by_baseline_tier: Vec<_> = pr.by_baseline_tier.iter().collect();
+    by_baseline_tier.sort_by_key(|(prefix, _)| prefix.as_str());
+    for (prefix, tiers) in &by_baseline_tier {
+        let mut tier_entries: Vec<_> = tiers.iter().collect();
+        tier_entries.sort_by_key(|(tier, _)| tier.as_str());
+        for (tier, spec) in tier_entries {
+            let pname = runner_spec_provider_label(spec);
+            writeln!(
+                writer,
+                "    byBaselineTier[{prefix}][{tier}] -> {pname}/{}",
+                spec.model
+            )?;
+        }
     }
     Ok(())
 }
@@ -388,6 +402,10 @@ pub fn handle_set_review_model(db_dir: &Path, model: &str, project: bool) -> io:
         .map(|pr| {
             pr.by_task_type.values().any(|s| s.provider == "codex")
                 || pr.by_id_prefix.values().any(|s| s.provider == "codex")
+                || pr
+                    .by_baseline_tier
+                    .values()
+                    .any(|tiers| tiers.values().any(|s| s.provider == "codex"))
         })
         .unwrap_or(false);
     if has_codex_primary {
@@ -522,8 +540,14 @@ mod show_tests {
                         "runtimeErrorThreshold": 2
                     }},
                     "primaryRunner": {{
+                        "byBaselineTier": {{
+                            "FEAT": {{
+                                "opus": {{ "provider": "codex", "fallbackToClaude": true }},
+                                "sonnet": {{ "provider": "grok", "model": "grok-build" }}
+                            }}
+                        }},
                         "byIdPrefix": {{
-                            "FIX": {{ "provider": "grok", "model": "grok-build" }}
+                            "FIX": {{ "provider": "claude", "model": "{OPUS_MODEL}" }}
                         }}
                     }}
                 }}"#
@@ -542,8 +566,16 @@ mod show_tests {
             "fallbackRunner section missing or wrong; got:\n{out}"
         );
         assert!(
-            out.contains("byIdPrefix[FIX] -> Grok/grok-build"),
+            out.contains(&format!("byIdPrefix[FIX] -> Claude/{OPUS_MODEL}")),
             "primaryRunner byIdPrefix section missing or wrong; got:\n{out}"
+        );
+        assert!(
+            out.contains("byBaselineTier[FEAT][opus] -> Codex/"),
+            "primaryRunner byBaselineTier opus section missing or wrong; got:\n{out}"
+        );
+        assert!(
+            out.contains("byBaselineTier[FEAT][sonnet] -> Grok/grok-build"),
+            "primaryRunner byBaselineTier sonnet section missing or wrong; got:\n{out}"
         );
     }
 
@@ -613,6 +645,12 @@ mod show_tests {
                     },
                     "byIdPrefix": {
                         "REVIEW-": { "provider": "grok", "model": "grok-build" }
+                    },
+                    "byBaselineTier": {
+                        "FEAT": {
+                            "opus": { "provider": "codex" },
+                            "sonnet": { "provider": "grok", "model": "grok-build" }
+                        }
                     }
                 }
             }"#,
@@ -631,6 +669,14 @@ mod show_tests {
         assert!(
             out.contains("byIdPrefix[REVIEW-] -> Grok/grok-build"),
             "byIdPrefix REVIEW- missing; got:\n{out}"
+        );
+        assert!(
+            out.contains("byBaselineTier[FEAT][opus] -> Codex/"),
+            "byBaselineTier FEAT opus missing; got:\n{out}"
+        );
+        assert!(
+            out.contains("byBaselineTier[FEAT][sonnet] -> Grok/grok-build"),
+            "byBaselineTier FEAT sonnet missing; got:\n{out}"
         );
     }
 }

@@ -52,20 +52,21 @@ Do **not** hardcode model IDs — they change with each Claude release and must 
 - `high` → `xhigh`
 <!-- MODELS:END -->
 
-**Resolve review model** — Before stamping `model` on review-class tasks (`CODE-REVIEW-*`, `MILESTONE-FINAL`), read `.task-mgr/config.json` and check `reviewModel`. If set, use that value for those tasks; otherwise fall back to opus. Default recommendation: `grok-4`.
+**Resolve review model** — Before stamping `model` on review-class tasks (`CODE-REVIEW-*`, `MILESTONE-FINAL`), read `.task-mgr/config.json` and check `reviewModel`. If set, use that value for those tasks; otherwise fall back to opus.
 
 **Model assignment rubric** (set `model` field on tasks that need a specific tier; omit for tasks that should use the PRD-level default):
 
 | Task type                                                                  | Assign `model`             | Rationale                                              |
 | -------------------------------------------------------------------------- | -------------------------- | ------------------------------------------------------ |
-| `FEAT-xxx` / `FIX-xxx` with `estimatedEffort: "high"` OR `modifiesBehavior: true` | opus                | Complex implementation — stronger model reduces rework |
+| `FEAT-xxx`                                                                | _(omit)_                   | Runtime policy maps baseline Sonnet→Grok and Opus→Codex |
 | `ANALYSIS-xxx`                                                             | opus                       | Deep semantic and consumer analysis                    |
-| `CODE-REVIEW-*`                                                            | reviewModel (default `grok-4`, else opus) | Second-model perspective on implementation review      |
+| `CODE-REVIEW-*`                                                            | reviewModel (else opus)    | Review routing is explicit and should not use FEAT policy |
 | `REFACTOR-REVIEW-FINAL`                                                    | opus                       | Nuanced quality/security/architecture judgment         |
-| `MILESTONE-FINAL`                                                          | reviewModel (default `grok-4`, else opus) | Final gate — full test suite + must fix any pre-existing failures |
+| `MILESTONE-FINAL`                                                          | reviewModel (else opus)    | Final gate — full test suite + must fix any pre-existing failures |
 | `MILESTONE-1` / `MILESTONE-2`                                              | opus                       | Intermediate checkpoints — full gate                  |
 | `VERIFY-xxx`                                                               | opus                       | Final validation gate, thoroughness required           |
-| All other implementation, test, and fix tasks                              | _(omit — use PRD default)_ | Standard work handled by the Sonnet default            |
+| `CODE-FIX-*` / `WIRE-FIX-*` / `IMPL-FIX-*` / `FIX-*` / `REFACTOR-*`        | opus                       | Spawned follow-ups need the strongest repair/review model |
+| All other implementation and test tasks                                    | _(omit — use PRD default)_ | Standard work handled by the Sonnet default            |
 
 **`timeoutSecs` assignment** (set on tasks that run the full test suite):
 
@@ -85,7 +86,11 @@ Set the resolved **sonnet** model as the PRD-level `"model"` field:
 }
 ```
 
-This makes sonnet the iteration default, with opus tasks explicitly overriding per-task.
+This makes sonnet the baseline for ordinary FEAT work. Do **not** stamp
+`model` on FEAT tasks: use `estimatedEffort: "high"` and/or
+`modifiesBehavior: true` to express complexity, and let `.task-mgr/config.json`
+`primaryRunner.byBaselineTier` route FEAT Sonnet baselines to Grok and Opus
+baselines to Codex. Explicit FEAT `model` fields bypass that policy.
 
 ---
 
@@ -892,10 +897,10 @@ Every task list follows a lean phased structure. The table below is the spine fo
 | - | -------- | ------------------------------- | --------------- | ---------------- | ----------------------------------- | ---------------------- |
 | 0 | 0-1      | `CONTRACT-xxx` (optional)       | contract        | — / `/spike`     | —                                   | opus (if complex)      |
 | 1 | 2-12     | `FEAT-xxx` / `FIX-xxx`          | implementation  | —                | relevant CONTRACT (if any)          | —                      |
-| 2 | 13       | `CODE-REVIEW-1` (large PRDs only) | review        | —                | all early FEAT/FIX + CONTRACT       | reviewModel (default grok-4) |
-| 2a| 14-20    | `CODE-FIX-xxx` / `WIRE-FIX-xxx` | implementation  | CODE-REVIEW-1    | —                                   | —                      |
+| 2 | 13       | `CODE-REVIEW-1` (large PRDs only) | review        | —                | all early FEAT/FIX + CONTRACT       | reviewModel (else opus) |
+| 2a| 14-20    | `CODE-FIX-xxx` / `WIRE-FIX-xxx` | implementation  | CODE-REVIEW-1    | —                                   | opus                   |
 | 3 | 70       | `REFACTOR-REVIEW-FINAL` (optional) | review       | —                | all implementation                  | opus                   |
-| 3a| 71-85    | `REFACTOR-xxx`                  | implementation  | REFACTOR-REVIEW-FINAL | —                                | —                      |
+| 3a| 71-85    | `REFACTOR-xxx`                  | implementation  | REFACTOR-REVIEW-FINAL | —                                | opus                   |
 | 4 | 99       | `REVIEW-001` (the final gate)   | review          | —                | all prior work + REFACTOR (if any)  | opus / 1800s           |
 
 **REVIEW-001 is the milestone.** It runs the full, unscoped quality gate and must leave the repo green (including pre-existing failures). There are no separate MILESTONE-1 / MILESTONE-2 tasks in the lean skeleton.
@@ -906,7 +911,7 @@ Every task list follows a lean phased structure. The table below is the spine fo
 
 - **ANALYSIS-xxx** (opt-in) — Only for behavior-modifying changes that span >2 top-level directories *or* when the PRD/spike author explicitly requests it (set `requiresConsumerAnalysis: true` or create the task manually). For small localized changes, document the callers directly in the FEAT task description instead.
 
-- **FEAT-xxx / FIX-xxx** — Tests for the new behavior live *inside* the same coherent change (see the lean skeleton in `plan-tasks.md`). `edgeCases`, `invariants`, and known-bad discriminators are still required on the task. Set `model: opus` only for `estimatedEffort: "high"` OR `modifiesBehavior: true`.
+- **FEAT-xxx** — Tests for the new behavior live *inside* the same coherent change (see the lean skeleton in `plan-tasks.md`). `edgeCases`, `invariants`, and known-bad discriminators are still required on the task. Do not set `model`; mark `estimatedEffort: "high"` and/or `modifiesBehavior: true` when the baseline should be Opus, then let runtime routing choose Codex for Opus-baseline FEAT work.
 
 - **Middle milestones, separate TEST-INIT, INT-xxx, and VERIFY-001 removed** — These were identified as low-ROI ceremony (see anti-pattern table in `plan-tasks.md`). The single `REVIEW-001` at the end runs the full gate and serves as the milestone. `INT-xxx` concerns are now handled inside the final review's acceptance criteria and the PRD's Boundary Contracts section. A `CONTRACT-xxx` (when present) does the deep edge-case/invariant work before any implementation begins.
 

@@ -272,6 +272,24 @@ pub fn model_tier(model: Option<&str>) -> ModelTier {
     }
 }
 
+/// Parse a baseline-tier key from `primaryRunner.byBaselineTier`.
+///
+/// Accepted keys are the stable lowercase tier names used by
+/// `ModelTier` display in config: `haiku`, `sonnet`, and `opus`.
+/// `default` is intentionally rejected because an unknown/no-model baseline
+/// is not a useful routing policy input.
+pub fn parse_baseline_tier_key(s: &str) -> Result<ModelTier, String> {
+    let trimmed = s.trim();
+    match trimmed.to_ascii_lowercase().as_str() {
+        "haiku" => Ok(ModelTier::Haiku),
+        "sonnet" => Ok(ModelTier::Sonnet),
+        "opus" => Ok(ModelTier::Opus),
+        _ => Err(format!(
+            "unknown baseline tier {trimmed:?} (expected one of: haiku, sonnet, opus)"
+        )),
+    }
+}
+
 /// Inputs to [`resolve_task_model`]. Built with `..Default::default()` so
 /// callers only name the fields they have; absent fields contribute nothing to
 /// the resolution chain. Using a struct over positional args avoids the
@@ -333,11 +351,44 @@ pub fn primary_runner_match<'a>(
     if let Some(id) = task_id {
         let body = strip_prd_prefix(id);
         for (prefix, spec) in &cfg.by_id_prefix {
-            // Normalize the key (trim a trailing `-`) then require a `-`
-            // boundary after the prefix segment, so a key like "REVIEW" cannot
-            // false-match "REVIEWER-001".
-            let needle = format!("{}-", prefix.trim_end_matches('-'));
-            if body.starts_with(&needle) || body.contains(&format!("-{needle}")) {
+            if id_body_matches_prefix(body, prefix) {
+                return Some(spec);
+            }
+        }
+    }
+    None
+}
+
+fn id_body_matches_prefix(body: &str, prefix: &str) -> bool {
+    // Normalize the key (trim a trailing `-`) then require a `-`
+    // boundary after the prefix segment, so a key like "REVIEW" cannot
+    // false-match "REVIEWER-001".
+    let needle = format!("{}-", prefix.trim_end_matches('-'));
+    body.starts_with(&needle) || body.contains(&format!("-{needle}"))
+}
+
+/// Return a baseline-tier remap for a task ID and Claude baseline model.
+///
+/// `byBaselineTier` is intentionally checked after direct primary-runner
+/// routes. It gives projects a way to say "for FEAT work, if the normal Claude
+/// baseline would have been Opus, use Codex; if Sonnet, use Grok" without
+/// overriding explicit per-task `model` fields.
+pub fn primary_runner_baseline_tier_match<'a>(
+    cfg: &'a PrimaryRunnerConfig,
+    task_id: Option<&str>,
+    baseline_model: Option<&str>,
+) -> Option<&'a RunnerSpec> {
+    let tier = model_tier(baseline_model);
+    if tier == ModelTier::Default {
+        return None;
+    }
+    let body = strip_prd_prefix(task_id?);
+    for (prefix, tier_map) in &cfg.by_baseline_tier {
+        if !id_body_matches_prefix(body, prefix) {
+            continue;
+        }
+        for (tier_key, spec) in tier_map {
+            if parse_baseline_tier_key(tier_key).ok() == Some(tier) {
                 return Some(spec);
             }
         }
@@ -394,24 +445,33 @@ pub fn resolve_task_execution_target(ctx: &ModelResolutionContext<'_>) -> Resolv
             provider_hint: parse_config_provider(&spec.provider).ok(),
         };
     }
-    // Rung 3: difficulty=high forces OPUS_MODEL.
-    if ctx
+
+    let baseline_model = if ctx
         .difficulty
         .is_some_and(|d| d.eq_ignore_ascii_case("high"))
     {
+        Some(OPUS_MODEL.to_string())
+    } else {
+        [ctx.prd_default, ctx.project_default, ctx.user_default]
+            .into_iter()
+            .find_map(|fallback| normalize(fallback).map(str::to_string))
+    };
+
+    // Rung 3: baseline-tier remap after the normal Claude baseline is known.
+    if let Some(spec) = ctx.primary_runner.and_then(|cfg| {
+        primary_runner_baseline_tier_match(cfg, ctx.task_id, baseline_model.as_deref())
+    }) {
         return ResolvedExecutionTarget {
-            model: Some(OPUS_MODEL.to_string()),
-            provider_hint: None,
+            model: normalize(Some(&spec.model)).map(str::to_string),
+            provider_hint: parse_config_provider(&spec.provider).ok(),
         };
     }
-    // Rungs 4-6: project/user defaults in precedence order.
-    for fallback in [ctx.prd_default, ctx.project_default, ctx.user_default] {
-        if let Some(m) = normalize(fallback) {
-            return ResolvedExecutionTarget {
-                model: Some(m.to_string()),
-                provider_hint: None,
-            };
-        }
+
+    if let Some(model) = baseline_model {
+        return ResolvedExecutionTarget {
+            model: Some(model),
+            provider_hint: None,
+        };
     }
     ResolvedExecutionTarget::default()
 }
@@ -730,6 +790,7 @@ mod tests {
             runtime_error_threshold: 2,
             by_task_type,
             by_id_prefix,
+            ..Default::default()
         }
     }
 
@@ -816,6 +877,7 @@ mod tests {
             runtime_error_threshold: 2,
             by_task_type,
             by_id_prefix: HashMap::new(),
+            ..Default::default()
         };
         let result = resolve_task_execution_target(&ModelResolutionContext {
             task_type: Some("review"),
@@ -843,6 +905,7 @@ mod tests {
             runtime_error_threshold: 2,
             by_task_type,
             by_id_prefix: HashMap::new(),
+            ..Default::default()
         };
         let result = resolve_task_execution_target(&ModelResolutionContext {
             task_model: Some(OPUS_MODEL),
@@ -870,6 +933,98 @@ mod tests {
             Some("grok-build".to_string()),
             "primaryRunner rung must precede difficulty=high escalation"
         );
+    }
+
+    #[test]
+    fn test_primary_runner_baseline_tier_feat_opus_routes_to_codex_hint() {
+        use std::collections::HashMap;
+        let mut tiers = HashMap::new();
+        tiers.insert(
+            "opus".to_string(),
+            RunnerSpec {
+                provider: "codex".to_string(),
+                model: String::new(),
+                fallback_to_claude: true,
+            },
+        );
+        let mut by_baseline_tier = HashMap::new();
+        by_baseline_tier.insert("FEAT".to_string(), tiers);
+        let cfg = PrimaryRunnerConfig {
+            by_baseline_tier,
+            ..Default::default()
+        };
+
+        let result = resolve_task_execution_target(&ModelResolutionContext {
+            task_id: Some("8d71d1f7-FEAT-001"),
+            difficulty: Some("high"),
+            primary_runner: Some(&cfg),
+            prd_default: Some(SONNET_MODEL),
+            ..ctx()
+        });
+
+        assert_eq!(result.model, None);
+        assert_eq!(result.provider_hint, Some(Provider::Codex));
+    }
+
+    #[test]
+    fn test_primary_runner_baseline_tier_feat_sonnet_routes_to_grok() {
+        use std::collections::HashMap;
+        let mut tiers = HashMap::new();
+        tiers.insert(
+            "sonnet".to_string(),
+            RunnerSpec {
+                provider: "grok".to_string(),
+                model: "grok-build".to_string(),
+                ..Default::default()
+            },
+        );
+        let mut by_baseline_tier = HashMap::new();
+        by_baseline_tier.insert("FEAT".to_string(), tiers);
+        let cfg = PrimaryRunnerConfig {
+            by_baseline_tier,
+            ..Default::default()
+        };
+
+        let result = resolve_task_execution_target(&ModelResolutionContext {
+            task_id: Some("FEAT-002"),
+            primary_runner: Some(&cfg),
+            prd_default: Some(SONNET_MODEL),
+            ..ctx()
+        });
+
+        assert_eq!(result.model.as_deref(), Some("grok-build"));
+        assert_eq!(result.provider_hint, Some(Provider::Grok));
+    }
+
+    #[test]
+    fn test_explicit_task_model_wins_over_baseline_tier_route() {
+        use std::collections::HashMap;
+        let mut tiers = HashMap::new();
+        tiers.insert(
+            "opus".to_string(),
+            RunnerSpec {
+                provider: "codex".to_string(),
+                model: String::new(),
+                ..Default::default()
+            },
+        );
+        let mut by_baseline_tier = HashMap::new();
+        by_baseline_tier.insert("FEAT".to_string(), tiers);
+        let cfg = PrimaryRunnerConfig {
+            by_baseline_tier,
+            ..Default::default()
+        };
+
+        let result = resolve_task_execution_target(&ModelResolutionContext {
+            task_id: Some("FEAT-003"),
+            task_model: Some(OPUS_MODEL),
+            difficulty: Some("high"),
+            primary_runner: Some(&cfg),
+            ..ctx()
+        });
+
+        assert_eq!(result.model.as_deref(), Some(OPUS_MODEL));
+        assert_eq!(result.provider_hint, None);
     }
 
     /// AC: primary_runner is None → behavior byte-identical to pre-primaryRunner
@@ -943,6 +1098,7 @@ mod tests {
             runtime_error_threshold: 2,
             by_task_type,
             by_id_prefix,
+            ..Default::default()
         };
         let spec = primary_runner_match(&cfg, Some("REVIEW-001"), Some("review"));
         assert_eq!(

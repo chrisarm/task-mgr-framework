@@ -301,7 +301,10 @@ fn maybe_codex_fallback_to_claude(
     ctx: &IterationContext,
     primary_cfg: Option<&project_config::PrimaryRunnerConfig>,
 ) -> TaskMgrResult<(Option<String>, Option<PendingPromotion>)> {
-    use crate::loop_engine::model::{Provider, parse_config_provider, primary_runner_match};
+    use crate::loop_engine::model::{
+        ModelResolutionContext, Provider, parse_config_provider,
+        primary_runner_baseline_tier_match, primary_runner_match, resolve_task_model,
+    };
 
     if ctx.runner_overrides.contains_key(task_id) {
         return Ok((None, None));
@@ -309,12 +312,33 @@ fn maybe_codex_fallback_to_claude(
     let Some(primary) = primary_cfg else {
         return Ok((None, None));
     };
+    let difficulty: Option<String> = conn
+        .query_row(
+            "SELECT difficulty FROM tasks WHERE id = ?",
+            [task_id],
+            |r| r.get(0),
+        )
+        .ok()
+        .flatten();
+    let prd_default: Option<String> = conn
+        .query_row(
+            "SELECT default_model FROM prd_metadata WHERE id = 1",
+            [],
+            |r| r.get(0),
+        )
+        .ok()
+        .flatten();
+    let baseline_model = resolve_task_model(&ModelResolutionContext {
+        difficulty: difficulty.as_deref(),
+        prd_default: prd_default.as_deref(),
+        project_default: primary.claude_fallback_model.as_deref(),
+        ..Default::default()
+    });
     // `task_type` is not threaded into recovery; production Codex routing is
-    // dominated by `byIdPrefix`. A future `byTaskType`-only Codex route with
-    // `fallbackToClaude:true` would miss this lookup — that's an acceptable
-    // gap because the legacy auto-block path is still correct, just not the
-    // opt-in promotion. Calling sites can thread `task_type` later if needed.
-    let Some(spec) = primary_runner_match(primary, Some(task_id), None) else {
+    // dominated by `byIdPrefix` and `byBaselineTier`.
+    let Some(spec) = primary_runner_match(primary, Some(task_id), None).or_else(|| {
+        primary_runner_baseline_tier_match(primary, Some(task_id), baseline_model.as_deref())
+    }) else {
         return Ok((None, None));
     };
     if !spec.fallback_to_claude {
@@ -336,14 +360,6 @@ fn maybe_codex_fallback_to_claude(
     //     the operator's intent explicit, so we never bail on a missing
     //     `claudeFallbackModel` (unlike the Grok→Claude branch which is
     //     project-level rather than per-route).
-    let difficulty: Option<String> = conn
-        .query_row(
-            "SELECT difficulty FROM tasks WHERE id = ?",
-            [task_id],
-            |r| r.get(0),
-        )
-        .ok()
-        .flatten();
     let target_model = if difficulty
         .as_deref()
         .is_some_and(|d| d.eq_ignore_ascii_case("high"))
@@ -1674,6 +1690,7 @@ mod tests {
             runtime_error_threshold: 2,
             by_task_type: std::collections::HashMap::new(),
             by_id_prefix,
+            ..Default::default()
         }
     }
 
@@ -1911,6 +1928,7 @@ mod tests {
             runtime_error_threshold: 2,
             by_task_type: std::collections::HashMap::new(),
             by_id_prefix,
+            ..Default::default()
         };
         let mut ctx = IterationContext::new(8);
         // Force-mark this task as Codex-executing so we exercise the new branch.

@@ -203,20 +203,21 @@ Do **not** hardcode model IDs — they change with each Claude release and must 
 - `high` → `xhigh`
 <!-- MODELS:END -->
 
-Set the resolved **sonnet** model as the PRD-level `"model"` field. Sonnet is the iteration default; opus tasks explicitly override per-task.
+Set the resolved **sonnet** model as the PRD-level `"model"` field. Sonnet is the iteration baseline for ordinary FEAT work.
 
-**Resolve review model** — Before stamping `model` on `REVIEW-001`, read `.task-mgr/config.json` and check `reviewModel`. If set, use that value; otherwise fall back to opus. Default recommendation: `grok-4`.
+**Resolve review model** — Before stamping `model` on `REVIEW-001`, read `.task-mgr/config.json` and check `reviewModel`. If set, use that value; otherwise fall back to opus.
 
 **Model assignment rubric** (set `model` field only where listed; omit for everything else — uses PRD default):
 
 | Task type                                                                   | Assign `model`             | Rationale                                              |
 | --------------------------------------------------------------------------- | -------------------------- | ------------------------------------------------------ |
-| `FEAT-xxx` / `FIX-xxx` with `estimatedEffort: "high"` OR `modifiesBehavior: true` | opus                 | Complex implementation — stronger model reduces rework |
-| `REVIEW-001`                                                                | reviewModel (default `grok-4`, else opus) | Second-model perspective; full suite run |
+| `FEAT-xxx`                                                                  | _(omit)_                   | Runtime policy maps baseline Sonnet→Grok and Opus→Codex |
+| `FIX-xxx` / `CODE-FIX-*` / `WIRE-FIX-*` / `IMPL-FIX-*`                      | opus                       | Spawned follow-ups need the strongest repair model |
+| `REVIEW-001`                                                                | reviewModel (else opus)    | Full-suite review gate |
 | `REFACTOR-001`                                                              | opus                       | Nuanced quality/security/architecture judgment; full suite run |
 | All other implementation, test, and fix tasks                               | _(omit — use PRD default)_ | Standard work handled by the Sonnet default            |
 
-> The old "first FEAT is always opus" rule is gone — it was pattern-worship. Iterations don't inherit patterns across runs.
+> Do not stamp `model` on FEAT tasks. Use `estimatedEffort: "high"` and/or `modifiesBehavior: true` to express complexity; `.task-mgr/config.json` `primaryRunner.byBaselineTier` maps FEAT Sonnet baselines to Grok and Opus baselines to Codex. Explicit FEAT `model` fields bypass that policy.
 
 **`timeoutSecs` assignment** (set on tasks that run the full test suite):
 
@@ -270,7 +271,7 @@ FEAT-001: [First coherent change] (priority 1)
   — Edge cases to handle (edgeCases field)
   — Known-bad patterns to avoid
   — Failure modes and expected behavior
-  — Set model: opus ONLY if estimatedEffort: high OR modifiesBehavior: true
+  — Do not set model; use estimatedEffort/modifiesBehavior to influence baseline tier
 
 FEAT-002: [Second coherent change] (priority 2)
   — Depends on FEAT-001 if sequential
@@ -511,7 +512,7 @@ The agent checks these before starting any task. If the required task hasn't pas
       "priority": 99,
       "estimatedEffort": "medium",
       "passes": false,
-      "model": "<resolved-reviewModel-id>",
+      "model": "<resolved-reviewModel-or-opus-id>",
       "timeoutSecs": 1800,
       "notes": "Spawn fixes via `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001` — DB + JSON synced atomically, no manual edit. If no issues: emit `<task-status>REVIEW-001:done</task-status>` with 'Clean review' note. Review remaining tasks — if implementation changed APIs, data structures, or assumptions, update task descriptions/criteria to match (via `task-mgr init --from-json ... --append --update-existing`).",
       "qualityDimensions": ["No unwrap in production", "All new code wired to production entry point", "Full suite green including pre-existing"],
@@ -970,8 +971,9 @@ Verify:
 - [ ] Each implementation task has `qualityDimensions` populated as a **flat array** (NOT `{correctness, performance, style}` sub-objects)
 - [ ] Each task's known edge cases appear in `edgeCases` field
 - [ ] Tasks with `modifiesBehavior: true` have caller impact documented in description
+- [ ] No FEAT task has a `model` field; FEAT complexity is expressed with `estimatedEffort` / `modifiesBehavior`
 - [ ] REFACTOR-001 has `model: <opus-id>` and `timeoutSecs: 1800`
-- [ ] REVIEW-001 has `model: <reviewModel-id>` (read from `.task-mgr/config.json` `reviewModel`; default `grok-4`, else opus) and `timeoutSecs: 1800`
+- [ ] REVIEW-001 has `model: <reviewModel-or-opus-id>` (read from `.task-mgr/config.json` `reviewModel`; else opus) and `timeoutSecs: 1800`
 - [ ] **No task has `synergyWith` / `batchWith` / `conflictsWith` populated** (dropped — `touchesFiles` drives synergy at runtime)
 - [ ] **Context-economy placeholders populated in the generated prompt** (the agent can't read the JSON, so these MUST be in the prompt):
   - [ ] `{{PROHIBITED_OUTCOMES}}` — rendered from JSON `prohibitedOutcomes[]` as a bullet list
@@ -1031,7 +1033,7 @@ To run: task-mgr loop -y tasks/{feature}.json
 | Missing edgeCases                              | Agent discovers edge cases in production                      | Every identified edge case has an edgeCases entry               |
 | Populating `synergyWith` / `batchWith`         | Ignored — `task-mgr next` derives synergy from `touchesFiles` | Just populate `touchesFiles` accurately; drop synergyWith       |
 | `qualityDimensions` as sub-objects             | Old schema; agent reads flat arrays now                       | One flat list of strings, not `{correctness, performance, style}` |
-| Setting `model: opus` on FEAT-001              | "First FEAT = opus" rule was pattern-worship, now removed     | Only set opus for `high` effort OR `modifiesBehavior: true`     |
+| Setting `model: opus` on FEAT-001              | Explicit FEAT models bypass runtime Codex/Grok routing        | Omit model; use `estimatedEffort` / `modifiesBehavior`          |
 | Prompt that tells agent to Read `tasks/*.json` | Wastes context; agent can't edit JSON anyway                  | Use `task-mgr next --claim`; embed global fields in prompt      |
 | Prompt without `{{PROHIBITED_OUTCOMES}}` etc.  | Agent can't see those JSON fields                             | Render all global fields as bullet lists in the prompt          |
 | No data flow contracts for cross-module data   | Silent wrong-key-type bugs                                    | Trace key types, document in prompt                             |

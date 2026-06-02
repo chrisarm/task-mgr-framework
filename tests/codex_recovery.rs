@@ -21,6 +21,7 @@ use task_mgr::loop_engine::config::CrashType;
 use task_mgr::loop_engine::engine::{
     IterationContext, escalate_task_model_if_needed_for_runner, handle_task_failure_with_runner,
 };
+use task_mgr::loop_engine::model::OPUS_MODEL;
 use task_mgr::loop_engine::project_config::{
     FallbackRunnerConfig, PrimaryRunnerConfig, RunnerSpec,
 };
@@ -563,5 +564,57 @@ fn codex_runtime_failure_with_fallback_to_claude_promotes_to_claude_once() {
         ctx.runner_overrides.get("SPIKE-FALLBACK-001").copied(),
         Some(RunnerKind::Claude),
         "runner_overrides MUST remain Claude after the second Codex failure"
+    );
+}
+
+#[test]
+fn codex_baseline_tier_route_with_fallback_to_claude_promotes() {
+    let (_tmp, conn) = setup_db();
+    conn.execute(
+        "INSERT INTO tasks \
+         (id, title, status, difficulty, consecutive_failures, max_retries, priority) \
+         VALUES ('FEAT-TIER-001', 'Codex tier fallback test', 'in_progress', 'high', 0, 5, 10)",
+        [],
+    )
+    .expect("insert task");
+
+    let mut tiers = HashMap::new();
+    tiers.insert(
+        "opus".to_string(),
+        RunnerSpec {
+            provider: "codex".to_string(),
+            model: String::new(),
+            fallback_to_claude: true,
+        },
+    );
+    let mut by_baseline_tier = HashMap::new();
+    by_baseline_tier.insert("FEAT".to_string(), tiers);
+    let primary_cfg = PrimaryRunnerConfig {
+        by_baseline_tier,
+        ..Default::default()
+    };
+    let mut ctx = IterationContext::new(8);
+
+    let result = escalate_task_model_if_needed_for_runner(
+        &conn,
+        "FEAT-TIER-001",
+        2,
+        RunnerKind::Codex,
+        &mut ctx,
+        None,
+        Some(&primary_cfg),
+    )
+    .expect("baseline-tier codex fallback");
+
+    assert_eq!(result.as_deref(), Some(OPUS_MODEL));
+    assert_eq!(
+        ctx.runner_overrides.get("FEAT-TIER-001").copied(),
+        Some(RunnerKind::Claude),
+        "byBaselineTier Codex route with fallbackToClaude must promote to Claude"
+    );
+    assert_eq!(
+        ctx.model_overrides.get("FEAT-TIER-001").map(String::as_str),
+        Some(OPUS_MODEL),
+        "high-difficulty FEAT baseline promotes to Opus on Claude fallback"
     );
 }

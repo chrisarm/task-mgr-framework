@@ -96,27 +96,38 @@ only in v1; it is not part of the Claude↔Grok fallback pair.
     "byIdPrefix": {
       "REVIEW-":    { "provider": "grok", "model": "grok-build" },
       "MILESTONE-": { "provider": "grok", "model": "grok-build" }
+    },
+    "byBaselineTier": {
+      "FEAT": {
+        "opus":   { "provider": "codex", "fallbackToClaude": true },
+        "sonnet": { "provider": "grok", "model": "grok-build" }
+      }
     }
   }
 }
 ```
 
 Field defaults: `claudeFallbackModel=null`, `runtimeErrorThreshold=2`,
-`byTaskType={}`, `byIdPrefix={}`. `RunnerSpec.model` defaults to `""` and is
-valid only for `provider: "codex"`; Grok and Claude routes must provide a
-nonblank model. Absent or `null` → `primary_runner = None` in `ProjectConfig`;
-loop behavior is byte-identical to a pure-Claude run.
+`byTaskType={}`, `byIdPrefix={}`, `byBaselineTier={}`. `RunnerSpec.model`
+defaults to `""` and is valid only for `provider: "codex"`; Grok and Claude
+routes must provide a nonblank model. `byBaselineTier` is keyed by task prefix,
+then by baseline Claude tier (`haiku`, `sonnet`, `opus`). Absent or `null` →
+`primary_runner = None` in `ProjectConfig`; loop behavior is byte-identical to
+a pure-Claude run.
 
 ### Routing precedence (`resolve_task_execution_target`)
 
 ```
 explicit task model   (tasks.model DB column / model_overrides override; provider hint cleared)
-  → primaryRunner match  (byTaskType wins over byIdPrefix; may carry provider hint)
-    → difficulty=high   (forces OPUS_MODEL)
-      → prd default     (prd_metadata.default_model)
-        → project default (.task-mgr/config.json defaultModel)
-          → user default  ($XDG_CONFIG_HOME/task-mgr/config.json defaultModel)
-            → None
+  → direct primaryRunner match  (byTaskType wins over byIdPrefix; may carry provider hint)
+    → compute baseline Claude model
+      → difficulty=high   (forces OPUS_MODEL)
+        → prd default     (prd_metadata.default_model)
+          → project default (.task-mgr/config.json defaultModel)
+            → user default  ($XDG_CONFIG_HOME/task-mgr/config.json defaultModel)
+    → primaryRunner.byBaselineTier remap for the task prefix + baseline tier
+      → baseline Claude model
+        → None
 ```
 
 Rung 2 (`primaryRunner`) is skipped entirely when `primary_runner = None` —
@@ -134,6 +145,9 @@ for EVERY task):
    (e.g. `"review"`, `"milestone"`).
 2. `byIdPrefix` — the task ID body (after stripping the 8-hex project prefix)
    starts with the map key, OR the body contains `"-<key>"`.
+3. `byBaselineTier` — checked after the normal Claude baseline is computed;
+   uses the same task-ID prefix matching, then selects the route matching the
+   baseline tier.
 
 When both produce a match, `byTaskType` wins.
 

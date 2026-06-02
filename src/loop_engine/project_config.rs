@@ -100,6 +100,14 @@ pub struct PrimaryRunnerConfig {
     /// Task-ID-prefix → `RunnerSpec` routing map. Absent key → empty map.
     #[serde(default)]
     pub by_id_prefix: HashMap<String, RunnerSpec>,
+
+    /// Task-ID-prefix → baseline Claude tier → `RunnerSpec` routing map.
+    ///
+    /// Used when a task has no explicit `model`, after its baseline Claude
+    /// tier is known from difficulty/default resolution. Tier keys are
+    /// validated by `model::parse_baseline_tier_key`.
+    #[serde(default)]
+    pub by_baseline_tier: HashMap<String, HashMap<String, RunnerSpec>>,
 }
 
 impl Default for PrimaryRunnerConfig {
@@ -109,6 +117,7 @@ impl Default for PrimaryRunnerConfig {
             runtime_error_threshold: default_primary_runtime_error_threshold(),
             by_task_type: HashMap::new(),
             by_id_prefix: HashMap::new(),
+            by_baseline_tier: HashMap::new(),
         }
     }
 }
@@ -492,6 +501,16 @@ pub fn validate_runner_routing_config(cfg: &ProjectConfig) -> TaskMgrResult<()> 
                 });
             }
         }
+        for (prefix, tier_map) in &primary.by_baseline_tier {
+            for tier_key in tier_map.keys() {
+                crate::loop_engine::model::parse_baseline_tier_key(tier_key).map_err(
+                    |message| TaskMgrError::InvalidConfig {
+                        field: format!("primaryRunner.byBaselineTier.{prefix}.{tier_key}"),
+                        message,
+                    },
+                )?;
+            }
+        }
         if cfg
             .review_model
             .as_deref()
@@ -526,17 +545,22 @@ pub fn check_codex_runner_binary(primary: Option<&PrimaryRunnerConfig>) -> TaskM
 
 fn primary_runner_specs(
     primary: &PrimaryRunnerConfig,
-) -> impl Iterator<Item = (&'static str, &String, &RunnerSpec)> {
+) -> impl Iterator<Item = (&'static str, String, &RunnerSpec)> {
     primary
         .by_task_type
         .iter()
-        .map(|(k, v)| ("byTaskType", k, v))
+        .map(|(k, v)| ("byTaskType", k.clone(), v))
         .chain(
             primary
                 .by_id_prefix
                 .iter()
-                .map(|(k, v)| ("byIdPrefix", k, v)),
+                .map(|(k, v)| ("byIdPrefix", k.clone(), v)),
         )
+        .chain(primary.by_baseline_tier.iter().flat_map(|(prefix, tiers)| {
+            tiers
+                .iter()
+                .map(move |(tier, spec)| ("byBaselineTier", format!("{prefix}.{tier}"), spec))
+        }))
 }
 
 fn primary_runner_contains_codex_review_route(primary: &PrimaryRunnerConfig) -> bool {
@@ -550,6 +574,14 @@ fn primary_runner_contains_codex_review_route(primary: &PrimaryRunnerConfig) -> 
                 }
                 "byIdPrefix" => {
                     let k = key.trim_end_matches('-').to_ascii_uppercase();
+                    matches!(k.as_str(), "CODE-REVIEW" | "REVIEW" | "MILESTONE-FINAL")
+                }
+                "byBaselineTier" => {
+                    let prefix = key
+                        .split_once('.')
+                        .map(|(prefix, _)| prefix)
+                        .unwrap_or(key.as_str());
+                    let k = prefix.trim_end_matches('-').to_ascii_uppercase();
                     matches!(k.as_str(), "CODE-REVIEW" | "REVIEW" | "MILESTONE-FINAL")
                 }
                 _ => false,
@@ -1292,6 +1324,7 @@ mod tests {
         assert_eq!(pr.runtime_error_threshold, 2);
         assert!(pr.by_task_type.is_empty());
         assert!(pr.by_id_prefix.is_empty());
+        assert!(pr.by_baseline_tier.is_empty());
     }
 
     #[test]
@@ -1313,6 +1346,12 @@ mod tests {
                     "byIdPrefix": {{
                         "REVIEW-":    {{ "provider": "grok", "model": "grok-build" }},
                         "MILESTONE-": {{ "provider": "grok", "model": "grok-build" }}
+                    }},
+                    "byBaselineTier": {{
+                        "FEAT": {{
+                            "opus": {{ "provider": "codex", "fallbackToClaude": true }},
+                            "sonnet": {{ "provider": "grok", "model": "grok-build" }}
+                        }}
                     }}
                 }}
             }}"#
@@ -1345,6 +1384,14 @@ mod tests {
             .expect("MILESTONE- key missing");
         assert_eq!(ms_prefix_spec.provider, "grok");
         assert_eq!(ms_prefix_spec.model, "grok-build");
+
+        let feat_tiers = pr.by_baseline_tier.get("FEAT").expect("FEAT key missing");
+        let opus_spec = feat_tiers.get("opus").expect("opus key missing");
+        assert_eq!(opus_spec.provider, "codex");
+        assert!(opus_spec.fallback_to_claude);
+        let sonnet_spec = feat_tiers.get("sonnet").expect("sonnet key missing");
+        assert_eq!(sonnet_spec.provider, "grok");
+        assert_eq!(sonnet_spec.model, "grok-build");
     }
 
     #[test]
@@ -1371,6 +1418,10 @@ mod tests {
         );
         assert_eq!(pr.runtime_error_threshold, 2, "default threshold is 2");
         assert!(pr.by_id_prefix.is_empty(), "byIdPrefix absent → empty map");
+        assert!(
+            pr.by_baseline_tier.is_empty(),
+            "byBaselineTier absent → empty map"
+        );
         let spec = pr.by_task_type.get("review").expect("review key missing");
         assert_eq!(spec.model, "grok-build");
     }
@@ -1418,6 +1469,7 @@ mod tests {
             runtime_error_threshold: 2,
             by_task_type,
             by_id_prefix: HashMap::new(),
+            ..Default::default()
         }
     }
 
@@ -1695,6 +1747,34 @@ mod tests {
                 "the typo path must surface the unknown-provider error, not the blank-model rule: {msg}",
             );
         }
+    }
+
+    #[test]
+    fn test_validate_rejects_unknown_baseline_tier() {
+        let mut tiers = HashMap::new();
+        tiers.insert(
+            "superopus".to_string(),
+            RunnerSpec {
+                provider: "codex".to_string(),
+                model: String::new(),
+                ..Default::default()
+            },
+        );
+        let mut by_baseline_tier = HashMap::new();
+        by_baseline_tier.insert("FEAT".to_string(), tiers);
+        let cfg = ProjectConfig {
+            primary_runner: Some(PrimaryRunnerConfig {
+                by_baseline_tier,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err = validate_runner_routing_config(&cfg).expect_err("unknown tier must reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("byBaselineTier.FEAT.superopus") && msg.contains("haiku"),
+            "error must name the bad tier and allowed tiers: {msg}"
+        );
     }
 
     /// CONTRACT: `EffectiveRunnerInput` field names match the struct in

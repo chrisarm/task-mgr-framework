@@ -90,8 +90,9 @@ wasn't printed.
 Cache: `$XDG_CACHE_HOME/task-mgr/models-cache.json` (24h TTL, stale treated as miss).
 
 **Config locations & precedence** (highest to lowest): explicit task `model` →
-`difficulty==high` → PRD `defaultModel` → `.task-mgr/config.json defaultModel`
-→ `$XDG_CONFIG_HOME/task-mgr/config.json defaultModel` → none.
+direct `primaryRunner` match → baseline Claude model (`difficulty==high` or
+PRD/project/user default) → `primaryRunner.byBaselineTier` remap → baseline
+Claude model → none.
 `difficulty==high` always escalates to `OPUS_MODEL`, independent of any
 default.
 

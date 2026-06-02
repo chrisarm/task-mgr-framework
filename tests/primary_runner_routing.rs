@@ -28,7 +28,8 @@ use task_mgr::loop_engine::engine::{
     EffectiveRunnerInput, IterationContext, resolve_effective_runner,
 };
 use task_mgr::loop_engine::model::{
-    ModelResolutionContext, OPUS_MODEL, SONNET_MODEL, resolve_task_model,
+    ModelResolutionContext, OPUS_MODEL, Provider, SONNET_MODEL, resolve_task_execution_target,
+    resolve_task_model,
 };
 use task_mgr::loop_engine::project_config::{PrimaryRunnerConfig, RunnerSpec};
 use task_mgr::loop_engine::runner::RunnerKind;
@@ -63,6 +64,32 @@ fn make_cfg() -> PrimaryRunnerConfig {
     }
 }
 
+fn make_baseline_tier_cfg() -> PrimaryRunnerConfig {
+    let mut tiers = HashMap::new();
+    tiers.insert(
+        "opus".to_string(),
+        RunnerSpec {
+            provider: "codex".to_string(),
+            model: String::new(),
+            fallback_to_claude: true,
+        },
+    );
+    tiers.insert(
+        "sonnet".to_string(),
+        RunnerSpec {
+            provider: "grok".to_string(),
+            model: GROK_MODEL.to_string(),
+            ..Default::default()
+        },
+    );
+    let mut by_baseline_tier = HashMap::new();
+    by_baseline_tier.insert("FEAT".to_string(), tiers);
+    PrimaryRunnerConfig {
+        by_baseline_tier,
+        ..Default::default()
+    }
+}
+
 // ── Scenario 1 — byTaskType "review" match ────────────────────────────────────
 
 /// `task_type = "review"` with a matching `byTaskType["review"]` entry routes
@@ -84,6 +111,30 @@ fn by_task_type_review_routes_to_grok() {
         "byTaskType review match MUST resolve to the configured Grok model — \
          the primaryRunner rung beats project_default",
     );
+}
+
+#[test]
+fn feat_baseline_tier_routes_sonnet_to_grok_and_opus_to_codex() {
+    let cfg = make_baseline_tier_cfg();
+
+    let sonnet_target = resolve_task_execution_target(&ModelResolutionContext {
+        task_id: Some("8d71d1f7-FEAT-001"),
+        prd_default: Some(SONNET_MODEL),
+        primary_runner: Some(&cfg),
+        ..Default::default()
+    });
+    assert_eq!(sonnet_target.model.as_deref(), Some(GROK_MODEL));
+    assert_eq!(sonnet_target.provider_hint, Some(Provider::Grok));
+
+    let opus_target = resolve_task_execution_target(&ModelResolutionContext {
+        task_id: Some("8d71d1f7-FEAT-002"),
+        difficulty: Some("high"),
+        prd_default: Some(SONNET_MODEL),
+        primary_runner: Some(&cfg),
+        ..Default::default()
+    });
+    assert_eq!(opus_target.model, None);
+    assert_eq!(opus_target.provider_hint, Some(Provider::Codex));
 }
 
 // ── Scenario 2 — byTaskType "milestone" match ─────────────────────────────────
