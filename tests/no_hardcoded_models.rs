@@ -49,6 +49,31 @@ fn no_hardcoded_model_strings_outside_model_rs() {
     );
 }
 
+#[test]
+fn task_generation_docs_do_not_stamp_models_on_feat_tasks() {
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    for rel in [
+        ".claude/commands/tasks.md",
+        ".claude/commands/plan-tasks.md",
+    ] {
+        let contents = fs::read_to_string(repo_root.join(rel)).expect("read command doc");
+        assert!(
+            !contents.contains("Set model: opus ONLY if estimatedEffort"),
+            "{rel} must not revive the old FEAT opus-stamping guidance"
+        );
+        assert!(
+            !contents.contains("FEAT-xxx` / `FIX-xxx` with `estimatedEffort"),
+            "{rel} must not tell generators to stamp model fields on FEAT tasks"
+        );
+        assert!(
+            contents.contains("Do not stamp `model` on FEAT")
+                || contents.contains("Do **not** stamp\n`model` on FEAT")
+                || contents.contains("Do not set model; use estimatedEffort"),
+            "{rel} must explicitly preserve runtime FEAT provider routing"
+        );
+    }
+}
+
 fn scan_dir(dir: &Path, repo_root: &Path, pattern: &regex::Regex, out: &mut Vec<String>) {
     if SKIP_DIR_SUFFIXES
         .iter()

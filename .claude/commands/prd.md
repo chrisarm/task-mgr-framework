@@ -196,7 +196,7 @@ task-mgr recall --tags "{domain}" --query "{concept}" --limit 10
 - Also try query-based: `task-mgr recall --query "library evaluation benchmark spike" --limit 10`
 - Past spikes have crashed when the agent tried to run Docker or heavy evaluation code. If the PRD includes evaluation work:
   - Mark the task as `taskType: "research"` with `requiresHuman: true` so the loop agent flags it for human attention
-  - Recommend `model: opus` and `estimatedEffort: "high"`
+  - Recommend `estimatedEffort: "high"`; `/tasks` owns any explicit model field assignment
   - Require a clear fallback decision: "if evaluation takes >3 days, default to X and document why"
   - Consider splitting: "define evaluation criteria" (automatable) vs "run benchmarks + write ADR" (requires human)
 - Embed relevant learnings in the PRD's Technical Considerations section so the implementing agent doesn't repeat past mistakes.

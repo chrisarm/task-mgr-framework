@@ -14,6 +14,8 @@
 
 `task-mgr loop run` and `task-mgr batch run` accept `--parallel N` (1-3, default 2) to schedule non-conflicting tasks across N slots per wave. Conflict detection uses each task's `touchesFiles` (file overlap → serialize) plus the shared-infra heuristic in `src/commands/next/selection.rs`. `--parallel 1` is byte-identical to sequential execution. The deprecated `synergyWith` / `batchWith` / `conflictsWith` relationship fields still parse without error but are ignored — `touchesFiles` is the sole conflict source. See `src/loop_engine/CLAUDE.md` "Parallel-slot scheduling" for the full defense layering.
 
+**Gotcha — stale slot-worktree test binaries after a parallel-slot loop.** The repo's shared cargo target dir (`~/.cargo-target`) caches test binaries keyed independently of which worktree built them. When a parallel-slot loop's `…-slot-N` worktree is pruned at merge-back, fixture-reading test binaries (`cli_tests`, `concurrent`) keep the dead slot's compiled-in `CARGO_MANIFEST_DIR`, so a later `cargo test` (e.g. during `/review-loop`) fails en masse with `Failed to read .../<branch>-slot-N/tests/fixtures/…: No such file or directory`. This is **not** a code regression — the giveaway is that only fixture-reading binaries fail and every error points at the same removed `-slot-N` path. Fix: force a recompile in the current worktree (`touch tests/<binary>.rs` then re-run). Rebuild before concluding a parallel-slot loop introduced test failures. (learning #4753)
+
 ## Subsystem design notes
 
 Module-level CLAUDE.md files (auto-loaded when files in the module are read):
@@ -90,8 +92,9 @@ wasn't printed.
 Cache: `$XDG_CACHE_HOME/task-mgr/models-cache.json` (24h TTL, stale treated as miss).
 
 **Config locations & precedence** (highest to lowest): explicit task `model` →
-`difficulty==high` → PRD `defaultModel` → `.task-mgr/config.json defaultModel`
-→ `$XDG_CONFIG_HOME/task-mgr/config.json defaultModel` → none.
+direct `primaryRunner` match → baseline model (`difficulty==high` or
+PRD/project/user default) → `primaryRunner.baselineTierRoutes` remap using the
+provider-neutral baseline tier (`low`/`standard`/`high`) → baseline model → none.
 `difficulty==high` always escalates to `OPUS_MODEL`, independent of any
 default.
 
@@ -336,16 +339,16 @@ overflow rung-4 pivot):
   "primaryRunner": {
     "claudeFallbackModel": "<claude model id>",
     "byIdPrefix": {
-      "FEAT-": { "provider": "codex", "fallbackToClaude": true }
+      "FEAT-": { "provider": "codex", "runtimeErrorFallback": true }
     }
   }
 }
 ```
 
-When `fallbackToClaude: true` AND consecutive RuntimeErrors reach
+When `runtimeErrorFallback: true` AND consecutive RuntimeErrors reach
 `primaryRunner.runtimeErrorThreshold`, the task is promoted to Claude
 (`runner_overrides[id] = Claude`, never Codex) — once per loop run.
-Field defaults: `fallbackToClaude=false`; absent → no Codex→Claude
+Field defaults: `runtimeErrorFallback=false`; absent → no Codex→Claude
 promotion. See `src/loop_engine/CLAUDE.md` "Codex provider integration"
 for the full design notes (schema, auth detection, protected-state guard,
 binary probe contract, prohibited outcomes).

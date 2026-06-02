@@ -666,6 +666,15 @@ pub struct WaveIterationParams<'a> {
     pub permission_mode: &'a PermissionMode,
     pub signal_flag: &'a SignalFlag,
     pub default_model: Option<&'a str>,
+    /// Default model from the per-project config (`.task-mgr/config.json`),
+    /// cached once at `run_loop` startup. Threaded into the post-wave
+    /// `handle_task_failure_with_runner` call so the recovery baseline-tier
+    /// derivation uses the SAME defaults the primary spawn-site does (FIX-001).
+    pub project_default_model: Option<&'a str>,
+    /// Default model from the per-user config
+    /// (`$XDG_CONFIG_HOME/task-mgr/config.json`), cached at `run_loop` startup.
+    /// See `project_default_model` (FIX-001).
+    pub user_default_model: Option<&'a str>,
     pub verbose: bool,
     pub task_prefix: Option<&'a str>,
     pub prd_path: &'a Path,

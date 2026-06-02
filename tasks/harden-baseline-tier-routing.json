@@ -1,0 +1,826 @@
+{
+  "branchName": "feat/harden-baseline-tier-routing",
+  "description": "Harden the baseline-tier runner routing change: fix the correct-by-accident config read path, close the recovery↔primary baseline-tier derivation divergence (full fidelity), test the on-disk config rewrite, neutralize the `..` worktree path-traversal gap, and extract two foundational abstractions (compute_baseline_model, promote_once) plus split the two largest god-modules along clean seams.",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "Rust: No warnings in `cargo check` output",
+      "Rust: No warnings in `cargo clippy -- -D warnings` output",
+      "Rust: Scoped tests pass with `cargo test` (full suite at milestones)",
+      "Rust: `cargo fmt --check` passes",
+      "No literal model-id strings outside src/loop_engine/model.rs (tests/no_hardcoded_models.rs)",
+      "Status mutations go through TaskLifecycle verbs, never raw `UPDATE tasks SET status`",
+      "No breaking changes to documented happy-path routing precedence"
+    ],
+    "description": "These criteria apply to ALL implementation tasks"
+  },
+  "mergeStrategy": "Merge to main after MILESTONE-FINAL passes. Each WS-3 refactor lands as its own behavior-neutral commit; do not bundle refactors with the fixes.",
+  "model": "claude-sonnet-4-6",
+  "priorityPhilosophy": {
+    "description": "Hierarchy of what matters most when implementing tasks",
+    "hierarchy": [
+      "1. PLAN — Anticipate edge cases before coding",
+      "2. PHASE 2 FOUNDATION — ~1 day now to save ~2+ weeks later (1:10+ ratio); we are pre-launch, foundations compound",
+      "3. FUNCTIONING CODE — Pragmatic, reliable, wired in per plan",
+      "4. CORRECTNESS — Compiles, type-checks, scoped tests pass deterministically",
+      "5. CODE QUALITY — Clean code, qualityDimensions satisfied, no warnings",
+      "6. POLISH — Docs, formatting, minor improvements"
+    ],
+    "principles": [
+      "Quality dimensions explicit — qualityDimensions on every task tells you what 'good' looks like",
+      "Phase 2 foundation — prefer solutions that lay strong post-launch foundations (1:10+ savings ratio)",
+      "Edge cases = test cases — every known edge case must have a corresponding test",
+      "Scoped per-iteration tests, full suite at milestones — milestones must leave the trunk green including pre-existing failures",
+      "Refactors are separate, behavior-neutral commits — never bundle a WS-3 split with a fix"
+    ]
+  },
+  "prohibitedOutcomes": [
+    "Tests that only assert 'no crash' or check type without verifying content",
+    "Tests that mirror implementation internals (break when refactoring)",
+    "Abstractions with only one concrete use",
+    "promote_once mutating IterationContext (reintroduces dirty-ctx-on-rollback)",
+    "Inserting RunnerKind::Codex into runner_overrides on a Codex→Claude promotion (must always insert Claude)",
+    "Changing happy-path routing-precedence behavior or editing existing routing-precedence test assertions (beyond mechanical ..Default::default())",
+    "Bundling a WS-3 god-module split with a logic change in the same commit",
+    "Catch-all error handlers that swallow context"
+  ],
+  "project": "task-mgr",
+  "requires": [],
+  "reviewGuidelines": {
+    "priorityGuidelines": {
+      "critical": "1-10: Blocks further work, fix immediately",
+      "high": "11-20: Fix before phase completion",
+      "low": "51-99: Defer to hardening phase",
+      "medium": "21-50: Fix in current phase if time permits"
+    }
+  },
+  "taskPrefix": "2c53f8d1",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "Consumer Impact Table generated in the progress file: every caller of the five failure-handler functions identified with file:line and OK/BREAKS/NEEDS_REVIEW",
+        "Semantic distinction documented: baseline-tier derivation (decides WHETHER/WHERE to route) vs target_model selection at recovery.rs:363-376 (decides WHICH Claude model to promote to) — confirm the latter is UNCHANGED",
+        "Confirm no production caller derives the recovery baseline from claude_fallback_model intentionally (it is the bug, not a feature)",
+        "List the recovery unit tests + tests/codex_recovery.rs cases whose call shapes must update in lockstep"
+      ],
+      "dependsOn": [],
+      "description": "Confirm the blast radius of (a) changing maybe_codex_fallback_to_claude's baseline derivation to use compute_baseline_model, and (b) adding project_default/user_default params to handle_task_failure, handle_task_failure_with_runner, escalate_task_model_if_needed_inner, escalate_task_model_if_needed, escalate_task_model_if_needed_for_runner. Identify every caller (production + tests) and the exact tier-derivation behavior delta. Source the Consumer Impact + Semantic Distinctions tables from PRD section 6.",
+      "estimatedEffort": "high",
+      "id": "ANALYSIS-001",
+      "modifiesBehavior": false,
+      "notes": "PRD already contains the Consumers + Semantic Distinctions tables (section 6). Use them; do not re-run /analyze from scratch. Learning [4418]: provider identity / baseline must thread from spawn through recovery, not be re-derived — this analysis confirms the threading targets.",
+      "passes": true,
+      "priority": 0,
+      "qualityDimensions": [
+        "Every caller of the five failure-handler functions enumerated with file:line — none missed (a missed caller is a compile error, but enumerate anyway for review)",
+        "The target_model vs baseline-tier distinction is stated explicitly so the implementer does not accidentally change target_model"
+      ],
+      "requiresHuman": false,
+      "taskType": "analysis",
+      "title": "Consumer impact of recovery baseline-derivation change + failure-handler signature threading",
+      "touchesFiles": [
+        "src/loop_engine/recovery.rs",
+        "src/loop_engine/orchestrator.rs",
+        "src/loop_engine/wave_scheduler.rs",
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "compute_baseline_model: difficulty=high (eq_ignore_ascii_case) returns Some(OPUS_MODEL); else find_map over [prd_default, project_default, user_default] through `normalize`",
+        "resolve_task_execution_target calls compute_baseline_model; the inline block is removed",
+        "Existing model.rs resolution tests and tests/primary_runner_routing.rs pass WITHOUT assertion edits (only mechanical ..Default::default() allowed)",
+        "Unit tests: difficulty=high short-circuit; three-default precedence (prd > project > user); all-None → None; blank/whitespace defaults skipped via normalize",
+        "No literal model strings introduced outside model.rs"
+      ],
+      "dependsOn": [],
+      "description": "Add `pub fn compute_baseline_model(difficulty, prd_default, project_default, user_default: Option<&str>) -> Option<String>` to src/loop_engine/model.rs, body identical to the current inline logic at resolve_task_execution_target (model.rs:~450-459), reusing the private `normalize`. Refactor resolve_task_execution_target to call it. Pure refactor — zero behavior change.",
+      "estimatedEffort": "high",
+      "id": "CONTRACT-BASE-001",
+      "modifiesBehavior": false,
+      "notes": "Foundational SSoT consumed by FIX-001. Learning [4049]: precedence chain is explicit task model > primaryRunner match > difficulty=high > prd > project > user. Learning [3057]/[9]: layered resolution. Keep the function total (never panics).",
+      "passes": true,
+      "priority": 1,
+      "qualityDimensions": [
+        "Byte-identical behavior to the prior inline computation — pinned by existing resolution tests passing unchanged",
+        "Single home: no other site recomputes the difficulty=high→OPUS / find_map-over-defaults logic",
+        "Total function (every Option input yields some result; never panics)"
+      ],
+      "requiresHuman": false,
+      "taskType": "contract",
+      "title": "Extract model::compute_baseline_model as the single baseline-model SSoT",
+      "touchesFiles": [
+        "src/loop_engine/model.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "promote_once reads ctx immutably; returns None iff ctx.runner_overrides.contains_key(task_id), else Some(PendingPromotion) with the given source/target/model/new_count/pre_promotion_model",
+        "promote_once performs no ctx mutation and no DB write (compiler-enforced by &IterationContext signature; assert in a unit test that ctx is unchanged after a Some return)",
+        "Unit test: already-promoted task → None; fresh task → Some with correct source_runner/target_runner so the apply_pending_promotion banner ([4532]) stays direction-correct",
+        "apply_pending_promotion (recovery.rs:92) is unchanged"
+      ],
+      "dependsOn": [],
+      "description": "Add `promote_once(ctx, task_id, source: RunnerKind, target: RunnerKind, target_model: String, pre_promotion_model: Option<String>, new_count: i32) -> Option<PendingPromotion>` that owns the `ctx.runner_overrides.contains_key(task_id)` idempotency guard and PendingPromotion construction. Returns None when already promoted, else Some(PendingPromotion). MUST NOT mutate ctx and MUST NOT do DB writes. Do NOT yet adopt it at the call sites (that is REFACTOR-001) — land the primitive + its unit tests only.",
+      "estimatedEffort": "high",
+      "id": "CONTRACT-PROMO-001",
+      "modifiesBehavior": false,
+      "notes": "Learning [4553]: insert-safe-provider — Codex→Claude inserts Claude, never Codex (the target arg the caller passes must be RunnerKind::Claude for that path). Learning [4532]: source_runner disambiguates Grok→Claude vs Codex→Claude (both target Claude) for the banner. The primitive only constructs PendingPromotion; the caller still owns apply timing (deferred post-commit vs immediate) — do NOT collapse that.",
+      "passes": true,
+      "priority": 2,
+      "qualityDimensions": [
+        "No ctx mutation, no DB write — purely guard + construct; preserves the deferred-commit transaction boundary",
+        "source_runner/target_runner carried so the existing direction-neutral banner is unaffected",
+        "Single guard implementation — the three existing guard sites can later delegate without re-deriving the check"
+      ],
+      "requiresHuman": false,
+      "taskType": "contract",
+      "title": "Extract recovery::promote_once cross-provider idempotency primitive",
+      "touchesFiles": [
+        "src/loop_engine/recovery.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Regression test for the confirmed divergence: a non-high Codex task with prd_default=SONNET_MODEL, project_default=HAIKU_MODEL, user_default=HAIKU_MODEL, claudeFallbackModel unset → recovery resolves the SAME baseline tier (and therefore the same baselineTierRoutes match) as the primary site",
+        "Test: difficulty=high + a `high`-tier Codex route → model=None, provider_hint=Codex (parity with existing primary-site test)",
+        "Known-bad discriminator: the parity test FAILS against the current recovery code (which substitutes claude_fallback_model for project_default and omits user_default) and PASSES after FIX-001",
+        "compute_baseline_model unit cases: high→OPUS; prd>project>user precedence; all-None→None; whitespace skipped",
+        "Tests compile against the post-CONTRACT-BASE-001 API"
+      ],
+      "dependsOn": [
+        "CONTRACT-BASE-001",
+        "ANALYSIS-001"
+      ],
+      "description": "Write tests (may be #[ignore] until FIX-001) pinning that the recovery path derives the same baseline tier as resolve_task_execution_target for identical inputs, plus compute_baseline_model edge cases.",
+      "edgeCases": [
+        "Non-high task, prd=sonnet/project=haiku/user=haiku, no claudeFallbackModel: recovery tier == primary tier (THE divergence)",
+        "difficulty=high + high-tier Codex route: model=None, provider_hint=Codex",
+        "All defaults None and difficulty not high: baseline None → no tier remap",
+        "claudeFallbackModel set but project/user defaults also set: project/user defaults win for the BASELINE tier derivation (claudeFallbackModel only governs target_model, not the tier)"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "recovery omits user_default",
+          "expectedBehavior": "test fails until user_default is threaded"
+        },
+        {
+          "cause": "recovery uses claude_fallback_model as project_default",
+          "expectedBehavior": "test fails until real project_default is threaded"
+        }
+      ],
+      "id": "TEST-INIT-001",
+      "invariants": [
+        "For identical (difficulty, prd_default, project_default, user_default), the tier derived at recovery == tier derived at primary resolution",
+        "target_model selection (recovery.rs:363-376) is independent of the baseline-tier derivation and unchanged"
+      ],
+      "modifiesBehavior": false,
+      "notes": "Use production-shaped inputs (real ModelResolutionContext / DB rows), not hand-built maps. Data contract: project_default/user_default are typed Option<&str> threaded from the engine cache (engine.rs:159-161), prd_default from `SELECT default_model FROM prd_metadata WHERE id=1`.",
+      "passes": true,
+      "priority": 3,
+      "qualityDimensions": [
+        "Parity asserted on tier (the routing-relevant projection), not just the raw model string",
+        "Known-bad discriminator present: fails on today's divergent code, passes after the fix"
+      ],
+      "requiresHuman": false,
+      "taskType": "test",
+      "title": "Tests: recovery↔primary baseline-tier parity + compute_baseline_model edge cases",
+      "touchesFiles": [
+        "src/loop_engine/model.rs",
+        "src/loop_engine/recovery.rs",
+        "tests/codex_recovery.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "read_project_config: a legacy-key config (byBaselineTier + fallbackToClaude + opus/sonnet tier keys) deserializes into a ProjectConfig EQUAL to its canonical-key equivalent",
+        "update_project_config_format: seed legacy routing keys PLUS unrelated keys (additionalAllowedTools, embeddingModel, customField); after rewrite legacy keys are canonicalized AND unrelated keys survive byte-for-byte",
+        "update_project_config_format idempotent: a second run returns Ok(false) and does not rewrite",
+        "update_project_config_format on malformed / non-object JSON returns Err and leaves the file untouched",
+        "merge collision: when both byBaselineTier(opus) and baselineTierRoutes(high) exist for the same prefix, canonical (high) wins and legacy is dropped — asserted explicitly",
+        "Known-bad discriminator: the unrelated-key-survival assertion fails if migration rebuilds the object from typed config instead of mutating serde_json::Value"
+      ],
+      "dependsOn": [],
+      "description": "Write tests for the config migration surface: read-path equivalence, update_project_config_format key-preservation + idempotency + malformed handling, and merge collision precedence.",
+      "edgeCases": [
+        "Legacy byBaselineTier + fallbackToClaude + opus/sonnet keys: reads identical to canonical",
+        "Legacy + canonical collision (opus vs high) same prefix+tier: canonical wins, legacy dropped",
+        "Malformed / non-object config.json passed to update_project_config_format: Err, no write",
+        "Second run on already-canonical config: Ok(false), no write",
+        "Config with additionalAllowedTools/embeddingModel/customField: survive byte-for-byte through rewrite"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "rewrite serializes a typed ProjectConfig back out",
+          "expectedBehavior": "unrelated/unknown keys lost → test fails"
+        },
+        {
+          "cause": "migrator not idempotent",
+          "expectedBehavior": "second run rewrites → Ok(true) → test fails"
+        }
+      ],
+      "id": "TEST-INIT-002",
+      "invariants": [
+        "Migration only ever ADDS canonical keys / removes the specific legacy keys — never touches unrelated keys",
+        "Rewrite is atomic (tempfile + persist): a crash mid-write cannot leave a half-written config.json"
+      ],
+      "modifiesBehavior": false,
+      "notes": "Learnings [4393]/[4396]/[4378]/[4561]: key-preserving config writers MUST round-trip through serde_json::Value and mutate one key, never reserialize a typed struct. Use real config.json fixtures on disk (tempdir), not in-memory Value only, so the atomic-write path is exercised.",
+      "passes": true,
+      "priority": 4,
+      "qualityDimensions": [
+        "Asserts unrelated-key survival explicitly (the project's stated SSoT bar for config writers)",
+        "Exercises the on-disk atomic-write path, not just in-memory Value mutation"
+      ],
+      "requiresHuman": false,
+      "taskType": "test",
+      "title": "Tests: config read identical + on-disk rewrite key-preservation/idempotency + collision precedence",
+      "touchesFiles": [
+        "src/loop_engine/project_config.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Branch names `..`, `..foo`, `a/../b` cannot produce a compute_worktree_path / compute_slot_worktree_path result that resolves outside the `<repo>-worktrees/` parent",
+        "Dotted branch `release/1.0.0` maps to a stable in-dir path (intra-segment dots preserved; not over-sanitized)",
+        "Sanitization is idempotent (sanitize(sanitize(x)) == sanitize(x))",
+        "Known-bad discriminator: the `..` containment assertion FAILS against current sanitize_branch_name and PASSES after FIX-004"
+      ],
+      "dependsOn": [],
+      "description": "Write tests (may be #[ignore] until FIX-004) that no branch/PRD-derived name can produce a worktree path escaping the worktrees parent.",
+      "edgeCases": [
+        "`..` → must not resolve to the worktrees parent",
+        "`..foo` → stable in-dir token, no escape",
+        "`a/../b` → `/` already mapped to `-`; the `..` segment must not survive as a traversal component",
+        "`release/1.0.0` → stable in-dir path, intra-segment dots kept",
+        "empty branch name → deterministic non-empty fallback"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "`..` component survives sanitization",
+          "expectedBehavior": "containment assert fails until neutralized"
+        }
+      ],
+      "id": "TEST-INIT-003",
+      "invariants": [
+        "compute_worktree_path(root, name) and compute_slot_worktree_path(root, name, n) always resolve under the worktrees parent dir",
+        "Existing valid (dotless-segment) branch names map to the same path as before"
+      ],
+      "modifiesBehavior": false,
+      "notes": "Learning [2954]: the overflow dump-filename sanitizer already collapses `..` before allowlist filtering — mirror that approach (neutralize the `.`/`..` COMPONENT, do not blanket-strip all dots). Containment assertion is the backstop even if sanitization is later loosened.",
+      "passes": true,
+      "priority": 5,
+      "qualityDimensions": [
+        "Tests both the sanitizer and the computed-path containment (defense in depth)",
+        "Does not over-assert on the exact sanitized token — asserts containment + stability, not a brittle exact string"
+      ],
+      "requiresHuman": false,
+      "taskType": "test",
+      "title": "Tests: sanitize_branch_name path-traversal containment",
+      "touchesFiles": [
+        "src/loop_engine/worktree.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "project_default/user_default (Option<&str>) added to handle_task_failure, handle_task_failure_with_runner, escalate_task_model_if_needed_inner, escalate_task_model_if_needed, escalate_task_model_if_needed_for_runner",
+        "Both production callers (orchestrator.rs, wave_scheduler.rs) pass the engine-cached project_default_model/user_default_model (engine.rs:159-161)",
+        "maybe_codex_fallback_to_claude derives baseline via compute_baseline_model with the SAME four inputs the primary site uses; prd_default still read from prd_metadata",
+        "target_model selection at recovery.rs:363-376 is byte-identical to before",
+        "TEST-INIT-001 parity test passes; tests/codex_recovery.rs cases updated in lockstep and pass",
+        "tests/no_hardcoded_models.rs passes (no literal model ids leaked)"
+      ],
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/loop_engine/recovery.rs",
+            "impact": "BREAKS",
+            "line": 331,
+            "mitigation": "replace with compute_baseline_model + threaded real defaults",
+            "usage": "recovery baseline derivation (divergent inputs)"
+          },
+          {
+            "file": "src/loop_engine/orchestrator.rs",
+            "impact": "NEEDS_REVIEW",
+            "line": 0,
+            "mitigation": "pass engine-cached project/user defaults (compile-checked)",
+            "usage": "calls handle_task_failure*"
+          },
+          {
+            "file": "src/loop_engine/wave_scheduler.rs",
+            "impact": "NEEDS_REVIEW",
+            "line": 0,
+            "mitigation": "pass engine-cached project/user defaults (compile-checked)",
+            "usage": "calls handle_task_failure*"
+          }
+        ],
+        "semanticDistinctions": [
+          {
+            "context": "baseline-tier derivation (recovery.rs:331-336)",
+            "currentBehavior": "uses claude_fallback_model as project_default, omits user_default → can mismatch primary",
+            "requiredBehavior": "use real project_default + user_default via compute_baseline_model"
+          },
+          {
+            "context": "target_model selection (recovery.rs:363-376)",
+            "currentBehavior": "high→OPUS else claude_fallback_model else OPUS",
+            "requiredBehavior": "KEEP unchanged — decides WHICH Claude model to promote to, not the tier"
+          }
+        ]
+      },
+      "dependsOn": [
+        "CONTRACT-BASE-001",
+        "TEST-INIT-001",
+        "ANALYSIS-001"
+      ],
+      "description": "Close the recovery↔primary divergence. Thread project_default_model + user_default_model from the engine cache through handle_task_failure -> handle_task_failure_with_runner -> escalate_task_model_if_needed_inner -> maybe_codex_fallback_to_claude, update the escalate_task_model_if_needed / _for_runner wrappers and both production callers, and replace the recovery inline baseline derivation (recovery.rs:331-336) with compute_baseline_model(difficulty, prd_default, project_default, user_default). The target_model selection (recovery.rs:363-376) is UNCHANGED.",
+      "estimatedEffort": "high",
+      "id": "FIX-001",
+      "modifiesBehavior": true,
+      "notes": "Data contract: project_default_model: Option<&'a str> + user_default_model: Option<&'a str> are typed fields on the engine's cached run config (engine.rs:159-161). prd_default = `SELECT default_model FROM prd_metadata WHERE id=1`. Pass as Option<&str> straight into compute_baseline_model. Learning [4418]: thread identity through recovery, do not re-derive. Do NOT touch the target_model branch — it is a distinct concern (decides WHICH model to promote to, not the tier).",
+      "passes": true,
+      "priority": 7,
+      "qualityDimensions": [
+        "Recovery and primary derive the baseline tier from identical inputs — divergence eliminated, not merely narrowed",
+        "target_model selection untouched (distinct concern)",
+        "Signature changes are compile-checked across both callers; recovery unit-test call shapes updated in the same commit"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Full-fidelity baseline-tier derivation in recovery (thread project/user defaults + use compute_baseline_model)",
+      "touchesFiles": [
+        "src/loop_engine/recovery.rs",
+        "src/loop_engine/orchestrator.rs",
+        "src/loop_engine/wave_scheduler.rs",
+        "src/loop_engine/model.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "serde_json::from_value is called on the migrated Value (or an equivalent that guarantees the migrator is the read normalizer)",
+        "A legacy-key config still produces a ProjectConfig identical to its canonical form (TEST-INIT-002 read-equivalence test passes)",
+        "The legacy-key warning fires exactly once on a legacy config and not at all on a canonical config",
+        "No second full deserialization is introduced (no extra clone beyond what is required)"
+      ],
+      "dependsOn": [
+        "TEST-INIT-002"
+      ],
+      "description": "Fix the correct-by-accident read path at project_config.rs:674-684: deserialize from `migrated` (the already-normalized Value) rather than the original `value`, so a future legacy->canonical rename in migrate_project_config_value cannot silently deserialize wrong values while only emitting a warning. The legacy-key warning still fires exactly once.",
+      "estimatedEffort": "low",
+      "id": "FIX-002",
+      "modifiesBehavior": false,
+      "notes": "read_project_config is on the loop hot path — keep it to one deserialize. The migrated clone already exists; deserializing it instead of the original removes the invisible 'serde aliases must cover every rewrite' invariant.",
+      "passes": true,
+      "priority": 8,
+      "qualityDimensions": [
+        "Migrator becomes the single read-path normalizer (no reliance on serde-alias coincidence)",
+        "Hot-path cost unchanged (single deserialize)"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "read_project_config: deserialize from the migrated value",
+      "touchesFiles": [
+        "src/loop_engine/project_config.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "merge_baseline_tier_routes carries a one-line 'canonical wins on collision' doc comment; the TEST-INIT-002 collision precedence test passes",
+        "On Unix, update_project_config_format reads the original config.json mode and applies it to the temp file before persist (so a 0o644 config stays 0o644)",
+        "Non-Unix builds compile unchanged (cfg-gate the mode handling)",
+        "Malformed-input behavior (Err, no write) from TEST-INIT-002 still holds"
+      ],
+      "dependsOn": [
+        "TEST-INIT-002"
+      ],
+      "description": "Document + harden two migration nits. (a) merge_baseline_tier_routes (project_config.rs:~1043) silently drops a legacy byBaselineTier entry on collision with an existing canonical entry — add a 'canonical wins' doc comment (behavior already correct; lock it with the TEST-INIT-002 collision test). (b) update_project_config_format tempfile is created 0o600 and persist preserves that, narrowing an originally group-readable config — on Unix, re-apply the original file's mode to the temp file before persist.",
+      "estimatedEffort": "low",
+      "id": "FIX-003",
+      "modifiesBehavior": false,
+      "notes": "Use std::os::unix::fs::PermissionsExt behind cfg(unix). Read the original mode BEFORE writing the temp file; apply before tmp.persist(&path).",
+      "passes": true,
+      "priority": 9,
+      "qualityDimensions": [
+        "No silent permission narrowing of a tracked config file",
+        "Collision precedence is documented + test-pinned, not implicit"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Config-migration nits: collision precedence doc + Unix mode preservation",
+      "touchesFiles": [
+        "src/loop_engine/project_config.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "A branch/PRD-derived name of `..`, `..foo`, or `a/../b` cannot produce a worktree path resolving outside the worktrees parent (TEST-INIT-003 passes)",
+        "Dotted names like `release/1.0.0` still map to a stable in-dir path (intra-segment dots preserved)",
+        "compute_worktree_path / compute_slot_worktree_path assert containment under the worktrees parent (the backstop)",
+        "Sanitization is idempotent",
+        "Existing worktree tests pass unchanged"
+      ],
+      "dependsOn": [
+        "TEST-INIT-003"
+      ],
+      "description": "Security fix (WS-2.1). Make sanitize_branch_name (worktree.rs:31-39) neutralize any path component equal to `.` or `..` (map to a stable token, do not blanket-strip intra-segment dots), and add a containment assertion in compute_worktree_path / compute_slot_worktree_path so the result always resolves under the `<repo>-worktrees/` parent.",
+      "estimatedEffort": "low",
+      "id": "FIX-004",
+      "modifiesBehavior": false,
+      "notes": "Learning [2954]: mirror the overflow dump-filename sanitizer — collapse the `.`/`..` COMPONENT before/after the existing allowlist map; don't strip all dots. The containment assert is defense-in-depth: even a future looser sanitizer can't escape the worktrees dir.",
+      "passes": true,
+      "priority": 10,
+      "qualityDimensions": [
+        "Neutralizes only the traversal component — valid dotted branch names keep working",
+        "Two-layer defense: sanitizer + computed-path containment assertion"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Neutralize `..` in sanitize_branch_name + assert worktree-path containment",
+      "touchesFiles": [
+        "src/loop_engine/worktree.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "validate_runner_routing_config returns InvalidConfig for a route whose model (trimmed) starts with `-`, naming the offending route key",
+        "Existing nonblank-model check and all current validate tests still pass",
+        "Codex routes with empty model remain valid (the check only fires on a non-empty model starting with `-`)"
+      ],
+      "dependsOn": [],
+      "description": "Optional hardening (WS-2.2). In validate_runner_routing_config, reject any RunnerSpec.model that begins with `-` (after trim), mirroring the existing nonblank-model check, so a config model string cannot be argv-flag-confused on the child CLI. One guard + one test.",
+      "estimatedEffort": "low",
+      "id": "FEAT-005",
+      "modifiesBehavior": false,
+      "notes": "Defense-in-depth; the model already reaches the child as a discrete argv element (no shell), so this is hardening, not a live exploit fix. Keep it to the one guard + one test; if it grows, defer (see PRD open question).",
+      "passes": true,
+      "priority": 11,
+      "qualityDimensions": [
+        "Mirrors the existing nonblank-model validation shape (consistency)",
+        "Error names the offending route so the operator can fix it"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Reject route model strings starting with `-` in validate_runner_routing_config",
+      "touchesFiles": [
+        "src/loop_engine/project_config.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Verify promote_once does not mutate ctx and does no DB write; PendingPromotion fields correct",
+        "Verify FIX-001 leaves target_model selection unchanged and threads real project/user defaults at both callers",
+        "Verify FIX-002 deserializes the migrated value; FIX-003 preserves file mode; FIX-004 containment assert present",
+        "Verify no happy-path routing-precedence assertions were edited beyond mechanical ..Default::default()",
+        "Any issues found have corresponding CODE-FIX-xxx / WIRE-FIX-xxx tasks added via task-mgr add --stdin --depended-on-by MILESTONE-1"
+      ],
+      "dependsOn": [
+        "CONTRACT-BASE-001",
+        "CONTRACT-PROMO-001",
+        "FIX-001",
+        "FIX-002",
+        "FIX-003",
+        "FIX-004",
+        "FEAT-005"
+      ],
+      "description": "Review CONTRACT-BASE-001, CONTRACT-PROMO-001, FIX-001..004, FEAT-005 for: no-ctx-mutation in promote_once, insert-safe-provider invariant, recovery↔primary parity, config key-preservation, branch-name containment, no leaked model literals, and reachability of new code.",
+      "estimatedEffort": "high",
+      "id": "CODE-REVIEW-1",
+      "modifiesBehavior": false,
+      "notes": "Use the rust-python-code-reviewer agent. Review-class / gate: no per-task \"model\" (rung-1 bypass avoided); routing via reviewModel (if set in .task-mgr/config.json) + primaryRunner.byIdPrefix (REVIEW/MILESTONE/REFACTOR etc. entries) + difficulty=high / baselineTierRoutes. For each issue: echo '{...}' | task-mgr add --stdin --depended-on-by MILESTONE-1. If no issues, emit <task-status>CODE-REVIEW-1:done</task-status> with a one-line note.",
+      "passes": true,
+      "priority": 13,
+      "qualityDimensions": [
+        "Confirms the two load-bearing invariants (no-ctx-mutation, insert-safe-provider) hold in code, not just in tests",
+        "Confirms new code paths are reachable from production"
+      ],
+      "requiresHuman": false,
+      "taskType": "review",
+      "title": "Review contracts + fixes for correctness, security, and wiring",
+      "touchesFiles": [
+        "src/loop_engine/model.rs",
+        "src/loop_engine/recovery.rs",
+        "src/loop_engine/project_config.rs",
+        "src/loop_engine/worktree.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "All dependsOn tasks passes:true",
+        "cargo fmt --check && cargo check && cargo clippy -- -D warnings && cargo test all green",
+        "gen-docs check not required here (no model.rs constant bump in this PRD) but run `cargo run --bin gen-docs -- --check` to confirm no doc drift introduced",
+        "Any failing test (including pre-existing) fixed inline or routed to a FIX-xxx via task-mgr add --stdin --depended-on-by MILESTONE-1"
+      ],
+      "dependsOn": [
+        "CODE-REVIEW-1",
+        "CONTRACT-BASE-001",
+        "CONTRACT-PROMO-001",
+        "FIX-001",
+        "FIX-002",
+        "FIX-003",
+        "FIX-004",
+        "FEAT-005"
+      ],
+      "description": "Run the full unscoped gate (fmt, check, clippy -D warnings, full cargo test) and leave the trunk green, fixing any pre-existing failures. Gate for the fixes phase.",
+      "estimatedEffort": "high",
+      "id": "MILESTONE-1",
+      "modifiesBehavior": false,
+      "notes": "The ONE place the full suite runs in the fixes phase. Trunk-green is the invariant.",
+      "passes": true,
+      "priority": 20,
+      "qualityDimensions": [
+        "Whole workspace compiles + tests green, including any pre-existing failures",
+        "No clippy warnings"
+      ],
+      "requiresHuman": false,
+      "taskType": "milestone",
+      "timeoutSecs": 1800,
+      "title": "Full gate green after contracts + fixes",
+      "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": [
+        "promote_once: already-promoted returns None for Claude→Grok, Grok→Claude, and Codex→Claude target shapes; fresh returns Some with the correct source/target",
+        "Migration round-trip: write legacy config -> update_project_config_format -> read_project_config yields the same ProjectConfig as writing the canonical config directly",
+        "Recovery permutation matrix: for {difficulty high/low} x {project/user default present/absent}, recovery tier == primary tier",
+        "80%+ coverage on the new compute_baseline_model and promote_once functions"
+      ],
+      "dependsOn": [
+        "MILESTONE-1"
+      ],
+      "description": "Broaden coverage beyond the TEST-INIT discriminators: promote_once idempotency across all three would-be sites' inputs, config migration round-trip (legacy -> canonical -> read), and a small recovery default-permutation matrix.",
+      "estimatedEffort": "medium",
+      "id": "TEST-001",
+      "modifiesBehavior": false,
+      "notes": "Reuse production-shaped fixtures. tests/codex_runner_overrides_invariant.rs already pins never-insert-Codex; extend rather than duplicate.",
+      "passes": true,
+      "priority": 25,
+      "qualityDimensions": [
+        "Covers all three promotion directions' guard behavior through the single primitive's inputs",
+        "Round-trip equivalence, not just one-directional migration"
+      ],
+      "requiresHuman": false,
+      "taskType": "test",
+      "title": "Comprehensive tests: promotion idempotency, migration round-trip, recovery matrix",
+      "touchesFiles": [
+        "tests/codex_recovery.rs",
+        "src/loop_engine/recovery.rs",
+        "src/loop_engine/project_config.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "All dependsOn passes:true",
+        "Full gate (fmt/check/clippy -D warnings/test) green",
+        "Any new failures fixed inline or routed via task-mgr add --stdin --depended-on-by MILESTONE-2"
+      ],
+      "dependsOn": [
+        "MILESTONE-1",
+        "TEST-001"
+      ],
+      "description": "Full unscoped gate after TEST-001; trunk green including pre-existing failures.",
+      "estimatedEffort": "high",
+      "id": "MILESTONE-2",
+      "modifiesBehavior": false,
+      "passes": true,
+      "priority": 50,
+      "qualityDimensions": [
+        "Whole workspace green before the refactor phase begins"
+      ],
+      "requiresHuman": false,
+      "taskType": "milestone",
+      "timeoutSecs": 1800,
+      "title": "Full gate green after comprehensive tests",
+      "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": [
+        "Handoff points enumerated: engine cache field → call site args at orchestrator.rs + wave_scheduler.rs → escalate_task_model_if_needed_inner → maybe_codex_fallback_to_claude → compute_baseline_model",
+        "Confirm both production callers pass the SAME engine-cached defaults the primary resolution path uses (no second source)",
+        "If any handoff drops a value (e.g., a caller passing None), file a WIRE-FIX via task-mgr add --stdin --depended-on-by MILESTONE-FINAL",
+        "No regression: MILESTONE-2 gate still green"
+      ],
+      "dependsOn": [
+        "MILESTONE-2"
+      ],
+      "description": "Verify the cross-boundary data/control path that FIX-001 wires: engine-cached project_default_model/user_default_model (src/loop_engine/engine.rs) → handle_task_failure* (recovery.rs) → compute_baseline_model (model.rs) → primary_runner_baseline_tier_match. Confirm the same values reach recovery as the primary resolution site. No new code unless a handoff is missing.",
+      "estimatedEffort": "high",
+      "id": "INT-001",
+      "modifiesBehavior": false,
+      "notes": "This is the one cross-boundary path the PRD introduces (engine ↔ recovery ↔ model). Data contract: typed Option<&str> at every hop — no key-type transition, but the value SOURCE must be identical to the primary site or the divergence reopens.",
+      "passes": true,
+      "priority": 55,
+      "qualityDimensions": [
+        "Confirms value identity (same source) end-to-end, not just type compatibility",
+        "Names every handoff so a future signature change has a checklist"
+      ],
+      "requiresHuman": false,
+      "taskType": "verification",
+      "title": "Trace: engine cached defaults → failure-handler chain → recovery baseline → tier route",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/orchestrator.rs",
+        "src/loop_engine/wave_scheduler.rs",
+        "src/loop_engine/recovery.rs",
+        "src/loop_engine/model.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "All three sites obtain their PendingPromotion via promote_once; the inline contains_key guard + manual struct construction are removed",
+        "Deferred-commit ordering in recovery preserved (promote_once returns Some, applied after tx.commit()? via apply_pending_promotion); overflow path applies immediately as today",
+        "Insert-safe-provider invariant unchanged (Codex→Claude passes target=RunnerKind::Claude)",
+        "tests/codex_recovery.rs, tests/codex_runner_overrides_invariant.rs, and the recovery ping-pong unit tests pass unchanged",
+        "src/loop_engine/CLAUDE.md 'when you add a THIRD cross-provider promotion site…' note updated to point at promote_once"
+      ],
+      "dependsOn": [
+        "CONTRACT-PROMO-001",
+        "MILESTONE-2"
+      ],
+      "description": "WS-3.1. Replace the hand-replicated idempotency guard + PendingPromotion construction at recovery.rs:193 (Claude→Grok / Grok→Claude), recovery.rs:309 (Codex→Claude), and reactions/post_output.rs:169 (overflow rung-4) with CONTRACT-PROMO-001's promote_once. Keep apply_pending_promotion and the deferred-commit (recovery) vs immediate (overflow) apply timing intact. Behavior-neutral; its own commit.",
+      "estimatedEffort": "high",
+      "id": "REFACTOR-001",
+      "modifiesBehavior": false,
+      "notes": "Behavior-neutral refactor — its own commit, no logic edits beyond delegating to the primitive. Learning [4553]/[4532]: preserve insert-safe + source_runner banner semantics. Do NOT collapse the two apply contexts into promote_once.",
+      "passes": true,
+      "priority": 60,
+      "qualityDimensions": [
+        "Single guard implementation now backs all three sites; no copy-pasted contains_key",
+        "Deferred-commit boundary preserved (no dirty-ctx-on-rollback)",
+        "Pure delegation — reviewer can see behavior is unchanged"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Adopt promote_once at the three cross-provider guard sites",
+      "touchesFiles": [
+        "src/loop_engine/recovery.rs",
+        "src/loop_engine/reactions/post_output.rs",
+        "src/loop_engine/CLAUDE.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "New src/loop_engine/startup.rs with initialize_loop(...) -> TaskMgrResult<LoopInitContext>; run_loop body reduced to iteration-loop + post-loop",
+        "Relocated code is byte-for-byte the same logic (no behavior change); only mechanical wrapping into the helper + context struct",
+        "Startup-related unit tests move with the code (or are referenced from the new module) and pass",
+        "All loop/batch integration tests pass; no clippy warnings"
+      ],
+      "dependsOn": [
+        "MILESTONE-2"
+      ],
+      "description": "WS-3.2. Move the linear startup phase of run_loop (env/git/PRD validation, DB open, signal handler — roughly Steps 1–11) into a new src/loop_engine/startup.rs returning a LoopInitContext struct. Pure move; no logic edits in the relocated code. Its own commit.",
+      "estimatedEffort": "high",
+      "id": "REFACTOR-002",
+      "modifiesBehavior": false,
+      "notes": "Learning [3914]: byte-identical extraction validates carving correctness — diff the moved block against the original to prove no logic changed. Learning [1484]/[880]: inline orchestrator blocks are the real refactoring targets; enum/struct return types give a clean boundary. Decide LoopInitContext struct-vs-tuple by how many fields run_loop threads forward (PRD open question).",
+      "passes": true,
+      "priority": 62,
+      "qualityDimensions": [
+        "Behavior-neutral move — no logic edits in the same commit",
+        "run_loop becomes readable (iteration + post-loop only)",
+        "LoopInitContext threads exactly the fields the loop needs forward, no more"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Extract orchestrator startup into startup::initialize_loop (behavior-neutral move)",
+      "touchesFiles": [
+        "src/loop_engine/orchestrator.rs",
+        "src/loop_engine/startup.rs",
+        "src/loop_engine/mod.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "The three handlers live in a wave_orchestration submodule; wave_scheduler.rs retains the fan-out hot path",
+        "No behavior change to wave scheduling, deadlock/halt, stale handling, or the SYNTHETIC_DEADLOCK_SLOT sentinel logic",
+        "tests/reaction_parity.rs and the wave/merge integration suites pass",
+        "No clippy warnings; relocated code is a pure move (no logic edits)"
+      ],
+      "dependsOn": [
+        "MILESTONE-2"
+      ],
+      "description": "WS-3.3. Move handle_no_eligible_tasks / handle_ephemeral_deadlock / wave_preflight_check (~250 LOC of non-hot-path group-selection/safety logic) out of wave_scheduler.rs into a wave_orchestration submodule, ideally returning a WaveDecision enum. The parallel fan-out hot path stays in wave_scheduler.rs. Pure move; its own commit.",
+      "estimatedEffort": "high",
+      "id": "REFACTOR-003",
+      "modifiesBehavior": false,
+      "notes": "Learning [1484]: extract loop bodies with enum return types for clean orchestration — WaveDecision { Proceed, EmptyGroup, Deadlock, ... } is the seam. Preserve the FEAT-002 reset/halt contract and the synthetic-deadlock sentinel exactly. [3914]: diff moved block vs original.",
+      "passes": true,
+      "priority": 64,
+      "qualityDimensions": [
+        "Hot path untouched; only decision logic relocated",
+        "WaveDecision enum makes the proceed/empty/deadlock branches explicit",
+        "Halt-threshold + synthetic-deadlock sentinel semantics preserved byte-for-byte"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Extract wave decision trio into a wave_orchestration submodule (behavior-neutral move)",
+      "touchesFiles": [
+        "src/loop_engine/wave_scheduler.rs",
+        "src/loop_engine/mod.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Confirm REFACTOR-001/002/003 introduced no behavior change (spot-diff moved blocks vs git history)",
+        "Confirm promote_once / compute_baseline_model have no single-use-abstraction smell and are the sole homes for their logic",
+        "Confirm no leaked model literals, no raw status UPDATEs, no new clippy warnings",
+        "Any issues found spawn REFACTOR-xxx tasks via task-mgr add --stdin --depended-on-by MILESTONE-FINAL"
+      ],
+      "dependsOn": [
+        "REFACTOR-001",
+        "REFACTOR-002",
+        "REFACTOR-003",
+        "INT-001"
+      ],
+      "description": "Full-context pass over the contracts, fixes, and the three refactors: DRY, complexity, coupling, clarity, pattern adherence, and confirmation that the WS-3 moves are genuinely behavior-neutral.",
+      "estimatedEffort": "high",
+      "id": "REFACTOR-REVIEW-FINAL",
+      "modifiesBehavior": false,
+      "notes": "Use the rust-python-code-reviewer agent with full context. This is the final pre-merge quality pass.",
+      "passes": true,
+      "priority": 70,
+      "qualityDimensions": [
+        "Verifies behavior-neutrality of the refactors with evidence (diffs), not assertion",
+        "Confirms the two new abstractions are SSoT, not one-off wrappers"
+      ],
+      "requiresHuman": false,
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Full-context final review of all code + tests",
+      "touchesFiles": [
+        "src/loop_engine/recovery.rs",
+        "src/loop_engine/model.rs",
+        "src/loop_engine/project_config.rs",
+        "src/loop_engine/worktree.rs",
+        "src/loop_engine/orchestrator.rs",
+        "src/loop_engine/startup.rs",
+        "src/loop_engine/wave_scheduler.rs",
+        "src/loop_engine/reactions/post_output.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "cargo fmt --check && cargo check && cargo clippy -- -D warnings && cargo test all green",
+        "cargo run --bin gen-docs -- --check passes (no doc drift)",
+        "src/loop_engine/CLAUDE.md updated: compute_baseline_model as baseline SSoT, promote_once as the cross-provider guard primitive, startup.rs + wave_orchestration modules noted; routing-precedence section still accurate",
+        "model.rs rustdoc documents compute_baseline_model as the single baseline home",
+        "Grep-verified reachability: compute_baseline_model, promote_once, startup::initialize_loop, and the wave_orchestration entry points are all called from production",
+        "No .unwrap() introduced on fallible IO/serde paths"
+      ],
+      "dependsOn": [
+        "REFACTOR-REVIEW-FINAL",
+        "INT-001"
+      ],
+      "description": "Authoritative final check before MILESTONE-FINAL. Full unscoped gate, gen-docs --check, documentation updates, and grep-verified reachability of new public functions/modules.",
+      "estimatedEffort": "high",
+      "id": "VERIFY-001",
+      "modifiesBehavior": false,
+      "notes": "Documentation updates land here (not earlier) so they describe the final shape. Record a task-mgr learn for the divergence fix + promote_once extraction so /compound can surface them later.",
+      "passes": true,
+      "priority": 90,
+      "qualityDimensions": [
+        "Trunk fully green + docs match the final code",
+        "New public surfaces proven reachable from production by grep"
+      ],
+      "requiresHuman": false,
+      "taskType": "verification",
+      "timeoutSecs": 1800,
+      "title": "Final validation: full gate, gen-docs check, docs, reachability",
+      "touchesFiles": [
+        "src/loop_engine/CLAUDE.md",
+        "src/loop_engine/model.rs",
+        "CLAUDE.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "All dependsOn passes:true",
+        "Full gate (fmt/check/clippy -D warnings/test) green from a clean checkout",
+        "cargo run --bin gen-docs -- --check passes",
+        "No new tasks created during this final gate (or all spawned fixes resolved)"
+      ],
+      "dependsOn": [
+        "VERIFY-001",
+        "REFACTOR-001",
+        "REFACTOR-002",
+        "REFACTOR-003"
+      ],
+      "description": "Final full-gate checkpoint. All stories passes:true, full suite green, docs updated, ready to merge to main.",
+      "estimatedEffort": "high",
+      "id": "MILESTONE-FINAL",
+      "modifiesBehavior": false,
+      "notes": "Review-class final gate: no per-task \"model\" (rung-1 bypass avoided); routing via reviewModel (if set) + primaryRunner.byIdPrefix + difficulty=high. Trunk must be green including any pre-existing failures.",
+      "passes": true,
+      "priority": 99,
+      "qualityDimensions": [
+        "Merge-ready: whole workspace green, docs current, no open spawned fixes"
+      ],
+      "requiresHuman": false,
+      "taskType": "milestone",
+      "timeoutSecs": 1800,
+      "title": "Final gate — merge-ready",
+      "touchesFiles": []
+    }
+  ],
+  "version": "1.0"
+}

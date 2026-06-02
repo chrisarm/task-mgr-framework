@@ -32,6 +32,8 @@ tasks/.last-branch
 
 # Debug/logs
 *.log
+# Quality-gate scratch output (cargo test/clippy redirected for grep)
+.gate-*.txt
 
 # OS files
 .DS_Store

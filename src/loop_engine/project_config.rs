@@ -12,7 +12,7 @@ use crate::loop_engine::model::{Provider, parse_config_provider};
 /// after the Claude overflow ladder is exhausted (rung 4) or after
 /// `runtime_error_threshold` consecutive `RuntimeError` rounds. Absent or
 /// `enabled = false` → no change to the existing 4-rung ladder.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct FallbackRunnerConfig {
     /// Whether the Grok fallback runner is active. Default: `false`.
@@ -68,8 +68,8 @@ pub struct RunnerSpec {
     /// the task never returns to Codex. Default: `false` (legacy auto-block).
     /// Ignored on non-codex routes — Claude/Grok runners already have their
     /// own cross-provider promotion paths (`fallbackRunner` / `claudeFallbackModel`).
-    #[serde(default)]
-    pub fallback_to_claude: bool,
+    #[serde(default, alias = "fallbackToClaude")]
+    pub runtime_error_fallback: bool,
 }
 
 /// Per-task-type and per-id-prefix routing for the primary runner.
@@ -79,7 +79,7 @@ pub struct RunnerSpec {
 /// tasks continue to use the default Claude model/runner.
 ///
 /// Phase 1: schema + serde only — resolution-chain wiring comes in a later phase.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PrimaryRunnerConfig {
     /// Claude model to fall back to when a task routed via `primaryRunner`
@@ -100,6 +100,15 @@ pub struct PrimaryRunnerConfig {
     /// Task-ID-prefix → `RunnerSpec` routing map. Absent key → empty map.
     #[serde(default)]
     pub by_id_prefix: HashMap<String, RunnerSpec>,
+
+    /// Task-ID-prefix → baseline capability tier → `RunnerSpec` routing map.
+    ///
+    /// Used when a task has no explicit `model`, after its baseline Claude
+    /// model is known from difficulty/default resolution and normalized into
+    /// a provider-neutral tier. Tier keys are validated by
+    /// `model::parse_baseline_tier_key`.
+    #[serde(default, alias = "byBaselineTier")]
+    pub baseline_tier_routes: HashMap<String, HashMap<String, RunnerSpec>>,
 }
 
 impl Default for PrimaryRunnerConfig {
@@ -109,6 +118,7 @@ impl Default for PrimaryRunnerConfig {
             runtime_error_threshold: default_primary_runtime_error_threshold(),
             by_task_type: HashMap::new(),
             by_id_prefix: HashMap::new(),
+            baseline_tier_routes: HashMap::new(),
         }
     }
 }
@@ -118,7 +128,7 @@ impl Default for PrimaryRunnerConfig {
 /// Allows projects to extend the default tool allowlist with project-specific
 /// tools (e.g., `docker`, `curl`, `./scripts/*`) without modifying the core
 /// default. Forward-compatible: unknown fields are silently ignored.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectConfig {
     /// Schema version for forward compatibility.
@@ -491,6 +501,26 @@ pub fn validate_runner_routing_config(cfg: &ProjectConfig) -> TaskMgrResult<()> 
                     message: "model must not be blank unless provider is codex".to_string(),
                 });
             }
+            if spec.model.trim().starts_with('-') {
+                return Err(TaskMgrError::InvalidConfig {
+                    field: format!("primaryRunner.{map_name}.{key}.model"),
+                    message: format!(
+                        "model must not start with `-` (got {:?}); a leading `-` would be \
+                         interpreted as a CLI flag by the child runner",
+                        spec.model.trim(),
+                    ),
+                });
+            }
+        }
+        for (prefix, tier_map) in &primary.baseline_tier_routes {
+            for tier_key in tier_map.keys() {
+                crate::loop_engine::model::parse_baseline_tier_key(tier_key).map_err(
+                    |message| TaskMgrError::InvalidConfig {
+                        field: format!("primaryRunner.baselineTierRoutes.{prefix}.{tier_key}"),
+                        message,
+                    },
+                )?;
+            }
         }
         if cfg
             .review_model
@@ -526,16 +556,26 @@ pub fn check_codex_runner_binary(primary: Option<&PrimaryRunnerConfig>) -> TaskM
 
 fn primary_runner_specs(
     primary: &PrimaryRunnerConfig,
-) -> impl Iterator<Item = (&'static str, &String, &RunnerSpec)> {
+) -> impl Iterator<Item = (&'static str, String, &RunnerSpec)> {
     primary
         .by_task_type
         .iter()
-        .map(|(k, v)| ("byTaskType", k, v))
+        .map(|(k, v)| ("byTaskType", k.clone(), v))
         .chain(
             primary
                 .by_id_prefix
                 .iter()
-                .map(|(k, v)| ("byIdPrefix", k, v)),
+                .map(|(k, v)| ("byIdPrefix", k.clone(), v)),
+        )
+        .chain(
+            primary
+                .baseline_tier_routes
+                .iter()
+                .flat_map(|(prefix, tiers)| {
+                    tiers.iter().map(move |(tier, spec)| {
+                        ("baselineTierRoutes", format!("{prefix}.{tier}"), spec)
+                    })
+                }),
         )
 }
 
@@ -550,6 +590,14 @@ fn primary_runner_contains_codex_review_route(primary: &PrimaryRunnerConfig) -> 
                 }
                 "byIdPrefix" => {
                     let k = key.trim_end_matches('-').to_ascii_uppercase();
+                    matches!(k.as_str(), "CODE-REVIEW" | "REVIEW" | "MILESTONE-FINAL")
+                }
+                "baselineTierRoutes" => {
+                    let prefix = key
+                        .split_once('.')
+                        .map(|(prefix, _)| prefix)
+                        .unwrap_or(key.as_str());
+                    let k = prefix.trim_end_matches('-').to_ascii_uppercase();
                     matches!(k.as_str(), "CODE-REVIEW" | "REVIEW" | "MILESTONE-FINAL")
                 }
                 _ => false,
@@ -625,11 +673,196 @@ pub fn preflight_validate_and_probe(cfg: &ProjectConfig) -> TaskMgrResult<()> {
 pub fn read_project_config(db_dir: &Path) -> ProjectConfig {
     let path = db_dir.join("config.json");
     match std::fs::read_to_string(&path) {
-        Ok(contents) => serde_json::from_str(&contents).unwrap_or_else(|e| {
-            eprintln!("\x1b[33m[warn]\x1b[0m Invalid .task-mgr/config.json: {e}");
-            ProjectConfig::default()
-        }),
+        Ok(contents) => {
+            let mut value: serde_json::Value = match serde_json::from_str(&contents) {
+                Ok(value) => value,
+                Err(e) => {
+                    crate::output::warn(&format!("Invalid .task-mgr/config.json: {e}"));
+                    return ProjectConfig::default();
+                }
+            };
+            // Normalize legacy routing keys in place, then deserialize from the
+            // SAME migrated value we just normalized. Deserializing the original
+            // would rely on serde aliases covering every rewrite — a silent
+            // wrong-value risk the moment a future legacy->canonical rename lands
+            // in migrate_project_config_value without a matching alias.
+            if migrate_project_config_value(&mut value) {
+                crate::output::warn(
+                    ".task-mgr/config.json uses legacy model routing keys; run `task-mgr init` \
+                     to update it to baselineTierRoutes/runtimeErrorFallback",
+                );
+            }
+            serde_json::from_value(value).unwrap_or_else(|e| {
+                crate::output::warn(&format!("Invalid .task-mgr/config.json: {e}"));
+                ProjectConfig::default()
+            })
+        }
         Err(_) => ProjectConfig::default(),
+    }
+}
+
+/// Rewrite `<db_dir>/config.json` from legacy routing keys to the current
+/// canonical shape. Returns `true` when the file was changed.
+pub fn update_project_config_format(db_dir: &Path) -> std::io::Result<bool> {
+    use std::io::Write;
+
+    let path = db_dir.join("config.json");
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(contents) if !contents.trim().is_empty() => contents,
+        _ => return Ok(false),
+    };
+    let mut value: serde_json::Value = serde_json::from_str(&contents).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{}: malformed JSON: {e}", path.display()),
+        )
+    })?;
+    if !value.is_object() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{}: config is not a JSON object", path.display()),
+        ));
+    }
+    if !migrate_project_config_value(&mut value) {
+        return Ok(false);
+    }
+
+    let contents = serde_json::to_string_pretty(&value)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let dir = path.parent().unwrap_or(db_dir);
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".config-")
+        .suffix(".json")
+        .tempfile_in(dir)?;
+    tmp.write_all(contents.as_bytes())?;
+    tmp.write_all(b"\n")?;
+    // The tempfile is created 0o600; persist preserves that, which would narrow
+    // an originally group/world-readable config. Re-apply the original file's
+    // mode before persisting so the migration is permission-neutral.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(orig) = std::fs::metadata(&path) {
+            tmp.as_file()
+                .set_permissions(std::fs::Permissions::from_mode(orig.permissions().mode()))?;
+        }
+    }
+    tmp.persist(&path).map_err(|e| e.error)?;
+    Ok(true)
+}
+
+fn migrate_project_config_value(value: &mut serde_json::Value) -> bool {
+    let Some(root) = value.as_object_mut() else {
+        return false;
+    };
+    let Some(primary) = root
+        .get_mut("primaryRunner")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return false;
+    };
+
+    let mut changed = false;
+    changed |= migrate_runner_spec_map(primary.get_mut("byTaskType"));
+    changed |= migrate_runner_spec_map(primary.get_mut("byIdPrefix"));
+
+    if let Some(legacy) = primary.remove("byBaselineTier") {
+        changed = true;
+        merge_baseline_tier_routes(primary, legacy);
+    }
+    changed |= migrate_baseline_tier_routes(primary.get_mut("baselineTierRoutes"));
+    changed
+}
+
+/// Fold a legacy `byBaselineTier` map into the canonical `baselineTierRoutes`.
+/// On collision (same prefix + same canonical tier key) the existing canonical
+/// entry wins — legacy values only fill gaps (`entry().or_insert`), never
+/// overwrite a route the operator already expressed in the canonical form.
+fn merge_baseline_tier_routes(
+    primary: &mut serde_json::Map<String, serde_json::Value>,
+    legacy: serde_json::Value,
+) {
+    let canonical = primary
+        .entry("baselineTierRoutes".to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let Some(canonical_obj) = canonical.as_object_mut() else {
+        return;
+    };
+    let serde_json::Value::Object(legacy_prefixes) = legacy else {
+        return;
+    };
+    for (prefix, legacy_tiers) in legacy_prefixes {
+        let target = canonical_obj
+            .entry(prefix)
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        let Some(target_tiers) = target.as_object_mut() else {
+            continue;
+        };
+        let serde_json::Value::Object(legacy_tiers) = legacy_tiers else {
+            continue;
+        };
+        for (tier, spec) in legacy_tiers {
+            target_tiers
+                .entry(canonical_baseline_tier_key(&tier).to_string())
+                .or_insert(spec);
+        }
+    }
+}
+
+fn migrate_baseline_tier_routes(value: Option<&mut serde_json::Value>) -> bool {
+    let Some(prefixes) = value.and_then(serde_json::Value::as_object_mut) else {
+        return false;
+    };
+    let mut changed = false;
+    for tiers in prefixes.values_mut() {
+        let Some(tiers) = tiers.as_object_mut() else {
+            continue;
+        };
+        let old = std::mem::take(tiers);
+        for (tier, mut spec) in old {
+            let canonical = canonical_baseline_tier_key(&tier).to_string();
+            if canonical != tier {
+                changed = true;
+            }
+            changed |= migrate_runner_spec(&mut spec);
+            tiers.entry(canonical).or_insert(spec);
+        }
+    }
+    changed
+}
+
+fn migrate_runner_spec_map(value: Option<&mut serde_json::Value>) -> bool {
+    let Some(map) = value.and_then(serde_json::Value::as_object_mut) else {
+        return false;
+    };
+    // migrate_runner_spec mutates each spec; run it on EVERY entry (no `.any()`
+    // short-circuit, which would stop migrating after the first hit).
+    #[allow(clippy::unnecessary_fold)]
+    map.values_mut()
+        .fold(false, |changed, spec| migrate_runner_spec(spec) || changed)
+}
+
+fn migrate_runner_spec(spec: &mut serde_json::Value) -> bool {
+    let Some(obj) = spec.as_object_mut() else {
+        return false;
+    };
+    let Some(legacy) = obj.remove("fallbackToClaude") else {
+        return false;
+    };
+    obj.entry("runtimeErrorFallback".to_string())
+        .or_insert(legacy);
+    true
+}
+
+fn canonical_baseline_tier_key(key: &str) -> &str {
+    match key.trim().to_ascii_lowercase().as_str() {
+        "haiku" => "low",
+        "sonnet" => "standard",
+        "opus" => "high",
+        "low" => "low",
+        "standard" => "standard",
+        "high" => "high",
+        _ => key,
     }
 }
 
@@ -698,6 +931,21 @@ pub fn write_fallback_runner(
 mod tests {
     use super::*;
     use std::fs;
+
+    /// Serializes tests that mutate the process-global `CODEX_BINARY` env var
+    /// and then probe it (directly or via `preflight_validate_and_probe`).
+    ///
+    /// Under `cargo test`'s default multi-threaded runner these tests race on
+    /// the shared env var and against the PATH-reading binary probe: a sibling
+    /// test removing/restoring `CODEX_BINARY` mid-flight can make the probe fall
+    /// through to a real `codex` on PATH and flip an `expect_err` to a pass.
+    /// A module-local `Mutex` is the minimal, dependency-free serializer
+    /// (no `serial_test` crate). `GROK_BINARY`-mutating tests in this module
+    /// use the cross-file [`crate::loop_engine::test_utils::GROK_BINARY_MUTEX`]
+    /// instead, because `GROK_BINARY` is also mutated by tests in other lib
+    /// modules (`runner.rs`, `commands::models::handlers`) that share this test
+    /// binary; a module-local lock would not serialize against those.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn test_read_missing_file_returns_default() {
@@ -1292,6 +1540,7 @@ mod tests {
         assert_eq!(pr.runtime_error_threshold, 2);
         assert!(pr.by_task_type.is_empty());
         assert!(pr.by_id_prefix.is_empty());
+        assert!(pr.baseline_tier_routes.is_empty());
     }
 
     #[test]
@@ -1313,6 +1562,12 @@ mod tests {
                     "byIdPrefix": {{
                         "REVIEW-":    {{ "provider": "grok", "model": "grok-build" }},
                         "MILESTONE-": {{ "provider": "grok", "model": "grok-build" }}
+                    }},
+                    "baselineTierRoutes": {{
+                        "FEAT": {{
+                            "high": {{ "provider": "codex", "runtimeErrorFallback": true }},
+                            "standard": {{ "provider": "grok", "model": "grok-build" }}
+                        }}
                     }}
                 }}
             }}"#
@@ -1345,6 +1600,47 @@ mod tests {
             .expect("MILESTONE- key missing");
         assert_eq!(ms_prefix_spec.provider, "grok");
         assert_eq!(ms_prefix_spec.model, "grok-build");
+
+        let feat_tiers = pr
+            .baseline_tier_routes
+            .get("FEAT")
+            .expect("FEAT key missing");
+        let high_spec = feat_tiers.get("high").expect("high key missing");
+        assert_eq!(high_spec.provider, "codex");
+        assert!(high_spec.runtime_error_fallback);
+        let standard_spec = feat_tiers.get("standard").expect("standard key missing");
+        assert_eq!(standard_spec.provider, "grok");
+        assert_eq!(standard_spec.model, "grok-build");
+    }
+
+    #[test]
+    fn test_primary_runner_accepts_legacy_baseline_tier_routes_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{
+                "primaryRunner": {
+                    "byBaselineTier": {
+                        "FEAT": {
+                            "opus": { "provider": "codex", "fallbackToClaude": true },
+                            "sonnet": { "provider": "grok", "model": "grok-build" }
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let config = read_project_config(dir.path());
+        let pr = config.primary_runner.expect("primaryRunner present");
+        let feat_tiers = pr
+            .baseline_tier_routes
+            .get("FEAT")
+            .expect("FEAT key missing");
+        // read_project_config runs the on-disk migrator as its read normalizer
+        // (FIX-002), so legacy tier-key spellings are canonicalized in memory:
+        // opus -> high, sonnet -> standard. The legacy keys no longer survive.
+        assert!(feat_tiers["high"].runtime_error_fallback);
+        assert_eq!(feat_tiers["standard"].model, "grok-build");
     }
 
     #[test]
@@ -1371,6 +1667,10 @@ mod tests {
         );
         assert_eq!(pr.runtime_error_threshold, 2, "default threshold is 2");
         assert!(pr.by_id_prefix.is_empty(), "byIdPrefix absent → empty map");
+        assert!(
+            pr.baseline_tier_routes.is_empty(),
+            "baselineTierRoutes absent → empty map"
+        );
         let spec = pr.by_task_type.get("review").expect("review key missing");
         assert_eq!(spec.model, "grok-build");
     }
@@ -1418,14 +1718,15 @@ mod tests {
             runtime_error_threshold: 2,
             by_task_type,
             by_id_prefix: HashMap::new(),
+            ..Default::default()
         }
     }
 
-    // ---- RunnerSpec.fallback_to_claude serde tests (FEAT-005) ----
+    // ---- RunnerSpec.runtime_error_fallback serde tests (FEAT-005) ----
 
     #[test]
     fn test_runner_spec_fallback_to_claude_absent_defaults_to_false() {
-        // AC: fallbackToClaude defaults to false; an absent field deserializes
+        // AC: runtimeErrorFallback defaults to false; an absent field deserializes
         // to false. Existing Codex projects keep the legacy auto-block path.
         let dir = tempfile::tempdir().unwrap();
         fs::write(
@@ -1447,13 +1748,40 @@ mod tests {
             .remove("spike")
             .expect("spike key present");
         assert!(
-            !spec.fallback_to_claude,
-            "absent fallbackToClaude must deserialize to false"
+            !spec.runtime_error_fallback,
+            "absent runtimeErrorFallback must deserialize to false"
         );
     }
 
     #[test]
-    fn test_runner_spec_fallback_to_claude_true_round_trips() {
+    fn test_runner_spec_runtime_error_fallback_true_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{
+                "primaryRunner": {
+                    "byIdPrefix": {
+                        "SPIKE-": { "provider": "codex", "runtimeErrorFallback": true }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let cfg = read_project_config(dir.path());
+        let spec = cfg
+            .primary_runner
+            .expect("primaryRunner present")
+            .by_id_prefix
+            .remove("SPIKE-")
+            .expect("SPIKE- key present");
+        assert!(
+            spec.runtime_error_fallback,
+            "runtimeErrorFallback=true must round-trip"
+        );
+    }
+
+    #[test]
+    fn test_runner_spec_runtime_error_fallback_accepts_legacy_alias() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(
             dir.path().join("config.json"),
@@ -1474,14 +1802,40 @@ mod tests {
             .remove("SPIKE-")
             .expect("SPIKE- key present");
         assert!(
-            spec.fallback_to_claude,
-            "fallbackToClaude=true must round-trip"
+            spec.runtime_error_fallback,
+            "legacy fallbackToClaude alias must deserialize to runtimeErrorFallback"
         );
     }
 
     #[test]
-    fn test_runner_spec_fallback_to_claude_snake_case_rejected() {
-        // CONTRACT: the field name on the wire is camelCase (fallbackToClaude),
+    fn test_migrate_runner_spec_map_migrates_every_legacy_spec() {
+        // Guards the `unnecessary_fold` allow at migrate_runner_spec_map: the
+        // fold must call migrate_runner_spec on EVERY entry. A `.any()`
+        // short-circuit would stop after the first spec returning true, leaving
+        // the second `fallbackToClaude` un-rewritten. Two legacy specs prove it.
+        let mut map = serde_json::json!({
+            "FEAT-": { "provider": "codex", "fallbackToClaude": true },
+            "FIX-":  { "provider": "codex", "fallbackToClaude": true }
+        });
+        let changed = migrate_runner_spec_map(Some(&mut map));
+        assert!(changed, "migration must report a change");
+        for key in ["FEAT-", "FIX-"] {
+            let spec = &map[key];
+            assert!(
+                spec.get("fallbackToClaude").is_none(),
+                "{key}: legacy fallbackToClaude must be removed"
+            );
+            assert_eq!(
+                spec["runtimeErrorFallback"],
+                serde_json::json!(true),
+                "{key}: must be rewritten to runtimeErrorFallback"
+            );
+        }
+    }
+
+    #[test]
+    fn test_runner_spec_runtime_error_fallback_snake_case_rejected() {
+        // CONTRACT: the field name on the wire is camelCase (runtimeErrorFallback),
         // matching the rest of RunnerSpec's serde rename_all. snake_case must
         // NOT silently set the field.
         let dir = tempfile::tempdir().unwrap();
@@ -1504,8 +1858,8 @@ mod tests {
             .remove("spike")
             .expect("spike key present");
         assert!(
-            !spec.fallback_to_claude,
-            "snake_case key must not set fallback_to_claude"
+            !spec.runtime_error_fallback,
+            "snake_case key must not set runtime_error_fallback"
         );
     }
 
@@ -1517,6 +1871,7 @@ mod tests {
         // it would fail. The default config has neither a Codex primaryRunner
         // route nor a fallbackRunner, so check_codex_runner_binary must
         // short-circuit on `primary.is_none()` before any path probe runs.
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var_os("CODEX_BINARY");
         let bogus = "/tmp/task-mgr-test-nonexistent-codex-binary-feat004";
         unsafe { std::env::set_var("CODEX_BINARY", bogus) };
@@ -1536,6 +1891,7 @@ mod tests {
         // Acceptance: Codex route + CODEX_BINARY pointing at a nonexistent
         // path returns Err — exactly the failure batch_run must surface
         // BEFORE expanding PRD files.
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var_os("CODEX_BINARY");
         let bogus = "/tmp/task-mgr-test-nonexistent-codex-binary-feat004-route";
         unsafe { std::env::set_var("CODEX_BINARY", bogus) };
@@ -1695,6 +2051,86 @@ mod tests {
                 "the typo path must surface the unknown-provider error, not the blank-model rule: {msg}",
             );
         }
+    }
+
+    #[test]
+    fn test_validate_rejects_unknown_baseline_tier() {
+        let mut tiers = HashMap::new();
+        tiers.insert(
+            "superopus".to_string(),
+            RunnerSpec {
+                provider: "codex".to_string(),
+                model: String::new(),
+                ..Default::default()
+            },
+        );
+        let mut baseline_tier_routes = HashMap::new();
+        baseline_tier_routes.insert("FEAT".to_string(), tiers);
+        let cfg = ProjectConfig {
+            primary_runner: Some(PrimaryRunnerConfig {
+                baseline_tier_routes,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err = validate_runner_routing_config(&cfg).expect_err("unknown tier must reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("baselineTierRoutes.FEAT.superopus") && msg.contains("low"),
+            "error must name the bad tier and allowed tiers: {msg}"
+        );
+    }
+
+    /// AC (WS-2.2): a route model that starts with `-` (after trim) is rejected
+    /// with an error naming the offending route key, so it cannot be argv-flag-
+    /// confused on the child CLI. Codex routes with an empty model are still valid.
+    #[test]
+    fn test_validate_rejects_model_starting_with_dash() {
+        // Positive: dash-prefixed model on a Grok route must be rejected.
+        let mut by_id = HashMap::new();
+        by_id.insert(
+            "FEAT-".to_string(),
+            RunnerSpec {
+                provider: "grok".to_string(),
+                model: "--flag-injection".to_string(),
+                ..Default::default()
+            },
+        );
+        let cfg = ProjectConfig {
+            primary_runner: Some(PrimaryRunnerConfig {
+                by_id_prefix: by_id,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err =
+            validate_runner_routing_config(&cfg).expect_err("dash-prefixed model must reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("byIdPrefix.FEAT-.model") && msg.contains('-'),
+            "error must name the offending route key and the offending value: {msg}",
+        );
+
+        // Negative: Codex route with empty model must still validate (the check
+        // only fires on a non-empty model starting with `-`).
+        let mut by_type = HashMap::new();
+        by_type.insert(
+            "spike".to_string(),
+            RunnerSpec {
+                provider: "codex".to_string(),
+                model: String::new(),
+                ..Default::default()
+            },
+        );
+        let cfg_codex = ProjectConfig {
+            primary_runner: Some(PrimaryRunnerConfig {
+                by_task_type: by_type,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        validate_runner_routing_config(&cfg_codex)
+            .expect("codex route with empty model must not trigger the dash guard");
     }
 
     /// CONTRACT: `EffectiveRunnerInput` field names match the struct in
@@ -1957,6 +2393,404 @@ mod tests {
         assert!(
             !raw.contains("\"cliBinary\""),
             "None cli_binary should be omitted, not null"
+        );
+    }
+
+    // ============ TEST-INIT-002: config migration surface ============
+    // Covers (1) read-path serde-alias equivalence, (2) the on-disk
+    // `update_project_config_format` rewrite — key-preservation, idempotency,
+    // and malformed/non-object handling — and (3) merge-collision precedence.
+    //
+    // Learnings [4393]/[4396]/[4378]/[4561]: the on-disk migration MUST
+    // round-trip through `serde_json::Value` and mutate keys in place — NEVER
+    // reserialize a typed struct, which would silently drop unknown fields.
+    // Real config.json fixtures on disk (tempdir) are used so the atomic-write
+    // path (tempfile + persist) is actually exercised.
+
+    /// AC1: a legacy-key config (`byBaselineTier` + `fallbackToClaude`)
+    /// deserializes into a `ProjectConfig` structurally EQUAL to the same
+    /// config written with the canonical top-level keys (`baselineTierRoutes`
+    /// + `runtimeErrorFallback`).
+    ///
+    /// Post FIX-002 the mechanism making this hold is the in-memory MIGRATOR,
+    /// not the serde `alias` attributes: `read_project_config` runs
+    /// `migrate_project_config_value` as its read normalizer and deserializes
+    /// from the MIGRATED `Value`. The migrator both renames the legacy keys
+    /// AND canonicalizes the HashMap tier keys (`opus` -> `high`,
+    /// `sonnet` -> `standard`). Both inputs therefore normalize to the same
+    /// canonical tier keys in memory, so equality no longer depends on the two
+    /// fixtures spelling the tier keys identically — it is true canonical
+    /// equivalence (the sanity assertions below index the canonical `high` key).
+    #[test]
+    fn test_read_legacy_keys_equal_canonical_equivalent() {
+        let legacy_dir = tempfile::tempdir().unwrap();
+        fs::write(
+            legacy_dir.path().join("config.json"),
+            r#"{
+                "version": 1,
+                "additionalAllowedTools": ["Bash(docker:*)"],
+                "primaryRunner": {
+                    "byBaselineTier": {
+                        "FEAT": {
+                            "opus": { "provider": "codex", "fallbackToClaude": true },
+                            "sonnet": { "provider": "grok", "model": "grok-build" }
+                        }
+                    },
+                    "byIdPrefix": {
+                        "SPIKE-": { "provider": "codex", "fallbackToClaude": true }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let canonical_dir = tempfile::tempdir().unwrap();
+        fs::write(
+            canonical_dir.path().join("config.json"),
+            r#"{
+                "version": 1,
+                "additionalAllowedTools": ["Bash(docker:*)"],
+                "primaryRunner": {
+                    "baselineTierRoutes": {
+                        "FEAT": {
+                            "opus": { "provider": "codex", "runtimeErrorFallback": true },
+                            "sonnet": { "provider": "grok", "model": "grok-build" }
+                        }
+                    },
+                    "byIdPrefix": {
+                        "SPIKE-": { "provider": "codex", "runtimeErrorFallback": true }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let legacy = read_project_config(legacy_dir.path());
+        let canonical = read_project_config(canonical_dir.path());
+        assert_eq!(
+            legacy, canonical,
+            "legacy byBaselineTier/fallbackToClaude must deserialize identically to canonical keys"
+        );
+
+        // Sanity: the routes actually populated — guards against a vacuous
+        // pass where the alias silently dropped and both sides became empty
+        // (the index below would also panic in that case).
+        let pr = legacy.primary_runner.expect("primaryRunner present");
+        // The read normalizer (FIX-002) canonicalizes tier keys: opus -> high.
+        assert!(
+            pr.baseline_tier_routes["FEAT"]["high"].runtime_error_fallback,
+            "byBaselineTier→baseline_tier_routes alias must populate the tier route"
+        );
+        assert!(
+            pr.by_id_prefix["SPIKE-"].runtime_error_fallback,
+            "fallbackToClaude→runtime_error_fallback alias must populate the spec field"
+        );
+    }
+
+    /// AC2 + AC6 (known-bad discriminator): `update_project_config_format`
+    /// canonicalizes legacy routing keys AND preserves unrelated keys
+    /// value-for-value. The top-level `customField` and the in-spec
+    /// `customSpecField` (neither is a field on `ProjectConfig`/`RunnerSpec`)
+    /// are the discriminators: if the migration rebuilt the JSON from a typed
+    /// struct instead of mutating the `serde_json::Value` tree in place, both
+    /// unknown fields would silently vanish and these assertions would fail.
+    #[test]
+    fn test_update_format_canonicalizes_and_preserves_unrelated_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = r#"{
+            "version": 1,
+            "additionalAllowedTools": ["Bash(docker:*)"],
+            "embeddingModel": "custom-embed",
+            "customField": { "nested": [1, 2, 3] },
+            "primaryRunner": {
+                "byBaselineTier": {
+                    "FEAT": {
+                        "opus": { "provider": "codex", "fallbackToClaude": true }
+                    }
+                },
+                "byIdPrefix": {
+                    "SPIKE-": { "provider": "codex", "fallbackToClaude": true, "customSpecField": 42 }
+                }
+            }
+        }"#;
+        let original: serde_json::Value = serde_json::from_str(input).unwrap();
+        fs::write(dir.path().join("config.json"), input).unwrap();
+
+        let changed = update_project_config_format(dir.path()).unwrap();
+        assert!(changed, "legacy keys must trigger a rewrite");
+
+        let migrated: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(dir.path().join("config.json")).unwrap())
+                .unwrap();
+
+        // Legacy top-level container removed; canonical present.
+        let primary = &migrated["primaryRunner"];
+        assert!(
+            primary.get("byBaselineTier").is_none(),
+            "byBaselineTier must be removed after canonicalization"
+        );
+        // Tier key canonicalized opus -> high; spec field canonicalized.
+        let feat = &primary["baselineTierRoutes"]["FEAT"];
+        assert!(
+            feat.get("opus").is_none(),
+            "opus tier key must canonicalize to high"
+        );
+        assert_eq!(
+            feat["high"]["runtimeErrorFallback"],
+            serde_json::json!(true),
+            "fallbackToClaude must canonicalize to runtimeErrorFallback in the tier spec"
+        );
+        assert!(
+            feat["high"].get("fallbackToClaude").is_none(),
+            "legacy fallbackToClaude must be removed from the tier spec"
+        );
+        // byIdPrefix spec canonicalized; unknown spec field preserved.
+        let spike = &primary["byIdPrefix"]["SPIKE-"];
+        assert_eq!(spike["runtimeErrorFallback"], serde_json::json!(true));
+        assert!(spike.get("fallbackToClaude").is_none());
+        assert_eq!(
+            spike["customSpecField"],
+            serde_json::json!(42),
+            "KNOWN-BAD DISCRIMINATOR: unknown spec field must survive in-place Value mutation"
+        );
+
+        // Unrelated top-level keys survive value-for-value. `customField` is
+        // the load-bearing discriminator — a typed-struct rebuild would drop
+        // it because it is not a field on ProjectConfig.
+        for key in [
+            "version",
+            "additionalAllowedTools",
+            "embeddingModel",
+            "customField",
+        ] {
+            assert_eq!(
+                migrated[key], original[key],
+                "unrelated key {key} must survive the rewrite unchanged"
+            );
+        }
+    }
+
+    /// AC3: a second `update_project_config_format` run returns `Ok(false)` and
+    /// does not modify the file.
+    #[test]
+    fn test_update_format_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{
+                "primaryRunner": {
+                    "byBaselineTier": {
+                        "FEAT": { "opus": { "provider": "codex", "fallbackToClaude": true } }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let first = update_project_config_format(dir.path()).unwrap();
+        assert!(first, "first run must rewrite legacy keys");
+        let after_first = fs::read_to_string(dir.path().join("config.json")).unwrap();
+
+        let second = update_project_config_format(dir.path()).unwrap();
+        assert!(!second, "second run must be a no-op returning Ok(false)");
+        let after_second = fs::read_to_string(dir.path().join("config.json")).unwrap();
+
+        assert_eq!(
+            after_first, after_second,
+            "an idempotent run must leave the file byte-identical"
+        );
+    }
+
+    /// AC4: malformed JSON returns `Err` and leaves the file untouched.
+    #[test]
+    fn test_update_format_malformed_json_errors_and_preserves_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = "not json at all {{{";
+        fs::write(dir.path().join("config.json"), original).unwrap();
+
+        let err =
+            update_project_config_format(dir.path()).expect_err("malformed JSON must return Err");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("config.json") && msg.contains("malformed"),
+            "error must name the file and explain the failure: {msg}"
+        );
+
+        let after = fs::read_to_string(dir.path().join("config.json")).unwrap();
+        assert_eq!(after, original, "malformed file must be left untouched");
+    }
+
+    /// AC4: a syntactically-valid but non-object JSON document (e.g. an array)
+    /// returns `Err` and leaves the file untouched.
+    #[test]
+    fn test_update_format_non_object_json_errors_and_preserves_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = "[1, 2, 3]";
+        fs::write(dir.path().join("config.json"), original).unwrap();
+
+        let err =
+            update_project_config_format(dir.path()).expect_err("non-object JSON must return Err");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("not a JSON object"),
+            "error must explain the non-object shape: {msg}"
+        );
+
+        let after = fs::read_to_string(dir.path().join("config.json")).unwrap();
+        assert_eq!(after, original, "non-object file must be left untouched");
+    }
+
+    /// AC5: when BOTH `byBaselineTier` (legacy `opus`) and `baselineTierRoutes`
+    /// (canonical `high`) exist for the same prefix, the canonical route wins
+    /// and the legacy entry is dropped. `merge_baseline_tier_routes` uses
+    /// `.or_insert`, so a pre-existing canonical value is never overwritten.
+    #[test]
+    fn test_update_format_collision_canonical_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{
+                "primaryRunner": {
+                    "byBaselineTier": {
+                        "FEAT": { "opus": { "provider": "grok", "model": "legacy-loser" } }
+                    },
+                    "baselineTierRoutes": {
+                        "FEAT": { "high": { "provider": "codex", "runtimeErrorFallback": true } }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let changed = update_project_config_format(dir.path()).unwrap();
+        assert!(changed, "presence of byBaselineTier must trigger a rewrite");
+
+        let raw = fs::read_to_string(dir.path().join("config.json")).unwrap();
+        let migrated: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let feat = &migrated["primaryRunner"]["baselineTierRoutes"]["FEAT"];
+
+        // Canonical `high` route preserved verbatim; legacy `opus` value dropped.
+        assert_eq!(
+            feat["high"]["provider"],
+            serde_json::json!("codex"),
+            "canonical high route must win the collision"
+        );
+        assert!(
+            feat.get("opus").is_none(),
+            "legacy opus key must be dropped, not retained alongside high"
+        );
+        assert!(
+            migrated["primaryRunner"].get("byBaselineTier").is_none(),
+            "legacy byBaselineTier container must be removed"
+        );
+        assert!(
+            !raw.contains("legacy-loser"),
+            "the dropped legacy spec value must not survive anywhere in the file"
+        );
+    }
+
+    /// AC2 migration round-trip: write legacy config → `update_project_config_format`
+    /// → `read_project_config` yields the same `ProjectConfig` as writing the
+    /// canonical config directly and reading it.
+    ///
+    /// Known-bad discriminator: if `read_project_config` relied ONLY on its own
+    /// in-memory migration (rather than consuming the already-migrated on-disk
+    /// form), both paths would pass even if `update_project_config_format` wrote
+    /// something subtly wrong — the in-memory normaliser would paper over it.
+    /// This test catches the case where the on-disk write and the in-memory read
+    /// disagree (a canonical read of the freshly-written file must equal a
+    /// direct read of the reference canonical form).
+    #[test]
+    fn test_migration_round_trip_legacy_update_read_equals_canonical() {
+        let legacy_dir = tempfile::tempdir().unwrap();
+        let canonical_dir = tempfile::tempdir().unwrap();
+
+        // Legacy form: byBaselineTier + fallbackToClaude + alias tier keys.
+        fs::write(
+            legacy_dir.path().join("config.json"),
+            r#"{
+                "version": 1,
+                "additionalAllowedTools": ["Bash(docker:*)"],
+                "primaryRunner": {
+                    "byBaselineTier": {
+                        "FEAT": {
+                            "opus": { "provider": "codex", "fallbackToClaude": true },
+                            "sonnet": { "provider": "grok", "model": "grok-build" }
+                        }
+                    },
+                    "byIdPrefix": {
+                        "SPIKE-": { "provider": "codex", "fallbackToClaude": true }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        // Canonical equivalent: baselineTierRoutes + runtimeErrorFallback + canonical tier keys.
+        fs::write(
+            canonical_dir.path().join("config.json"),
+            r#"{
+                "version": 1,
+                "additionalAllowedTools": ["Bash(docker:*)"],
+                "primaryRunner": {
+                    "baselineTierRoutes": {
+                        "FEAT": {
+                            "high": { "provider": "codex", "runtimeErrorFallback": true },
+                            "standard": { "provider": "grok", "model": "grok-build" }
+                        }
+                    },
+                    "byIdPrefix": {
+                        "SPIKE-": { "provider": "codex", "runtimeErrorFallback": true }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        // Step: rewrite legacy file to canonical shape on disk.
+        let changed = update_project_config_format(legacy_dir.path()).unwrap();
+        assert!(changed, "legacy keys must trigger a rewrite");
+
+        // Post-migration read must equal a clean read of the canonical form.
+        let after_migration = read_project_config(legacy_dir.path());
+        let direct_canonical = read_project_config(canonical_dir.path());
+        assert_eq!(
+            after_migration, direct_canonical,
+            "write legacy → update_project_config_format → read_project_config must yield \
+             the same ProjectConfig as writing the canonical config directly"
+        );
+    }
+
+    /// FIX-003: the rewrite must be permission-neutral. The atomic tempfile is
+    /// created 0o600; without re-applying the original mode, a group/world
+    /// readable config (0o644) would be silently narrowed by `persist`.
+    #[cfg(unix)]
+    #[test]
+    fn test_update_format_preserves_original_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        fs::write(
+            &path,
+            r#"{
+                "primaryRunner": {
+                    "byBaselineTier": {
+                        "FEAT": { "opus": { "provider": "codex" } }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let changed = update_project_config_format(dir.path()).unwrap();
+        assert!(changed, "legacy key must trigger a rewrite");
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o644,
+            "rewrite must preserve the original 0o644 mode, not narrow to the 0o600 tempfile default"
         );
     }
 }

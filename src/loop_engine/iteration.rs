@@ -123,7 +123,7 @@ pub fn run_iteration(
 
     // Step 1.5: Pre-iteration usage gate (account-global). Routes through the
     // converged `reactions::account::account_usage_gate` coordinator — the SAME
-    // gate the wave path folds once per wave (`wave_scheduler::wave_preflight_check`),
+    // gate the wave path folds once per wave (`wave_orchestration::wave_preflight_check`),
     // so both paths agree on the GateDecision for a given usage state. The
     // relocated `usage::check_and_wait` leaf is `#[deprecated]` and this file
     // carries `#![deny(deprecated)]`, so a direct call here is a compile error.

@@ -39,6 +39,7 @@ pub mod runner;
 pub mod signals;
 pub(crate) mod slot;
 pub mod stale;
+pub(crate) mod startup;
 pub mod status;
 pub mod status_display;
 pub mod status_queries;
@@ -46,6 +47,7 @@ pub(crate) mod stream;
 pub mod usage;
 pub mod user_config;
 pub mod watchdog;
+pub(crate) mod wave_orchestration;
 pub(crate) mod wave_scheduler;
 pub mod worktree;
 
