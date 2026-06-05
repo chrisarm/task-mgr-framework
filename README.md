@@ -366,6 +366,7 @@ task-mgr models unset-default [--project]
 6. None (CLI default)
 
 Route selected task classes to Codex with `primaryRunner`. Codex routing is explicit only; model names such as `gpt-*`, `o*`, or `codex-*` do not auto-select Codex.
+Overlapping `byIdPrefix` or `baselineTierRoutes` prefixes must route to the same spec; conflicting overlaps fail config validation before the loop starts.
 
 ```json
 {

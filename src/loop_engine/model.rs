@@ -360,12 +360,38 @@ pub fn primary_runner_match<'a>(
     None
 }
 
+pub(crate) fn normalize_route_prefix(prefix: &str) -> String {
+    prefix.trim().trim_end_matches('-').to_string()
+}
+
+pub(crate) fn route_prefixes_overlap(left: &str, right: &str) -> bool {
+    let left = normalize_route_prefix(left);
+    let right = normalize_route_prefix(right);
+    if left.is_empty() || right.is_empty() {
+        return false;
+    }
+    let left_segments: Vec<&str> = left.split('-').collect();
+    let right_segments: Vec<&str> = right.split('-').collect();
+    segments_contain(&left_segments, &right_segments)
+        || segments_contain(&right_segments, &left_segments)
+}
+
 fn id_body_matches_prefix(body: &str, prefix: &str) -> bool {
-    // Normalize the key (trim a trailing `-`) then require a `-`
-    // boundary after the prefix segment, so a key like "REVIEW" cannot
-    // false-match "REVIEWER-001".
-    let needle = format!("{}-", prefix.trim_end_matches('-'));
-    body.starts_with(&needle) || body.contains(&format!("-{needle}"))
+    let prefix = normalize_route_prefix(prefix);
+    if prefix.is_empty() {
+        return false;
+    }
+    let body_segments: Vec<&str> = body.split('-').collect();
+    let prefix_segments: Vec<&str> = prefix.split('-').collect();
+    segments_contain(&body_segments, &prefix_segments)
+}
+
+fn segments_contain(haystack: &[&str], needle: &[&str]) -> bool {
+    !needle.is_empty()
+        && needle.len() <= haystack.len()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
 }
 
 /// Return a baseline-tier remap for a task ID and Claude baseline model.
@@ -1220,6 +1246,38 @@ mod tests {
         // task_type is not in byTaskType; id prefix IS in byIdPrefix.
         let spec = primary_runner_match(&cfg, Some("REVIEW-001"), Some("implementation"));
         assert_eq!(spec.map(|s| s.model.as_str()), Some("grok-build"));
+    }
+
+    #[test]
+    fn test_primary_runner_match_exact_final_id_prefix() {
+        use std::collections::HashMap;
+        let mut by_id_prefix = HashMap::new();
+        by_id_prefix.insert(
+            "MILESTONE-FINAL".to_string(),
+            RunnerSpec {
+                provider: "codex".to_string(),
+                model: String::new(),
+                ..Default::default()
+            },
+        );
+        let cfg = PrimaryRunnerConfig {
+            by_id_prefix,
+            ..Default::default()
+        };
+
+        let bare = primary_runner_match(&cfg, Some("MILESTONE-FINAL"), None);
+        assert_eq!(bare.map(|s| s.provider.as_str()), Some("codex"));
+
+        let prefixed = primary_runner_match(&cfg, Some("8d71d1f7-MILESTONE-FINAL"), None);
+        assert_eq!(prefixed.map(|s| s.provider.as_str()), Some("codex"));
+    }
+
+    #[test]
+    fn test_route_prefix_matching_keeps_dash_segment_boundary() {
+        assert!(route_prefixes_overlap("MILESTONE", "MILESTONE-FINAL"));
+        assert!(route_prefixes_overlap("FIX", "CODE-FIX"));
+        assert!(id_body_matches_prefix("REVIEW-001", "REVIEW"));
+        assert!(!id_body_matches_prefix("REVIEWER-001", "REVIEW"));
     }
 
     #[test]
