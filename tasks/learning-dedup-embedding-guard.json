@@ -1,0 +1,240 @@
+{
+  "branchName": "feat/learning-dedup-embedding-guard",
+  "description": "Add an inline embedding-similarity guard to the loop-engine learning auto-extraction path so cross-iteration semantic near-duplicates are skipped at write time instead of polluting recall until the post-hoc curate dedup pass.",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "Rust: No warnings in `cargo check` output",
+      "Rust: No warnings in `cargo clippy -- -D warnings` output",
+      "Rust: Scoped tests pass with `cargo test` for the touched module",
+      "Rust: `cargo fmt --check` passes",
+      "No breaking changes to existing public APIs (ExtractionResult shape, learning_exists signature) unless explicitly required",
+      "No literal Claude model strings introduced outside model.rs (tests/no_hardcoded_models.rs)"
+    ],
+    "description": "These criteria apply to ALL implementation tasks"
+  },
+  "model": "claude-sonnet-4-6",
+  "priorityPhilosophy": {
+    "description": "Hierarchy of what matters most when implementing tasks",
+    "hierarchy": [
+      "1. PLAN — Anticipate edge cases before coding",
+      "2. PHASE 2 FOUNDATION — ~1 day now to save ~2+ weeks later (1:10+ ratio); we are pre-launch, foundations compound",
+      "3. FUNCTIONING CODE — Pragmatic, reliable, wired in per plan",
+      "4. CORRECTNESS — Compiles, type-checks, scoped tests pass deterministically",
+      "5. CODE QUALITY — Clean code, qualityDimensions satisfied, no warnings",
+      "6. POLISH — Docs, formatting, minor improvements"
+    ],
+    "principles": [
+      "Quality dimensions explicit — qualityDimensions on every task tells you what 'good' looks like",
+      "Edge cases = test cases — every known edge case must have a corresponding test",
+      "Bias toward false negatives, not false positives — a wrongly-dropped distinct learning is unrecoverable; a missed dupe is cleaned up by curate dedup later",
+      "Graceful degradation — Ollama down must be byte-identical to today's exact-match-only behavior",
+      "Scoped per-iteration tests, full suite at REVIEW-001"
+    ]
+  },
+  "prohibitedOutcomes": [
+    "Tests that assert try_embed_* returns 0 or 'Ollama is down' — they fail when local Ollama is actually running (learning #1513). Test the PURE cosine decision (find_near_duplicate) with synthetic vectors instead.",
+    "Silently dropping a learning when the embedding call errors mid-batch — uncertainty must record, never skip.",
+    "Bypassing the LearningWriter chokepoint by calling store_embedding inline to avoid the flush re-embed.",
+    "Applying the new guard to the human `task-mgr learn` path or import_learnings — ingestion auto-extraction ONLY.",
+    "Tests that only assert 'no crash' or check a type without verifying the similarity/skip behavior."
+  ],
+  "project": "task-mgr",
+  "requires": [],
+  "taskPrefix": "7af89fcb",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "Positive: best_match returns Some((id, sim)) for the single highest-similarity known entry regardless of threshold",
+        "Positive: find_near_duplicate == best_match filtered to sim >= threshold",
+        "Positive: NEAR_DUP_THRESHOLD == 0.92 (f32) with a doc comment stating the asymmetric-risk rationale; NEAR_MISS_LOG_FLOOR == 0.80",
+        "Negative: best_match / find_near_duplicate return None on an empty `known` slice",
+        "Negative: find_near_duplicate returns None when all cosine similarities are strictly below threshold",
+        "Negative: NearDuplicateChecker has NO `model` struct field — cargo clippy/check pass with -D warnings (no dead_code on an unread field)",
+        "Unit test: two identical vectors -> cosine 1.0 -> best_match returns Some with that id",
+        "Unit test: orthogonal vectors (cosine 0) with threshold 0.92 -> find_near_duplicate None",
+        "Unit test: boundary — a pair whose cosine == threshold is treated as a duplicate by find_near_duplicate (>= not >)",
+        "Unit test: among three known vectors with sims 0.93/0.97/0.95, best_match returns the 0.97 id (picks max, not first)",
+        "Known-bad: an implementation that returns the FIRST match (not the max) fails the 0.93/0.97/0.95 ordering test — the test must assert the max-similarity id, not just 'a match'",
+        "Known-bad: using `> threshold` instead of `>= threshold` in find_near_duplicate fails the exactly-at-threshold boundary test",
+        "Failure mode: NearDuplicateChecker::new returns None (not Err, no panic) when Ollama is unreachable — verifiable by pointing read_project_config's ollama_url at an unreachable host via a temp config",
+        "Failure mode: NearDuplicateChecker::new returns None (logs a warning) if load_all_active_embeddings errors — exact-match-only is preserved",
+        "Observability: check() emits a near-miss line ('near-miss #<id> cos=<sim:.3> (< <threshold>)') when NEAR_MISS_LOG_FLOOR <= best sim < threshold, then returns Unique — verifiable via best_match purely: a 0.85-similar vector is the best_match max yet find_near_duplicate(.., 0.92) is None, so the Unique arm (not Duplicate) must be taken. Do NOT implement check() with only the >= threshold arm and a bare Unique else — that skips the near-miss log the best_match/find_near_duplicate split exists to enable",
+        "Documentation: a code comment at the new()/load path states cross-model comparison is intentionally skipped (only configured-model embeddings are loaded)",
+        "CONTRACT: load_all_active_embeddings returns Vec<LearningEmbedding> (struct with .learning_id and .embedding) — adapt to (i64, Vec<f32>) via .map; grep the struct def in embeddings/mod.rs to confirm field names"
+      ],
+      "dependsOn": [],
+      "description": "Add the reusable near-duplicate machinery to src/learnings/embeddings/mod.rs. Two consts, two pure fns, an enum, and a checker — all decision logic unit-tested without Ollama.\n\nDO:\n- Add `pub const NEAR_DUP_THRESHOLD: f32 = 0.92;` with a doc comment explaining the asymmetric-risk rationale (false positive silently drops a real learning with no LLM second opinion; bias high, well above curate's 0.65 pre-cluster value). Add `const NEAR_MISS_LOG_FLOOR: f32 = 0.80;` for the near-miss calibration band.\n- Add pure fn `best_match(candidate: &[f32], known: &[(i64, Vec<f32>)]) -> Option<(i64, f32)>` returning the single highest-similarity known entry (by cosine_similarity) REGARDLESS of threshold, else None on empty `known`. Reuse the existing `cosine_similarity` fn. No I/O. This is the testable primitive (review finding #3).\n- Add pure fn `find_near_duplicate(candidate, known, threshold) -> Option<(i64, f32)>` = `best_match(candidate, known).filter(|(_, s)| *s >= threshold)`. No I/O.\n- Add `pub enum NearDupOutcome { Duplicate { existing_id: i64, similarity: f32 }, Unique(Vec<f32>), Unavailable }`.\n- Add `pub struct NearDuplicateChecker { embedder: OllamaEmbedder, threshold: f32, known: Vec<(i64, Vec<f32>)> }`. NO owned `model` field — the OllamaEmbedder already retains its model internally; a second unread field trips `dead_code` under -D warnings (review finding #2).\n  - `pub fn new(conn: &Connection, db_dir: &Path, threshold: f32) -> Option<Self>`: resolve ollama_url + embedding_model ONCE into LOCAL bindings via read_project_config (mirror try_embed_learning at embeddings/mod.rs ~375); build OllamaEmbedder::new(&url, &model); return None unless is_available() is Ok(true); then call load_all_active_embeddings(conn, &model) — on Ok map each LearningEmbedding via `.map(|le| (le.learning_id, le.embedding))` into `known`; on Err, eprintln a warning and return None (review finding #4 — exact-match-only, not an empty-known checker). The local `model` is used for BOTH the embedder and the loader, then dropped.\n  - `pub fn check(&self, title: &str, content: &str) -> NearDupOutcome`: compose_embed_text(title, content); if empty -> Unavailable; embed once via self.embedder; on Err -> Unavailable (fire-and-forget, never propagate); else call best_match(&emb, &self.known): Some((id,sim)) with sim>=threshold -> Duplicate{existing_id:id, similarity:sim}; Some((id,sim)) with NEAR_MISS_LOG_FLOOR<=sim<threshold -> eprintln a near-miss line (`near-miss #<id> cos=<sim:.3> (< <threshold>)`) then Unique(emb); otherwise Unique(emb).\n  - `pub fn register(&mut self, id: i64, embedding: Vec<f32>)`: push (id, embedding) onto self.known so a later same-batch candidate is compared against it.\n\nDO NOT:\n- Do NOT store the model as a struct field (review finding #2) — resolve once locally in new().\n- Do NOT call read_project_config more than once per checker.\n- Do NOT write tests that assume Ollama is down (learning #1513) — test best_match / find_near_duplicate purely.\n- Do NOT compare across embedding models — only rows stored under the configured model are loaded; intentional, document in a code comment.\n\nEdge cases:\n- Empty known set -> best_match / find_near_duplicate return None.\n- Exactly-at-threshold cosine -> counts as a match (>=).\n- Multiple matches -> best_match returns the single highest-similarity one.\n- Empty composed text -> check() returns Unavailable.\n- load_all_active_embeddings Err -> new() returns None.",
+      "edgeCases": [
+        "Empty `known` slice: best_match / find_near_duplicate -> None",
+        "Cosine exactly at threshold: treated as duplicate (>=)",
+        "Multiple above-threshold matches: return the maximum, not the first",
+        "Empty composed embed text: check() -> Unavailable",
+        "Ollama unreachable at construction: new() -> None",
+        "load_all_active_embeddings Err: new() -> None (warn logged)"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Ollama unreachable / model missing at new()",
+          "expectedBehavior": "new() returns None; caller degrades to exact-match guard"
+        },
+        {
+          "cause": "load_all_active_embeddings returns Err at new()",
+          "expectedBehavior": "new() logs a warning and returns None; exact-match-only preserved (review finding #4)"
+        },
+        {
+          "cause": "embed() errors for a single candidate mid-batch",
+          "expectedBehavior": "check() returns Unavailable; caller records the candidate (never drops on uncertainty)"
+        }
+      ],
+      "id": "FEAT-001",
+      "modifiesBehavior": false,
+      "notes": "Reuse: cosine_similarity, compose_embed_text, OllamaEmbedder (new/embed/is_available/model), load_all_active_embeddings, LearningEmbedding — all in src/learnings/embeddings/mod.rs. read_project_config from src/loop_engine/project_config.rs (ollama_url: Option<String>, embedding_model: Option<String>); DEFAULT_OLLAMA_URL / DEFAULT_EMBEDDING_MODEL consts already exist in embeddings/mod.rs — mirror try_embed_learning's resolution exactly, but bind model to a LOCAL (not a struct field — review finding #2). best_match is the pure primitive; find_near_duplicate filters it; check() reuses best_match for both the decision and the near-miss log (review finding #3). load error -> warn + None (review finding #4). Learning #1414: embedding pre-filter via cosine on stored embeddings is the established dedup pattern. Learning #1658: vector backend already loads via load_all_active_embeddings and post-filters in Rust — same loader. Learning #1513: do NOT write Ollama-down-assuming tests. Learning #2670: degrade gracefully for optional services (return None).",
+      "passes": true,
+      "priority": 1,
+      "qualityDimensions": [
+        "best_match / find_near_duplicate are pure (no I/O) and deterministic — unit-testable without Ollama",
+        "Single max-similarity match returned; find_near_duplicate uses >= threshold semantics",
+        "Embedding model resolved exactly once (LOCAL binding in new(), no owned struct field) — no dead_code warning, no config-drift no-op",
+        "Graceful degradation: new() -> None on Ollama-unavailable AND on load error; check() -> Unavailable on any Ollama failure; never panic/propagate",
+        "Public items documented; cross-model-skip is an explicit code comment"
+      ],
+      "taskType": "implementation",
+      "title": "Add embedding near-duplicate primitives (const, pure fn, checker)",
+      "touchesFiles": [
+        "src/learnings/embeddings/mod.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: record_extracted_learnings is a private helper taking Option<&mut dyn NearDupGuard>; extract_learnings_from_output delegates to it after spawn/parse/enrich and flushes after",
+        "Positive: a scripted NearDupGuard fake returning Duplicate{..} causes the candidate to NOT be recorded and deduped to increment",
+        "Positive: a fake returning Unique(emb) records the candidate AND register() is called with (new id, emb)",
+        "Positive: a fake returning Unavailable records the candidate (never dropped)",
+        "Positive: a Duplicate skip logs the existing learning id and the cosine similarity",
+        "Negative: when guard is None, behavior is byte-identical to before — only Tier-1 exact-match dedup runs",
+        "Negative: ExtractionResult shape and learning_exists signature are unchanged",
+        "Test (no Ollama): record_extracted_learnings with guard=None, two params with distinct titles -> both record",
+        "Test (no Ollama): record_extracted_learnings with guard=None, two params with identical (outcome,title) -> second skipped by Tier-1 (Tier-1-runs-first regression guard)",
+        "Test (no Ollama): record_extracted_learnings with a fake guard scripted Duplicate then Unique -> first deduped, second recorded+registered (exercises all arms without Ollama)",
+        "Known-bad: an implementation that runs Tier-2 BEFORE Tier-1, or skips Tier-1 when a guard exists, breaks the guard=None exact-match test and the 'Tier-1 unconditional' guarantee — the test must confirm exact-match fires with no guard",
+        "Known-bad: forgetting to call guard.register() on a Unique record lets same-batch dupes through — the scripted-fake test asserts register was invoked with the recorded id",
+        "Failure mode: if NearDuplicateChecker::new returns None, extract_learnings_from_output passes guard=None and records all non-exact-dup learnings",
+        "CONTRACT: params.outcome + params.title feed learning_exists; params.title + params.content feed check(); grep RecordLearningParams in src/learnings/crud to confirm field names"
+      ],
+      "dependsOn": [
+        "FEAT-001"
+      ],
+      "description": "Add tier-2 semantic dedup to the recording loop in extract_learnings_from_output (src/learnings/ingestion/mod.rs), via a TEST SEAM so the Tier-2 arms are unit-testable without a subprocess or Ollama.\n\nThis modifies the side effects of extract_learnings_from_output: when Ollama is up, it skips inserting extracted learnings whose embedding is >= NEAR_DUP_THRESHOLD cosine-similar to an existing active learning or an earlier-accepted candidate in the same batch. Callers (loop_engine iteration pipeline, learning #2135) consume only ExtractionResult{learnings_extracted, learning_ids}; the shape is unchanged — they simply observe fewer rows. The existing `deduped` counter / 'duplicate(s) skipped' log already exists; extend it.\n\nTEST SEAM (review finding #1) — extract_learnings_from_output calls spawn_claude (~mod.rs:105) BEFORE the recording loop, so the loop is unreachable from a unit test without a subprocess. Extract the loop:\n- Add a PRIVATE trait `NearDupGuard { fn check(&self, title: &str, content: &str) -> NearDupOutcome; fn register(&mut self, id: i64, embedding: Vec<f32>); }` and `impl NearDupGuard for NearDuplicateChecker` (forwards to the inherent methods from FEAT-001).\n- Add a PRIVATE helper `fn record_extracted_learnings(conn: &Connection, writer: &mut LearningWriter, params_list: Vec<RecordLearningParams>, guard: Option<&mut dyn NearDupGuard>) -> TaskMgrResult<(Vec<i64>, usize)>` returning (learning_ids, deduped). All Tier-1/Tier-2 logic moves here.\n- extract_learnings_from_output becomes: spawn -> parse -> enrich -> `let mut checker = db_dir.and_then(|d| NearDuplicateChecker::new(conn, d, NEAR_DUP_THRESHOLD));` -> `record_extracted_learnings(conn, &mut writer, params_list, checker.as_mut().map(|c| c as &mut dyn NearDupGuard))` -> writer.flush(conn).\nThis is DI-for-testability (CLAUDE.md §5), not premature abstraction — the test fake is the second impl that earns the trait, so it does NOT violate REFACTOR-001's 'no abstraction over one call site' rule.\n\nDO (inside record_extracted_learnings, per candidate):\n- Keep Tier-1 `learning_exists(conn, &params.outcome, &params.title)?` exact-match check FIRST and UNCONDITIONAL (the only guard when guard is None / Ollama down).\n- Then, if guard is Some, call check(&params.title, &params.content):\n  - Duplicate { existing_id, similarity } -> increment deduped, eprintln a skip line including existing_id and the cosine (e.g. \"Learning extraction: skipped near-duplicate of #<id> (cos=<score:.3>)\"), continue.\n  - Unique(emb) -> writer.record(conn, params); on Ok(result) push result.learning_id and call guard.register(result.learning_id, emb).\n  - Unavailable -> fall through to the plain writer.record(...) path.\n- Preserve LearningWriter construction-before / flush-after ordering (flush stays in extract_learnings_from_output, after the helper returns).\n- Borrow note: check() is &self, register() is &mut self. Sequence so the &mut borrow happens after check() returns and after record() — don't hold check()'s result borrow across register().\n\nDO NOT:\n- Do NOT call store_embedding inline to skip the flush re-embed — accept the N+1 embed as a documented tradeoff (bypassing the writer violates the chokepoint).\n- Do NOT change learning_exists or the ExtractionResult struct.\n- Do NOT gate Tier-1 on Ollama state / guard presence — it always runs first.\n- Do NOT apply this in learn.rs or import_learnings.\n\nEdge cases:\n- guard is None (tests / Ollama down): exact-match-only path, behavior unchanged.\n- Two near-duplicate candidates in the SAME batch: second caught because the first was register()'d.\n- First-ever learning (empty known set): records normally.",
+      "edgeCases": [
+        "db_dir None: checker None, exact-match-only, unchanged behavior",
+        "Two same-batch near-dupes: second caught via register()",
+        "First-ever learning / empty known set: records normally",
+        "Per-candidate embed failure: Unavailable -> records the candidate"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Ollama dies mid-loop after checker built",
+          "expectedBehavior": "per-candidate check() returns Unavailable; remaining candidates record via exact-match path"
+        },
+        {
+          "cause": "Threshold mis-calibrated (real distinct learning scores high)",
+          "expectedBehavior": "conservative 0.92 minimizes this; the id+cosine skip log makes any false positive diagnosable"
+        }
+      ],
+      "id": "FEAT-002",
+      "model": "claude-opus-4-8",
+      "modifiesBehavior": true,
+      "notes": "Insertion point: the `for params in params_list` recording loop in extract_learnings_from_output (src/learnings/ingestion/mod.rs ~170-200); learning_exists is ~256-267. Move that loop into a private `record_extracted_learnings` helper taking Option<&mut dyn NearDupGuard> (review finding #1) so the Tier-2 arms are unit-testable with a fake — spawn_claude at ~mod.rs:105 makes the in-fn loop unreachable from tests otherwise. Records against a bare &Connection (NO transaction — flush is after the helper returns), so no tx/borrow conflict. LearningWriter lifecycle (construct before, record, flush after) per learning #2726 — keep it. Reuse NearDuplicateChecker/NearDupOutcome/NEAR_DUP_THRESHOLD from FEAT-001; the near-miss calibration log lives in check() (FEAT-001), not here. Learning #1456: dedup key is (outcome,title) today — leave it; widening to title+content is out of scope. Learning #2135: sole caller is the unified iteration pipeline — verify wiring there.",
+      "passes": false,
+      "priority": 2,
+      "qualityDimensions": [
+        "Tier-1 exact match runs first and unconditionally; Tier-2 only augments when a guard is present",
+        "Test seam: record_extracted_learnings + NearDupGuard trait make all arms unit-testable without subprocess/Ollama (DI per CLAUDE.md §5)",
+        "Uncertainty records, never drops — Unavailable falls through to record",
+        "No chokepoint bypass — writer.record + flush ownership preserved",
+        "Skip path is observable (id + cosine logged) for threshold calibration",
+        "Intra-batch dedup correct via register() on every accepted Unique"
+      ],
+      "taskType": "implementation",
+      "title": "Wire the embedding near-duplicate guard into learning auto-extraction",
+      "touchesFiles": [
+        "src/learnings/ingestion/mod.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No duplicated cosine/compose/embedding-resolution logic (reuses existing fns)",
+        "NearDuplicateChecker methods each under ~30 lines, single responsibility",
+        "The extract_learnings_from_output loop body stays readable; extract a private helper only if it genuinely clarifies",
+        "Code follows existing embeddings/ingestion module patterns",
+        "Any issues found spawn REFACTOR-FIX-xxx tasks via `task-mgr add --stdin --depended-on-by REVIEW-001`"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002"
+      ],
+      "description": "Review the embedding-guard implementation for DRY violations, complexity, coupling, and clarity.\n\nDO: Check NearDuplicateChecker for single-responsibility, confirm cosine/compose/loader reuse (no duplicated similarity logic), confirm the ingestion loop stays readable (consider a small private helper if the per-candidate match arms grow past ~30 lines).\nDO NOT: Skip — this gate catches issues before final review. Do NOT introduce a premature abstraction over the two call sites.",
+      "estimatedEffort": "high",
+      "id": "REFACTOR-001",
+      "model": "claude-opus-4-8",
+      "notes": "If issues found: `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001` for each (priority 50-97). If no issues, invoke /simplify on any ugly touchpoint, then emit `<task-status>REFACTOR-001:done</task-status>` with a one-line note.",
+      "passes": false,
+      "priority": 98,
+      "qualityDimensions": [
+        "DRY — no reinvented similarity/embedding logic",
+        "Single-responsibility methods",
+        "Pattern consistency with embeddings/ and ingestion/ modules"
+      ],
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Review for refactoring opportunities",
+      "touchesFiles": [
+        "src/learnings/embeddings/mod.rs",
+        "src/learnings/ingestion/mod.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: NearDuplicateChecker is reachable from production (extract_learnings_from_output), grep-verified",
+        "Positive: All errors handled without unwrap()/expect() in production paths (Ollama failures degrade to Unavailable/None)",
+        "Positive: FULL `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check` all clean (no scope filter)",
+        "Negative: No unwrap() in production code paths added by this change",
+        "Negative: No dead-code / unused warnings for the new public items",
+        "Negative: Ollama-down behavior is byte-identical to pre-change (exact-match only) — confirmed by a db_dir-None test path",
+        "Documentation: src/learnings/CLAUDE.md 'Learning Creation Chokepoint' section notes the ingestion-path write-time embedding near-dup guard, NEAR_DUP_THRESHOLD, and the intentional cross-model skip",
+        "Documentation: no literal model strings leaked (tests/no_hardcoded_models.rs passes)",
+        "Task update: remaining tasks reviewed; descriptions updated if APIs/assumptions changed",
+        "Pre-existing test failures fixed (or spawned as FIX-xxx with verifyCommand if >~12 unrelated)",
+        "If issues found: FIX-xxx / WIRE-FIX-xxx tasks spawned via `task-mgr add --stdin --depended-on-by REVIEW-001`"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "REFACTOR-001"
+      ],
+      "description": "Review all implementation for quality, security, integration wiring, and documentation needs. RUN THE FULL QUALITY GATE (unscoped test suite).\n\nDO: Verify the guard is reachable from the loop engine's iteration pipeline (extract_learnings_from_output is the only insertion point — grep callers). Verify no unwrap() in new paths. Verify graceful degradation (Ollama down) is preserved. Confirm src/learnings/CLAUDE.md is updated to document the new write-time near-dup guard in the 'Learning Creation Chokepoint' narrative. Run full cargo test / clippy / fmt (no scope filter).\nDO NOT: Skip the wiring check. Do NOT scope the test suite — this is THE place the full suite runs.",
+      "estimatedEffort": "medium",
+      "id": "REVIEW-001",
+      "notes": "Do NOT stamp `model` here — runtime reviewModel config (currently claude-opus-4-8) owns the reviewer. Spawn fixes via `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001` (no `model` on spawned FIX/WIRE-FIX — primaryRunner.byIdPrefix routes them). Watch for the stale slot-worktree test-binary gotcha (CLAUDE.md): mass fixture-read failures naming a removed -slot-N path are not regressions — `touch tests/<bin>.rs` and rebuild. If clean: emit `<task-status>REVIEW-001:done</task-status>` with 'Clean review'.",
+      "passes": false,
+      "priority": 99,
+      "qualityDimensions": [
+        "No unwrap in production",
+        "Guard wired to the loop-engine extraction path",
+        "Full suite green including pre-existing",
+        "Graceful degradation preserved and documented"
+      ],
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Code review + final verification",
+      "touchesFiles": [
+        "src/learnings/embeddings/mod.rs",
+        "src/learnings/ingestion/mod.rs",
+        "src/learnings/CLAUDE.md"
+      ]
+    }
+  ],
+  "version": "1.0"
+}
