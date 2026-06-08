@@ -549,7 +549,7 @@ fn validate_non_conflicting_prefix_routes(primary: &PrimaryRunnerConfig) -> Task
 
 fn validate_by_id_prefix_conflicts(primary: &PrimaryRunnerConfig) -> TaskMgrResult<()> {
     let mut routes: Vec<_> = primary.by_id_prefix.iter().collect();
-    routes.sort_by(|(left_key, _), (right_key, _)| left_key.cmp(right_key));
+    routes.sort_by_key(|(left_key, _)| *left_key);
 
     for (i, (left_key, left_spec)) in routes.iter().enumerate() {
         for (right_key, right_spec) in routes.iter().skip(i + 1) {
