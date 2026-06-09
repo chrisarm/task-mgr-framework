@@ -434,7 +434,6 @@ fn edge_case_1_all_candidates_quota_deferred_stale_counter_untouched_both_paths(
 /// assert!(c_idx < exec_idx && effort_idx < exec_idx);
 /// assert!(!argv.iter().any(|a| a.contains("xhigh")));
 /// ```
-#[ignore = "un-ignored by FEAT-006: build_codex_argv gains effort; -c model_reasoning_effort=<level> must precede the exec subcommand and difficulty=high caps at high"]
 #[test]
 fn edge_case_2_codex_effort_flag_precedes_exec_and_caps_at_high() {
     // Reachable proxy for the cap the argv builder will honor: difficulty=high

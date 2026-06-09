@@ -1030,7 +1030,7 @@ pub(crate) struct CodexRunner;
 impl LlmRunner for CodexRunner {
     fn supports(&self, cap: RunnerCapability) -> bool {
         match cap {
-            RunnerCapability::Effort => false,
+            RunnerCapability::Effort => true,
             RunnerCapability::StreamJson => true,
             RunnerCapability::Pty => false,
             RunnerCapability::DisallowedTools => false,
@@ -1048,6 +1048,7 @@ impl LlmRunner for CodexRunner {
             signal_flag,
             working_dir,
             model,
+            effort,
             timeout,
             stream_json,
             db_dir,
@@ -1058,7 +1059,7 @@ impl LlmRunner for CodexRunner {
         } = opts;
 
         let binary = resolve_codex_binary();
-        let args = build_codex_argv(permission_mode, working_dir, model);
+        let args = build_codex_argv(permission_mode, working_dir, model, effort);
 
         let mut cmd = Command::new(&binary);
         cmd.args(&args)
@@ -1192,8 +1193,13 @@ fn build_codex_argv(
     permission_mode: &PermissionMode,
     working_dir: Option<&std::path::Path>,
     model: Option<&str>,
+    effort: Option<&str>,
 ) -> Vec<String> {
     let mut args: Vec<String> = Vec::new();
+    if let Some(v) = effort.filter(|v| !v.trim().is_empty()) {
+        args.push("-c".to_string());
+        args.push(format!("model_reasoning_effort={}", v.trim()));
+    }
     match permission_mode {
         PermissionMode::Dangerous => {
             args.push("exec".to_string());
@@ -1899,6 +1905,11 @@ mod tests {
             ("grok", &GrokRunner, Pty, false),
             ("grok", &GrokRunner, DisallowedTools, true),
             ("grok", &GrokRunner, TitleArtifactCleanup, false),
+            ("codex", &CodexRunner, Effort, true),
+            ("codex", &CodexRunner, StreamJson, true),
+            ("codex", &CodexRunner, Pty, false),
+            ("codex", &CodexRunner, DisallowedTools, false),
+            ("codex", &CodexRunner, TitleArtifactCleanup, false),
         ];
         for (name, runner, cap, expected) in expectations {
             assert_eq!(
@@ -2308,6 +2319,11 @@ mod tests {
                 GrokRunner.supports(cap),
                 "RunnerKind::Grok.supports({cap:?}) drifted from GrokRunner",
             );
+            assert_eq!(
+                RunnerKind::Codex.supports(cap),
+                CodexRunner.supports(cap),
+                "RunnerKind::Codex.supports({cap:?}) drifted from CodexRunner",
+            );
         }
         // Spot-check the specific bit that caused the production crash.
         assert!(!RunnerKind::Grok.supports(TitleArtifactCleanup));
@@ -2698,7 +2714,7 @@ Assistant: I'll retry with credentials.\n";
     /// Dangerous mode emits the bypass flag instead of the sandbox chain.
     #[test]
     fn build_codex_argv_dangerous_mode() {
-        let argv = build_codex_argv(&PermissionMode::Dangerous, None, None);
+        let argv = build_codex_argv(&PermissionMode::Dangerous, None, None, None);
         assert_eq!(argv[0], "exec");
         assert_eq!(argv[1], "--json");
         assert_eq!(argv[2], "--dangerously-bypass-approvals-and-sandbox");
@@ -2716,6 +2732,7 @@ Assistant: I'll retry with credentials.\n";
             &PermissionMode::Scoped {
                 allowed_tools: None,
             },
+            None,
             None,
             None,
         );
@@ -2740,11 +2757,13 @@ Assistant: I'll retry with credentials.\n";
             },
             None,
             None,
+            None,
         );
         let scoped_argv = build_codex_argv(
             &PermissionMode::Scoped {
                 allowed_tools: None,
             },
+            None,
             None,
             None,
         );
@@ -2763,11 +2782,52 @@ Assistant: I'll retry with credentials.\n";
             },
             Some(std::path::Path::new("/workspace/project")),
             Some("codex-mini-latest"),
+            None,
         );
         let cd_pos = argv.iter().position(|a| a == "--cd").expect("--cd present");
         assert_eq!(argv[cd_pos + 1], "/workspace/project");
         let m_pos = argv.iter().position(|a| a == "-m").expect("-m present");
         assert_eq!(argv[m_pos + 1], "codex-mini-latest");
+    }
+
+    /// -c model_reasoning_effort=<level> is emitted BEFORE exec (pinned
+    /// placement); no-effort path is byte-identical (argv shape unchanged).
+    /// Covers dangerous (starts with exec) and scoped/auto.
+    #[test]
+    fn build_codex_argv_injects_effort_before_exec() {
+        // dangerous: effort prepended, exec shifts to [2]
+        let d = build_codex_argv(&PermissionMode::Dangerous, None, None, Some("medium"));
+        assert_eq!(d[0], "-c");
+        assert_eq!(d[1], "model_reasoning_effort=medium");
+        assert_eq!(d[2], "exec");
+        assert!(!d.iter().any(|a| a.contains("xhigh")));
+
+        // scoped: effort first, then -a never exec ...
+        let s = build_codex_argv(
+            &PermissionMode::Scoped {
+                allowed_tools: None,
+            },
+            None,
+            None,
+            Some("high"),
+        );
+        assert_eq!(s[0], "-c");
+        assert_eq!(s[1], "model_reasoning_effort=high");
+        let exec_idx = s.iter().position(|a| a == "exec").unwrap();
+        let c_idx = s.iter().position(|a| a == "-c").unwrap();
+        assert!(c_idx < exec_idx);
+        // no-effort case byte-identical to pre-change shape
+        let s_no = build_codex_argv(
+            &PermissionMode::Scoped {
+                allowed_tools: None,
+            },
+            None,
+            None,
+            None,
+        );
+        assert_eq!(s_no[0], "-a");
+        assert_eq!(s_no[2], "exec");
+        assert_eq!(s_no.len(), s.len() - 2); // exactly two extra tokens when effort present
     }
 
     // ------------------------------------------------------------------

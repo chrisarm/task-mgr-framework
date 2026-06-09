@@ -421,7 +421,7 @@
       "model": "claude-opus-4-8",
       "modifiesBehavior": true,
       "notes": "Heart of the PRD. Learning 3019/3736: check_override_invalidation keys off tasks.model vs ctx.overflow_original_task_model — NULL-original is the new case to handle explicitly. Learning 4913: sequential/wave parity requires matching parameter threading — verify every input influencing the plan reaches both builders. Learning 4915: adding fields to SlotPromptBundle requires systematic construction-site discovery (production + test helpers + fixtures). Old fns (resolve_task_execution_target, resolve_task_model, compute_baseline_model) remain in place until REFACTOR-005 deletes them — integration tests still reference them, so no dead-code warnings; do NOT delete here. Data contract: ExecutionPlan.effort: Option<String>; spawn-time precedence: ctx.effort_overrides.get(task_id) wins over plan.effort.",
-      "passes": false,
+      "passes": true,
       "priority": 8,
       "qualityDimensions": [
         "Resolution determinism: pure function of (task fields, config); zero hidden state",
@@ -463,7 +463,7 @@
       "id": "CODE-REVIEW-1",
       "modifiesBehavior": false,
       "notes": "For each issue: echo '{...}' | task-mgr add --stdin --depended-on-by MILESTONE-1 — atomic DB+JSON sync, no manual edit. If no issues, emit <task-status>CODE-REVIEW-1:done</task-status> with a one-line progress note. Use the rust-python-code-reviewer agent.",
-      "passes": false,
+      "passes": true,
       "priority": 13,
       "qualityDimensions": [
         "Review verifies contracts (escape valve, purity, single-home stamping) by grep/read, not by trusting task notes"
@@ -489,7 +489,7 @@
       "model": "claude-opus-4-8",
       "modifiesBehavior": false,
       "notes": "If fixture-reading test binaries fail en masse pointing at a removed -slot-N worktree path, that's stale shared-target binaries, not a regression — touch tests/<binary>.rs and re-run (learning #4753) before spawning FIX tasks.",
-      "passes": false,
+      "passes": true,
       "priority": 20,
       "qualityDimensions": [
         "Trunk-green invariant: zero failures left behind, zero punted without a spawned FIX task"

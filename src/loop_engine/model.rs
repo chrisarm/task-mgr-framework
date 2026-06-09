@@ -232,6 +232,8 @@ pub const EFFORT_FOR_DIFFICULTY: &[(&str, &str)] =
 /// budget can never be configured. `validate_models_config` rejects an `xhigh`
 /// codex effort entry naming the policy. Unlike `EFFORT_FOR_DIFFICULTY` (Claude
 /// /Grok), codex maps each difficulty to the same-named effort level.
+/// The flag is emitted by build_codex_argv (BEFORE the exec subcommand) when
+/// the selected runner supports Effort (now true for CodexRunner).
 pub const CODEX_EFFORT_FOR_DIFFICULTY: &[(&str, &str)] =
     &[("low", "low"), ("medium", "medium"), ("high", "high")];
 
