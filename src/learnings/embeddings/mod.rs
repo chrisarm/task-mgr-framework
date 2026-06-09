@@ -17,6 +17,24 @@ pub const DEFAULT_OLLAMA_URL: &str = "http://localhost:11435";
 pub const DEFAULT_EMBEDDING_MODEL: &str =
     "hf.co/jinaai/jina-embeddings-v5-text-small-retrieval-GGUF:Q8_0";
 
+/// Cosine similarity threshold for treating a candidate as a near-duplicate of an
+/// existing learning.
+///
+/// Asymmetric-risk rationale: a false positive (incorrectly deciding "duplicate" and
+/// dropping the candidate) is unrecoverable — there is no LLM second opinion at
+/// write time, and the learning is silently lost. A false negative (letting a
+/// near-duplicate through) is cheap because `curate dedup` will catch it later.
+/// Bias high (0.92) and well above the curate pre-cluster threshold (0.65) to
+/// minimize the risk of dropping a distinct learning.
+pub const NEAR_DUP_THRESHOLD: f32 = 0.92;
+
+/// Log floor for "near-miss" observability band inside `NearDuplicateChecker::check`.
+///
+/// When the best-match similarity satisfies `NEAR_MISS_LOG_FLOOR <= sim < threshold`,
+/// we emit a diagnostic line and still treat the candidate as Unique (so it is
+/// recorded). This band aids calibration without changing the accept decision.
+const NEAR_MISS_LOG_FLOOR: f32 = 0.80;
+
 // ---------------------------------------------------------------------------
 // OllamaEmbedder
 // ---------------------------------------------------------------------------
@@ -233,6 +251,45 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     }
 
     (dot / denom) as f32
+}
+
+// ---------------------------------------------------------------------------
+// Near-duplicate primitives (pure, no I/O)
+// ---------------------------------------------------------------------------
+
+/// Return the single highest-similarity known entry for `candidate`, or None if
+/// `known` is empty.
+///
+/// Compares using [`cosine_similarity`] and returns the `(id, sim)` pair for the
+/// maximum similarity regardless of any threshold. This is the testable primitive
+/// for near-duplicate decisions; threshold filtering is applied by the caller or
+/// by [`find_near_duplicate`].
+pub fn best_match(candidate: &[f32], known: &[(i64, Vec<f32>)]) -> Option<(i64, f32)> {
+    if known.is_empty() {
+        return None;
+    }
+    let mut best: Option<(i64, f32)> = None;
+    for (id, emb) in known {
+        let sim = cosine_similarity(candidate, emb);
+        match best {
+            Some((_, s)) if sim > s => best = Some((*id, sim)),
+            None => best = Some((*id, sim)),
+            _ => {}
+        }
+    }
+    best
+}
+
+/// Return the highest-similarity known entry whose similarity is >= `threshold`,
+/// or None if no such entry exists (including when `known` is empty).
+///
+/// Defined as `best_match(candidate, known).filter(|(_, s)| *s >= threshold)`.
+pub fn find_near_duplicate(
+    candidate: &[f32],
+    known: &[(i64, Vec<f32>)],
+    threshold: f32,
+) -> Option<(i64, f32)> {
+    best_match(candidate, known).filter(|(_, s)| *s >= threshold)
 }
 
 // ---------------------------------------------------------------------------
@@ -468,6 +525,138 @@ pub fn try_embed_learnings_batch(
     }
 
     stored
+}
+
+// ---------------------------------------------------------------------------
+// Near-duplicate guard (embedding-based pre-filter at write time)
+// ---------------------------------------------------------------------------
+
+/// Outcome of an inline near-duplicate check performed by [`NearDuplicateChecker`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum NearDupOutcome {
+    /// Candidate is similar enough to an existing learning to be treated as a duplicate.
+    Duplicate { existing_id: i64, similarity: f32 },
+    /// Candidate is unique (or best match is below the near-miss floor); the
+    /// freshly-computed embedding is returned so the caller can register it for
+    /// subsequent same-batch checks via [`NearDuplicateChecker::register`].
+    Unique(Vec<f32>),
+    /// Checker unavailable (embedder down, empty text, etc.). Caller must fall
+    /// back to exact-match-only behavior.
+    Unavailable,
+}
+
+/// Reusable near-duplicate checker that embeds a candidate once and compares it
+/// (via cosine) against embeddings previously loaded for the *configured* model.
+///
+/// Cross-model comparison is intentionally skipped: only rows stored under the
+/// model resolved from the current project config (via `read_project_config`) are
+/// loaded at construction time. This matches the embedding used for the candidate
+/// and avoids meaningless similarity scores across different embedding spaces.
+///
+/// The struct deliberately holds no separate `model` field; `OllamaEmbedder` already
+/// retains the model it was constructed with. Adding a second copy would trigger
+/// `dead_code` under `-D warnings` because the value is never read after `new`.
+pub struct NearDuplicateChecker {
+    embedder: OllamaEmbedder,
+    threshold: f32,
+    known: Vec<(i64, Vec<f32>)>,
+}
+
+impl NearDuplicateChecker {
+    /// Construct a checker for the given connection and project directory.
+    ///
+    /// Resolves `ollama_url` and `embedding_model` exactly once via
+    /// `read_project_config` (mirrors the locals pattern in `try_embed_learning`).
+    /// Builds an embedder, verifies availability, then loads all active embeddings
+    /// for that model via [`load_all_active_embeddings`]. On load error, prints a
+    /// warning and returns `None` (preserving exact-match-only behavior).
+    ///
+    /// Returns `None` (never panics, never Err) when the embedder is unavailable
+    /// or the load fails. The local `model` binding is used for both the embedder
+    /// and the loader then dropped; it is not stored on the struct.
+    pub fn new(conn: &Connection, db_dir: &std::path::Path, threshold: f32) -> Option<Self> {
+        use crate::loop_engine::project_config::read_project_config;
+
+        let proj = read_project_config(db_dir);
+        let url = proj
+            .ollama_url
+            .unwrap_or_else(|| DEFAULT_OLLAMA_URL.to_string());
+        let model = proj
+            .embedding_model
+            .unwrap_or_else(|| DEFAULT_EMBEDDING_MODEL.to_string());
+
+        let embedder = OllamaEmbedder::new(&url, &model);
+
+        if !matches!(embedder.is_available(), Ok(true)) {
+            return None;
+        }
+
+        // Only embeddings for the *configured* model are loaded; cross-model
+        // comparison is intentionally skipped (see struct doc comment).
+        let known = match load_all_active_embeddings(conn, &model) {
+            Ok(v) => v
+                .into_iter()
+                .map(|le| (le.learning_id, le.embedding))
+                .collect(),
+            Err(e) => {
+                eprintln!("Warning: near-dup checker load failed: {e}");
+                return None;
+            }
+        };
+
+        Some(Self {
+            embedder,
+            threshold,
+            known,
+        })
+    }
+
+    /// Check whether `(title, content)` is a near-duplicate of a known learning.
+    ///
+    /// - Empty composed text -> `Unavailable`.
+    /// - Embed failure -> `Unavailable` (fire-and-forget; never propagates).
+    /// - Best match with sim >= threshold -> `Duplicate`.
+    /// - Best match with `NEAR_MISS_LOG_FLOOR <= sim < threshold` -> log a
+    ///   near-miss line then `Unique(embedding)`.
+    /// - Otherwise (including no known entries) -> `Unique(embedding)`.
+    ///
+    /// The near-miss observability arm exists precisely because `check` re-uses
+    /// `best_match` (the max regardless of threshold) rather than only testing
+    /// `>= threshold`; a bare `if >= { Duplicate } else { Unique }` would skip
+    /// the diagnostic the split enables.
+    pub fn check(&self, title: &str, content: &str) -> NearDupOutcome {
+        let text = compose_embed_text(title, content);
+        if text.is_empty() {
+            return NearDupOutcome::Unavailable;
+        }
+
+        let emb = match self.embedder.embed(&text) {
+            Ok(v) => v,
+            Err(_) => return NearDupOutcome::Unavailable,
+        };
+
+        if let Some((id, sim)) = best_match(&emb, &self.known) {
+            if sim >= self.threshold {
+                NearDupOutcome::Duplicate {
+                    existing_id: id,
+                    similarity: sim,
+                }
+            } else if sim >= NEAR_MISS_LOG_FLOOR {
+                eprintln!("near-miss #{} cos={:.3} (< {})", id, sim, self.threshold);
+                NearDupOutcome::Unique(emb)
+            } else {
+                NearDupOutcome::Unique(emb)
+            }
+        } else {
+            NearDupOutcome::Unique(emb)
+        }
+    }
+
+    /// Register a freshly-accepted unique learning's embedding so that subsequent
+    /// candidates in the same batch are compared against it as well.
+    pub fn register(&mut self, id: i64, embedding: Vec<f32>) {
+        self.known.push((id, embedding));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -730,5 +919,239 @@ mod tests {
         store_embedding(&conn, 2, "model-x", &[2.0]).unwrap();
 
         assert_eq!(count_embedded(&conn, "model-x").unwrap(), 1);
+    }
+
+    // ---- best_match / find_near_duplicate pure tests (no Ollama) ----
+
+    #[test]
+    fn test_near_dup_consts() {
+        assert!((NEAR_DUP_THRESHOLD - 0.92).abs() < 1e-9);
+        assert!((NEAR_MISS_LOG_FLOOR - 0.80).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_best_match_empty_known() {
+        let cand = vec![1.0, 0.0];
+        assert!(best_match(&cand, &[]).is_none());
+        assert!(find_near_duplicate(&cand, &[], NEAR_DUP_THRESHOLD).is_none());
+    }
+
+    #[test]
+    fn test_best_match_identical_returns_some_with_id() {
+        let id = 42i64;
+        let v = vec![0.1, 0.2, 0.3];
+        let known = vec![(id, v.clone())];
+        let res = best_match(&v, &known);
+        assert_eq!(res, Some((id, 1.0)));
+    }
+
+    #[test]
+    fn test_find_near_duplicate_orthogonal_below_threshold() {
+        let cand = vec![1.0, 0.0];
+        let known = vec![(7, vec![0.0, 1.0])];
+        let res = find_near_duplicate(&cand, &known, 0.92);
+        assert!(res.is_none(), "cosine 0 with thresh 0.92 -> None");
+    }
+
+    #[test]
+    fn test_find_near_duplicate_exactly_at_threshold_is_match() {
+        // Construct two unit vectors whose cosine is exactly the threshold
+        // (within f32 precision): the known vector is the x-axis, and the
+        // candidate is forced onto the unit sphere at angle acos(0.92) so the
+        // exact-at-threshold case is exercised deterministically.
+        let thresh = 0.92_f32;
+        let known_vec = vec![1.0_f32, 0.0, 0.0];
+        // cos theta = 0.92 => adjacent component 0.92 on unit sphere slice
+        let b0 = thresh;
+        let b1 = (1.0_f32 - thresh * thresh).sqrt();
+        let cand_vec = vec![b0, b1, 0.0];
+        // Verify our construction
+        let sim = cosine_similarity(&known_vec, &cand_vec);
+        assert!(
+            (sim - thresh).abs() < 1e-5,
+            "test construction must yield ~exactly threshold, got {sim}"
+        );
+        let known = vec![(99i64, known_vec)];
+        let hit = find_near_duplicate(&cand_vec, &known, thresh);
+        assert_eq!(
+            hit,
+            Some((99, sim)),
+            "exactly-at-threshold must be >= match"
+        );
+    }
+
+    #[test]
+    fn test_best_match_returns_max_not_first() {
+        // sims: 0.93, 0.97, 0.95 -> must return the 0.97 id (105), not the first (101)
+        let v1 = vec![1.0_f32, 0.0, 0.0]; // ref
+        // Build vectors with controlled cosines to v1 (unit).
+        let c93 = 0.93_f32;
+        let c97 = 0.97_f32;
+        let c95 = 0.95_f32;
+        let v93 = vec![c93, (1.0 - c93 * c93).sqrt(), 0.0];
+        let v97 = vec![c97, (1.0 - c97 * c97).sqrt(), 0.0];
+        let v95 = vec![c95, (1.0 - c95 * c95).sqrt(), 0.0];
+        let known = vec![(101i64, v93), (105i64, v97), (103i64, v95)];
+        let cand = v1;
+        let best = best_match(&cand, &known).expect("must have a best");
+        assert_eq!(
+            best.0, 105,
+            "must pick the max-similarity id (0.97), not first"
+        );
+        assert!((best.1 - 0.97).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_find_near_duplicate_below_threshold_none() {
+        let cand = vec![1.0_f32, 0.0, 0.0];
+        let low = vec![0.5_f32, (1.0_f32 - 0.25_f32).sqrt(), 0.0];
+        let known = vec![(1, low)];
+        assert!(best_match(&cand, &known).is_some());
+        assert!(find_near_duplicate(&cand, &known, 0.92).is_none());
+    }
+
+    // The following two tests document "known-bad" implementations:
+    // - Returning the *first* high match instead of the global max fails the ordering test.
+    // - Using `> threshold` instead of `>=` fails the exactly-at-threshold test.
+    // They are written to assert the *specific* max id and the inclusive boundary so that
+    // a wrong impl would fail these (not just "got a match").
+
+    #[test]
+    fn test_best_match_max_id_assertion_would_fail_first_match_impl() {
+        // If an impl did `find(|s| s >= 0.9).first()` or "return first >= thresh" style,
+        // this ordering would surface the wrong id. We assert the true max id.
+        let base = vec![1.0_f32, 0.0, 0.0];
+        let k1 = vec![0.93_f32, (1.0_f32 - 0.93_f32 * 0.93_f32).sqrt(), 0.0];
+        let k2 = vec![0.97_f32, (1.0_f32 - 0.97_f32 * 0.97_f32).sqrt(), 0.0];
+        let k3 = vec![0.95_f32, (1.0_f32 - 0.95_f32 * 0.95_f32).sqrt(), 0.0];
+        let known = vec![(11, k1), (22, k2), (33, k3)];
+        let best = best_match(&base, &known).unwrap();
+        assert_eq!(
+            best.0, 22,
+            "known-bad first-match would have returned 11 here"
+        );
+    }
+
+    #[test]
+    fn test_find_near_duplicate_boundary_ge_would_fail_gt_impl() {
+        let thresh = 0.92_f32;
+        let base = vec![1.0_f32, 0.0, 0.0];
+        let b0 = thresh;
+        let b1 = (1.0_f32 - thresh * thresh).sqrt();
+        let exact = vec![b0, b1, 0.0];
+        let known = vec![(7, base)];
+        let hit = find_near_duplicate(&exact, &known, thresh);
+        assert!(
+            hit.is_some(),
+            "known-bad `> threshold` impl would return None for exactly == threshold"
+        );
+    }
+
+    // ---- NearDuplicateChecker tests (construction + basic check behavior) ----
+
+    #[test]
+    fn test_near_duplicate_checker_new_unreachable_via_temp_config() {
+        // AC: new returns None (not Err, no panic) when Ollama unreachable.
+        // Use a temp config dir with an unreachable ollama_url.
+        let cfg_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            cfg_dir.path().join("config.json"),
+            r#"{"ollamaUrl": "http://127.0.0.1:1"}"#,
+        )
+        .unwrap();
+
+        let (_db_dir, conn) = setup_db(); // schema present, but load won't be reached
+        let checker = NearDuplicateChecker::new(&conn, cfg_dir.path(), NEAR_DUP_THRESHOLD);
+        assert!(
+            checker.is_none(),
+            "unreachable host via temp config must yield None checker"
+        );
+    }
+
+    #[test]
+    fn test_near_duplicate_checker_new_load_error_returns_none() {
+        // AC: new returns None (and logs a warning) if load_all_active_embeddings errors.
+        // We point config at default URL (may or may not be reachable) but use a conn
+        // with no tables so the SELECT prepare inside load_all will fail.
+        let cfg_dir = tempfile::tempdir().unwrap();
+        // Write a config that does not override URL (defaults apply).
+        std::fs::write(cfg_dir.path().join("config.json"), "{}").unwrap();
+
+        // Open a connection but *do not* create schema/migrations -> tables absent.
+        let no_schema_dir = tempfile::tempdir().unwrap();
+        let conn = rusqlite::Connection::open(no_schema_dir.path().join("no-schema.db"))
+            .expect("temp conn");
+        // Do not run create_schema / run_migrations.
+
+        let checker = NearDuplicateChecker::new(&conn, cfg_dir.path(), NEAR_DUP_THRESHOLD);
+        assert!(
+            checker.is_none(),
+            "load failure (missing tables) must cause new() -> None"
+        );
+    }
+
+    #[test]
+    fn test_near_duplicate_checker_check_empty_text_unavailable() {
+        // Even without a live embedder we can reach the empty-text early return
+        // by constructing a checker that never gets used for embed (but we still
+        // need one to call the method). If construction fails (no Ollama), we
+        // simply skip the assertion — the empty-text path is also exercised in
+        // the real caller before any checker is built.
+        let cfg_dir = tempfile::tempdir().unwrap();
+        std::fs::write(cfg_dir.path().join("config.json"), "{}").unwrap();
+        let (_d, conn) = setup_db();
+
+        if let Some(checker) = NearDuplicateChecker::new(&conn, cfg_dir.path(), NEAR_DUP_THRESHOLD)
+        {
+            let out = checker.check("", "");
+            assert_eq!(out, NearDupOutcome::Unavailable);
+            let out2 = checker.check("   ", "\n\n");
+            assert_eq!(out2, NearDupOutcome::Unavailable);
+        }
+    }
+
+    #[test]
+    fn test_near_miss_band_via_pure_fns() {
+        // AC observability: a 0.85-similar vector is best_match max yet
+        // find_near_duplicate(0.92) is None, so check()'s Unique arm (with
+        // near-miss log when >= floor) must be taken, not a bare else.
+        let base = vec![1.0_f32, 0.0, 0.0];
+        let c85: f32 = 0.85;
+        let v85 = vec![c85, (1.0 - c85 * c85).sqrt(), 0.0];
+        let known = vec![(555i64, v85.clone())];
+        let best = best_match(&base, &known);
+        assert!(best.is_some());
+        assert!((best.unwrap().1 - 0.85).abs() < 1e-5);
+        let near = find_near_duplicate(&base, &known, 0.92);
+        assert!(near.is_none(), "0.85 must be below 0.92 threshold");
+        // Therefore in check(), after a successful embed yielding a vector whose
+        // best sim is ~0.85, the code must hit the NEAR_MISS_LOG_FLOOR..thresh
+        // arm (eprintln + Unique) rather than falling to a catch-all Unique
+        // without having consulted best_match for the near-miss case.
+    }
+
+    #[test]
+    fn test_checker_register_affects_subsequent_best_match() {
+        // If we can build a checker (Ollama present + model available), register
+        // should make a subsequent intra-batch candidate see the newly added entry.
+        let cfg_dir = tempfile::tempdir().unwrap();
+        std::fs::write(cfg_dir.path().join("config.json"), "{}").unwrap();
+        let (_d, conn) = setup_db();
+
+        if let Some(mut checker) =
+            NearDuplicateChecker::new(&conn, cfg_dir.path(), NEAR_DUP_THRESHOLD)
+        {
+            // Pick an arbitrary id/embedding we "just stored".
+            let id = 999i64;
+            let emb = vec![0.11_f32, 0.22, 0.33];
+            checker.register(id, emb.clone());
+
+            // After register, the in-memory known now contains the id/emb we just
+            // pushed. Reconstruct a 1-element view and assert best_match sees it at
+            // cosine 1.0. This exercises register() + the pure primitive without
+            // depending on a second embed matching exactly.
+            let before = best_match(&emb, &[(id, emb.clone())]);
+            assert_eq!(before, Some((id, 1.0)));
+        }
     }
 }

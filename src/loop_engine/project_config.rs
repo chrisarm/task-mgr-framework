@@ -4,7 +4,10 @@ use std::path::Path;
 
 use crate::error::{TaskMgrError, TaskMgrResult};
 use crate::loop_engine::config_io::{OnCorruptJson, write_config_key_at};
-use crate::loop_engine::model::{Provider, parse_config_provider};
+use crate::loop_engine::model::{
+    Provider, normalize_route_prefix, parse_baseline_tier_key, parse_config_provider,
+    route_prefixes_overlap,
+};
 
 /// Configuration for the Grok fallback runner (US-005, FR-006).
 ///
@@ -514,14 +517,15 @@ pub fn validate_runner_routing_config(cfg: &ProjectConfig) -> TaskMgrResult<()> 
         }
         for (prefix, tier_map) in &primary.baseline_tier_routes {
             for tier_key in tier_map.keys() {
-                crate::loop_engine::model::parse_baseline_tier_key(tier_key).map_err(
-                    |message| TaskMgrError::InvalidConfig {
+                parse_baseline_tier_key(tier_key).map_err(|message| {
+                    TaskMgrError::InvalidConfig {
                         field: format!("primaryRunner.baselineTierRoutes.{prefix}.{tier_key}"),
                         message,
-                    },
-                )?;
+                    }
+                })?;
             }
         }
+        validate_non_conflicting_prefix_routes(primary)?;
         if cfg
             .review_model
             .as_deref()
@@ -531,6 +535,78 @@ pub fn validate_runner_routing_config(cfg: &ProjectConfig) -> TaskMgrResult<()> 
             return Err(TaskMgrError::InvalidConfig {
                 field: "reviewModel".to_string(),
                 message: "reviewModel is string-only in v1 and overrides primaryRunner Codex review routes; unset reviewModel or remove the Codex review route".to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_non_conflicting_prefix_routes(primary: &PrimaryRunnerConfig) -> TaskMgrResult<()> {
+    validate_by_id_prefix_conflicts(primary)?;
+    validate_baseline_tier_prefix_conflicts(primary)?;
+    Ok(())
+}
+
+fn validate_by_id_prefix_conflicts(primary: &PrimaryRunnerConfig) -> TaskMgrResult<()> {
+    let mut routes: Vec<_> = primary.by_id_prefix.iter().collect();
+    routes.sort_by_key(|(left_key, _)| *left_key);
+
+    for (i, (left_key, left_spec)) in routes.iter().enumerate() {
+        for (right_key, right_spec) in routes.iter().skip(i + 1) {
+            if left_spec == right_spec || !route_prefixes_overlap(left_key, right_key) {
+                continue;
+            }
+            return Err(TaskMgrError::InvalidConfig {
+                field: "primaryRunner.byIdPrefix".to_string(),
+                message: format!(
+                    "conflicting overlapping prefixes {left_key:?} and {right_key:?}; \
+                     {left:?} and {right:?} can match the same task id but route to \
+                     different specs",
+                    left = normalize_route_prefix(left_key),
+                    right = normalize_route_prefix(right_key),
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_baseline_tier_prefix_conflicts(primary: &PrimaryRunnerConfig) -> TaskMgrResult<()> {
+    let mut routes = Vec::new();
+    for (prefix, tier_map) in &primary.baseline_tier_routes {
+        for (tier_key, spec) in tier_map {
+            let tier = parse_baseline_tier_key(tier_key).map_err(|message| {
+                TaskMgrError::InvalidConfig {
+                    field: format!("primaryRunner.baselineTierRoutes.{prefix}.{tier_key}"),
+                    message,
+                }
+            })?;
+            routes.push((prefix, tier_key, tier, spec));
+        }
+    }
+    routes.sort_by(
+        |(left_prefix, left_tier_key, _, _), (right_prefix, right_tier_key, _, _)| {
+            left_prefix
+                .cmp(right_prefix)
+                .then_with(|| left_tier_key.cmp(right_tier_key))
+        },
+    );
+
+    for (i, (left_prefix, left_tier_key, left_tier, left_spec)) in routes.iter().enumerate() {
+        for (right_prefix, right_tier_key, right_tier, right_spec) in routes.iter().skip(i + 1) {
+            if left_tier != right_tier
+                || left_spec == right_spec
+                || !route_prefixes_overlap(left_prefix, right_prefix)
+            {
+                continue;
+            }
+            return Err(TaskMgrError::InvalidConfig {
+                field: "primaryRunner.baselineTierRoutes".to_string(),
+                message: format!(
+                    "conflicting overlapping prefixes {left_prefix:?}.{left_tier_key} and \
+                     {right_prefix:?}.{right_tier_key}; both normalize to tier {left_tier:?} \
+                     and can match the same task id but route to different specs",
+                ),
             });
         }
     }
@@ -2078,6 +2154,186 @@ mod tests {
         assert!(
             msg.contains("baselineTierRoutes.FEAT.superopus") && msg.contains("low"),
             "error must name the bad tier and allowed tiers: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_conflicting_overlapping_by_id_prefix_routes() {
+        use crate::loop_engine::model::OPUS_MODEL;
+        let mut by_id_prefix = HashMap::new();
+        by_id_prefix.insert(
+            "MILESTONE".to_string(),
+            RunnerSpec {
+                provider: "claude".to_string(),
+                model: OPUS_MODEL.to_string(),
+                ..Default::default()
+            },
+        );
+        by_id_prefix.insert(
+            "MILESTONE-FINAL".to_string(),
+            RunnerSpec {
+                provider: "codex".to_string(),
+                model: String::new(),
+                ..Default::default()
+            },
+        );
+        let cfg = ProjectConfig {
+            primary_runner: Some(PrimaryRunnerConfig {
+                by_id_prefix,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let err = validate_runner_routing_config(&cfg)
+            .expect_err("conflicting overlapping prefixes must reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("byIdPrefix")
+                && msg.contains("MILESTONE")
+                && msg.contains("MILESTONE-FINAL"),
+            "error must name both conflicting prefixes: {msg}",
+        );
+    }
+
+    #[test]
+    fn test_validate_allows_same_spec_overlapping_by_id_prefix_routes() {
+        use crate::loop_engine::model::OPUS_MODEL;
+        let same_spec = RunnerSpec {
+            provider: "claude".to_string(),
+            model: OPUS_MODEL.to_string(),
+            ..Default::default()
+        };
+        let mut by_id_prefix = HashMap::new();
+        by_id_prefix.insert("FIX".to_string(), same_spec.clone());
+        by_id_prefix.insert("CODE-FIX".to_string(), same_spec.clone());
+        by_id_prefix.insert("IMPL-FIX".to_string(), same_spec.clone());
+        by_id_prefix.insert("WIRE-FIX".to_string(), same_spec);
+        let cfg = ProjectConfig {
+            primary_runner: Some(PrimaryRunnerConfig {
+                by_id_prefix,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        validate_runner_routing_config(&cfg)
+            .expect("same-spec overlapping prefixes must remain valid");
+    }
+
+    #[test]
+    fn test_validate_rejects_conflicting_overlapping_baseline_tier_routes() {
+        let mut feat_tiers = HashMap::new();
+        feat_tiers.insert(
+            "high".to_string(),
+            RunnerSpec {
+                provider: "codex".to_string(),
+                model: String::new(),
+                ..Default::default()
+            },
+        );
+        let mut special_tiers = HashMap::new();
+        special_tiers.insert(
+            "high".to_string(),
+            RunnerSpec {
+                provider: "grok".to_string(),
+                model: "grok-build".to_string(),
+                ..Default::default()
+            },
+        );
+        let mut baseline_tier_routes = HashMap::new();
+        baseline_tier_routes.insert("FEAT".to_string(), feat_tiers);
+        baseline_tier_routes.insert("FEAT-SPECIAL".to_string(), special_tiers);
+        let cfg = ProjectConfig {
+            primary_runner: Some(PrimaryRunnerConfig {
+                baseline_tier_routes,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let err = validate_runner_routing_config(&cfg)
+            .expect_err("conflicting overlapping baseline tier prefixes must reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("baselineTierRoutes")
+                && msg.contains("FEAT")
+                && msg.contains("FEAT-SPECIAL")
+                && msg.contains("high"),
+            "error must name both prefixes and the conflicting tier: {msg}",
+        );
+    }
+
+    #[test]
+    fn test_validate_allows_overlapping_baseline_prefixes_with_disjoint_tiers() {
+        let mut feat_tiers = HashMap::new();
+        feat_tiers.insert(
+            "standard".to_string(),
+            RunnerSpec {
+                provider: "grok".to_string(),
+                model: "grok-build".to_string(),
+                ..Default::default()
+            },
+        );
+        let mut special_tiers = HashMap::new();
+        special_tiers.insert(
+            "high".to_string(),
+            RunnerSpec {
+                provider: "codex".to_string(),
+                model: String::new(),
+                ..Default::default()
+            },
+        );
+        let mut baseline_tier_routes = HashMap::new();
+        baseline_tier_routes.insert("FEAT".to_string(), feat_tiers);
+        baseline_tier_routes.insert("FEAT-SPECIAL".to_string(), special_tiers);
+        let cfg = ProjectConfig {
+            primary_runner: Some(PrimaryRunnerConfig {
+                baseline_tier_routes,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        validate_runner_routing_config(&cfg)
+            .expect("overlapping baseline prefixes with disjoint tiers must remain valid");
+    }
+
+    #[test]
+    fn test_validate_rejects_conflicting_baseline_tier_aliases() {
+        let mut feat_tiers = HashMap::new();
+        feat_tiers.insert(
+            "high".to_string(),
+            RunnerSpec {
+                provider: "codex".to_string(),
+                model: String::new(),
+                ..Default::default()
+            },
+        );
+        feat_tiers.insert(
+            "opus".to_string(),
+            RunnerSpec {
+                provider: "grok".to_string(),
+                model: "grok-build".to_string(),
+                ..Default::default()
+            },
+        );
+        let mut baseline_tier_routes = HashMap::new();
+        baseline_tier_routes.insert("FEAT".to_string(), feat_tiers);
+        let cfg = ProjectConfig {
+            primary_runner: Some(PrimaryRunnerConfig {
+                baseline_tier_routes,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let err = validate_runner_routing_config(&cfg)
+            .expect_err("conflicting baseline tier aliases must reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("baselineTierRoutes") && msg.contains("high") && msg.contains("opus"),
+            "error must name both alias tier keys: {msg}",
         );
     }
 

@@ -151,6 +151,9 @@ for EVERY task):
    provider-neutral baseline tier.
 
 When both produce a match, `byTaskType` wins.
+Overlapping `byIdPrefix` / `baselineTierRoutes` prefixes are allowed only when
+the overlapping routes have identical `RunnerSpec`s; conflicting overlaps are
+config errors caught before loop startup.
 
 **SSoT**: `model::primary_runner_match` is the single prefix-matching impl —
 do NOT re-implement the prefix-matching logic anywhere else.
