@@ -147,7 +147,7 @@
       "model": "claude-opus-4-8",
       "modifiesBehavior": true,
       "notes": "Insertion point: the `for params in params_list` recording loop in extract_learnings_from_output (src/learnings/ingestion/mod.rs ~170-200); learning_exists is ~256-267. Move that loop into a private `record_extracted_learnings` helper taking Option<&mut dyn NearDupGuard> (review finding #1) so the Tier-2 arms are unit-testable with a fake — spawn_claude at ~mod.rs:105 makes the in-fn loop unreachable from tests otherwise. Records against a bare &Connection (NO transaction — flush is after the helper returns), so no tx/borrow conflict. LearningWriter lifecycle (construct before, record, flush after) per learning #2726 — keep it. Reuse NearDuplicateChecker/NearDupOutcome/NEAR_DUP_THRESHOLD from FEAT-001; the near-miss calibration log lives in check() (FEAT-001), not here. Learning #1456: dedup key is (outcome,title) today — leave it; widening to title+content is out of scope. Learning #2135: sole caller is the unified iteration pipeline — verify wiring there.",
-      "passes": false,
+      "passes": true,
       "priority": 2,
       "qualityDimensions": [
         "Tier-1 exact match runs first and unconditionally; Tier-2 only augments when a guard is present",
@@ -180,7 +180,7 @@
       "id": "REFACTOR-001",
       "model": "claude-opus-4-8",
       "notes": "If issues found: `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001` for each (priority 50-97). If no issues, invoke /simplify on any ugly touchpoint, then emit `<task-status>REFACTOR-001:done</task-status>` with a one-line note.",
-      "passes": false,
+      "passes": true,
       "priority": 98,
       "qualityDimensions": [
         "DRY — no reinvented similarity/embedding logic",

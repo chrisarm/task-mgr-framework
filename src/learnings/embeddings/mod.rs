@@ -955,17 +955,10 @@ mod tests {
 
     #[test]
     fn test_find_near_duplicate_exactly_at_threshold_is_match() {
-        // Build two vectors whose cosine is exactly 0.92 (within f32 precision).
-        // Use a simple pair: a and a scaled/angled version.
-        // For determinism we compute a vector at the boundary using the fn itself.
-        // (The literal below is intentionally unused; the construction uses
-        // named vectors for the exact-at-threshold assertion.)
-        let _a = vec![1.0_f32, 0.0, 0.0];
-        // A vector with cosine exactly 0.92 to a: dot = 0.92 * ||a|| * ||b||
-        // Since ||a||=1, choose b = (0.92, sqrt(1-0.92^2), 0) normalized? Simpler:
-        // Just assert using the math we trust: if sim == thresh it must be kept.
-        // We synthesize by taking a known and a candidate that we *force* to the thresh
-        // via a unit vector construction.
+        // Construct two unit vectors whose cosine is exactly the threshold
+        // (within f32 precision): the known vector is the x-axis, and the
+        // candidate is forced onto the unit sphere at angle acos(0.92) so the
+        // exact-at-threshold case is exercised deterministically.
         let thresh = 0.92_f32;
         let known_vec = vec![1.0_f32, 0.0, 0.0];
         // cos theta = 0.92 => adjacent component 0.92 on unit sphere slice

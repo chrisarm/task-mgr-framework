@@ -30,6 +30,36 @@ The low-level `record_learning()` primitive in `src/learnings/crud/create.rs` is
 public for tests and `curate enrich`, but new production creation paths should use
 `LearningWriter` to get automatic embedding scheduling.
 
+### Write-time near-duplicate guard (ingestion auto-extraction ONLY)
+
+The loop-engine auto-extraction path mines a learning from each iteration's output
+via Haiku. When two iterations surface the *same* lesson with slightly reworded
+titles, the exact `(outcome, title)` guard (`learning_exists`) lets both rows in,
+polluting `recall` until the post-hoc `curate dedup` LLM pass merges them. To stop
+the near-duplicate at write time, `extract_learnings_from_output()` layers a second,
+embedding-based tier on top of the exact-match guard:
+
+- **Tier-1** (`learning_exists`, exact outcome+title) runs FIRST and UNCONDITIONALLY.
+  It is the sole guard when the embedding checker is absent (Ollama down, no `db_dir`),
+  so offline behavior is **byte-identical** to before this feature.
+- **Tier-2** (`NearDuplicateChecker`, embedding cosine ≥ `NEAR_DUP_THRESHOLD` = 0.92)
+  runs only when the checker constructs — i.e. Ollama is up and `db_dir` is `Some`.
+  A `Duplicate` candidate is skipped (counted); a `Unique` candidate is recorded and
+  its embedding `register`ed so later same-batch candidates compare against it too.
+
+`NearDuplicateChecker` (`src/learnings/embeddings/mod.rs`) loads only the embeddings
+stored under the **configured** embedding model at construction — **cross-model
+comparison is intentionally skipped** (similarity across different embedding spaces is
+meaningless). The guard is wired ONLY into ingestion auto-extraction; the human
+`task-mgr learn` and `import_learnings` paths are deliberately untouched.
+
+**Asymmetric-risk bias — uncertainty RECORDS, never skips.** A false positive (dropping
+a real, distinct learning) is unrecoverable at write time (no LLM second opinion),
+whereas a leaked dupe is cheap (`curate dedup` catches it). So every uncertain outcome
+— checker absent, embed failure, empty text (`NearDupOutcome::Unavailable`) — falls
+through to record. The checker never bypasses the `LearningWriter` chokepoint:
+embeddings are still scheduled via `flush()`, not stored inline.
+
 ## Learning Supersession
 
 When a newer learning replaces an older one, the link is tracked in the

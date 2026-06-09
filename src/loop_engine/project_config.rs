@@ -2159,12 +2159,13 @@ mod tests {
 
     #[test]
     fn test_validate_rejects_conflicting_overlapping_by_id_prefix_routes() {
+        use crate::loop_engine::model::OPUS_MODEL;
         let mut by_id_prefix = HashMap::new();
         by_id_prefix.insert(
             "MILESTONE".to_string(),
             RunnerSpec {
                 provider: "claude".to_string(),
-                model: "claude-opus-4-8".to_string(),
+                model: OPUS_MODEL.to_string(),
                 ..Default::default()
             },
         );
@@ -2197,9 +2198,10 @@ mod tests {
 
     #[test]
     fn test_validate_allows_same_spec_overlapping_by_id_prefix_routes() {
+        use crate::loop_engine::model::OPUS_MODEL;
         let same_spec = RunnerSpec {
             provider: "claude".to_string(),
-            model: "claude-opus-4-8".to_string(),
+            model: OPUS_MODEL.to_string(),
             ..Default::default()
         };
         let mut by_id_prefix = HashMap::new();
