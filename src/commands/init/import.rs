@@ -193,6 +193,17 @@ pub fn insert_prd_metadata(
     prd: &PrdFile,
     raw_json: Option<&str>,
 ) -> TaskMgrResult<i64> {
+    // FR-002 hard break: a PRD-level `default_model` is still stored and
+    // exported verbatim (this INSERT keeps the column), but model resolution
+    // ignores it under the provider-first `models`/`routing` config. Warn once
+    // per import (loop init / batch init / loop-run re-import) so the operator
+    // isn't surprised when the value has no effect.
+    if prd.model.is_some() {
+        crate::output::warn(
+            "PRD `default_model` is ignored under the models config; use models.anchor / \
+             routing instead",
+        );
+    }
     let priority_philosophy = prd
         .priority_philosophy
         .as_ref()

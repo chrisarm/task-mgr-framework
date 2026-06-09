@@ -33,6 +33,7 @@
 use rusqlite::Connection;
 use tempfile::TempDir;
 
+use task_mgr::commands::models::{SetDefaultOpts, handle_set_default};
 use task_mgr::db::{create_schema, open_connection, run_migrations};
 use task_mgr::loop_engine::engine::IterationContext;
 use task_mgr::loop_engine::model::{
@@ -40,8 +41,8 @@ use task_mgr::loop_engine::model::{
     SONNET_MODEL, anchored_tier, provider_for_model, resolve_models_config,
 };
 use task_mgr::loop_engine::project_config::{
-    ModelsConfig, RoutingConfig, detect_legacy_model_keys, read_project_config,
-    validate_models_config,
+    ModelsConfig, RoutingConfig, detect_legacy_model_keys, preflight_validate_and_probe,
+    read_project_config, validate_models_config,
 };
 use task_mgr::loop_engine::reactions::pre_spawn::invalidate_stale_overrides;
 use task_mgr::loop_engine::runner::RunnerKind;
@@ -463,7 +464,6 @@ fn edge_case_2_codex_effort_flag_precedes_exec_and_caps_at_high() {
 ///
 /// FEAT-002 wiring: assert the loop/batch preflight returns Err naming each
 /// legacy key, and that `models` mutating verbs hard-error the same way.
-#[ignore = "un-ignored by FEAT-002: loop/batch entry + models mutating verbs must HARD-ERROR naming each legacy key; non-loop read paths warn once and proceed"]
 #[test]
 fn edge_case_3_legacy_keys_hard_error_at_loop_warn_on_nonloop() {
     let dir = TempDir::new().unwrap();
@@ -490,8 +490,46 @@ fn edge_case_3_legacy_keys_hard_error_at_loop_warn_on_nonloop() {
     std::fs::write(dir.path().join("config.json"), legacy.to_string()).unwrap();
     let _cfg = read_project_config(dir.path());
 
-    // <FEAT-002: assert the loop/batch preflight returns Err naming each legacy
-    //  key here, and that `models` mutating verbs hard-error the same way.>
+    // Loop/batch entry: preflight HARD-ERRORS naming every present legacy key
+    // and pointing at the migration command.
+    let err = preflight_validate_and_probe(dir.path(), &_cfg)
+        .expect_err("loop/batch preflight must reject a legacy-key config");
+    let msg = format!("{err}");
+    for key in [
+        "defaultModel",
+        "reviewModel",
+        "primaryRunner",
+        "fallbackRunner",
+    ] {
+        assert!(msg.contains(key), "preflight error must name {key}: {msg}");
+    }
+    assert!(
+        msg.contains("models init --force-replace-legacy"),
+        "preflight error must point at the migration command: {msg}"
+    );
+
+    // `models` mutating verbs hard-error the same way (interim guard until
+    // FEAT-009 replaces them).
+    let verb_err = handle_set_default(
+        dir.path(),
+        SetDefaultOpts {
+            model: Some(OPUS_MODEL.to_string()),
+            project: true,
+        },
+    )
+    .expect_err("models mutating verb must refuse a legacy-key config");
+    let verb_msg = format!("{verb_err}");
+    for key in [
+        "defaultModel",
+        "reviewModel",
+        "primaryRunner",
+        "fallbackRunner",
+    ] {
+        assert!(
+            verb_msg.contains(key),
+            "mutating-verb error must name {key}: {verb_msg}"
+        );
+    }
 }
 
 /// AC #6 (owner FEAT-008) — known-bad discriminator: the quota-blackout reroute

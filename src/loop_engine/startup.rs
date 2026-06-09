@@ -489,6 +489,15 @@ pub(crate) fn initialize_loop(
     let task_count = prd_metadata.task_count;
     let task_prefix = prd_metadata.task_prefix;
     let default_model = prd_metadata.default_model;
+    // FR-002 hard break: a PRD-level `default_model` is parsed/stored/exported
+    // verbatim but is ignored by model resolution under the provider-first
+    // `models`/`routing` config. Warn once at loop run so the operator knows.
+    if default_model.is_some() {
+        crate::output::warn(
+            "PRD metadata `default_model` is ignored under the models config; use \
+             models.anchor / routing instead",
+        );
+    }
     // Config-level defaults: fall below PRD default in the resolution chain.
     // The loop engine never prompts — it runs non-interactively — so these
     // are pure reads. Users pin a default via `task-mgr init` or

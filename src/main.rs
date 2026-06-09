@@ -1127,7 +1127,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                             preflight_validate_and_probe, read_project_config,
                         };
                         let proj_cfg = read_project_config(&cli.dir);
-                        preflight_validate_and_probe(&proj_cfg)?;
+                        preflight_validate_and_probe(&cli.dir, &proj_cfg)?;
                     }
 
                     let run_config = task_mgr::loop_engine::engine::LoopRunConfig {

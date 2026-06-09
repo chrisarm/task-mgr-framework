@@ -83,7 +83,7 @@
       "model": "claude-opus-4-8",
       "modifiesBehavior": false,
       "notes": "KEYSTONE TASK (FR-011 generator rule): highest transitive fan-out — every FEAT/REFACTOR in this PRD consumes these signatures; stamped estimatedEffort=high so the loop escalates the model. Strictly pure: no filesystem, no PATH probes inside the validator. Learning 4959: prefix/ID matching uses dash-boundary token matching, never substring. Learning 4729: no_hardcoded_models keeps literals in model.rs only. Data contract: cfg.providers is HashMap<String, ProviderConfig> (lowercase provider-name keys); p.tiers is HashMap<String, Option<String>> (kebab-case tier keys → model id). Modularity rule (PRD §2.6): anchor/tier derivation lives in exactly ONE function shared by spawn site and every recovery path.",
-      "passes": false,
+      "passes": true,
       "priority": 1,
       "qualityDimensions": [
         "Strict parse for all config enums — typos are CONFIG ERRORs naming the accepted set, never silent fall-throughs",
@@ -143,7 +143,7 @@
       "model": "claude-opus-4-8",
       "modifiesBehavior": false,
       "notes": "TDD: pin the contract before downstream FEATs build on it. Use production-shaped fixtures (the FR-001 JSON block verbatim from the PRD), NEVER hand-built maps — wrong key format (snake_case vs kebab-case tier keys) silently passes otherwise. Data contract: JSON tier keys are kebab-case strings ('cost-efficient'); CapabilityTier::as_str() must emit exactly that.",
-      "passes": false,
+      "passes": true,
       "priority": 2,
       "qualityDimensions": [
         "Tests are specific enough to reject wrong implementations (known-bad discriminator present)",
@@ -203,7 +203,7 @@
       "model": "claude-opus-4-8",
       "modifiesBehavior": false,
       "notes": "Learning 3019/3736/3065: check_override_invalidation (engine.rs) snapshots tasks.model vs ctx.overflow_original_task_model — the NEW NULL-original semantics (anchor-resolved tasks recorded NULL) is exactly what these tests pin. Learning 3927: handle_no_eligible_tasks (wave path) historically went straight to the stale tracker on empty selection — the documented false-abort bug class this PRD's deferral-first branch fixes. Learning 4921/4672: promote_once owns the single runner_overrides idempotency guard; blackout channel must never read/write it. Use production-shaped fixtures (render via tests/common/mod.rs::render_fixture_tmpl where model placeholders are needed).",
-      "passes": false,
+      "passes": true,
       "priority": 3,
       "qualityDimensions": [
         "Each #[ignore] names the FEAT that un-ignores it — no orphaned skeletons",

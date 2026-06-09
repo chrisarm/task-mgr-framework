@@ -72,7 +72,7 @@ pub struct RunnerSpec {
     /// the task never returns to Codex. Default: `false` (legacy auto-block).
     /// Ignored on non-codex routes — Claude/Grok runners already have their
     /// own cross-provider promotion paths (`fallbackRunner` / `claudeFallbackModel`).
-    #[serde(default, alias = "fallbackToClaude")]
+    #[serde(default)]
     pub runtime_error_fallback: bool,
 }
 
@@ -111,7 +111,7 @@ pub struct PrimaryRunnerConfig {
     /// model is known from difficulty/default resolution and normalized into
     /// a provider-neutral tier. Tier keys are validated by
     /// `model::parse_baseline_tier_key`.
-    #[serde(default, alias = "byBaselineTier")]
+    #[serde(default)]
     pub baseline_tier_routes: HashMap<String, HashMap<String, RunnerSpec>>,
 }
 
@@ -399,6 +399,34 @@ pub fn detect_legacy_model_keys(config: &serde_json::Value) -> Vec<&'static str>
             .collect(),
         None => Vec::new(),
     }
+}
+
+/// The minimal FR-001 `models`/`routing` skeleton printed alongside a
+/// legacy-key rejection so the operator sees the replacement shape inline.
+const FR_001_SCHEMA_SKELETON: &str = r#"{
+  "models": {
+    "primaryProvider": "claude",
+    "anchor": "standard",
+    "providers": { "claude": { "enabled": true } }
+  },
+  "routing": {}
+}"#;
+
+/// Build the hard-break rejection message for a set of present legacy keys.
+///
+/// Names each offending key, prints the FR-001 replacement skeleton, and points
+/// at the migration command. Shared by the loop/batch preflight
+/// ([`preflight_validate_and_probe`]) and the interim `models` mutating-verb
+/// guard so every entry point speaks with one voice (FR-002 coverage table).
+pub fn legacy_model_keys_message(keys: &[&str]) -> String {
+    format!(
+        "legacy model-config key(s) [{keys}] are no longer supported and must be removed — the \
+         provider-first `models`/`routing` config replaces all of \
+         defaultModel/reviewModel/primaryRunner/fallbackRunner:\n{skeleton}\n\
+         Run `task-mgr models init --force-replace-legacy` to migrate.",
+        keys = keys.join(", "),
+        skeleton = FR_001_SCHEMA_SKELETON,
+    )
 }
 
 /// Pure schema + semantic validation of a (merged) `models` + `routing` block.
@@ -769,8 +797,31 @@ pub struct ProjectConfig {
     /// Primary runner routing configuration. Absent key → `None`; explicit
     /// `null` → `None`; explicit object → `Some` (with per-field defaults
     /// applied for any omitted optional fields). Default: `None`.
+    ///
+    /// LEGACY (FR-002 hard break): `default_model` / `review_model` /
+    /// `fallback_runner` / `primary_runner` are no longer honored by model
+    /// resolution. They still deserialize so the OLD resolution chain
+    /// (`resolve_task_execution_target` & friends) compiles until REFACTOR-005
+    /// removes both the chain and these four fields in one diff. A config that
+    /// actually SETS any of these keys hard-errors at the loop/batch preflight
+    /// and warns on non-loop reads — see [`detect_legacy_model_keys`] /
+    /// [`preflight_validate_and_probe`] / [`read_project_config`].
     #[serde(default)]
     pub primary_runner: Option<PrimaryRunnerConfig>,
+
+    /// Provider-first model config (FR-001): the SOLE model-routing surface
+    /// going forward. NOT serde-derived — a sparse user override deep-merges
+    /// onto [`ModelsConfig::builtin_default`] (see [`merge_models_config`]), so
+    /// [`read_project_config`] populates this field explicitly. A config with no
+    /// `models` key gets the built-in default (Claude enabled across the ladder).
+    #[serde(skip)]
+    pub models: ModelsConfig,
+
+    /// Routing policy (FR-001): role-split / spillover layered over the anchor
+    /// window. Like `models`, populated explicitly by [`read_project_config`]
+    /// (NOT serde-derived) so absent → the empty default.
+    #[serde(skip)]
+    pub routing: RoutingConfig,
 }
 
 impl Default for ProjectConfig {
@@ -796,6 +847,8 @@ impl Default for ProjectConfig {
             fallback_runner: None,
             review_model: None,
             primary_runner: None,
+            models: ModelsConfig::builtin_default(),
+            routing: RoutingConfig::default(),
         }
     }
 }
@@ -1214,22 +1267,30 @@ pub fn check_review_model_binary(
     })
 }
 
-/// Startup pre-flight: validate the project config, then probe every runner
-/// binary the config will need, BEFORE the first iteration.
+/// Startup pre-flight (FR-002 hard break): reject any legacy model-config keys,
+/// then validate the provider-first `models`/`routing` block and probe every
+/// ENABLED provider's CLI binary, BEFORE the first iteration.
 ///
 /// This is the single source of truth for "is this project safe to run?" and
 /// MUST be called from every loop entry point — both `loop run` (single PRD)
 /// and `batch run` (N PRDs). Hoisting it here closes the parity gap where a
-/// misconfigured provider string or a missing `codex`/`grok` binary would
-/// surface only on `loop run`, but run unvalidated under `batch run`.
+/// misconfigured config would surface only on `loop run`, but run unvalidated
+/// under `batch run`.
 ///
-/// Ordering matches `loop run`'s historical block: validation runs BEFORE the
-/// binary probes so an operator who mis-typed a provider string sees the
-/// structured config error, not a misleading "binary missing" message from a
-/// downstream probe that wouldn't have fired anyway.
-///
-/// Codex binary probe is route-gated by `check_codex_runner_binary`: a
-/// pure-Claude / pure-Grok project triggers no PATH lookup for `codex`.
+/// Order (load-bearing):
+/// 1. **Legacy-key hard error.** A config that still carries any of
+///    `defaultModel`/`reviewModel`/`primaryRunner`/`fallbackRunner` is rejected
+///    up front, naming each present key + printing the FR-001 skeleton +
+///    pointing at `models init --force-replace-legacy`. Reads the raw JSON
+///    (not the parsed struct) so it can name the exact keys present.
+/// 2. **User-config `defaultModel` deprecation warning** (non-fatal): emitted at
+///    the loop/batch preflight ONLY, never on every non-loop read.
+/// 3. **Pure validation** (`validate_models_config`): every config error in one
+///    pass — no I/O. An operator who mis-typed a provider/tier sees the
+///    structured config error, not a misleading "binary missing" message.
+/// 4. **Enabled-only binary probes** (`probe_enabled_provider_binaries`):
+///    separate from validation; a pure-Claude config triggers no `grok`/`codex`
+///    PATH lookup because disabled providers are skipped.
 ///
 /// Failure semantics for `batch run`: a failure here aborts the WHOLE batch
 /// before any PRD runs. Config validity and binary availability are
@@ -1237,217 +1298,114 @@ pub fn check_review_model_binary(
 /// and `$PATH`), so a failure affects every PRD equally — failing fast up-front
 /// mirrors `loop run`'s fail-before-iteration-1 contract and avoids burning N
 /// partial runs on a uniformly-broken environment.
-pub fn preflight_validate_and_probe(cfg: &ProjectConfig) -> TaskMgrResult<()> {
-    validate_runner_routing_config(cfg)?;
-    check_fallback_runner_binary(cfg.fallback_runner.as_ref())?;
-    check_review_model_binary(
-        cfg.review_model.as_deref(),
-        cfg.fallback_runner
-            .as_ref()
-            .and_then(|fr| fr.cli_binary.as_deref()),
-    )?;
-    check_codex_runner_binary(cfg.primary_runner.as_ref())?;
+pub fn preflight_validate_and_probe(db_dir: &Path, cfg: &ProjectConfig) -> TaskMgrResult<()> {
+    // 1. Hard break: legacy keys are fatal at the loop/batch entry.
+    reject_legacy_model_config(db_dir)?;
+
+    // 2. Deprecated user-level defaultModel: warn (not fatal) here only.
+    if crate::loop_engine::user_config::read_user_config()
+        .default_model
+        .is_some()
+    {
+        crate::output::warn(
+            "user config `defaultModel` is ignored under the models config; use \
+             models.anchor / routing instead",
+        );
+    }
+
+    // 3. Pure validation, then 4. enabled-only probes — distinct steps.
+    validate_models_config(&cfg.models, &cfg.routing).map_err(|errors| {
+        TaskMgrError::InvalidConfig {
+            field: "models".to_string(),
+            message: errors.join("; "),
+        }
+    })?;
+    let resolved = crate::loop_engine::model::resolve_models_config(&cfg.models, &cfg.routing);
+    probe_enabled_provider_binaries(&resolved)?;
     Ok(())
+}
+
+/// Hard-error when `<db_dir>/config.json` still carries any legacy model-config
+/// key. Reads the RAW JSON so the error can name each present key exactly.
+/// A missing or malformed config file is not this function's concern — it is
+/// handled (warned, not fatal) by [`read_project_config`].
+fn reject_legacy_model_config(db_dir: &Path) -> TaskMgrResult<()> {
+    let path = db_dir.join("config.json");
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return Ok(());
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&contents) else {
+        return Ok(());
+    };
+    let legacy = detect_legacy_model_keys(&value);
+    if legacy.is_empty() {
+        return Ok(());
+    }
+    Err(TaskMgrError::InvalidConfig {
+        field: "models".to_string(),
+        message: legacy_model_keys_message(&legacy),
+    })
 }
 
 /// Read project config from `<db_dir>/config.json`.
 ///
-/// Returns default (empty) config if the file doesn't exist.
-/// Warns on invalid JSON but does not fail — returns defaults instead.
+/// Returns the default config if the file doesn't exist. Warns (never fails) on
+/// invalid JSON, returning defaults instead — non-loop commands (`recall`,
+/// `curate`, `next`, `models show`, …) must keep working on a broken config.
+///
+/// FR-002 hard break: legacy model-config keys are no longer honored. When any
+/// are present this emits ONE stderr warning and proceeds with DEFAULT model
+/// routing — the loop/batch preflight is the only place those keys hard-error
+/// (see [`preflight_validate_and_probe`]). The provider-first `models`/`routing`
+/// surfaces are populated explicitly (a sparse `models` override deep-merges
+/// onto the built-in default; plain serde would replace the whole ladder).
 pub fn read_project_config(db_dir: &Path) -> ProjectConfig {
     let path = db_dir.join("config.json");
-    match std::fs::read_to_string(&path) {
-        Ok(contents) => {
-            let mut value: serde_json::Value = match serde_json::from_str(&contents) {
-                Ok(value) => value,
-                Err(e) => {
-                    crate::output::warn(&format!("Invalid .task-mgr/config.json: {e}"));
-                    return ProjectConfig::default();
-                }
-            };
-            // Normalize legacy routing keys in place, then deserialize from the
-            // SAME migrated value we just normalized. Deserializing the original
-            // would rely on serde aliases covering every rewrite — a silent
-            // wrong-value risk the moment a future legacy->canonical rename lands
-            // in migrate_project_config_value without a matching alias.
-            if migrate_project_config_value(&mut value) {
-                crate::output::warn(
-                    ".task-mgr/config.json uses legacy model routing keys; run `task-mgr init` \
-                     to update it to baselineTierRoutes/runtimeErrorFallback",
-                );
-            }
-            serde_json::from_value(value).unwrap_or_else(|e| {
-                crate::output::warn(&format!("Invalid .task-mgr/config.json: {e}"));
-                ProjectConfig::default()
-            })
-        }
-        Err(_) => ProjectConfig::default(),
-    }
-}
-
-/// Rewrite `<db_dir>/config.json` from legacy routing keys to the current
-/// canonical shape. Returns `true` when the file was changed.
-pub fn update_project_config_format(db_dir: &Path) -> std::io::Result<bool> {
-    use std::io::Write;
-
-    let path = db_dir.join("config.json");
-    let contents = match std::fs::read_to_string(&path) {
-        Ok(contents) if !contents.trim().is_empty() => contents,
-        _ => return Ok(false),
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return ProjectConfig::default();
     };
-    let mut value: serde_json::Value = serde_json::from_str(&contents).map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("{}: malformed JSON: {e}", path.display()),
-        )
-    })?;
-    if !value.is_object() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("{}: config is not a JSON object", path.display()),
+    let value: serde_json::Value = match serde_json::from_str(&contents) {
+        Ok(value) => value,
+        Err(e) => {
+            crate::output::warn(&format!("Invalid .task-mgr/config.json: {e}"));
+            return ProjectConfig::default();
+        }
+    };
+    // Non-loop read path: legacy keys warn ONCE and proceed (never fatal).
+    let legacy = detect_legacy_model_keys(&value);
+    if !legacy.is_empty() {
+        crate::output::warn(&format!(
+            ".task-mgr/config.json carries legacy model key(s) [{}] which are ignored under the \
+             provider-first `models`/`routing` config; run `task-mgr models init \
+             --force-replace-legacy` to migrate.",
+            legacy.join(", ")
         ));
     }
-    if !migrate_project_config_value(&mut value) {
-        return Ok(false);
-    }
-
-    let contents = serde_json::to_string_pretty(&value)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    let dir = path.parent().unwrap_or(db_dir);
-    let mut tmp = tempfile::Builder::new()
-        .prefix(".config-")
-        .suffix(".json")
-        .tempfile_in(dir)?;
-    tmp.write_all(contents.as_bytes())?;
-    tmp.write_all(b"\n")?;
-    // The tempfile is created 0o600; persist preserves that, which would narrow
-    // an originally group/world-readable config. Re-apply the original file's
-    // mode before persisting so the migration is permission-neutral.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(orig) = std::fs::metadata(&path) {
-            tmp.as_file()
-                .set_permissions(std::fs::Permissions::from_mode(orig.permissions().mode()))?;
+    // Deserialize the non-model surfaces. The legacy fields still parse (they
+    // remain on the struct until REFACTOR-005) but never feed resolution; the
+    // `models`/`routing` fields are `#[serde(skip)]` and set below.
+    let mut cfg: ProjectConfig = match serde_json::from_value(value.clone()) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            crate::output::warn(&format!("Invalid .task-mgr/config.json: {e}"));
+            return ProjectConfig::default();
         }
-    }
-    tmp.persist(&path).map_err(|e| e.error)?;
-    Ok(true)
-}
-
-fn migrate_project_config_value(value: &mut serde_json::Value) -> bool {
-    let Some(root) = value.as_object_mut() else {
-        return false;
     };
-    let Some(primary) = root
-        .get_mut("primaryRunner")
-        .and_then(serde_json::Value::as_object_mut)
-    else {
-        return false;
-    };
-
-    let mut changed = false;
-    changed |= migrate_runner_spec_map(primary.get_mut("byTaskType"));
-    changed |= migrate_runner_spec_map(primary.get_mut("byIdPrefix"));
-
-    if let Some(legacy) = primary.remove("byBaselineTier") {
-        changed = true;
-        merge_baseline_tier_routes(primary, legacy);
-    }
-    changed |= migrate_baseline_tier_routes(primary.get_mut("baselineTierRoutes"));
-    changed
-}
-
-/// Fold a legacy `byBaselineTier` map into the canonical `baselineTierRoutes`.
-/// On collision (same prefix + same canonical tier key) the existing canonical
-/// entry wins — legacy values only fill gaps (`entry().or_insert`), never
-/// overwrite a route the operator already expressed in the canonical form.
-fn merge_baseline_tier_routes(
-    primary: &mut serde_json::Map<String, serde_json::Value>,
-    legacy: serde_json::Value,
-) {
-    let canonical = primary
-        .entry("baselineTierRoutes".to_string())
-        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-    let Some(canonical_obj) = canonical.as_object_mut() else {
-        return;
-    };
-    let serde_json::Value::Object(legacy_prefixes) = legacy else {
-        return;
-    };
-    for (prefix, legacy_tiers) in legacy_prefixes {
-        let target = canonical_obj
-            .entry(prefix)
-            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-        let Some(target_tiers) = target.as_object_mut() else {
-            continue;
-        };
-        let serde_json::Value::Object(legacy_tiers) = legacy_tiers else {
-            continue;
-        };
-        for (tier, spec) in legacy_tiers {
-            target_tiers
-                .entry(canonical_baseline_tier_key(&tier).to_string())
-                .or_insert(spec);
+    cfg.models = match merge_models_config(value.get("models")) {
+        Ok(models) => models,
+        Err(e) => {
+            crate::output::warn(&format!("Invalid `models` config: {e}; using defaults"));
+            ModelsConfig::builtin_default()
         }
-    }
-}
-
-fn migrate_baseline_tier_routes(value: Option<&mut serde_json::Value>) -> bool {
-    let Some(prefixes) = value.and_then(serde_json::Value::as_object_mut) else {
-        return false;
     };
-    let mut changed = false;
-    for tiers in prefixes.values_mut() {
-        let Some(tiers) = tiers.as_object_mut() else {
-            continue;
-        };
-        let old = std::mem::take(tiers);
-        for (tier, mut spec) in old {
-            let canonical = canonical_baseline_tier_key(&tier).to_string();
-            if canonical != tier {
-                changed = true;
-            }
-            changed |= migrate_runner_spec(&mut spec);
-            tiers.entry(canonical).or_insert(spec);
-        }
-    }
-    changed
-}
-
-fn migrate_runner_spec_map(value: Option<&mut serde_json::Value>) -> bool {
-    let Some(map) = value.and_then(serde_json::Value::as_object_mut) else {
-        return false;
+    cfg.routing = match value.get("routing") {
+        Some(routing) => serde_json::from_value(routing.clone()).unwrap_or_else(|e| {
+            crate::output::warn(&format!("Invalid `routing` config: {e}; using defaults"));
+            RoutingConfig::default()
+        }),
+        None => RoutingConfig::default(),
     };
-    // migrate_runner_spec mutates each spec; run it on EVERY entry (no `.any()`
-    // short-circuit, which would stop migrating after the first hit).
-    #[allow(clippy::unnecessary_fold)]
-    map.values_mut()
-        .fold(false, |changed, spec| migrate_runner_spec(spec) || changed)
-}
-
-fn migrate_runner_spec(spec: &mut serde_json::Value) -> bool {
-    let Some(obj) = spec.as_object_mut() else {
-        return false;
-    };
-    let Some(legacy) = obj.remove("fallbackToClaude") else {
-        return false;
-    };
-    obj.entry("runtimeErrorFallback".to_string())
-        .or_insert(legacy);
-    true
-}
-
-fn canonical_baseline_tier_key(key: &str) -> &str {
-    match key.trim().to_ascii_lowercase().as_str() {
-        "haiku" => "low",
-        "sonnet" => "standard",
-        "opus" => "high",
-        "low" => "low",
-        "standard" => "standard",
-        "high" => "high",
-        _ => key,
-    }
+    cfg
 }
 
 /// Set (or clear) the `defaultModel` field in `<db_dir>/config.json` without
@@ -1514,6 +1472,7 @@ pub fn write_fallback_runner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::loop_engine::test_utils::{CLAUDE_BINARY_MUTEX, EnvGuard};
     use std::fs;
 
     /// Serializes tests that mutate the process-global `CODEX_BINARY` env var
@@ -2198,36 +2157,6 @@ mod tests {
     }
 
     #[test]
-    fn test_primary_runner_accepts_legacy_baseline_tier_routes_alias() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(
-            dir.path().join("config.json"),
-            r#"{
-                "primaryRunner": {
-                    "byBaselineTier": {
-                        "FEAT": {
-                            "opus": { "provider": "codex", "fallbackToClaude": true },
-                            "sonnet": { "provider": "grok", "model": "grok-build" }
-                        }
-                    }
-                }
-            }"#,
-        )
-        .unwrap();
-        let config = read_project_config(dir.path());
-        let pr = config.primary_runner.expect("primaryRunner present");
-        let feat_tiers = pr
-            .baseline_tier_routes
-            .get("FEAT")
-            .expect("FEAT key missing");
-        // read_project_config runs the on-disk migrator as its read normalizer
-        // (FIX-002), so legacy tier-key spellings are canonicalized in memory:
-        // opus -> high, sonnet -> standard. The legacy keys no longer survive.
-        assert!(feat_tiers["high"].runtime_error_fallback);
-        assert_eq!(feat_tiers["standard"].model, "grok-build");
-    }
-
-    #[test]
     fn test_primary_runner_partial_uses_defaults() {
         // Partial object: only byTaskType set → claudeFallbackModel is None,
         // runtimeErrorThreshold is 2, byIdPrefix is empty.
@@ -2279,31 +2208,6 @@ mod tests {
     #[test]
     fn test_primary_runner_default_impl_is_none() {
         assert!(ProjectConfig::default().primary_runner.is_none());
-    }
-
-    // ---- preflight_validate_and_probe tests (FEAT-004) ----
-
-    fn primary_with_one_task_route(
-        task_key: &str,
-        provider: &str,
-        model: &str,
-    ) -> PrimaryRunnerConfig {
-        let mut by_task_type = HashMap::new();
-        by_task_type.insert(
-            task_key.to_string(),
-            RunnerSpec {
-                provider: provider.to_string(),
-                model: model.to_string(),
-                ..Default::default()
-            },
-        );
-        PrimaryRunnerConfig {
-            claude_fallback_model: None,
-            runtime_error_threshold: 2,
-            by_task_type,
-            by_id_prefix: HashMap::new(),
-            ..Default::default()
-        }
     }
 
     // ---- RunnerSpec.runtime_error_fallback serde tests (FEAT-005) ----
@@ -2365,59 +2269,6 @@ mod tests {
     }
 
     #[test]
-    fn test_runner_spec_runtime_error_fallback_accepts_legacy_alias() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(
-            dir.path().join("config.json"),
-            r#"{
-                "primaryRunner": {
-                    "byIdPrefix": {
-                        "SPIKE-": { "provider": "codex", "fallbackToClaude": true }
-                    }
-                }
-            }"#,
-        )
-        .unwrap();
-        let cfg = read_project_config(dir.path());
-        let spec = cfg
-            .primary_runner
-            .expect("primaryRunner present")
-            .by_id_prefix
-            .remove("SPIKE-")
-            .expect("SPIKE- key present");
-        assert!(
-            spec.runtime_error_fallback,
-            "legacy fallbackToClaude alias must deserialize to runtimeErrorFallback"
-        );
-    }
-
-    #[test]
-    fn test_migrate_runner_spec_map_migrates_every_legacy_spec() {
-        // Guards the `unnecessary_fold` allow at migrate_runner_spec_map: the
-        // fold must call migrate_runner_spec on EVERY entry. A `.any()`
-        // short-circuit would stop after the first spec returning true, leaving
-        // the second `fallbackToClaude` un-rewritten. Two legacy specs prove it.
-        let mut map = serde_json::json!({
-            "FEAT-": { "provider": "codex", "fallbackToClaude": true },
-            "FIX-":  { "provider": "codex", "fallbackToClaude": true }
-        });
-        let changed = migrate_runner_spec_map(Some(&mut map));
-        assert!(changed, "migration must report a change");
-        for key in ["FEAT-", "FIX-"] {
-            let spec = &map[key];
-            assert!(
-                spec.get("fallbackToClaude").is_none(),
-                "{key}: legacy fallbackToClaude must be removed"
-            );
-            assert_eq!(
-                spec["runtimeErrorFallback"],
-                serde_json::json!(true),
-                "{key}: must be rewritten to runtimeErrorFallback"
-            );
-        }
-    }
-
-    #[test]
     fn test_runner_spec_runtime_error_fallback_snake_case_rejected() {
         // CONTRACT: the field name on the wire is camelCase (runtimeErrorFallback),
         // matching the rest of RunnerSpec's serde rename_all. snake_case must
@@ -2447,96 +2298,138 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_preflight_passes_pure_claude_config_without_codex_probe() {
-        // Acceptance: a pure-Claude config triggers no PATH lookup for codex.
-        // We verify by setting CODEX_BINARY to a path that DOES NOT exist —
-        // if preflight ever resolved the Codex binary on a pure-Claude config
-        // it would fail. The default config has neither a Codex primaryRunner
-        // route nor a fallbackRunner, so check_codex_runner_binary must
-        // short-circuit on `primary.is_none()` before any path probe runs.
-        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev = std::env::var_os("CODEX_BINARY");
-        let bogus = "/tmp/task-mgr-test-nonexistent-codex-binary-feat004";
-        unsafe { std::env::set_var("CODEX_BINARY", bogus) };
-        let result = preflight_validate_and_probe(&ProjectConfig::default());
-        match prev {
-            Some(v) => unsafe { std::env::set_var("CODEX_BINARY", v) },
-            None => unsafe { std::env::remove_var("CODEX_BINARY") },
+    // ---- preflight_validate_and_probe tests (FR-002 hard break) ----
+
+    /// Create an executable stub a binary probe will accept via `cliBinary`.
+    fn make_executable_stub(dir: &Path, name: &str) -> std::path::PathBuf {
+        let p = dir.join(name);
+        fs::write(&p, b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
         }
+        p
+    }
+
+    #[test]
+    fn test_preflight_hard_errors_on_legacy_keys_naming_each() {
+        // FR-002 / edgeCases[3]: the loop/batch entry must HARD-ERROR on a
+        // legacy-key config, naming every present key and pointing at the
+        // migration command. This is the loop-side half of the warn-vs-error
+        // split (read_project_config is the warn-and-proceed half).
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            serde_json::json!({
+                "defaultModel": OPUS_MODEL,
+                "reviewModel": SONNET_MODEL,
+                "primaryRunner": {},
+                "fallbackRunner": {}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let cfg = read_project_config(dir.path());
+        let err = preflight_validate_and_probe(dir.path(), &cfg)
+            .expect_err("legacy keys must hard-error at loop/batch preflight");
+        let msg = format!("{err}");
+        for key in [
+            "defaultModel",
+            "reviewModel",
+            "primaryRunner",
+            "fallbackRunner",
+        ] {
+            assert!(msg.contains(key), "preflight error must name {key}: {msg}");
+        }
+        assert!(
+            msg.contains("models init --force-replace-legacy"),
+            "error must point at the migration command: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_preflight_passes_clean_config_after_validation_and_probe() {
+        // A legacy-free config validates and probes the enabled provider's
+        // binary. Claude is enabled by default; point its cliBinary at a stub
+        // so the probe resolves deterministically. Hold the CLAUDE_BINARY mutex
+        // + clear the env var so a sibling test can't override the cliBinary.
+        let _guard = CLAUDE_BINARY_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _claude_env = EnvGuard::remove("CLAUDE_BINARY");
+        let dir = tempfile::tempdir().unwrap();
+        let stub = make_executable_stub(dir.path(), "claude-stub");
+        fs::write(
+            dir.path().join("config.json"),
+            serde_json::json!({
+                "models": { "providers": { "claude": { "cliBinary": stub.to_str().unwrap() } } }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let cfg = read_project_config(dir.path());
+        let result = preflight_validate_and_probe(dir.path(), &cfg);
         assert!(
             result.is_ok(),
-            "pure-Claude config must pass preflight with codex absent from PATH: {result:?}"
+            "clean config must pass validation + probe: {result:?}"
         );
     }
 
     #[test]
-    fn test_preflight_codex_route_missing_binary_returns_err() {
-        // Acceptance: Codex route + CODEX_BINARY pointing at a nonexistent
-        // path returns Err — exactly the failure batch_run must surface
-        // BEFORE expanding PRD files.
+    fn test_preflight_rejects_invalid_models_config_before_probe() {
+        // AC#7: validation runs (and fails) BEFORE any binary probe. A codex
+        // `xhigh` effort is a policy violation with no binary to probe — a
+        // probe-only preflight would wave it through.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            serde_json::json!({
+                "models": { "providers": { "codex": { "enabled": true, "effort": { "high": "xhigh" } } } }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let cfg = read_project_config(dir.path());
+        let err = preflight_validate_and_probe(dir.path(), &cfg)
+            .expect_err("invalid models config must be rejected by validation");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("xhigh"),
+            "validation error must name the offending value: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_preflight_errors_when_enabled_provider_binary_missing() {
+        // AC#7: probes fire only for ENABLED providers and surface a missing
+        // binary as Err. Claude (stub) passes; codex is enabled with a cliBinary
+        // pointing at a nonexistent path → probe Err naming codex.
+        let _guard = CLAUDE_BINARY_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev = std::env::var_os("CODEX_BINARY");
-        let bogus = "/tmp/task-mgr-test-nonexistent-codex-binary-feat004-route";
-        unsafe { std::env::set_var("CODEX_BINARY", bogus) };
-        let cfg = ProjectConfig {
-            primary_runner: Some(primary_with_one_task_route(
-                "spike", "codex", "", // codex provider permits blank model
-            )),
-            ..Default::default()
-        };
-        let result = preflight_validate_and_probe(&cfg);
-        match prev {
-            Some(v) => unsafe { std::env::set_var("CODEX_BINARY", v) },
-            None => unsafe { std::env::remove_var("CODEX_BINARY") },
-        }
-        let err = result.expect_err("missing codex binary must return Err");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("Codex") || msg.contains("codex"),
-            "error should mention codex: {msg}"
-        );
-    }
-
-    #[test]
-    fn test_preflight_runs_validation_not_just_probes() {
-        // Regression: preflight must run config VALIDATION, not only binary
-        // probes. The poison reviewModel⨯Codex combo has no binary to probe,
-        // so a probe-only preflight would wave it through — exactly the
-        // batch-run parity gap this helper closes.
-        let cfg = ProjectConfig {
-            review_model: Some("grok-build".to_string()),
-            primary_runner: Some(primary_with_one_task_route("review", "codex", "")),
-            ..Default::default()
-        };
-        let err = preflight_validate_and_probe(&cfg).expect_err("preflight must reject");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("reviewModel"),
-            "preflight must reject via validation, naming reviewModel: {msg}"
-        );
-    }
-
-    #[test]
-    fn test_preflight_rejects_invalid_fallback_provider() {
-        // Acceptance failure-mode: fallbackRunner.provider != "grok" aborts
-        // preflight with the same structured error from validate_runner_routing_config.
-        let cfg = ProjectConfig {
-            fallback_runner: Some(FallbackRunnerConfig {
-                enabled: true,
-                provider: "codex".to_string(),
-                model: "gpt-5-codex".to_string(),
-                cli_binary: None,
-                runtime_error_threshold: 2,
-            }),
-            ..Default::default()
-        };
-        let err = preflight_validate_and_probe(&cfg).expect_err("invalid fallback provider");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("fallbackRunner.provider") || msg.contains("grok"),
-            "error must name fallbackRunner.provider: {msg}"
-        );
+        let _claude_env = EnvGuard::remove("CLAUDE_BINARY");
+        let _codex_env = EnvGuard::remove("CODEX_BINARY");
+        let dir = tempfile::tempdir().unwrap();
+        let stub = make_executable_stub(dir.path(), "claude-stub");
+        let missing = dir.path().join("nonexistent-codex-binary");
+        fs::write(
+            dir.path().join("config.json"),
+            serde_json::json!({
+                "models": { "providers": {
+                    "claude": { "cliBinary": stub.to_str().unwrap() },
+                    "codex": { "enabled": true, "cliBinary": missing.to_str().unwrap() }
+                } }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let cfg = read_project_config(dir.path());
+        let err = preflight_validate_and_probe(dir.path(), &cfg)
+            .expect_err("missing codex binary must return Err");
+        let msg = format!("{err}").to_ascii_lowercase();
+        assert!(msg.contains("codex"), "probe error must name codex: {msg}");
     }
 
     // ============ FEAT-006: strict provider parser + provider-only Codex ============
@@ -3157,404 +3050,6 @@ mod tests {
         assert!(
             !raw.contains("\"cliBinary\""),
             "None cli_binary should be omitted, not null"
-        );
-    }
-
-    // ============ TEST-INIT-002: config migration surface ============
-    // Covers (1) read-path serde-alias equivalence, (2) the on-disk
-    // `update_project_config_format` rewrite — key-preservation, idempotency,
-    // and malformed/non-object handling — and (3) merge-collision precedence.
-    //
-    // Learnings [4393]/[4396]/[4378]/[4561]: the on-disk migration MUST
-    // round-trip through `serde_json::Value` and mutate keys in place — NEVER
-    // reserialize a typed struct, which would silently drop unknown fields.
-    // Real config.json fixtures on disk (tempdir) are used so the atomic-write
-    // path (tempfile + persist) is actually exercised.
-
-    /// AC1: a legacy-key config (`byBaselineTier` + `fallbackToClaude`)
-    /// deserializes into a `ProjectConfig` structurally EQUAL to the same
-    /// config written with the canonical top-level keys (`baselineTierRoutes`
-    /// + `runtimeErrorFallback`).
-    ///
-    /// Post FIX-002 the mechanism making this hold is the in-memory MIGRATOR,
-    /// not the serde `alias` attributes: `read_project_config` runs
-    /// `migrate_project_config_value` as its read normalizer and deserializes
-    /// from the MIGRATED `Value`. The migrator both renames the legacy keys
-    /// AND canonicalizes the HashMap tier keys (`opus` -> `high`,
-    /// `sonnet` -> `standard`). Both inputs therefore normalize to the same
-    /// canonical tier keys in memory, so equality no longer depends on the two
-    /// fixtures spelling the tier keys identically — it is true canonical
-    /// equivalence (the sanity assertions below index the canonical `high` key).
-    #[test]
-    fn test_read_legacy_keys_equal_canonical_equivalent() {
-        let legacy_dir = tempfile::tempdir().unwrap();
-        fs::write(
-            legacy_dir.path().join("config.json"),
-            r#"{
-                "version": 1,
-                "additionalAllowedTools": ["Bash(docker:*)"],
-                "primaryRunner": {
-                    "byBaselineTier": {
-                        "FEAT": {
-                            "opus": { "provider": "codex", "fallbackToClaude": true },
-                            "sonnet": { "provider": "grok", "model": "grok-build" }
-                        }
-                    },
-                    "byIdPrefix": {
-                        "SPIKE-": { "provider": "codex", "fallbackToClaude": true }
-                    }
-                }
-            }"#,
-        )
-        .unwrap();
-
-        let canonical_dir = tempfile::tempdir().unwrap();
-        fs::write(
-            canonical_dir.path().join("config.json"),
-            r#"{
-                "version": 1,
-                "additionalAllowedTools": ["Bash(docker:*)"],
-                "primaryRunner": {
-                    "baselineTierRoutes": {
-                        "FEAT": {
-                            "opus": { "provider": "codex", "runtimeErrorFallback": true },
-                            "sonnet": { "provider": "grok", "model": "grok-build" }
-                        }
-                    },
-                    "byIdPrefix": {
-                        "SPIKE-": { "provider": "codex", "runtimeErrorFallback": true }
-                    }
-                }
-            }"#,
-        )
-        .unwrap();
-
-        let legacy = read_project_config(legacy_dir.path());
-        let canonical = read_project_config(canonical_dir.path());
-        assert_eq!(
-            legacy, canonical,
-            "legacy byBaselineTier/fallbackToClaude must deserialize identically to canonical keys"
-        );
-
-        // Sanity: the routes actually populated — guards against a vacuous
-        // pass where the alias silently dropped and both sides became empty
-        // (the index below would also panic in that case).
-        let pr = legacy.primary_runner.expect("primaryRunner present");
-        // The read normalizer (FIX-002) canonicalizes tier keys: opus -> high.
-        assert!(
-            pr.baseline_tier_routes["FEAT"]["high"].runtime_error_fallback,
-            "byBaselineTier→baseline_tier_routes alias must populate the tier route"
-        );
-        assert!(
-            pr.by_id_prefix["SPIKE-"].runtime_error_fallback,
-            "fallbackToClaude→runtime_error_fallback alias must populate the spec field"
-        );
-    }
-
-    /// AC2 + AC6 (known-bad discriminator): `update_project_config_format`
-    /// canonicalizes legacy routing keys AND preserves unrelated keys
-    /// value-for-value. The top-level `customField` and the in-spec
-    /// `customSpecField` (neither is a field on `ProjectConfig`/`RunnerSpec`)
-    /// are the discriminators: if the migration rebuilt the JSON from a typed
-    /// struct instead of mutating the `serde_json::Value` tree in place, both
-    /// unknown fields would silently vanish and these assertions would fail.
-    #[test]
-    fn test_update_format_canonicalizes_and_preserves_unrelated_keys() {
-        let dir = tempfile::tempdir().unwrap();
-        let input = r#"{
-            "version": 1,
-            "additionalAllowedTools": ["Bash(docker:*)"],
-            "embeddingModel": "custom-embed",
-            "customField": { "nested": [1, 2, 3] },
-            "primaryRunner": {
-                "byBaselineTier": {
-                    "FEAT": {
-                        "opus": { "provider": "codex", "fallbackToClaude": true }
-                    }
-                },
-                "byIdPrefix": {
-                    "SPIKE-": { "provider": "codex", "fallbackToClaude": true, "customSpecField": 42 }
-                }
-            }
-        }"#;
-        let original: serde_json::Value = serde_json::from_str(input).unwrap();
-        fs::write(dir.path().join("config.json"), input).unwrap();
-
-        let changed = update_project_config_format(dir.path()).unwrap();
-        assert!(changed, "legacy keys must trigger a rewrite");
-
-        let migrated: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(dir.path().join("config.json")).unwrap())
-                .unwrap();
-
-        // Legacy top-level container removed; canonical present.
-        let primary = &migrated["primaryRunner"];
-        assert!(
-            primary.get("byBaselineTier").is_none(),
-            "byBaselineTier must be removed after canonicalization"
-        );
-        // Tier key canonicalized opus -> high; spec field canonicalized.
-        let feat = &primary["baselineTierRoutes"]["FEAT"];
-        assert!(
-            feat.get("opus").is_none(),
-            "opus tier key must canonicalize to high"
-        );
-        assert_eq!(
-            feat["high"]["runtimeErrorFallback"],
-            serde_json::json!(true),
-            "fallbackToClaude must canonicalize to runtimeErrorFallback in the tier spec"
-        );
-        assert!(
-            feat["high"].get("fallbackToClaude").is_none(),
-            "legacy fallbackToClaude must be removed from the tier spec"
-        );
-        // byIdPrefix spec canonicalized; unknown spec field preserved.
-        let spike = &primary["byIdPrefix"]["SPIKE-"];
-        assert_eq!(spike["runtimeErrorFallback"], serde_json::json!(true));
-        assert!(spike.get("fallbackToClaude").is_none());
-        assert_eq!(
-            spike["customSpecField"],
-            serde_json::json!(42),
-            "KNOWN-BAD DISCRIMINATOR: unknown spec field must survive in-place Value mutation"
-        );
-
-        // Unrelated top-level keys survive value-for-value. `customField` is
-        // the load-bearing discriminator — a typed-struct rebuild would drop
-        // it because it is not a field on ProjectConfig.
-        for key in [
-            "version",
-            "additionalAllowedTools",
-            "embeddingModel",
-            "customField",
-        ] {
-            assert_eq!(
-                migrated[key], original[key],
-                "unrelated key {key} must survive the rewrite unchanged"
-            );
-        }
-    }
-
-    /// AC3: a second `update_project_config_format` run returns `Ok(false)` and
-    /// does not modify the file.
-    #[test]
-    fn test_update_format_is_idempotent() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(
-            dir.path().join("config.json"),
-            r#"{
-                "primaryRunner": {
-                    "byBaselineTier": {
-                        "FEAT": { "opus": { "provider": "codex", "fallbackToClaude": true } }
-                    }
-                }
-            }"#,
-        )
-        .unwrap();
-
-        let first = update_project_config_format(dir.path()).unwrap();
-        assert!(first, "first run must rewrite legacy keys");
-        let after_first = fs::read_to_string(dir.path().join("config.json")).unwrap();
-
-        let second = update_project_config_format(dir.path()).unwrap();
-        assert!(!second, "second run must be a no-op returning Ok(false)");
-        let after_second = fs::read_to_string(dir.path().join("config.json")).unwrap();
-
-        assert_eq!(
-            after_first, after_second,
-            "an idempotent run must leave the file byte-identical"
-        );
-    }
-
-    /// AC4: malformed JSON returns `Err` and leaves the file untouched.
-    #[test]
-    fn test_update_format_malformed_json_errors_and_preserves_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let original = "not json at all {{{";
-        fs::write(dir.path().join("config.json"), original).unwrap();
-
-        let err =
-            update_project_config_format(dir.path()).expect_err("malformed JSON must return Err");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("config.json") && msg.contains("malformed"),
-            "error must name the file and explain the failure: {msg}"
-        );
-
-        let after = fs::read_to_string(dir.path().join("config.json")).unwrap();
-        assert_eq!(after, original, "malformed file must be left untouched");
-    }
-
-    /// AC4: a syntactically-valid but non-object JSON document (e.g. an array)
-    /// returns `Err` and leaves the file untouched.
-    #[test]
-    fn test_update_format_non_object_json_errors_and_preserves_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let original = "[1, 2, 3]";
-        fs::write(dir.path().join("config.json"), original).unwrap();
-
-        let err =
-            update_project_config_format(dir.path()).expect_err("non-object JSON must return Err");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("not a JSON object"),
-            "error must explain the non-object shape: {msg}"
-        );
-
-        let after = fs::read_to_string(dir.path().join("config.json")).unwrap();
-        assert_eq!(after, original, "non-object file must be left untouched");
-    }
-
-    /// AC5: when BOTH `byBaselineTier` (legacy `opus`) and `baselineTierRoutes`
-    /// (canonical `high`) exist for the same prefix, the canonical route wins
-    /// and the legacy entry is dropped. `merge_baseline_tier_routes` uses
-    /// `.or_insert`, so a pre-existing canonical value is never overwritten.
-    #[test]
-    fn test_update_format_collision_canonical_wins() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(
-            dir.path().join("config.json"),
-            r#"{
-                "primaryRunner": {
-                    "byBaselineTier": {
-                        "FEAT": { "opus": { "provider": "grok", "model": "legacy-loser" } }
-                    },
-                    "baselineTierRoutes": {
-                        "FEAT": { "high": { "provider": "codex", "runtimeErrorFallback": true } }
-                    }
-                }
-            }"#,
-        )
-        .unwrap();
-
-        let changed = update_project_config_format(dir.path()).unwrap();
-        assert!(changed, "presence of byBaselineTier must trigger a rewrite");
-
-        let raw = fs::read_to_string(dir.path().join("config.json")).unwrap();
-        let migrated: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        let feat = &migrated["primaryRunner"]["baselineTierRoutes"]["FEAT"];
-
-        // Canonical `high` route preserved verbatim; legacy `opus` value dropped.
-        assert_eq!(
-            feat["high"]["provider"],
-            serde_json::json!("codex"),
-            "canonical high route must win the collision"
-        );
-        assert!(
-            feat.get("opus").is_none(),
-            "legacy opus key must be dropped, not retained alongside high"
-        );
-        assert!(
-            migrated["primaryRunner"].get("byBaselineTier").is_none(),
-            "legacy byBaselineTier container must be removed"
-        );
-        assert!(
-            !raw.contains("legacy-loser"),
-            "the dropped legacy spec value must not survive anywhere in the file"
-        );
-    }
-
-    /// AC2 migration round-trip: write legacy config → `update_project_config_format`
-    /// → `read_project_config` yields the same `ProjectConfig` as writing the
-    /// canonical config directly and reading it.
-    ///
-    /// Known-bad discriminator: if `read_project_config` relied ONLY on its own
-    /// in-memory migration (rather than consuming the already-migrated on-disk
-    /// form), both paths would pass even if `update_project_config_format` wrote
-    /// something subtly wrong — the in-memory normaliser would paper over it.
-    /// This test catches the case where the on-disk write and the in-memory read
-    /// disagree (a canonical read of the freshly-written file must equal a
-    /// direct read of the reference canonical form).
-    #[test]
-    fn test_migration_round_trip_legacy_update_read_equals_canonical() {
-        let legacy_dir = tempfile::tempdir().unwrap();
-        let canonical_dir = tempfile::tempdir().unwrap();
-
-        // Legacy form: byBaselineTier + fallbackToClaude + alias tier keys.
-        fs::write(
-            legacy_dir.path().join("config.json"),
-            r#"{
-                "version": 1,
-                "additionalAllowedTools": ["Bash(docker:*)"],
-                "primaryRunner": {
-                    "byBaselineTier": {
-                        "FEAT": {
-                            "opus": { "provider": "codex", "fallbackToClaude": true },
-                            "sonnet": { "provider": "grok", "model": "grok-build" }
-                        }
-                    },
-                    "byIdPrefix": {
-                        "SPIKE-": { "provider": "codex", "fallbackToClaude": true }
-                    }
-                }
-            }"#,
-        )
-        .unwrap();
-
-        // Canonical equivalent: baselineTierRoutes + runtimeErrorFallback + canonical tier keys.
-        fs::write(
-            canonical_dir.path().join("config.json"),
-            r#"{
-                "version": 1,
-                "additionalAllowedTools": ["Bash(docker:*)"],
-                "primaryRunner": {
-                    "baselineTierRoutes": {
-                        "FEAT": {
-                            "high": { "provider": "codex", "runtimeErrorFallback": true },
-                            "standard": { "provider": "grok", "model": "grok-build" }
-                        }
-                    },
-                    "byIdPrefix": {
-                        "SPIKE-": { "provider": "codex", "runtimeErrorFallback": true }
-                    }
-                }
-            }"#,
-        )
-        .unwrap();
-
-        // Step: rewrite legacy file to canonical shape on disk.
-        let changed = update_project_config_format(legacy_dir.path()).unwrap();
-        assert!(changed, "legacy keys must trigger a rewrite");
-
-        // Post-migration read must equal a clean read of the canonical form.
-        let after_migration = read_project_config(legacy_dir.path());
-        let direct_canonical = read_project_config(canonical_dir.path());
-        assert_eq!(
-            after_migration, direct_canonical,
-            "write legacy → update_project_config_format → read_project_config must yield \
-             the same ProjectConfig as writing the canonical config directly"
-        );
-    }
-
-    /// FIX-003: the rewrite must be permission-neutral. The atomic tempfile is
-    /// created 0o600; without re-applying the original mode, a group/world
-    /// readable config (0o644) would be silently narrowed by `persist`.
-    #[cfg(unix)]
-    #[test]
-    fn test_update_format_preserves_original_mode() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.json");
-        fs::write(
-            &path,
-            r#"{
-                "primaryRunner": {
-                    "byBaselineTier": {
-                        "FEAT": { "opus": { "provider": "codex" } }
-                    }
-                }
-            }"#,
-        )
-        .unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-
-        let changed = update_project_config_format(dir.path()).unwrap();
-        assert!(changed, "legacy key must trigger a rewrite");
-
-        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(
-            mode, 0o644,
-            "rewrite must preserve the original 0o644 mode, not narrow to the 0o600 tempfile default"
         );
     }
 

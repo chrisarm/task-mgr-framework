@@ -13,7 +13,8 @@ use crate::loop_engine::model::{
 };
 use crate::loop_engine::project_config::{
     FallbackRunnerConfig, check_fallback_runner_binary, check_review_model_binary,
-    read_project_config, write_default_model as write_project_default,
+    detect_legacy_model_keys, legacy_model_keys_message, read_project_config,
+    write_default_model as write_project_default,
     write_fallback_runner as write_project_fallback_runner,
     write_review_model as write_project_review_model,
 };
@@ -132,8 +133,36 @@ pub fn handle_list_to<W: io::Write>(
     Ok(())
 }
 
+/// FR-002 interim guard: the legacy `models` *setter* verbs (set-default,
+/// set-review-model, set-fallback) must refuse to write onto a
+/// `.task-mgr/config.json` that already carries any legacy model key — so an
+/// operator can't keep accreting legacy config the loop will reject. The
+/// migration path is `task-mgr models init --force-replace-legacy` (FEAT-009
+/// replaces these verbs wholesale). The `unset-*` verbs are deliberately NOT
+/// guarded: removing a legacy key is the de-escalation/cleanup direction and
+/// must stay functional. A missing/malformed config is not legacy — the verb
+/// proceeds (read/write paths handle malformed JSON on their own).
+fn reject_legacy_project_config(db_dir: &Path) -> io::Result<()> {
+    let path = db_dir.join("config.json");
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return Ok(());
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&contents) else {
+        return Ok(());
+    };
+    let legacy = detect_legacy_model_keys(&value);
+    if legacy.is_empty() {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        legacy_model_keys_message(&legacy),
+    ))
+}
+
 /// `task-mgr models set-default` entry point.
 pub fn handle_set_default(db_dir: &Path, opts: SetDefaultOpts) -> io::Result<()> {
+    reject_legacy_project_config(db_dir)?;
     let pick = match opts.model {
         Some(m) => Some(m),
         None => {
@@ -386,6 +415,7 @@ pub struct SetFallbackOpts {
 /// Warns when a `primaryRunner` Codex route already exists (the engine
 /// rejects that combination at loop startup).
 pub fn handle_set_review_model(db_dir: &Path, model: &str, project: bool) -> io::Result<()> {
+    reject_legacy_project_config(db_dir)?;
     let project_cfg = read_project_config(db_dir);
 
     // Probe binary BEFORE write if the model routes to Grok.
@@ -447,6 +477,7 @@ pub fn handle_unset_review_model(db_dir: &Path, project: bool) -> io::Result<()>
 /// Grok binary **before** writing when `--enable` is used. Rejects any
 /// provider other than `"grok"` (v1 contract).
 pub fn handle_set_fallback(db_dir: &Path, opts: SetFallbackOpts) -> io::Result<()> {
+    reject_legacy_project_config(db_dir)?;
     // v1: only "grok" is a valid fallback provider.
     let provider = opts.provider.clone().unwrap_or_else(|| "grok".to_string());
     if !provider.trim().eq_ignore_ascii_case("grok") {

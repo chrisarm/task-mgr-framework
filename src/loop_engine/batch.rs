@@ -505,7 +505,7 @@ pub async fn run_batch(
     // probe loop run does, BEFORE the first PRD. A failure here aborts the
     // whole batch — config and binaries are project-level so the failure
     // applies uniformly to every PRD.
-    if let Err(e) = preflight_validate_and_probe(&project_config) {
+    if let Err(e) = preflight_validate_and_probe(dir, &project_config) {
         ui::emit_err(&format!("Error: {}", e));
         return batch_fail_early();
     }
