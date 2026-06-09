@@ -10,7 +10,7 @@ use tempfile::TempDir;
 use task_mgr::commands::init;
 use task_mgr::db::open_connection;
 use task_mgr::loop_engine::display::format_iteration_header;
-use task_mgr::loop_engine::model::{HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL};
+use task_mgr::loop_engine::model::{FABLE_MODEL, HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL};
 use task_mgr::loop_engine::prompt::{BuildPromptParams, build_prompt};
 
 mod common;
@@ -52,11 +52,14 @@ fn create_escalation_template(base_prompt_dir: &Path, content: &str) {
 }
 
 // ============================================================================
-// AC: PRD with default_model=haiku + high-difficulty task → resolved_model is opus
+// AC (FR-003): high-difficulty task under default routing → frontier tier.
+// The legacy difficulty=high→OPUS hardcode is replaced by the anchor window
+// (anchor=standard, high→anchor+1=frontier→FABLE). The PRD default_model is
+// ignored under the models config. Provider stays Claude (US-004 AC).
 // ============================================================================
 
 #[test]
-fn test_e2e_high_difficulty_resolves_to_opus() {
+fn test_e2e_high_difficulty_resolves_to_frontier_under_default_routing() {
     let (temp_dir, conn) = init_prd("prd_model_resolution_integration.json");
     let base_prompt_path = create_base_prompt(temp_dir.path());
 
@@ -94,6 +97,8 @@ fn test_e2e_high_difficulty_resolves_to_opus() {
         batch_sibling_prds: &[],
         permission_mode: &task_mgr::loop_engine::config::PermissionMode::Dangerous,
         primary_runner: None,
+        models_config: task_mgr::loop_engine::project_config::default_models_config(),
+        routing_config: task_mgr::loop_engine::project_config::default_routing_config(),
     };
 
     let result = build_prompt(&params)
@@ -106,8 +111,10 @@ fn test_e2e_high_difficulty_resolves_to_opus() {
     );
     assert_eq!(
         result.resolved_model,
-        Some(OPUS_MODEL.to_string()),
-        "High difficulty with haiku default should resolve to opus"
+        Some(FABLE_MODEL.to_string()),
+        "High difficulty under default routing resolves to the frontier tier \
+         (anchor=standard, high→anchor+1=frontier→FABLE); the PRD haiku default \
+         is ignored under the models config. Provider stays Claude."
     );
 }
 
@@ -149,6 +156,8 @@ fn test_e2e_explicit_model_overrides_default() {
         batch_sibling_prds: &[],
         permission_mode: &task_mgr::loop_engine::config::PermissionMode::Dangerous,
         primary_runner: None,
+        models_config: task_mgr::loop_engine::project_config::default_models_config(),
+        routing_config: task_mgr::loop_engine::project_config::default_routing_config(),
     };
 
     let result = build_prompt(&params)
@@ -167,11 +176,14 @@ fn test_e2e_explicit_model_overrides_default() {
 }
 
 // ============================================================================
-// AC: PRD with no default_model + task with no model → resolved_model is None
+// AC (FR-003): PRD with no default_model + task with no model → the anchor
+// window still resolves a model. The default `models` config exposes a full
+// capability ladder, so "no config → None" is gone (hard break): a no-model,
+// no-difficulty task lands on the standard-tier default (OPUS).
 // ============================================================================
 
 #[test]
-fn test_e2e_no_model_fields_resolves_to_none() {
+fn test_e2e_no_model_fields_resolves_via_anchor_window() {
     let (temp_dir, conn) = init_prd("prd_no_model_fields.json");
     let base_prompt_path = create_base_prompt(temp_dir.path());
 
@@ -206,6 +218,8 @@ fn test_e2e_no_model_fields_resolves_to_none() {
         batch_sibling_prds: &[],
         permission_mode: &task_mgr::loop_engine::config::PermissionMode::Dangerous,
         primary_runner: None,
+        models_config: task_mgr::loop_engine::project_config::default_models_config(),
+        routing_config: task_mgr::loop_engine::project_config::default_routing_config(),
     };
 
     let result = build_prompt(&params)
@@ -213,13 +227,23 @@ fn test_e2e_no_model_fields_resolves_to_none() {
         .expect("Should return a prompt");
 
     assert_eq!(
-        result.resolved_model, None,
-        "No model fields at any level should resolve to None"
+        result.resolved_model,
+        Some(OPUS_MODEL.to_string()),
+        "With no explicit/default model the anchor window resolves to the \
+         standard-tier default (OPUS) — the legacy 'no config → None' semantics \
+         are replaced by the always-resolvable capability ladder (FR-003)"
     );
 }
 
 // ============================================================================
-// AC: Escalation template present for non-opus, absent for opus
+// AC: Escalation template present for non-opus, absent for opus.
+//
+// The escalation-section gate still keys on the legacy `model_tier == Opus`
+// (its migration to capability tiers is FEAT-007's scope, not FEAT-004's), so
+// this test pins explicit OPUS / HAIKU models to exercise the gate directly —
+// independent of the FR-003 anchor-window resolution (covered by the two tests
+// above). That keeps the escalation-section coverage stable across the tier
+// rewrite instead of coupling it to which tier `high` maps to.
 // ============================================================================
 
 #[test]
@@ -227,6 +251,19 @@ fn test_e2e_escalation_template_present_for_haiku_absent_for_opus() {
     let (temp_dir, conn) = init_prd("prd_model_resolution_integration.json");
     let base_prompt_path = create_base_prompt(temp_dir.path());
     create_escalation_template(temp_dir.path(), "ESCALATION_INTEGRATION_MARKER");
+
+    // Pin explicit models so resolution is deterministic at rung EXPLICIT_MODEL:
+    // MR-001 → OPUS (escalation absent), MR-003 → HAIKU (escalation present).
+    conn.execute(
+        "UPDATE tasks SET model = ?1 WHERE id = 'MR-001'",
+        [OPUS_MODEL],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE tasks SET model = ?1 WHERE id = 'MR-003'",
+        [HAIKU_MODEL],
+    )
+    .unwrap();
 
     let default_model: Option<String> = conn
         .query_row(
@@ -236,7 +273,7 @@ fn test_e2e_escalation_template_present_for_haiku_absent_for_opus() {
         )
         .unwrap();
 
-    // MR-001 resolves to opus (high difficulty) — escalation should be ABSENT
+    // MR-001 carries an explicit OPUS model — escalation should be ABSENT
     let params = BuildPromptParams {
         dir: temp_dir.path(),
         project_root: temp_dir.path(),
@@ -256,6 +293,8 @@ fn test_e2e_escalation_template_present_for_haiku_absent_for_opus() {
         batch_sibling_prds: &[],
         permission_mode: &task_mgr::loop_engine::config::PermissionMode::Dangerous,
         primary_runner: None,
+        models_config: task_mgr::loop_engine::project_config::default_models_config(),
+        routing_config: task_mgr::loop_engine::project_config::default_routing_config(),
     };
 
     let result = build_prompt(&params)
@@ -268,7 +307,7 @@ fn test_e2e_escalation_template_present_for_haiku_absent_for_opus() {
         "Escalation template must be absent for opus-resolved task"
     );
 
-    // Now mark MR-001 done, MR-003 will be selected (no model, default=haiku)
+    // Now mark MR-001/MR-002 done, MR-003 (explicit HAIKU) will be selected.
     conn.execute("UPDATE tasks SET status = 'done' WHERE id = 'MR-001'", [])
         .unwrap();
     conn.execute("UPDATE tasks SET status = 'done' WHERE id = 'MR-002'", [])
@@ -282,7 +321,7 @@ fn test_e2e_escalation_template_present_for_haiku_absent_for_opus() {
     assert_eq!(
         result2.resolved_model,
         Some(HAIKU_MODEL.to_string()),
-        "MR-003 with no model/difficulty should fall back to haiku default"
+        "MR-003 carries an explicit HAIKU model (rung EXPLICIT_MODEL)"
     );
     assert!(
         result2.prompt.contains("ESCALATION_INTEGRATION_MARKER"),

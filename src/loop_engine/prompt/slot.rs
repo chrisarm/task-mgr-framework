@@ -212,6 +212,13 @@ pub struct SlotPromptParams<'a> {
     /// Engine-cached user default model (`$XDG_CONFIG_HOME/task-mgr/config.json`).
     /// See [`Self::prd_default`].
     pub user_default: Option<&'a str>,
+    /// Provider-first `models` config block (FR-001). Resolved per build and
+    /// fed to [`crate::loop_engine::model::resolve_execution_plan`]. Threaded
+    /// from `ProjectConfig::models`.
+    pub models_config: &'a crate::loop_engine::project_config::ModelsConfig,
+    /// Routing policy block (FR-001) consumed by `resolve_execution_plan`.
+    /// Threaded from `ProjectConfig::routing`.
+    pub routing_config: &'a crate::loop_engine::project_config::RoutingConfig,
 }
 
 /// Send-safe bundle of everything a slot worker needs to invoke Claude and
@@ -332,20 +339,28 @@ pub fn build_prompt(
 ) -> SlotPromptBundle {
     let task_files = load_task_files(conn, &task.id);
 
-    let target = crate::loop_engine::model::resolve_task_execution_target(
-        &crate::loop_engine::model::ModelResolutionContext {
+    // FR-003 single resolution path (FEAT-004) — identical to the sequential
+    // builder so the two paths compute the same plan for the same task+config
+    // (reaction parity). `resolve_models_config` is a pure projection (no I/O).
+    let resolved_models = crate::loop_engine::model::resolve_models_config(
+        params.models_config,
+        params.routing_config,
+    );
+    let no_blackouts = std::collections::HashSet::new();
+    let plan = crate::loop_engine::model::resolve_execution_plan(
+        &crate::loop_engine::model::PlanContext {
+            task_id: &task.id,
             task_model: task.model.as_deref(),
             difficulty: task.difficulty.as_deref(),
-            task_id: Some(&task.id),
-            primary_runner: params.primary_runner,
-            prd_default: params.prd_default,
-            project_default: params.project_default,
-            user_default: params.user_default,
-            ..Default::default()
+            models: &resolved_models,
+            provider_blackouts: &no_blackouts,
         },
     );
-    let resolved_model = target.model;
-    let provider_hint = target.provider_hint;
+    let resolved_model = plan.model;
+    let provider_hint = match plan.provider {
+        crate::loop_engine::model::Provider::Claude => None,
+        other => Some(other),
+    };
 
     // The `&Connection` lives only in this main-thread `PromptContext`, which is
     // dropped before the bundle crosses the worker boundary — no `&Connection`

@@ -19,7 +19,7 @@ use task_mgr::db::migrations::run_migrations;
 use task_mgr::db::{create_schema, open_connection};
 use task_mgr::learnings::crud::{RecordLearningParams, record_learning};
 use task_mgr::loop_engine::config::PermissionMode;
-use task_mgr::loop_engine::model::SONNET_MODEL;
+use task_mgr::loop_engine::model::{OPUS_MODEL, SONNET_MODEL};
 use task_mgr::loop_engine::prompt::slot::{SlotPromptBundle, SlotPromptParams, build_prompt};
 use task_mgr::models::{Confidence, LearningOutcome, Task};
 
@@ -76,6 +76,8 @@ fn make_params(project_root: PathBuf, base_prompt_path: PathBuf) -> SlotPromptPa
         prd_default: None,
         project_default: None,
         user_default: None,
+        models_config: task_mgr::loop_engine::project_config::default_models_config(),
+        routing_config: task_mgr::loop_engine::project_config::default_routing_config(),
     }
 }
 
@@ -543,16 +545,22 @@ fn build_prompt_empty_model_string_normalised_to_none() {
         &make_params(project.path().to_path_buf(), base_prompt),
     );
 
-    assert!(
-        bundle.resolved_model.is_none(),
-        "resolved_model must be None when the task model field is an empty string; \
-         got {:?}",
+    // The empty string is normalized to None at rung EXPLICIT_MODEL (NOT treated
+    // as an explicit `Some("")`), so resolution falls through to the anchor
+    // window: medium difficulty → standard tier → OPUS under the default config.
+    // The invariant (empty ≡ no model) is preserved; the result is the
+    // anchor-resolved model rather than the legacy None.
+    assert_eq!(
+        bundle.resolved_model.as_deref(),
+        Some(OPUS_MODEL),
+        "empty model string must normalize to None and resolve via the anchor \
+         window (standard→OPUS), never as an explicit empty model; got {:?}",
         bundle.resolved_model
     );
 }
 
 #[test]
-fn build_prompt_no_model_set_yields_none_resolved_model() {
+fn build_prompt_no_model_set_resolves_via_anchor_window() {
     let (_tmp, conn) = setup_migrated_db();
     let project = project_with_files(&[]);
     let base_prompt = project.path().join("prompt.md");
@@ -565,9 +573,14 @@ fn build_prompt_no_model_set_yields_none_resolved_model() {
         &make_params(project.path().to_path_buf(), base_prompt),
     );
 
-    assert!(
-        bundle.resolved_model.is_none(),
-        "resolved_model must be None when the task has no model; got {:?}",
+    // With no explicit model the anchor window resolves the model (medium →
+    // standard → OPUS). The legacy "no model → None" is gone (FR-003 always
+    // resolves through the capability ladder under the default config).
+    assert_eq!(
+        bundle.resolved_model.as_deref(),
+        Some(OPUS_MODEL),
+        "a no-model task resolves via the anchor window (standard→OPUS), not None; \
+         got {:?}",
         bundle.resolved_model
     );
 }

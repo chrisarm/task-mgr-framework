@@ -756,6 +756,8 @@ mod tests {
             prd_default: None,
             project_default: None,
             user_default: None,
+            models_config: crate::loop_engine::project_config::default_models_config(),
+            routing_config: crate::loop_engine::project_config::default_routing_config(),
         }
     }
 

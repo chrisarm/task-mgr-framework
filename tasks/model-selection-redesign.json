@@ -314,7 +314,7 @@
       "id": "FEAT-003",
       "modifiesBehavior": false,
       "notes": "Rationale for shipping now (FR-006): audit value on its own + the deferred cascade's reviewer≠implementer rule gets real history from day one instead of a NULL backlog. Data contract: IterationResult.effective_runner: RunnerKind / SlotResult.effective_runner → tasks.completed_by_provider TEXT (lowercase via Provider::as_str). Stamp in the completion arm of process_iteration_output — single home, learning #4865/#4186 (single-home coordinators).",
-      "passes": false,
+      "passes": true,
       "priority": 7,
       "qualityDimensions": [
         "Additive-only schema change: no existing column touched, NULL-safe hydration for historical rows",

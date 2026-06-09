@@ -343,6 +343,22 @@ impl Default for ModelsConfig {
     }
 }
 
+/// A process-wide `&'static` builtin-default `models` block, for callers (and
+/// the many prompt-builder test sites) that need a borrow to thread into
+/// [`crate::loop_engine::model::resolve_execution_plan`] without owning a local.
+/// Production threads the run's ACTUAL `ProjectConfig::models` instead.
+pub fn default_models_config() -> &'static ModelsConfig {
+    static C: std::sync::OnceLock<ModelsConfig> = std::sync::OnceLock::new();
+    C.get_or_init(ModelsConfig::builtin_default)
+}
+
+/// The `&'static` empty default `routing` block — companion to
+/// [`default_models_config`].
+pub fn default_routing_config() -> &'static RoutingConfig {
+    static C: std::sync::OnceLock<RoutingConfig> = std::sync::OnceLock::new();
+    C.get_or_init(RoutingConfig::default)
+}
+
 /// Deep-merge `overlay` onto `base` IN PLACE: two objects merge key-by-key
 /// (recursively); every other shape (scalar, array, `null`) replaces wholesale.
 /// This is the field-wise merge that makes a sparse user override a complete

@@ -41,7 +41,8 @@ pub const PRIORITY_BASE: i32 = 1000;
 /// form like `cbd7d081-REFACTOR-N-xxx` tokenizes as one token starting with
 /// `cbd7d081-` and **silently bypasses the guard**. If you're authoring an AC
 /// that should defer a milestone, use the bare prefix.
-const SPAWNED_FIXUP_PREFIXES: &[&str] = &["REFACTOR-N", "CODE-FIX", "WIRE-FIX", "IMPL-FIX"];
+pub(crate) const SPAWNED_FIXUP_PREFIXES: &[&str] =
+    &["REFACTOR-N", "CODE-FIX", "WIRE-FIX", "IMPL-FIX"];
 
 /// Task-ID prefixes that are treated as "buildy" — they touch shared build
 /// infrastructure (Cargo.lock, lockfiles, generated config) and so must

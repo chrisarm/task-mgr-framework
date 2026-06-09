@@ -27,7 +27,7 @@ use task_mgr::db::migrations::run_migrations;
 use task_mgr::db::{create_schema, open_connection};
 use task_mgr::learnings::crud::{RecordLearningParams, record_learning};
 use task_mgr::loop_engine::config::PermissionMode;
-use task_mgr::loop_engine::model::{Provider, SONNET_MODEL};
+use task_mgr::loop_engine::model::{OPUS_MODEL, SONNET_MODEL};
 use task_mgr::loop_engine::project_config::{PrimaryRunnerConfig, RunnerSpec};
 use task_mgr::loop_engine::prompt::slot::{
     CRITICAL_OVERFLOW_SENTINEL, SlotPromptBundle, SlotPromptParams, build_prompt,
@@ -86,6 +86,8 @@ fn make_params(project_root: PathBuf, base_prompt_path: PathBuf) -> SlotPromptPa
         prd_default: None,
         project_default: None,
         user_default: None,
+        models_config: task_mgr::loop_engine::project_config::default_models_config(),
+        routing_config: task_mgr::loop_engine::project_config::default_routing_config(),
     }
 }
 
@@ -391,6 +393,8 @@ fn build_prompt_renders_steering_and_session_guidance_when_set() {
         prd_default: None,
         project_default: None,
         user_default: None,
+        models_config: task_mgr::loop_engine::project_config::default_models_config(),
+        routing_config: task_mgr::loop_engine::project_config::default_routing_config(),
     };
     let bundle = build_prompt(&conn, &task, &params);
 
@@ -592,6 +596,8 @@ fn build_prompt_oversize_drops_trimmable_sections_and_caps_total_budget() {
         prd_default: None,
         project_default: None,
         user_default: None,
+        models_config: task_mgr::loop_engine::project_config::default_models_config(),
+        routing_config: task_mgr::loop_engine::project_config::default_routing_config(),
     };
     let bundle = build_prompt(&conn, &task, &params);
 
@@ -678,6 +684,8 @@ fn build_prompt_clears_shown_learning_ids_when_learnings_dropped() {
         prd_default: None,
         project_default: None,
         user_default: None,
+        models_config: task_mgr::loop_engine::project_config::default_models_config(),
+        routing_config: task_mgr::loop_engine::project_config::default_routing_config(),
     };
     let bundle = build_prompt(&conn, &task, &params);
 
@@ -730,6 +738,8 @@ fn build_prompt_critical_only_oversize_returns_sentinel_bundle() {
         prd_default: None,
         project_default: None,
         user_default: None,
+        models_config: task_mgr::loop_engine::project_config::default_models_config(),
+        routing_config: task_mgr::loop_engine::project_config::default_routing_config(),
     };
     let bundle = build_prompt(&conn, &task, &params);
 
@@ -760,27 +770,23 @@ fn build_prompt_critical_only_oversize_returns_sentinel_bundle() {
 }
 
 // ---------------------------------------------------------------------------
-// WIRE-FIX-001 — wave-mode baseline-tier routing parity.
+// FEAT-004 — the wave slot spawn-site (build_prompt) resolves through the
+// single FR-003 path (resolve_execution_plan), identical to the sequential
+// builder. The legacy `primaryRunner.baselineTierRoutes` map and the
+// prd/project/user `default_model` are NO LONGER consulted by the spawn-side
+// resolver — routing now flows from the `models` + `routing` config blocks.
 //
-// The wave slot spawn-site (build_prompt) historically built its
-// ModelResolutionContext with `..Default::default()`, dropping the
-// engine-cached prd/project/user defaults. As a result
-// `compute_baseline_model` returned a baseline only for difficulty==high, so a
-// `baselineTierRoutes` *standard*-tier route never fired under `--parallel N`
-// even though the identical config DID route in sequential mode
-// (tests/primary_runner_routing::feat_baseline_tier_routes_standard_to_grok_and_high_to_codex).
-//
-// These tests pin the parity: with the prd_default threaded through
-// SlotPromptParams, a medium-difficulty FEAT task whose baseline is SONNET
-// (tier "standard") resolves to the grok-build route — exactly the sequential
-// assertion. The guard test proves the threading is load-bearing: without a
-// default the standard route cannot fire (no baseline → no tier).
+// These tests pin that behavior change: a medium-difficulty FEAT task lands on
+// the anchor window's standard tier (OPUS) regardless of a legacy
+// baselineTierRoutes config or a threaded default. (TEST-010 adds the positive
+// routing.byIdPrefix slot-path coverage; here we prove the legacy surfaces are
+// inert.)
 // ---------------------------------------------------------------------------
 
 const GROK_MODEL: &str = "grok-build";
 
-/// `baselineTierRoutes` for the `FEAT` prefix: `standard` → Grok, `high` →
-/// Codex. Mirrors `tests/primary_runner_routing::make_baseline_tier_cfg`.
+/// A legacy `baselineTierRoutes` config (`FEAT` prefix → Grok on the `standard`
+/// tier). Passed to the slot builder ONLY to prove the new resolver ignores it.
 fn baseline_tier_cfg() -> PrimaryRunnerConfig {
     let mut tiers = std::collections::HashMap::new();
     tiers.insert(
@@ -800,15 +806,16 @@ fn baseline_tier_cfg() -> PrimaryRunnerConfig {
 }
 
 #[test]
-fn wave_baseline_tier_standard_route_fires_when_prd_default_threaded() {
+fn wave_slot_ignores_legacy_baseline_tier_routes_resolves_via_anchor_window() {
     let (_tmp, conn) = setup_migrated_db();
     let project = project_with_files(&[]);
     let base_prompt = project.path().join("prompt.md");
     fs::write(&base_prompt, "# base\n").unwrap();
 
-    // Medium-difficulty FEAT task: baseline = prd_default (SONNET) → tier
-    // "standard" → grok-build route.
-    let mut task = Task::new("8d71d1f7-FEAT-001", "wave baseline-tier parity");
+    // Medium-difficulty FEAT task. Even with a legacy baselineTierRoutes config
+    // AND a threaded SONNET prd_default, the FR-003 spawn-side resolver consults
+    // neither — it uses the anchor window: medium → standard tier → OPUS.
+    let mut task = Task::new("8d71d1f7-FEAT-001", "wave anchor-window resolution");
     task.difficulty = Some("medium".into());
 
     let cfg = baseline_tier_cfg();
@@ -822,33 +829,39 @@ fn wave_baseline_tier_standard_route_fires_when_prd_default_threaded() {
         prd_default: Some(SONNET_MODEL),
         project_default: None,
         user_default: None,
+        models_config: task_mgr::loop_engine::project_config::default_models_config(),
+        routing_config: task_mgr::loop_engine::project_config::default_routing_config(),
     };
     let bundle = build_prompt(&conn, &task, &params);
 
     assert_eq!(
         bundle.resolved_model.as_deref(),
-        Some(GROK_MODEL),
-        "wave slot resolution MUST fire the 'standard'-tier baselineTierRoutes route \
-         (SONNET baseline) exactly as sequential does — the engine-cached prd_default \
-         is threaded into the slot ModelResolutionContext",
+        Some(OPUS_MODEL),
+        "the slot builder resolves via the FR-003 anchor window (medium→standard→OPUS); \
+         the legacy baselineTierRoutes grok route and the SONNET prd_default are NOT \
+         consulted by the spawn-side resolver (FEAT-004)",
     );
     assert_eq!(
-        bundle.provider_hint,
-        Some(Provider::Grok),
-        "the standard-tier route carries the Grok provider hint into the wave bundle",
+        bundle.provider_hint, None,
+        "anchor-window resolution to a Claude model carries no provider hint — the \
+         legacy Grok route is ignored",
     );
 }
 
 #[test]
-fn wave_baseline_tier_standard_route_does_not_fire_without_default() {
+fn wave_slot_anchor_window_resolves_without_any_default() {
     let (_tmp, conn) = setup_migrated_db();
     let project = project_with_files(&[]);
     let base_prompt = project.path().join("prompt.md");
     fs::write(&base_prompt, "# base\n").unwrap();
 
-    // Same medium-difficulty FEAT task, but NO default threaded: with no
-    // baseline there is no tier to remap, so the standard route cannot fire.
-    let mut task = Task::new("8d71d1f7-FEAT-001", "wave baseline-tier parity (guard)");
+    // Same medium FEAT task, no default threaded and the same legacy config: the
+    // result is identical (OPUS via the anchor window), proving the prd/project/
+    // user default is no longer load-bearing for spawn-side resolution.
+    let mut task = Task::new(
+        "8d71d1f7-FEAT-001",
+        "wave anchor-window resolution (no default)",
+    );
     task.difficulty = Some("medium".into());
 
     let cfg = baseline_tier_cfg();
@@ -862,14 +875,16 @@ fn wave_baseline_tier_standard_route_does_not_fire_without_default() {
         prd_default: None,
         project_default: None,
         user_default: None,
+        models_config: task_mgr::loop_engine::project_config::default_models_config(),
+        routing_config: task_mgr::loop_engine::project_config::default_routing_config(),
     };
     let bundle = build_prompt(&conn, &task, &params);
 
     assert_eq!(
-        bundle.resolved_model, None,
-        "with no prd/project/user default there is no baseline tier, so the \
-         standard-tier route must NOT fire — this proves the default threading is \
-         what makes the route reachable in wave mode",
+        bundle.resolved_model.as_deref(),
+        Some(OPUS_MODEL),
+        "with no default threaded the anchor window still resolves (medium→standard→OPUS) \
+         — the default is no longer consulted by the spawn-side resolver (FEAT-004)",
     );
     assert_eq!(bundle.provider_hint, None);
 }

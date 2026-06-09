@@ -31,10 +31,11 @@
 //! the current model (currently Opus only). This gives the task a larger
 //! context window without changing effort.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::loop_engine::project_config::{
-    ModelsConfig, PrimaryRunnerConfig, RoutingConfig, RunnerSpec,
+    ModelsConfig, PrimaryRunnerConfig, RouteSpec, RoutingConfig, RunnerSpec, SpilloverConfig,
+    TaskClassRoute,
 };
 
 /// Well-known model identifiers.
@@ -186,7 +187,13 @@ fn strip_prd_prefix(id: &str) -> &str {
 /// Only exactly 8 lowercase hex chars followed by `-` are stripped. Stripping
 /// on the first `-` generically would reduce `REFACTOR-REVIEW-FINAL` to
 /// `REVIEW-FINAL` and produce a false positive.
-pub fn is_review_class(id: &str) -> bool {
+///
+/// This is the SSoT for the built-in review class (consumed by
+/// [`classify_task`] → [`TaskClass::Review`]); it forces the frontier tier and
+/// is NOT redefinable via config — hence the "frontier class" name. Renamed
+/// from `is_review_class` (FEAT-004); the old name remains as a thin
+/// compatibility shim until REFACTOR-005 deletes the legacy resolution path.
+pub fn is_frontier_class(id: &str) -> bool {
     let body = strip_prd_prefix(id);
 
     if body.starts_with("REFACTOR-REVIEW") {
@@ -196,6 +203,13 @@ pub fn is_review_class(id: &str) -> bool {
     body.starts_with("CODE-REVIEW-")
         || body.starts_with("MILESTONE-FINAL")
         || body.starts_with("REVIEW-")
+}
+
+/// Deprecated alias for [`is_frontier_class`], kept only because the legacy
+/// `apply_review_model_override` path (slated for deletion in REFACTOR-005)
+/// still references it. New code MUST call [`is_frontier_class`].
+pub fn is_review_class(id: &str) -> bool {
+    is_frontier_class(id)
 }
 
 /// Mapping from task difficulty to Claude CLI `--effort` level.
@@ -559,21 +573,30 @@ fn normalize(s: Option<&str>) -> Option<&str> {
     })
 }
 
-/// Resolve the model for an iteration by selecting the highest-tier model
-/// from a synergy cluster of tasks.
+/// Resolve the model for an iteration by selecting the highest capability-tier
+/// model from a cluster of tasks.
 ///
-/// When multiple tasks run in the same iteration (synergy cluster),
-/// the highest-tier model wins so that all tasks get adequate capability.
+/// When multiple tasks run in the same iteration, the highest-tier model wins
+/// so that all tasks get adequate capability. Tier membership is the new
+/// **config exact-match** [`ResolvedModelsConfig::tier_of`] (keyed by the
+/// model's provider via [`provider_for_model`]), NOT the dead substring
+/// [`model_tier`]. The comparison key is `Option<CapabilityTier>`, so a model
+/// absent from the config (`tier_of == None`) ranks BELOW any configured rung
+/// (`None < Some(Cheapest)`), and a configured `Cheapest` rung beats it.
 ///
-/// Note: `max_by_key` returns the **last** element when tiers are tied,
-/// so the model from the last task in the slice wins among equal tiers.
+/// `max_by_key` returns the **last** element when keys are tied, so the model
+/// from the last task in the slice wins among equal tiers — the historical
+/// tie-break, preserved.
 ///
 /// Returns `None` if the slice is empty or all entries are `None`.
-pub fn resolve_iteration_model(task_models: &[Option<String>]) -> Option<String> {
+pub fn resolve_iteration_model(
+    models: &ResolvedModelsConfig,
+    task_models: &[Option<String>],
+) -> Option<String> {
     task_models
         .iter()
         .filter_map(|m| m.as_deref())
-        .max_by_key(|m| model_tier(Some(m)))
+        .max_by_key(|m| models.tier_of(provider_for_model(Some(m)), m))
         .map(String::from)
 }
 
@@ -962,6 +985,346 @@ impl ResolvedModelsConfig {
     /// Used by the cross-provider recovery rung (FEAT-007).
     pub fn fallback_provider(&self, provider: Provider) -> Option<Provider> {
         self.providers.get(&provider).and_then(|p| p.fallback)
+    }
+
+    /// Whether `provider` is present in the config AND enabled. A provider
+    /// absent from the config is treated as disabled (fail-closed) — class
+    /// provider-preference and blackout reroute only ever select an enabled
+    /// provider.
+    pub fn is_provider_enabled(&self, provider: Provider) -> bool {
+        self.providers.get(&provider).is_some_and(|p| p.enabled)
+    }
+}
+
+// ============================================================================
+// Task classification + the FR-003 six-rung resolution chain (FEAT-004)
+//
+// `classify_task` is the classification SSoT consumed by BOTH the class-route
+// rung AND spillover eligibility. `resolve_execution_plan` is the single pure
+// resolver both prompt builders call — it NEVER writes `tasks.model`
+// (escape-valve contract); escalation/promotion paths in recovery.rs remain
+// the only writers.
+// ============================================================================
+
+/// Semantic task class. Maps a task ID to a `routing.taskClasses` config key
+/// and (for [`TaskClass::Review`]) a built-in, non-redefinable frontier force.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskClass {
+    /// Built-in review class ([`is_frontier_class`]). Forces the frontier tier;
+    /// NOT redefinable via config and never spillover-eligible.
+    Review,
+    /// Planning-phase work ([`PLANNING_PREFIXES`]). Routed via
+    /// `routing.taskClasses.planning` when present.
+    Planning,
+    /// Default class — every ID that is neither review nor planning. Routed via
+    /// `routing.taskClasses.implementation` when present, else the anchor window.
+    Implementation,
+}
+
+impl TaskClass {
+    /// The `routing.taskClasses` map key for this class.
+    pub fn config_key(self) -> &'static str {
+        match self {
+            TaskClass::Review => "review",
+            TaskClass::Planning => "planning",
+            TaskClass::Implementation => "implementation",
+        }
+    }
+}
+
+/// Planning-phase task-ID prefixes (`SPIKE-…`, `PLAN-…`). Matched with the same
+/// dash-boundary [`id_body_matches_prefix`] used everywhere else — never substring.
+pub const PLANNING_PREFIXES: &[&str] = &["SPIKE", "PLAN"];
+
+/// Default implementation-class prefixes. This list MUST remain a SUPERSET of
+/// `commands::next::selection::SPAWNED_FIXUP_PREFIXES` so spawned fixup tasks
+/// (`CODE-FIX-`, `WIRE-FIX-`, `IMPL-FIX-`, `REFACTOR-N-`) classify as
+/// implementation rather than drifting into another class. A consistency test
+/// pins the subset relationship. Unmatched IDs also fall through to
+/// [`TaskClass::Implementation`]; this list exists to document the intent and
+/// anchor that guard.
+pub const IMPLEMENTATION_PREFIXES: &[&str] = &[
+    "FEAT",
+    "FIX",
+    "REFACTOR",
+    "REFACTOR-N",
+    "CODE-FIX",
+    "WIRE-FIX",
+    "IMPL-FIX",
+    "TEST",
+    "VERIFY",
+    "CONTRACT",
+];
+
+/// Classify a task ID into a [`TaskClass`] — the classification SSoT.
+///
+/// Order: built-in review ([`is_frontier_class`], not redefinable) → planning
+/// prefixes → implementation (every other ID, the default). Built on
+/// [`id_body_matches_prefix`] (dash-boundary token matching after stripping the
+/// 8-hex project prefix), never substring. The `routing` parameter is accepted
+/// for signature stability with the rung-3 consumer and future config-driven
+/// classification; classification today is purely ID-prefix based.
+pub fn classify_task(id: &str, _routing: &RoutingConfig) -> TaskClass {
+    if is_frontier_class(id) {
+        return TaskClass::Review;
+    }
+    let body = strip_prd_prefix(id);
+    if PLANNING_PREFIXES
+        .iter()
+        .any(|p| id_body_matches_prefix(body, p))
+    {
+        return TaskClass::Planning;
+    }
+    TaskClass::Implementation
+}
+
+/// Inputs to [`resolve_execution_plan`]. Built per resolution pass; the
+/// `provider_blackouts` set is derived per pass and NEVER stored (FEAT-008
+/// populates it from account-level quota signals; FEAT-004 callers pass an
+/// empty set).
+pub struct PlanContext<'a> {
+    /// Task ID, used for `byIdPrefix` routing and classification.
+    pub task_id: &'a str,
+    /// Explicit `tasks.model` for the task (empty/whitespace normalized to None).
+    pub task_model: Option<&'a str>,
+    /// Task difficulty (DB value, lowercase). Drives the anchor window offset
+    /// and the per-provider effort lookup.
+    pub difficulty: Option<&'a str>,
+    /// The resolved provider-first config (tiers, anchor, routing).
+    pub models: &'a ResolvedModelsConfig,
+    /// Providers under a quota blackout this pass. Spillover-eligible default
+    /// tasks reroute off these; explicit/byIdPrefix/class-forced routes do not.
+    pub provider_blackouts: &'a HashSet<Provider>,
+}
+
+/// The FR-003 six-rung resolution chain as a single pure function. Both prompt
+/// builders (`prompt::sequential` + `prompt::slot`) call this — there is no
+/// second resolution path on the spawn side.
+///
+/// Rungs (named, not numbered — the deferred cascade PRD inserts a rung between
+/// EXPLICIT_MODEL and BY_ID_PREFIX):
+///
+/// - **EXPLICIT_MODEL** — `tasks.model` set → provider via [`provider_for_model`],
+///   tier via [`ResolvedModelsConfig::tier_of`] (anchor window fallback if the
+///   model is off-ladder), effort from that provider's table.
+/// - **BY_ID_PREFIX** — `routing.byIdPrefix` forced route (provider + optional
+///   forced tier). Beats the class route, blackout reroute, and anchor window.
+/// - **TASK_CLASS** — [`classify_task`] → `routing.taskClasses` provider
+///   preference + forced tier; review forces frontier (built-in). Beats the
+///   blackout reroute and anchor window.
+/// - **QUOTA_BLACKOUT** — when the provider was chosen by the default path (not
+///   forced above) and is blacked out AND the task is spillover-eligible,
+///   reroute (tier-preserving) to an enabled, non-blacked-out provider. Beats
+///   the anchor window's provider choice; never touched by `runner_overrides`.
+/// - **ANCHOR_WINDOW** — the default tier: [`anchored_tier`] (low → anchor−1,
+///   medium → anchor, high → anchor+1, clamped).
+/// - **TIER_TO_MODEL** — [`ResolvedModelsConfig::model_for`] resolves the FINAL
+///   (provider, tier) to a concrete model; effort is taken LAST from the FINAL
+///   provider's effort table.
+///
+/// NEVER writes `tasks.model` — pure, no I/O, no DB.
+pub fn resolve_execution_plan(plan: &PlanContext<'_>) -> ExecutionPlan {
+    let models = plan.models;
+    let routing = &models.routing;
+
+    // Rung EXPLICIT_MODEL.
+    if let Some(m) = normalize(plan.task_model) {
+        let provider = provider_for_model(Some(m));
+        let tier = models
+            .tier_of(provider, m)
+            .unwrap_or_else(|| anchored_tier(models.anchor, plan.difficulty));
+        return ExecutionPlan {
+            provider,
+            model: Some(m.to_string()),
+            tier,
+            effort: models
+                .effort_for(provider, plan.difficulty)
+                .map(str::to_string),
+        };
+    }
+
+    // Rung BY_ID_PREFIX — a forced route beats class / blackout / anchor.
+    if let Some((provider, tier)) = byidprefix_route(models, plan.task_id, plan.difficulty) {
+        return finalize_plan(models, provider, tier, plan.difficulty);
+    }
+
+    // Rung TASK_CLASS — when the class produces a forced provider and/or tier,
+    // it beats the blackout reroute and the anchor window.
+    let class = classify_task(plan.task_id, routing);
+    if let Some((provider, tier)) = class_route(models, class, plan.difficulty) {
+        return finalize_plan(models, provider, tier, plan.difficulty);
+    }
+
+    // Default path: primary provider on the anchor window, eligible for the
+    // QUOTA_BLACKOUT reroute.
+    let tier = anchored_tier(models.anchor, plan.difficulty);
+    let provider = reroute_for_blackout(models, models.primary_provider, plan, class);
+    finalize_plan(models, provider, tier, plan.difficulty)
+}
+
+/// Resolve `(provider, tier)` for a `routing.byIdPrefix` match, or `None`.
+/// The forced tier is the route's `tier` (validated) when present, else the
+/// anchor window for the task's difficulty.
+fn byidprefix_route(
+    models: &ResolvedModelsConfig,
+    task_id: &str,
+    difficulty: Option<&str>,
+) -> Option<(Provider, CapabilityTier)> {
+    let body = strip_prd_prefix(task_id);
+    let route: &RouteSpec = models
+        .routing
+        .by_id_prefix
+        .iter()
+        .find(|(prefix, _)| id_body_matches_prefix(body, prefix))
+        .map(|(_, spec)| spec)?;
+    let provider = parse_config_provider(&route.provider).unwrap_or(models.primary_provider);
+    let tier = route
+        .tier
+        .as_deref()
+        .and_then(|t| CapabilityTier::parse(t).ok())
+        .unwrap_or_else(|| anchored_tier(models.anchor, difficulty));
+    Some((provider, tier))
+}
+
+/// Resolve `(provider, tier)` for a task class, or `None` when the class does
+/// not force a route (the default-path tasks that fall through to the anchor
+/// window + blackout reroute).
+///
+/// Review forces the frontier tier built-in (not redefinable). For every class
+/// the provider preference comes from the config route's `byDifficulty` override
+/// (matched via the shared [`normalize_difficulty`]) then `providerPreference`;
+/// the first ENABLED provider wins.
+fn class_route(
+    models: &ResolvedModelsConfig,
+    class: TaskClass,
+    difficulty: Option<&str>,
+) -> Option<(Provider, CapabilityTier)> {
+    let route = models.routing.task_classes.get(class.config_key());
+
+    let forced_tier = if class == TaskClass::Review {
+        // Built-in, not redefinable: review always forces frontier.
+        Some(CapabilityTier::Frontier)
+    } else {
+        route
+            .and_then(|r| r.force_tier.as_deref())
+            .and_then(|t| CapabilityTier::parse(t).ok())
+    };
+
+    let forced_provider = route.and_then(|r| class_provider(models, r, difficulty));
+
+    match (forced_provider, forced_tier) {
+        (None, None) => None,
+        (provider, tier) => Some((
+            provider.unwrap_or(models.primary_provider),
+            tier.unwrap_or_else(|| anchored_tier(models.anchor, difficulty)),
+        )),
+    }
+}
+
+/// First enabled provider for a class route: `byDifficulty[difficulty]` (matched
+/// lowercase-trimmed via [`normalize_difficulty`]) then `providerPreference`.
+fn class_provider(
+    models: &ResolvedModelsConfig,
+    route: &TaskClassRoute,
+    difficulty: Option<&str>,
+) -> Option<Provider> {
+    if let Some(norm) = normalize_difficulty(difficulty) {
+        let by_difficulty = route
+            .by_difficulty
+            .iter()
+            .find(|(k, _)| normalize_difficulty(Some(k)).as_deref() == Some(norm.as_str()))
+            .map(|(_, names)| names);
+        if let Some(names) = by_difficulty
+            && let Some(p) = first_enabled_provider(models, names)
+        {
+            return Some(p);
+        }
+    }
+    first_enabled_provider(models, &route.provider_preference)
+}
+
+/// First entry in `names` that parses to a [`Provider`] and is enabled.
+fn first_enabled_provider(models: &ResolvedModelsConfig, names: &[String]) -> Option<Provider> {
+    names
+        .iter()
+        .filter_map(|n| parse_config_provider(n).ok())
+        .find(|p| models.is_provider_enabled(*p))
+}
+
+/// Spillover eligibility (FR-008), consuming [`classify_task`]'s result so it
+/// and the rung-3 class route agree. A task may reroute off a blacked-out
+/// provider only when: it is NOT the built-in review class (review is
+/// frontier-critical and waits for quota rather than dropping tier), AND its
+/// difficulty is at or below `routing.spillover.maxDifficulty`. `maxDifficulty`
+/// unset → spillover disabled. Absent/unranked difficulty is treated as the
+/// lowest rung (eligible).
+fn is_spillover_eligible(
+    class: TaskClass,
+    difficulty: Option<&str>,
+    spillover: &SpilloverConfig,
+) -> bool {
+    if class == TaskClass::Review {
+        return false;
+    }
+    let Some(max) = spillover.max_difficulty.as_deref() else {
+        return false;
+    };
+    let Some(max_rank) = difficulty_rank(Some(max)) else {
+        return false;
+    };
+    match difficulty_rank(difficulty) {
+        Some(rank) => rank <= max_rank,
+        None => true,
+    }
+}
+
+/// Rung QUOTA_BLACKOUT: reroute the default-path provider off a quota blackout.
+/// Returns the original provider unchanged when it is not blacked out, the task
+/// is not spillover-eligible, or no enabled non-blacked-out alternative exists
+/// (FEAT-008's deferral-first path then waits for the quota reset). The
+/// reroute is tier-preserving and EPHEMERAL — it never reads or writes
+/// `runner_overrides` (the permanent-promotion channel owned by `promote_once`).
+fn reroute_for_blackout(
+    models: &ResolvedModelsConfig,
+    provider: Provider,
+    plan: &PlanContext<'_>,
+    class: TaskClass,
+) -> Provider {
+    if !plan.provider_blackouts.contains(&provider) {
+        return provider;
+    }
+    if !is_spillover_eligible(class, plan.difficulty, &models.routing.spillover) {
+        return provider;
+    }
+    // Prefer the configured tier-preserving fallback when it is enabled and not
+    // itself blacked out; otherwise the first enabled, non-blacked-out provider.
+    if let Some(fb) = models.fallback_provider(provider)
+        && models.is_provider_enabled(fb)
+        && !plan.provider_blackouts.contains(&fb)
+    {
+        return fb;
+    }
+    models
+        .enabled_providers()
+        .into_iter()
+        .map(|(p, _)| p)
+        .find(|p| *p != provider && !plan.provider_blackouts.contains(p))
+        .unwrap_or(provider)
+}
+
+/// Rung TIER_TO_MODEL: resolve the FINAL `(provider, tier)` to a concrete model
+/// and read effort LAST from the FINAL provider's table.
+fn finalize_plan(
+    models: &ResolvedModelsConfig,
+    provider: Provider,
+    tier: CapabilityTier,
+    difficulty: Option<&str>,
+) -> ExecutionPlan {
+    ExecutionPlan {
+        provider,
+        model: models.model_for(provider, tier).map(str::to_string),
+        tier,
+        effort: models.effort_for(provider, difficulty).map(str::to_string),
     }
 }
 
@@ -1920,6 +2283,13 @@ mod tests {
 
     // ============ resolve_iteration_model tests ============
 
+    /// Default provider-first config (Claude full ladder enabled) for tier
+    /// reverse-lookup in the iteration-model + plan tests:
+    /// haiku→Cheapest, sonnet→CostEfficient, opus→Standard, fable→Frontier.
+    fn default_models_cfg() -> ResolvedModelsConfig {
+        resolve_models_config(&ModelsConfig::builtin_default(), &RoutingConfig::default())
+    }
+
     #[test]
     fn test_resolve_iteration_model_highest_tier_wins() {
         let models = vec![
@@ -1927,21 +2297,21 @@ mod tests {
             Some(OPUS_MODEL.to_string()),
             Some(SONNET_MODEL.to_string()),
         ];
-        let result = resolve_iteration_model(&models);
+        let result = resolve_iteration_model(&default_models_cfg(), &models);
         assert_eq!(result, Some(OPUS_MODEL.to_string()));
     }
 
     #[test]
     fn test_resolve_iteration_model_all_none() {
         let models: Vec<Option<String>> = vec![None, None, None];
-        let result = resolve_iteration_model(&models);
+        let result = resolve_iteration_model(&default_models_cfg(), &models);
         assert_eq!(result, None);
     }
 
     #[test]
     fn test_resolve_iteration_model_empty_list() {
         let models: Vec<Option<String>> = vec![];
-        let result = resolve_iteration_model(&models);
+        let result = resolve_iteration_model(&default_models_cfg(), &models);
         assert_eq!(result, None);
     }
 
@@ -1949,14 +2319,14 @@ mod tests {
     #[test]
     fn test_resolve_iteration_model_single_task_cluster() {
         let models = vec![Some(SONNET_MODEL.to_string())];
-        let result = resolve_iteration_model(&models);
+        let result = resolve_iteration_model(&default_models_cfg(), &models);
         assert_eq!(result, Some(SONNET_MODEL.to_string()));
     }
 
     #[test]
     fn test_resolve_iteration_model_mixed_none_and_some() {
         let models = vec![None, Some(HAIKU_MODEL.to_string()), None];
-        let result = resolve_iteration_model(&models);
+        let result = resolve_iteration_model(&default_models_cfg(), &models);
         assert_eq!(result, Some(HAIKU_MODEL.to_string()));
     }
 
@@ -1966,7 +2336,7 @@ mod tests {
             Some(SONNET_MODEL.to_string()),
             Some(SONNET_MODEL.to_string()),
         ];
-        let result = resolve_iteration_model(&models);
+        let result = resolve_iteration_model(&default_models_cfg(), &models);
         assert_eq!(result, Some(SONNET_MODEL.to_string()));
     }
 
@@ -1976,7 +2346,7 @@ mod tests {
             Some(HAIKU_MODEL.to_string()),
             Some(SONNET_MODEL.to_string()),
         ];
-        let result = resolve_iteration_model(&models);
+        let result = resolve_iteration_model(&default_models_cfg(), &models);
         assert_eq!(result, Some(SONNET_MODEL.to_string()));
     }
 
@@ -1990,7 +2360,7 @@ mod tests {
             Some(HAIKU_MODEL.to_string()),
             Some(SONNET_MODEL.to_string()),
         ];
-        let result = resolve_iteration_model(&models);
+        let result = resolve_iteration_model(&default_models_cfg(), &models);
         assert_eq!(result, Some(OPUS_MODEL.to_string()));
     }
 
@@ -2005,7 +2375,7 @@ mod tests {
             Some(SONNET_MODEL.to_string()),
             None,
         ];
-        let result = resolve_iteration_model(&models);
+        let result = resolve_iteration_model(&default_models_cfg(), &models);
         assert_eq!(
             result,
             Some(SONNET_MODEL.to_string()),
@@ -2021,7 +2391,7 @@ mod tests {
             Some(HAIKU_MODEL.to_string()),
             Some(HAIKU_MODEL.to_string()),
         ];
-        let result = resolve_iteration_model(&models);
+        let result = resolve_iteration_model(&default_models_cfg(), &models);
         assert_eq!(result, Some(HAIKU_MODEL.to_string()));
     }
 
@@ -2034,7 +2404,7 @@ mod tests {
             Some(HAIKU_MODEL.to_string()),
             Some("llama-3".to_string()),
         ];
-        let result = resolve_iteration_model(&models);
+        let result = resolve_iteration_model(&default_models_cfg(), &models);
         assert_eq!(
             result,
             Some(HAIKU_MODEL.to_string()),
@@ -2046,7 +2416,7 @@ mod tests {
     #[test]
     fn test_resolve_iteration_model_all_unknown() {
         let models = vec![Some("gpt-4".to_string()), Some("llama-3".to_string())];
-        let result = resolve_iteration_model(&models);
+        let result = resolve_iteration_model(&default_models_cfg(), &models);
         // All are ModelTier::Default; max_by_key picks the last tied element
         assert!(
             result.is_some(),
@@ -2869,5 +3239,339 @@ mod tests {
         );
         // The bogus tier key never created a rung.
         assert_eq!(r.tier_of(Provider::Claude, "x"), None);
+    }
+
+    // ============ classify_task / is_frontier_class (FEAT-004) ============
+
+    #[test]
+    fn classify_task_review_class_is_built_in() {
+        let routing = RoutingConfig::default();
+        assert_eq!(classify_task("CODE-REVIEW-1", &routing), TaskClass::Review);
+        assert_eq!(
+            classify_task("MILESTONE-FINAL", &routing),
+            TaskClass::Review
+        );
+        assert_eq!(classify_task("REVIEW-007", &routing), TaskClass::Review);
+        // 8-hex project prefix is stripped before matching.
+        assert_eq!(
+            classify_task("8d71d1f7-CODE-REVIEW-1", &routing),
+            TaskClass::Review
+        );
+        // REFACTOR-REVIEW is explicitly excluded from the review class.
+        assert_eq!(
+            classify_task("REFACTOR-REVIEW-1", &routing),
+            TaskClass::Implementation
+        );
+    }
+
+    #[test]
+    fn classify_task_planning_and_implementation_defaults() {
+        let routing = RoutingConfig::default();
+        assert_eq!(classify_task("SPIKE-1", &routing), TaskClass::Planning);
+        assert_eq!(classify_task("PLAN-2", &routing), TaskClass::Planning);
+        assert_eq!(
+            classify_task("FEAT-001", &routing),
+            TaskClass::Implementation
+        );
+        assert_eq!(
+            classify_task("CODE-FIX-9", &routing),
+            TaskClass::Implementation
+        );
+        // Unmatched IDs fall through to the implementation default.
+        assert_eq!(
+            classify_task("WHATEVER-1", &routing),
+            TaskClass::Implementation
+        );
+    }
+
+    /// AC #6: `SPAWNED_FIXUP_PREFIXES` MUST be a subset of the implementation
+    /// class defaults so spawned fixups never drift into another class.
+    #[test]
+    fn spawned_fixup_prefixes_subset_of_implementation_defaults() {
+        use crate::commands::next::selection::SPAWNED_FIXUP_PREFIXES;
+        for prefix in SPAWNED_FIXUP_PREFIXES {
+            assert!(
+                IMPLEMENTATION_PREFIXES.contains(prefix),
+                "SPAWNED_FIXUP prefix {prefix:?} must be in IMPLEMENTATION_PREFIXES \
+                 (prefix sets drifted)"
+            );
+        }
+    }
+
+    #[test]
+    fn is_frontier_class_and_is_review_class_alias_agree() {
+        assert!(is_frontier_class("CODE-REVIEW-1"));
+        assert!(!is_frontier_class("REFACTOR-REVIEW-1"));
+        assert!(!is_frontier_class("FEAT-1"));
+        // The compatibility shim delegates to the same logic.
+        assert_eq!(
+            is_review_class("CODE-REVIEW-1"),
+            is_frontier_class("CODE-REVIEW-1")
+        );
+        assert_eq!(is_review_class("FEAT-1"), is_frontier_class("FEAT-1"));
+    }
+
+    // ============ resolve_execution_plan (FR-003 six rungs) ============
+
+    /// A multi-provider config in the production JSON shape: claude full ladder,
+    /// grok single `standard` rung, codex single `standard` rung (null model),
+    /// all enabled. `anchor` and `routing` are caller-supplied.
+    fn plan_models(anchor: CapabilityTier, routing: serde_json::Value) -> ResolvedModelsConfig {
+        let models: ModelsConfig = serde_json::from_value(serde_json::json!({
+            "primaryProvider": "claude",
+            "anchor": anchor.as_str(),
+            "providers": {
+                "claude": {
+                    "enabled": true,
+                    "tiers": {
+                        "cheapest": HAIKU_MODEL,
+                        "cost-efficient": SONNET_MODEL,
+                        "standard": OPUS_MODEL,
+                        "frontier": FABLE_MODEL,
+                    },
+                    "effort": { "low": "medium", "medium": "high", "high": "xhigh" },
+                    "fallback": "grok",
+                },
+                "grok": {
+                    "enabled": true,
+                    "tiers": { "standard": "grok-build" },
+                    "effort": { "low": "low", "medium": "medium", "high": "high" },
+                },
+                "codex": {
+                    "enabled": true,
+                    "tiers": { "standard": null },
+                    "effort": { "low": "low", "medium": "medium", "high": "high" },
+                },
+            }
+        }))
+        .expect("production-shaped models fixture");
+        let routing: RoutingConfig =
+            serde_json::from_value(routing).expect("production-shaped routing fixture");
+        resolve_models_config(&models, &routing)
+    }
+
+    fn plan(
+        models: &ResolvedModelsConfig,
+        id: &str,
+        task_model: Option<&str>,
+        difficulty: Option<&str>,
+        blackouts: &HashSet<Provider>,
+    ) -> ExecutionPlan {
+        resolve_execution_plan(&PlanContext {
+            task_id: id,
+            task_model,
+            difficulty,
+            models,
+            provider_blackouts: blackouts,
+        })
+    }
+
+    /// US-004 / PRD success metric: default config + anchor=standard maps the
+    /// difficulty window to sonnet / opus / fable, all on Claude. High-difficulty
+    /// implementation stays on Claude (frontier = claude-fable-5).
+    #[test]
+    fn default_anchor_standard_difficulty_window_stays_on_claude() {
+        let models = plan_models(CapabilityTier::Standard, serde_json::json!({}));
+        let no_blackout = HashSet::new();
+
+        let low = plan(&models, "FEAT-1", None, Some("low"), &no_blackout);
+        assert_eq!(low.provider, Provider::Claude);
+        assert_eq!(low.model.as_deref(), Some(SONNET_MODEL));
+        assert_eq!(low.tier, CapabilityTier::CostEfficient);
+
+        let med = plan(&models, "FEAT-2", None, Some("medium"), &no_blackout);
+        assert_eq!(med.provider, Provider::Claude);
+        assert_eq!(med.model.as_deref(), Some(OPUS_MODEL));
+        assert_eq!(med.tier, CapabilityTier::Standard);
+
+        let high = plan(&models, "FEAT-3", None, Some("high"), &no_blackout);
+        assert_eq!(high.provider, Provider::Claude);
+        assert_eq!(high.model.as_deref(), Some(FABLE_MODEL));
+        assert_eq!(high.tier, CapabilityTier::Frontier);
+        // Effort comes LAST from the final (Claude) provider's table.
+        assert_eq!(high.effort.as_deref(), Some("xhigh"));
+    }
+
+    /// anchor=cost-efficient slides the whole window down one rung.
+    #[test]
+    fn anchor_cost_efficient_window() {
+        let models = plan_models(CapabilityTier::CostEfficient, serde_json::json!({}));
+        let nb = HashSet::new();
+        assert_eq!(
+            plan(&models, "FEAT-1", None, Some("low"), &nb)
+                .model
+                .as_deref(),
+            Some(HAIKU_MODEL)
+        );
+        assert_eq!(
+            plan(&models, "FEAT-2", None, Some("medium"), &nb)
+                .model
+                .as_deref(),
+            Some(SONNET_MODEL)
+        );
+        assert_eq!(
+            plan(&models, "FEAT-3", None, Some("high"), &nb)
+                .model
+                .as_deref(),
+            Some(OPUS_MODEL)
+        );
+    }
+
+    /// AC #2 precedence: explicit `tasks.model` beats a byIdPrefix route.
+    #[test]
+    fn precedence_explicit_beats_byidprefix() {
+        let routing = serde_json::json!({
+            "byIdPrefix": { "FEAT": { "provider": "grok" } }
+        });
+        let models = plan_models(CapabilityTier::Standard, routing);
+        let p = plan(
+            &models,
+            "FEAT-1",
+            Some(HAIKU_MODEL),
+            Some("high"),
+            &HashSet::new(),
+        );
+        assert_eq!(p.provider, Provider::Claude);
+        assert_eq!(p.model.as_deref(), Some(HAIKU_MODEL));
+        assert_eq!(p.tier, CapabilityTier::Cheapest); // tier_of(haiku)
+    }
+
+    /// AC #2 precedence: a byIdPrefix route beats the class route.
+    #[test]
+    fn precedence_byidprefix_beats_class_route() {
+        let routing = serde_json::json!({
+            "byIdPrefix": { "FEAT": { "provider": "grok" } },
+            "taskClasses": { "implementation": { "providerPreference": ["codex"] } }
+        });
+        let models = plan_models(CapabilityTier::Standard, routing);
+        let p = plan(&models, "FEAT-1", None, Some("medium"), &HashSet::new());
+        assert_eq!(p.provider, Provider::Grok);
+        assert_eq!(p.model.as_deref(), Some("grok-build"));
+    }
+
+    /// AC #2 precedence: a class route beats the blackout reroute (the forced
+    /// provider stays even under a blackout — it is deferred, not rerouted).
+    #[test]
+    fn precedence_class_route_beats_blackout_reroute() {
+        let routing = serde_json::json!({
+            "taskClasses": { "implementation": { "providerPreference": ["claude"] } },
+            "spillover": { "maxDifficulty": "high" }
+        });
+        let models = plan_models(CapabilityTier::Standard, routing);
+        let mut blackout = HashSet::new();
+        blackout.insert(Provider::Claude);
+        let p = plan(&models, "FEAT-1", None, Some("medium"), &blackout);
+        assert_eq!(p.provider, Provider::Claude);
+    }
+
+    /// AC #2 precedence: the blackout reroute beats the plain anchor window —
+    /// a default-path task on a blacked-out primary reroutes (tier preserved).
+    #[test]
+    fn precedence_blackout_reroute_beats_anchor_window() {
+        let routing = serde_json::json!({ "spillover": { "maxDifficulty": "high" } });
+        let models = plan_models(CapabilityTier::Standard, routing);
+        let mut blackout = HashSet::new();
+        blackout.insert(Provider::Claude);
+        let p = plan(&models, "FEAT-1", None, Some("medium"), &blackout);
+        assert_eq!(p.provider, Provider::Grok);
+        assert_eq!(p.model.as_deref(), Some("grok-build"));
+    }
+
+    #[test]
+    fn anchor_window_is_the_floor_when_nothing_else_fires() {
+        let models = plan_models(CapabilityTier::Standard, serde_json::json!({}));
+        let p = plan(&models, "FEAT-1", None, Some("high"), &HashSet::new());
+        assert_eq!(p.provider, Provider::Claude);
+        assert_eq!(p.tier, CapabilityTier::Frontier);
+    }
+
+    /// Review class forces the frontier tier built-in even with an empty routing
+    /// config (not redefinable), and never reroutes under a blackout.
+    #[test]
+    fn review_class_forces_frontier_built_in() {
+        let models = plan_models(CapabilityTier::Cheapest, serde_json::json!({}));
+        let p = plan(&models, "CODE-REVIEW-1", None, Some("low"), &HashSet::new());
+        assert_eq!(p.tier, CapabilityTier::Frontier);
+        assert_eq!(p.provider, Provider::Claude);
+        assert_eq!(p.model.as_deref(), Some(FABLE_MODEL));
+
+        let mut blackout = HashSet::new();
+        blackout.insert(Provider::Claude);
+        let routing = serde_json::json!({ "spillover": { "maxDifficulty": "high" } });
+        let models = plan_models(CapabilityTier::Standard, routing);
+        let p = plan(&models, "CODE-REVIEW-2", None, Some("high"), &blackout);
+        assert_eq!(p.provider, Provider::Claude);
+    }
+
+    /// AC #7: `byDifficulty` keys + the lookup difficulty are both matched
+    /// lowercase-trimmed via the shared `normalize_difficulty` — no second
+    /// normalizer. A `"High"` map key matches a `" high "` task difficulty.
+    #[test]
+    fn class_by_difficulty_matched_via_shared_normalizer() {
+        let routing = serde_json::json!({
+            "taskClasses": {
+                "implementation": {
+                    "providerPreference": ["claude"],
+                    "byDifficulty": { "High": ["grok"] }
+                }
+            }
+        });
+        let models = plan_models(CapabilityTier::Standard, routing);
+        let p = plan(&models, "FEAT-1", None, Some(" high "), &HashSet::new());
+        assert_eq!(
+            p.provider,
+            Provider::Grok,
+            "byDifficulty 'High' must match difficulty ' high ' via normalize_difficulty"
+        );
+    }
+
+    /// Codex routes resolve a `None` model (provider-only spawn) and read effort
+    /// from the codex table (capped at high).
+    #[test]
+    fn codex_route_resolves_null_model_and_codex_effort() {
+        let routing = serde_json::json!({
+            "byIdPrefix": { "FEAT": { "provider": "codex" } }
+        });
+        let models = plan_models(CapabilityTier::Standard, routing);
+        let p = plan(&models, "FEAT-1", None, Some("high"), &HashSet::new());
+        assert_eq!(p.provider, Provider::Codex);
+        assert_eq!(p.model, None);
+        assert_eq!(p.effort.as_deref(), Some("high"));
+    }
+
+    /// Spillover eligibility consumes `classify_task`: review is never eligible;
+    /// implementation is eligible up to `maxDifficulty`; disabled when unset.
+    #[test]
+    fn spillover_eligibility_respects_class_and_max_difficulty() {
+        let spill = SpilloverConfig {
+            max_difficulty: Some("medium".to_string()),
+        };
+        assert!(is_spillover_eligible(
+            TaskClass::Implementation,
+            Some("low"),
+            &spill
+        ));
+        assert!(is_spillover_eligible(
+            TaskClass::Implementation,
+            Some("medium"),
+            &spill
+        ));
+        assert!(!is_spillover_eligible(
+            TaskClass::Implementation,
+            Some("high"),
+            &spill
+        ));
+        assert!(!is_spillover_eligible(
+            TaskClass::Review,
+            Some("low"),
+            &spill
+        ));
+        // Unset maxDifficulty disables spillover entirely.
+        let spill_off = SpilloverConfig::default();
+        assert!(!is_spillover_eligible(
+            TaskClass::Implementation,
+            Some("low"),
+            &spill_off
+        ));
     }
 }

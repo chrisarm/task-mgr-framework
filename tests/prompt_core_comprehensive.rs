@@ -483,6 +483,8 @@ fn slot_build_prompt_missing_base_prompt_path_degrades_gracefully() {
         prd_default: None,
         project_default: None,
         user_default: None,
+        models_config: task_mgr::loop_engine::project_config::default_models_config(),
+        routing_config: task_mgr::loop_engine::project_config::default_routing_config(),
     };
 
     let bundle: SlotPromptBundle =
@@ -526,6 +528,8 @@ fn slot_build_prompt_with_real_base_prompt_file_includes_content() {
         prd_default: None,
         project_default: None,
         user_default: None,
+        models_config: task_mgr::loop_engine::project_config::default_models_config(),
+        routing_config: task_mgr::loop_engine::project_config::default_routing_config(),
     };
 
     let bundle = task_mgr::loop_engine::prompt::slot::build_prompt(&conn, &task, &params);
@@ -557,6 +561,8 @@ fn slot_build_prompt_large_base_prompt_is_truncated() {
         prd_default: None,
         project_default: None,
         user_default: None,
+        models_config: task_mgr::loop_engine::project_config::default_models_config(),
+        routing_config: task_mgr::loop_engine::project_config::default_routing_config(),
     };
 
     let bundle = task_mgr::loop_engine::prompt::slot::build_prompt(&conn, &task, &params);

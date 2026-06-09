@@ -357,7 +357,6 @@ fn null_snapshot_then_operator_stamp_fires_six_channel_clear() {
 /// Fails today: the current comparison (`Some(None) != Some(Some(opus))`) fires
 /// on the ladder's own write at step 3. FEAT-004's NULL-original semantics make
 /// the snapshot absorb that write so the clear fires exactly once at step 4.
-#[ignore = "un-ignored by FEAT-004: NULL-original snapshot must absorb the ladder's own tasks.model write so only a later operator edit fires the six-channel clear"]
 #[test]
 fn edge_case_0_anchor_resolved_null_escape_valve_fires_exactly_once() {
     let (_dir, conn) = setup_db();

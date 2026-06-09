@@ -200,9 +200,33 @@ pub fn invalidate_stale_overrides(ctx: &mut IterationContext, conn: &Connection,
         }
     };
 
-    let snapshotted = ctx.overflow_original_task_model.get(task_id);
-    if snapshotted.map(Option::as_deref) == Some(current_model.as_deref()) {
+    // The snapshot's inner value: `None` = anchor-resolved (NULL `tasks.model`
+    // at first overflow); `Some(m)` = the task carried an explicit model.
+    let snapshot_inner: Option<String> = match ctx.overflow_original_task_model.get(task_id) {
+        Some(inner) => inner.clone(),
+        None => return,
+    };
+
+    // No divergence from the snapshot → no-op (the dominant steady state).
+    if snapshot_inner.as_deref() == current_model.as_deref() {
         return;
+    }
+
+    // NULL-original semantics (FEAT-004): an anchor-resolved task snapshotted a
+    // NULL `tasks.model`, then the escalation ladder wrote `tasks.model` itself
+    // (to the auto-recovery model it also recorded in `model_overrides`). That
+    // write is the LADDER's, NOT an operator edit — absorb it into the snapshot
+    // so the next pass compares against the escalated model. Only a SUBSEQUENT
+    // edit to a DIFFERENT model fires the six-channel clear. Without this, the
+    // ladder's own first write (`Some(None) != Some(Some(opus))`) would
+    // self-trip the escape valve and wipe the recovery it just set up.
+    if snapshot_inner.is_none() {
+        let ladder_model = ctx.model_overrides.get(task_id).map(String::as_str);
+        if current_model.is_some() && current_model.as_deref() == ladder_model {
+            ctx.overflow_original_task_model
+                .insert(task_id.to_string(), current_model);
+            return;
+        }
     }
 
     ctx.runner_overrides.remove(task_id);

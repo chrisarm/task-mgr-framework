@@ -224,6 +224,8 @@ fn render_prompt(conn: &Connection, base_prompt_path: &Path) -> String {
         batch_sibling_prds: &[],
         permission_mode: &permission_mode,
         primary_runner: None,
+        models_config: task_mgr::loop_engine::project_config::default_models_config(),
+        routing_config: task_mgr::loop_engine::project_config::default_routing_config(),
     };
 
     let result = build_prompt(&params)

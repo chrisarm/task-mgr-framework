@@ -55,7 +55,7 @@ use crate::loop_engine::detection;
 use crate::loop_engine::display;
 use crate::loop_engine::engine::{
     IterationContext, IterationParams, IterationResult, MAX_CONSECUTIVE_REORDERS,
-    apply_review_model_override, resolve_effective_runner,
+    resolve_effective_runner,
 };
 use crate::loop_engine::monitor;
 use crate::loop_engine::prd_reconcile::reconcile_passes_with_db;
@@ -232,6 +232,8 @@ pub fn run_iteration(
         batch_sibling_prds: params.batch_sibling_prds,
         permission_mode: params.permission_mode,
         primary_runner: params.project_config.primary_runner.as_ref(),
+        models_config: &params.project_config.models,
+        routing_config: &params.project_config.routing,
     });
 
     let prompt_result = match first_attempt {
@@ -311,6 +313,8 @@ pub fn run_iteration(
                     batch_sibling_prds: params.batch_sibling_prds,
                     permission_mode: params.permission_mode,
                     primary_runner: params.project_config.primary_runner.as_ref(),
+                    models_config: &params.project_config.models,
+                    routing_config: &params.project_config.routing,
                 });
                 match retry_attempt {
                     Ok(Some(result)) => result,
@@ -417,21 +421,10 @@ pub fn run_iteration(
         effective_model = Some(override_model.clone());
     }
 
-    // Route review-class tasks to `reviewModel` after the crash / overflow
-    // escalation so escalation can't overwrite this routing. The single
-    // `effective_model` here feeds both `resolve_effective_runner` (runner
-    // selection) and the `--model` flag passed to the runner, so one assignment
-    // keeps selection and dispatch in sync.
-    if let Some(review_model_override) =
-        apply_review_model_override(params.project_config.review_model.as_deref(), &task_id)
-    {
-        let old = effective_model.as_deref().unwrap_or("(default)");
-        ui::emit(&format!(
-            "Review-class routing: {} → {} (reviewModel)",
-            old, review_model_override,
-        ));
-        effective_model = Some(review_model_override);
-    }
+    // Review-class routing now flows from `resolve_execution_plan` rung 3
+    // (FEAT-004): the plan already carries the review→frontier provider/model,
+    // baked into `resolved_model`/`provider_hint` above. The legacy
+    // `apply_review_model_override` post-hoc rewrite is deleted.
 
     // Effort: the plan's prior-overflow override wins, else the cluster-wide
     // effort `build_prompt` computed (parallels the cluster-wide

@@ -65,7 +65,7 @@ use crate::loop_engine::config::{self, IterationOutcome};
 use crate::loop_engine::engine::{
     EffectiveRunnerInput, FailedMerge, IterationContext, MergeFailHaltDecision, SlotContext,
     SlotIterationParams, SlotResult, WaveAggregator, WaveIterationParams, WaveOutcome, WaveResult,
-    WaveTerminal, apply_review_model_override, resolve_effective_runner,
+    WaveTerminal, resolve_effective_runner,
 };
 use crate::loop_engine::git_reconcile::reconcile_merged_slot_completions;
 use crate::loop_engine::merge_resolver;
@@ -294,6 +294,8 @@ fn build_slot_prompt_params<'a>(
         prd_default: params.default_model,
         project_default: params.project_default_model,
         user_default: params.user_default_model,
+        models_config: &params.project_config.models,
+        routing_config: &params.project_config.routing,
     }
 }
 
@@ -795,30 +797,13 @@ pub fn run_wave_iteration(
         }
         slot.effective_effort = plan.effort;
 
-        // Route review-class slots to `reviewModel` AFTER the escape valve /
-        // crash escalation (so neither overwrites the routing). Mutating the
-        // bundle's `resolved_model` (not just a local) keeps runner selection,
-        // the `--model` flag in `run_slot_iteration`, and the prompt-baked
-        // model consistent — a drift-`assert!` cross-check on
-        // `slot_result.effective_runner` would panic if these disagreed.
-        if let Some(review_model_override) =
-            apply_review_model_override(params.project_config.review_model.as_deref(), &task_id)
-        {
-            let old = slot
-                .prompt_bundle
-                .resolved_model
-                .as_deref()
-                .unwrap_or("(default)");
-            ui::emit(&format!(
-                "Review-class routing [slot {}]: {} → {} (reviewModel)",
-                slot.slot_index, old, review_model_override,
-            ));
-            slot.prompt_bundle.resolved_model = Some(review_model_override);
-            slot.prompt_bundle.provider_hint = None;
-        }
+        // Review-class routing now flows from `resolve_execution_plan` rung 3
+        // (FEAT-004): the slot bundle's `resolved_model`/`provider_hint` already
+        // carry the review→frontier route from build time. The legacy
+        // `apply_review_model_override` per-slot rewrite is deleted.
 
-        // Resolve the runner over the FINAL model (post crash escalation +
-        // review routing). `plan.runner` reflects only the pre-routing
+        // Resolve the runner over the FINAL model (post crash escalation).
+        // `plan.runner` reflects only the pre-routing
         // baseline, so this re-resolution is the authoritative spawn
         // discriminant — identical in shape to the sequential path's single
         // `resolve_effective_runner` at the end of its pre-spawn block.
@@ -2170,6 +2155,8 @@ mod tests {
             prd_default: None,
             project_default: None,
             user_default: None,
+            models_config: crate::loop_engine::project_config::default_models_config(),
+            routing_config: crate::loop_engine::project_config::default_routing_config(),
         };
         let slot_paths = vec![tmp.path().to_path_buf()];
         let slots = build_slot_contexts(&conn, vec![scored], &slot_paths, &prompt_params);

@@ -198,6 +198,8 @@ fn wave_review_class_slot_bundle_resolved_model_is_rewritten_to_grok_build() {
         prd_default: None,
         project_default: None,
         user_default: None,
+        models_config: task_mgr::loop_engine::project_config::default_models_config(),
+        routing_config: task_mgr::loop_engine::project_config::default_routing_config(),
     };
     let bundle = build_prompt(&conn, &task, &params);
 
@@ -270,6 +272,8 @@ fn wave_non_review_slot_bundle_is_untouched_when_review_model_is_set() {
         prd_default: None,
         project_default: None,
         user_default: None,
+        models_config: task_mgr::loop_engine::project_config::default_models_config(),
+        routing_config: task_mgr::loop_engine::project_config::default_routing_config(),
     };
     let mut bundle = build_prompt(&conn, &task, &params);
 
@@ -287,23 +291,17 @@ fn wave_non_review_slot_bundle_is_untouched_when_review_model_is_set() {
     );
 }
 
-// ── Source-grep wiring: both dispatch sites read `params.project_config.review_model` ──
+// ── Source-grep: review routing flows from the plan, NOT a post-hoc override ──
 
-/// Source-grep: `run_iteration` MUST call `apply_review_model_override`
-/// with the in-scope `params.project_config.review_model`, and the result
-/// MUST flow into `effective_model` AFTER the crash/overflow escalation
-/// block (so escalation can't overwrite the routing) and BEFORE
-/// `resolve_effective_runner`.
-///
-/// Known-bad guard #1: a refactor placing the override BEFORE
-/// `ctx.model_overrides` consultation lets a stale prior-overflow override
-/// shadow the routing. The relative-order assert below catches that.
-///
-/// Known-bad guard #2: a re-read of `read_project_config(...)` here would
-/// bypass the in-scope reference — the grep on `params.project_config` is
-/// the canonical access pattern.
+/// FEAT-004 AC#9: the legacy `apply_review_model_override` post-hoc rewrite is
+/// DELETED from `run_iteration`. Review-class routing now flows from rung 3 of
+/// `resolve_execution_plan` (review → frontier tier), baked into the prompt
+/// builder's `resolved_model` before the iteration even starts. This test is a
+/// regression guard against re-introducing the post-hoc call site: it asserts
+/// the call is gone from `run_iteration` AND that the sequential prompt builder
+/// resolves through `resolve_execution_plan`.
 #[test]
-fn run_iteration_wires_review_model_override_at_the_right_spot() {
+fn run_iteration_routes_review_via_plan_not_post_hoc_override() {
     // `run_iteration` was carved into `iteration.rs` (PRD 02, FEAT-004); the
     // sequential body lives there now, not in `engine.rs`.
     let source = std::fs::read_to_string("src/loop_engine/iteration.rs")
@@ -327,71 +325,46 @@ fn run_iteration_wires_review_model_override_at_the_right_spot() {
         .unwrap_or(after_open.len());
     let body = &after_open[..body_end_rel];
 
-    // Wiring check #1: helper is called.
+    // AC#9: the post-hoc override call site is DELETED. Match the call (with
+    // the open paren) so the explanatory comment that still names the helper in
+    // backticks does not register as a call.
     assert!(
-        body.contains("apply_review_model_override("),
-        "run_iteration MUST call apply_review_model_override — the shared \
-         predicate is the single source of truth for the routing check",
+        !body.contains("apply_review_model_override("),
+        "run_iteration MUST NOT call apply_review_model_override — the post-hoc \
+         review rewrite is deleted (FEAT-004 AC#9); routing flows from rung 3 of \
+         resolve_execution_plan",
     );
 
-    // Wiring check #2: the in-scope config reference is the input.
+    // The pre-spawn coordinator and runner resolution remain wired.
     assert!(
-        body.contains("params.project_config.review_model"),
-        "run_iteration MUST read `params.project_config.review_model` — the \
-         reference is already passed in; re-reading config from disk is wrong",
+        body.contains("resolve_task_execution("),
+        "run_iteration MUST still fold crash escalation via resolve_task_execution",
+    );
+    assert!(
+        body.contains("resolve_effective_runner("),
+        "run_iteration MUST still resolve the effective runner",
     );
 
-    // Wiring check #3: the result mutates `effective_model` (not a new local
-    // that never reaches `resolve_effective_runner`).
+    // Positive side: the sequential prompt builder resolves through the single
+    // FR-003 path, which carries the review→frontier routing into resolved_model.
+    let builder = std::fs::read_to_string("src/loop_engine/prompt/sequential.rs")
+        .expect("could not read src/loop_engine/prompt/sequential.rs from tests/ cwd");
     assert!(
-        body.contains("effective_model = Some("),
-        "run_iteration MUST assign the override into `effective_model` so \
-         both runner selection and the --model flag see the new value",
-    );
-
-    // Relative-order check: the override site MUST be AFTER both the pre-spawn
-    // coordinator (`resolve_task_execution`, which folds crash escalation as of
-    // FEAT-002) and `ctx.model_overrides`, and BEFORE `resolve_effective_runner`.
-    // Otherwise escalation can overwrite the routing (known-bad path in the AC).
-    let override_idx = body
-        .find("apply_review_model_override(")
-        .expect("expected apply_review_model_override call in run_iteration body");
-    let crash_escalation_idx = body
-        .find("resolve_task_execution(")
-        .expect("expected resolve_task_execution call in run_iteration body");
-    let model_overrides_idx = body
-        .find("ctx.model_overrides.get(&task_id)")
-        .expect("expected ctx.model_overrides.get(&task_id) in run_iteration body");
-    let resolve_idx = body
-        .find("resolve_effective_runner(")
-        .expect("expected resolve_effective_runner call in run_iteration body");
-
-    assert!(
-        override_idx > crash_escalation_idx,
-        "review-model override MUST be applied AFTER the resolve_task_execution \
-         coordinator (which folds crash escalation) — otherwise escalation \
-         could overwrite the routing",
-    );
-    assert!(
-        override_idx > model_overrides_idx,
-        "review-model override MUST be applied AFTER the overflow \
-         model_overrides consultation — otherwise overflow recovery could \
-         overwrite the routing",
-    );
-    assert!(
-        override_idx < resolve_idx,
-        "review-model override MUST be applied BEFORE resolve_effective_runner \
-         so the runner selection sees the rewritten model",
+        builder.contains("resolve_execution_plan("),
+        "the sequential prompt builder MUST resolve via resolve_execution_plan — \
+         review-class routing flows from its rung 3 (review → frontier tier)",
     );
 }
 
-/// Source-grep: `run_wave_iteration` MUST call
-/// `apply_review_model_override` and mutate `slot.prompt_bundle.resolved_model`
-/// before `resolve_effective_runner` recomputes for the slot. Anything else
-/// (mutating a transient local, putting it in `runner_overrides`) sends a
-/// Claude `--model` to the Grok runner or trips the drift sentinel.
+/// FEAT-004 AC#9: the legacy `apply_review_model_override` per-slot bundle
+/// rewrite is DELETED from `run_wave_iteration`. The slot prompt builder bakes
+/// the review→frontier routing into `SlotPromptBundle::resolved_model` via
+/// `resolve_execution_plan` (rung 3) before the bundle crosses the worker
+/// boundary, so no post-hoc rewrite is needed. Regression guard: assert the
+/// call is gone from `run_wave_iteration` AND that the slot builder resolves
+/// through `resolve_execution_plan`.
 #[test]
-fn run_wave_iteration_wires_review_model_override_into_bundle() {
+fn run_wave_iteration_routes_review_via_plan_not_post_hoc_override() {
     // `run_wave_iteration` was carved into `wave_scheduler.rs` (PRD 02,
     // FEAT-003); the source-grep follows it there.
     let source = std::fs::read_to_string("src/loop_engine/wave_scheduler.rs")
@@ -414,36 +387,23 @@ fn run_wave_iteration_wires_review_model_override_into_bundle() {
         .expect("expected a top-level fn or test module after run_wave_iteration");
     let body = &after_open[..body_end_rel];
 
+    // AC#9: the per-slot post-hoc override call site is DELETED (match the call
+    // with its open paren so the explanatory comment naming the helper in
+    // backticks is not counted).
     assert!(
-        body.contains("apply_review_model_override("),
-        "run_wave_iteration MUST call apply_review_model_override — the \
-         shared predicate is the single source of truth for review routing",
-    );
-    assert!(
-        body.contains("params.project_config.review_model"),
-        "run_wave_iteration MUST read `params.project_config.review_model`",
-    );
-    // CRITICAL: mutation lands on the bundle field (not a transient local).
-    // The bundle's resolved_model is what `run_slot_iteration` reads for the
-    // `--model` flag — overriding only a local would trip the drift sentinel.
-    assert!(
-        body.contains("slot.prompt_bundle.resolved_model = Some("),
-        "run_wave_iteration MUST assign the override into \
-         `slot.prompt_bundle.resolved_model` — only the bundle field reaches \
-         both the runner selection and the slot worker's --model flag",
+        !body.contains("apply_review_model_override("),
+        "run_wave_iteration MUST NOT call apply_review_model_override — the \
+         per-slot review rewrite is deleted (FEAT-004 AC#9); routing is baked \
+         into the bundle by resolve_execution_plan rung 3",
     );
 
-    // The override MUST be applied BEFORE the per-slot
-    // `resolve_effective_runner` call so runner selection sees the rewrite.
-    let override_idx = body
-        .find("apply_review_model_override(")
-        .expect("expected apply_review_model_override call in run_wave_iteration body");
-    let resolve_idx = body
-        .find("resolve_effective_runner(")
-        .expect("expected resolve_effective_runner call in run_wave_iteration body");
+    // Positive side: the slot prompt builder resolves through the single FR-003
+    // path, carrying the review→frontier routing into the bundle's resolved_model.
+    let builder = std::fs::read_to_string("src/loop_engine/prompt/slot.rs")
+        .expect("could not read src/loop_engine/prompt/slot.rs from tests/ cwd");
     assert!(
-        override_idx < resolve_idx,
-        "wave review-model override MUST be applied BEFORE \
-         resolve_effective_runner so the runner selection sees the rewrite",
+        builder.contains("resolve_execution_plan("),
+        "the slot prompt builder MUST resolve via resolve_execution_plan — \
+         review-class routing flows from its rung 3 into SlotPromptBundle::resolved_model",
     );
 }
