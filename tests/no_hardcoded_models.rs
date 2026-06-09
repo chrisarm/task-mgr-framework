@@ -31,7 +31,7 @@ const SCAN_EXTENSIONS: &[&str] = &["rs", "json", "md", "tmpl", "toml", "yml", "y
 #[test]
 fn no_hardcoded_model_strings_outside_model_rs() {
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let pattern = regex::Regex::new(r"claude-(opus|sonnet|haiku)-\d").unwrap();
+    let pattern = regex::Regex::new(r"claude-(opus|sonnet|haiku|fable)-\d").unwrap();
 
     let mut offenders: Vec<String> = Vec::new();
     for dir in ["src", "tests"] {
@@ -42,7 +42,7 @@ fn no_hardcoded_model_strings_outside_model_rs() {
         offenders.is_empty(),
         "\nHardcoded Claude model strings found outside the canonical source of truth \
          (`src/loop_engine/model.rs`).\n\
-         Use `OPUS_MODEL` / `SONNET_MODEL` / `HAIKU_MODEL` constants or \
+         Use `OPUS_MODEL` / `SONNET_MODEL` / `HAIKU_MODEL` / `FABLE_MODEL` constants or \
          `{{{{OPUS_MODEL}}}}` placeholders in `.json.tmpl` fixtures instead.\n\n\
          Offenders:\n{}\n",
         offenders.join("\n")

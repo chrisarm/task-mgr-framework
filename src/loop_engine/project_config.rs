@@ -5,8 +5,9 @@ use std::path::Path;
 use crate::error::{TaskMgrError, TaskMgrResult};
 use crate::loop_engine::config_io::{OnCorruptJson, write_config_key_at};
 use crate::loop_engine::model::{
-    Provider, normalize_route_prefix, parse_baseline_tier_key, parse_config_provider,
-    route_prefixes_overlap,
+    CODEX_EFFORT_FOR_DIFFICULTY, CapabilityTier, EFFORT_FOR_DIFFICULTY, FABLE_MODEL, HAIKU_MODEL,
+    OPUS_MODEL, Provider, ResolvedModelsConfig, SONNET_MODEL, normalize_route_prefix,
+    parse_baseline_tier_key, parse_config_provider, route_prefixes_overlap,
 };
 
 /// Configuration for the Grok fallback runner (US-005, FR-006).
@@ -124,6 +125,513 @@ impl Default for PrimaryRunnerConfig {
             baseline_tier_routes: HashMap::new(),
         }
     }
+}
+
+// ============================================================================
+// Provider-first model config (FR-001): the `models` + `routing` blocks
+//
+// Replaces the five legacy surfaces (defaultModel, reviewModel, primaryRunner,
+// fallbackRunner). CONTRACT-001 defines the serde types + pure validation +
+// the (separate, I/O-doing) binary probe. Wiring into `ProjectConfig` and the
+// hard-break deletion of the legacy fields is FEAT-002.
+// ============================================================================
+
+/// The `models` config block: provider-first capability-tier routing policy.
+///
+/// Keys mirror the FR-001 canonical JSON. A user config is a SPARSE override
+/// merged field-wise onto [`ModelsConfig::builtin_default`] (see
+/// [`merge_models_config`]), so `{"providers":{"grok":{"enabled":true}}}` is a
+/// complete opt-in — Grok inherits the default ladder + effort table.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelsConfig {
+    /// Provider that owns unrouted / anchor-resolved tasks. Default `"claude"`.
+    /// Must parse to a [`Provider`] AND be enabled (validated).
+    #[serde(default = "default_primary_provider")]
+    pub primary_provider: String,
+    /// Anchor capability tier; the difficulty window centers here. Default
+    /// `"standard"`. Must parse to a `CapabilityTier` (validated).
+    #[serde(default = "default_anchor_tier")]
+    pub anchor: String,
+    /// Lowercase provider name (`"claude"`/`"grok"`/`"codex"`) → its config.
+    #[serde(default)]
+    pub providers: HashMap<String, ProviderConfig>,
+}
+
+/// One provider's capability ladder, per-provider effort table, and routing
+/// metadata.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderConfig {
+    /// Whether this provider may be selected. Claude defaults enabled;
+    /// grok/codex default disabled.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Kebab-case capability tier (`"cost-efficient"`) → model id. A `null`
+    /// value = "route with no model flag"; an absent tier key is undefined.
+    #[serde(default)]
+    pub tiers: HashMap<String, Option<String>>,
+    /// Difficulty (`"low"`/`"medium"`/`"high"`) → effort level. `null` value =
+    /// no effort flag. Codex must not map to `"xhigh"` (policy cap; validated).
+    #[serde(default)]
+    pub effort: HashMap<String, Option<String>>,
+    /// Tier-preserving cross-provider fallback target. Must be a DIFFERENT,
+    /// enabled provider (validated). `None` = no fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<String>,
+    /// Absolute path to this provider's CLI binary; `None` resolves the bare
+    /// name on PATH. Probed when enabled by [`probe_enabled_provider_binaries`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli_binary: Option<String>,
+}
+
+/// The `routing` config block: role-split + difficulty-spillover policy layered
+/// over the anchor window. Consumed by `resolve_execution_plan` (FEAT-004).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RoutingConfig {
+    /// Task-ID-prefix → forced route (provider + optional forced tier).
+    #[serde(default)]
+    pub by_id_prefix: HashMap<String, RouteSpec>,
+    /// Semantic task class (`"review"`/`"planning"`/`"implementation"`) →
+    /// route preferences.
+    #[serde(default)]
+    pub task_classes: HashMap<String, TaskClassRoute>,
+    /// Difficulty-spillover eligibility for quota-aware failover (FR-008).
+    #[serde(default)]
+    pub spillover: SpilloverConfig,
+    /// DEFERRED to `tasks/prd-review-cascade.md`. Captured here ONLY so
+    /// [`validate_models_config`] can reject it with a "not yet supported"
+    /// note — building the cascade is out of scope for this PRD.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_cascade: Option<serde_json::Value>,
+}
+
+/// A forced route: a provider, optionally pinned to a capability tier.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteSpec {
+    /// Provider to route to. Must be enabled (validated).
+    pub provider: String,
+    /// Optional forced capability tier (overrides the anchor window). Must
+    /// parse to a `CapabilityTier` (validated). `None` = use the anchor window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
+}
+
+/// Per-task-class routing: an ordered provider preference, an optional forced
+/// tier (e.g. review / planning → frontier), and a per-difficulty override map.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskClassRoute {
+    /// Ordered provider preference; the first enabled provider wins.
+    #[serde(default)]
+    pub provider_preference: Vec<String>,
+    /// Forced capability tier for this class. Must parse (validated).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub force_tier: Option<String>,
+    /// Difficulty → ordered provider-name override. Matches the Data Flow
+    /// Contract: `HashMap<String, Vec<String>>` (difficulty → provider names).
+    #[serde(default)]
+    pub by_difficulty: HashMap<String, Vec<String>>,
+}
+
+/// Difficulty-spillover policy for quota-aware failover (FR-008).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SpilloverConfig {
+    /// Highest task difficulty eligible to spill to another provider on quota
+    /// blackout. `None` = spillover disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_difficulty: Option<String>,
+}
+
+fn default_primary_provider() -> String {
+    Provider::Claude.as_str().to_string()
+}
+
+fn default_anchor_tier() -> String {
+    CapabilityTier::Standard.as_str().to_string()
+}
+
+/// Build a `tiers` map from typed `(tier, model)` pairs. Keeps model-ID
+/// literals confined to `model.rs` — entries reference the constants, never
+/// hardcode strings here.
+fn tier_map(entries: &[(CapabilityTier, Option<&str>)]) -> HashMap<String, Option<String>> {
+    entries
+        .iter()
+        .map(|(t, m)| (t.as_str().to_string(), m.map(str::to_string)))
+        .collect()
+}
+
+/// Build an `effort` map from a difficulty→effort table (each value is `Some`).
+fn effort_map(entries: &[(&str, &str)]) -> HashMap<String, Option<String>> {
+    entries
+        .iter()
+        .map(|(d, e)| (d.to_string(), Some(e.to_string())))
+        .collect()
+}
+
+/// Built-in default Claude provider: the full capability ladder, enabled.
+fn default_claude_provider() -> ProviderConfig {
+    ProviderConfig {
+        enabled: true,
+        tiers: tier_map(&[
+            (CapabilityTier::Cheapest, Some(HAIKU_MODEL)),
+            (CapabilityTier::CostEfficient, Some(SONNET_MODEL)),
+            (CapabilityTier::Standard, Some(OPUS_MODEL)),
+            (CapabilityTier::Frontier, Some(FABLE_MODEL)),
+        ]),
+        effort: effort_map(EFFORT_FOR_DIFFICULTY),
+        fallback: None,
+        cli_binary: None,
+    }
+}
+
+/// Built-in default Grok provider: a single `standard` rung (the only model the
+/// grok CLI exposes), disabled. One rung keeps the reverse lookup unambiguous.
+fn default_grok_provider() -> ProviderConfig {
+    ProviderConfig {
+        enabled: false,
+        tiers: tier_map(&[(CapabilityTier::Standard, Some("grok-build"))]),
+        effort: effort_map(EFFORT_FOR_DIFFICULTY),
+        fallback: None,
+        cli_binary: None,
+    }
+}
+
+/// Built-in default Codex provider: one `standard` rung with a `null` model
+/// (codex is routed provider-only and spawns with no `-m` flag), disabled.
+/// Effort is capped at `high` by the codex table.
+fn default_codex_provider() -> ProviderConfig {
+    ProviderConfig {
+        enabled: false,
+        tiers: tier_map(&[(CapabilityTier::Standard, None)]),
+        effort: effort_map(CODEX_EFFORT_FOR_DIFFICULTY),
+        fallback: None,
+        cli_binary: None,
+    }
+}
+
+impl ModelsConfig {
+    /// The built-in default `models` block: Claude enabled across the full
+    /// ladder, Grok/Codex present-but-disabled, `anchor=standard`,
+    /// `primaryProvider=claude`. A user config is merged field-wise onto this
+    /// (see [`merge_models_config`]).
+    pub fn builtin_default() -> ModelsConfig {
+        ModelsConfig {
+            primary_provider: default_primary_provider(),
+            anchor: default_anchor_tier(),
+            providers: HashMap::from([
+                (
+                    Provider::Claude.as_str().to_string(),
+                    default_claude_provider(),
+                ),
+                (Provider::Grok.as_str().to_string(), default_grok_provider()),
+                (
+                    Provider::Codex.as_str().to_string(),
+                    default_codex_provider(),
+                ),
+            ]),
+        }
+    }
+}
+
+impl Default for ModelsConfig {
+    fn default() -> Self {
+        ModelsConfig::builtin_default()
+    }
+}
+
+/// Deep-merge `overlay` onto `base` IN PLACE: two objects merge key-by-key
+/// (recursively); every other shape (scalar, array, `null`) replaces wholesale.
+/// This is the field-wise merge that makes a sparse user override a complete
+/// opt-in — a provider the user only flips `enabled` on keeps its default
+/// tier ladder, because the nested `tiers` object is never visited.
+fn deep_merge_value(base: &mut serde_json::Value, overlay: &serde_json::Value) {
+    use serde_json::Value;
+    match (base, overlay) {
+        (Value::Object(b), Value::Object(o)) => {
+            for (k, v) in o {
+                deep_merge_value(b.entry(k.clone()).or_insert(Value::Null), v);
+            }
+        }
+        (b, o) => *b = o.clone(),
+    }
+}
+
+/// Merge a user-supplied `models` JSON value onto the built-in default and
+/// deserialize the result.
+///
+/// `None` / `Some(null)` → the pure built-in default. Otherwise the override is
+/// deep-merged field-wise (see [`deep_merge_value`]) so partial provider
+/// overrides inherit every unspecified default. Returns the merged
+/// [`ModelsConfig`]; validate it with [`validate_models_config`] before use.
+pub fn merge_models_config(user: Option<&serde_json::Value>) -> Result<ModelsConfig, String> {
+    let mut base = serde_json::to_value(ModelsConfig::builtin_default())
+        .map_err(|e| format!("serializing default models config: {e}"))?;
+    if let Some(u) = user.filter(|v| !v.is_null()) {
+        deep_merge_value(&mut base, u);
+    }
+    serde_json::from_value(base).map_err(|e| format!("deserializing merged models config: {e}"))
+}
+
+/// Legacy model-config keys removed by this PRD's hard break, in canonical
+/// order. Surfaced by [`detect_legacy_model_keys`].
+const LEGACY_MODEL_KEYS: &[&str] = &[
+    "defaultModel",
+    "reviewModel",
+    "primaryRunner",
+    "fallbackRunner",
+];
+
+/// Return which legacy model-config keys appear at the TOP LEVEL of `config`,
+/// in canonical order. Empty vec = a clean post-migration config.
+///
+/// Pure: inspects the already-parsed value, no I/O. FEAT-002 wires this into
+/// the loop/batch hard-error preflight and the non-loop one-line warning.
+pub fn detect_legacy_model_keys(config: &serde_json::Value) -> Vec<&'static str> {
+    match config.as_object() {
+        Some(obj) => LEGACY_MODEL_KEYS
+            .iter()
+            .copied()
+            .filter(|k| obj.contains_key(*k))
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
+/// Pure schema + semantic validation of a (merged) `models` + `routing` block.
+///
+/// **NO I/O** — never probes a binary or touches the filesystem. That is
+/// [`probe_enabled_provider_binaries`], a SEPARATE enabled-gated function this
+/// validator never calls.
+///
+/// Returns EVERY error found (not just the first) so an operator fixes the
+/// config in one pass. Each message names the offending key and the accepted
+/// set / reason. Rejects:
+/// - unknown provider keys, unknown / legacy-alias tier keys,
+/// - a malformed or disabled `primaryProvider`, a malformed `anchor`,
+/// - ambiguous reverse model lookups (two tiers → one model),
+/// - codex effort `xhigh` (by policy),
+/// - a `fallback` to self or to a disabled / unknown provider,
+/// - routes referencing disabled / unknown providers or malformed forced tiers,
+/// - the premature `routing.reviewCascade` key (deferred — not yet supported).
+pub fn validate_models_config(
+    models: &ModelsConfig,
+    routing: &RoutingConfig,
+) -> Result<(), Vec<String>> {
+    use std::collections::HashSet;
+    let mut errors: Vec<String> = Vec::new();
+
+    // Pass 1: validate provider keys and collect the enabled set.
+    let mut enabled: HashSet<Provider> = HashSet::new();
+    for (name, pcfg) in &models.providers {
+        match parse_config_provider(name) {
+            Ok(provider) => {
+                if pcfg.enabled {
+                    enabled.insert(provider);
+                }
+            }
+            Err(e) => errors.push(format!(
+                "models.providers: invalid provider key {name:?} — {e}"
+            )),
+        }
+    }
+
+    // primaryProvider must parse AND be enabled.
+    match parse_config_provider(&models.primary_provider) {
+        Ok(p) if enabled.contains(&p) => {}
+        Ok(p) => errors.push(format!(
+            "models.primaryProvider {:?} is disabled — enable providers.{} or pick an enabled provider",
+            models.primary_provider,
+            p.as_str()
+        )),
+        Err(e) => errors.push(format!("models.primaryProvider: {e}")),
+    }
+
+    // anchor must parse to a CapabilityTier.
+    if let Err(e) = CapabilityTier::parse(&models.anchor) {
+        errors.push(format!("models.anchor: {e}"));
+    }
+
+    // Pass 2: per-provider tiers / effort / fallback.
+    for (name, pcfg) in &models.providers {
+        let provider = parse_config_provider(name).ok();
+
+        let mut seen_models: HashMap<&str, &str> = HashMap::new();
+        for (tier_key, model) in &pcfg.tiers {
+            if let Err(e) = CapabilityTier::parse(tier_key) {
+                errors.push(format!("models.providers.{name}.tiers: {e}"));
+            }
+            if let Some(m) = model.as_deref()
+                && let Some(prev) = seen_models.insert(m, tier_key)
+            {
+                errors.push(format!(
+                    "models.providers.{name}.tiers: ambiguous reverse lookup — model {m:?} \
+                     is mapped by both {prev:?} and {tier_key:?}; each model must map to at \
+                     most one tier"
+                ));
+            }
+        }
+
+        if provider == Some(Provider::Codex) {
+            for (difficulty, level) in &pcfg.effort {
+                if level
+                    .as_deref()
+                    .is_some_and(|l| l.trim().eq_ignore_ascii_case("xhigh"))
+                {
+                    errors.push(format!(
+                        "models.providers.{name}.effort.{difficulty}: codex effort \"xhigh\" is \
+                         rejected by policy (allowed: low, medium, high)"
+                    ));
+                }
+            }
+        }
+
+        if let Some(fb) = pcfg.fallback.as_deref() {
+            match parse_config_provider(fb) {
+                Ok(target) if provider == Some(target) => errors.push(format!(
+                    "models.providers.{name}.fallback: a provider cannot fall back to itself ({fb:?})"
+                )),
+                Ok(target) if !enabled.contains(&target) => errors.push(format!(
+                    "models.providers.{name}.fallback: target {fb:?} is not an enabled provider"
+                )),
+                Ok(_) => {}
+                Err(e) => errors.push(format!("models.providers.{name}.fallback: {e}")),
+            }
+        }
+    }
+
+    // Pass 3: routing routes must reference enabled providers; forced tiers
+    // must parse.
+    let check_provider_ref =
+        |errors: &mut Vec<String>, ctx: String, prov: &str| match parse_config_provider(prov) {
+            Ok(p) if enabled.contains(&p) => {}
+            Ok(p) => errors.push(format!("{ctx}: provider {:?} is not enabled", p.as_str())),
+            Err(e) => errors.push(format!("{ctx}: {e}")),
+        };
+    let check_tier = |errors: &mut Vec<String>, ctx: String, tier: &str| {
+        if let Err(e) = CapabilityTier::parse(tier) {
+            errors.push(format!("{ctx}: {e}"));
+        }
+    };
+
+    for (prefix, route) in &routing.by_id_prefix {
+        check_provider_ref(
+            &mut errors,
+            format!("routing.byIdPrefix.{prefix}.provider"),
+            &route.provider,
+        );
+        if let Some(t) = route.tier.as_deref() {
+            check_tier(&mut errors, format!("routing.byIdPrefix.{prefix}.tier"), t);
+        }
+    }
+    for (class, route) in &routing.task_classes {
+        for prov in &route.provider_preference {
+            check_provider_ref(
+                &mut errors,
+                format!("routing.taskClasses.{class}.providerPreference"),
+                prov,
+            );
+        }
+        if let Some(t) = route.force_tier.as_deref() {
+            check_tier(
+                &mut errors,
+                format!("routing.taskClasses.{class}.forceTier"),
+                t,
+            );
+        }
+        for (difficulty, provs) in &route.by_difficulty {
+            for prov in provs {
+                check_provider_ref(
+                    &mut errors,
+                    format!("routing.taskClasses.{class}.byDifficulty.{difficulty}"),
+                    prov,
+                );
+            }
+        }
+    }
+
+    // reviewCascade is deferred to the review-cascade PRD — reject up-front.
+    if routing.review_cascade.is_some() {
+        errors.push(
+            "routing.reviewCascade is not yet supported — the multi-provider review cascade is \
+             deferred to tasks/prd-review-cascade.md; remove this key"
+                .to_string(),
+        );
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+/// Verify the CLI binary of every ENABLED provider resolves to an executable.
+///
+/// SEPARATE from [`validate_models_config`] and NEVER called by it — validation
+/// is pure; this performs PATH / filesystem I/O. Disabled providers are skipped,
+/// so a Claude-only config never trips a grok/codex probe. Errors name the
+/// missing binary and how to fix it. Providers are probed in a deterministic
+/// order so a failure is reproducible.
+pub fn probe_enabled_provider_binaries(resolved: &ResolvedModelsConfig) -> TaskMgrResult<()> {
+    for (provider, cli_binary) in resolved.enabled_providers() {
+        probe_provider_binary(provider, cli_binary).map_err(|binary| TaskMgrError::NotFound {
+            resource_type: format!("{} runner binary", provider.as_str()),
+            id: format!(
+                "{binary} — install the {provider} CLI or set \
+                 models.providers.{provider}.cliBinary to an executable path, then retry",
+                provider = provider.as_str()
+            ),
+        })?;
+    }
+    Ok(())
+}
+
+/// Resolve + verify one provider's binary (env var → config override → PATH).
+fn probe_provider_binary(provider: Provider, cli_binary: Option<&str>) -> Result<(), String> {
+    let (env_var, default_name) = match provider {
+        Provider::Claude => ("CLAUDE_BINARY", "claude"),
+        Provider::Grok => ("GROK_BINARY", "grok"),
+        Provider::Codex => ("CODEX_BINARY", "codex"),
+    };
+    resolve_and_verify_named_binary(env_var, default_name, cli_binary)
+}
+
+/// Resolve a provider binary the same way the runtime runners do: `<ENV_VAR>`
+/// when set and non-blank, else `cli_binary` when non-blank, else the bare
+/// `default_name` searched on PATH. Empty / whitespace values fall through (the
+/// `export VAR=""` footgun). Returns `Err(binary_name)` when nothing executable
+/// resolves.
+fn resolve_and_verify_named_binary(
+    env_var: &str,
+    default_name: &str,
+    cli_binary: Option<&str>,
+) -> Result<(), String> {
+    let env_bin = std::env::var(env_var).ok().filter(|v| !v.trim().is_empty());
+    let cli_bin = cli_binary.filter(|v| !v.trim().is_empty());
+
+    let (binary, found) = if let Some(env_bin) = env_bin {
+        let exec = is_executable_path(Path::new(&env_bin));
+        (env_bin, exec)
+    } else if let Some(explicit) = cli_bin {
+        (
+            explicit.to_string(),
+            is_executable_path(Path::new(explicit)),
+        )
+    } else {
+        let found = std::env::var_os("PATH")
+            .map(|path_var| {
+                std::env::split_paths(&path_var)
+                    .any(|dir| is_executable_path(&dir.join(default_name)))
+            })
+            .unwrap_or(false);
+        (default_name.to_string(), found)
+    };
+
+    if found { Ok(()) } else { Err(binary) }
 }
 
 /// Per-project loop configuration read from `.task-mgr/config.json`.
@@ -3047,6 +3555,296 @@ mod tests {
         assert_eq!(
             mode, 0o644,
             "rewrite must preserve the original 0o644 mode, not narrow to the 0o600 tempfile default"
+        );
+    }
+
+    // ============ models/routing config (FR-001) ============
+
+    /// A valid baseline: a single enabled provider with one model tier.
+    fn enabled_provider_models(provider: &str, model: &str) -> ModelsConfig {
+        let mut providers = HashMap::new();
+        providers.insert(
+            provider.to_string(),
+            ProviderConfig {
+                enabled: true,
+                tiers: HashMap::from([("standard".to_string(), Some(model.to_string()))]),
+                effort: HashMap::new(),
+                fallback: None,
+                cli_binary: None,
+            },
+        );
+        ModelsConfig {
+            primary_provider: provider.to_string(),
+            anchor: "standard".to_string(),
+            providers,
+        }
+    }
+
+    #[test]
+    fn models_builtin_default_deserializes_canonical_shape() {
+        // FR-001 defaults: claude enabled, grok/codex disabled, anchor=standard,
+        // primaryProvider=claude. Round-trips through serde verbatim.
+        let cfg = ModelsConfig::builtin_default();
+        assert_eq!(cfg.primary_provider, "claude");
+        assert_eq!(cfg.anchor, "standard");
+        assert!(cfg.providers["claude"].enabled);
+        assert!(!cfg.providers["grok"].enabled);
+        assert!(!cfg.providers["codex"].enabled);
+        let value = serde_json::to_value(&cfg).unwrap();
+        let back: ModelsConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            cfg, back,
+            "ModelsConfig must round-trip through JSON verbatim"
+        );
+        // The default config + default routing is itself valid.
+        assert!(validate_models_config(&cfg, &RoutingConfig::default()).is_ok());
+    }
+
+    #[test]
+    fn merge_models_config_field_wise_optin() {
+        // {"providers":{"grok":{"enabled":true}}} is a COMPLETE opt-in.
+        let user = serde_json::json!({ "providers": { "grok": { "enabled": true } } });
+        let merged = merge_models_config(Some(&user)).unwrap();
+        assert!(merged.providers["grok"].enabled);
+        assert_eq!(
+            merged.providers["grok"].tiers.get("standard"),
+            Some(&Some("grok-build".to_string())),
+            "grok keeps its default ladder under field-wise merge"
+        );
+        assert!(merged.providers["claude"].enabled, "claude untouched");
+        // None / explicit null → pure default.
+        assert_eq!(
+            merge_models_config(None).unwrap(),
+            ModelsConfig::builtin_default()
+        );
+        assert_eq!(
+            merge_models_config(Some(&serde_json::Value::Null)).unwrap(),
+            ModelsConfig::builtin_default()
+        );
+    }
+
+    #[test]
+    fn validate_rejects_legacy_alias_and_unknown_tier_keys() {
+        let mut models = enabled_provider_models("claude", OPUS_MODEL);
+        models
+            .providers
+            .get_mut("claude")
+            .unwrap()
+            .tiers
+            .insert("opus".to_string(), Some(OPUS_MODEL.to_string()));
+        let errs = validate_models_config(&models, &RoutingConfig::default()).unwrap_err();
+        // Legacy alias rejected (ambiguity may also fire — but the tier-key
+        // error must be present and name the accepted set).
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("opus") && e.contains("cost-efficient")),
+            "legacy alias tier key must be rejected naming the accepted set: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_disabled_primary_provider() {
+        let mut models = enabled_provider_models("claude", OPUS_MODEL);
+        models.providers.get_mut("claude").unwrap().enabled = false;
+        let errs = validate_models_config(&models, &RoutingConfig::default()).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("primaryProvider") && e.contains("disabled")),
+            "disabled primaryProvider must be rejected: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_ambiguous_reverse_model_lookup() {
+        let mut models = enabled_provider_models("claude", OPUS_MODEL);
+        // Two tiers → the SAME model id → reverse lookup is ambiguous.
+        models
+            .providers
+            .get_mut("claude")
+            .unwrap()
+            .tiers
+            .insert("frontier".to_string(), Some(OPUS_MODEL.to_string()));
+        let errs = validate_models_config(&models, &RoutingConfig::default()).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("ambiguous reverse lookup")),
+            "duplicate model across tiers must be rejected: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_codex_effort_xhigh_by_policy() {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "claude".to_string(),
+            ProviderConfig {
+                enabled: true,
+                tiers: HashMap::from([("standard".to_string(), Some(OPUS_MODEL.to_string()))]),
+                ..Default::default()
+            },
+        );
+        providers.insert(
+            "codex".to_string(),
+            ProviderConfig {
+                enabled: true,
+                tiers: HashMap::from([("standard".to_string(), None)]),
+                effort: HashMap::from([("high".to_string(), Some("xhigh".to_string()))]),
+                ..Default::default()
+            },
+        );
+        let models = ModelsConfig {
+            primary_provider: "claude".to_string(),
+            anchor: "standard".to_string(),
+            providers,
+        };
+        let errs = validate_models_config(&models, &RoutingConfig::default()).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("xhigh") && e.contains("policy")),
+            "codex xhigh must be rejected by policy: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_fallback_to_self_or_disabled() {
+        // Fallback to self.
+        let mut models = enabled_provider_models("claude", OPUS_MODEL);
+        models.providers.get_mut("claude").unwrap().fallback = Some("claude".to_string());
+        let errs = validate_models_config(&models, &RoutingConfig::default()).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("fall back to itself")),
+            "self-fallback must be rejected: {errs:?}"
+        );
+        // Fallback to a disabled provider (grok present-but-disabled).
+        let mut models2 = ModelsConfig::builtin_default();
+        models2.providers.get_mut("claude").unwrap().fallback = Some("grok".to_string());
+        let errs2 = validate_models_config(&models2, &RoutingConfig::default()).unwrap_err();
+        assert!(
+            errs2
+                .iter()
+                .any(|e| e.contains("fallback") && e.contains("not an enabled provider")),
+            "fallback to disabled provider must be rejected: {errs2:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_routes_referencing_disabled_providers() {
+        let models = enabled_provider_models("claude", OPUS_MODEL);
+        let routing = RoutingConfig {
+            by_id_prefix: HashMap::from([(
+                "FEAT-".to_string(),
+                RouteSpec {
+                    provider: "grok".to_string(),
+                    tier: None,
+                },
+            )]),
+            ..Default::default()
+        };
+        let errs = validate_models_config(&models, &routing).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("byIdPrefix") && e.contains("not enabled")),
+            "route to disabled provider must be rejected: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_premature_review_cascade_key() {
+        let models = enabled_provider_models("claude", OPUS_MODEL);
+        let routing = RoutingConfig {
+            review_cascade: Some(serde_json::json!({ "stages": [] })),
+            ..Default::default()
+        };
+        let errs = validate_models_config(&models, &routing).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("reviewCascade") && e.contains("not yet supported")),
+            "reviewCascade must be rejected as deferred: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn detect_legacy_model_keys_names_each_present_key() {
+        let config = serde_json::json!({
+            "defaultModel": "x",
+            "reviewModel": "y",
+            "primaryRunner": {},
+            "fallbackRunner": {},
+            "models": {},
+            "additionalAllowedTools": []
+        });
+        assert_eq!(
+            detect_legacy_model_keys(&config),
+            vec![
+                "defaultModel",
+                "reviewModel",
+                "primaryRunner",
+                "fallbackRunner"
+            ]
+        );
+        // A clean config returns an empty vec; a non-object returns empty.
+        assert!(detect_legacy_model_keys(&serde_json::json!({ "models": {} })).is_empty());
+        assert!(detect_legacy_model_keys(&serde_json::json!([1, 2, 3])).is_empty());
+    }
+
+    #[test]
+    fn probe_skips_disabled_providers() {
+        // A disabled provider with a bogus binary must NOT trip the probe —
+        // enabled-gated. Only a disabled grok is present; nothing to probe.
+        let mut providers = HashMap::new();
+        providers.insert(
+            "grok".to_string(),
+            ProviderConfig {
+                enabled: false,
+                tiers: HashMap::from([("standard".to_string(), Some("grok-build".to_string()))]),
+                cli_binary: Some("/tmp/task-mgr-test-nonexistent-binary-xyz".to_string()),
+                ..Default::default()
+            },
+        );
+        let models = ModelsConfig {
+            primary_provider: "grok".to_string(),
+            anchor: "standard".to_string(),
+            providers,
+        };
+        let resolved =
+            crate::loop_engine::model::resolve_models_config(&models, &RoutingConfig::default());
+        assert!(
+            probe_enabled_provider_binaries(&resolved).is_ok(),
+            "disabled provider with a missing binary must be skipped"
+        );
+    }
+
+    #[test]
+    fn probe_errors_on_enabled_provider_missing_binary() {
+        use crate::loop_engine::test_utils::GROK_BINARY_MUTEX;
+        let _guard = GROK_BINARY_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        // GROK_BINARY unset so the probe checks the explicit (bogus) cliBinary.
+        unsafe { std::env::remove_var("GROK_BINARY") };
+        let mut providers = HashMap::new();
+        providers.insert(
+            "grok".to_string(),
+            ProviderConfig {
+                enabled: true,
+                tiers: HashMap::from([("standard".to_string(), Some("grok-build".to_string()))]),
+                cli_binary: Some("/tmp/task-mgr-test-nonexistent-grok-xyz".to_string()),
+                ..Default::default()
+            },
+        );
+        let models = ModelsConfig {
+            primary_provider: "grok".to_string(),
+            anchor: "standard".to_string(),
+            providers,
+        };
+        let resolved =
+            crate::loop_engine::model::resolve_models_config(&models, &RoutingConfig::default());
+        let result = probe_enabled_provider_binaries(&resolved);
+        assert!(
+            result.is_err(),
+            "enabled grok with a missing binary must error"
+        );
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("grok"),
+            "probe error must name the provider/binary; got {msg}"
         );
     }
 }

@@ -31,13 +31,26 @@
 //! the current model (currently Opus only). This gives the task a larger
 //! context window without changing effort.
 
-use crate::loop_engine::project_config::{PrimaryRunnerConfig, RunnerSpec};
+use std::collections::{BTreeMap, HashMap};
+
+use crate::loop_engine::project_config::{
+    ModelsConfig, PrimaryRunnerConfig, RoutingConfig, RunnerSpec,
+};
 
 /// Well-known model identifiers.
 pub const OPUS_MODEL: &str = "claude-opus-4-8";
 pub const OPUS_MODEL_1M: &str = "claude-opus-4-8[1m]";
 pub const SONNET_MODEL: &str = "claude-sonnet-4-6";
 pub const HAIKU_MODEL: &str = "claude-haiku-4-5-20251001";
+/// Claude Fable 5 — the frontier-tier Claude model, above Opus. Added by the
+/// model-selection redesign (FR-001); `claude-fable-5` contains no legacy tier
+/// token, which is why substring `ModelTier` classification is structurally
+/// dead and `CapabilityTier`/`tier_of` use config exact-match instead.
+pub const FABLE_MODEL: &str = "claude-fable-5";
+/// Suffix marking a 1M-context model variant (`claude-opus-4-8[1m]`).
+/// Stripped by `tier_of` before the exact config match and appended by the
+/// Claude-only 1M escalation rung. Single source of truth for the literal.
+pub const ONE_M_SUFFIX: &str = "[1m]";
 
 /// LLM provider classification.
 ///
@@ -196,6 +209,17 @@ pub fn is_review_class(id: &str) -> bool {
 /// steps `xhigh → high`; `high` is the floor.
 pub const EFFORT_FOR_DIFFICULTY: &[(&str, &str)] =
     &[("low", "medium"), ("medium", "high"), ("high", "xhigh")];
+
+/// Codex difficulty → `-c model_reasoning_effort=` level.
+///
+/// Capped at `high` BY POLICY: the codex CLI itself accepts
+/// `none|minimal|low|medium|high|xhigh` (spike-confirmed against codex-cli
+/// 0.136.0, 2026-06-09), but the loop forbids `xhigh` so a runaway reasoning
+/// budget can never be configured. `validate_models_config` rejects an `xhigh`
+/// codex effort entry naming the policy. Unlike `EFFORT_FOR_DIFFICULTY` (Claude
+/// /Grok), codex maps each difficulty to the same-named effort level.
+pub const CODEX_EFFORT_FOR_DIFFICULTY: &[(&str, &str)] =
+    &[("low", "low"), ("medium", "medium"), ("high", "high")];
 
 /// Trim + lowercase a difficulty string for table lookup. Returns `None` when
 /// the input is absent or whitespace-only so callers can short-circuit.
@@ -636,6 +660,308 @@ pub fn to_1m_model(model: Option<&str>) -> Option<&'static str> {
         Some(m) if is_1m_model(Some(m)) => None,
         Some(m) if model_tier(Some(m)) == ModelTier::Opus => Some(OPUS_MODEL_1M),
         _ => None,
+    }
+}
+
+// ============================================================================
+// Capability tiers + resolved models config (FR-001)
+//
+// The keystone of the model-selection redesign. Every provider exposes a
+// *sparse ladder* of these tiers → concrete model ids; routing picks a TIER
+// (anchor ± difficulty offset), then resolves the tier to a model per provider.
+// Adding a new model becomes a config edit, not a code change.
+// ============================================================================
+
+/// Provider-neutral capability tier, ordered least → most capable.
+///
+/// `Ord` follows declaration order (`Cheapest < CostEfficient < Standard <
+/// Frontier`), so the anchor window and sparse-ladder clamp compare and step
+/// tiers directly.
+///
+/// Unlike the legacy [`ModelTier`] (substring matching on Claude names), tier
+/// membership is **config exact-match**: a model belongs to whichever tier the
+/// provider's `tiers` map points at it. Substring matching is structurally dead
+/// (`claude-fable-5` contains no `"opus"`/`"sonnet"`/`"haiku"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CapabilityTier {
+    /// Fastest / cheapest rung.
+    Cheapest,
+    /// Cost-optimized rung.
+    CostEfficient,
+    /// Balanced default rung.
+    Standard,
+    /// Highest-capability rung.
+    Frontier,
+}
+
+impl CapabilityTier {
+    /// All tiers ascending. Array index is the tier's ladder position.
+    pub const ALL: [CapabilityTier; 4] = [
+        CapabilityTier::Cheapest,
+        CapabilityTier::CostEfficient,
+        CapabilityTier::Standard,
+        CapabilityTier::Frontier,
+    ];
+
+    /// Kebab-case wire form used as the JSON `tiers` map key. MUST stay exact —
+    /// `"cost-efficient"`, never `"cost_efficient"` — it is the literal key an
+    /// operator types in `.task-mgr/config.json`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CapabilityTier::Cheapest => "cheapest",
+            CapabilityTier::CostEfficient => "cost-efficient",
+            CapabilityTier::Standard => "standard",
+            CapabilityTier::Frontier => "frontier",
+        }
+    }
+
+    /// Strict parse of a config tier key.
+    ///
+    /// Trims + lowercases, then matches the exact kebab-case set. Every other
+    /// input — typos (`"cost_efficient"`, `"fronteir"`), legacy Claude-family
+    /// aliases (`"opus"`/`"sonnet"`/`"haiku"`), the empty string — is a CONFIG
+    /// ERROR naming the accepted set, never a silent fall-through.
+    pub fn parse(s: &str) -> Result<CapabilityTier, String> {
+        let trimmed = s.trim();
+        match trimmed.to_ascii_lowercase().as_str() {
+            "cheapest" => Ok(CapabilityTier::Cheapest),
+            "cost-efficient" => Ok(CapabilityTier::CostEfficient),
+            "standard" => Ok(CapabilityTier::Standard),
+            "frontier" => Ok(CapabilityTier::Frontier),
+            _ => Err(format!(
+                "unknown capability tier {trimmed:?} (expected one of: \
+                 cheapest, cost-efficient, standard, frontier)"
+            )),
+        }
+    }
+
+    /// Ladder index (`Cheapest = 0 … Frontier = 3`).
+    fn index(self) -> usize {
+        CapabilityTier::ALL
+            .iter()
+            .position(|t| *t == self)
+            .expect("ALL contains every CapabilityTier variant")
+    }
+
+    /// Tier at ladder `index`, or `None` when out of range.
+    fn from_index(index: usize) -> Option<CapabilityTier> {
+        CapabilityTier::ALL.get(index).copied()
+    }
+}
+
+/// Difficulty offset applied to the anchor tier: `low → −1`, `medium → 0`,
+/// `high → +1`; absent / unknown difficulty contributes `0`.
+///
+/// Derived from [`difficulty_rank`] (`low=0, medium=1, high=2`) as `rank − 1`,
+/// so the difficulty ladder and the offset window share ONE source of truth.
+fn difficulty_offset(difficulty: Option<&str>) -> isize {
+    match difficulty_rank(difficulty) {
+        Some(rank) => rank as isize - 1,
+        None => 0,
+    }
+}
+
+/// Select a capability tier from the anchor and task difficulty, clamped to the
+/// ladder ends so the offset NEVER wraps.
+///
+/// Single source of truth for anchor/tier derivation (PRD §2.6): the spawn-site
+/// resolver and every recovery path call it, so a recovering task derives the
+/// exact tier it was first routed by. With `anchor=standard`:
+/// `low→cost-efficient`, `medium→standard`, `high→frontier`. At the ends,
+/// `anchor=cheapest`+`low` saturates at `cheapest` and `anchor=frontier`+`high`
+/// saturates at `frontier` — never wrapping around the ladder.
+pub fn anchored_tier(anchor: CapabilityTier, difficulty: Option<&str>) -> CapabilityTier {
+    let target = anchor.index() as isize + difficulty_offset(difficulty);
+    let last = CapabilityTier::ALL.len() as isize - 1;
+    let clamped = target.clamp(0, last) as usize;
+    CapabilityTier::from_index(clamped).unwrap_or(anchor)
+}
+
+/// Strip a trailing 1M-context suffix ([`ONE_M_SUFFIX`], case-insensitive) for
+/// tier reverse lookup. `claude-fable-5[1m]` → `claude-fable-5`. Model ids are
+/// ASCII so the byte slice lands on a char boundary.
+fn strip_1m_suffix(model: &str) -> &str {
+    let n = ONE_M_SUFFIX.len();
+    if model.len() >= n && model[model.len() - n..].eq_ignore_ascii_case(ONE_M_SUFFIX) {
+        &model[..model.len() - n]
+    } else {
+        model
+    }
+}
+
+/// The fully-resolved execution decision for one task: which provider, which
+/// concrete model (`None` = spawn with no `-m`/`--model` flag — the provider's
+/// own default), which capability tier it landed on, and which effort level to
+/// pass. Produced by `resolve_execution_plan` (FEAT-004); this is the struct it
+/// returns and both prompt builders thread to the runner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionPlan {
+    pub provider: Provider,
+    pub model: Option<String>,
+    pub tier: CapabilityTier,
+    pub effort: Option<String>,
+}
+
+/// One provider's resolved capability ladder + effort table + routing metadata,
+/// built once per run from a merged [`ProviderConfig`](crate::loop_engine::project_config::ProviderConfig).
+#[derive(Debug, Clone, PartialEq)]
+struct ResolvedProvider {
+    enabled: bool,
+    /// Sparse tier → model map. A present key is a *defined rung* (a valid
+    /// clamp target); its value is `Some(model)` or `None` (route with no model
+    /// flag). An absent key is an *undefined rung*, skipped by clamping.
+    tiers: BTreeMap<CapabilityTier, Option<String>>,
+    /// Normalized difficulty → effort level. `None` value = no effort flag.
+    effort: HashMap<String, Option<String>>,
+    fallback: Option<Provider>,
+    cli_binary: Option<String>,
+}
+
+/// Typed, resolved view of the `models` + `routing` config, built ONCE per run.
+/// After construction all lookups are cheap, allocation-free reads.
+///
+/// `model_for` / `tier_of` / `effort_for` are the keystone lookups every
+/// downstream task consumes; `routing` is carried for the resolution chain
+/// (FEAT-004). Construction is [`resolve_models_config`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedModelsConfig {
+    pub primary_provider: Provider,
+    pub anchor: CapabilityTier,
+    providers: HashMap<Provider, ResolvedProvider>,
+    pub routing: RoutingConfig,
+}
+
+/// Build the typed [`ResolvedModelsConfig`] from a merged `models` block and its
+/// `routing` block.
+///
+/// Infallible: malformed provider/tier/difficulty keys (already rejected by
+/// [`validate_models_config`](crate::loop_engine::project_config::validate_models_config))
+/// are skipped rather than erroring, so resolution is a pure typed projection of
+/// already-validated input.
+pub fn resolve_models_config(
+    models: &ModelsConfig,
+    routing: &RoutingConfig,
+) -> ResolvedModelsConfig {
+    let mut providers = HashMap::new();
+    for (name, pcfg) in &models.providers {
+        let Ok(provider) = parse_config_provider(name) else {
+            continue;
+        };
+        let mut tiers = BTreeMap::new();
+        for (tier_key, model) in &pcfg.tiers {
+            if let Ok(tier) = CapabilityTier::parse(tier_key) {
+                tiers.insert(tier, model.clone());
+            }
+        }
+        let mut effort = HashMap::new();
+        for (difficulty, level) in &pcfg.effort {
+            if let Some(norm) = normalize_difficulty(Some(difficulty)) {
+                effort.insert(norm, level.clone());
+            }
+        }
+        let fallback = pcfg
+            .fallback
+            .as_deref()
+            .and_then(|f| parse_config_provider(f).ok());
+        providers.insert(
+            provider,
+            ResolvedProvider {
+                enabled: pcfg.enabled,
+                tiers,
+                effort,
+                fallback,
+                cli_binary: pcfg.cli_binary.clone(),
+            },
+        );
+    }
+    let primary_provider =
+        parse_config_provider(&models.primary_provider).unwrap_or(Provider::Claude);
+    let anchor = CapabilityTier::parse(&models.anchor).unwrap_or(CapabilityTier::Standard);
+    ResolvedModelsConfig {
+        primary_provider,
+        anchor,
+        providers,
+        routing: routing.clone(),
+    }
+}
+
+impl ResolvedModelsConfig {
+    /// Concrete model for `(provider, tier)` with sparse-ladder clamping.
+    ///
+    /// Finds the nearest *defined* rung to `tier` — distance 0 first, then each
+    /// successive distance checking DOWN before UP (so an equidistant tie
+    /// resolves to the cheaper tier) — and returns that rung's value. `None`
+    /// means "route with no model flag": either the nearest defined rung holds
+    /// a `null` value, or the provider has no defined rung at all (or is absent
+    /// from the config entirely).
+    pub fn model_for(&self, provider: Provider, tier: CapabilityTier) -> Option<&str> {
+        let p = self.providers.get(&provider)?;
+        let target = tier.index() as isize;
+        let len = CapabilityTier::ALL.len() as isize;
+        for d in 0..len {
+            for cand in [target - d, target + d] {
+                if (0..len).contains(&cand) {
+                    let t = CapabilityTier::from_index(cand as usize)
+                        .expect("cand bounded to ladder range");
+                    if let Some(value) = p.tiers.get(&t) {
+                        return value.as_deref();
+                    }
+                }
+                if d == 0 {
+                    break; // distance 0 is a single tier; do not check it twice
+                }
+            }
+        }
+        None
+    }
+
+    /// Reverse lookup: which tier does `model` belong to for `provider`?
+    ///
+    /// Strips a trailing [`ONE_M_SUFFIX`] before an EXACT config match (so
+    /// `claude-fable-5[1m]` → `Frontier`). Substring matching is dead. Returns
+    /// `None` when the provider is absent or no tier maps to the model.
+    /// `validate_models_config` guarantees each model maps to at most one tier,
+    /// so the match is unambiguous.
+    pub fn tier_of(&self, provider: Provider, model: &str) -> Option<CapabilityTier> {
+        let base = strip_1m_suffix(model);
+        let p = self.providers.get(&provider)?;
+        p.tiers
+            .iter()
+            .find(|(_, value)| value.as_deref() == Some(base))
+            .map(|(tier, _)| *tier)
+    }
+
+    /// Effort level for `(provider, difficulty)` from the provider's table.
+    ///
+    /// Reuses the shared [`normalize_difficulty`] — there is NO second
+    /// difficulty normalizer. `None` = no effort flag (absent difficulty,
+    /// unknown difficulty, absent provider, or an explicit `null` table entry).
+    pub fn effort_for(&self, provider: Provider, difficulty: Option<&str>) -> Option<&str> {
+        let p = self.providers.get(&provider)?;
+        let norm = normalize_difficulty(difficulty)?;
+        p.effort.get(&norm)?.as_deref()
+    }
+
+    /// Enabled providers paired with their configured CLI-binary override, for
+    /// the binary probe. Resolution methods never touch the filesystem;
+    /// `probe_enabled_provider_binaries` consumes this to do the I/O separately.
+    pub fn enabled_providers(&self) -> Vec<(Provider, Option<&str>)> {
+        let mut out: Vec<(Provider, Option<&str>)> = self
+            .providers
+            .iter()
+            .filter(|(_, p)| p.enabled)
+            .map(|(provider, p)| (*provider, p.cli_binary.as_deref()))
+            .collect();
+        // Deterministic order (HashMap iteration is unspecified) so probe
+        // failures are reproducible.
+        out.sort_by_key(|(provider, _)| provider.as_str());
+        out
+    }
+
+    /// The configured tier-preserving fallback provider for `provider`, if any.
+    /// Used by the cross-provider recovery rung (FEAT-007).
+    pub fn fallback_provider(&self, provider: Provider) -> Option<Provider> {
+        self.providers.get(&provider).and_then(|p| p.fallback)
     }
 }
 
@@ -2171,5 +2497,377 @@ mod tests {
                 "round-trip through as_str → parse_config_provider must be lossless for {p:?}",
             );
         }
+    }
+
+    // ============ CapabilityTier + ResolvedModelsConfig (FR-001) ============
+
+    use crate::loop_engine::project_config::{ModelsConfig, ProviderConfig, RoutingConfig};
+
+    /// Build a production-shaped single-provider `ResolvedModelsConfig` from a
+    /// sparse tier ladder. Uses the real `ProviderConfig`/`ModelsConfig` structs
+    /// through `resolve_models_config` — NOT a hand-rolled map — so the tests
+    /// exercise the same path the deserializer feeds.
+    fn resolved_single(
+        provider: Provider,
+        tiers: &[(CapabilityTier, Option<&str>)],
+    ) -> ResolvedModelsConfig {
+        let mut providers = HashMap::new();
+        providers.insert(
+            provider.as_str().to_string(),
+            ProviderConfig {
+                enabled: true,
+                tiers: tiers
+                    .iter()
+                    .map(|(t, m)| (t.as_str().to_string(), m.map(str::to_string)))
+                    .collect(),
+                effort: HashMap::new(),
+                fallback: None,
+                cli_binary: None,
+            },
+        );
+        let models = ModelsConfig {
+            primary_provider: provider.as_str().to_string(),
+            anchor: CapabilityTier::Standard.as_str().to_string(),
+            providers,
+        };
+        resolve_models_config(&models, &RoutingConfig::default())
+    }
+
+    #[test]
+    fn capability_tier_as_str_is_exact_kebab_case() {
+        assert_eq!(CapabilityTier::Cheapest.as_str(), "cheapest");
+        assert_eq!(CapabilityTier::CostEfficient.as_str(), "cost-efficient");
+        assert_eq!(CapabilityTier::Standard.as_str(), "standard");
+        assert_eq!(CapabilityTier::Frontier.as_str(), "frontier");
+        // The footgun this pins: snake_case must NEVER leak into the wire form.
+        assert_ne!(CapabilityTier::CostEfficient.as_str(), "cost_efficient");
+    }
+
+    #[test]
+    fn capability_tier_parse_accepts_canonical_and_round_trips() {
+        for tier in CapabilityTier::ALL {
+            assert_eq!(CapabilityTier::parse(tier.as_str()), Ok(tier));
+        }
+        // Trim + case-insensitive.
+        assert_eq!(
+            CapabilityTier::parse("  COST-EFFICIENT \n"),
+            Ok(CapabilityTier::CostEfficient)
+        );
+    }
+
+    #[test]
+    fn capability_tier_parse_rejects_typos_and_legacy_aliases() {
+        // Legacy Claude-family aliases must NOT be accepted as tier keys.
+        for bad in ["opus", "sonnet", "haiku", "cost_efficient", "fronteir", ""] {
+            let err = CapabilityTier::parse(bad).unwrap_err();
+            assert!(
+                err.contains("cheapest")
+                    && err.contains("cost-efficient")
+                    && err.contains("standard")
+                    && err.contains("frontier"),
+                "error for {bad:?} must name the accepted set; got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn capability_tier_is_ordered_ascending() {
+        assert!(CapabilityTier::Cheapest < CapabilityTier::CostEfficient);
+        assert!(CapabilityTier::CostEfficient < CapabilityTier::Standard);
+        assert!(CapabilityTier::Standard < CapabilityTier::Frontier);
+    }
+
+    #[test]
+    fn capability_tier_model_for_full_ladder_exact() {
+        let r = resolved_single(
+            Provider::Claude,
+            &[
+                (CapabilityTier::Cheapest, Some(HAIKU_MODEL)),
+                (CapabilityTier::CostEfficient, Some(SONNET_MODEL)),
+                (CapabilityTier::Standard, Some(OPUS_MODEL)),
+                (CapabilityTier::Frontier, Some(FABLE_MODEL)),
+            ],
+        );
+        assert_eq!(
+            r.model_for(Provider::Claude, CapabilityTier::Cheapest),
+            Some(HAIKU_MODEL)
+        );
+        assert_eq!(
+            r.model_for(Provider::Claude, CapabilityTier::CostEfficient),
+            Some(SONNET_MODEL)
+        );
+        assert_eq!(
+            r.model_for(Provider::Claude, CapabilityTier::Standard),
+            Some(OPUS_MODEL)
+        );
+        assert_eq!(
+            r.model_for(Provider::Claude, CapabilityTier::Frontier),
+            Some(FABLE_MODEL)
+        );
+    }
+
+    #[test]
+    fn capability_tier_model_for_single_tier_ladder_clamps_every_request() {
+        // Only Standard defined → EVERY requested tier clamps to it.
+        let r = resolved_single(
+            Provider::Claude,
+            &[(CapabilityTier::Standard, Some(OPUS_MODEL))],
+        );
+        for tier in CapabilityTier::ALL {
+            assert_eq!(
+                r.model_for(Provider::Claude, tier),
+                Some(OPUS_MODEL),
+                "tier {tier:?} should clamp to the only defined rung"
+            );
+        }
+    }
+
+    #[test]
+    fn capability_tier_model_for_gap_ladder_nearest_down_first() {
+        // Only cheapest + frontier defined (the gap-ladder case).
+        let r = resolved_single(
+            Provider::Claude,
+            &[
+                (CapabilityTier::Cheapest, Some(HAIKU_MODEL)),
+                (CapabilityTier::Frontier, Some(FABLE_MODEL)),
+            ],
+        );
+        // Exact rungs.
+        assert_eq!(
+            r.model_for(Provider::Claude, CapabilityTier::Cheapest),
+            Some(HAIKU_MODEL)
+        );
+        assert_eq!(
+            r.model_for(Provider::Claude, CapabilityTier::Frontier),
+            Some(FABLE_MODEL)
+        );
+        // CostEfficient: cheapest(dist 1) beats frontier(dist 2) → down wins.
+        assert_eq!(
+            r.model_for(Provider::Claude, CapabilityTier::CostEfficient),
+            Some(HAIKU_MODEL)
+        );
+        // Standard: frontier(dist 1) beats cheapest(dist 2) → nearest is up.
+        assert_eq!(
+            r.model_for(Provider::Claude, CapabilityTier::Standard),
+            Some(FABLE_MODEL)
+        );
+    }
+
+    #[test]
+    fn capability_tier_model_for_null_value_routes_with_no_flag() {
+        // A defined rung whose value is null = route-with-no-model-flag.
+        let r = resolved_single(Provider::Claude, &[(CapabilityTier::Standard, None)]);
+        assert_eq!(
+            r.model_for(Provider::Claude, CapabilityTier::Standard),
+            None,
+            "null value at the defined rung → None (no -m flag)"
+        );
+        // Frontier clamps down to the only defined (null) rung → still None.
+        assert_eq!(
+            r.model_for(Provider::Claude, CapabilityTier::Frontier),
+            None
+        );
+    }
+
+    #[test]
+    fn capability_tier_model_for_absent_provider_is_none() {
+        let r = resolved_single(
+            Provider::Claude,
+            &[(CapabilityTier::Standard, Some(OPUS_MODEL))],
+        );
+        assert_eq!(r.model_for(Provider::Grok, CapabilityTier::Standard), None);
+    }
+
+    #[test]
+    fn capability_tier_tier_of_exact_match_and_1m_strip() {
+        let r = resolved_single(
+            Provider::Claude,
+            &[
+                (CapabilityTier::Cheapest, Some(HAIKU_MODEL)),
+                (CapabilityTier::Standard, Some(OPUS_MODEL)),
+                (CapabilityTier::Frontier, Some(FABLE_MODEL)),
+            ],
+        );
+        assert_eq!(
+            r.tier_of(Provider::Claude, OPUS_MODEL),
+            Some(CapabilityTier::Standard)
+        );
+        assert_eq!(
+            r.tier_of(Provider::Claude, HAIKU_MODEL),
+            Some(CapabilityTier::Cheapest)
+        );
+        // [1m] suffix stripped before the exact match.
+        assert_eq!(
+            r.tier_of(Provider::Claude, "claude-fable-5[1m]"),
+            Some(CapabilityTier::Frontier)
+        );
+        assert_eq!(
+            r.tier_of(Provider::Claude, OPUS_MODEL_1M),
+            Some(CapabilityTier::Standard)
+        );
+        // Unknown model / wrong provider → None (no substring fallback).
+        assert_eq!(r.tier_of(Provider::Claude, "gpt-4"), None);
+        assert_eq!(r.tier_of(Provider::Grok, OPUS_MODEL), None);
+    }
+
+    #[test]
+    fn capability_tier_effort_for_uses_shared_normalizer() {
+        let mut providers = HashMap::new();
+        providers.insert(
+            Provider::Claude.as_str().to_string(),
+            ProviderConfig {
+                enabled: true,
+                tiers: HashMap::from([("standard".to_string(), Some(OPUS_MODEL.to_string()))]),
+                effort: HashMap::from([
+                    ("low".to_string(), Some("medium".to_string())),
+                    ("high".to_string(), None), // explicit null = no flag
+                ]),
+                fallback: None,
+                cli_binary: None,
+            },
+        );
+        let models = ModelsConfig {
+            primary_provider: "claude".to_string(),
+            anchor: "standard".to_string(),
+            providers,
+        };
+        let r = resolve_models_config(&models, &RoutingConfig::default());
+        // Normalized lookup (trim + lowercase) via the shared normalize_difficulty.
+        assert_eq!(
+            r.effort_for(Provider::Claude, Some("  LOW ")),
+            Some("medium")
+        );
+        // Explicit null entry → None.
+        assert_eq!(r.effort_for(Provider::Claude, Some("high")), None);
+        // Unknown difficulty / None / absent provider → None.
+        assert_eq!(r.effort_for(Provider::Claude, Some("medium")), None);
+        assert_eq!(r.effort_for(Provider::Claude, None), None);
+        assert_eq!(r.effort_for(Provider::Grok, Some("low")), None);
+    }
+
+    #[test]
+    fn capability_tier_anchored_tier_window_and_end_clamps() {
+        use CapabilityTier::*;
+        // anchor=standard window.
+        assert_eq!(anchored_tier(Standard, Some("low")), CostEfficient);
+        assert_eq!(anchored_tier(Standard, Some("medium")), Standard);
+        assert_eq!(anchored_tier(Standard, Some("high")), Frontier);
+        // Absent / unknown difficulty → anchor itself (offset 0).
+        assert_eq!(anchored_tier(Standard, None), Standard);
+        assert_eq!(anchored_tier(Standard, Some("trivial")), Standard);
+        // End clamps: offset never wraps.
+        assert_eq!(
+            anchored_tier(Cheapest, Some("low")),
+            Cheapest,
+            "cheapest−1 clamps"
+        );
+        assert_eq!(anchored_tier(Cheapest, Some("high")), CostEfficient);
+        assert_eq!(
+            anchored_tier(Frontier, Some("high")),
+            Frontier,
+            "frontier+1 clamps"
+        );
+        assert_eq!(anchored_tier(Frontier, Some("low")), Standard);
+    }
+
+    #[test]
+    fn capability_tier_default_anchor_standard_sanity() {
+        // PRD success metric: default config + anchor=standard →
+        // low=sonnet, medium=opus, high=fable.
+        let r = resolve_models_config(&ModelsConfig::builtin_default(), &RoutingConfig::default());
+        assert_eq!(r.anchor, CapabilityTier::Standard);
+        for (difficulty, expected) in [
+            ("low", SONNET_MODEL),
+            ("medium", OPUS_MODEL),
+            ("high", FABLE_MODEL),
+        ] {
+            let tier = anchored_tier(r.anchor, Some(difficulty));
+            assert_eq!(
+                r.model_for(Provider::Claude, tier),
+                Some(expected),
+                "anchor=standard, difficulty={difficulty}"
+            );
+        }
+    }
+
+    #[test]
+    fn capability_tier_anchor_cost_efficient_sanity() {
+        // anchor=cost-efficient → low=haiku, medium=sonnet, high=opus.
+        let mut models = ModelsConfig::builtin_default();
+        models.anchor = CapabilityTier::CostEfficient.as_str().to_string();
+        let r = resolve_models_config(&models, &RoutingConfig::default());
+        for (difficulty, expected) in [
+            ("low", HAIKU_MODEL),
+            ("medium", SONNET_MODEL),
+            ("high", OPUS_MODEL),
+        ] {
+            let tier = anchored_tier(r.anchor, Some(difficulty));
+            assert_eq!(
+                r.model_for(Provider::Claude, tier),
+                Some(expected),
+                "anchor=cost-efficient, difficulty={difficulty}"
+            );
+        }
+    }
+
+    #[test]
+    fn capability_tier_grok_enable_is_complete_optin_via_field_merge() {
+        // {"providers":{"grok":{"enabled":true}}} must be a COMPLETE opt-in:
+        // grok inherits the default ladder + effort table, just flips enabled.
+        let user = serde_json::json!({ "providers": { "grok": { "enabled": true } } });
+        let merged = crate::loop_engine::project_config::merge_models_config(Some(&user)).unwrap();
+        let grok = merged
+            .providers
+            .get("grok")
+            .expect("grok present after merge");
+        assert!(grok.enabled, "user override flips enabled");
+        assert_eq!(
+            grok.tiers.get("standard"),
+            Some(&Some("grok-build".to_string())),
+            "grok inherits its default tier ladder"
+        );
+        assert!(
+            !grok.effort.is_empty(),
+            "grok inherits its default effort table"
+        );
+        // Untouched providers keep their defaults.
+        assert!(merged.providers.get("claude").unwrap().enabled);
+        assert!(!merged.providers.get("codex").unwrap().enabled);
+    }
+
+    #[test]
+    fn capability_tier_resolve_skips_unparseable_keys() {
+        // resolve is a typed projection of VALIDATED input; defensively it
+        // skips a junk provider/tier key rather than panicking.
+        let mut providers = HashMap::new();
+        providers.insert(
+            "claude".to_string(),
+            ProviderConfig {
+                enabled: true,
+                tiers: HashMap::from([
+                    ("standard".to_string(), Some(OPUS_MODEL.to_string())),
+                    ("bogus-tier".to_string(), Some("x".to_string())),
+                ]),
+                effort: HashMap::new(),
+                fallback: None,
+                cli_binary: None,
+            },
+        );
+        providers.insert(
+            "openai".to_string(), // unparseable provider key
+            ProviderConfig::default(),
+        );
+        let models = ModelsConfig {
+            primary_provider: "claude".to_string(),
+            anchor: "standard".to_string(),
+            providers,
+        };
+        let r = resolve_models_config(&models, &RoutingConfig::default());
+        assert_eq!(
+            r.model_for(Provider::Claude, CapabilityTier::Standard),
+            Some(OPUS_MODEL)
+        );
+        // The bogus tier key never created a rung.
+        assert_eq!(r.tier_of(Provider::Claude, "x"), None);
     }
 }
