@@ -249,6 +249,7 @@ fn run_once(
         files_modified: &[],
         effective_model: None,
         effective_effort: None,
+        effective_runner: None,
         slot_index: cfg.slot_index,
     });
 
@@ -1217,6 +1218,7 @@ fn sequential_call_site_destructures_full_params(params: ProcessingParams<'_>) {
         files_modified: _,
         effective_model: _,
         effective_effort: _,
+        effective_runner: _,
         slot_index: _,
     } = params;
 }
@@ -1247,6 +1249,7 @@ fn wave_call_site_destructures_full_params(params: ProcessingParams<'_>) {
         files_modified: _,
         effective_model: _,
         effective_effort: _,
+        effective_runner: _,
         slot_index: _,
     } = params;
 }
@@ -1287,6 +1290,7 @@ fn fr006_both_call_sites_handle_every_processing_param_field() {
         files_modified: &[],
         effective_model: None,
         effective_effort: None,
+        effective_runner: None,
         slot_index: None,
     };
     sequential_call_site_destructures_full_params(sequential);
@@ -1316,6 +1320,7 @@ fn fr006_both_call_sites_handle_every_processing_param_field() {
         files_modified: &[],
         effective_model: None,
         effective_effort: None,
+        effective_runner: None,
         slot_index: Some(1),
     };
     wave_call_site_destructures_full_params(wave);

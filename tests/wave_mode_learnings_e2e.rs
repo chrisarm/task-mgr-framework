@@ -224,6 +224,7 @@ fn wave_mode_learnings_and_bandit_feedback_sql_metrics() {
             files_modified: &[],
             effective_model: None,
             effective_effort: None,
+            effective_runner: None,
             slot_index: Some(slot_idx),
         });
 

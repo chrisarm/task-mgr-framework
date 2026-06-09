@@ -683,6 +683,7 @@ mod tests {
             requires_human: false,
             human_review_timeout: None,
             claims_shared_infra: None,
+            completed_by_provider: None,
         };
 
         let summary = TaskSummary::from(&task);

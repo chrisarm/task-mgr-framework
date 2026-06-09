@@ -78,9 +78,11 @@ use crate::loop_engine::engine::IterationContext;
 use crate::loop_engine::engine::apply_status_updates;
 use crate::loop_engine::feedback;
 use crate::loop_engine::git_reconcile::check_git_for_task_completion;
+use crate::loop_engine::model::Provider;
 use crate::loop_engine::output_parsing::{parse_completed_tasks, scan_output_for_completed_tasks};
 use crate::loop_engine::prd_reconcile::{mark_task_done, update_prd_task_passes};
 use crate::loop_engine::progress;
+use crate::loop_engine::runner::RunnerKind;
 use crate::loop_engine::signals::SignalFlag;
 use crate::output::ui;
 
@@ -183,6 +185,10 @@ pub struct ProcessingParams<'a> {
     /// progress log entry. `None` when difficulty is unset/unknown or for
     /// early-exit paths.
     pub effective_effort: Option<&'static str>,
+    /// Effective runner kind for this iteration (Claude/Grok/Codex).
+    /// Threaded from IterationResult/SlotResult (already resolved at spawn
+    /// time) so the completion arm can stamp without re-deriving.
+    pub effective_runner: Option<RunnerKind>,
     /// Slot index when the pipeline runs from a parallel wave; `None` for
     /// the sequential `run_loop` call site. Threaded into the progress log
     /// entry header (`Slot N`) so wave entries are distinguishable.
@@ -221,6 +227,7 @@ pub fn process_iteration_output(params: ProcessingParams<'_>) -> ProcessingOutco
         files_modified,
         effective_model,
         effective_effort,
+        effective_runner,
         slot_index,
     } = params;
 
@@ -457,6 +464,38 @@ pub fn process_iteration_output(params: ProcessingParams<'_>) -> ProcessingOutco
                 "Task {} completed (reported as already done)",
                 claimed_id
             ));
+        }
+
+        // v20 provider stamping (single home, both paths).
+        // Fires on the completion arm for the *claimed* task of this iteration
+        // (the one whose effective_runner/model describe the run that produced
+        // this output). Stores Provider::as_str values, never model strings.
+        // Also records the (provider, model) pair on the matching run_tasks row.
+        if task_marked_done && let Some(runner) = effective_runner {
+            let prov = match runner {
+                RunnerKind::Claude => Provider::Claude.as_str(),
+                RunnerKind::Grok => Provider::Grok.as_str(),
+                RunnerKind::Codex => Provider::Codex.as_str(),
+            };
+            if let Err(e) = conn.execute(
+                "UPDATE tasks SET completed_by_provider = ?1 WHERE id = ?2",
+                [prov, claimed_id],
+            ) {
+                tracing::warn!(
+                    "failed to stamp completed_by_provider for {}: {}",
+                    claimed_id,
+                    e
+                );
+            }
+            // Best-effort stamp of the run_tasks attempt (run_id, task_id, iteration).
+            // iteration is u32 in params; run_tasks uses INTEGER.
+            let iter_i32 = i32::try_from(iteration).unwrap_or(i32::MAX);
+            if let Err(e) = conn.execute(
+                "UPDATE run_tasks SET provider = ?1, model = ?2 WHERE run_id = ?3 AND task_id = ?4 AND iteration = ?5",
+                rusqlite::params![prov, effective_model, run_id, claimed_id, iter_i32],
+            ) {
+                tracing::warn!("failed to stamp run_tasks provider/model for run={} task={}: {}", run_id, claimed_id, e);
+            }
         }
     }
 

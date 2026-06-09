@@ -123,6 +123,7 @@ fn run_pipeline_crash(
         files_modified: &[],
         effective_model: None,
         effective_effort: None,
+        effective_runner: None,
         slot_index: None,
     });
     outcome
@@ -157,6 +158,7 @@ fn run_pipeline_noop(
         files_modified: &[],
         effective_model: None,
         effective_effort: None,
+        effective_runner: None,
         slot_index: None,
     });
     outcome
@@ -193,6 +195,7 @@ fn run_pipeline_completion(
         files_modified: &[],
         effective_model: None,
         effective_effort: None,
+        effective_runner: None,
         slot_index: None,
     });
     outcome

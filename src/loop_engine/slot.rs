@@ -644,6 +644,7 @@ pub(super) fn process_slot_result(
             files_modified: &slot_result.iteration_result.files_modified,
             effective_model: slot_result.iteration_result.effective_model.as_deref(),
             effective_effort: slot_result.iteration_result.effective_effort,
+            effective_runner: slot_result.iteration_result.effective_runner,
             slot_index: Some(slot_idx),
         });
 

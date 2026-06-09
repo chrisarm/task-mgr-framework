@@ -382,6 +382,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                 files_modified: &result.files_modified,
                 effective_model: result.effective_model.as_deref(),
                 effective_effort: result.effective_effort,
+                effective_runner: result.effective_runner,
                 slot_index: None,
             });
         tasks_completed += processing_outcome.tasks_completed;

@@ -94,6 +94,15 @@ pub struct RunTaskExport {
     /// Additional notes about this execution
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
+
+    /// Provider for the execution (from v20 stamping). May be NULL for
+    /// historical exports or pre-completion rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+
+    /// Model for the execution (from v20 stamping).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 impl RunTaskExport {
@@ -108,6 +117,8 @@ impl RunTaskExport {
             ended_at: None,
             duration_seconds: None,
             notes: None,
+            provider: None,
+            model: None,
         }
     }
 }

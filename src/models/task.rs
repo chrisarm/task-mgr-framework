@@ -230,6 +230,13 @@ pub struct Task {
     /// `claims_shared_infra` column.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claims_shared_infra: Option<bool>,
+
+    /// Provider that completed this task (set exclusively by stamping in
+    /// process_iteration_output on the done arm). Stores lowercase values from
+    /// Provider::as_str ("claude" | "grok" | "codex"), never a model string.
+    /// NULL for historical rows and for any task not yet Done.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_by_provider: Option<String>,
 }
 
 fn default_max_retries() -> i32 {
@@ -269,6 +276,7 @@ impl Task {
             requires_human: false,
             human_review_timeout: None,
             claims_shared_infra: None,
+            completed_by_provider: None,
         }
     }
 
@@ -367,6 +375,8 @@ impl TryFrom<&Row<'_>> for Task {
                 .ok()
                 .flatten()
                 .map(|v| v != 0),
+            // New in v20; graceful for pre-migration rows or direct Row construction in tests.
+            completed_by_provider: row.get("completed_by_provider").ok().flatten(),
         })
     }
 }
