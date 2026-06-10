@@ -196,13 +196,23 @@ pub fn is_frontier_class(id: &str) -> bool {
 
 /// Mapping from task difficulty to Claude CLI `--effort` level.
 ///
-/// Scaling: low difficulty → medium effort, medium → high, high → xhigh.
+/// Scaling: low → low, medium → medium, high → high.
 /// Unset / unknown difficulty → no `--effort` flag (CLI default applies).
 ///
-/// The ladder intentionally stops below `max`: `max` consistently overshot the
-/// model context budget on long iterations (observed repeated
-/// `Prompt is too long` failures on Opus 4.7). On overflow, `downgrade_effort`
-/// steps `xhigh → high`; `high` is the floor.
+/// Intentionally capped at `high` (not `xhigh`): `xhigh` overshoots the
+/// context budget on frontier models. On overflow, `downgrade_effort` steps
+/// `high → medium`; `medium` is the floor.
+pub const CLAUDE_EFFORT_FOR_DIFFICULTY: &[(&str, &str)] =
+    &[("low", "low"), ("medium", "medium"), ("high", "high")];
+
+/// Grok difficulty → `--effort` level.
+///
+/// Scaling: low → medium, medium → high, high → xhigh.
+pub const GROK_EFFORT_FOR_DIFFICULTY: &[(&str, &str)] =
+    &[("low", "medium"), ("medium", "high"), ("high", "xhigh")];
+
+/// Static fallback used by prompt builders when no per-provider effort entry is
+/// found. Identical to `GROK_EFFORT_FOR_DIFFICULTY`.
 pub const EFFORT_FOR_DIFFICULTY: &[(&str, &str)] =
     &[("low", "medium"), ("medium", "high"), ("high", "xhigh")];
 

@@ -4,9 +4,9 @@ use std::path::Path;
 
 use crate::error::{TaskMgrError, TaskMgrResult};
 use crate::loop_engine::model::{
-    CLAUDE_DEFAULT_TIER_MODELS, CODEX_DEFAULT_TIER_MODELS, CODEX_EFFORT_FOR_DIFFICULTY,
-    CapabilityTier, EFFORT_FOR_DIFFICULTY, GROK_DEFAULT_TIER_MODELS, Provider,
-    ResolvedModelsConfig, parse_config_provider,
+    CLAUDE_DEFAULT_TIER_MODELS, CLAUDE_EFFORT_FOR_DIFFICULTY, CODEX_DEFAULT_TIER_MODELS,
+    CODEX_EFFORT_FOR_DIFFICULTY, CapabilityTier, GROK_DEFAULT_TIER_MODELS,
+    GROK_EFFORT_FOR_DIFFICULTY, Provider, ResolvedModelsConfig, parse_config_provider,
 };
 
 // ============================================================================
@@ -190,7 +190,7 @@ fn default_claude_provider() -> ProviderConfig {
     ProviderConfig {
         enabled: true,
         tiers: tier_map_from_defaults(CLAUDE_DEFAULT_TIER_MODELS),
-        effort: effort_map(EFFORT_FOR_DIFFICULTY),
+        effort: effort_map(CLAUDE_EFFORT_FOR_DIFFICULTY),
         fallback: None,
         cli_binary: None,
     }
@@ -202,7 +202,7 @@ fn default_grok_provider() -> ProviderConfig {
     ProviderConfig {
         enabled: false,
         tiers: tier_map_from_defaults(GROK_DEFAULT_TIER_MODELS),
-        effort: effort_map(EFFORT_FOR_DIFFICULTY),
+        effort: effort_map(GROK_EFFORT_FOR_DIFFICULTY),
         fallback: None,
         cli_binary: None,
     }
