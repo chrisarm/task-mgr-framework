@@ -381,6 +381,17 @@ pub struct BuildPromptParams<'a> {
     /// Routing policy block (FR-001) consumed by `resolve_execution_plan`.
     /// Threaded from `ProjectConfig::routing`.
     pub routing_config: &'a crate::loop_engine::project_config::RoutingConfig,
+    /// FEAT-008: providers under an active quota blackout this iteration
+    /// (`ctx.provider_blackouts.active(now)`). Fed to `resolve_execution_plan`
+    /// so a spillover-eligible task reroutes off a blacked-out provider at spawn
+    /// time, consistent with `excluded_ids`. Empty (the default) → no reroute.
+    pub provider_blackouts: std::collections::HashSet<crate::loop_engine::model::Provider>,
+    /// FEAT-008: todo task ids that are quota-deferred this iteration
+    /// (`reactions::pre_spawn::compute_quota_excluded_ids`). Threaded into
+    /// selection via `next::next_excluding` so a doomed task is never picked;
+    /// an all-excluded queue yields the no-eligible result and the deferral
+    /// branch waits. Empty (the default) → identical to pre-FEAT-008 selection.
+    pub excluded_ids: std::collections::HashSet<String>,
 }
 
 /// Build a prompt for the current iteration.
@@ -395,14 +406,17 @@ pub struct BuildPromptParams<'a> {
 ///
 /// Returns `None` if no tasks remain.
 pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<PromptResult>> {
-    // Step 1: Select and claim a task
-    let next_result = next::next(
+    // Step 1: Select and claim a task. FEAT-008: thread the quota-deferred
+    // `excluded_ids` so a task resolving to a blacked-out provider it cannot
+    // reroute off of is never selected.
+    let next_result = next::next_excluding(
         params.dir,
         params.after_files,
         true,
         params.run_id,
         params.verbose,
         params.task_prefix,
+        &params.excluded_ids,
     )?;
 
     let task_output = match next_result.task {
@@ -419,15 +433,14 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
         params.models_config,
         params.routing_config,
     );
-    // FEAT-004 callers pass no blackouts; FEAT-008 wires the quota-blackout set.
-    let no_blackouts = std::collections::HashSet::new();
     let plan = crate::loop_engine::model::resolve_execution_plan(
         &crate::loop_engine::model::PlanContext {
             task_id: &task_output.id,
             task_model: task_output.model.as_deref(),
             difficulty: task_output.difficulty.as_deref(),
             models: &resolved_models,
-            provider_blackouts: &no_blackouts,
+            // FEAT-008: reroute off any blacked-out provider at spawn time.
+            provider_blackouts: &params.provider_blackouts,
         },
     );
     let resolved_model = plan.model.clone();
@@ -837,6 +850,8 @@ mod tests {
             primary_runner: None,
             models_config: crate::loop_engine::project_config::default_models_config(),
             routing_config: crate::loop_engine::project_config::default_routing_config(),
+            provider_blackouts: Default::default(),
+            excluded_ids: Default::default(),
         }
     }
 
@@ -1053,6 +1068,8 @@ mod tests {
             primary_runner: None,
             models_config: crate::loop_engine::project_config::default_models_config(),
             routing_config: crate::loop_engine::project_config::default_routing_config(),
+            provider_blackouts: Default::default(),
+            excluded_ids: Default::default(),
         };
 
         let result = build_prompt(&params)
@@ -1427,6 +1444,8 @@ pub enum ApiError {
             primary_runner: None,
             models_config: crate::loop_engine::project_config::default_models_config(),
             routing_config: crate::loop_engine::project_config::default_routing_config(),
+            provider_blackouts: Default::default(),
+            excluded_ids: Default::default(),
         };
 
         let result = build_prompt(&params)
@@ -1550,6 +1569,8 @@ pub enum ApiError {
             primary_runner: None,
             models_config: crate::loop_engine::project_config::default_models_config(),
             routing_config: crate::loop_engine::project_config::default_routing_config(),
+            provider_blackouts: Default::default(),
+            excluded_ids: Default::default(),
         };
 
         let result = build_prompt(&params)
@@ -1602,6 +1623,8 @@ pub enum ApiError {
             primary_runner: None,
             models_config: crate::loop_engine::project_config::default_models_config(),
             routing_config: crate::loop_engine::project_config::default_routing_config(),
+            provider_blackouts: Default::default(),
+            excluded_ids: Default::default(),
         };
 
         let result = build_prompt(&params)
@@ -2138,6 +2161,8 @@ pub enum ApiError {
             primary_runner: None,
             models_config: crate::loop_engine::project_config::default_models_config(),
             routing_config: crate::loop_engine::project_config::default_routing_config(),
+            provider_blackouts: Default::default(),
+            excluded_ids: Default::default(),
         };
 
         let result = build_prompt(&params)
@@ -2196,6 +2221,8 @@ pub enum ApiError {
             primary_runner: None,
             models_config: crate::loop_engine::project_config::default_models_config(),
             routing_config: crate::loop_engine::project_config::default_routing_config(),
+            provider_blackouts: Default::default(),
+            excluded_ids: Default::default(),
         };
 
         let result = build_prompt(&params)
@@ -2246,6 +2273,8 @@ pub enum ApiError {
             primary_runner: None,
             models_config: crate::loop_engine::project_config::default_models_config(),
             routing_config: crate::loop_engine::project_config::default_routing_config(),
+            provider_blackouts: Default::default(),
+            excluded_ids: Default::default(),
         };
 
         // next::next uses dir for DB access — task should be found
@@ -3172,6 +3201,8 @@ pub enum ApiError {
             primary_runner: None,
             models_config: crate::loop_engine::project_config::default_models_config(),
             routing_config: crate::loop_engine::project_config::default_routing_config(),
+            provider_blackouts: Default::default(),
+            excluded_ids: Default::default(),
         };
 
         let result = build_prompt(&params)
@@ -3266,6 +3297,8 @@ pub enum ApiError {
             primary_runner: None,
             models_config: crate::loop_engine::project_config::default_models_config(),
             routing_config: crate::loop_engine::project_config::default_routing_config(),
+            provider_blackouts: Default::default(),
+            excluded_ids: Default::default(),
         };
 
         let result = build_prompt(&params)
@@ -3420,6 +3453,8 @@ pub enum ApiError {
             primary_runner: None,
             models_config: crate::loop_engine::project_config::default_models_config(),
             routing_config: crate::loop_engine::project_config::default_routing_config(),
+            provider_blackouts: Default::default(),
+            excluded_ids: Default::default(),
         };
 
         let result = build_prompt(&params)
@@ -3548,6 +3583,8 @@ pub enum ApiError {
             primary_runner: None,
             models_config: crate::loop_engine::project_config::default_models_config(),
             routing_config: crate::loop_engine::project_config::default_routing_config(),
+            provider_blackouts: Default::default(),
+            excluded_ids: Default::default(),
         };
 
         let result = build_prompt(&params)

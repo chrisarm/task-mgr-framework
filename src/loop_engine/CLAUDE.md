@@ -208,6 +208,25 @@ purely for the guard and discards the returned `PendingPromotion`.
 `claudeFallbackModel` absent → no Grok→Claude fallback. The Grok task
 dead-ends on `blocked` exactly as a Claude task without `fallbackRunner` does.
 
+> ⚠️ Footgun (FEAT-008 quota blackout channel): `IterationContext::provider_blackouts`
+> (a `BlackoutState`) is a SEPARATE, EPHEMERAL channel from `runner_overrides`,
+> and the two must NEVER touch. `runner_overrides` is the PERMANENT
+> cross-provider promotion channel owned by `promote_once` (a task crosses the
+> provider boundary at most once per run). `provider_blackouts` is the
+> per-pass, self-expiring quota-reroute channel: it is written ONLY by the
+> account-level rate-limit reaction (`reactions::account::react_to_outputs`),
+> read at the spawn-side resolver (`model::resolve_execution_plan` via
+> `BlackoutState::active`), the quota-deferral wait
+> (`reactions::account::handle_quota_deferral`), and the excluded-id computation
+> (`reactions::pre_spawn::compute_quota_excluded_ids`). It is never persisted
+> (no DB column, no serde) and is cleared on restart by design. `promote_once`
+> and every `runner_overrides` site MUST NOT read or write `provider_blackouts`,
+> and the blackout reroute MUST NOT write `runner_overrides` — an implementation
+> that promoted a spillover via `runner_overrides` would permanently pin the
+> task to the spillover provider for the rest of the run (the known-bad pinned
+> by `tests/model_selection_engine_edges.rs::blackout_reroute_leaves_runner_overrides_untouched`).
+> The two channels are derived independently per pass; do not collapse them.
+
 **Stream-C (grok child stderr capture, FEAT-006)**: Raw grok stderr (telemetry, HTML errors, etc.) is captured by a sniffer thread to `.task-mgr/logs/<prefix>-<run>-<slot>-iterN-grok-stderr.log` (path announced via `ui::emit`; never teed to console). The capture file is the permanent artifact for post-run inspection. Classifier-based extraction/surfacing of notable lines from these files into the operator or learnings flow is deferred to FEAT-014 (intentionally decoupled).
 
 ## Reaction framework (shared)

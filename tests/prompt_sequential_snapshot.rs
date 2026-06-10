@@ -226,6 +226,8 @@ fn render_prompt(conn: &Connection, base_prompt_path: &Path) -> String {
         primary_runner: None,
         models_config: task_mgr::loop_engine::project_config::default_models_config(),
         routing_config: task_mgr::loop_engine::project_config::default_routing_config(),
+        provider_blackouts: Default::default(),
+        excluded_ids: Default::default(),
     };
 
     let result = build_prompt(&params)

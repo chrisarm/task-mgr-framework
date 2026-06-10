@@ -573,6 +573,33 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
 
         // Track consecutive stale iterations and abort if stuck
         if matches!(result.outcome, IterationOutcome::NoEligibleTasks) {
+            // FEAT-008 deferral-first — ordered BEFORE drained classification
+            // and the stale tracker, in parity with the wave path's
+            // `handle_no_eligible_tasks`. When a provider blackout is active and
+            // todo work remains, the empty selection is quota-DEFERRAL, not a
+            // stale or drained queue: wait for the reset (reusing
+            // `wait_for_usage_reset`), clear the blackout, and retry WITHOUT
+            // marking the stale tracker (learning 3927).
+            let now = crate::loop_engine::engine::now_unix_secs();
+            match reactions::account::handle_quota_deferral(
+                &conn,
+                task_prefix.as_deref(),
+                &mut ctx.provider_blackouts,
+                now,
+                &paths.tasks_dir,
+                usage_params.fallback_wait,
+            ) {
+                reactions::account::QuotaDeferral::Inactive => {}
+                reactions::account::QuotaDeferral::Deferred { stopped: true } => {
+                    exit_code = 130;
+                    exit_reason = "stop signal during quota-blackout wait".to_string();
+                    break;
+                }
+                reactions::account::QuotaDeferral::Deferred { stopped: false } => {
+                    ui::emit("Quota blackout reset — retrying task selection...");
+                    continue;
+                }
+            }
             // Drained-but-stuck short-circuit (shared with the wave path): if
             // no schedulable work remains and only blocked/skipped tasks are
             // left, exit immediately with the classifier's named verdict

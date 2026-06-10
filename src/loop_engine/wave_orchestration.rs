@@ -183,6 +183,52 @@ pub(super) fn handle_no_eligible_tasks(
     let task_prefix = params.task_prefix;
     let prd_path = params.prd_path;
 
+    // (0) FEAT-008 deferral-first — ordered BEFORE drained classification,
+    // auto-recovery, and the stale tracker. When a provider blackout is active
+    // and todo work remains, the empty selection is quota-DEFERRAL (every
+    // candidate resolves to a blacked-out provider it cannot reroute off of),
+    // NOT a stale or drained queue. Wait for the reset reusing the existing
+    // `wait_for_usage_reset` machinery (no busy-spin), clear the blackout, and
+    // retry WITHOUT touching the stale tracker (learning 3927). The wait gives
+    // back the loop-bound iteration (B2) and skips the FEAT-002 reset/halt
+    // check (B3) exactly like a rate-limit retry wave.
+    let now = crate::loop_engine::engine::now_unix_secs();
+    match reactions::account::handle_quota_deferral(
+        params.conn,
+        task_prefix,
+        &mut ctx.provider_blackouts,
+        now,
+        params.tasks_dir,
+        params.usage_params.fallback_wait,
+    ) {
+        reactions::account::QuotaDeferral::Inactive => {}
+        reactions::account::QuotaDeferral::Deferred { stopped: true } => {
+            return WaveOutcome {
+                tasks_completed: 0,
+                iteration_consumed: true,
+                terminal: Some(WaveTerminal {
+                    exit_code: 130,
+                    reason: "stop signal during quota-blackout wait".to_string(),
+                    run_status: None,
+                }),
+                was_stopped: true,
+                failed_merges: Vec::new(),
+                rate_limited_retry: false,
+            };
+        }
+        reactions::account::QuotaDeferral::Deferred { stopped: false } => {
+            ui::emit("Quota blackout reset — retrying task selection next wave...");
+            return WaveOutcome {
+                tasks_completed: 0,
+                iteration_consumed: false,
+                terminal: None,
+                was_stopped: false,
+                failed_merges: Vec::new(),
+                rate_limited_retry: true,
+            };
+        }
+    }
+
     // (1) Queue genuinely drained → terminal completion exit, NOT a stale
     // failure. The classifier separates a fully-successful drain (exit 0) from
     // one where tasks were left blocked/skipped (non-zero exit, named reason)

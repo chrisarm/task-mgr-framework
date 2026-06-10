@@ -215,6 +215,100 @@ pub struct IterationResult {
     pub shown_learning_ids: Vec<i64>,
 }
 
+/// Current wall-clock time as whole seconds since the Unix epoch.
+///
+/// Single home for the "now" the in-memory quota-blackout channel
+/// ([`BlackoutState`]) and its deferral wait are keyed on. A pre-epoch clock
+/// (only possible on a badly-misconfigured host) saturates to `0` rather than
+/// panicking, so a blackout simply reads as already-expired.
+pub fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// In-memory, self-expiring, provider-keyed quota-blackout channel that lives
+/// ONLY on [`IterationContext`] (FR-008). Three load-bearing rules — encoded
+/// here so the next reader does not have to reconstruct them:
+///
+/// 1. **Never persisted.** No DB column, no serde, no disk. A blackout reflects
+///    transient account-level quota state, not durable task state. The channel
+///    is empty at process start and is **cleared on restart by design** — a
+///    fresh loop never inherits a stale blackout.
+/// 2. **Never read or written by `promote_once` / `runner_overrides`.** This is
+///    the EPHEMERAL per-pass reroute channel; `runner_overrides` is the
+///    PERMANENT cross-provider promotion channel owned by
+///    `recovery::promote_once`. Mixing them would pin a task to the spillover
+///    provider for the rest of the run (the `blackout_reroute_*` known-bad in
+///    `tests/model_selection_engine_edges.rs`). The two channels never touch.
+/// 3. **Set only by account-level rate-limit signals.** `record` is called
+///    exclusively from the post-output rate-limit reaction
+///    (`reactions::account::react_to_outputs`); a per-task crash, overflow, or
+///    RuntimeError never writes here.
+///
+/// Each entry maps a [`model::Provider`] to the Unix-epoch second at which its
+/// blackout expires. Queries take an explicit `now_secs` (so callers/tests
+/// control the clock); expired entries are filtered lazily, so the channel
+/// self-clears on expiry without a sweep.
+#[derive(Debug, Default)]
+pub struct BlackoutState {
+    /// provider → Unix-epoch-seconds expiry.
+    until: std::collections::HashMap<model::Provider, u64>,
+}
+
+impl BlackoutState {
+    /// Record `provider` blacked out until `now_secs + reset_secs`. A later
+    /// signal for the same provider extends (never shortens) the window.
+    pub fn record(&mut self, provider: model::Provider, now_secs: u64, reset_secs: u64) {
+        let expiry = now_secs.saturating_add(reset_secs);
+        self.until
+            .entry(provider)
+            .and_modify(|e| *e = (*e).max(expiry))
+            .or_insert(expiry);
+    }
+
+    /// The set of providers still under blackout at `now_secs` (expired entries
+    /// excluded — the self-clearing read). This is the `HashSet<Provider>`
+    /// threaded into `model::PlanContext::provider_blackouts`.
+    pub fn active(&self, now_secs: u64) -> std::collections::HashSet<model::Provider> {
+        self.until
+            .iter()
+            .filter(|(_, expiry)| **expiry > now_secs)
+            .map(|(p, _)| *p)
+            .collect()
+    }
+
+    /// Whether any provider is still blacked out at `now_secs`.
+    pub fn any_active(&self, now_secs: u64) -> bool {
+        self.until.values().any(|&expiry| expiry > now_secs)
+    }
+
+    /// Longest remaining blackout window in seconds at `now_secs` (`0` when no
+    /// entry is still active). Drives the deferral-first wait so it sleeps until
+    /// the LAST blacked-out provider reopens.
+    pub fn max_remaining_secs(&self, now_secs: u64) -> u64 {
+        self.until
+            .values()
+            .filter(|&&expiry| expiry > now_secs)
+            .map(|&expiry| expiry - now_secs)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Drop every blackout entry — called after a deferral wait completes so the
+    /// next selection pass re-evaluates eligibility against a clean channel.
+    pub fn clear(&mut self) {
+        self.until.clear();
+    }
+
+    /// Whether the channel currently holds no entries at all (used by the
+    /// runner-overrides-untouched discriminator and restart semantics).
+    pub fn is_empty(&self) -> bool {
+        self.until.is_empty()
+    }
+}
+
 /// Mutable context carried between iterations.
 pub struct IterationContext {
     /// Last commit hash from previous iteration
@@ -329,6 +423,14 @@ pub struct IterationContext {
     /// path. Loop-thread-local (the reaction runs on the main thread in both
     /// paths), preserving the no-Mutex contract.
     pub transient_backend_attempts: u32,
+    /// In-memory quota-blackout channel (FR-008, FEAT-008). Provider-keyed,
+    /// self-expiring, NEVER persisted, and NEVER touched by
+    /// `promote_once` / `runner_overrides`. Written only by the account-level
+    /// rate-limit reaction (`reactions::account::react_to_outputs`) and read at
+    /// the spawn-side resolver (`model::resolve_execution_plan` via
+    /// [`BlackoutState::active`]), the quota-deferral wait, and the
+    /// excluded-id computation. See [`BlackoutState`] for the three rules.
+    pub provider_blackouts: BlackoutState,
 }
 
 impl IterationContext {
@@ -353,6 +455,7 @@ impl IterationContext {
             runner_overrides: std::collections::HashMap::new(),
             overflow_original_task_model: std::collections::HashMap::new(),
             transient_backend_attempts: 0,
+            provider_blackouts: BlackoutState::default(),
         }
     }
 }

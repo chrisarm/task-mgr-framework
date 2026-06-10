@@ -3547,6 +3547,7 @@ mod tests {
     fn spillover_eligibility_respects_class_and_max_difficulty() {
         let spill = SpilloverConfig {
             max_difficulty: Some("medium".to_string()),
+            ..SpilloverConfig::default()
         };
         assert!(is_spillover_eligible(
             TaskClass::Implementation,

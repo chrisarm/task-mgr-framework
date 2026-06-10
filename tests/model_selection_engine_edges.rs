@@ -37,13 +37,15 @@ use task_mgr::commands::models::{SetDefaultOpts, handle_set_default};
 use task_mgr::db::{create_schema, open_connection, run_migrations};
 use task_mgr::loop_engine::engine::IterationContext;
 use task_mgr::loop_engine::model::{
-    CODEX_EFFORT_FOR_DIFFICULTY, CapabilityTier, FABLE_MODEL, HAIKU_MODEL, OPUS_MODEL, Provider,
-    SONNET_MODEL, anchored_tier, provider_for_model, resolve_models_config,
+    CODEX_EFFORT_FOR_DIFFICULTY, CapabilityTier, FABLE_MODEL, HAIKU_MODEL, OPUS_MODEL, PlanContext,
+    Provider, SONNET_MODEL, anchored_tier, provider_for_model, resolve_execution_plan,
+    resolve_models_config,
 };
 use task_mgr::loop_engine::project_config::{
     ModelsConfig, RoutingConfig, detect_legacy_model_keys, preflight_validate_and_probe,
     read_project_config, validate_models_config,
 };
+use task_mgr::loop_engine::reactions::account::{QuotaDeferral, handle_quota_deferral_inner};
 use task_mgr::loop_engine::reactions::pre_spawn::invalidate_stale_overrides;
 use task_mgr::loop_engine::runner::RunnerKind;
 
@@ -393,23 +395,51 @@ fn edge_case_0_anchor_resolved_null_escape_valve_fires_exactly_once() {
 /// via `provider_blackouts`) and drive each path's no-eligible handler, then
 /// assert `stale_tracker.count()` is still 0. `provider_blackouts` must never
 /// read or write `runner_overrides` (see `blackout_reroute_*` discriminator).
-#[ignore = "un-ignored by FEAT-008: deferral-first branch (wave handle_no_eligible_tasks + sequential parity) must wait for quota reset without marking stale"]
 #[test]
 fn edge_case_1_all_candidates_quota_deferred_stale_counter_untouched_both_paths() {
-    let ctx = IterationContext::new(5);
+    let (_dir, conn) = setup_db();
+    // Todo work remains under an active (Claude) quota blackout: a non-empty
+    // queue whose only candidate resolves to a blacked-out provider it cannot
+    // reroute off of. Selection returns empty → the no-eligible handler runs.
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, max_retries, consecutive_failures) \
+         VALUES ('DEFER-001', 'deferred', 'todo', 5, 0)",
+        [],
+    )
+    .unwrap();
+
+    let mut ctx = IterationContext::new(5);
     // Baseline: a fresh tracker has counted nothing.
     assert_eq!(ctx.stale_tracker.count(), 0);
 
-    // <FEAT-008: drive the SEQUENTIAL no-eligible handler under a full quota
-    //  blackout here, then assert the counter is still 0.>
+    // Injected wait that completes immediately (no real sleep / OAuth / usage
+    // API). A `false` return models a `.stop` during the wait. Both no-eligible
+    // paths route their deferral-first branch through THIS exact helper
+    // (`handle_quota_deferral_inner`) BEFORE any stale marking, so driving it is
+    // driving the single-source-of-truth both handlers share.
+    let now = 1_000_000u64;
+    let wait = |_secs: u64| true;
+
+    // SEQUENTIAL no-eligible path: arm a full blackout and run the deferral-first
+    // SSoT. It must report Deferred (the empty selection was quota-deferral) and
+    // NEVER touch the stale tracker (the helper has no access to it by design).
+    ctx.provider_blackouts.record(Provider::Claude, now, 3600);
+    let seq = handle_quota_deferral_inner(&conn, None, &mut ctx.provider_blackouts, now, &wait);
+    assert_eq!(seq, QuotaDeferral::Deferred { stopped: false });
+    // Self-clear: the blackout is dropped after the wait completes.
+    assert!(ctx.provider_blackouts.is_empty());
     assert_eq!(
         ctx.stale_tracker.count(),
         0,
         "sequential deferral-first path must not increment the stale counter"
     );
 
-    // <FEAT-008: drive the WAVE handle_no_eligible_tasks under a full quota
-    //  blackout here (same fixture), then assert the counter is still 0.>
+    // WAVE `handle_no_eligible_tasks` routes its deferral-first branch through the
+    // SAME helper (parity). Re-arm the blackout (the prior call cleared it) and
+    // drive it again on the same fixture.
+    ctx.provider_blackouts.record(Provider::Claude, now, 3600);
+    let wave = handle_quota_deferral_inner(&conn, None, &mut ctx.provider_blackouts, now, &wait);
+    assert_eq!(wave, QuotaDeferral::Deferred { stopped: false });
     assert_eq!(
         ctx.stale_tracker.count(),
         0,
@@ -536,15 +566,64 @@ fn edge_case_3_legacy_keys_hard_error_at_loop_warn_on_nonloop() {
 /// (learning 4921/4672). A blackout reroute that promoted via `runner_overrides`
 /// would permanently pin the task to the spillover provider for the rest of the
 /// run — exactly the known-bad this test catches.
-#[ignore = "un-ignored by FEAT-008: provider_blackouts reroute must leave runner_overrides untouched (promote_once stays the single permanent-promotion guard)"]
 #[test]
 fn blackout_reroute_leaves_runner_overrides_untouched() {
-    let ctx = IterationContext::new(5);
+    // Production-shaped models config (FR-001 JSON): Claude primary + Grok
+    // enabled, anchor standard, spillover up to `high`.
+    let models: ModelsConfig = serde_json::from_value(serde_json::json!({
+        "primaryProvider": "claude",
+        "anchor": "standard",
+        "providers": {
+            "claude": {
+                "enabled": true,
+                "tiers": {
+                    "cost-efficient": HAIKU_MODEL,
+                    "standard": SONNET_MODEL,
+                    "frontier": OPUS_MODEL
+                }
+            },
+            "grok": {
+                "enabled": true,
+                "tiers": {
+                    "cost-efficient": "grok-build",
+                    "standard": "grok-build",
+                    "frontier": "grok-build"
+                }
+            }
+        }
+    }))
+    .unwrap();
+    let routing: RoutingConfig =
+        serde_json::from_value(serde_json::json!({ "spillover": { "maxDifficulty": "high" } }))
+            .unwrap();
+    let resolved = resolve_models_config(&models, &routing);
+
+    let mut ctx = IterationContext::new(5);
     assert!(ctx.runner_overrides.is_empty());
 
-    // <FEAT-008: apply a provider_blackouts quota reroute for a deferred task
-    //  here, then assert runner_overrides is STILL empty.>
+    // Record a Claude quota blackout on the EPHEMERAL channel and resolve a
+    // spillover-eligible (medium) implementation task against it.
+    let now = 1_000_000u64;
+    ctx.provider_blackouts.record(Provider::Claude, now, 3600);
+    let active = ctx.provider_blackouts.active(now);
+    let plan = resolve_execution_plan(&PlanContext {
+        task_id: "FEAT-1",
+        task_model: None,
+        difficulty: Some("medium"),
+        models: &resolved,
+        provider_blackouts: &active,
+    });
 
+    // The reroute moved the task OFF the blacked-out provider...
+    assert_eq!(
+        plan.provider,
+        Provider::Grok,
+        "a spillover-eligible task must reroute off the blacked-out primary provider"
+    );
+    // ...purely through the ephemeral blackout channel. `runner_overrides` (the
+    // permanent cross-provider promotion channel owned by `promote_once`) is the
+    // known-bad discriminator: an implementation that promoted via it would
+    // permanently pin the task to the spillover provider for the rest of the run.
     assert!(
         ctx.runner_overrides.is_empty(),
         "blackout reroute must NOT write the permanent-promotion channel; \

@@ -16,6 +16,8 @@ use rusqlite::Connection;
 
 use crate::lifecycle::TaskLifecycle;
 use crate::loop_engine::config::{IterationOutcome, PermissionMode};
+use crate::loop_engine::engine::BlackoutState;
+use crate::loop_engine::model::Provider;
 use crate::loop_engine::recovery::probe_rate_limit_lifted;
 use crate::loop_engine::usage::{UsageCheckResult, check_usage_api};
 use crate::loop_engine::{display, oauth, signals};
@@ -121,6 +123,24 @@ pub enum AccountReaction {
     /// The usage wait was interrupted by a `.stop` signal. The caller stops
     /// (sequential: `should_stop` early return; wave: terminal exit 130).
     Stop,
+    /// FEAT-008 quota-aware failover: a Claude rate-limit hit while
+    /// difficulty-spillover is enabled. A provider blackout was **freshly**
+    /// recorded on `ctx.provider_blackouts` from the reset timestamp (or
+    /// `blackoutFallbackSecs` when unparseable), the affected `in_progress`
+    /// task(s) were reset to `todo`, and the wait was **skipped** — the next
+    /// selection pass reroutes spillover-eligible work to another provider and
+    /// the no-eligible deferral branch waits only if EVERYTHING is
+    /// quota-deferred. Caller treats it exactly like [`WaitedAndRetry`] for the
+    /// budget give-back (B2) and the merge-fail-streak preservation (B3) — it
+    /// simply did not block. NEVER touches `runner_overrides`.
+    RerouteAndRetry,
+    /// FEAT-008: a Claude rate-limit hit while spillover is enabled AND the
+    /// provider was **already** under an active blackout (a prior wave recorded
+    /// it). The window is extended; no fresh reset is implied. Treated
+    /// identically to [`RerouteAndRetry`] by both callers — distinguished only
+    /// so the reaction does not misreport a re-entrant rate-limit as a brand-new
+    /// blackout. NEVER touches `runner_overrides`.
+    ProceedWithSpillover,
 }
 
 /// One per-slot (or the single sequential) output the reaction inspects.
@@ -174,6 +194,20 @@ pub struct AccountReactionParams<'a> {
     /// (`probe_rate_limit_lifted`) in the production wait closure. Unused by
     /// the hermetic [`react_to_outputs_inner`] (the wait is injected there).
     pub permission_mode: &'a PermissionMode,
+    /// FEAT-008: whether difficulty-spillover is configured
+    /// (`routing.spillover.maxDifficulty` is set). `false` → the reaction takes
+    /// the legacy reset-and-wait path, byte-identical to pre-FEAT-008.
+    pub spillover_enabled: bool,
+    /// FEAT-008: the provider a Claude rate-limit blacks out (the resolved
+    /// `models.primary_provider`; Claude in v1). Used only on the spillover
+    /// path.
+    pub primary_provider: Provider,
+    /// FEAT-008: blackout window (seconds) recorded when the rate-limit reset
+    /// timestamp is unparseable (`routing.spillover.blackoutFallbackSecs`).
+    pub blackout_fallback_secs: u64,
+    /// FEAT-008: the "now" (Unix-epoch seconds) the blackout expiry is keyed on.
+    /// Threaded as an input so the spillover path is deterministic in tests.
+    pub now_secs: u64,
 }
 
 /// Post-output rate-limit reaction (production entry point). Builds the real
@@ -186,6 +220,7 @@ pub fn react_to_outputs(
     conn: &mut Connection,
     items: &[OutputReactionItem<'_>],
     params: &AccountReactionParams<'_>,
+    blackout: &mut BlackoutState,
 ) -> AccountReaction {
     // Exhaustive destructure (no `..`) — the single-home parity lock. Adding a
     // field to `AccountReactionParams` forces this coordinator to account for
@@ -199,6 +234,10 @@ pub fn react_to_outputs(
         prefix: _,
         run_id: _,
         permission_mode,
+        spillover_enabled: _,
+        primary_provider: _,
+        blackout_fallback_secs: _,
+        now_secs: _,
     } = params;
 
     let wait = |wait_secs: u64| -> bool {
@@ -217,7 +256,7 @@ pub fn react_to_outputs(
         wait_for_usage_reset(wait_secs, tasks_dir, fallback_wait, Some(&probe))
     };
 
-    react_to_outputs_inner(conn, items, params, &wait)
+    react_to_outputs_inner(conn, items, params, blackout, &wait)
 }
 
 /// Hermetic core of the post-output rate-limit reaction. Detects `RateLimit`
@@ -229,6 +268,7 @@ pub fn react_to_outputs_inner(
     conn: &mut Connection,
     items: &[OutputReactionItem<'_>],
     params: &AccountReactionParams<'_>,
+    blackout: &mut BlackoutState,
     wait: WaitFn<'_>,
 ) -> AccountReaction {
     // No `RateLimit` item ⇒ nothing to do. ZERO DB writes, no wait.
@@ -244,18 +284,136 @@ pub fn react_to_outputs_inner(
     // wave/iteration re-runs them. Slots that already completed THIS wave
     // (flipped to `done` by `process_slot_result`) are never clobbered
     // (FEAT-006 B1) — the `status = 'in_progress'` guard is inside the helper.
+    // Runs in BOTH the spillover and the legacy paths.
     reset_in_progress_tasks(conn, params.run_id, params.prefix, "rate limit");
 
-    // Compute the wait once from the FIRST rate-limited output, then fire the
-    // injected wait seam EXACTLY once for the whole wave — never once per
-    // rate-limited slot.
-    let wait_secs =
-        parse_reset_from_output(first_rate_limited.output).unwrap_or(params.fallback_wait);
+    // The reset timestamp is parsed once from the FIRST rate-limited output and
+    // shared by both paths (the spillover blackout window and the legacy wait).
+    let reset_secs = parse_reset_from_output(first_rate_limited.output);
 
+    // FEAT-008 quota-aware failover. When difficulty-spillover is enabled, the
+    // shared account's primary provider is blacked out (ephemerally, on
+    // `ctx.provider_blackouts`) and the wait is SKIPPED: the next selection pass
+    // reroutes spillover-eligible work to another provider, and the no-eligible
+    // deferral branch waits only if EVERY remaining task is quota-deferred. This
+    // channel is EPHEMERAL — it never reads or writes `runner_overrides` (the
+    // permanent cross-provider promotion channel owned by `promote_once`). With
+    // spillover DISABLED (the default), this branch is skipped entirely and the
+    // reaction is byte-identical to the pre-FEAT-008 reset-and-wait path.
+    if params.spillover_enabled {
+        let blackout_secs = reset_secs.unwrap_or(params.blackout_fallback_secs);
+        let already_active = blackout
+            .active(params.now_secs)
+            .contains(&params.primary_provider);
+        blackout.record(params.primary_provider, params.now_secs, blackout_secs);
+        return if already_active {
+            AccountReaction::ProceedWithSpillover
+        } else {
+            AccountReaction::RerouteAndRetry
+        };
+    }
+
+    // Legacy reset-and-wait path. Compute the wait once and fire the injected
+    // wait seam EXACTLY once for the whole wave — never once per rate-limited
+    // slot.
+    let wait_secs = reset_secs.unwrap_or(params.fallback_wait);
     if wait(wait_secs) {
         AccountReaction::WaitedAndRetry
     } else {
         AccountReaction::Stop
+    }
+}
+
+/// FEAT-008 deferral-first outcome — the verdict BOTH no-eligible paths (wave
+/// `handle_no_eligible_tasks` and the sequential `NoEligibleTasks` branch) get
+/// from [`handle_quota_deferral`] BEFORE any stale / auto-recovery / drained
+/// classification.
+#[derive(Debug, PartialEq, Eq)]
+pub enum QuotaDeferral {
+    /// No provider blackout is active (or it expired, or no todo work remains).
+    /// The caller proceeds to its normal auto-recovery / stale logic. Any
+    /// expired-but-lingering blackout was cleared as a side effect.
+    Inactive,
+    /// A provider blackout is active AND todo work remains: the empty selection
+    /// is quota-DEFERRAL, not a stale or drained queue. The reset wait has
+    /// completed (or `.stop` interrupted it) and the blackout was cleared. The
+    /// caller retries WITHOUT marking the stale tracker. `stopped == true` →
+    /// `.stop` fired during the wait; the caller stops instead of retrying.
+    Deferred { stopped: bool },
+}
+
+/// Count `todo` rows for `task_prefix` (`None` = every prefix). Read-only — used
+/// by the deferral check to decide whether an active blackout still has work to
+/// wait for. `archived_at IS NULL` mirrors the drain-classification queries so
+/// an archived row never keeps a blackout alive.
+fn count_todo_tasks(conn: &Connection, task_prefix: Option<&str>) -> i64 {
+    // `id LIKE '' || '%'` collapses to `id LIKE '%'` (every non-null id) when no
+    // prefix is given, so one parameterized query covers both cases.
+    let like_prefix = task_prefix.unwrap_or("");
+    conn.query_row(
+        "SELECT COUNT(*) FROM tasks WHERE status = 'todo' AND id LIKE ?1 || '%' \
+         AND archived_at IS NULL",
+        rusqlite::params![like_prefix],
+        |row| row.get(0),
+    )
+    .unwrap_or(0)
+}
+
+/// FEAT-008 deferral-first check (production entry point). When a provider
+/// blackout is active and todo work remains, wait for the reset reusing the
+/// EXISTING [`wait_for_usage_reset`] machinery (no busy-spin), clear the
+/// blackout, and report [`QuotaDeferral::Deferred`]. Builds the real wait
+/// closure and delegates to [`handle_quota_deferral_inner`].
+///
+/// Called FIRST — before stale / auto-recovery / drained classification — by
+/// BOTH no-eligible paths, so an all-quota-deferred wave/iteration never trips
+/// the stale-abort tracker (learning 3927).
+pub fn handle_quota_deferral(
+    conn: &Connection,
+    task_prefix: Option<&str>,
+    blackout: &mut BlackoutState,
+    now_secs: u64,
+    tasks_dir: &Path,
+    fallback_wait: u64,
+) -> QuotaDeferral {
+    let wait = |wait_secs: u64| -> bool {
+        // No early-lift probe: a quota blackout reopens on its own schedule, and
+        // the probe is an OAuth/usage-API call we deliberately avoid on this
+        // deferral path. `.stop` polling inside `wait_for_usage_reset` still
+        // applies, so the wait stays interruptible.
+        wait_for_usage_reset(wait_secs, tasks_dir, fallback_wait, None)
+    };
+    handle_quota_deferral_inner(conn, task_prefix, blackout, now_secs, &wait)
+}
+
+/// Hermetic core of the deferral-first check. Takes the wait as an injected seam
+/// so the parity/edge-case tests can drive it without a real sleep, OAuth, or
+/// usage API (`tests/model_selection_engine_edges.rs`). NEVER touches
+/// `ctx.stale_tracker` or `runner_overrides` — it returns a verdict; the caller
+/// owns the control flow.
+pub fn handle_quota_deferral_inner(
+    conn: &Connection,
+    task_prefix: Option<&str>,
+    blackout: &mut BlackoutState,
+    now_secs: u64,
+    wait: &dyn Fn(u64) -> bool,
+) -> QuotaDeferral {
+    if !blackout.any_active(now_secs) {
+        return QuotaDeferral::Inactive;
+    }
+    // A blackout is active but nothing is left to defer → not a deferral; clear
+    // the stale channel and let the caller run its normal drain classification.
+    if count_todo_tasks(conn, task_prefix) == 0 {
+        blackout.clear();
+        return QuotaDeferral::Inactive;
+    }
+    // Wait until the LAST blacked-out provider reopens, then clear so the next
+    // selection pass re-evaluates eligibility against a fresh channel.
+    let wait_secs = blackout.max_remaining_secs(now_secs);
+    let completed = wait(wait_secs);
+    blackout.clear();
+    QuotaDeferral::Deferred {
+        stopped: !completed,
     }
 }
 

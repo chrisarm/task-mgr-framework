@@ -25,14 +25,14 @@
 //! Wired into both paths by FEAT-002/FEAT-008 (sequential: `iteration.rs`
 //! ~L367/L419; wave: per-slot, folded in `wave_scheduler.rs` ~L983).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use rusqlite::Connection;
 
 use crate::loop_engine::engine::{
     EffectiveRunnerInput, IterationContext, resolve_effective_runner,
 };
-use crate::loop_engine::model;
+use crate::loop_engine::model::{self, Provider, ResolvedModelsConfig};
 use crate::loop_engine::recovery::normalize_baseline;
 use crate::loop_engine::runner::RunnerKind;
 
@@ -239,4 +239,100 @@ pub fn invalidate_stale_overrides(ctx: &mut IterationContext, conn: &Connection,
     eprintln!(
         "Operator changed task model for {task_id} — clearing auto-recovery overrides; resolving fresh."
     );
+}
+
+/// FEAT-008: the set of todo task ids that are QUOTA-DEFERRED under the active
+/// provider blackouts — their effective provider is still blacked out and they
+/// cannot reroute off it. This is the `excluded_ids` set passed to
+/// `select_next_task_excluding` / `select_parallel_group_excluding`; its
+/// complement (todo tasks NOT returned) are the spillover-eligible tasks
+/// selection may run on an alternate provider.
+///
+/// Per-task effective provider — the spillover-eligibility SSoT:
+/// - A task carrying a `ctx.runner_overrides` entry is PINNED to that runner
+///   (the permanent cross-provider promotion owned by `promote_once`). It is
+///   never spillover-eligible: if its pinned provider is blacked out it defers,
+///   otherwise it runs. This is the "no runner override" half of the FR-008
+///   eligibility rule — a pinned task is read here but `runner_overrides` is
+///   NEVER written.
+/// - Otherwise the spawn-side resolver `model::resolve_execution_plan` (WITH the
+///   active blackouts) decides: a spillover-eligible implementation task at or
+///   below `spillover.maxDifficulty` reroutes to a non-blacked provider (→ NOT
+///   deferred); a frontier/review task, an explicit-model task, or one with no
+///   enabled alternative stays on the blacked-out provider (→ deferred).
+///
+/// Returns an empty set when no provider is blacked out (the dominant case), so
+/// the DB scan only runs while a blackout is live. Read-only — DB errors are
+/// logged and treated as "nothing excluded" so a transient failure degrades to
+/// the pre-FEAT-008 selection rather than stranding the wave.
+pub fn compute_quota_excluded_ids(
+    ctx: &IterationContext,
+    conn: &Connection,
+    task_prefix: Option<&str>,
+    models: &ResolvedModelsConfig,
+    active_blackouts: &HashSet<Provider>,
+) -> HashSet<String> {
+    if active_blackouts.is_empty() {
+        return HashSet::new();
+    }
+
+    // `id LIKE '' || '%'` collapses to `id LIKE '%'` (every non-null id) when no
+    // prefix is given, so one parameterized query covers both cases.
+    let like_prefix = task_prefix.unwrap_or("");
+    let mut stmt = match conn.prepare(
+        "SELECT id, model, difficulty FROM tasks \
+         WHERE status = 'todo' AND id LIKE ?1 || '%' AND archived_at IS NULL",
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Warning: compute_quota_excluded_ids: prepare failed: {e}");
+            return HashSet::new();
+        }
+    };
+    let rows = stmt.query_map(rusqlite::params![like_prefix], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+        ))
+    });
+    let rows = match rows {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Warning: compute_quota_excluded_ids: query failed: {e}");
+            return HashSet::new();
+        }
+    };
+
+    let mut excluded = HashSet::new();
+    for (id, model_col, difficulty) in rows.flatten() {
+        let effective_provider = match ctx.runner_overrides.get(&id) {
+            Some(kind) => provider_of_runner(*kind),
+            None => {
+                model::resolve_execution_plan(&model::PlanContext {
+                    task_id: &id,
+                    task_model: model_col.as_deref(),
+                    difficulty: difficulty.as_deref(),
+                    models,
+                    provider_blackouts: active_blackouts,
+                })
+                .provider
+            }
+        };
+        if active_blackouts.contains(&effective_provider) {
+            excluded.insert(id);
+        }
+    }
+    excluded
+}
+
+/// `RunnerKind → Provider` identity translation (the inverse of the match in
+/// `resolve_effective_runner`). Local to the blackout-exclusion computation so a
+/// pinned runner override can be compared against the active blackout set.
+fn provider_of_runner(kind: RunnerKind) -> Provider {
+    match kind {
+        RunnerKind::Claude => Provider::Claude,
+        RunnerKind::Grok => Provider::Grok,
+        RunnerKind::Codex => Provider::Codex,
+    }
 }

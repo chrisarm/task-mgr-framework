@@ -219,6 +219,12 @@ pub struct SlotPromptParams<'a> {
     /// Routing policy block (FR-001) consumed by `resolve_execution_plan`.
     /// Threaded from `ProjectConfig::routing`.
     pub routing_config: &'a crate::loop_engine::project_config::RoutingConfig,
+    /// FEAT-008: providers under an active quota blackout this wave
+    /// (`ctx.provider_blackouts.active(now)`). Fed to `resolve_execution_plan`
+    /// so a spillover-eligible task reroutes off a blacked-out provider at spawn
+    /// time, consistent with the wave's `excluded_ids` computation. Empty (the
+    /// default) → no reroute, byte-identical to the pre-FEAT-008 plan.
+    pub provider_blackouts: std::collections::HashSet<crate::loop_engine::model::Provider>,
 }
 
 /// Send-safe bundle of everything a slot worker needs to invoke Claude and
@@ -346,14 +352,14 @@ pub fn build_prompt(
         params.models_config,
         params.routing_config,
     );
-    let no_blackouts = std::collections::HashSet::new();
     let plan = crate::loop_engine::model::resolve_execution_plan(
         &crate::loop_engine::model::PlanContext {
             task_id: &task.id,
             task_model: task.model.as_deref(),
             difficulty: task.difficulty.as_deref(),
             models: &resolved_models,
-            provider_blackouts: &no_blackouts,
+            // FEAT-008: reroute off any blacked-out provider at spawn time.
+            provider_blackouts: &params.provider_blackouts,
         },
     );
     let resolved_model = plan.model;

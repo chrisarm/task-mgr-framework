@@ -99,6 +99,8 @@ fn test_e2e_high_difficulty_resolves_to_frontier_under_default_routing() {
         primary_runner: None,
         models_config: task_mgr::loop_engine::project_config::default_models_config(),
         routing_config: task_mgr::loop_engine::project_config::default_routing_config(),
+        provider_blackouts: Default::default(),
+        excluded_ids: Default::default(),
     };
 
     let result = build_prompt(&params)
@@ -158,6 +160,8 @@ fn test_e2e_explicit_model_overrides_default() {
         primary_runner: None,
         models_config: task_mgr::loop_engine::project_config::default_models_config(),
         routing_config: task_mgr::loop_engine::project_config::default_routing_config(),
+        provider_blackouts: Default::default(),
+        excluded_ids: Default::default(),
     };
 
     let result = build_prompt(&params)
@@ -220,6 +224,8 @@ fn test_e2e_no_model_fields_resolves_via_anchor_window() {
         primary_runner: None,
         models_config: task_mgr::loop_engine::project_config::default_models_config(),
         routing_config: task_mgr::loop_engine::project_config::default_routing_config(),
+        provider_blackouts: Default::default(),
+        excluded_ids: Default::default(),
     };
 
     let result = build_prompt(&params)
@@ -295,6 +301,8 @@ fn test_e2e_escalation_template_present_for_haiku_absent_for_opus() {
         primary_runner: None,
         models_config: task_mgr::loop_engine::project_config::default_models_config(),
         routing_config: task_mgr::loop_engine::project_config::default_routing_config(),
+        provider_blackouts: Default::default(),
+        excluded_ids: Default::default(),
     };
 
     let result = build_prompt(&params)

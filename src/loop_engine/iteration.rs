@@ -213,6 +213,26 @@ pub fn run_iteration(
     let session_guidance_text = ctx.session_guidance.format_for_prompt();
     let effective_reorder_hint_str = effective_reorder_hint.as_deref();
 
+    // FEAT-008: under an active quota blackout, compute the spillover-deferred
+    // todo ids so selection skips them (and resolve spawns reroute consistently).
+    // Empty blackout set → empty excluded set → identical to pre-FEAT-008.
+    let active_blackouts = ctx
+        .provider_blackouts
+        .active(crate::loop_engine::engine::now_unix_secs());
+    let excluded_ids = {
+        let resolved_models = crate::loop_engine::model::resolve_models_config(
+            &params.project_config.models,
+            &params.project_config.routing,
+        );
+        reactions::pre_spawn::compute_quota_excluded_ids(
+            ctx,
+            params.conn,
+            params.task_prefix,
+            &resolved_models,
+            &active_blackouts,
+        )
+    };
+
     let first_attempt = prompt::build_prompt(&BuildPromptParams {
         dir: params.db_dir,
         project_root: params.project_root,
@@ -234,6 +254,8 @@ pub fn run_iteration(
         primary_runner: params.project_config.primary_runner.as_ref(),
         models_config: &params.project_config.models,
         routing_config: &params.project_config.routing,
+        provider_blackouts: active_blackouts.clone(),
+        excluded_ids: excluded_ids.clone(),
     });
 
     let prompt_result = match first_attempt {
@@ -315,6 +337,8 @@ pub fn run_iteration(
                     primary_runner: params.project_config.primary_runner.as_ref(),
                     models_config: &params.project_config.models,
                     routing_config: &params.project_config.routing,
+                    provider_blackouts: active_blackouts.clone(),
+                    excluded_ids: excluded_ids.clone(),
                 });
                 match retry_attempt {
                     Ok(Some(result)) => result,
@@ -744,6 +768,13 @@ pub fn run_iteration(
                 outcome: &outcome,
                 output: &claude_output,
             }];
+            // FEAT-008: resolve the provider-first config once so the reaction
+            // records a quota blackout (spillover path) instead of waiting when
+            // difficulty-spillover is enabled. `resolve_models_config` is pure.
+            let resolved_models = crate::loop_engine::model::resolve_models_config(
+                &params.project_config.models,
+                &params.project_config.routing,
+            );
             let account_params = reactions::account::AccountReactionParams {
                 threshold: params.usage_params.threshold,
                 usage_enabled: params.usage_params.enabled,
@@ -752,9 +783,24 @@ pub fn run_iteration(
                 prefix: params.task_prefix.unwrap_or(""),
                 run_id: params.run_id,
                 permission_mode: params.permission_mode,
+                spillover_enabled: resolved_models.routing.spillover.max_difficulty.is_some(),
+                primary_provider: resolved_models.primary_provider,
+                blackout_fallback_secs: resolved_models.routing.spillover.blackout_fallback_secs,
+                now_secs: crate::loop_engine::engine::now_unix_secs(),
             };
-            reactions::account::react_to_outputs(params.conn, &items, &account_params)
+            reactions::account::react_to_outputs(
+                params.conn,
+                &items,
+                &account_params,
+                &mut ctx.provider_blackouts,
+            )
         };
+        // `RerouteAndRetry` / `ProceedWithSpillover` (FEAT-008) and
+        // `WaitedAndRetry` all fall through with the outcome still `RateLimit`,
+        // which `run_loop` marks non-counting (budget give-back). The blackout
+        // recorded on `ctx.provider_blackouts` reroutes spillover-eligible work
+        // on the next iteration; the no-eligible deferral branch waits only if
+        // everything is quota-deferred. Only `Stop` exits early here.
         if reaction == reactions::account::AccountReaction::Stop {
             return Ok(IterationResult {
                 outcome: IterationOutcome::RateLimit,

@@ -56,7 +56,7 @@ use std::time::{Duration, Instant};
 use rusqlite::Connection;
 
 use crate::TaskMgrResult;
-use crate::commands::next::selection::select_parallel_group;
+use crate::commands::next::selection::select_parallel_group_excluding;
 use crate::commands::run as run_cmd;
 use crate::db::prefix::prefix_and;
 use crate::lifecycle::TaskLifecycle;
@@ -283,6 +283,7 @@ fn build_shared_slot_params(
 /// avoids cloning the `PathBuf` per slot.
 fn build_slot_prompt_params<'a>(
     params: &'a WaveIterationParams<'a>,
+    provider_blackouts: &std::collections::HashSet<crate::loop_engine::model::Provider>,
 ) -> prompt::slot::SlotPromptParams<'a> {
     prompt::slot::SlotPromptParams {
         project_root: params.source_root.to_path_buf(),
@@ -296,6 +297,9 @@ fn build_slot_prompt_params<'a>(
         user_default: params.user_default_model,
         models_config: &params.project_config.models,
         routing_config: &params.project_config.routing,
+        // FEAT-008: the active quota blackouts, so each slot's spawn-time plan
+        // reroutes spillover-eligible work consistently with `excluded_ids`.
+        provider_blackouts: provider_blackouts.clone(),
     }
 }
 
@@ -703,13 +707,34 @@ pub fn run_wave_iteration(
         })
         .collect();
 
-    let result = match select_parallel_group(
+    // FEAT-008: under an active quota blackout, exclude the todo tasks that
+    // resolve to a blacked-out provider they cannot reroute off of, so the wave
+    // fills its slots with spillover-eligible work and defers the rest. Empty
+    // blackout set → empty excluded set → identical to the pre-FEAT-008 group.
+    let active_blackouts = ctx
+        .provider_blackouts
+        .active(crate::loop_engine::engine::now_unix_secs());
+    let excluded_ids = {
+        let resolved_models = crate::loop_engine::model::resolve_models_config(
+            &params.project_config.models,
+            &params.project_config.routing,
+        );
+        reactions::pre_spawn::compute_quota_excluded_ids(
+            ctx,
+            params.conn,
+            params.task_prefix,
+            &resolved_models,
+            &active_blackouts,
+        )
+    };
+    let result = match select_parallel_group_excluding(
         params.conn,
         &ctx.last_files,
         params.task_prefix,
         params.parallel_slots,
         &extra_implicit,
         &ephemeral_overlay,
+        &excluded_ids,
     ) {
         Ok(r) => r,
         Err(e) => {
@@ -740,7 +765,7 @@ pub fn run_wave_iteration(
 
     let n_slots = group.len();
     let slot_paths: &[PathBuf] = &params.slot_worktree_paths[..n_slots];
-    let slot_prompt_params = build_slot_prompt_params(&params);
+    let slot_prompt_params = build_slot_prompt_params(&params, &active_blackouts);
     let mut slot_contexts =
         build_slot_contexts(params.conn, group, slot_paths, &slot_prompt_params);
     // FEAT-002: resolve the pre-spawn execution plan per slot on the main
@@ -945,6 +970,14 @@ pub fn run_wave_iteration(
                 output: &s.iteration_result.output,
             })
             .collect();
+        // FEAT-008: resolve the provider-first config once so the reaction can
+        // record a quota blackout (spillover path) instead of waiting when
+        // difficulty-spillover is enabled. `resolve_models_config` is pure.
+        let resolved_models = crate::loop_engine::model::resolve_models_config(
+            &params.project_config.models,
+            &params.project_config.routing,
+        );
+        let now_secs = crate::loop_engine::engine::now_unix_secs();
         let account_params = reactions::account::AccountReactionParams {
             threshold: params.usage_params.threshold,
             usage_enabled: params.usage_params.enabled,
@@ -953,11 +986,27 @@ pub fn run_wave_iteration(
             prefix: params.task_prefix.unwrap_or(""),
             run_id: params.run_id,
             permission_mode: params.permission_mode,
+            spillover_enabled: resolved_models.routing.spillover.max_difficulty.is_some(),
+            primary_provider: resolved_models.primary_provider,
+            blackout_fallback_secs: resolved_models.routing.spillover.blackout_fallback_secs,
+            now_secs,
         };
-        match reactions::account::react_to_outputs(params.conn, &rate_limit_items, &account_params)
-        {
+        match reactions::account::react_to_outputs(
+            params.conn,
+            &rate_limit_items,
+            &account_params,
+            &mut ctx.provider_blackouts,
+        ) {
             reactions::account::AccountReaction::None => {}
-            reactions::account::AccountReaction::WaitedAndRetry => {
+            // A completed wait OR a recorded quota blackout (FEAT-008
+            // RerouteAndRetry / ProceedWithSpillover): the wave retries WITHOUT
+            // consuming the loop-bound iteration (B2) and WITHOUT zeroing the
+            // merge-fail streak (B3). The blackout path skipped the wait; the
+            // next wave reroutes spillover-eligible work and the no-eligible
+            // deferral branch waits only if everything is quota-deferred.
+            reactions::account::AccountReaction::WaitedAndRetry
+            | reactions::account::AccountReaction::RerouteAndRetry
+            | reactions::account::AccountReaction::ProceedWithSpillover => {
                 return WaveOutcome {
                     tasks_completed: agg.tasks_completed,
                     iteration_consumed: false,
@@ -2157,6 +2206,7 @@ mod tests {
             user_default: None,
             models_config: crate::loop_engine::project_config::default_models_config(),
             routing_config: crate::loop_engine::project_config::default_routing_config(),
+            provider_blackouts: Default::default(),
         };
         let slot_paths = vec![tmp.path().to_path_buf()];
         let slots = build_slot_contexts(&conn, vec![scored], &slot_paths, &prompt_params);

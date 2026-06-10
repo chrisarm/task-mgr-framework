@@ -288,13 +288,15 @@ pub struct ParallelGroupResult {
 /// sorted by total_score DESC, priority ASC — the callers diverge only in how
 /// they pick from this ordered list.
 ///
-/// Filters applied (in order): formal `dependsOn` deps complete, then the
-/// soft-dep guard (see [`find_blocking_active_fixups`]) which defers
-/// milestone candidates whose AC text references a same-prefix active sibling.
+/// Filters applied (in order): caller-supplied `excluded_ids` (FEAT-008
+/// quota-deferred tasks), formal `dependsOn` deps complete, then the soft-dep
+/// guard (see [`find_blocking_active_fixups`]) which defers milestone candidates
+/// whose AC text references a same-prefix active sibling.
 fn build_scored_candidates(
     conn: &Connection,
     after_files: &[String],
     task_prefix: Option<&str>,
+    excluded_ids: &HashSet<String>,
 ) -> TaskMgrResult<Vec<ScoredTask>> {
     let completed_ids = get_completed_task_ids(conn, task_prefix)?;
     let active_ids = get_active_task_ids(conn, task_prefix)?;
@@ -304,6 +306,11 @@ fn build_scored_candidates(
 
     let eligible_tasks: Vec<Task> = todo_tasks
         .into_iter()
+        // FEAT-008: skip caller-excluded (quota-deferred) ids FIRST so a task
+        // resolving to a blacked-out provider it cannot reroute off of never
+        // gets selected — selection returns empty and the no-eligible deferral
+        // branch waits for the quota reset instead of re-spawning a doomed task.
+        .filter(|task| !excluded_ids.contains(&task.id))
         .filter(|task| {
             let task_deps = dependencies
                 .get(&task.id)
@@ -381,7 +388,23 @@ pub fn select_next_task(
     after_files: &[String],
     task_prefix: Option<&str>,
 ) -> TaskMgrResult<SelectionResult> {
-    let scored_tasks = build_scored_candidates(conn, after_files, task_prefix)?;
+    select_next_task_excluding(conn, after_files, task_prefix, &HashSet::new())
+}
+
+/// [`select_next_task`] with a FEAT-008 `excluded_ids` set — the sequential
+/// equivalent of [`select_parallel_group_excluding`]. Quota-deferred ids
+/// (provider blacked out, not reroutable) are filtered out of the candidate
+/// pool so a doomed task is never selected; an all-excluded queue returns the
+/// "no eligible tasks" result and the no-eligible deferral branch waits for the
+/// quota reset. With an empty `excluded_ids`, behavior is identical to
+/// [`select_next_task`].
+pub fn select_next_task_excluding(
+    conn: &Connection,
+    after_files: &[String],
+    task_prefix: Option<&str>,
+    excluded_ids: &HashSet<String>,
+) -> TaskMgrResult<SelectionResult> {
+    let scored_tasks = build_scored_candidates(conn, after_files, task_prefix, excluded_ids)?;
 
     if scored_tasks.is_empty() {
         return Ok(SelectionResult {
@@ -622,11 +645,39 @@ pub fn select_parallel_group(
     extra_implicit_overlap_files: &[String],
     ephemeral_overlay: &[(String, Vec<String>)],
 ) -> TaskMgrResult<ParallelGroupResult> {
+    select_parallel_group_excluding(
+        conn,
+        after_files,
+        task_prefix,
+        max_slots,
+        extra_implicit_overlap_files,
+        ephemeral_overlay,
+        &HashSet::new(),
+    )
+}
+
+/// [`select_parallel_group`] with a FEAT-008 `excluded_ids` set. Quota-deferred
+/// ids (resolving to a blacked-out provider with no reroute) are dropped from
+/// the candidate pool BEFORE the greedy slot-packing pass, so a wave under a
+/// quota blackout fills its slots with spillover-eligible work and defers the
+/// rest. When every candidate is excluded the group is empty and the wave
+/// no-eligible handler's deferral-first branch waits for the reset. With an
+/// empty `excluded_ids`, behavior is identical to [`select_parallel_group`].
+#[allow(clippy::too_many_arguments)]
+pub fn select_parallel_group_excluding(
+    conn: &Connection,
+    after_files: &[String],
+    task_prefix: Option<&str>,
+    max_slots: usize,
+    extra_implicit_overlap_files: &[String],
+    ephemeral_overlay: &[(String, Vec<String>)],
+    excluded_ids: &HashSet<String>,
+) -> TaskMgrResult<ParallelGroupResult> {
     if max_slots == 0 {
         return Ok(ParallelGroupResult::default());
     }
 
-    let scored_tasks = build_scored_candidates(conn, after_files, task_prefix)?;
+    let scored_tasks = build_scored_candidates(conn, after_files, task_prefix, excluded_ids)?;
 
     if scored_tasks.is_empty() {
         return Ok(ParallelGroupResult::default());

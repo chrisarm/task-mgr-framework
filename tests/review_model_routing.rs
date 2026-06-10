@@ -200,6 +200,7 @@ fn wave_review_class_slot_bundle_resolved_model_is_rewritten_to_grok_build() {
         user_default: None,
         models_config: task_mgr::loop_engine::project_config::default_models_config(),
         routing_config: task_mgr::loop_engine::project_config::default_routing_config(),
+        provider_blackouts: Default::default(),
     };
     let bundle = build_prompt(&conn, &task, &params);
 
@@ -274,6 +275,7 @@ fn wave_non_review_slot_bundle_is_untouched_when_review_model_is_set() {
         user_default: None,
         models_config: task_mgr::loop_engine::project_config::default_models_config(),
         routing_config: task_mgr::loop_engine::project_config::default_routing_config(),
+        provider_blackouts: Default::default(),
     };
     let mut bundle = build_prompt(&conn, &task, &params);
 

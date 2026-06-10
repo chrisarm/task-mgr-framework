@@ -236,14 +236,38 @@ pub struct TaskClassRoute {
     pub by_difficulty: HashMap<String, Vec<String>>,
 }
 
+/// Default provider-blackout window (seconds) used by the quota-aware failover
+/// reaction when the rate-limit reset timestamp can't be parsed from the CLI
+/// output. One hour — generous enough to outlast a transient quota window
+/// without pinning a blackout for the rest of the run.
+pub const DEFAULT_BLACKOUT_FALLBACK_SECS: u64 = 3600;
+
+fn default_blackout_fallback_secs() -> u64 {
+    DEFAULT_BLACKOUT_FALLBACK_SECS
+}
+
 /// Difficulty-spillover policy for quota-aware failover (FR-008).
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct SpilloverConfig {
     /// Highest task difficulty eligible to spill to another provider on quota
     /// blackout. `None` = spillover disabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_difficulty: Option<String>,
+    /// Provider-blackout window (seconds) the quota-aware failover reaction
+    /// records when the rate-limit reset timestamp is unparseable
+    /// (`blackoutFallbackSecs`). Defaults to [`DEFAULT_BLACKOUT_FALLBACK_SECS`].
+    #[serde(default = "default_blackout_fallback_secs")]
+    pub blackout_fallback_secs: u64,
+}
+
+impl Default for SpilloverConfig {
+    fn default() -> Self {
+        Self {
+            max_difficulty: None,
+            blackout_fallback_secs: DEFAULT_BLACKOUT_FALLBACK_SECS,
+        }
+    }
 }
 
 fn default_primary_provider() -> String {

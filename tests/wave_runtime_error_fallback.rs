@@ -36,8 +36,10 @@ use tempfile::TempDir;
 
 use task_mgr::db::{create_schema, open_connection, run_migrations};
 use task_mgr::loop_engine::config::{CrashType, IterationOutcome, PermissionMode};
+use task_mgr::loop_engine::engine::BlackoutState;
 use task_mgr::loop_engine::engine::{IterationContext, handle_task_failure};
 use task_mgr::loop_engine::model::OPUS_MODEL;
+use task_mgr::loop_engine::model::Provider;
 use task_mgr::loop_engine::project_config::FallbackRunnerConfig;
 use task_mgr::loop_engine::reactions::account::{
     AccountReaction, AccountReactionParams, OutputReactionItem, WaitFn, react_to_outputs_inner,
@@ -532,9 +534,16 @@ fn wave_rate_limit_two_slots_session_limit_waits_once_and_resets_to_todo() {
         prefix: "WAVE-RL",
         run_id: "wave-rl-run",
         permission_mode: &WAVE_RL_PERMISSION_MODE,
+        // Spillover disabled — this case pins the legacy wave reset-and-wait path.
+        spillover_enabled: false,
+        primary_provider: Provider::Claude,
+        blackout_fallback_secs: 3600,
+        now_secs: 0,
     };
 
-    let reaction = react_to_outputs_inner(&mut conn, &items, &params, &wait as WaitFn);
+    let mut blackout = BlackoutState::default();
+    let reaction =
+        react_to_outputs_inner(&mut conn, &items, &params, &mut blackout, &wait as WaitFn);
 
     // AC1: the account-global wait fires EXACTLY once for the whole wave,
     // regardless of how many rate-limited slots there are.

@@ -42,6 +42,8 @@ use tempfile::TempDir;
 use task_mgr::db::migrations::run_migrations;
 use task_mgr::db::{create_schema, open_connection};
 use task_mgr::loop_engine::config::{IterationOutcome, PermissionMode};
+use task_mgr::loop_engine::engine::BlackoutState;
+use task_mgr::loop_engine::model::Provider;
 use task_mgr::loop_engine::reactions::account::{
     AccountReaction, AccountReactionParams, OutputReactionItem, WaitFn, react_to_outputs_inner,
 };
@@ -187,6 +189,13 @@ fn params<'a>(tasks_dir: &'a Path, fallback_wait: u64) -> AccountReactionParams<
         prefix: PREFIX,
         run_id: RUN_ID,
         permission_mode: &PERMISSION_MODE,
+        // Spillover disabled: the existing parity cases exercise the legacy
+        // reset-and-wait path (WaitedAndRetry / Stop). FEAT-008's
+        // RerouteAndRetry case sets `spillover_enabled: true` explicitly.
+        spillover_enabled: false,
+        primary_provider: Provider::Claude,
+        blackout_fallback_secs: 3600,
+        now_secs: 0,
     }
 }
 
@@ -230,6 +239,7 @@ fn wait_once_fires_wait_exactly_once_for_multi_rate_limit_wave() {
         &mut conn,
         &items,
         &params(db_temp.path(), 600),
+        &mut BlackoutState::default(),
         &wait as WaitFn,
     );
 
@@ -279,6 +289,7 @@ fn mixed_wave_resets_only_rate_limited_task_and_preserves_completed() {
         &mut conn,
         &items,
         &params(db_temp.path(), 600),
+        &mut BlackoutState::default(),
         &wait as WaitFn,
     );
 
@@ -329,6 +340,7 @@ fn rate_limit_output_does_not_trigger_completions_or_learnings() {
         &mut conn,
         &items,
         &params(db_temp.path(), 600),
+        &mut BlackoutState::default(),
         &wait as WaitFn,
     );
 
@@ -374,6 +386,7 @@ fn parse_fail_falls_back_to_fallback_wait_and_both_shapes_agree() {
         &mut seq_conn,
         &seq_items,
         &params(seq_temp.path(), FALLBACK),
+        &mut BlackoutState::default(),
         &seq_wait as WaitFn,
     );
 
@@ -401,6 +414,7 @@ fn parse_fail_falls_back_to_fallback_wait_and_both_shapes_agree() {
         &mut wave_conn,
         &wave_items,
         &params(wave_temp.path(), FALLBACK),
+        &mut BlackoutState::default(),
         &wave_wait as WaitFn,
     );
 
@@ -453,6 +467,7 @@ fn no_rate_limit_returns_none_and_writes_nothing() {
         &mut conn,
         &items,
         &params(db_temp.path(), 600),
+        &mut BlackoutState::default(),
         &wait as WaitFn,
     );
 
@@ -497,6 +512,7 @@ fn stop_signal_during_wait_returns_stop() {
         &mut conn,
         &items,
         &params(db_temp.path(), 600),
+        &mut BlackoutState::default(),
         &wait as WaitFn,
     );
 
@@ -505,6 +521,120 @@ fn stop_signal_during_wait_returns_stop() {
         reaction,
         AccountReaction::Stop,
         "a wait interrupted by the .stop signal must return AccountReaction::Stop",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// AC (FEAT-008): RerouteAndRetry — with difficulty-spillover enabled, a Claude
+// rate-limit records a provider blackout from the (unparseable here → fallback)
+// reset, resets the rate-limited task to `todo`, and SKIPS the wait. The
+// sequential (1-item) and wave (N-item) shapes compute the identical verdict.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn reroute_and_retry_records_blackout_and_skips_wait_both_shapes() {
+    disable_llm_extraction();
+    const NOW: u64 = 1_000;
+    const FALLBACK: u64 = 1800;
+    let rate = IterationOutcome::RateLimit;
+
+    // Sequential shape: one rate-limited item with no parseable reset token.
+    let (seq_temp, mut seq_conn) = setup_migrated_db();
+    insert_run(&seq_conn);
+    insert_in_progress_task(&seq_conn, "RP-RATE-1");
+    let seq_items = [OutputReactionItem {
+        task_id: Some("RP-RATE-1"),
+        outcome: &rate,
+        output: "rate limited but NO parseable reset token here",
+    }];
+    let mut seq_params = params(seq_temp.path(), 600);
+    seq_params.spillover_enabled = true;
+    seq_params.now_secs = NOW;
+    seq_params.blackout_fallback_secs = FALLBACK;
+    let mut seq_blackout = BlackoutState::default();
+    let seq_spy = WaitSpy::completing();
+    let seq_wait = seq_spy.closure();
+    let seq_reaction = react_to_outputs_inner(
+        &mut seq_conn,
+        &seq_items,
+        &seq_params,
+        &mut seq_blackout,
+        &seq_wait as WaitFn,
+    );
+
+    assert_eq!(
+        seq_reaction,
+        AccountReaction::RerouteAndRetry,
+        "a spillover-enabled rate-limit records a blackout and reroutes, never waiting",
+    );
+    assert_eq!(
+        seq_spy.calls.get(),
+        0,
+        "RerouteAndRetry must SKIP the wait entirely",
+    );
+    assert!(
+        seq_blackout.active(NOW).contains(&Provider::Claude),
+        "a Claude provider blackout must be recorded from the (fallback) reset",
+    );
+    assert_eq!(
+        task_status(&seq_conn, "RP-RATE-1").as_deref(),
+        Some("todo"),
+        "the rate-limited task is still reset to `todo` so it re-selects and reroutes",
+    );
+
+    // Wave shape: same rate-limited item plus a completed sibling. Must compute
+    // the IDENTICAL verdict and likewise skip the wait, leaving the done sibling.
+    let (wave_temp, mut wave_conn) = setup_migrated_db();
+    insert_run(&wave_conn);
+    insert_in_progress_task(&wave_conn, "RP-RATE-1");
+    insert_done_task(&wave_conn, "RP-DONE-2");
+    let done = IterationOutcome::Completed;
+    let wave_items = [
+        OutputReactionItem {
+            task_id: Some("RP-RATE-1"),
+            outcome: &rate,
+            output: "rate limited but NO parseable reset token here",
+        },
+        OutputReactionItem {
+            task_id: Some("RP-DONE-2"),
+            outcome: &done,
+            output: "<completed>RP-DONE-2</completed>",
+        },
+    ];
+    let mut wave_params = params(wave_temp.path(), 600);
+    wave_params.spillover_enabled = true;
+    wave_params.now_secs = NOW;
+    wave_params.blackout_fallback_secs = FALLBACK;
+    let mut wave_blackout = BlackoutState::default();
+    let wave_spy = WaitSpy::completing();
+    let wave_wait = wave_spy.closure();
+    let wave_reaction = react_to_outputs_inner(
+        &mut wave_conn,
+        &wave_items,
+        &wave_params,
+        &mut wave_blackout,
+        &wave_wait as WaitFn,
+    );
+
+    assert_eq!(
+        wave_reaction,
+        AccountReaction::RerouteAndRetry,
+        "the wave (N-item) shape must compute the SAME RerouteAndRetry verdict",
+    );
+    assert_eq!(
+        wave_spy.calls.get(),
+        0,
+        "the wave RerouteAndRetry must SKIP the wait too",
+    );
+    assert!(wave_blackout.active(NOW).contains(&Provider::Claude));
+    assert_eq!(
+        task_status(&wave_conn, "RP-DONE-2").as_deref(),
+        Some("done"),
+        "the completed sibling must remain `done` (reset filters on in_progress)",
+    );
+    assert_eq!(
+        task_status(&wave_conn, "RP-RATE-1").as_deref(),
+        Some("todo"),
     );
 }
 
