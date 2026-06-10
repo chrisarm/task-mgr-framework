@@ -57,3 +57,88 @@ Full control path verified at production call sites:
 **No wiring gaps found. No WIRE-FIX tasks needed.**
 
 ---
+## === wave merge @ 2026-06-10T05:55:01Z ===
+## --- slot 1 (feat-model-selection-redesign-slot-1) ---
+## 2026-06-09 - cd8d4641-INT-002
+
+### Integration Trace: rate-limit signal → blackout → reroute/deferral → stale counter untouched → expiry
+
+Full control path verified at production call sites:
+
+**Step 1 — RateLimit detection (once per wave aggregation)**
+- Wave: `src/loop_engine/wave_scheduler.rs:994` — `react_to_outputs()` called with all `N` slot outcomes folded into `rate_limit_items`, once per wave.
+- Sequential: `src/loop_engine/iteration.rs:791` — same coordinator, one-item slice.
+
+**Step 2 — parse_reset_from_output**
+- `src/loop_engine/reactions/account.rs:292`: `let reset_secs = parse_reset_from_output(first_rate_limited.output)` — called on the FIRST rate-limited item's output. Returns `None` if the "resets Xpm" pattern is unparseable.
+- Fallback when `None`: `account.rs:304`: `let blackout_secs = reset_secs.unwrap_or(params.blackout_fallback_secs)` — uses `routing.spillover.blackoutFallbackSecs`.
+
+**Step 3 — BlackoutState on IterationContext**
+- `account.rs:308`: `blackout.record(params.primary_provider, params.now_secs, blackout_secs)` — records provider → expiry on `ctx.provider_blackouts` (ephemeral, never persisted).
+- Returns `RerouteAndRetry` (first blackout) or `ProceedWithSpillover` (already active).
+
+**Step 4 — Wave returns early, no iteration consumed**
+- `wave_scheduler.rs:1007-1017`: `WaveOutcome { iteration_consumed: false, rate_limited_retry: true }` — iteration budget preserved, merge-fail streak NOT reset.
+
+**Step 5 — Next wave: excluded_ids via classify_task**
+- Wave: `wave_scheduler.rs:714-728` — `active_blackouts = ctx.provider_blackouts.active(now)`, then `compute_quota_excluded_ids()`.
+- Sequential: `iteration.rs:219-233` — identical computation.
+- `src/loop_engine/reactions/pre_spawn.rs:271-329`: For each `todo` task, calls `resolve_execution_plan` WITH active blackouts. If the resolved provider is in the blackout set → task excluded. Read-only — never writes `runner_overrides`.
+
+**Step 6 — Excluded IDs into select_parallel_group / sequential selection**
+- Wave: `wave_scheduler.rs:730-737`: `select_parallel_group_excluding(..., &excluded_ids)` — blackout-deferred tasks are never selected.
+- Sequential: `iteration.rs:236-258`: `BuildPromptParams { excluded_ids }` passed to `build_prompt`.
+
+**Step 7 — RerouteAndRetry vs frontier deferral**
+- Spillover-eligible tasks (difficulty ≤ `spillover.maxDifficulty`, not frontier/review): `resolve_execution_plan` routes to alternate provider → NOT excluded → selected and rerouted.
+- Frontier/review tasks or tasks with no enabled alternative: resolve stays on blacked-out provider → excluded → deferred.
+
+**Step 8 — All-deferred wave: deferral-first branch (wait, clear, return)**
+- Wave: `src/loop_engine/wave_orchestration.rs:186-229` — `handle_quota_deferral()` called FIRST, before `classify_drained_queue`, `reconcile_passes_with_db`, and `stale_tracker.mark_stale()`.
+- Sequential: `src/loop_engine/orchestrator.rs:576-602` — same call, same ordering invariant. Both comment "FEAT-008 deferral-first — ordered BEFORE drained classification and the stale tracker".
+- `handle_quota_deferral_inner` (`account.rs:394-418`): waits `blackout.max_remaining_secs(now)`, then calls `blackout.clear()`. Returns `Deferred { stopped }`.
+- On `Deferred { stopped: false }`: returns `WaveOutcome { rate_limited_retry: true, iteration_consumed: false }` — stale tracker NOT incremented.
+
+**Step 9 — Stale counter verified untouched**
+- `wave_orchestration.rs:283-284`: `ctx.stale_tracker.mark_stale()` is at step (3) — AFTER the `QuotaDeferral::Deferred` early return at step (0). An all-deferred wave never reaches `mark_stale()`.
+- Test: `model_selection_engine_edges.rs:642` `blackout_medium_reroutes_while_frontier_review_defers_zero_stale` asserts stale count = 0 after a quota deferral cycle.
+
+**Step 10 — Blackout expiry self-clear**
+- Lazy path: `BlackoutState::active()` (`engine.rs:274`) filters `expiry > now` — expired entries silently excluded; the map self-clears on next read.
+- Explicit path: `handle_quota_deferral_inner:414`: `blackout.clear()` after wait completes.
+
+**Channel discipline — zero touch points between blackout and runner_overrides:**
+- `reactions/account.rs`: zero code accesses to `runner_overrides` (only comments asserting it is never touched).
+- `recovery.rs` (the `runner_overrides` writer): zero references to `provider_blackouts` or `BlackoutState`.
+- `compute_quota_excluded_ids` reads `runner_overrides` only to determine the effective provider for already-pinned tasks — never writes.
+- Test: `model_selection_engine_edges.rs:565` `blackout_reroute_leaves_runner_overrides_untouched` asserts `ctx.runner_overrides.is_empty()` after a blackout reroute.
+
+**All tests pass:** `cargo test --test model_selection_engine_edges` (14/14 OK), `cargo test --test reaction_parity` (38/38 OK).
+
+**No wiring gaps found. No WIRE-FIX tasks needed.**
+
+---
+
+## 2026-06-09 - cd8d4641-WIRE-FIX-001
+
+**Wire ExecutionPlan.effort through prompt builders to runner argv**
+
+Root cause: `resolve_execution_plan` correctly computed `ExecutionPlan.effort = models.effort_for(final_provider, difficulty)` (per-provider table), but BOTH prompt builders dropped it and independently recomputed from the static `EFFORT_FOR_DIFFICULTY` table via `effort_for_difficulty()`. Default config matched, so custom per-provider tables (e.g. `providers.grok.effort.high = "medium"`) were silently ignored at the runner argv.
+
+**Fix — carry plan.effort end-to-end (owned `String`, since per-provider levels are runtime config):**
+- `PromptResult::cluster_effort`: `Option<&'static str>` → `Option<String>`. Initialized as `plan.effort.or_else(static effort_for_difficulty)` in `prompt/sequential.rs::build_prompt` (static is now only the fallback when the resolved provider has no effort entry).
+- `SlotPromptBundle`: added `cluster_effort: Option<String>` field, populated identically from `plan.effort.or_else(static)` in `prompt/slot.rs::build_prompt`. The slot worker now prefers it over re-deriving from `difficulty`.
+- `IterationResult::effective_effort` + `SlotEarlyExit::effective_effort` (engine.rs): `Option<&'static str>` → `Option<String>` so the final merged effort flows consistently into the synthetic overflow `PromptResult` and the progress log.
+- `iteration_pipeline::ProcessingParams::effective_effort`: `Option<&'static str>` → `Option<&'a str>` (borrowed; only feeds `progress::log_iteration`).
+
+**Dispatch sites now prefer plan effort over the static fallback:**
+- Sequential `iteration.rs:459`: `base_effort = prompt_result.cluster_effort` (the plan effort); `effort = overflow_override.or(base_effort)`.
+- Wave `slot.rs:150`: `effort = slot.effective_effort(override).or(bundle.cluster_effort)`. The redundant static `effort_for_difficulty` call was removed here (the bundle already bakes the static fallback at build time), dropping the now-unused top-level `model` import.
+
+**Channel discipline preserved:** the prior-overflow effort OVERRIDE channel (`ctx.effort_overrides` → `TaskExecutionPlan::effort` → `SlotContext::effective_effort`) stays `Option<&'static str>` — those are escalation-ladder levels, not config values, and still win over the plan effort. Only the computed/base effort channel became `String`.
+
+**Regression test:** `prompt/sequential.rs::test_cluster_effort_honors_custom_provider_effort_table` — production-shaped grok-primary `ModelsConfig` with `effort.medium = "low"` (vs static medium→"high"); asserts `cluster_effort == Some("low")`. Existing `test_cluster_effort_*` updated to `.as_deref()` comparisons (default claude table still maps medium→"high", unchanged).
+
+**Gate:** `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check` clean. `cargo test --lib loop_engine::` 1945/0. Integration: iteration_pipeline_parity, reaction_parity, prompt_slot, overflow_per_slot, iteration_result_conversation, grok_to_claude_fallback all green.
+
+---

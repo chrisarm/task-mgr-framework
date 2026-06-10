@@ -55,7 +55,7 @@ fn iteration_result_carries_optional_conversation_transcript() {
         should_stop: false,
         output: "raw stdout".into(),
         effective_model: Some(OPUS_MODEL.into()),
-        effective_effort: Some("high"),
+        effective_effort: Some("high".to_string()),
         effective_runner: None,
         key_decisions_count: 0,
         conversation: Some("[user] go\n[assistant] done\n".into()),

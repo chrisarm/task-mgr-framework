@@ -1528,6 +1528,7 @@ mod tests {
             shown_learning_ids: Vec::new(),
             resolved_model: None,
             difficulty: None,
+            cluster_effort: None,
             provider_hint: None,
             section_sizes: Vec::new(),
             dropped_sections: Vec::new(),
