@@ -2451,9 +2451,9 @@ pub enum ApiError {
             .unwrap()
             .expect("Should return a prompt");
 
-        // medium → "high" per the default claude effort table (matches
-        // effort_for_difficulty); partner's "high" difficulty is ignored.
-        assert_eq!(result.cluster_effort.as_deref(), Some("high"));
+        // medium → "medium" per the default claude effort table; partner's
+        // "high" difficulty is ignored.
+        assert_eq!(result.cluster_effort.as_deref(), Some("medium"));
         assert_eq!(result.task_difficulty.as_deref(), Some("medium"));
     }
 
@@ -2484,8 +2484,8 @@ pub enum ApiError {
 
         assert_eq!(
             result.cluster_effort.as_deref(),
-            Some("high"),
-            "done partner must not influence cluster effort — stays at primary's medium→high"
+            Some("medium"),
+            "done partner must not influence cluster effort — stays at primary's medium→medium"
         );
     }
 
