@@ -226,3 +226,198 @@ Gate: cargo fmt --check OK; clippy --all-targets -D warnings clean; gen-docs --c
 full `cargo test` GREEN (4675 passed, 0 failed, 72 binaries).
 
 ---
+## === wave merge @ 2026-06-10T11:50:31Z ===
+## --- slot 1 (feat-model-selection-redesign-slot-1) ---
+## 2026-06-09 - cd8d4641-INT-002
+
+### Integration Trace: rate-limit signal → blackout → reroute/deferral → stale counter untouched → expiry
+
+Full control path verified at production call sites:
+
+**Step 1 — RateLimit detection (once per wave aggregation)**
+- Wave: `src/loop_engine/wave_scheduler.rs:994` — `react_to_outputs()` called with all `N` slot outcomes folded into `rate_limit_items`, once per wave.
+- Sequential: `src/loop_engine/iteration.rs:791` — same coordinator, one-item slice.
+
+**Step 2 — parse_reset_from_output**
+- `src/loop_engine/reactions/account.rs:292`: `let reset_secs = parse_reset_from_output(first_rate_limited.output)` — called on the FIRST rate-limited item's output. Returns `None` if the "resets Xpm" pattern is unparseable.
+- Fallback when `None`: `account.rs:304`: `let blackout_secs = reset_secs.unwrap_or(params.blackout_fallback_secs)` — uses `routing.spillover.blackoutFallbackSecs`.
+
+**Step 3 — BlackoutState on IterationContext**
+- `account.rs:308`: `blackout.record(params.primary_provider, params.now_secs, blackout_secs)` — records provider → expiry on `ctx.provider_blackouts` (ephemeral, never persisted).
+- Returns `RerouteAndRetry` (first blackout) or `ProceedWithSpillover` (already active).
+
+**Step 4 — Wave returns early, no iteration consumed**
+- `wave_scheduler.rs:1007-1017`: `WaveOutcome { iteration_consumed: false, rate_limited_retry: true }` — iteration budget preserved, merge-fail streak NOT reset.
+
+**Step 5 — Next wave: excluded_ids via classify_task**
+- Wave: `wave_scheduler.rs:714-728` — `active_blackouts = ctx.provider_blackouts.active(now)`, then `compute_quota_excluded_ids()`.
+- Sequential: `iteration.rs:219-233` — identical computation.
+- `src/loop_engine/reactions/pre_spawn.rs:271-329`: For each `todo` task, calls `resolve_execution_plan` WITH active blackouts. If the resolved provider is in the blackout set → task excluded. Read-only — never writes `runner_overrides`.
+
+**Step 6 — Excluded IDs into select_parallel_group / sequential selection**
+- Wave: `wave_scheduler.rs:730-737`: `select_parallel_group_excluding(..., &excluded_ids)` — blackout-deferred tasks are never selected.
+- Sequential: `iteration.rs:236-258`: `BuildPromptParams { excluded_ids }` passed to `build_prompt`.
+
+**Step 7 — RerouteAndRetry vs frontier deferral**
+- Spillover-eligible tasks (difficulty ≤ `spillover.maxDifficulty`, not frontier/review): `resolve_execution_plan` routes to alternate provider → NOT excluded → selected and rerouted.
+- Frontier/review tasks or tasks with no enabled alternative: resolve stays on blacked-out provider → excluded → deferred.
+
+**Step 8 — All-deferred wave: deferral-first branch (wait, clear, return)**
+- Wave: `src/loop_engine/wave_orchestration.rs:186-229` — `handle_quota_deferral()` called FIRST, before `classify_drained_queue`, `reconcile_passes_with_db`, and `stale_tracker.mark_stale()`.
+- Sequential: `src/loop_engine/orchestrator.rs:576-602` — same call, same ordering invariant. Both comment "FEAT-008 deferral-first — ordered BEFORE drained classification and the stale tracker".
+- `handle_quota_deferral_inner` (`account.rs:394-418`): waits `blackout.max_remaining_secs(now)`, then calls `blackout.clear()`. Returns `Deferred { stopped }`.
+- On `Deferred { stopped: false }`: returns `WaveOutcome { rate_limited_retry: true, iteration_consumed: false }` — stale tracker NOT incremented.
+
+**Step 9 — Stale counter verified untouched**
+- `wave_orchestration.rs:283-284`: `ctx.stale_tracker.mark_stale()` is at step (3) — AFTER the `QuotaDeferral::Deferred` early return at step (0). An all-deferred wave never reaches `mark_stale()`.
+- Test: `model_selection_engine_edges.rs:642` `blackout_medium_reroutes_while_frontier_review_defers_zero_stale` asserts stale count = 0 after a quota deferral cycle.
+
+**Step 10 — Blackout expiry self-clear**
+- Lazy path: `BlackoutState::active()` (`engine.rs:274`) filters `expiry > now` — expired entries silently excluded; the map self-clears on next read.
+- Explicit path: `handle_quota_deferral_inner:414`: `blackout.clear()` after wait completes.
+
+**Channel discipline — zero touch points between blackout and runner_overrides:**
+- `reactions/account.rs`: zero code accesses to `runner_overrides` (only comments asserting it is never touched).
+- `recovery.rs` (the `runner_overrides` writer): zero references to `provider_blackouts` or `BlackoutState`.
+- `compute_quota_excluded_ids` reads `runner_overrides` only to determine the effective provider for already-pinned tasks — never writes.
+- Test: `model_selection_engine_edges.rs:565` `blackout_reroute_leaves_runner_overrides_untouched` asserts `ctx.runner_overrides.is_empty()` after a blackout reroute.
+
+**All tests pass:** `cargo test --test model_selection_engine_edges` (14/14 OK), `cargo test --test reaction_parity` (38/38 OK).
+
+**No wiring gaps found. No WIRE-FIX tasks needed.**
+
+---
+## === wave merge @ 2026-06-10T05:55:01Z ===
+## --- slot 1 (feat-model-selection-redesign-slot-1) ---
+## 2026-06-09 - cd8d4641-INT-002
+
+### Integration Trace: rate-limit signal → blackout → reroute/deferral → stale counter untouched → expiry
+
+Full control path verified at production call sites:
+
+**Step 1 — RateLimit detection (once per wave aggregation)**
+- Wave: `src/loop_engine/wave_scheduler.rs:994` — `react_to_outputs()` called with all `N` slot outcomes folded into `rate_limit_items`, once per wave.
+- Sequential: `src/loop_engine/iteration.rs:791` — same coordinator, one-item slice.
+
+**Step 2 — parse_reset_from_output**
+- `src/loop_engine/reactions/account.rs:292`: `let reset_secs = parse_reset_from_output(first_rate_limited.output)` — called on the FIRST rate-limited item's output. Returns `None` if the "resets Xpm" pattern is unparseable.
+- Fallback when `None`: `account.rs:304`: `let blackout_secs = reset_secs.unwrap_or(params.blackout_fallback_secs)` — uses `routing.spillover.blackoutFallbackSecs`.
+
+**Step 3 — BlackoutState on IterationContext**
+- `account.rs:308`: `blackout.record(params.primary_provider, params.now_secs, blackout_secs)` — records provider → expiry on `ctx.provider_blackouts` (ephemeral, never persisted).
+- Returns `RerouteAndRetry` (first blackout) or `ProceedWithSpillover` (already active).
+
+**Step 4 — Wave returns early, no iteration consumed**
+- `wave_scheduler.rs:1007-1017`: `WaveOutcome { iteration_consumed: false, rate_limited_retry: true }` — iteration budget preserved, merge-fail streak NOT reset.
+
+**Step 5 — Next wave: excluded_ids via classify_task**
+- Wave: `wave_scheduler.rs:714-728` — `active_blackouts = ctx.provider_blackouts.active(now)`, then `compute_quota_excluded_ids()`.
+- Sequential: `iteration.rs:219-233` — identical computation.
+- `src/loop_engine/reactions/pre_spawn.rs:271-329`: For each `todo` task, calls `resolve_execution_plan` WITH active blackouts. If the resolved provider is in the blackout set → task excluded. Read-only — never writes `runner_overrides`.
+
+**Step 6 — Excluded IDs into select_parallel_group / sequential selection**
+- Wave: `wave_scheduler.rs:730-737`: `select_parallel_group_excluding(..., &excluded_ids)` — blackout-deferred tasks are never selected.
+- Sequential: `iteration.rs:236-258`: `BuildPromptParams { excluded_ids }` passed to `build_prompt`.
+
+**Step 7 — RerouteAndRetry vs frontier deferral**
+- Spillover-eligible tasks (difficulty ≤ `spillover.maxDifficulty`, not frontier/review): `resolve_execution_plan` routes to alternate provider → NOT excluded → selected and rerouted.
+- Frontier/review tasks or tasks with no enabled alternative: resolve stays on blacked-out provider → excluded → deferred.
+
+**Step 8 — All-deferred wave: deferral-first branch (wait, clear, return)**
+- Wave: `src/loop_engine/wave_orchestration.rs:186-229` — `handle_quota_deferral()` called FIRST, before `classify_drained_queue`, `reconcile_passes_with_db`, and `stale_tracker.mark_stale()`.
+- Sequential: `src/loop_engine/orchestrator.rs:576-602` — same call, same ordering invariant. Both comment "FEAT-008 deferral-first — ordered BEFORE drained classification and the stale tracker".
+- `handle_quota_deferral_inner` (`account.rs:394-418`): waits `blackout.max_remaining_secs(now)`, then calls `blackout.clear()`. Returns `Deferred { stopped }`.
+- On `Deferred { stopped: false }`: returns `WaveOutcome { rate_limited_retry: true, iteration_consumed: false }` — stale tracker NOT incremented.
+
+**Step 9 — Stale counter verified untouched**
+- `wave_orchestration.rs:283-284`: `ctx.stale_tracker.mark_stale()` is at step (3) — AFTER the `QuotaDeferral::Deferred` early return at step (0). An all-deferred wave never reaches `mark_stale()`.
+- Test: `model_selection_engine_edges.rs:642` `blackout_medium_reroutes_while_frontier_review_defers_zero_stale` asserts stale count = 0 after a quota deferral cycle.
+
+**Step 10 — Blackout expiry self-clear**
+- Lazy path: `BlackoutState::active()` (`engine.rs:274`) filters `expiry > now` — expired entries silently excluded; the map self-clears on next read.
+- Explicit path: `handle_quota_deferral_inner:414`: `blackout.clear()` after wait completes.
+
+**Channel discipline — zero touch points between blackout and runner_overrides:**
+- `reactions/account.rs`: zero code accesses to `runner_overrides` (only comments asserting it is never touched).
+- `recovery.rs` (the `runner_overrides` writer): zero references to `provider_blackouts` or `BlackoutState`.
+- `compute_quota_excluded_ids` reads `runner_overrides` only to determine the effective provider for already-pinned tasks — never writes.
+- Test: `model_selection_engine_edges.rs:565` `blackout_reroute_leaves_runner_overrides_untouched` asserts `ctx.runner_overrides.is_empty()` after a blackout reroute.
+
+**All tests pass:** `cargo test --test model_selection_engine_edges` (14/14 OK), `cargo test --test reaction_parity` (38/38 OK).
+
+**No wiring gaps found. No WIRE-FIX tasks needed.**
+
+---
+
+## 2026-06-09 - cd8d4641-WIRE-FIX-001
+
+**Wire ExecutionPlan.effort through prompt builders to runner argv**
+
+Root cause: `resolve_execution_plan` correctly computed `ExecutionPlan.effort = models.effort_for(final_provider, difficulty)` (per-provider table), but BOTH prompt builders dropped it and independently recomputed from the static `EFFORT_FOR_DIFFICULTY` table via `effort_for_difficulty()`. Default config matched, so custom per-provider tables (e.g. `providers.grok.effort.high = "medium"`) were silently ignored at the runner argv.
+
+**Fix — carry plan.effort end-to-end (owned `String`, since per-provider levels are runtime config):**
+- `PromptResult::cluster_effort`: `Option<&'static str>` → `Option<String>`. Initialized as `plan.effort.or_else(static effort_for_difficulty)` in `prompt/sequential.rs::build_prompt` (static is now only the fallback when the resolved provider has no effort entry).
+- `SlotPromptBundle`: added `cluster_effort: Option<String>` field, populated identically from `plan.effort.or_else(static)` in `prompt/slot.rs::build_prompt`. The slot worker now prefers it over re-deriving from `difficulty`.
+- `IterationResult::effective_effort` + `SlotEarlyExit::effective_effort` (engine.rs): `Option<&'static str>` → `Option<String>` so the final merged effort flows consistently into the synthetic overflow `PromptResult` and the progress log.
+- `iteration_pipeline::ProcessingParams::effective_effort`: `Option<&'static str>` → `Option<&'a str>` (borrowed; only feeds `progress::log_iteration`).
+
+**Dispatch sites now prefer plan effort over the static fallback:**
+- Sequential `iteration.rs:459`: `base_effort = prompt_result.cluster_effort` (the plan effort); `effort = overflow_override.or(base_effort)`.
+- Wave `slot.rs:150`: `effort = slot.effective_effort(override).or(bundle.cluster_effort)`. The redundant static `effort_for_difficulty` call was removed here (the bundle already bakes the static fallback at build time), dropping the now-unused top-level `model` import.
+
+**Channel discipline preserved:** the prior-overflow effort OVERRIDE channel (`ctx.effort_overrides` → `TaskExecutionPlan::effort` → `SlotContext::effective_effort`) stays `Option<&'static str>` — those are escalation-ladder levels, not config values, and still win over the plan effort. Only the computed/base effort channel became `String`.
+
+**Regression test:** `prompt/sequential.rs::test_cluster_effort_honors_custom_provider_effort_table` — production-shaped grok-primary `ModelsConfig` with `effort.medium = "low"` (vs static medium→"high"); asserts `cluster_effort == Some("low")`. Existing `test_cluster_effort_*` updated to `.as_deref()` comparisons (default claude table still maps medium→"high", unchanged).
+
+**Gate:** `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check` clean. `cargo test --lib loop_engine::` 1945/0. Integration: iteration_pipeline_parity, reaction_parity, prompt_slot, overflow_per_slot, iteration_result_conversation, grok_to_claude_fallback all green.
+
+---
+## 2026-06-09 - cd8d4641-INT-003
+
+### Integration trace: completion result → provider stamping → DB columns → export round-trip
+
+**Trace verified:**
+1. Single home: `iteration_pipeline.rs:474-498` — stamps both `tasks.completed_by_provider` and `run_tasks.provider/model` in the `task_marked_done && effective_runner.is_some()` arm. Fires for sequential AND wave completions (both call `process_iteration_output`).
+2. Grep-verified: no other writers of `completed_by_provider` or `run_tasks.provider`.
+3. TryFrom<Row> hydration: `models/task.rs:379` uses `.ok().flatten()` — graceful for NULL historical rows.
+4. Export gap found and fixed: `ExportedUserStory` was missing `completed_by_provider`. Added field to struct, SQL SELECT, tuple, and struct construction in `export/prd.rs`.
+5. prd_metadata.default_model: already exported correctly via `load_prd_metadata` → `ExportedPrd.model`.
+
+**Tests added:** 3 new tests in `export/tests.rs` covering absent-when-None, present-when-stamped, and full DB round-trip.
+
+---
+## 2026-06-10 - cd8d4641-REFACTOR-REVIEW-FINAL
+
+### Final refactoring review: full-context pass over all new/changed code
+
+Reviewed the full PRD diff (main...HEAD: 98 files, ~11.5k insertions; 48 src files) — own targeted architecture pass + rust-python-code-reviewer agent broad pass (per task notes).
+
+**Acceptance-criteria verdicts:**
+1. **Single anchor/tier derivation — PASS (function level), with one input-divergence finding.** `anchored_tier`/`difficulty_offset`/`normalize_difficulty`/`escalate_tier`/`tier_of` live only in model.rs; spawn sites (prompt/sequential.rs:440, prompt/slot.rs:361), pre_spawn (reactions/pre_spawn.rs:315), the overflow ladder, and the `models show` matrix all call them. BUT recovery.rs:248, pre_spawn.rs:173, and escalation.rs:52 pass `builtin_resolved_models()` while spawn + overflow pass the OPERATOR-resolved config → REFACTOR-007.
+2. **No duplicated sequential/wave precedence — PASS.** `resolve_execution_plan` is the single spawn-side decision site (rung order pinned by tests/precedence_matrix.rs); `resolve_effective_runner` the single dispatch discriminant; effort dispatch is a documented 2-line mirror at both sites (WIRE-FIX-001 shape). One reasoned, commented asymmetry in post-plan provider_hint dropping → REFACTOR-009 (helper or parity pin).
+3. **Config types / error strings — FAIL on dead legacy plumbing → REFACTOR-006.** Preflight hard-rejects primaryRunner/fallbackRunner (LEGACY_MODEL_KEYS), so ProjectConfig.{default_model,review_model,primary_runner,fallback_runner} are always None at loop time; all three cross-provider RuntimeError promotion branches in recovery.rs are UNREACHABLE in production (tests construct the legacy structs directly). validate_runner_routing_config + write_default_model have test-only callers; prompt builders carry dead primary_runner/project_default_model/user_default_model params. Error strings PASS: every validate_models_config message names the key path + accepted set; legacy tier aliases (opus/sonnet/haiku) rejected with the accepted set named; handlers funnel through the CONFIG ERROR voice.
+4. **BlackoutState isolation — PASS** (re-confirmed by agent: no serde/DB, zero runner_overrides cross-touches; INT-002 trace + `blackout_reroute_leaves_runner_overrides_untouched` still hold). Rung constants readable; lifecycle-verb discipline clean (the one raw status UPDATE in the diff is test setup in sequential.rs:3079); ui:: vs tracing clean; no production unwrap(); provider token-equality / tier exact-match confirmed.
+
+**Spawned (all --depended-on-by MILESTONE-FINAL):**
+- REFACTOR-006 (pri 72, high): RuntimeError cross-provider promotion migrate-or-delete — unreachable post-hard-break; <key-decision> emitted (migrate to provider-first surface vs delete).
+- REFACTOR-007 (pri 74, medium, dependsOn 006): thread operator-resolved ModelsConfig into recovery/pre_spawn/escalation-section builtin_resolved_models() sites.
+- REFACTOR-008 (pri 76, low): single-source *_DEFAULT_TIER_MODELS vs default_*_provider builders; grok-build literal (project_config.rs:310) escapes no_hardcoded_models — widen guard.
+- REFACTOR-009 (pri 78, low): share/pin the post-plan provider_hint drop rule (sequential blanket-drop vs wave keep-on-widening; possible latent sequential bug for Codex empty-model routes — investigate first).
+
+**Fixed inline:** src/loop_engine/CLAUDE.md routing-precedence list was stale — review-class force was listed as its own rung ABOVE byIdPrefix, contradicting code + the pinning test (precedence_matrix::byidprefix_route_beats_review_class_force). Folded the review force into the taskClasses rung with the test reference.
+
+No Rust code changed this iteration (doc + task adds only) — quality gate not applicable.
+
+---
+
+## 2026-06-10 - cd8d4641-REFACTOR-008
+Single-sourced the default tier→model tables and widened the no-hardcoded-models guard to grok ids.
+
+- project_config.rs: replaced `tier_map(&[(CapabilityTier, Option<&str>)])` with `tier_map_from_defaults(table: &[(&str,&str)])` that consumes the `*_DEFAULT_TIER_MODELS` tables in model.rs directly. default_claude/grok/codex_provider now derive their `tiers` from CLAUDE/GROK/CODEX_DEFAULT_TIER_MODELS — one home, no drift between runtime routing and gen-docs. Empty model string → None (codex no -m flag). Removed the lone production `"grok-build"` literal (was project_config.rs:202).
+- Moved OPUS_MODEL/SONNET_MODEL imports into the test module (now test-only after the builder no longer references them); dropped HAIKU/FABLE imports.
+- Added test `default_providers_derive_tiers_from_canonical_tables`: pins derivation + canonical CapabilityTier keys (rejects legacy opus/sonnet/haiku aliases).
+- tests/no_hardcoded_models.rs: added a second regex `grok-(build|code|\d)` (matches grok-build/grok-4/grok-code-fast-1 without snaring grok-cli/grok-fallback/grok-stderr). Claude pattern stays banned everywhere; grok pattern is production-scoped — skips `#[cfg(test)]` modules and `tests/` files since they legitimately use the literal (no exported Grok constant). Verified via injection: a production `const _SENTINEL = "grok-build"` is flagged.
+- `default_fallback_model` referenced in the task description no longer exists (removed by an earlier REFACTOR); no action needed.
+
+Gate: fmt/check/clippy --all-targets clean; no_hardcoded_models (2) + project_config lib (57) pass; `gen-docs --check` green (model.rs untouched).
+---

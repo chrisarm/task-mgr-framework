@@ -1084,7 +1084,7 @@
       "estimatedEffort": "high",
       "id": "REFACTOR-006",
       "notes": "Found by REFACTOR-REVIEW-FINAL (own analysis + rust-python-code-reviewer agent, SUBSTANTIVE #1). The rustdoc at recovery.rs:412 already flags the params as retained-for-a-follow-up; this is that follow-up plus the migrate-or-delete decision. promote_once / deferred-apply / invalidate_stale_overrides stay UNTOUCHED regardless of branch.",
-      "passes": false,
+      "passes": true,
       "priority": 72,
       "title": "RuntimeError cross-provider promotion: migrate to provider-first config or delete (unreachable dead code post-hard-break)",
       "touchesFiles": [

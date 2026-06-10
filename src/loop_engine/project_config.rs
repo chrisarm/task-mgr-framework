@@ -5,8 +5,9 @@ use std::path::Path;
 use crate::error::{TaskMgrError, TaskMgrResult};
 use crate::loop_engine::config_io::{OnCorruptJson, write_config_key_at};
 use crate::loop_engine::model::{
-    CODEX_EFFORT_FOR_DIFFICULTY, CapabilityTier, EFFORT_FOR_DIFFICULTY, FABLE_MODEL, HAIKU_MODEL,
-    OPUS_MODEL, Provider, ResolvedModelsConfig, SONNET_MODEL, parse_config_provider,
+    CLAUDE_DEFAULT_TIER_MODELS, CODEX_DEFAULT_TIER_MODELS, CODEX_EFFORT_FOR_DIFFICULTY,
+    CapabilityTier, EFFORT_FOR_DIFFICULTY, GROK_DEFAULT_TIER_MODELS, Provider,
+    ResolvedModelsConfig, parse_config_provider,
 };
 
 // ============================================================================
@@ -160,13 +161,20 @@ fn default_anchor_tier() -> String {
     CapabilityTier::Standard.as_str().to_string()
 }
 
-/// Build a `tiers` map from typed `(tier, model)` pairs. Keeps model-ID
-/// literals confined to `model.rs` — entries reference the constants, never
-/// hardcode strings here.
-fn tier_map(entries: &[(CapabilityTier, Option<&str>)]) -> HashMap<String, Option<String>> {
-    entries
+/// Build a `tiers` map from a `*_DEFAULT_TIER_MODELS` table in `model.rs` — the
+/// single source of truth also consumed by `gen-docs` for the tier-matrix docs.
+/// Deriving the runtime default from the same table (instead of restating the
+/// assignments) means a rung added in `model.rs` can't silently desync the
+/// resolved routing from the documentation. An empty model string means "route
+/// with no `-m` flag" → `None` (the codex `standard` rung). Model-ID literals
+/// stay confined to `model.rs`, keeping the `no_hardcoded_models` guard happy.
+fn tier_map_from_defaults(table: &[(&str, &str)]) -> HashMap<String, Option<String>> {
+    table
         .iter()
-        .map(|(t, m)| (t.as_str().to_string(), m.map(str::to_string)))
+        .map(|(tier, model)| {
+            let value = (!model.is_empty()).then(|| (*model).to_string());
+            ((*tier).to_string(), value)
+        })
         .collect()
 }
 
@@ -182,12 +190,7 @@ fn effort_map(entries: &[(&str, &str)]) -> HashMap<String, Option<String>> {
 fn default_claude_provider() -> ProviderConfig {
     ProviderConfig {
         enabled: true,
-        tiers: tier_map(&[
-            (CapabilityTier::Cheapest, Some(HAIKU_MODEL)),
-            (CapabilityTier::CostEfficient, Some(SONNET_MODEL)),
-            (CapabilityTier::Standard, Some(OPUS_MODEL)),
-            (CapabilityTier::Frontier, Some(FABLE_MODEL)),
-        ]),
+        tiers: tier_map_from_defaults(CLAUDE_DEFAULT_TIER_MODELS),
         effort: effort_map(EFFORT_FOR_DIFFICULTY),
         fallback: None,
         cli_binary: None,
@@ -199,7 +202,7 @@ fn default_claude_provider() -> ProviderConfig {
 fn default_grok_provider() -> ProviderConfig {
     ProviderConfig {
         enabled: false,
-        tiers: tier_map(&[(CapabilityTier::Standard, Some("grok-build"))]),
+        tiers: tier_map_from_defaults(GROK_DEFAULT_TIER_MODELS),
         effort: effort_map(EFFORT_FOR_DIFFICULTY),
         fallback: None,
         cli_binary: None,
@@ -212,7 +215,7 @@ fn default_grok_provider() -> ProviderConfig {
 fn default_codex_provider() -> ProviderConfig {
     ProviderConfig {
         enabled: false,
-        tiers: tier_map(&[(CapabilityTier::Standard, None)]),
+        tiers: tier_map_from_defaults(CODEX_DEFAULT_TIER_MODELS),
         effort: effort_map(CODEX_EFFORT_FOR_DIFFICULTY),
         fallback: None,
         cli_binary: None,
@@ -998,8 +1001,43 @@ pub fn write_review_model(db_dir: &Path, model: Option<&str>) -> std::io::Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::loop_engine::model::{OPUS_MODEL, SONNET_MODEL};
     use crate::loop_engine::test_utils::{CLAUDE_BINARY_MUTEX, EnvGuard};
     use std::fs;
+
+    /// The built-in provider builders MUST derive their `tiers` from the
+    /// `*_DEFAULT_TIER_MODELS` tables (the SSoT also consumed by `gen-docs`), and
+    /// every table key MUST be a canonical `CapabilityTier` wire form — never a
+    /// legacy alias (`opus`/`sonnet`/`haiku`). This pins both the derivation and
+    /// the no-legacy-alias invariant so the two representations can't drift.
+    #[test]
+    fn default_providers_derive_tiers_from_canonical_tables() {
+        // Assert a built provider's `tiers` is exactly the derivation of its
+        // source table: same rung count, canonical CapabilityTier keys (no
+        // legacy aliases), empty model → `None`.
+        fn assert_derived(table: &[(&str, &str)], provider: &ProviderConfig) {
+            assert_eq!(provider.tiers.len(), table.len());
+            for (tier, model) in table {
+                let parsed = CapabilityTier::parse(tier)
+                    .unwrap_or_else(|e| panic!("table key {tier:?} not a CapabilityTier: {e}"));
+                assert_eq!(
+                    parsed.as_str(),
+                    *tier,
+                    "table key {tier:?} is not canonical"
+                );
+                let expected = (!model.is_empty()).then(|| model.to_string());
+                assert_eq!(
+                    provider.tiers.get(*tier),
+                    Some(&expected),
+                    "rung {tier:?} drifted from its source table",
+                );
+            }
+        }
+
+        assert_derived(CLAUDE_DEFAULT_TIER_MODELS, &default_claude_provider());
+        assert_derived(GROK_DEFAULT_TIER_MODELS, &default_grok_provider());
+        assert_derived(CODEX_DEFAULT_TIER_MODELS, &default_codex_provider());
+    }
 
     /// Serializes tests that mutate the process-global `CODEX_BINARY` env var
     /// and then probe it (directly or via `preflight_validate_and_probe`).
