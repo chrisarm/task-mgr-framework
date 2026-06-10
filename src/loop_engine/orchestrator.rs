@@ -93,8 +93,6 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
         task_prefix,
         default_model,
         project_config,
-        project_default_model,
-        user_default_model,
         prd_implicit_overlap_files,
         external_repo_path,
         actual_worktree_path,
@@ -220,8 +218,6 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                 permission_mode: &permission_mode,
                 signal_flag: &signal_flag,
                 default_model: default_model.as_deref(),
-                project_default_model: project_default_model.as_deref(),
-                user_default_model: user_default_model.as_deref(),
                 verbose: run_config.config.verbose,
                 task_prefix: task_prefix.as_deref(),
                 prd_path: paths.prd_file.as_path(),
@@ -314,8 +310,6 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
             prd_path: Some(paths.prd_file.as_path()),
             task_prefix: task_prefix.as_deref(),
             default_model: default_model.as_deref(),
-            project_default_model: project_default_model.as_deref(),
-            user_default_model: user_default_model.as_deref(),
             permission_mode: &permission_mode,
             batch_sibling_prds: &run_config.batch_sibling_prds,
             project_config: &project_config,
@@ -562,10 +556,6 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                 iteration as i64,
                 &mut ctx,
                 result.effective_runner,
-                project_config.fallback_runner.as_ref(),
-                project_config.primary_runner.as_ref(),
-                project_default_model.as_deref(),
-                user_default_model.as_deref(),
             )
         {
             tracing::warn!("failed to start retry tracking transaction: {}", e);

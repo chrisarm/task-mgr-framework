@@ -28,7 +28,6 @@ use task_mgr::db::{create_schema, open_connection};
 use task_mgr::learnings::crud::{RecordLearningParams, record_learning};
 use task_mgr::loop_engine::config::PermissionMode;
 use task_mgr::loop_engine::model::{OPUS_MODEL, SONNET_MODEL};
-use task_mgr::loop_engine::project_config::{PrimaryRunnerConfig, RunnerSpec};
 use task_mgr::loop_engine::prompt::slot::{
     CRITICAL_OVERFLOW_SENTINEL, SlotPromptBundle, SlotPromptParams, build_prompt,
 };
@@ -82,10 +81,7 @@ fn make_params(project_root: PathBuf, base_prompt_path: PathBuf) -> SlotPromptPa
         permission_mode: PermissionMode::Dangerous,
         steering_path: None,
         session_guidance: "",
-        primary_runner: None,
         prd_default: None,
-        project_default: None,
-        user_default: None,
         models_config: task_mgr::loop_engine::project_config::default_models_config(),
         routing_config: task_mgr::loop_engine::project_config::default_routing_config(),
         provider_blackouts: Default::default(),
@@ -390,10 +386,7 @@ fn build_prompt_renders_steering_and_session_guidance_when_set() {
         permission_mode: PermissionMode::Dangerous,
         steering_path: Some(steering_file.as_path()),
         session_guidance: "operator note: focus on edge cases",
-        primary_runner: None,
         prd_default: None,
-        project_default: None,
-        user_default: None,
         models_config: task_mgr::loop_engine::project_config::default_models_config(),
         routing_config: task_mgr::loop_engine::project_config::default_routing_config(),
         provider_blackouts: Default::default(),
@@ -594,10 +587,7 @@ fn build_prompt_oversize_drops_trimmable_sections_and_caps_total_budget() {
         permission_mode: PermissionMode::Dangerous,
         steering_path: None,
         session_guidance: "",
-        primary_runner: None,
         prd_default: None,
-        project_default: None,
-        user_default: None,
         models_config: task_mgr::loop_engine::project_config::default_models_config(),
         routing_config: task_mgr::loop_engine::project_config::default_routing_config(),
         provider_blackouts: Default::default(),
@@ -683,10 +673,7 @@ fn build_prompt_clears_shown_learning_ids_when_learnings_dropped() {
         permission_mode: PermissionMode::Dangerous,
         steering_path: None,
         session_guidance: "",
-        primary_runner: None,
         prd_default: None,
-        project_default: None,
-        user_default: None,
         models_config: task_mgr::loop_engine::project_config::default_models_config(),
         routing_config: task_mgr::loop_engine::project_config::default_routing_config(),
         provider_blackouts: Default::default(),
@@ -738,10 +725,7 @@ fn build_prompt_critical_only_oversize_returns_sentinel_bundle() {
         permission_mode: PermissionMode::Dangerous,
         steering_path: None,
         session_guidance: "",
-        primary_runner: None,
         prd_default: None,
-        project_default: None,
-        user_default: None,
         models_config: task_mgr::loop_engine::project_config::default_models_config(),
         routing_config: task_mgr::loop_engine::project_config::default_routing_config(),
         provider_blackouts: Default::default(),
@@ -787,29 +771,8 @@ fn build_prompt_critical_only_oversize_returns_sentinel_bundle() {
 // slot-path coverage; here we prove the legacy surfaces are inert.)
 // ---------------------------------------------------------------------------
 
-const GROK_MODEL: &str = "grok-build";
-
-/// A legacy `primaryRunner` config (`FEAT` id-prefix → Grok). Passed to the slot
-/// builder ONLY to prove the new resolver ignores the legacy primaryRunner
-/// surface.
-fn legacy_primary_runner_cfg() -> PrimaryRunnerConfig {
-    let mut by_id_prefix = std::collections::HashMap::new();
-    by_id_prefix.insert(
-        "FEAT".to_string(),
-        RunnerSpec {
-            provider: "grok".to_string(),
-            model: GROK_MODEL.to_string(),
-            ..Default::default()
-        },
-    );
-    PrimaryRunnerConfig {
-        by_id_prefix,
-        ..Default::default()
-    }
-}
-
 #[test]
-fn wave_slot_ignores_legacy_primary_runner_resolves_via_anchor_window() {
+fn wave_slot_resolves_via_anchor_window() {
     let (_tmp, conn) = setup_migrated_db();
     let project = project_with_files(&[]);
     let base_prompt = project.path().join("prompt.md");
@@ -821,17 +784,13 @@ fn wave_slot_ignores_legacy_primary_runner_resolves_via_anchor_window() {
     let mut task = Task::new("8d71d1f7-FEAT-001", "wave anchor-window resolution");
     task.difficulty = Some("medium".into());
 
-    let cfg = legacy_primary_runner_cfg();
     let params = SlotPromptParams {
         project_root: project.path().to_path_buf(),
         base_prompt_path: base_prompt,
         permission_mode: PermissionMode::Dangerous,
         steering_path: None,
         session_guidance: "",
-        primary_runner: Some(&cfg),
         prd_default: Some(SONNET_MODEL),
-        project_default: None,
-        user_default: None,
         models_config: task_mgr::loop_engine::project_config::default_models_config(),
         routing_config: task_mgr::loop_engine::project_config::default_routing_config(),
         provider_blackouts: Default::default(),
@@ -868,17 +827,13 @@ fn wave_slot_anchor_window_resolves_without_any_default() {
     );
     task.difficulty = Some("medium".into());
 
-    let cfg = legacy_primary_runner_cfg();
     let params = SlotPromptParams {
         project_root: project.path().to_path_buf(),
         base_prompt_path: base_prompt,
         permission_mode: PermissionMode::Dangerous,
         steering_path: None,
         session_guidance: "",
-        primary_runner: Some(&cfg),
         prd_default: None,
-        project_default: None,
-        user_default: None,
         models_config: task_mgr::loop_engine::project_config::default_models_config(),
         routing_config: task_mgr::loop_engine::project_config::default_routing_config(),
         provider_blackouts: Default::default(),

@@ -10,19 +10,12 @@
 //!  - `escalate_task_model_if_needed_for_runner` (explicit runner variant)
 //!  - `handle_task_failure_with_runner` (explicit runner variant)
 //!  - `crash_counts_as_task_failure` replaces V1's `is_non_counting_auth_failure`
-//!  - FEAT-005 fallback test added (not in V1): Codex + runtimeErrorFallback:true
-//!    → exactly one Claude promotion in `runner_overrides`.
-
-use std::collections::HashMap;
 
 use rusqlite::Connection;
 use task_mgr::db::{create_schema, open_connection, run_migrations};
 use task_mgr::loop_engine::config::CrashType;
 use task_mgr::loop_engine::engine::{
     IterationContext, escalate_task_model_if_needed_for_runner, handle_task_failure_with_runner,
-};
-use task_mgr::loop_engine::project_config::{
-    FallbackRunnerConfig, PrimaryRunnerConfig, RunnerSpec,
 };
 use task_mgr::loop_engine::runner::{RunnerKind, codex_conversation_indicates_auth_failure};
 
@@ -80,13 +73,6 @@ fn codex_runtime_error_null_db_model_writes_no_model_and_no_promotion() {
     insert_task(&conn, "CODEX-NULL-001", None);
 
     let mut ctx = IterationContext::new(8);
-    let cfg = FallbackRunnerConfig {
-        enabled: true,
-        provider: "grok".to_string(),
-        model: "grok-build".to_string(),
-        runtime_error_threshold: 2,
-        ..Default::default()
-    };
 
     // `new_count = 2` matches the escalation threshold AND the Grok-promotion
     // `runtime_error_threshold`, so both branches would fire were it not for
@@ -97,10 +83,6 @@ fn codex_runtime_error_null_db_model_writes_no_model_and_no_promotion() {
         2,
         RunnerKind::Codex,
         &mut ctx,
-        Some(&cfg),
-        None,
-        None,
-        None,
     )
     .expect("escalate_task_model_if_needed_for_runner");
 
@@ -137,13 +119,6 @@ fn codex_runtime_error_populated_gpt_model_writes_no_model_and_no_promotion() {
     insert_task(&conn, "CODEX-GPT-001", Some("gpt-4o"));
 
     let mut ctx = IterationContext::new(8);
-    let cfg = FallbackRunnerConfig {
-        enabled: true,
-        provider: "grok".to_string(),
-        model: "grok-build".to_string(),
-        runtime_error_threshold: 2,
-        ..Default::default()
-    };
 
     let outcome = escalate_task_model_if_needed_for_runner(
         &conn,
@@ -151,10 +126,6 @@ fn codex_runtime_error_populated_gpt_model_writes_no_model_and_no_promotion() {
         2,
         RunnerKind::Codex,
         &mut ctx,
-        Some(&cfg),
-        None,
-        None,
-        None,
     )
     .expect("escalate_task_model_if_needed_for_runner");
 
@@ -186,13 +157,6 @@ fn handle_task_failure_codex_increments_counter_but_does_not_promote() {
     insert_task(&conn, "CODEX-RT-001", Some("gpt-4o"));
 
     let mut ctx = IterationContext::new(8);
-    let cfg = FallbackRunnerConfig {
-        enabled: true,
-        provider: "grok".to_string(),
-        model: "grok-build".to_string(),
-        runtime_error_threshold: 2,
-        ..Default::default()
-    };
 
     // Failure 1: count → 1. Below escalate threshold, below auto-block.
     handle_task_failure_with_runner(
@@ -201,10 +165,6 @@ fn handle_task_failure_codex_increments_counter_but_does_not_promote() {
         1,
         &mut ctx,
         Some(RunnerKind::Codex),
-        Some(&cfg),
-        None,
-        None,
-        None,
     )
     .expect("handle_task_failure_with_runner 1");
     assert_eq!(read_consecutive_failures(&conn, "CODEX-RT-001"), 1);
@@ -222,10 +182,6 @@ fn handle_task_failure_codex_increments_counter_but_does_not_promote() {
         2,
         &mut ctx,
         Some(RunnerKind::Codex),
-        Some(&cfg),
-        None,
-        None,
-        None,
     )
     .expect("handle_task_failure_with_runner 2");
     assert_eq!(read_consecutive_failures(&conn, "CODEX-RT-001"), 2);
@@ -246,10 +202,6 @@ fn handle_task_failure_codex_increments_counter_but_does_not_promote() {
         3,
         &mut ctx,
         Some(RunnerKind::Codex),
-        Some(&cfg),
-        None,
-        None,
-        None,
     )
     .expect("handle_task_failure_with_runner 3");
     assert_eq!(read_consecutive_failures(&conn, "CODEX-RT-001"), 3);
@@ -476,106 +428,4 @@ fn iteration_result_effective_runner_populated_at_spawn_sites() {
             "expected at least one IterationResult literal in {path}"
         );
     }
-}
-
-// ── NEW: FEAT-005 fallback test — Codex runtime failure + runtimeErrorFallback:true
-// → runner_overrides carries RunnerKind::Claude exactly once ──────────────────
-
-/// A Codex task whose `primaryRunner` spec has `runtimeErrorFallback: true` MUST
-/// be promoted to `RunnerKind::Claude` on the first runtime failure at threshold.
-///
-/// Known-bad negative: a test that only checks `runner_overrides` is NOT Codex
-/// (i.e. `assert_ne!(kind, RunnerKind::Codex)`) would pass a buggy
-/// promote-to-Codex implementation. We assert the specific value is
-/// `RunnerKind::Claude`.
-///
-/// Idempotency: a second failure call with Codex runner MUST NOT re-promote
-/// (the `runner_overrides` entry blocks the fallback branch).
-#[test]
-fn codex_runtime_failure_with_fallback_to_claude_promotes_to_claude_once() {
-    let (_tmp, conn) = setup_db();
-    // Codex tasks typically have NULL model (model is owned by the route spec).
-    conn.execute(
-        "INSERT INTO tasks (id, title, status, consecutive_failures, max_retries, priority) \
-         VALUES ('SPIKE-FALLBACK-001', 'Codex fallback test', 'in_progress', 0, 5, 10)",
-        [],
-    )
-    .expect("insert task");
-
-    let mut ctx = IterationContext::new(8);
-    let mut by_id_prefix = HashMap::new();
-    by_id_prefix.insert(
-        "SPIKE-".to_string(),
-        RunnerSpec {
-            provider: "codex".to_string(),
-            model: String::new(),
-            runtime_error_fallback: true,
-        },
-    );
-    let primary_cfg = PrimaryRunnerConfig {
-        by_id_prefix,
-        ..Default::default()
-    };
-
-    // First failure at threshold → should promote to Claude.
-    let result = escalate_task_model_if_needed_for_runner(
-        &conn,
-        "SPIKE-FALLBACK-001",
-        2,
-        RunnerKind::Codex,
-        &mut ctx,
-        None,
-        Some(&primary_cfg),
-        None,
-        None,
-    )
-    .expect("escalate first failure");
-
-    assert!(
-        result.is_some(),
-        "runtimeErrorFallback:true at threshold MUST return Some(target_model)"
-    );
-    assert_eq!(
-        ctx.runner_overrides.get("SPIKE-FALLBACK-001").copied(),
-        Some(RunnerKind::Claude),
-        "Codex→Claude promotion MUST insert RunnerKind::Claude into runner_overrides, \
-         not RunnerKind::Codex or RunnerKind::Grok"
-    );
-    assert!(
-        ctx.model_overrides.contains_key("SPIKE-FALLBACK-001"),
-        "model_overrides MUST carry the promoted Claude model"
-    );
-    let promoted_model = ctx
-        .model_overrides
-        .get("SPIKE-FALLBACK-001")
-        .expect("model_overrides entry");
-    assert!(
-        !promoted_model.is_empty(),
-        "promoted Claude model MUST be non-empty"
-    );
-
-    // Second failure with Codex runner MUST NOT re-promote (idempotency).
-    let result2 = escalate_task_model_if_needed_for_runner(
-        &conn,
-        "SPIKE-FALLBACK-001",
-        3,
-        RunnerKind::Codex,
-        &mut ctx,
-        None,
-        Some(&primary_cfg),
-        None,
-        None,
-    )
-    .expect("escalate second failure");
-
-    assert_eq!(
-        result2, None,
-        "already-promoted task MUST NOT re-promote — idempotency guard must prevent \
-         the second Codex failure from overwriting the Claude override"
-    );
-    assert_eq!(
-        ctx.runner_overrides.get("SPIKE-FALLBACK-001").copied(),
-        Some(RunnerKind::Claude),
-        "runner_overrides MUST remain Claude after the second Codex failure"
-    );
 }

@@ -222,11 +222,13 @@ pub struct RunnerOpts<'a> {
     /// the cleanup workaround (e.g. non-loop callers) leave this `false`
     /// (the default), and cleanup is skipped.
     pub cleanup_title_artifact: bool,
-    /// Fallback runner CLI binary path resolved from `FallbackRunnerConfig.cli_binary`.
-    /// Only consumed by `GrokRunner`: used as the second link in the binary
-    /// resolution chain (`$GROK_BINARY` → `fallback_cli_binary` → `"grok"` on
-    /// PATH). `ClaudeRunner` ignores it. `None` falls through to the PATH
-    /// default; `Some(p)` is invoked verbatim (no PATH re-resolution).
+    /// Optional explicit Grok CLI binary path. Only consumed by `GrokRunner`:
+    /// the second link in the binary resolution chain (`$GROK_BINARY` →
+    /// `fallback_cli_binary` → `"grok"` on PATH). `ClaudeRunner` ignores it.
+    /// `None` falls through to the PATH default; `Some(p)` is invoked verbatim
+    /// (no PATH re-resolution). Post-hard-break (REFACTOR-006) no config surface
+    /// populates this — it is reserved for a future `providers.grok` binary
+    /// override; the live resolution is `$GROK_BINARY` else bare `grok`.
     pub fallback_cli_binary: Option<&'a str>,
     /// Loop run ID forwarded to the per-slot grok stderr capture file name.
     /// Non-loop callers pass `None`; the sniffer uses `"no-run"` as a fallback.
@@ -711,7 +713,8 @@ impl LlmRunner for ClaudeRunner {
 /// Binary resolution chain (PRD §2.5: "GrokRunner binary resolution is
 /// config-independent"):
 /// 1. `GROK_BINARY` env var if set and non-empty
-/// 2. `opts.fallback_cli_binary` (from `FallbackRunnerConfig.cli_binary`)
+/// 2. `opts.fallback_cli_binary` (explicit override; currently unpopulated by
+///    any config surface post-hard-break)
 /// 3. `"grok"` resolved on `PATH`
 ///
 /// Flag mapping (PRD §6 Public Contracts):
