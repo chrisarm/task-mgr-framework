@@ -363,6 +363,25 @@ channels are cleared in one shot: `effort_overrides`, `model_overrides`,
 the operator sees the escape valve fired. Short-circuits for any task that
 never triggered the ladder (the dominant case is free).
 
+> **Absorb discriminator — the valve must not self-trip on the ladder's own
+> writes.** Every recovery rung that changes `tasks.model` also writes the same
+> value to `ctx.model_overrides` (rung-2/3 escalation, rung-4 cross-provider
+> pivot). The absorb rule in `invalidate_stale_overrides` therefore keys on
+> **`current tasks.model == model_overrides[task]`** → "this is the ladder's own
+> write, refresh the snapshot and return", NOT on whether the snapshot's inner
+> value is `None`. Gating absorb on `snapshot_inner.is_none()` (the original
+> NULL-original-only form) self-tripped the valve for a `Some`-original task that
+> pivoted cross-provider at the ceiling — wiping the just-installed promotion
+> including `runner_overrides`, weakening the `promote_once` guard. **Exception:
+> consecutive-failure escalation (`recovery::escalate_task_model_if_needed*`)
+> writes `tasks.model` WITHOUT touching `model_overrides`**, so it cannot be
+> recognized by the discriminator; it instead refreshes the snapshot directly at
+> its write site (`absorb_escalation_into_overflow_snapshot`, `and_modify` —
+> refreshes an existing snapshot only, never inserts, so a never-overflowed task
+> stays untracked). A new model-mutating recovery path must do ONE of: (a) write
+> `model_overrides` (then the valve recognizes it), or (b) refresh the snapshot at
+> its write site. Otherwise the next pre-spawn pass nukes the recovery it set up.
+
 **Provider routing — `model::provider_for_model` +
 `EffectiveRunnerInput.provider_hint`**: `provider_for_model` classifies a
 model id as `Provider::Claude` or `Provider::Grok` via **token equality on `-`
