@@ -469,10 +469,18 @@ pub fn run_iteration(
     // pre-rewrite baseline, so this re-resolution is the authoritative spawn
     // discriminant. Placed before the banner so the "(via grok)" annotation
     // can be included in the iteration header.
-    let mut provider_hint = prompt_result.provider_hint;
-    if effective_model != prompt_result.resolved_model {
-        provider_hint = None;
-    }
+    // Drop the hint on a model REWRITE (crash escalation / prior-overflow 1M),
+    // preserve it on a None→default widening — the shared rule lives in
+    // `model::final_provider_hint` so the sequential and wave paths cannot
+    // diverge (REFACTOR-009). Sequential does not widen `effective_model`
+    // today, but routing through the helper keeps that an implementation
+    // detail rather than a latent Codex→Claude misroute.
+    let provider_hint = crate::loop_engine::model::final_provider_hint(
+        prompt_result.provider_hint,
+        effective_model.as_deref(),
+        prompt_result.resolved_model.as_deref(),
+        params.default_model,
+    );
     let effective_runner = resolve_effective_runner(
         ctx,
         &task_id,

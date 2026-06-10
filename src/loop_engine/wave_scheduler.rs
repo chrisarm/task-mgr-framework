@@ -842,7 +842,18 @@ pub fn run_wave_iteration(
             .resolved_model
             .as_deref()
             .or(params.default_model);
-        let provider_hint = slot.prompt_bundle.provider_hint;
+        // Shared with the sequential path via `model::final_provider_hint`
+        // (REFACTOR-009): preserve the hint on the None→default widening
+        // (provider-only Codex spec), drop it only on a genuine rewrite.
+        // Crash escalation (line ~808) and review routing already cleared the
+        // hint at their rewrite sites, so the helper sees `None` there and is a
+        // no-op; any remaining hint is intentional provider intent.
+        let provider_hint = model::final_provider_hint(
+            slot.prompt_bundle.provider_hint,
+            effective_model,
+            slot.prompt_bundle.resolved_model.as_deref(),
+            params.default_model,
+        );
         slot.effective_runner = resolve_effective_runner(
             ctx,
             &task_id,

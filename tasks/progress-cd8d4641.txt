@@ -1078,3 +1078,29 @@ See the key-decision emitted this iteration. A proper effort-split task must als
 to resolve the alias (or keep the literal) before re-landing.
 
 ---
+## 2026-06-10 - cd8d4641-REFACTOR-009
+
+Shared the post-plan provider_hint drop rule between sequential
+(iteration.rs) and wave (wave_scheduler.rs) via new
+`model::final_provider_hint(plan_hint, effective_model, resolved_model,
+default_model)`.
+
+Investigated the latent-bug question first: sequential's blanket
+`effective_model != resolved_model -> None` was NOT actually wrong, because
+sequential never widens `effective_model` to `default_model` (it stays None for
+the Codex `model:""` case, so the comparison is None==None and the hint
+survives). Wave DOES widen, hence its deliberate "keep" comment. Result-parity
+held today but was one `.or(default_model)` edit away from a Codex->Claude
+misroute in sequential only.
+
+Helper rule: drop iff `effective_model != resolved_model && !widened`, where
+`widened = resolved_model.is_none() && effective_model == default_model`. Both
+sites now route through it. Crash escalation / review routing in wave still
+clear the hint at their rewrite sites, so the helper sees None there (no-op).
+
+Tests: 4 unit tests in model.rs (widening preserved, unchanged preserved,
+rewrite dropped, both-None preserved). reaction_parity (38), prompt_slot (14),
+prompt_slot_comprehensive (12), provider_routing (12) all green. fmt/check/
+clippy/gen-docs clean.
+
+---
