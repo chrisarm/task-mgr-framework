@@ -220,6 +220,20 @@ pub const EFFORT_FOR_DIFFICULTY: &[(&str, &str)] =
 pub const CODEX_EFFORT_FOR_DIFFICULTY: &[(&str, &str)] =
     &[("low", "low"), ("medium", "medium"), ("high", "high")];
 
+/// Default tier → model tables for the built-in providers (declarative source
+/// for `cargo run --bin gen-docs` tier matrix + anchor docs). These mirror the
+/// construction in `project_config::default_*_provider` but live here so docs
+/// extraction and the no-hardcoded-models rule stay confined to model.rs.
+/// Empty string value for codex "standard" signals "route with no model flag".
+pub const CLAUDE_DEFAULT_TIER_MODELS: &[(&str, &str)] = &[
+    ("cheapest", HAIKU_MODEL),
+    ("cost-efficient", SONNET_MODEL),
+    ("standard", OPUS_MODEL),
+    ("frontier", FABLE_MODEL),
+];
+pub const GROK_DEFAULT_TIER_MODELS: &[(&str, &str)] = &[("standard", "grok-build")];
+pub const CODEX_DEFAULT_TIER_MODELS: &[(&str, &str)] = &[("standard", "")];
+
 /// Trim + lowercase a difficulty string for table lookup. Returns `None` when
 /// the input is absent or whitespace-only so callers can short-circuit.
 fn normalize_difficulty(difficulty: Option<&str>) -> Option<String> {

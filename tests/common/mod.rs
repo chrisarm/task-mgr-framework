@@ -9,7 +9,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use task_mgr::loop_engine::model::{HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL};
+use task_mgr::loop_engine::model::{FABLE_MODEL, HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL};
 
 /// Absolute path to `tests/fixtures/`.
 pub fn fixtures_dir() -> PathBuf {
@@ -22,8 +22,10 @@ pub fn fixtures_dir() -> PathBuf {
 /// substitution) if it exists, else the plain `<name>` (passthrough). Writes
 /// the final content to `dest_dir/<name>` and returns that path.
 ///
-/// Placeholders (`{{OPUS_MODEL}}` / `{{SONNET_MODEL}}` / `{{HAIKU_MODEL}}`)
-/// resolve to the canonical constants in `src/loop_engine/model.rs`.
+/// Placeholders resolve to the canonical constants in `src/loop_engine/model.rs`.
+/// Legacy style (`{{OPUS_MODEL}}` etc.) and new tier style
+/// (`{{FRONTIER_MODEL}}` / `{{STANDARD_MODEL}}` / `{{COST_EFFICIENT_MODEL}}` /
+/// `{{CHEAPEST_MODEL}}`) are both supported so fixtures can use abstract tiers.
 pub fn render_fixture_tmpl(name: &str, dest_dir: &Path) -> PathBuf {
     let tmpl_path = fixtures_dir().join(format!("{name}.tmpl"));
     let plain_path = fixtures_dir().join(name);
@@ -66,6 +68,13 @@ fn substitute_placeholders(raw: &str) -> Result<String, String> {
             "OPUS_MODEL" => OPUS_MODEL,
             "SONNET_MODEL" => SONNET_MODEL,
             "HAIKU_MODEL" => HAIKU_MODEL,
+            "FABLE_MODEL" => FABLE_MODEL,
+            // New tier-style placeholders (FR-010). Map to the frontier/standard/etc
+            // rung under the default Claude ladder (the values used by builtin_default).
+            "FRONTIER_MODEL" => FABLE_MODEL,
+            "STANDARD_MODEL" => OPUS_MODEL,
+            "COST_EFFICIENT_MODEL" => SONNET_MODEL,
+            "CHEAPEST_MODEL" => HAIKU_MODEL,
             other => return Err(format!("unknown placeholder `{{{{{other}}}}}`")),
         };
         out.push_str(replacement);
@@ -81,8 +90,24 @@ mod tests {
 
     #[test]
     fn substitutes_known_placeholders() {
-        let out = substitute_placeholders("a {{OPUS_MODEL}} b {{HAIKU_MODEL}} c").unwrap();
-        assert_eq!(out, format!("a {OPUS_MODEL} b {HAIKU_MODEL} c"));
+        let out = substitute_placeholders("a {{OPUS_MODEL}} b {{HAIKU_MODEL}} c {{FABLE_MODEL}}")
+            .unwrap();
+        assert_eq!(
+            out,
+            format!("a {OPUS_MODEL} b {HAIKU_MODEL} c {FABLE_MODEL}")
+        );
+    }
+
+    #[test]
+    fn substitutes_tier_placeholders() {
+        let out = substitute_placeholders(
+            "{{FRONTIER_MODEL}} {{STANDARD_MODEL}} {{COST_EFFICIENT_MODEL}} {{CHEAPEST_MODEL}}",
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            format!("{FABLE_MODEL} {OPUS_MODEL} {SONNET_MODEL} {HAIKU_MODEL}")
+        );
     }
 
     #[test]

@@ -33,76 +33,62 @@ File-scoped invariants are stored as learnings and surface via
 
 ## Model IDs and Effort Mapping
 
-All Claude model IDs and the difficulty→effort mapping live in a single file:
-`src/loop_engine/model.rs` (`OPUS_MODEL` / `SONNET_MODEL` / `HAIKU_MODEL` constants
-and the `EFFORT_FOR_DIFFICULTY` table). After bumping a value there:
+All model IDs (Claude + cross-provider) and the difficulty→effort tables live in a
+single file: `src/loop_engine/model.rs` (`FABLE_MODEL` / `OPUS_MODEL` /
+`SONNET_MODEL` / `HAIKU_MODEL` constants, `EFFORT_FOR_DIFFICULTY`,
+`CODEX_EFFORT_FOR_DIFFICULTY`, and the declarative `*_DEFAULT_TIER_MODELS`
+tables). After bumping a value or table there:
 
 ```sh
-cargo run --bin gen-docs   # regenerates the MODELS block in .claude/commands/tasks.md
+cargo run --bin gen-docs   # regenerates the MODELS block (with tier matrix + anchor explanation) in .claude/commands/tasks.md and plan-tasks.md
 ```
 
 CI runs `cargo run --bin gen-docs -- --check` which fails if the doc is stale.
-Tests import the constants; JSON fixtures use `{{OPUS_MODEL}}` placeholders in
-`tests/fixtures/*.json.tmpl` rendered at load time by
-`tests/common/mod.rs::render_fixture_tmpl`. A regression test
-(`tests/no_hardcoded_models.rs`) ensures literal model strings don't creep back
-in outside `model.rs`.
+Tests import the constants; JSON fixtures use tier placeholders
+(`{{FRONTIER_MODEL}}` / `{{STANDARD_MODEL}}` / `{{COST_EFFICIENT_MODEL}}` /
+`{{CHEAPEST_MODEL}}` and legacy const-style) in `tests/fixtures/*.json.tmpl`
+rendered at load time by `tests/common/mod.rs::render_fixture_tmpl`. A regression
+test (`tests/no_hardcoded_models.rs`) ensures literal model strings don't creep
+back in outside `model.rs`.
 
 ## `task-mgr models` subcommand
 
-List and pin Claude models, and manage the provider/model routing surfaces:
+Manage the provider-first `models` + `routing` config (FR-001 hard break). All
+writes target project `.task-mgr/config.json` (or user config) and round-trip via
+`serde_json::Value` so unrelated keys are preserved. Legacy surfaces are rejected
+at preflight.
 
 ```sh
-task-mgr models list                     # offline — built-in model IDs + effort table
-task-mgr models list --remote            # live /v1/models (requires both env vars below)
-task-mgr models list --refresh           # busts cache before fetch; implies --remote
-task-mgr models set-default [<model>]    # prompts interactively when model omitted
-task-mgr models set-default <id> --project   # writes .task-mgr/config.json instead
-task-mgr models unset-default [--project]
-task-mgr models show                     # default + reviewModel/fallbackRunner/primaryRunner routing table
-
-# Reviewer (review-class tasks: CODE-REVIEW-*, MILESTONE-FINAL, REVIEW-*)
-task-mgr models set-review-model <id> [--project]   # plain model string; provider inferred (grok-build → Grok)
-task-mgr models unset-review-model [--project]
-
-# Fallback runner (Grok overflow/RuntimeError escape; v1 provider must be grok)
-task-mgr models set-fallback --enable --model grok-build [--cli-binary /path/grok] [--runtime-error-threshold N] [--project]
-task-mgr models set-fallback --disable [--project]
-task-mgr models unset-fallback [--project]
+task-mgr models list                     # offline — built-in model IDs + per-provider tier/effort tables + anchor
+task-mgr models list --remote            # live /v1/models (Anthropic; requires ANTHROPIC_API_KEY + TASK_MGR_USE_API=1)
+task-mgr models list --refresh           # bust cache before fetch
+task-mgr models show                     # resolved models/routing table, anchor window, blackout note, codex route-only note, empty states
+task-mgr models init [--force-replace-legacy] [--dry-run]  # write default models+routing block (migration deletes old keys)
+task-mgr models set-anchor <tier>        # cheapest|cost-efficient|standard|frontier
+task-mgr models enable|disable <provider>   # claude|grok|codex (claude defaults enabled)
+task-mgr models set-tier <provider> <tier> [model-or-null]   # set rung (null = no -m flag)
+task-mgr models unset-tier <provider> <tier>
+task-mgr models set-effort <provider> <difficulty> [level-or-null]
+task-mgr models set-fallback <provider> [target-provider]   # tier-preserving rung-4 pivot target (different + enabled)
+task-mgr models unset-fallback <provider>
+task-mgr models route <prefix> [--provider <p>] [--tier <t>]   # byIdPrefix forcing
+task-mgr models unroute <prefix>
 ```
 
-`set-review-model` / `set-fallback` write the **config** routing surfaces
-(`reviewModel` / `fallbackRunner` in `.task-mgr/config.json`, or the user
-config without `--project`); they never stamp a per-task `model`. Every setter
-round-trips the config file via `serde_json::Value` so unrelated keys
-(`additionalAllowedTools`, `embeddingModel`, …) are preserved, and probes the
-target binary **before** writing when a Grok model/runner is involved (same
-resolver the loop startup probe uses). `set-fallback` rejects any provider other
-than `grok` in v1. `models show` reads the resolved `ProjectConfig` and prints
-the full routing table with explicit empty states — `(unset)`, `disabled`,
-`(no routes)` — so an unset surface is never confused with one that simply
-wasn't printed.
+`models show` prints the full merged routing table, the anchor-derived
+difficulty→model matrix for the primary, escalation cost note, and explicit
+`(unset)` / `disabled` / `(no routes)` / codex-route-only markers.
 
-**Remote opt-in** (prevents surprise HTTP calls on a globally-exported SDK key):
+**Remote / cache** (same as before for `list --remote`): `ANTHROPIC_API_KEY` +
+`TASK_MGR_USE_API=1`; cache under `$XDG_CACHE_HOME/task-mgr/models-cache.json`
+(24h).
 
-- `ANTHROPIC_API_KEY` — your Anthropic API key
-- `TASK_MGR_USE_API=1` — explicit opt-in; both must be set or we silently fall
-  back to the built-in list
+**Picker**: still fires on `task-mgr init` (and the permanent shim) when no
+default resolves and TTY; never on `loop init` / `batch init`.
 
-Cache: `$XDG_CACHE_HOME/task-mgr/models-cache.json` (24h TTL, stale treated as miss).
-
-**Config locations & precedence** (highest to lowest): explicit task `model` →
-direct `primaryRunner` match → baseline model (`difficulty==high` or
-PRD/project/user default) → `primaryRunner.baselineTierRoutes` remap using the
-provider-neutral baseline tier (`low`/`standard`/`high`) → baseline model → none.
-`difficulty==high` always escalates to `OPUS_MODEL`, independent of any
-default.
-
-The interactive picker fires from `task-mgr init` (project-level scaffold) and
-from the deprecated `task-mgr init --from-json X` shim path when nothing
-resolves and stdin+stderr are both TTYs. Non-TTY / auto-mode runs print a
-one-line stderr hint and skip — no hang. The picker does NOT fire from
-`task-mgr loop init` or `task-mgr batch init` directly.
+Codex routes are config-explicit only (byIdPrefix / taskClasses with
+`provider:"codex"`); never inferred from a model string. Blackout channel
+(`provider_blackouts`) is separate from permanent `runner_overrides` promotions.
 
 ## Deprecation policy
 

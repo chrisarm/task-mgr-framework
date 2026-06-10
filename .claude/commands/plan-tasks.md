@@ -192,15 +192,34 @@ Do **not** hardcode model IDs — they change with each Claude release and must 
 
 **Current model IDs** (bumped in `src/loop_engine/model.rs`):
 
-- **Opus** → `OPUS_MODEL` = `claude-opus-4-8`
-- **Sonnet** → `SONNET_MODEL` = `claude-sonnet-4-6`
-- **Haiku** → `HAIKU_MODEL` = `claude-haiku-4-5-20251001`
+- **Fable (frontier)** → `FABLE_MODEL` = `claude-fable-5`
+- **Opus (standard)** → `OPUS_MODEL` = `claude-opus-4-8`
+- **Sonnet (cost-efficient)** → `SONNET_MODEL` = `claude-sonnet-4-6`
+- **Haiku (cheapest)** → `HAIKU_MODEL` = `claude-haiku-4-5-20251001`
 
-**Difficulty → `--effort` mapping** (from `EFFORT_FOR_DIFFICULTY`):
+**Difficulty → `--effort` mapping**:
 
-- `low` → `medium`
-- `medium` → `high`
-- `high` → `xhigh`
+- Claude / Grok (`EFFORT_FOR_DIFFICULTY`): `low` → `medium`, `medium` → `high`, `high` → `xhigh`
+- Codex (`CODEX_EFFORT_FOR_DIFFICULTY`, capped at `high` by policy): `low` → `low`, `medium` → `medium`, `high` → `high`
+
+**Capability tiers + anchor window (default `models` config)**:
+
+Provider-neutral tiers (ordered Cheapest < CostEfficient < Standard < Frontier). The anchor (default `standard`) + difficulty offset produces the starting tier:
+- low difficulty → anchor − 1 (clamped at ladder bottom)
+- medium → anchor
+- high → anchor + 1 (clamped at ladder top)
+See `anchored_tier` + `difficulty_offset` (single normalizer). Sparse ladders: only defined rungs participate in clamp / escalate; gaps are skipped.
+
+Default tier matrix (from the `_DEFAULT_TIER_MODELS` tables; empty = route with no model flag):
+
+| Tier | Claude | Grok | Codex |
+|------|--------|------|-------|
+| frontier | claude-fable-5 | (n/a) | (n/a) |
+| standard | claude-opus-4-8 | grok-build | (no -m flag) |
+| cost-efficient | claude-sonnet-4-6 | (n/a) | (n/a) |
+| cheapest | claude-haiku-4-5-20251001 | (n/a) | (n/a) |
+
+Codex routes are always explicit (`byIdPrefix` or `taskClasses` in `routing`); Codex is never inferred from a model string.
 <!-- MODELS:END -->
 
 Set the resolved **sonnet** model as the PRD-level `"model"` field. Sonnet is the iteration baseline for ordinary FEAT work.

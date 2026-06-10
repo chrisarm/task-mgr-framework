@@ -71,125 +71,66 @@ wrapper to prove the TTY gate still fires. When adding a new
 launch-boundary guard, add it inside `maybe_fire_inner` and test it via
 the inner — never via the outer.
 
-## primaryRunner config and routing
+## models + routing config and capability tiers (FR-001)
 
-`primaryRunner` in `.task-mgr/config.json` routes specific task types or ID
-prefixes to a non-default runner (Grok or Codex) BEFORE the `difficulty=high →
-Opus` escalation. All other tasks continue on the default Claude runner. Grok
-primary routing is the mirror of `fallbackRunner`: instead of promoting a stuck
-Claude task to Grok as a last resort, `primaryRunner` routes designated task
-classes to Grok as the FIRST choice. Codex primary routing is provider-intent
-only in v1; it is not part of the Claude↔Grok fallback pair.
+The single provider-first surface is the `models` + `routing` block (merged onto
+`ModelsConfig::builtin_default`). Legacy `defaultModel` / `reviewModel` /
+`primaryRunner` / `fallbackRunner` / `baselineTierRoutes` are hard-broken (detected
+at preflight; migration via `task-mgr models init`).
 
-### Config block
+`models` supplies:
+- `primaryProvider`, `anchor` (default "standard")
+- per-provider `enabled` + sparse `tiers` (kebab keys: cheapest|cost-efficient|standard|frontier → model or null) + per-difficulty `effort` tables + optional `fallback` (different enabled provider)
 
-```json
-{
-  "primaryRunner": {
-    "claudeFallbackModel": "<a Claude model id — e.g. the SONNET_MODEL constant in src/loop_engine/model.rs>",
-    "runtimeErrorThreshold": 2,
-    "byTaskType": {
-      "review":    { "provider": "grok", "model": "grok-build" },
-      "milestone": { "provider": "grok", "model": "grok-build" },
-      "spike":     { "provider": "codex" }
-    },
-    "byIdPrefix": {
-      "REVIEW-":    { "provider": "grok", "model": "grok-build" },
-      "MILESTONE-": { "provider": "grok", "model": "grok-build" }
-    }
-  }
-}
-```
+`routing` supplies role split (`taskClasses`), prefix forcing (`byIdPrefix`), and
+spillover policy for quota blackouts.
 
-Field defaults: `claudeFallbackModel=null`, `runtimeErrorThreshold=2`,
-`byTaskType={}`, `byIdPrefix={}`. `RunnerSpec.model`
-defaults to `""` and is valid only for `provider: "codex"`; Grok and Claude
-routes must provide a nonblank model. Absent or `null` →
-`primary_runner = None` in `ProjectConfig`.
+See `src/loop_engine/model.rs` (CapabilityTier, anchored_tier, resolve_models_config,
+resolve_execution_plan) and `project_config.rs` (validate + merge).
 
-> **REFACTOR-005 (FR-002 hard break)**: `primaryRunner` is a legacy,
-> deserialize-only surface. A config that actually SETS it hard-errors at the
-> loop/batch preflight (`detect_legacy_model_keys`); spawn-side model/provider
-> routing is owned entirely by the provider-first `models` + `routing` block via
-> `model::resolve_execution_plan`. The `baselineTierRoutes` sub-map and the whole
-> legacy resolution chain (the pre-FR-001 task-model resolution functions and
-> the substring-tier classifier) were deleted. The
-> ONLY surviving consumer of a `primaryRunner` block is the opt-in Codex→Claude
-> RuntimeError fallback in `recovery::maybe_provider_runtime_fallback`, which
-> matches direct `byTaskType` / `byIdPrefix` routes via
-> `model::primary_runner_match`.
+### Capability tiers + anchor window
 
-**Match priority** inside `byTaskType` / `byIdPrefix` (both must be checked):
+Provider-neutral ordered ladder (`Cheapest < CostEfficient < Standard < Frontier`).
+Anchor (default standard) + difficulty offset (low=-1, med=0, high=+1; from the
+single `difficulty_rank` / `normalize_difficulty`) produces the starting tier,
+clamped at ends (never wraps).
 
-1. `byTaskType` — exact, case-sensitive match on the semantic task type
-   (e.g. `"review"`, `"milestone"`).
-2. `byIdPrefix` — the task ID body (after stripping the 8-hex project prefix)
-   starts with the map key, OR the body contains `"-<key>"`.
+- `anchor=standard` (default): low → cost-efficient, med → standard, high → frontier
+- Sparse per-provider ladders: `model_for` / escalate walk only defined rungs (gaps skipped; distance tie prefers cheaper).
 
-When both produce a match, `byTaskType` wins. Overlapping `byIdPrefix`
-prefixes are allowed only when the overlapping routes have identical
-`RunnerSpec`s; conflicting overlaps are config errors caught before loop startup.
+Tier membership and reverse lookup are **config exact-match** (`tier_of` after stripping `[1m]` suffix). Substring matching is dead (fable contains no "opus").
 
-**SSoT**: `model::primary_runner_match` is the single prefix-matching impl —
-do NOT re-implement the prefix-matching logic anywhere else.
+### Routing precedence (highest → lowest)
 
-### Symmetric Claude↔Grok fallback contract
+Implemented in `resolve_execution_plan` (the single decision site; `ExecutionPlan`
+carries final provider/tier/effort for prompt + runner dispatch):
 
-`fallbackRunner` and `primaryRunner` form a symmetric pair:
+1. Explicit task `"model"` (from DB / prd_default) — wins, bypasses all routing.
+2. Review class (`is_frontier_class` after 8-hex prefix strip: CODE-REVIEW-*, MILESTONE-FINAL, REVIEW-*; REFACTOR-REVIEW-* excluded). Built-in force to Frontier tier; never blackout-eligible; not redefinable via config.
+3. `routing.byIdPrefix` (dash-boundary token match on ID body post-prefix-strip). Optional forced tier; otherwise anchor window for difficulty.
+4. `routing.taskClasses` (implementation/planning/review keys). Review forces frontier built-in. `providerPreference` + `byDifficulty` can select provider; falls back to anchor window tier if no forceTier.
+5. QUOTA_BLACKOUT reroute (default-path tasks only): if the would-be provider is blacked out *and* task is spillover-eligible (difficulty ≤ `spillover.maxDifficulty` or max unset), tier-preserving reroute to first enabled non-blacked provider. Beats plain anchor window.
+6. ANCHOR_WINDOW (floor): `models.primaryProvider` + `anchored_tier(anchor, difficulty)`.
 
-| Direction | Config key | When it fires |
-|---|---|---|
-| Claude → Grok | `fallbackRunner.enabled=true` | Claude overflow-ladder exhausted (rung 4) OR consecutive RuntimeErrors ≥ `fallbackRunner.runtimeErrorThreshold` |
-| Grok → Claude | `primaryRunner.claudeFallbackModel` set | Grok overflow-ladder exhausted (rung 4) OR consecutive RuntimeErrors ≥ `primaryRunner.runtimeErrorThreshold` |
+After route selection, finalize:
+- model = `models.model_for(final_provider, final_tier)` (sparse clamp; null = omit -m flag)
+- effort = `models.effort_for(final_provider, difficulty)` (from *final* provider's table)
 
-Both paths share the same idempotency guard, and it is the SAME mechanism at
-every site: a single `ctx.runner_overrides.contains_key(task_id)` check taken
-BEFORE the promotion branch. If an override already exists (in EITHER direction),
-the site bails to normal failure accounting (→ `auto_block_task`) instead of
-promoting. A task can only cross the provider boundary ONCE per loop run
-(in-memory override; clears on restart). That check is no longer hand-replicated
-per site: `recovery::promote_once` (CONTRACT-PROMO-001) owns the single
-`contains_key` guard and constructs the `PendingPromotion`. All four
-cross-provider branches call it — Claude→Grok and Grok→Claude (RuntimeError
-escalation, `recovery::escalate_task_model_if_needed_inner`), Codex→Claude
-(`recovery::maybe_provider_runtime_fallback`), and the overflow rung-4 pivot
-(`reactions::post_output::handle_overflow`). The recovery sites defer the apply
-to `apply_pending_promotion` after `tx.commit()?`; the overflow site applies
-immediately (its own `runner_overrides`/`model_overrides` inserts + the rung-4
-`tasks.model` UPDATE) and keeps its own banner, so it adopts `promote_once`
-purely for the guard and discards the returned `PendingPromotion`.
+Codex is **route-only**: only reachable via explicit `byIdPrefix` or `taskClasses` routes with `provider: "codex"`. Never inferred from any model string (token-equality `provider_for_model` never yields Codex).
 
-> ⚠️ Footgun: do NOT gate idempotency on a re-derivation like
-> `provider_for_model(effective_model)` alone. Because a Grok→Claude promotion
-> sets `runner_overrides[id]=Claude`, the next failure would otherwise enter the
-> OPPOSITE (Claude→Grok) branch and flap providers every iteration (bounded only
-> by `max_retries`, each flip spawning a real CLI subprocess). The RuntimeError
-> escalation path shipped without this guard and ping-ponged; it now shares the
-> overflow rung-4 guard via `promote_once`. When you add a FURTHER cross-provider
-> promotion site, route its idempotency check through `promote_once` too — do
-> not re-inline a `contains_key` snapshot.
+### Blackout channel contract (FEAT-008)
 
-`claudeFallbackModel` absent → no Grok→Claude fallback. The Grok task
-dead-ends on `blocked` exactly as a Claude task without `fallbackRunner` does.
+`IterationContext::provider_blackouts` (a `BlackoutState`) is a SEPARATE, EPHEMERAL channel from `runner_overrides`:
 
-> ⚠️ Footgun (FEAT-008 quota blackout channel): `IterationContext::provider_blackouts`
-> (a `BlackoutState`) is a SEPARATE, EPHEMERAL channel from `runner_overrides`,
-> and the two must NEVER touch. `runner_overrides` is the PERMANENT
-> cross-provider promotion channel owned by `promote_once` (a task crosses the
-> provider boundary at most once per run). `provider_blackouts` is the
-> per-pass, self-expiring quota-reroute channel: it is written ONLY by the
-> account-level rate-limit reaction (`reactions::account::react_to_outputs`),
-> read at the spawn-side resolver (`model::resolve_execution_plan` via
-> `BlackoutState::active`), the quota-deferral wait
-> (`reactions::account::handle_quota_deferral`), and the excluded-id computation
-> (`reactions::pre_spawn::compute_quota_excluded_ids`). It is never persisted
-> (no DB column, no serde) and is cleared on restart by design. `promote_once`
-> and every `runner_overrides` site MUST NOT read or write `provider_blackouts`,
-> and the blackout reroute MUST NOT write `runner_overrides` — an implementation
-> that promoted a spillover via `runner_overrides` would permanently pin the
-> task to the spillover provider for the rest of the run (the known-bad pinned
-> by `tests/model_selection_engine_edges.rs::blackout_reroute_leaves_runner_overrides_untouched`).
-> The two channels are derived independently per pass; do not collapse them.
+- Blackouts: per-pass, self-expiring, never persisted (no DB/serde). Written only by account rate-limit reaction (`reactions::account`). Read by spawn resolver (`resolve_execution_plan` for QUOTA_BLACKOUT reroute), quota deferral, and excluded-id computation. Cleared on restart by design.
+- `runner_overrides` (and `promote_once`): permanent (cross-provider at most once per run) for overflow-ladder rung-4 fallback and RuntimeError escape valves. Cleared on restart.
+
+**Invariants**:
+- `promote_once` / every `runner_overrides` writer MUST NOT read or write `provider_blackouts`.
+- The blackout reroute path MUST NOT write `runner_overrides` (that would permanently pin the task to the spillover provider for the remainder of the run, violating the escape-valve "once" contract).
+- The two are derived independently per pass; collapsing them produces the exact failure mode guarded by `blackout_reroute_leaves_runner_overrides_untouched`.
+
+Rung-4 provider fallback (tier-preserving) now uses `providers.<source>.fallback` from the `models` config (resolved into `ResolvedModelsConfig`), not the old `fallbackRunner` surface.
 
 **Stream-C (grok child stderr capture, FEAT-006)**: Raw grok stderr (telemetry, HTML errors, etc.) is captured by a sniffer thread to `.task-mgr/logs/<prefix>-<run>-<slot>-iterN-grok-stderr.log` (path announced via `ui::emit`; never teed to console). The capture file is the permanent artifact for post-run inspection. Classifier-based extraction/surfacing of notable lines from these files into the operator or learnings flow is deferred to FEAT-014 (intentionally decoupled).
 
