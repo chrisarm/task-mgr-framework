@@ -22,23 +22,37 @@ pub struct ModelChoice {
 /// `None`. Keeps the prompt from blocking forever on bad pipes.
 const MAX_RETRIES: u32 = 3;
 
-/// Render the list and read a choice. Returns:
+/// Render the list and read a choice under the "Available Claude models:"
+/// header. Thin wrapper over [`select_choice_interactive`].
+pub fn select_model_interactive<R: BufRead, W: Write>(
+    reader: R,
+    writer: W,
+    choices: &[ModelChoice],
+) -> io::Result<Option<String>> {
+    select_choice_interactive(reader, writer, "Available Claude models:", choices)
+}
+
+/// Render `choices` under `header` and read a numbered choice. Returns:
 /// - `Ok(Some(id))` when the user picks a valid number.
 /// - `Ok(None)` when the user submits a blank line, hits EOF, or exhausts retries.
-pub fn select_model_interactive<R: BufRead, W: Write>(
+///
+/// Generalized from the model picker so the `task-mgr init` scaffold can reuse
+/// it for anchor-tier selection (FR-009) without a second prompt loop.
+pub fn select_choice_interactive<R: BufRead, W: Write>(
     mut reader: R,
     mut writer: W,
+    header: &str,
     choices: &[ModelChoice],
 ) -> io::Result<Option<String>> {
     if choices.is_empty() {
         writeln!(
             writer,
-            "(no models available; set ANTHROPIC_API_KEY + TASK_MGR_USE_API=1 for live list)"
+            "(no choices available; set ANTHROPIC_API_KEY + TASK_MGR_USE_API=1 for live list)"
         )?;
         return Ok(None);
     }
 
-    writeln!(writer, "Available Claude models:")?;
+    writeln!(writer, "{header}")?;
     writeln!(writer)?;
     for (i, choice) in choices.iter().enumerate() {
         let tier = if choice.tier.is_empty() {
@@ -183,7 +197,7 @@ mod tests {
         let picked = select_model_interactive(reader, &mut output, &[]).unwrap();
         assert_eq!(picked, None);
         let out = String::from_utf8(output).unwrap();
-        assert!(out.contains("no models available"));
+        assert!(out.contains("no choices available"));
     }
 
     #[test]

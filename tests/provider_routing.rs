@@ -2,7 +2,7 @@
 //!
 //! Pins the token-equality algorithm for [`provider_for_model`] and the
 //! Claude-only contract on the three escalation helpers
-//! ([`escalate_model`], [`escalate_below_opus`], [`to_1m_model`]). Together
+//! ([`escalate_tier`], [`escalate_below_ceiling`], [`to_1m_model`]). Together
 //! these are the **provider guard rail**: a Grok-tier model must never get
 //! escalated to a Claude tier (which would silently route a Grok task back
 //! through `ClaudeRunner` after Opus[1M] overflow), and a `groq-llama-*`
@@ -20,15 +20,12 @@
 //!      (single token `grokomatic` != `grok`) → `Provider::Claude`
 //!
 //! 2. The three Claude-only escalation helpers are no-ops on Grok inputs.
-//!    FEAT-002 will add an explicit early-return `if provider_for_model(m) !=
-//!    Provider::Claude { return None }` guard at the top of each function;
-//!    today the same contract holds implicitly via [`model_tier`] returning
-//!    `ModelTier::Default` for `grok-*` strings, so these assertions pass on
-//!    main and on the post-FEAT-002 branch alike. The test serves as a
-//!    contract lock: even if the model_tier implementation changes later,
-//!    Grok inputs must continue to return `None` from these three functions.
+//!    Grok models are off the Claude capability ladder, so `tier_of` returns
+//!    `None` for them and the escalation helpers short-circuit. The test serves
+//!    as a contract lock: Grok inputs must continue to return `None` from these
+//!    three functions even if the tier-classification internals change later.
 //!
-//! 3. Claude-side escalation is unchanged. `escalate_model(SONNET_MODEL) ==
+//! 3. Claude-side escalation is unchanged. `escalate_tier(SONNET_MODEL) ==
 //!    Some(OPUS_MODEL)` confirms the guard doesn't over-fire.
 //!
 //! ## File compiles
@@ -40,7 +37,7 @@
 //! a Provider-aware variant of the dispatch helper.
 
 use task_mgr::loop_engine::model::{
-    HAIKU_MODEL, OPUS_MODEL, OPUS_MODEL_1M, Provider, SONNET_MODEL, builtin_resolved_models,
+    HAIKU_MODEL, ONE_M_SUFFIX, OPUS_MODEL, Provider, SONNET_MODEL, builtin_resolved_models,
     escalate_below_ceiling, escalate_tier, provider_for_model, to_1m_model,
 };
 
@@ -122,11 +119,12 @@ fn provider_for_model_grok_prefix_token_is_not_xai() {
 /// fall through to Provider::Claude (the documented default).
 #[test]
 fn provider_for_model_default_cases_route_to_claude() {
+    let opus_1m = format!("{OPUS_MODEL}{ONE_M_SUFFIX}");
     let claude_defaults: &[Option<&str>] = &[
         Some(OPUS_MODEL),
         Some(SONNET_MODEL),
         Some(HAIKU_MODEL),
-        Some(OPUS_MODEL_1M),
+        Some(opus_1m.as_str()),
         Some("unknown-model"),
         Some(""),
         Some("   "),
@@ -265,7 +263,7 @@ fn escalate_claude_side_unaffected_by_guard() {
     );
     assert_eq!(
         to_1m_model(Some(OPUS_MODEL)),
-        Some(OPUS_MODEL_1M.to_string()),
+        Some(format!("{OPUS_MODEL}{ONE_M_SUFFIX}")),
         "Opus must still produce its 1M variant — guard must not over-fire",
     );
 }

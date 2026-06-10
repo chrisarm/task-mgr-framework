@@ -242,27 +242,28 @@ fn test_e2e_no_model_fields_resolves_via_anchor_window() {
 }
 
 // ============================================================================
-// AC: Escalation template present for non-opus, absent for opus.
+// AC: Escalation template present for sub-ceiling tiers, absent at the ceiling.
 //
-// The escalation-section gate still keys on the legacy `model_tier == Opus`
-// (its migration to capability tiers is FEAT-007's scope, not FEAT-004's), so
-// this test pins explicit OPUS / HAIKU models to exercise the gate directly —
-// independent of the FR-003 anchor-window resolution (covered by the two tests
-// above). That keeps the escalation-section coverage stable across the tier
-// rewrite instead of coupling it to which tier `high` maps to.
+// The escalation-section gate keys on the ceiling (frontier) capability tier
+// via `tier_of` (REFACTOR-005 replaced the legacy substring `Opus`-ceiling
+// check): the policy is omitted only when the model is already at the top tier
+// (FABLE), since there is nothing higher to escalate to. This test pins explicit
+// FABLE / HAIKU models to exercise the gate directly — independent of the FR-003
+// anchor-window resolution (covered by the two tests above).
 // ============================================================================
 
 #[test]
-fn test_e2e_escalation_template_present_for_haiku_absent_for_opus() {
+fn test_e2e_escalation_template_present_for_haiku_absent_for_fable() {
     let (temp_dir, conn) = init_prd("prd_model_resolution_integration.json");
     let base_prompt_path = create_base_prompt(temp_dir.path());
     create_escalation_template(temp_dir.path(), "ESCALATION_INTEGRATION_MARKER");
 
     // Pin explicit models so resolution is deterministic at rung EXPLICIT_MODEL:
-    // MR-001 → OPUS (escalation absent), MR-003 → HAIKU (escalation present).
+    // MR-001 → FABLE (ceiling tier; escalation absent), MR-003 → HAIKU
+    // (sub-ceiling; escalation present).
     conn.execute(
         "UPDATE tasks SET model = ?1 WHERE id = 'MR-001'",
-        [OPUS_MODEL],
+        [FABLE_MODEL],
     )
     .unwrap();
     conn.execute(
@@ -279,7 +280,7 @@ fn test_e2e_escalation_template_present_for_haiku_absent_for_opus() {
         )
         .unwrap();
 
-    // MR-001 carries an explicit OPUS model — escalation should be ABSENT
+    // MR-001 carries an explicit FABLE model (ceiling tier) — escalation ABSENT
     let params = BuildPromptParams {
         dir: temp_dir.path(),
         project_root: temp_dir.path(),
@@ -309,10 +310,10 @@ fn test_e2e_escalation_template_present_for_haiku_absent_for_opus() {
         .unwrap()
         .expect("Should return a prompt");
 
-    assert_eq!(result.resolved_model.as_deref(), Some(OPUS_MODEL));
+    assert_eq!(result.resolved_model.as_deref(), Some(FABLE_MODEL));
     assert!(
         !result.prompt.contains("ESCALATION_INTEGRATION_MARKER"),
-        "Escalation template must be absent for opus-resolved task"
+        "Escalation template must be absent for a ceiling-tier (fable) task"
     );
 
     // Now mark MR-001/MR-002 done, MR-003 (explicit HAIKU) will be selected.

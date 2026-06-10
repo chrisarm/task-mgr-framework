@@ -8,8 +8,8 @@
 //! ladder hand-off, and tracker updates.
 //!
 //! The hand-off data types (`IterationContext`, `IterationParams`,
-//! `IterationResult`) and the per-iteration runner-resolution helpers
-//! (`resolve_effective_runner`, `apply_review_model_override`) remain in
+//! `IterationResult`) and the per-iteration runner-resolution helper
+//! (`resolve_effective_runner`) remain in
 //! `engine.rs` and are imported here — `run_loop` and the inline engine test
 //! modules also consume them, so moving them would widen the carve's blast
 //! radius. The pre-spawn per-task recovery reactions (crash escalation, the
@@ -448,7 +448,7 @@ pub fn run_iteration(
     // Review-class routing now flows from `resolve_execution_plan` rung 3
     // (FEAT-004): the plan already carries the review→frontier provider/model,
     // baked into `resolved_model`/`provider_hint` above. The legacy
-    // `apply_review_model_override` post-hoc rewrite is deleted.
+    // review-model post-hoc rewrite is deleted.
 
     // Effort: the plan's prior-overflow override wins, else the cluster-wide
     // effort `build_prompt` computed (parallels the cluster-wide
@@ -829,10 +829,10 @@ pub fn run_iteration(
     //
     // The four rungs (first matching precondition wins, see
     // `overflow::handle_prompt_too_long`):
-    //   1. `downgrade_effort`   — effort floor preserved at `high`.
-    //   2. `escalate_below_opus` — `haiku → sonnet`, `sonnet → opus`.
-    //   3. `to_1m_model`        — `opus → opus[1m]`.
-    //   4. blocked              — no recovery left.
+    //   1. `downgrade_effort`     — effort floor preserved at `high`.
+    //   2. `escalate_below_ceiling` — up one tier (`haiku → sonnet → opus → fable`).
+    //   3. `to_1m_model`          — `fable → fable[1m]`.
+    //   4. blocked                — no recovery left.
     //
     // Each rung emits a distinct stderr message that names the current task,
     // current effort/model, and the chosen action. The Blocked phrasing makes

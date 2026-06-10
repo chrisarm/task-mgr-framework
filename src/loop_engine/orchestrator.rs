@@ -16,8 +16,8 @@
 //!
 //! The shared hand-off data types (`IterationContext`, `LoopRunConfig`,
 //! `LoopResult`, the slot/wave structs, etc.), the per-iteration
-//! runner-resolution helpers (`resolve_effective_runner`,
-//! `apply_review_model_override`), and the `<task-status>` dispatcher
+//! runner-resolution helper (`resolve_effective_runner`),
+//! and the `<task-status>` dispatcher
 //! (`apply_status_updates`, consumed by `iteration_pipeline`) remain in
 //! `engine.rs` and are glob-imported here. `engine.rs` re-exports `run_loop`
 //! and `on_run_completed` `pub` so the external import paths callers and

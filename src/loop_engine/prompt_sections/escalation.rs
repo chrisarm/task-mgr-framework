@@ -1,8 +1,8 @@
 //! Escalation policy section builder for the agent loop prompt.
 //!
 //! Loads the escalation policy template from disk and injects it into the
-//! prompt for non-Opus models. Opus is the highest tier — escalation is
-//! irrelevant there.
+//! prompt unless the model already sits at the ceiling (frontier) Claude tier —
+//! there is nothing higher to escalate to, so the policy is irrelevant there.
 
 use std::fs;
 use std::path::Path;
@@ -40,8 +40,18 @@ pub(crate) fn load_escalation_template(base_prompt_path: &Path) -> Option<String
 }
 
 /// Build an escalation policy section string.
+///
+/// Omitted when the model is already at the ceiling (frontier) Claude tier —
+/// there is no higher tier to escalate to. Tier membership is config
+/// exact-match via [`model::ResolvedModelsConfig::tier_of`] against the builtin
+/// Claude ladder (no substring matching); a model off the Claude ladder
+/// (`tier_of == None`, e.g. an unknown id) is not at the ceiling and still
+/// receives the policy.
 pub fn build_escalation_section(base_prompt_path: &Path, resolved_model: Option<&str>) -> String {
-    if model::model_tier(resolved_model) == model::ModelTier::Opus {
+    let at_ceiling = resolved_model
+        .and_then(|m| model::builtin_resolved_models().tier_of(model::Provider::Claude, m))
+        .is_some_and(|t| t == model::CapabilityTier::Frontier);
+    if at_ceiling {
         return String::new();
     }
 

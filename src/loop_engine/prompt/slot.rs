@@ -200,11 +200,9 @@ pub struct SlotPromptParams<'a> {
     /// Primary runner routing configuration.
     pub primary_runner: Option<&'a crate::loop_engine::project_config::PrimaryRunnerConfig>,
     /// Engine-cached PRD default model (`prd_metadata.default_model`). Threaded
-    /// from `WaveIterationParams::default_model` into the slot's
-    /// `ModelResolutionContext` so the wave baseline tier equals the sequential
-    /// baseline tier for the same task+config (WIRE-FIX-001). Without it,
-    /// `compute_baseline_model` only escalates `difficulty==high`, so non-high
-    /// `baselineTierRoutes` never fire in wave mode.
+    /// from `WaveIterationParams::default_model` into the slot's execution
+    /// plan so the wave baseline tier equals the sequential baseline tier for
+    /// the same task+config (WIRE-FIX-001).
     pub prd_default: Option<&'a str>,
     /// Engine-cached project default model (`.task-mgr/config.json`). See
     /// [`Self::prd_default`].

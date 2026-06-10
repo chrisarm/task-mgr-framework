@@ -33,7 +33,7 @@
 use rusqlite::Connection;
 use tempfile::TempDir;
 
-use task_mgr::commands::models::{SetDefaultOpts, handle_set_default};
+use task_mgr::commands::models::handle_set_anchor;
 use task_mgr::db::{create_schema, open_connection, run_migrations};
 use task_mgr::loop_engine::engine::IterationContext;
 use task_mgr::loop_engine::model::{
@@ -536,16 +536,11 @@ fn edge_case_3_legacy_keys_hard_error_at_loop_warn_on_nonloop() {
         "preflight error must point at the migration command: {msg}"
     );
 
-    // `models` mutating verbs hard-error the same way (interim guard until
-    // FEAT-009 replaces them).
-    let verb_err = handle_set_default(
-        dir.path(),
-        SetDefaultOpts {
-            model: Some(OPUS_MODEL.to_string()),
-            project: true,
-        },
-    )
-    .expect_err("models mutating verb must refuse a legacy-key config");
+    // `models` mutating verbs hard-error the same way (FR-009 provider-first
+    // verb set; `set-anchor` is representative — every mutating verb routes
+    // through the same legacy-key guard).
+    let verb_err = handle_set_anchor(dir.path(), "standard")
+        .expect_err("models mutating verb must refuse a legacy-key config");
     let verb_msg = format!("{verb_err}");
     for key in [
         "defaultModel",

@@ -192,7 +192,6 @@ fn non_codex_primary_runner_rejects_blank_model() {
             runtime_error_threshold: 2,
             by_task_type,
             by_id_prefix: Default::default(),
-            ..Default::default()
         }),
         ..ProjectConfig::default()
     };

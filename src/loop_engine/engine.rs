@@ -463,10 +463,9 @@ impl IterationContext {
 /// Explicit input to [`resolve_effective_runner`].
 ///
 /// Carries both the effective model string AND the optional `provider_hint`
-/// that flowed from a `primaryRunner` spec match (see
-/// [`model::resolve_task_execution_target`]). Production callers MUST
-/// construct this struct explicitly so a missed-thread (model-only) call
-/// site is a compile-time error rather than a silent Codex→Claude misroute.
+/// that flowed from the resolved execution plan's provider intent. Production
+/// callers MUST construct this struct explicitly so a missed-thread (model-only)
+/// call site is a compile-time error rather than a silent Codex→Claude misroute.
 ///
 /// The `From<Option<&str>>` ergonomic conversion (`provider_hint = None`) is
 /// `#[cfg(test)]`-gated so tests can stay terse without weakening the
@@ -539,38 +538,6 @@ pub fn resolve_effective_runner(
         model::Provider::Grok => RunnerKind::Grok,
         model::Provider::Codex => RunnerKind::Codex,
         model::Provider::Claude => RunnerKind::Claude,
-    }
-}
-
-/// Compute the `reviewModel` routing override for a single task.
-///
-/// Returns `Some(trimmed_model_id)` when both conditions hold:
-/// - [`model::is_review_class`] classifies `task_id` as review-class
-///   (`CODE-REVIEW-*`, `MILESTONE-FINAL`, `REVIEW-*`; project-prefixed ids
-///   are matched after stripping the leading 8-hex-char prefix).
-/// - `review_model` is `Some(v)` with non-whitespace content.
-///
-/// Returns `None` in every other case — non-review tasks, unset/empty
-/// `reviewModel`. Pure function: no side effects, no I/O, no access to
-/// `IterationContext`. Used at both dispatch sites (`run_iteration` for
-/// the sequential path, `run_wave_iteration` for the wave path) so the
-/// routing decision is identical regardless of execution mode.
-///
-/// The override deliberately changes the **model string** that flows into
-/// [`resolve_effective_runner`] and the `--model` CLI flag, NOT
-/// `ctx.runner_overrides`. The override map is reserved for the overflow
-/// ladder's promotion writes — leaving it untouched preserves its
-/// precedence over `provider_for_model(...)` so an in-flight overflow
-/// promotion isn't shadowed by review-model routing.
-pub fn apply_review_model_override(review_model: Option<&str>, task_id: &str) -> Option<String> {
-    if !model::is_review_class(task_id) {
-        return None;
-    }
-    let trimmed = review_model?.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
     }
 }
 
@@ -1233,132 +1200,6 @@ mod tests {
         assert!(
             ctx.overflow_original_task_model.is_empty(),
             "fresh IterationContext.overflow_original_task_model MUST be empty",
-        );
-    }
-
-    // --- FEAT-002: apply_review_model_override ---
-    //
-    // Pure-function tests for the predicate used at both dispatch sites
-    // (sequential `run_iteration` + wave `run_wave_iteration`). Failure here
-    // means review-class routing fired on a non-review task, or vice versa.
-
-    #[test]
-    fn feat_002_review_override_fires_for_review_class_ids() {
-        for id in &[
-            "CODE-REVIEW-1",
-            "CODE-REVIEW-007",
-            "MILESTONE-FINAL",
-            "REVIEW-001",
-            // Prefixed (production shape) — strips ^[0-9a-f]{8}- before matching.
-            "8d71d1f7-CODE-REVIEW-1",
-            "8d71d1f7-MILESTONE-FINAL",
-            "8d71d1f7-REVIEW-001",
-        ] {
-            assert_eq!(
-                apply_review_model_override(Some("grok-build"), id),
-                Some("grok-build".to_string()),
-                "review-class id {id} MUST receive the reviewModel override",
-            );
-        }
-    }
-
-    #[test]
-    fn feat_002_review_override_skips_non_review_ids() {
-        for id in &[
-            "FEAT-001",
-            "VERIFY-001",
-            "MILESTONE-1",
-            "MILESTONE-2",
-            "REFACTOR-001",
-            "REFACTOR-REVIEW-FINAL",
-            // Prefixed non-review ids must also be skipped — the `is_review_class`
-            // strip-then-match keeps REFACTOR-REVIEW-FINAL out of the REVIEW-* path.
-            "8d71d1f7-FEAT-001",
-            "8d71d1f7-VERIFY-001",
-            "8d71d1f7-MILESTONE-1",
-            "8d71d1f7-REFACTOR-REVIEW-FINAL",
-        ] {
-            assert_eq!(
-                apply_review_model_override(Some("grok-build"), id),
-                None,
-                "non-review id {id} MUST NOT receive the reviewModel override",
-            );
-        }
-    }
-
-    #[test]
-    fn feat_002_review_override_returns_none_when_review_model_unset() {
-        // Absent / empty / whitespace-only — review tasks stay on whatever
-        // model was already baked in (typically Opus).
-        for review_model in &[None, Some(""), Some("   "), Some("\t\n")] {
-            assert_eq!(
-                apply_review_model_override(*review_model, "CODE-REVIEW-1"),
-                None,
-                "unset/empty reviewModel ({review_model:?}) MUST NOT override review-class tasks",
-            );
-        }
-    }
-
-    #[test]
-    fn feat_002_review_override_trims_whitespace() {
-        // Outer whitespace is trimmed so a `"reviewModel": "  grok-build  "` config
-        // doesn't ship a model id with surprise whitespace to the runner.
-        assert_eq!(
-            apply_review_model_override(Some("  grok-build  "), "CODE-REVIEW-1"),
-            Some("grok-build".to_string()),
-        );
-    }
-
-    #[test]
-    fn feat_002_review_override_passes_through_any_provider() {
-        // The helper itself does not classify provider — it only routes
-        // review-class tasks. A Claude id, an unknown id, or Grok id all
-        // propagate identically; provider classification happens later in
-        // `resolve_effective_runner` via `provider_for_model`.
-        assert_eq!(
-            apply_review_model_override(Some(OPUS_MODEL), "REVIEW-001"),
-            Some(OPUS_MODEL.to_string()),
-        );
-        assert_eq!(
-            apply_review_model_override(Some("gpt-4"), "REVIEW-001"),
-            Some("gpt-4".to_string()),
-        );
-        assert_eq!(
-            apply_review_model_override(Some("grok-build"), "REVIEW-001"),
-            Some("grok-build".to_string()),
-        );
-    }
-
-    #[test]
-    fn feat_002_review_override_into_resolver_yields_grok_runner() {
-        // End-to-end shape: when the override fires for a review task with a
-        // Grok model id, feeding the result into `resolve_effective_runner`
-        // selects `RunnerKind::Grok`. This is the contract the sequential
-        // dispatch site relies on to keep selection + `--model` consistent.
-        let ctx = IterationContext::new(8);
-        let task_id = "8d71d1f7-CODE-REVIEW-1";
-        let effective_model = apply_review_model_override(Some("grok-build"), task_id);
-        assert_eq!(effective_model.as_deref(), Some("grok-build"));
-        assert_eq!(
-            resolve_effective_runner(&ctx, task_id, effective_model.as_deref().into()),
-            RunnerKind::Grok,
-        );
-    }
-
-    #[test]
-    fn feat_002_no_override_leaves_resolver_on_claude_for_review_tasks() {
-        // Negative path: reviewModel unset → effective_model is unchanged at
-        // the baked-in Opus, and the resolver returns Claude. This locks in
-        // the "no behavior change when reviewModel is absent" guarantee.
-        let ctx = IterationContext::new(8);
-        let task_id = "8d71d1f7-CODE-REVIEW-1";
-        let override_model = apply_review_model_override(None, task_id);
-        assert_eq!(override_model, None);
-        // Caller keeps the baked-in model — here, Opus.
-        let effective_model = override_model.or(Some(OPUS_MODEL.to_string()));
-        assert_eq!(
-            resolve_effective_runner(&ctx, task_id, effective_model.as_deref().into()),
-            RunnerKind::Claude,
         );
     }
 

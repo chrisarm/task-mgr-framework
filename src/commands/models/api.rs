@@ -1,8 +1,8 @@
 //! Anthropic `/v1/models` discovery.
 //!
 //! Small HTTP client over the project's existing `ureq` dep. All errors fall
-//! back silently at the ensure_default_model orchestrator layer — this module
-//! just surfaces the error variants so the caller can choose how to react.
+//! back silently at the `models list --remote` layer — this module just
+//! surfaces the error variants so the caller can choose how to react.
 
 use std::time::Duration;
 

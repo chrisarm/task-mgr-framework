@@ -244,7 +244,7 @@ fn no_inverse_promotion_when_claude_fallback_model_absent() {
 
     assert_eq!(
         outcome, None,
-        "no claudeFallbackModel → no inverse promotion; escalate_model returns None for Grok tier",
+        "no claudeFallbackModel → no inverse promotion; escalate_tier returns None for Grok tier",
     );
     assert!(
         !ctx.runner_overrides.contains_key("GROK-NOFB-001"),

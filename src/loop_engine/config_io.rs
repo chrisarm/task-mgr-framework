@@ -36,8 +36,6 @@ pub fn write_config_key_at(
     empty_seed: serde_json::Value,
     on_corrupt: OnCorruptJson,
 ) -> std::io::Result<()> {
-    use std::io::Write;
-
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -74,7 +72,23 @@ pub fn write_config_key_at(
         }
     }
 
-    let contents = serde_json::to_string_pretty(&json)
+    write_config_value_at(path, &json)
+}
+
+/// Atomically write an entire `serde_json::Value` to `path` (pretty-printed,
+/// trailing newline) via a same-directory tempfile + rename, creating parent
+/// directories as needed. The whole-document companion to
+/// [`write_config_key_at`]; the nested `models`/`routing` setters in
+/// `commands::models` use this after mutating a deep path in the parsed value,
+/// so unrelated top-level AND nested keys are preserved verbatim.
+pub fn write_config_value_at(path: &Path, value: &serde_json::Value) -> std::io::Result<()> {
+    use std::io::Write;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let contents = serde_json::to_string_pretty(value)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let mut tmp = tempfile::Builder::new()

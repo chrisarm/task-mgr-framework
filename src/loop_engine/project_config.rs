@@ -7,7 +7,7 @@ use crate::loop_engine::config_io::{OnCorruptJson, write_config_key_at};
 use crate::loop_engine::model::{
     CODEX_EFFORT_FOR_DIFFICULTY, CapabilityTier, EFFORT_FOR_DIFFICULTY, FABLE_MODEL, HAIKU_MODEL,
     OPUS_MODEL, Provider, ResolvedModelsConfig, SONNET_MODEL, normalize_route_prefix,
-    parse_baseline_tier_key, parse_config_provider, route_prefixes_overlap,
+    parse_config_provider, route_prefixes_overlap,
 };
 
 /// Configuration for the Grok fallback runner (US-005, FR-006).
@@ -104,15 +104,6 @@ pub struct PrimaryRunnerConfig {
     /// Task-ID-prefix → `RunnerSpec` routing map. Absent key → empty map.
     #[serde(default)]
     pub by_id_prefix: HashMap<String, RunnerSpec>,
-
-    /// Task-ID-prefix → baseline capability tier → `RunnerSpec` routing map.
-    ///
-    /// Used when a task has no explicit `model`, after its baseline Claude
-    /// model is known from difficulty/default resolution and normalized into
-    /// a provider-neutral tier. Tier keys are validated by
-    /// `model::parse_baseline_tier_key`.
-    #[serde(default)]
-    pub baseline_tier_routes: HashMap<String, HashMap<String, RunnerSpec>>,
 }
 
 impl Default for PrimaryRunnerConfig {
@@ -122,7 +113,6 @@ impl Default for PrimaryRunnerConfig {
             runtime_error_threshold: default_primary_runtime_error_threshold(),
             by_task_type: HashMap::new(),
             by_id_prefix: HashMap::new(),
-            baseline_tier_routes: HashMap::new(),
         }
     }
 }
@@ -417,13 +407,39 @@ pub fn merge_models_config(user: Option<&serde_json::Value>) -> Result<ModelsCon
 }
 
 /// Legacy model-config keys removed by this PRD's hard break, in canonical
-/// order. Surfaced by [`detect_legacy_model_keys`].
-const LEGACY_MODEL_KEYS: &[&str] = &[
+/// order. Surfaced by [`detect_legacy_model_keys`]; deleted (exactly these four,
+/// no more) by `task-mgr models init --force-replace-legacy`.
+pub const LEGACY_MODEL_KEYS: &[&str] = &[
     "defaultModel",
     "reviewModel",
     "primaryRunner",
     "fallbackRunner",
 ];
+
+/// The FR-001 default `models` + `routing` block, as a `serde_json::Value`.
+///
+/// The minimal sparse skeleton — Claude enabled (so [`merge_models_config`]
+/// gives it the full default ladder), `primaryProvider=claude`,
+/// `anchor=standard`, empty `routing`. Written verbatim by
+/// `task-mgr models init` (the `init` verb overlays the operator-chosen anchor
+/// onto `models.anchor` afterward) and by the `task-mgr init` anchor picker.
+/// Keeping it sparse means a future model-constant bump in `model.rs` flows
+/// through to every init'd config without an edit. Carries NO model-ID literals
+/// (provider name + tier name only), so the no_hardcoded_models guard is happy.
+pub fn fr_001_default_block() -> serde_json::Value {
+    // String-literal keys/values are the stable wire forms of
+    // `Provider::Claude.as_str()` / `CapabilityTier::Standard.as_str()`; a unit
+    // test (`fr_001_default_block_validates_and_matches_wire_forms`) pins them to
+    // the constants so a rename can't silently drift this block.
+    serde_json::json!({
+        "models": {
+            "primaryProvider": "claude",
+            "anchor": "standard",
+            "providers": { "claude": { "enabled": true } }
+        },
+        "routing": {}
+    })
+}
 
 /// Return which legacy model-config keys appear at the TOP LEVEL of `config`,
 /// in canonical order. Empty vec = a clean post-migration config.
@@ -746,7 +762,7 @@ pub struct ProjectConfig {
 
     /// Per-project default Claude model. Falls below `prd_metadata.default_model`
     /// and above `user_config.default_model` in the resolution chain (see
-    /// `loop_engine::model::resolve_task_model`).
+    /// `loop_engine::model::resolve_execution_plan`).
     #[serde(default)]
     pub default_model: Option<String>,
 
@@ -840,12 +856,14 @@ pub struct ProjectConfig {
     ///
     /// LEGACY (FR-002 hard break): `default_model` / `review_model` /
     /// `fallback_runner` / `primary_runner` are no longer honored by model
-    /// resolution. They still deserialize so the OLD resolution chain
-    /// (`resolve_task_execution_target` & friends) compiles until REFACTOR-005
-    /// removes both the chain and these four fields in one diff. A config that
-    /// actually SETS any of these keys hard-errors at the loop/batch preflight
-    /// and warns on non-loop reads — see [`detect_legacy_model_keys`] /
-    /// [`preflight_validate_and_probe`] / [`read_project_config`].
+    /// resolution — the provider-first `models` + `routing` block below is the
+    /// sole routing surface. They still deserialize so the legacy fields parse
+    /// without error, but a config that actually SETS any of these keys
+    /// hard-errors at the loop/batch preflight and warns on non-loop reads —
+    /// see [`detect_legacy_model_keys`] / [`preflight_validate_and_probe`] /
+    /// [`read_project_config`]. REFACTOR-005 removed the legacy resolution chain
+    /// these fields once fed (the pre-FR-001 resolution chain); the fields
+    /// themselves are retained as deserialize-only legacy-rejected surfaces.
     #[serde(default)]
     pub primary_runner: Option<PrimaryRunnerConfig>,
 
@@ -1116,16 +1134,6 @@ pub fn validate_runner_routing_config(cfg: &ProjectConfig) -> TaskMgrResult<()> 
                 });
             }
         }
-        for (prefix, tier_map) in &primary.baseline_tier_routes {
-            for tier_key in tier_map.keys() {
-                parse_baseline_tier_key(tier_key).map_err(|message| {
-                    TaskMgrError::InvalidConfig {
-                        field: format!("primaryRunner.baselineTierRoutes.{prefix}.{tier_key}"),
-                        message,
-                    }
-                })?;
-            }
-        }
         validate_non_conflicting_prefix_routes(primary)?;
         if cfg
             .review_model
@@ -1144,7 +1152,6 @@ pub fn validate_runner_routing_config(cfg: &ProjectConfig) -> TaskMgrResult<()> 
 
 fn validate_non_conflicting_prefix_routes(primary: &PrimaryRunnerConfig) -> TaskMgrResult<()> {
     validate_by_id_prefix_conflicts(primary)?;
-    validate_baseline_tier_prefix_conflicts(primary)?;
     Ok(())
 }
 
@@ -1165,48 +1172,6 @@ fn validate_by_id_prefix_conflicts(primary: &PrimaryRunnerConfig) -> TaskMgrResu
                      different specs",
                     left = normalize_route_prefix(left_key),
                     right = normalize_route_prefix(right_key),
-                ),
-            });
-        }
-    }
-    Ok(())
-}
-
-fn validate_baseline_tier_prefix_conflicts(primary: &PrimaryRunnerConfig) -> TaskMgrResult<()> {
-    let mut routes = Vec::new();
-    for (prefix, tier_map) in &primary.baseline_tier_routes {
-        for (tier_key, spec) in tier_map {
-            let tier = parse_baseline_tier_key(tier_key).map_err(|message| {
-                TaskMgrError::InvalidConfig {
-                    field: format!("primaryRunner.baselineTierRoutes.{prefix}.{tier_key}"),
-                    message,
-                }
-            })?;
-            routes.push((prefix, tier_key, tier, spec));
-        }
-    }
-    routes.sort_by(
-        |(left_prefix, left_tier_key, _, _), (right_prefix, right_tier_key, _, _)| {
-            left_prefix
-                .cmp(right_prefix)
-                .then_with(|| left_tier_key.cmp(right_tier_key))
-        },
-    );
-
-    for (i, (left_prefix, left_tier_key, left_tier, left_spec)) in routes.iter().enumerate() {
-        for (right_prefix, right_tier_key, right_tier, right_spec) in routes.iter().skip(i + 1) {
-            if left_tier != right_tier
-                || left_spec == right_spec
-                || !route_prefixes_overlap(left_prefix, right_prefix)
-            {
-                continue;
-            }
-            return Err(TaskMgrError::InvalidConfig {
-                field: "primaryRunner.baselineTierRoutes".to_string(),
-                message: format!(
-                    "conflicting overlapping prefixes {left_prefix:?}.{left_tier_key} and \
-                     {right_prefix:?}.{right_tier_key}; both normalize to tier {left_tier:?} \
-                     and can match the same task id but route to different specs",
                 ),
             });
         }
@@ -1244,16 +1209,6 @@ fn primary_runner_specs(
                 .iter()
                 .map(|(k, v)| ("byIdPrefix", k.clone(), v)),
         )
-        .chain(
-            primary
-                .baseline_tier_routes
-                .iter()
-                .flat_map(|(prefix, tiers)| {
-                    tiers.iter().map(move |(tier, spec)| {
-                        ("baselineTierRoutes", format!("{prefix}.{tier}"), spec)
-                    })
-                }),
-        )
 }
 
 fn primary_runner_contains_codex_review_route(primary: &PrimaryRunnerConfig) -> bool {
@@ -1267,14 +1222,6 @@ fn primary_runner_contains_codex_review_route(primary: &PrimaryRunnerConfig) -> 
                 }
                 "byIdPrefix" => {
                     let k = key.trim_end_matches('-').to_ascii_uppercase();
-                    matches!(k.as_str(), "CODE-REVIEW" | "REVIEW" | "MILESTONE-FINAL")
-                }
-                "baselineTierRoutes" => {
-                    let prefix = key
-                        .split_once('.')
-                        .map(|(prefix, _)| prefix)
-                        .unwrap_or(key.as_str());
-                    let k = prefix.trim_end_matches('-').to_ascii_uppercase();
                     matches!(k.as_str(), "CODE-REVIEW" | "REVIEW" | "MILESTONE-FINAL")
                 }
                 _ => false,
@@ -1536,6 +1483,26 @@ mod tests {
         let config = read_project_config(dir.path());
         assert_eq!(config.version, 1);
         assert!(config.additional_allowed_tools.is_empty());
+    }
+
+    #[test]
+    fn fr_001_default_block_validates_and_matches_wire_forms() {
+        let block = fr_001_default_block();
+        // Wire forms match the typed constants (guards against a rename drift).
+        assert_eq!(block["models"]["anchor"], CapabilityTier::Standard.as_str());
+        assert_eq!(
+            block["models"]["primaryProvider"],
+            Provider::Claude.as_str()
+        );
+        assert_eq!(
+            block["models"]["providers"][Provider::Claude.as_str()]["enabled"],
+            serde_json::Value::Bool(true)
+        );
+        // Merged onto the builtin default it must validate clean (AC#10).
+        let models = merge_models_config(block.get("models")).unwrap();
+        let routing: RoutingConfig = serde_json::from_value(block["routing"].clone()).unwrap();
+        validate_models_config(&models, &routing)
+            .expect("FR-001 default block must validate clean");
     }
 
     #[test]
@@ -2123,7 +2090,6 @@ mod tests {
         assert_eq!(pr.runtime_error_threshold, 2);
         assert!(pr.by_task_type.is_empty());
         assert!(pr.by_id_prefix.is_empty());
-        assert!(pr.baseline_tier_routes.is_empty());
     }
 
     #[test]
@@ -2145,12 +2111,6 @@ mod tests {
                     "byIdPrefix": {{
                         "REVIEW-":    {{ "provider": "grok", "model": "grok-build" }},
                         "MILESTONE-": {{ "provider": "grok", "model": "grok-build" }}
-                    }},
-                    "baselineTierRoutes": {{
-                        "FEAT": {{
-                            "high": {{ "provider": "codex", "runtimeErrorFallback": true }},
-                            "standard": {{ "provider": "grok", "model": "grok-build" }}
-                        }}
                     }}
                 }}
             }}"#
@@ -2183,17 +2143,6 @@ mod tests {
             .expect("MILESTONE- key missing");
         assert_eq!(ms_prefix_spec.provider, "grok");
         assert_eq!(ms_prefix_spec.model, "grok-build");
-
-        let feat_tiers = pr
-            .baseline_tier_routes
-            .get("FEAT")
-            .expect("FEAT key missing");
-        let high_spec = feat_tiers.get("high").expect("high key missing");
-        assert_eq!(high_spec.provider, "codex");
-        assert!(high_spec.runtime_error_fallback);
-        let standard_spec = feat_tiers.get("standard").expect("standard key missing");
-        assert_eq!(standard_spec.provider, "grok");
-        assert_eq!(standard_spec.model, "grok-build");
     }
 
     #[test]
@@ -2220,10 +2169,6 @@ mod tests {
         );
         assert_eq!(pr.runtime_error_threshold, 2, "default threshold is 2");
         assert!(pr.by_id_prefix.is_empty(), "byIdPrefix absent → empty map");
-        assert!(
-            pr.baseline_tier_routes.is_empty(),
-            "baselineTierRoutes absent → empty map"
-        );
         let spec = pr.by_task_type.get("review").expect("review key missing");
         assert_eq!(spec.model, "grok-build");
     }
@@ -2571,34 +2516,6 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_rejects_unknown_baseline_tier() {
-        let mut tiers = HashMap::new();
-        tiers.insert(
-            "superopus".to_string(),
-            RunnerSpec {
-                provider: "codex".to_string(),
-                model: String::new(),
-                ..Default::default()
-            },
-        );
-        let mut baseline_tier_routes = HashMap::new();
-        baseline_tier_routes.insert("FEAT".to_string(), tiers);
-        let cfg = ProjectConfig {
-            primary_runner: Some(PrimaryRunnerConfig {
-                baseline_tier_routes,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let err = validate_runner_routing_config(&cfg).expect_err("unknown tier must reject");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("baselineTierRoutes.FEAT.superopus") && msg.contains("low"),
-            "error must name the bad tier and allowed tiers: {msg}"
-        );
-    }
-
-    #[test]
     fn test_validate_rejects_conflicting_overlapping_by_id_prefix_routes() {
         use crate::loop_engine::model::OPUS_MODEL;
         let mut by_id_prefix = HashMap::new();
@@ -2660,122 +2577,6 @@ mod tests {
 
         validate_runner_routing_config(&cfg)
             .expect("same-spec overlapping prefixes must remain valid");
-    }
-
-    #[test]
-    fn test_validate_rejects_conflicting_overlapping_baseline_tier_routes() {
-        let mut feat_tiers = HashMap::new();
-        feat_tiers.insert(
-            "high".to_string(),
-            RunnerSpec {
-                provider: "codex".to_string(),
-                model: String::new(),
-                ..Default::default()
-            },
-        );
-        let mut special_tiers = HashMap::new();
-        special_tiers.insert(
-            "high".to_string(),
-            RunnerSpec {
-                provider: "grok".to_string(),
-                model: "grok-build".to_string(),
-                ..Default::default()
-            },
-        );
-        let mut baseline_tier_routes = HashMap::new();
-        baseline_tier_routes.insert("FEAT".to_string(), feat_tiers);
-        baseline_tier_routes.insert("FEAT-SPECIAL".to_string(), special_tiers);
-        let cfg = ProjectConfig {
-            primary_runner: Some(PrimaryRunnerConfig {
-                baseline_tier_routes,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        let err = validate_runner_routing_config(&cfg)
-            .expect_err("conflicting overlapping baseline tier prefixes must reject");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("baselineTierRoutes")
-                && msg.contains("FEAT")
-                && msg.contains("FEAT-SPECIAL")
-                && msg.contains("high"),
-            "error must name both prefixes and the conflicting tier: {msg}",
-        );
-    }
-
-    #[test]
-    fn test_validate_allows_overlapping_baseline_prefixes_with_disjoint_tiers() {
-        let mut feat_tiers = HashMap::new();
-        feat_tiers.insert(
-            "standard".to_string(),
-            RunnerSpec {
-                provider: "grok".to_string(),
-                model: "grok-build".to_string(),
-                ..Default::default()
-            },
-        );
-        let mut special_tiers = HashMap::new();
-        special_tiers.insert(
-            "high".to_string(),
-            RunnerSpec {
-                provider: "codex".to_string(),
-                model: String::new(),
-                ..Default::default()
-            },
-        );
-        let mut baseline_tier_routes = HashMap::new();
-        baseline_tier_routes.insert("FEAT".to_string(), feat_tiers);
-        baseline_tier_routes.insert("FEAT-SPECIAL".to_string(), special_tiers);
-        let cfg = ProjectConfig {
-            primary_runner: Some(PrimaryRunnerConfig {
-                baseline_tier_routes,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        validate_runner_routing_config(&cfg)
-            .expect("overlapping baseline prefixes with disjoint tiers must remain valid");
-    }
-
-    #[test]
-    fn test_validate_rejects_conflicting_baseline_tier_aliases() {
-        let mut feat_tiers = HashMap::new();
-        feat_tiers.insert(
-            "high".to_string(),
-            RunnerSpec {
-                provider: "codex".to_string(),
-                model: String::new(),
-                ..Default::default()
-            },
-        );
-        feat_tiers.insert(
-            "opus".to_string(),
-            RunnerSpec {
-                provider: "grok".to_string(),
-                model: "grok-build".to_string(),
-                ..Default::default()
-            },
-        );
-        let mut baseline_tier_routes = HashMap::new();
-        baseline_tier_routes.insert("FEAT".to_string(), feat_tiers);
-        let cfg = ProjectConfig {
-            primary_runner: Some(PrimaryRunnerConfig {
-                baseline_tier_routes,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        let err = validate_runner_routing_config(&cfg)
-            .expect_err("conflicting baseline tier aliases must reject");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("baselineTierRoutes") && msg.contains("high") && msg.contains("opus"),
-            "error must name both alias tier keys: {msg}",
-        );
     }
 
     /// AC (WS-2.2): a route model that starts with `-` (after trim) is rejected

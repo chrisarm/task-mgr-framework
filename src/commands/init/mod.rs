@@ -802,8 +802,9 @@ pub fn init_project(dir: &Path) -> TaskMgrResult<InitResult> {
     // via `models init --force-replace-legacy`, FEAT-009).
     let created_config = write_project_defaults(&db_dir).map_err(TaskMgrError::IoError)?;
 
-    // Fire model picker only when stdin+stderr are both TTYs; skip silently otherwise.
-    let _ = crate::commands::models::ensure_default::ensure_default_model(&db_dir, false);
+    // Fire the anchor-tier picker only when stdin+stderr are both TTYs and no
+    // models config exists yet; skip silently (with a hint) otherwise (FR-009).
+    let _ = crate::commands::models::ensure_default::ensure_models_anchor(&db_dir, false);
 
     // Ensure .gitignore ignores per-PRD progress files. Non-fatal: a warning is
     // printed if the file can't be written, but init_project still succeeds.

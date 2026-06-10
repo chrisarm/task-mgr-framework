@@ -2842,8 +2842,9 @@ pub enum ApiError {
     // Under FR-003 a no-model task no longer resolves to None — the anchor window
     // always picks a concrete model. A low-difficulty task lands on the
     // cost-efficient tier (anchor−1 → SONNET), which is sub-Opus, so the
-    // escalation section is still injected. (The escalation gate keys on the
-    // legacy `model_tier == Opus`; its migration to capability tiers is FEAT-007.)
+    // escalation section is still injected. (The escalation gate now keys on the
+    // ceiling/frontier capability tier via `tier_of`; a sub-frontier model like
+    // SONNET still receives the policy.)
 
     #[test]
     fn test_escalation_section_injected_for_sub_opus_anchor_resolution() {
@@ -2878,21 +2879,20 @@ pub enum ApiError {
         );
     }
 
-    // --- AC5: Escalation section NOT injected when resolved_model is opus ---
+    // --- AC5: Escalation section NOT injected when resolved_model is the ceiling tier ---
 
     #[test]
-
-    fn test_escalation_section_not_injected_for_opus() {
+    fn test_escalation_section_not_injected_for_fable() {
         let (temp_dir, conn) = setup_test_db();
 
-        insert_task(&conn, "ESC-004", "Opus task", "todo", 5);
+        insert_task(&conn, "ESC-004", "Fable task", "todo", 5);
         conn.execute(
             "UPDATE tasks SET model = ?1 WHERE id = 'ESC-004'",
-            params![OPUS_MODEL],
+            params![FABLE_MODEL],
         )
         .unwrap();
 
-        let template_content = "# Escalation Policy\n\nShould not appear for opus.\n";
+        let template_content = "# Escalation Policy\n\nShould not appear for the ceiling tier.\n";
         let base_prompt_path = create_base_prompt(temp_dir.path());
         create_escalation_template(temp_dir.path(), template_content);
 
@@ -2904,12 +2904,14 @@ pub enum ApiError {
 
         assert!(
             !result.prompt.contains("Escalation Policy"),
-            "Escalation section must NOT be injected for opus model — \
-             opus is the highest tier, escalation makes no sense"
+            "Escalation section must NOT be injected for the ceiling (frontier) model — \
+             fable is the highest tier, escalation makes no sense"
         );
         assert!(
-            !result.prompt.contains("Should not appear for opus."),
-            "Escalation template content must be absent for opus"
+            !result
+                .prompt
+                .contains("Should not appear for the ceiling tier."),
+            "Escalation template content must be absent for the ceiling tier"
         );
     }
 
@@ -2985,10 +2987,11 @@ pub enum ApiError {
         assert!(result.prompt.contains("<reorder>"));
     }
 
-    /// AC: Switching from non-opus to opus model → template disappears.
-    /// Verifies by contrast: sonnet task has template, opus task does not.
+    /// AC: Switching from a sub-ceiling to the ceiling-tier model → template
+    /// disappears. Verifies by contrast: sonnet task has template, fable
+    /// (ceiling) task does not.
     #[test]
-    fn test_escalation_template_disappears_for_opus() {
+    fn test_escalation_template_disappears_for_fable() {
         let (temp_dir, conn) = setup_test_db();
 
         // Sonnet task — should have escalation
@@ -3012,22 +3015,23 @@ pub enum ApiError {
             "Sonnet should have escalation template"
         );
 
-        // Now mark sonnet task done, add opus task
+        // Now mark sonnet task done, add fable (ceiling-tier) task
         conn.execute("UPDATE tasks SET status = 'done' WHERE id = 'ESC-031'", [])
             .unwrap();
-        insert_task(&conn, "ESC-032", "Opus task", "todo", 5);
+        insert_task(&conn, "ESC-032", "Fable task", "todo", 5);
         conn.execute(
             "UPDATE tasks SET model = ?1 WHERE id = 'ESC-032'",
-            params![OPUS_MODEL],
+            params![FABLE_MODEL],
         )
         .unwrap();
 
-        let opus_result = build_prompt(&params)
+        let fable_result = build_prompt(&params)
             .unwrap()
             .expect("Should return a prompt");
         assert!(
-            !opus_result.prompt.contains("ESCALATION_MARKER_CHECK"),
-            "Opus should NOT have escalation template — template disappears when tier is Opus"
+            !fable_result.prompt.contains("ESCALATION_MARKER_CHECK"),
+            "Fable (ceiling tier) should NOT have escalation template — template \
+             disappears when the model is already at the top tier"
         );
     }
 

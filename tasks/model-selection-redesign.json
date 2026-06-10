@@ -693,7 +693,7 @@
       "model": "claude-opus-4-8",
       "modifiesBehavior": false,
       "notes": "Isolated deletion diff per PRD risk mitigation (test blast radius). Runs AFTER FEAT-006/007/008 so no production caller of the deleted fns remains (FEAT-007 rewrote the escalation internals; FEAT-004 rewired both prompt builders). Mechanical test migration = swap deleted-fn calls for resolve_execution_plan/tier_of equivalents asserting the SAME behavior; if a test's premise no longer exists (e.g. baselineTierRoutes remap), delete it and note it in the progress log for TEST-010 to re-cover under the new system.",
-      "passes": false,
+      "passes": true,
       "priority": 28,
       "qualityDimensions": [
         "Deletion-only discipline: reviewers can read the diff as pure removal + mechanical rewiring",

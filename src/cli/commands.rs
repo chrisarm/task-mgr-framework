@@ -1598,16 +1598,44 @@ pub fn resolve_batch_command(
     BatchResolve::PrintHelp
 }
 
-/// `task-mgr models` subcommand actions.
+/// `task-mgr models` subcommand actions (provider-first config, FR-009).
 ///
-/// Remote fetches are gated behind `ANTHROPIC_API_KEY` + `TASK_MGR_USE_API=1`;
-/// without both, the offline list from `loop_engine::model` is used.
+/// All writes target the project `.task-mgr/config.json`, round-tripped through
+/// `serde_json::Value` so unknown keys are preserved. Remote fetches (`list
+/// --remote`) are gated behind `ANTHROPIC_API_KEY` + `TASK_MGR_USE_API=1`.
 #[derive(Subcommand, Debug)]
 pub enum ModelsAction {
-    /// Print the available model IDs
+    /// Write the FR-001 default `models`/`routing` config block
+    ///
+    /// `--force-replace-legacy` is the one sanctioned migration: it deletes the
+    /// four legacy keys (defaultModel/reviewModel/primaryRunner/fallbackRunner)
+    /// and writes the default block. Without it, a config still carrying legacy
+    /// keys is rejected. `--dry-run` prints the diff and writes nothing.
+    #[command(
+        name = "init",
+        after_help = "\
+EXAMPLES:
+    task-mgr models init
+    task-mgr models init --dry-run
+    task-mgr models init --force-replace-legacy
+"
+    )]
+    Init {
+        /// Delete the four legacy model keys before writing the default block
+        #[arg(long = "force-replace-legacy")]
+        force_replace_legacy: bool,
+        /// Print the diff (legacy keys + new block) without writing
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+    },
+
+    /// Show the resolved routing table, anchor-derived mapping, and notes
+    Show,
+
+    /// List the merged provider tier ladders (reverse lookup)
     List {
         /// Consult the Anthropic /v1/models endpoint if a key is present and
-        /// `TASK_MGR_USE_API=1`. Falls back silently to the built-in list.
+        /// `TASK_MGR_USE_API=1`. Falls back silently to the offline config.
         #[arg(long)]
         remote: bool,
         /// Bust the cache before fetching. Implies `--remote`.
@@ -1615,95 +1643,96 @@ pub enum ModelsAction {
         refresh: bool,
     },
 
-    /// Pin a default model (user config by default, `--project` for project)
-    SetDefault {
-        /// Model id. When omitted, prompts interactively.
+    /// Set the anchor capability tier (centers the difficulty window)
+    #[command(name = "set-anchor")]
+    SetAnchor {
+        /// Tier: cheapest | cost-efficient | standard | frontier
+        tier: String,
+    },
+
+    /// Enable a provider (probes its CLI binary BEFORE writing)
+    Enable {
+        /// Provider: claude | grok | codex
+        provider: String,
+    },
+
+    /// Disable a provider (never probes)
+    Disable {
+        /// Provider: claude | grok | codex
+        provider: String,
+    },
+
+    /// Pin a model to a provider's capability tier (omit MODEL to route with no model flag)
+    #[command(name = "set-tier")]
+    SetTier {
+        /// Provider: claude | grok | codex
+        provider: String,
+        /// Tier: cheapest | cost-efficient | standard | frontier
+        tier: String,
+        /// Model id; omit for a `null` rung (route with no model flag)
         model: Option<String>,
-        /// Write to `.task-mgr/config.json` instead of the per-user config.
-        #[arg(long)]
-        project: bool,
     },
 
-    /// Clear the pinned default model
-    UnsetDefault {
-        /// Clear the project-level default instead of the per-user default.
-        #[arg(long)]
-        project: bool,
+    /// Clear a provider tier override (the built-in default rung, if any, reapplies)
+    #[command(name = "unset-tier")]
+    UnsetTier {
+        /// Provider: claude | grok | codex
+        provider: String,
+        /// Tier: cheapest | cost-efficient | standard | frontier
+        tier: String,
     },
 
-    /// Show the currently resolved default model and where it came from
-    Show,
-
-    /// Set the reviewModel (routes CODE-REVIEW-*, MILESTONE-FINAL, REVIEW-* tasks)
-    ///
-    /// User scope by default; `--project` writes to `.task-mgr/config.json`.
-    /// When the model routes to Grok, the Grok binary is probed before the
-    /// config is written — a missing binary exits non-zero with no write.
-    #[command(name = "set-review-model")]
-    SetReviewModel {
-        /// Model id to use for review-class tasks (e.g. "grok-build")
-        model: String,
-        /// Write to `.task-mgr/config.json` instead of the per-user config
-        #[arg(long)]
-        project: bool,
+    /// Set a provider's per-difficulty effort level (omit EFFORT for no flag)
+    #[command(name = "set-effort")]
+    SetEffort {
+        /// Provider: claude | grok | codex
+        provider: String,
+        /// Difficulty: low | medium | high
+        difficulty: String,
+        /// Effort level; omit for a `null` entry (no effort flag). Codex rejects "xhigh".
+        effort: Option<String>,
     },
 
-    /// Clear the reviewModel
-    #[command(name = "unset-review-model")]
-    UnsetReviewModel {
-        /// Remove from the project config instead of the per-user config
-        #[arg(long)]
-        project: bool,
-    },
-
-    /// Set the fallbackRunner block (Grok overflow-fallback configuration)
-    ///
-    /// Creates or replaces the entire `fallbackRunner` block.  Pass `--enable`
-    /// to activate it; `--disable` to write a disabled template.  When
-    /// `--enable` is used, the Grok binary is probed BEFORE the config is
-    /// written — a missing binary exits non-zero with no write.
-    ///
-    /// Only `--provider grok` is accepted in v1.
-    #[command(
-        name = "set-fallback",
-        after_help = "\
-EXAMPLES:
-    task-mgr models set-fallback --enable --provider grok --model grok-build
-    task-mgr models set-fallback --enable --model grok-build --cli-binary /usr/local/bin/grok
-    task-mgr models set-fallback --enable --model grok-build --project
-    task-mgr models set-fallback --disable
-"
-    )]
+    /// Set a provider's tier-preserving cross-provider fallback target
+    #[command(name = "set-fallback")]
     SetFallback {
-        /// Enable the fallback runner
-        #[arg(long, conflicts_with = "disable")]
-        enable: bool,
-        /// Disable the fallback runner (leaves other fields at their defaults)
-        #[arg(long, conflicts_with = "enable")]
-        disable: bool,
-        /// Provider name (only "grok" is supported in v1)
-        #[arg(long)]
-        provider: Option<String>,
-        /// Model id passed to the fallback runner (required when --enable)
-        #[arg(long)]
-        model: Option<String>,
-        /// Absolute path to the Grok CLI binary (default: resolved from PATH)
-        #[arg(long = "cli-binary")]
-        cli_binary: Option<String>,
-        /// Consecutive RuntimeError rounds before the fallback fires (default: 2)
-        #[arg(long = "runtime-error-threshold")]
-        runtime_error_threshold: Option<u32>,
-        /// Write to `.task-mgr/config.json` instead of the per-user config
-        #[arg(long)]
-        project: bool,
+        /// Provider whose fallback to set: claude | grok | codex
+        provider: String,
+        /// Fallback target provider (must differ from PROVIDER and be enabled)
+        target: String,
     },
 
-    /// Remove the fallbackRunner block entirely
+    /// Remove a provider's fallback target
     #[command(name = "unset-fallback")]
     UnsetFallback {
-        /// Remove from the project config instead of the per-user config
+        /// Provider whose fallback to clear: claude | grok | codex
+        provider: String,
+    },
+
+    /// Add or replace a routing.byIdPrefix forced route
+    #[command(
+        name = "route",
+        after_help = "\
+EXAMPLES:
+    task-mgr models route REVIEW- --provider grok --tier frontier
+    task-mgr models route FEAT- --provider codex
+"
+    )]
+    Route {
+        /// Task-ID prefix (e.g. REVIEW-, FEAT-)
+        prefix: String,
+        /// Provider to route to: claude | grok | codex
         #[arg(long)]
-        project: bool,
+        provider: String,
+        /// Optional forced capability tier (overrides the anchor window)
+        #[arg(long)]
+        tier: Option<String>,
+    },
+
+    /// Remove a routing.byIdPrefix route
+    Unroute {
+        /// Task-ID prefix to unroute
+        prefix: String,
     },
 }
 

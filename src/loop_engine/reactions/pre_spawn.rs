@@ -98,9 +98,8 @@ pub struct ResolveTaskExecutionParams<'a> {
 /// `(ctx, task, resolved_model, conn)` inputs MUST produce an identical plan.
 ///
 /// Model-string layers that are NOT account-global recovery channels —
-/// `ctx.model_overrides` (prior-overflow model) and `apply_review_model_override`
-/// (review-class routing) — stay at the call sites: they rewrite the `--model`
-/// string and, for review routing, re-resolve the runner, AFTER this plan is
+/// `ctx.model_overrides` (prior-overflow model) — stays at the call sites: it
+/// rewrites the `--model` string AFTER this plan is
 /// produced. `model_overrides` is always paired with a `runner_overrides`
 /// entry, so [`TaskExecutionPlan::runner`] already reflects it.
 pub fn resolve_task_execution(params: ResolveTaskExecutionParams<'_>) -> TaskExecutionPlan {

@@ -5,7 +5,7 @@
 //! overflow ladder uses to promote a task to a different provider AFTER it
 //! has been spawned (e.g. Claude → Grok at rung 4). Codex is reached ONLY
 //! via an explicit `primaryRunner` provider hint at the spawn-resolution
-//! step (see `model::resolve_task_execution_target` →
+//! step (see `model::resolve_execution_plan` →
 //! `engine::resolve_effective_runner`). Inserting `RunnerKind::Codex` into
 //! `runner_overrides` would turn Codex into a recovery / fallback target,
 //! which would then run a `gpt-*` task through `CodexRunner` without the

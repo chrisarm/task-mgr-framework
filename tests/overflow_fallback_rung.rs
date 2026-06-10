@@ -19,7 +19,7 @@ use rusqlite::Connection;
 use tempfile::TempDir;
 
 use task_mgr::loop_engine::engine::IterationContext;
-use task_mgr::loop_engine::model::{FABLE_MODEL, ONE_M_SUFFIX, OPUS_MODEL, OPUS_MODEL_1M};
+use task_mgr::loop_engine::model::{FABLE_MODEL, ONE_M_SUFFIX, OPUS_MODEL};
 use task_mgr::loop_engine::overflow::{OverflowEvent, RecoveryAction};
 use task_mgr::loop_engine::project_config::{ModelsConfig, ProjectConfig};
 use task_mgr::loop_engine::prompt::PromptResult;
@@ -31,7 +31,7 @@ use task_mgr::loop_engine::runner::RunnerKind;
 const GROK_DEFAULT_MODEL: &str = "grok-build";
 
 /// The new Claude overflow ceiling: the 1M-context variant of the frontier
-/// (fable) model. The legacy ceiling was `OPUS_MODEL_1M`; the provider-first
+/// (fable) model. The legacy ceiling was the 1M Opus variant; the provider-first
 /// ladder now climbs haiku → sonnet → opus → fable → fable[1m] before rung 4.
 fn fable_1m() -> String {
     format!("{FABLE_MODEL}{ONE_M_SUFFIX}")
@@ -289,7 +289,7 @@ fn fallback_enabled_claude_at_ceiling_promotes_to_grok() {
     assert_eq!(
         task_model(&conn, task_id).as_deref(),
         Some(GROK_DEFAULT_MODEL),
-        "tasks.model UPDATE must run so resolve_task_model picks Grok next iter",
+        "tasks.model UPDATE must run so model resolution picks Grok next iter",
     );
     assert_eq!(
         task_status(&conn, task_id),
@@ -427,7 +427,7 @@ fn grok_primary_overflow_with_claude_fallback_promotes_to_claude() {
     assert_eq!(
         task_model(&conn, task_id).as_deref(),
         Some(OPUS_MODEL),
-        "tasks.model UPDATE must run so resolve_task_model picks Claude next iter",
+        "tasks.model UPDATE must run so model resolution picks Claude next iter",
     );
     assert_eq!(
         task_status(&conn, task_id),
@@ -660,17 +660,18 @@ fn fallback_to_provider_serializes_with_snake_case_tag_and_siblings() {
 
 #[test]
 fn user_message_fallback_to_provider_exact_string() {
+    let opus_1m = format!("{OPUS_MODEL}{ONE_M_SUFFIX}");
     let msg = RecoveryAction::FallbackToProvider {
         provider: "grok".to_string(),
         model: GROK_DEFAULT_MODEL.to_string(),
     }
-    .user_message("MY-TASK-001", Some("high"), Some(OPUS_MODEL_1M));
+    .user_message("MY-TASK-001", Some("high"), Some(opus_1m.as_str()));
     assert_eq!(
         msg,
         format!(
             "Prompt is too long for MY-TASK-001 at effort high, model {} — \
              falling back to {} (Claude ladder exhausted)",
-            OPUS_MODEL_1M, GROK_DEFAULT_MODEL,
+            opus_1m, GROK_DEFAULT_MODEL,
         ),
     );
 }
@@ -679,6 +680,6 @@ fn user_message_fallback_to_provider_exact_string() {
 
 #[test]
 fn test_file_compiles_marker() {
-    assert_eq!(OPUS_MODEL_1M, OPUS_MODEL_1M);
+    let _ = format!("{OPUS_MODEL}{ONE_M_SUFFIX}");
     assert_eq!(GROK_DEFAULT_MODEL, "grok-build");
 }

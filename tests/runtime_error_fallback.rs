@@ -24,7 +24,7 @@ use task_mgr::db::{create_schema, open_connection, run_migrations};
 use task_mgr::loop_engine::engine::{
     IterationContext, escalate_task_model_if_needed, handle_task_failure,
 };
-use task_mgr::loop_engine::model::{FABLE_MODEL, OPUS_MODEL, OPUS_MODEL_1M, SONNET_MODEL};
+use task_mgr::loop_engine::model::{FABLE_MODEL, ONE_M_SUFFIX, OPUS_MODEL, SONNET_MODEL};
 use task_mgr::loop_engine::project_config::FallbackRunnerConfig;
 use task_mgr::loop_engine::runner::RunnerKind;
 
@@ -509,7 +509,7 @@ fn grok_auth_failure_does_not_increment_consecutive_failures() {
 
 /// A task whose `tasks.model` is already the Grok model id (effective_runner
 /// == Grok on the next iteration) must NOT trigger a second promotion. Today
-/// `escalate_model` does not recognize the Grok id and returns `None`, which
+/// `escalate_tier` does not recognize the Grok id and returns `None`, which
 /// short-circuits the inner `if let Some(...)` block — so the DB column is
 /// untouched. Runs unconditionally; FEAT-007 must preserve this idempotency
 /// (e.g. via the `effective_runner == Claude` gate before the Grok branch).
@@ -542,7 +542,7 @@ fn task_already_at_grok_is_idempotent_no_second_promotion() {
     .unwrap();
     assert_eq!(
         result, None,
-        "task already at Grok must not re-promote — escalate_model returns None for an \
+        "task already at Grok must not re-promote — escalate_tier returns None for an \
          unknown tier, and the effective_runner == Claude gate blocks the Grok branch",
     );
     assert!(
@@ -558,18 +558,19 @@ fn task_already_at_grok_is_idempotent_no_second_promotion() {
 
 // ── H2 regression — Opus[1M] must also trigger Grok promotion ────────────────
 
-/// H2: a task at `OPUS_MODEL_1M` (the 1M-context Opus variant) with
+/// H2: a task at the 1M-context Opus variant (`opus[1m]`) with
 /// consecutive_failures >= threshold must be promoted to Grok. The original
 /// code used string-equality against `OPUS_MODEL` which excluded the 1M
-/// variant; the fix uses the ModelTier-based inclusive check so both
-/// `OPUS_MODEL` and `OPUS_MODEL_1M` satisfy the "was at Opus" gate.
+/// variant; the fix uses the tier-based inclusive check (`tier_of >= Standard`)
+/// so both Opus and its 1M variant satisfy the "was at Opus" gate.
 #[test]
 fn promotion_fires_at_opus_1m_and_threshold() {
     let (_dir, conn) = setup_db();
+    let opus_1m = format!("{OPUS_MODEL}{ONE_M_SUFFIX}");
     insert_task(
         &conn,
         "OPUS1M-001",
-        Some(OPUS_MODEL_1M),
+        Some(opus_1m.as_str()),
         FALLBACK_THRESHOLD - 1,
     );
 

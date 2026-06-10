@@ -825,7 +825,7 @@ pub fn run_wave_iteration(
         // Review-class routing now flows from `resolve_execution_plan` rung 3
         // (FEAT-004): the slot bundle's `resolved_model`/`provider_hint` already
         // carry the review→frontier route from build time. The legacy
-        // `apply_review_model_override` per-slot rewrite is deleted.
+        // review-model per-slot rewrite is deleted.
 
         // Resolve the runner over the FINAL model (post crash escalation).
         // `plan.runner` reflects only the pre-routing

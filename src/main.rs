@@ -1379,53 +1379,64 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
 
         Commands::Models { action } => {
             use task_mgr::commands::models::{
-                ListOpts, SetDefaultOpts, SetFallbackOpts, UnsetDefaultOpts, handle_list,
-                handle_set_default, handle_set_fallback, handle_set_review_model, handle_show,
-                handle_unset_default, handle_unset_fallback, handle_unset_review_model,
+                ListOpts, handle_init, handle_list, handle_route, handle_set_anchor,
+                handle_set_effort, handle_set_enabled, handle_set_fallback, handle_set_tier,
+                handle_show, handle_unroute, handle_unset_fallback, handle_unset_tier,
             };
             match action {
-                ModelsAction::List { remote, refresh } => {
-                    handle_list(&cli.dir, ListOpts { remote, refresh })?;
-                }
-                ModelsAction::SetDefault { model, project } => {
-                    handle_set_default(&cli.dir, SetDefaultOpts { model, project })?;
-                }
-                ModelsAction::UnsetDefault { project } => {
-                    handle_unset_default(&cli.dir, UnsetDefaultOpts { project })?;
+                ModelsAction::Init {
+                    force_replace_legacy,
+                    dry_run,
+                } => {
+                    handle_init(&cli.dir, force_replace_legacy, dry_run)?;
                 }
                 ModelsAction::Show => {
                     handle_show(&cli.dir, resolved_db_dir.source)?;
                 }
-                ModelsAction::SetReviewModel { model, project } => {
-                    handle_set_review_model(&cli.dir, &model, project)?;
+                ModelsAction::List { remote, refresh } => {
+                    handle_list(&cli.dir, ListOpts { remote, refresh })?;
                 }
-                ModelsAction::UnsetReviewModel { project } => {
-                    handle_unset_review_model(&cli.dir, project)?;
+                ModelsAction::SetAnchor { tier } => {
+                    handle_set_anchor(&cli.dir, &tier)?;
                 }
-                ModelsAction::SetFallback {
-                    enable,
-                    disable,
+                ModelsAction::Enable { provider } => {
+                    handle_set_enabled(&cli.dir, &provider, true)?;
+                }
+                ModelsAction::Disable { provider } => {
+                    handle_set_enabled(&cli.dir, &provider, false)?;
+                }
+                ModelsAction::SetTier {
                     provider,
+                    tier,
                     model,
-                    cli_binary,
-                    runtime_error_threshold,
-                    project,
                 } => {
-                    handle_set_fallback(
-                        &cli.dir,
-                        SetFallbackOpts {
-                            enable,
-                            disable,
-                            provider,
-                            model,
-                            cli_binary,
-                            runtime_error_threshold,
-                            project,
-                        },
-                    )?;
+                    handle_set_tier(&cli.dir, &provider, &tier, model.as_deref())?;
                 }
-                ModelsAction::UnsetFallback { project } => {
-                    handle_unset_fallback(&cli.dir, project)?;
+                ModelsAction::UnsetTier { provider, tier } => {
+                    handle_unset_tier(&cli.dir, &provider, &tier)?;
+                }
+                ModelsAction::SetEffort {
+                    provider,
+                    difficulty,
+                    effort,
+                } => {
+                    handle_set_effort(&cli.dir, &provider, &difficulty, effort.as_deref())?;
+                }
+                ModelsAction::SetFallback { provider, target } => {
+                    handle_set_fallback(&cli.dir, &provider, &target)?;
+                }
+                ModelsAction::UnsetFallback { provider } => {
+                    handle_unset_fallback(&cli.dir, &provider)?;
+                }
+                ModelsAction::Route {
+                    prefix,
+                    provider,
+                    tier,
+                } => {
+                    handle_route(&cli.dir, &prefix, &provider, tier.as_deref())?;
+                }
+                ModelsAction::Unroute { prefix } => {
+                    handle_unroute(&cli.dir, &prefix)?;
                 }
             }
             Ok(())

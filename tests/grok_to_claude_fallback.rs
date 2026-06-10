@@ -24,7 +24,7 @@ use tempfile::TempDir;
 use task_mgr::loop_engine::engine::{
     EffectiveRunnerInput, IterationContext, resolve_effective_runner,
 };
-use task_mgr::loop_engine::model::{OPUS_MODEL, OPUS_MODEL_1M, SONNET_MODEL};
+use task_mgr::loop_engine::model::{ONE_M_SUFFIX, OPUS_MODEL, SONNET_MODEL};
 use task_mgr::loop_engine::overflow::RecoveryAction;
 use task_mgr::loop_engine::project_config::{ModelsConfig, ProjectConfig};
 use task_mgr::loop_engine::prompt::PromptResult;
@@ -172,7 +172,7 @@ fn grok_task_prompt_too_long_at_ceiling_falls_back_to_claude() {
         task_model(&conn, task_id).as_deref(),
         Some(OPUS_MODEL),
         "inverse fallback MUST UPDATE tasks.model to the Claude target so \
-         resolve_task_model picks Claude on the next iteration",
+         model resolution picks Claude on the next iteration",
     );
     assert_eq!(
         task_status(&conn, task_id),
@@ -400,11 +400,12 @@ fn after_inverse_overflow_fallback_next_iteration_resolves_claude_runner() {
     );
 
     // Also verify against the 1M-context Claude model if it were somehow in play.
+    let opus_1m = format!("{OPUS_MODEL}{ONE_M_SUFFIX}");
     let runner_from_opus_1m = resolve_effective_runner(
         &ctx,
         task_id,
         EffectiveRunnerInput {
-            model: Some(OPUS_MODEL_1M),
+            model: Some(opus_1m.as_str()),
             provider_hint: None,
         },
     );
