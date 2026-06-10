@@ -453,13 +453,19 @@ pub fn run_iteration(
     // Effort: the plan's prior-overflow override wins, else the cluster-wide
     // effort `build_prompt` computed (parallels the cluster-wide
     // `resolved_model` so both axes scale with the hardest task in the cluster).
-    let base_effort = prompt_result.cluster_effort;
-    let effort = plan.effort.or(base_effort);
+    // `base_effort` is the plan/per-provider effort the builder carried
+    // (WIRE-FIX-001). `plan.effort` here is the prior-overflow effort override
+    // (static escalation levels) which wins when present.
+    let base_effort = prompt_result.cluster_effort.clone();
+    let effort = plan
+        .effort
+        .map(String::from)
+        .or_else(|| base_effort.clone());
     if effort != base_effort {
         ui::emit(&format!(
             "Effort override (prior prompt overflow): {} → {}",
-            base_effort.unwrap_or("(default)"),
-            effort.unwrap_or("(default)"),
+            base_effort.as_deref().unwrap_or("(default)"),
+            effort.as_deref().unwrap_or("(default)"),
         ));
     }
 
@@ -493,7 +499,7 @@ pub fn run_iteration(
         &task_id,
         params.elapsed_secs,
         effective_model.as_deref(),
-        effort,
+        effort.as_deref(),
         &ctx.overflow_recovered,
         &ctx.overflow_original_model,
         effective_runner,
@@ -513,7 +519,7 @@ pub fn run_iteration(
         effective_runner,
     );
     let runner_effort = if effective_runner.supports(runner::RunnerCapability::Effort) {
-        effort
+        effort.as_deref()
     } else {
         None
     };
@@ -581,7 +587,7 @@ pub fn run_iteration(
                 should_stop: false,
                 output: hint,
                 effective_model,
-                effective_effort: effort,
+                effective_effort: effort.clone(),
                 effective_runner: Some(effective_runner),
                 key_decisions_count: 0,
                 conversation: None,
@@ -600,7 +606,7 @@ pub fn run_iteration(
                 should_stop: false,
                 output: hint,
                 effective_model,
-                effective_effort: effort,
+                effective_effort: effort.clone(),
                 effective_runner: Some(effective_runner),
                 key_decisions_count: 0,
                 conversation: None,
@@ -627,7 +633,7 @@ pub fn run_iteration(
                 should_stop: false,
                 output: String::new(),
                 effective_model,
-                effective_effort: effort,
+                effective_effort: effort.clone(),
                 effective_runner: Some(effective_runner),
                 key_decisions_count: 0,
                 conversation: None,
@@ -709,7 +715,7 @@ pub fn run_iteration(
             should_stop: false,
             output: claude_result.output,
             effective_model,
-            effective_effort: effort,
+            effective_effort: effort.clone(),
             effective_runner: Some(effective_runner),
             key_decisions_count: 0,
             conversation: None,
@@ -856,7 +862,7 @@ pub fn run_iteration(
                 ctx,
                 conn: params.conn,
                 task_id: &task_id,
-                effort,
+                effort: effort.as_deref(),
                 effective_model: effective_model.as_deref(),
                 prompt_result: &prompt_result,
                 iteration: params.iteration,
@@ -904,7 +910,7 @@ pub fn run_iteration(
         should_stop,
         output: claude_output,
         effective_model,
-        effective_effort: effort,
+        effective_effort: effort.clone(),
         effective_runner: Some(effective_runner),
         key_decisions_count: 0,
         conversation: claude_conversation,

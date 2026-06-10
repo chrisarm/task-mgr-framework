@@ -187,9 +187,11 @@ pub struct IterationResult {
     /// Effective model used for this iteration (post-crash-escalation).
     /// None for early exits (signal, rate-limit, etc.).
     pub effective_model: Option<String>,
-    /// Effective `--effort` level used for this iteration, derived from task difficulty.
+    /// Effective `--effort` level used for this iteration. Carries the plan's
+    /// per-provider effort (or the prior-overflow override) — owned `String`
+    /// because per-provider effort levels come from runtime config (WIRE-FIX-001).
     /// None when difficulty is unset/unknown or for early exits.
-    pub effective_effort: Option<&'static str>,
+    pub effective_effort: Option<String>,
     /// Effective runner that executed this iteration.
     /// None for pre-dispatch early exits.
     pub effective_runner: Option<RunnerKind>,
@@ -709,7 +711,7 @@ pub(super) struct SlotEarlyExit {
     pub(super) should_stop: bool,
     pub(super) output: String,
     pub(super) effective_model: Option<String>,
-    pub(super) effective_effort: Option<&'static str>,
+    pub(super) effective_effort: Option<String>,
 }
 
 /// Borrowed parameters for one parallel wave iteration (FEAT-010).

@@ -252,12 +252,20 @@ pub struct SlotPromptBundle {
     pub resolved_model: Option<String>,
     /// Explicit provider intent from `primaryRunner`, when present.
     pub provider_hint: Option<crate::loop_engine::model::Provider>,
-    /// Task difficulty at bundle-build time. The slot worker derives effort
-    /// (`model::effort_for_difficulty`) and watchdog timeout
-    /// (`watchdog::TimeoutConfig::from_difficulty`) from this without needing
-    /// the original `Task` reference. `None` when the task has no difficulty
-    /// set; downstream callers fall back to defaults.
+    /// Task difficulty at bundle-build time. The slot worker derives the
+    /// watchdog timeout (`watchdog::TimeoutConfig::from_difficulty`) from this
+    /// without needing the original `Task` reference. `None` when the task has
+    /// no difficulty set; downstream callers fall back to defaults.
     pub difficulty: Option<String>,
+    /// Resolved CLI `--effort` level for this slot (None → omit flag). Carries
+    /// the [`ExecutionPlan::effort`](crate::loop_engine::model::ExecutionPlan)
+    /// the slot prompt builder computed — `models.effort_for(final_provider,
+    /// difficulty)` over the FINAL provider's per-provider effort table, with the
+    /// static `effort_for_difficulty` table as fallback. The slot worker prefers
+    /// this over re-deriving from `difficulty`, so a custom per-provider effort
+    /// table reaches the runner argv (WIRE-FIX-001). Mirrors
+    /// `PromptResult::cluster_effort` on the sequential path.
+    pub cluster_effort: Option<String>,
     /// Per-section byte sizes in prompt-assembly order. Mirrors
     /// `PromptResult::section_sizes` so overflow dumps include a meaningful
     /// section breakdown (instead of an empty `[]`) when a slot hits
@@ -365,6 +373,15 @@ pub fn build_prompt(
         crate::loop_engine::model::Provider::Claude => None,
         other => Some(other),
     };
+    // WIRE-FIX-001: carry the plan's per-provider effort onto the bundle so the
+    // slot worker uses it instead of recomputing from the static
+    // `effort_for_difficulty` table (which ignores custom per-provider tables).
+    // Static fallback only when the resolved provider has no entry for this
+    // difficulty, keeping default-config behavior unchanged.
+    let cluster_effort = plan.effort.or_else(|| {
+        crate::loop_engine::model::effort_for_difficulty(task.difficulty.as_deref())
+            .map(String::from)
+    });
 
     // The `&Connection` lives only in this main-thread `PromptContext`, which is
     // dropped before the bundle crosses the worker boundary — no `&Connection`
@@ -426,6 +443,7 @@ pub fn build_prompt(
             resolved_model,
             provider_hint,
             difficulty: task.difficulty.clone(),
+            cluster_effort,
             // `assemble` populates `section_sizes` on overflow (criticals in
             // roster order), the same breakdown the legacy sentinel reported.
             section_sizes: critical_assembled.section_sizes,
@@ -557,6 +575,7 @@ pub fn build_prompt(
         resolved_model,
         provider_hint,
         difficulty: task.difficulty.clone(),
+        cluster_effort,
         section_sizes,
         dropped_sections,
     }

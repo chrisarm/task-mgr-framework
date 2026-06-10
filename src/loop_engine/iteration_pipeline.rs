@@ -184,7 +184,7 @@ pub struct ProcessingParams<'a> {
     /// Effective `--effort` level for this iteration. Threaded into the
     /// progress log entry. `None` when difficulty is unset/unknown or for
     /// early-exit paths.
-    pub effective_effort: Option<&'static str>,
+    pub effective_effort: Option<&'a str>,
     /// Effective runner kind for this iteration (Claude/Grok/Codex).
     /// Threaded from IterationResult/SlotResult (already resolved at spawn
     /// time) so the completion arm can stamp without re-deriving.

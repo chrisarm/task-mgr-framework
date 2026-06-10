@@ -316,14 +316,18 @@ pub struct PromptResult {
     /// Propagated from `NextTaskOutput.difficulty`. Per-task, NOT cluster-wide — see
     /// `cluster_effort` for the effort flag that mirrors cluster-wide model escalation.
     pub task_difficulty: Option<String>,
-    /// Resolved Claude CLI `--effort` level for this iteration (None → omit flag).
+    /// Resolved CLI `--effort` level for this iteration (None → omit flag).
     ///
-    /// Derived from the **cluster-wide max difficulty** (primary task + pending
-    /// `synergyWith` partners), then mapped through `model::effort_for_difficulty`.
-    /// This parallels `resolved_model`: both scale with the hardest task in the
-    /// cluster so (Opus, `xhigh`) is chosen when a cluster contains a `high`-difficulty
-    /// partner, even if the primary is only `medium`.
-    pub cluster_effort: Option<&'static str>,
+    /// Sourced from the [`ExecutionPlan::effort`](crate::loop_engine::model::ExecutionPlan)
+    /// that `resolve_execution_plan` computes — i.e. `models.effort_for(final_provider,
+    /// difficulty)` over the **final** provider's per-provider effort table — falling
+    /// back to the static `model::effort_for_difficulty` table only when the resolved
+    /// provider has no effort entry for the difficulty. Owned `String` (not
+    /// `&'static str`) because per-provider effort levels come from runtime config.
+    /// Carrying `plan.effort` here is what lets a custom table (e.g.
+    /// `providers.grok.effort.high = "medium"`) reach the runner argv instead of being
+    /// silently overwritten by the static default (WIRE-FIX-001).
+    pub cluster_effort: Option<String>,
     /// Per-section byte counts for the assembled prompt, in assembly order.
     ///
     /// Used by overflow diagnostics to attribute prompt size to specific
@@ -452,8 +456,16 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
         crate::loop_engine::model::Provider::Claude => None,
         other => Some(other),
     };
-    let cluster_effort =
-        crate::loop_engine::model::effort_for_difficulty(task_output.difficulty.as_deref());
+    // WIRE-FIX-001: carry the plan's per-provider effort (computed from the FINAL
+    // provider's effort table by `resolve_execution_plan`) instead of recomputing
+    // from the static `effort_for_difficulty` table — the latter ignores custom
+    // per-provider effort tables. The static table is only the fallback when the
+    // resolved provider has no effort entry for this difficulty, so default-config
+    // behavior is unchanged.
+    let cluster_effort = plan.effort.clone().or_else(|| {
+        crate::loop_engine::model::effort_for_difficulty(task_output.difficulty.as_deref())
+            .map(String::from)
+    });
 
     // ============================================================
     // Phase 1: critical sections — gated together against the budget.
@@ -2469,9 +2481,9 @@ pub enum ApiError {
             .unwrap()
             .expect("Should return a prompt");
 
-        // medium → "high" per effort_for_difficulty mapping; partner's "high"
-        // difficulty is ignored.
-        assert_eq!(result.cluster_effort, Some("high"));
+        // medium → "high" per the default claude effort table (matches
+        // effort_for_difficulty); partner's "high" difficulty is ignored.
+        assert_eq!(result.cluster_effort.as_deref(), Some("high"));
         assert_eq!(result.task_difficulty.as_deref(), Some("medium"));
     }
 
@@ -2501,7 +2513,7 @@ pub enum ApiError {
             .expect("Should return a prompt");
 
         assert_eq!(
-            result.cluster_effort,
+            result.cluster_effort.as_deref(),
             Some("high"),
             "done partner must not influence cluster effort — stays at primary's medium→high"
         );
@@ -2520,6 +2532,54 @@ pub enum ApiError {
             .expect("Should return a prompt");
 
         assert_eq!(result.cluster_effort, None);
+    }
+
+    /// WIRE-FIX-001 regression: a custom per-provider effort table must reach
+    /// `cluster_effort` (and thus the runner argv) instead of being silently
+    /// overwritten by the static `effort_for_difficulty` mapping. Here the
+    /// primary provider is grok with `effort.medium = "low"`; the static table
+    /// would map medium → "high", so the two disagree and the assertion pins
+    /// the per-provider value.
+    #[test]
+    fn test_cluster_effort_honors_custom_provider_effort_table() {
+        let (temp_dir, conn) = setup_test_db();
+
+        insert_task(&conn, "CE-004", "Primary medium", "todo", 5);
+        conn.execute(
+            "UPDATE tasks SET difficulty = 'medium' WHERE id = 'CE-004'",
+            [],
+        )
+        .unwrap();
+
+        // Production-shaped models config: grok primary, custom effort table that
+        // maps medium → "low" (differs from the static medium → "high").
+        let models: crate::loop_engine::project_config::ModelsConfig =
+            serde_json::from_value(serde_json::json!({
+                "primaryProvider": "grok",
+                "anchor": "standard",
+                "providers": {
+                    "grok": {
+                        "enabled": true,
+                        "tiers": { "standard": "grok-build" },
+                        "effort": { "low": "low", "medium": "low", "high": "low" },
+                    },
+                },
+            }))
+            .expect("production-shaped models fixture");
+
+        let base_prompt_path = create_base_prompt(temp_dir.path());
+        let mut params = build_params(temp_dir.path(), &conn, &base_prompt_path);
+        params.models_config = &models;
+
+        let result = build_prompt(&params)
+            .unwrap()
+            .expect("Should return a prompt");
+
+        assert_eq!(
+            result.cluster_effort.as_deref(),
+            Some("low"),
+            "custom per-provider effort table must win over the static effort_for_difficulty mapping"
+        );
     }
 
     // --- Edge case tests for model resolution ---
