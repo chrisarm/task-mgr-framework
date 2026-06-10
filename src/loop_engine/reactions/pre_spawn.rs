@@ -250,21 +250,30 @@ pub fn invalidate_stale_overrides(ctx: &mut IterationContext, conn: &Connection,
         return;
     }
 
-    // NULL-original semantics (FEAT-004): an anchor-resolved task snapshotted a
-    // NULL `tasks.model`, then the escalation ladder wrote `tasks.model` itself
-    // (to the auto-recovery model it also recorded in `model_overrides`). That
-    // write is the LADDER's, NOT an operator edit — absorb it into the snapshot
-    // so the next pass compares against the escalated model. Only a SUBSEQUENT
-    // edit to a DIFFERENT model fires the six-channel clear. Without this, the
-    // ladder's own first write (`Some(None) != Some(Some(opus))`) would
-    // self-trip the escape valve and wipe the recovery it just set up.
-    if snapshot_inner.is_none() {
-        let ladder_model = ctx.model_overrides.get(task_id).map(String::as_str);
-        if current_model.is_some() && current_model.as_deref() == ladder_model {
-            ctx.overflow_original_task_model
-                .insert(task_id.to_string(), current_model);
-            return;
-        }
+    // Ladder-write absorb (FEAT-004 + rung-4 Some-original): a model-changing
+    // recovery rung records its target in `model_overrides` and then writes the
+    // SAME value to `tasks.model`. That write is the LADDER's, NOT an operator
+    // edit — absorb it into the snapshot so the next pass compares against the
+    // model the ladder set. Only a SUBSEQUENT edit to a DIFFERENT model fires
+    // the six-channel clear.
+    //
+    // This applies whether the snapshot's inner value is `None` (anchor-resolved
+    // task: rung-1/2/3 escalation, or a rung-4 pivot off a NULL model) OR
+    // `Some(original)` (a task that carried an explicit model and pivoted
+    // cross-provider at the ceiling — rung 4). Without covering the
+    // `Some(original)` case the pivot's own write (`Some(opus) != Some(grok)`)
+    // would self-trip the valve and wipe the just-installed promotion,
+    // including `runner_overrides` — weakening the `promote_once` guard.
+    //
+    // The consecutive-failure escalation path does NOT write `model_overrides`;
+    // it refreshes this snapshot directly at the write site
+    // (`recovery::absorb_escalation_into_overflow_snapshot`), so it reaches the
+    // `snapshot == current` early return above and never depends on this branch.
+    let ladder_model = ctx.model_overrides.get(task_id).map(String::as_str);
+    if current_model.is_some() && current_model.as_deref() == ladder_model {
+        ctx.overflow_original_task_model
+            .insert(task_id.to_string(), current_model);
+        return;
     }
 
     ctx.runner_overrides.remove(task_id);

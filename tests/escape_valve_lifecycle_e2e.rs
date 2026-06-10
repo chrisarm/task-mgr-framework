@@ -296,3 +296,71 @@ fn null_model_escalation_without_operator_edit_never_clears() {
         assert_recovery_channels_present(&ctx, task_id);
     }
 }
+
+/// SOME-original rung-4 pivot: a task that carried an EXPLICIT model (here the
+/// Claude ceiling `fable[1m]`) and pivots cross-provider to Grok at rung 4. The
+/// pivot writes `tasks.model = grok` (the same value it recorded in
+/// `model_overrides`) and snapshots the pre-pivot `Some(fable[1m])`. The escape
+/// valve must recognize the pivot's own write — NOT treat it as an operator edit
+/// — even though the snapshot's inner value is `Some(...)`, not `None`. Without
+/// the generalized ladder-write absorb this self-trips and wipes the just-
+/// installed promotion (including `runner_overrides`), weakening `promote_once`.
+#[test]
+fn some_original_model_rung4_pivot_does_not_self_trip_escape_valve() {
+    let task_id = "ESCAPE-SOME-FEAT-001";
+    let tmp = TempDir::new().expect("tempdir");
+    let ceiling = fable_1m();
+    // (1) task carries an EXPLICIT model: the Claude ceiling.
+    let mut conn = make_conn_with_task(task_id, Some(&ceiling));
+    let mut ctx = IterationContext::new(10);
+    let pr = make_prompt_result(task_id);
+    let project_cfg = models_claude_fallback_grok();
+
+    // (2) at (fable[1m], effort=high) rungs 1-3 are exhausted → rung 4 pivots to
+    // the configured Grok fallback.
+    let action = handle_overflow(HandleOverflowParams {
+        ctx: &mut ctx,
+        conn: &mut conn,
+        task_id,
+        effort: Some("high"),
+        effective_model: Some(&ceiling),
+        prompt_result: &pr,
+        iteration: 1,
+        run_id: Some("run-some"),
+        base_dir: tmp.path(),
+        slot_index: None,
+        effective_runner: RunnerKind::Claude,
+        project_config: &project_cfg,
+    });
+    assert!(
+        matches!(action, RecoveryAction::FallbackToProvider { .. }),
+        "an explicit-model task at the ceiling with claude.fallback=grok must pivot to Grok \
+         (rung 4), got {action:?}",
+    );
+    assert_eq!(
+        ctx.overflow_original_task_model.get(task_id),
+        Some(&Some(ceiling.clone())),
+        "the snapshot captured the pre-pivot EXPLICIT model (Some-original)",
+    );
+    assert_eq!(
+        task_model(&conn, task_id).as_deref(),
+        Some(GROK_MODEL),
+        "rung 4 writes the tier-preserving fallback model into tasks.model",
+    );
+    assert_recovery_channels_present(&ctx, task_id);
+
+    // (3) the pivot's OWN tasks.model write is absorbed even though the snapshot
+    // inner value is Some(...): invalidate is a no-op, recovery survives.
+    invalidate_stale_overrides(&mut ctx, &conn, task_id);
+    assert_recovery_channels_present(&ctx, task_id);
+    assert_eq!(
+        ctx.runner_overrides.get(task_id).copied(),
+        Some(RunnerKind::Grok),
+        "the escape valve must NOT self-trip on the Some-original rung-4 pivot's own write",
+    );
+
+    // (4) a genuine operator edit to a DIFFERENT model still fires the clear.
+    set_task_model(&conn, task_id, Some(SONNET_MODEL));
+    invalidate_stale_overrides(&mut ctx, &conn, task_id);
+    assert_recovery_channels_cleared(&ctx, task_id);
+}
