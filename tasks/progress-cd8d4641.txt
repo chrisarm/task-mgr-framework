@@ -226,3 +226,89 @@ Gate: cargo fmt --check OK; clippy --all-targets -D warnings clean; gen-docs --c
 full `cargo test` GREEN (4675 passed, 0 failed, 72 binaries).
 
 ---
+## 2026-06-10 - cd8d4641-VERIFY-001
+
+### Final verification: success metrics, docs, reachability, no-unwrap audit
+
+**Pre-verification union sync.** Slot-1 was one commit behind the feature branch:
+REFACTOR-006 (5d25b04, resolved migrate-vs-delete as DELETE) landed there after this
+slot's REFACTOR-REVIEW-FINAL. Verifying the pre-deletion state would have audited
+already-superseded code, so `feat/model-selection-redesign` was merged in first
+(merge commit 7be1043). One conflict (model.rs test module): dropped BOTH dead test
+families — `primary_runner_match` tests (HEAD side; fn deleted by REFACTOR-006) and
+`resolve_iteration_model` tests (incoming side; fn dead on both branches, deleted by
+this task's WIP e68c103) — and preserved the dash-boundary contract as
+`test_id_body_prefix_matching_keeps_dash_segment_boundary` (route_prefixes_overlap
+no longer exists; id_body_matches_prefix half kept).
+
+**PRD success metrics — all four demonstrated:**
+
+1. Anchor matrix (default config): `happy_path_anchor_standard_difficulty_window`
+   (low→SONNET_MODEL, medium→OPUS_MODEL, high→FABLE_MODEL) and
+   `happy_path_anchor_cost_efficient_shifts_one_rung_down` (low→HAIKU_MODEL,
+   medium→SONNET_MODEL, high→OPUS_MODEL) — tests/capability_tier_matrix.rs:84,104.
+2. Heterogeneous-provider wave with provider stamping:
+   `heterogeneous_wave_stamps_each_slot_with_its_own_provider`
+   (tests/provider_stamping_e2e.rs) — three slots in ONE run+iteration complete via
+   Claude/Grok/Codex through the shared `process_slot_result` shape
+   (slot_index: Some(N)); per-task `completed_by_provider` + run_tasks
+   provider/model columns asserted with no cross-slot bleed (codex stamps with
+   NULL model).
+3. Rate-limit reroute/deferral with zero stale increments:
+   `blackout_medium_reroutes_while_frontier_review_defers_zero_stale`
+   (tests/model_selection_engine_edges.rs:642) — medium FEAT reroutes to grok
+   standard rung, frontier REVIEW defers on Claude, `stale_tracker.count() == 0`,
+   `runner_overrides` untouched. (Full path trace: INT-002 section above.)
+4. Full gate green: `cargo test` 4651 passed / 0 failed across 72 binaries;
+   `cargo clippy --all-targets -- -D warnings` clean; `cargo fmt --check` clean;
+   `cargo run --bin gen-docs -- --check` clean.
+
+**Docs (AC#2/#3).** Root CLAUDE.md: models-command table, picker (anchor-tier FR-009)
+gating, and Codex section rewritten to provider-first reality (verified against
+ensure_models_anchor gates at src/commands/models/ensure_default.rs:57 + single
+caller init/mod.rs:807 — TTY-gated, auto-mode skip, legacy-key hint+skip, never
+loop/batch init). src/loop_engine/CLAUDE.md: fixed five stale post-REFACTOR-006
+spots — Codex "Selection" now names routing.byIdPrefix/taskClasses (not
+primaryRunner); "Binary probe" section renamed enabled-gated and now names
+reject_legacy_model_config + validate_models_config + probe_enabled_provider_binaries
+(validate_runner_routing_config/check_codex_runner_binary are deleted);
+prohibited-outcomes bullet primaryRunner.byIdPrefix → routing.byIdPrefix; overflow
+rung-4 byte-identical claim now keyed on providers.<source>.fallback unset; binary
+"" footgun section now points at probe_provider_binary.
+docs/designs/model-selection-redesign.md: precedence list matches
+resolve_execution_plan; REFACTOR-006 sentence updated from "tracked" to "resolved
+as DELETE".
+
+**Reachability (AC#4).** All 13 `task-mgr models` verbs have ModelsAction dispatch
+arms (main.rs:1387-1438). Zero-caller scan over model.rs / project_config.rs /
+config_io.rs / user_config.rs / commands/models/* / reactions/* found and removed
+the dead legacy-writer chain REFACTOR-006 missed:
+`project_config::write_review_model`, `user_config::{write_default_model,
+write_default_model_at, write_review_model, write_review_model_at}`, and
+`config_io::{OnCorruptJson, write_config_key_at}` (+ their tests; the live
+`write_config_value_at` used by models handlers is retained). Also removed (WIP
+commit): dead `resolve_iteration_model` (model.rs) and dead
+`select_model_interactive` wrapper (picker.rs). Stale code comment "(they remain
+on the struct until REFACTOR-005)" in read_project_config corrected.
+
+**No-unwrap (AC#5).** Diff-based audit (merge-base f157f257..HEAD, src/): every
+added `.unwrap()` line sits in #[cfg(test)] modules or dedicated tests.rs files
+except 7 in src/bin/gen-docs.rs (static regex patterns / guaranteed named groups)
+— converted to `.expect()` with messages (plus 1 pre-existing for consistency);
+gen-docs rebuilt, --check + its 2 unit tests green.
+
+**Fixtures (AC#6).** `fr001_canonical_models_json` in capability_tier_matrix.rs is
+the serde wire-form fixture (primaryProvider/cliBinary/kebab tier keys);
+`fr001_canonical_json_deserializes_into_models_config` round-trips it into
+ModelsConfig — passed. Engine-edge + precedence tests build configs from
+production-shaped JSON, not hand-built maps.
+
+**Gate (AC#7).** fmt ✓ / clippy --all-targets -D warnings ✓ / cargo test 4651-0 ✓ /
+gen-docs --check ✓.
+
+Note for MILESTONE-FINAL: stale shared-target rmeta from the sibling worktree
+(post-REFACTOR-006 lib) initially made clippy resolve 8-arg fns as 4-arg
+(learning #4753 class); `touch src/lib.rs ...` + rebuild cleared it. Rebuild
+before trusting first-run failures in this worktree.
+
+---

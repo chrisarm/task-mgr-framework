@@ -1058,10 +1058,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_route_prefix_matching_keeps_dash_segment_boundary() {
-        assert!(route_prefixes_overlap("MILESTONE", "MILESTONE-FINAL"));
-        assert!(route_prefixes_overlap("FIX", "CODE-FIX"));
+    fn test_id_body_prefix_matching_keeps_dash_segment_boundary() {
         assert!(id_body_matches_prefix("REVIEW-001", "REVIEW"));
+        assert!(id_body_matches_prefix("MILESTONE-FINAL", "MILESTONE-FINAL"));
         assert!(!id_body_matches_prefix("REVIEWER-001", "REVIEW"));
     }
 

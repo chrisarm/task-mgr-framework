@@ -56,7 +56,7 @@ Highest to lowest (see `ExecutionPlan`, `PlanContext`, `finalize_plan`):
 
 After selection: model = `model_for(p, tier)`, effort = `effort_for(final_p, difficulty)` (final provider's table wins).
 
-`primary_runner_match` (legacy byIdPrefix/byTaskType) survives only in the `recovery.rs` RuntimeError-promotion path, which is unreachable in production since the hard break rejects `primaryRunner` config at preflight (migrate-or-delete tracked as REFACTOR-006).
+`primary_runner_match` and the RuntimeError cross-provider promotion arms were DELETED (REFACTOR-006, resolved migrate-vs-delete as delete): preflight hard-rejects `primaryRunner`/`fallbackRunner`, so those paths could never fire in production. A RuntimeError-crashing Claude task climbs the same-provider tier ladder then auto-blocks; cross-provider rescue exists only on the overflow rung-4 `providers.<source>.fallback` pivot.
 
 ## Blackout Channel (separate from promotions)
 

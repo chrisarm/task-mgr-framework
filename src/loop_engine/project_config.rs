@@ -3,7 +3,6 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::error::{TaskMgrError, TaskMgrResult};
-use crate::loop_engine::config_io::{OnCorruptJson, write_config_key_at};
 use crate::loop_engine::model::{
     CODEX_EFFORT_FOR_DIFFICULTY, CapabilityTier, EFFORT_FOR_DIFFICULTY, FABLE_MODEL, HAIKU_MODEL,
     OPUS_MODEL, Provider, ResolvedModelsConfig, SONNET_MODEL, parse_config_provider,
@@ -951,9 +950,9 @@ pub fn read_project_config(db_dir: &Path) -> ProjectConfig {
             legacy.join(", ")
         ));
     }
-    // Deserialize the non-model surfaces. The legacy fields still parse (they
-    // remain on the struct until REFACTOR-005) but never feed resolution; the
-    // `models`/`routing` fields are `#[serde(skip)]` and set below.
+    // Deserialize the non-model surfaces. Legacy model keys are ignored by
+    // serde (REFACTOR-006 removed their struct fields); the `models`/`routing`
+    // fields are `#[serde(skip)]` and set below.
     let mut cfg: ProjectConfig = match serde_json::from_value(value.clone()) {
         Ok(cfg) => cfg,
         Err(e) => {
@@ -976,23 +975,6 @@ pub fn read_project_config(db_dir: &Path) -> ProjectConfig {
         None => RoutingConfig::default(),
     };
     cfg
-}
-
-/// Set (or clear) the `reviewModel` field in `<db_dir>/config.json` without
-/// clobbering other fields.
-///
-/// Pass `Some(model)` to set, `None` to remove the key.
-/// Creates the file if absent (`{"version":1}` + the target key).
-/// Returns `Err` if the existing file contains malformed JSON (path named in message).
-pub fn write_review_model(db_dir: &Path, model: Option<&str>) -> std::io::Result<()> {
-    let path = db_dir.join("config.json");
-    write_config_key_at(
-        &path,
-        "reviewModel",
-        model.map(|m| serde_json::Value::String(m.to_string())),
-        serde_json::json!({ "version": 1 }),
-        OnCorruptJson::ReturnError,
-    )
 }
 
 #[cfg(test)]
@@ -1583,95 +1565,6 @@ mod tests {
              `pub provider_hint: Option<model::Provider>`",
         );
     }
-
-    // ---- write_review_model tests ----
-
-    #[test]
-    fn test_write_review_model_sets_key() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(
-            dir.path().join("config.json"),
-            r#"{"version":1,"additionalAllowedTools":["Bash(docker:*)"]}"#,
-        )
-        .unwrap();
-        write_review_model(dir.path(), Some("grok-build")).unwrap();
-        let raw = fs::read_to_string(dir.path().join("config.json")).unwrap();
-        assert!(raw.contains("\"reviewModel\""), "key should be set");
-        assert!(raw.contains("grok-build"), "value should be present");
-        // load-bearing: unrelated key must survive
-        assert!(
-            raw.contains("additionalAllowedTools"),
-            "additionalAllowedTools lost"
-        );
-        assert!(
-            raw.contains("Bash(docker:*)"),
-            "additionalAllowedTools value lost"
-        );
-    }
-
-    #[test]
-    fn test_write_review_model_removes_key_when_none() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(
-            dir.path().join("config.json"),
-            r#"{"version":1,"reviewModel":"grok-build"}"#,
-        )
-        .unwrap();
-        write_review_model(dir.path(), None).unwrap();
-        let raw = fs::read_to_string(dir.path().join("config.json")).unwrap();
-        assert!(!raw.contains("reviewModel"), "key should be removed: {raw}");
-    }
-
-    #[test]
-    fn test_write_review_model_none_on_absent_key_is_noop() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("config.json"), r#"{"version":1}"#).unwrap();
-        write_review_model(dir.path(), None).unwrap();
-        let raw = fs::read_to_string(dir.path().join("config.json")).unwrap();
-        assert!(
-            !raw.contains("reviewModel"),
-            "key should stay absent: {raw}"
-        );
-    }
-
-    #[test]
-    fn test_write_review_model_preserves_all_unrelated_keys() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(
-            dir.path().join("config.json"),
-            r#"{"version":1,"additionalAllowedTools":["Bash(docker:*)"],"embeddingModel":"x","ollamaUrl":"http://x","rerankerModel":"m"}"#,
-        )
-        .unwrap();
-        write_review_model(dir.path(), Some("grok-build")).unwrap();
-        let raw = fs::read_to_string(dir.path().join("config.json")).unwrap();
-        assert!(
-            raw.contains("additionalAllowedTools"),
-            "additionalAllowedTools lost"
-        );
-        assert!(
-            raw.contains("Bash(docker:*)"),
-            "additionalAllowedTools value lost"
-        );
-        assert!(raw.contains("embeddingModel"), "embeddingModel lost");
-        assert!(raw.contains("ollamaUrl"), "ollamaUrl lost");
-        assert!(raw.contains("rerankerModel"), "rerankerModel lost");
-        assert!(raw.contains("grok-build"), "reviewModel not set");
-    }
-
-    #[test]
-    fn test_write_review_model_malformed_json_returns_err() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("config.json"), "not json at all").unwrap();
-        let result = write_review_model(dir.path(), Some("grok-build"));
-        assert!(result.is_err(), "malformed JSON must return Err");
-        let msg = format!("{}", result.unwrap_err());
-        assert!(
-            msg.contains("config.json"),
-            "error must name the file: {msg}"
-        );
-    }
-
-    // ---- write_fallback_runner tests ----
 
     // ============ models/routing config (FR-001) ============
 

@@ -346,10 +346,10 @@ UPDATE AND the override-map inserts MUST run together — otherwise
 model resolution on the next iteration silently shadows the override.
 
 Rungs 1–4 reset the task status to `todo` (and clear `started_at`) so the next
-iteration retries with the override applied; rung 5 sets `blocked`. Behavior
-is byte-identical to the pre-Grok 4-rung ladder when `fallbackRunner` is
-absent or `enabled: false` — rung 4 is unreachable from the Claude direction
-in that configuration, and the path collapses to rungs 1–3 → blocked.
+iteration retries with the override applied; rung 5 sets `blocked`. With no
+`providers.<source>.fallback` configured, rung 4 is unreachable and the path
+collapses to rungs 1–3 → blocked — byte-identical to the historical
+pure-Claude 4-rung ladder.
 
 **Operator escape valve — `check_override_invalidation`**: at the top of
 every iteration (before `resolve_effective_runner`),
@@ -449,7 +449,7 @@ live pivot and stay untouched.
 
 **Binary-resolution env var "" must fall through, and existence ≠
 executable** (`runner.rs::resolve_grok_binary`
-+ `project_config.rs::check_fallback_runner_binary`): both the runtime
++ `project_config.rs::probe_provider_binary`): both the runtime
 resolver and the startup probe MUST treat an empty/whitespace
 `GROK_BINARY` (or `CLAUDE_BINARY`) value as "unset" — `export VAR=""` is
 a common shell footgun and a divergence between resolver and probe
@@ -931,8 +931,10 @@ merged Codex path layers four load-bearing defenses on top of the V2 base:
 
 ### Selection — explicit provider intent only
 
-Codex is reachable EXCLUSIVELY through `primaryRunner` entries with
-`provider: "codex"` (the `model` field may be empty). `provider_for_model`
+Codex is reachable EXCLUSIVELY through `routing` entries (`byIdPrefix` /
+`taskClasses`) with `provider: "codex"` plus an enabled
+`models.providers.codex` block (its tier may map to `null` — no `-m` flag).
+`provider_for_model`
 classifies model strings into `Provider::Claude` or `Provider::Grok` and NEVER
 returns `Provider::Codex`; no `gpt-*` / `o*` / `codex-mini` / "openai"
 substring is ever interpreted as Codex intent. The strict parser
@@ -1029,18 +1031,20 @@ contributes nothing to the snapshot) so a hostile chmod cannot mask a
 mutation by hiding the directory — restoration just won't touch what it
 couldn't see.
 
-### Binary probe — route-gated, BOTH entry points
+### Binary probe — enabled-gated, BOTH entry points
 
 `preflight_validate_and_probe` runs from `main.rs::loop run` AND
 `batch.rs::run_batch` before any PRD work. It composes
-`validate_runner_routing_config` (strict provider parse, model presence,
-fallback-runner shape) with `check_codex_runner_binary` (PATH lookup of
-`CODEX_BINARY` / bare `codex`, executable-bit check on Unix). The probe is
-ROUTE-GATED: a pure-Claude config (no Codex route anywhere in
-`primaryRunner`) returns Ok before the env var or PATH is touched, so
-operators without `codex` installed never see a probe failure. Batch failure
-of preflight short-circuits the entire batch with `succeeded:0, failed:1,
-results:[]` — identical to the existing `collect_prd_files` Err shape.
+`reject_legacy_model_config` (FR-001 hard break), the deprecated user-config
+`defaultModel` warning, `validate_models_config` (strict provider parse, tier
+keys, fallback shape), and `probe_enabled_provider_binaries` (PATH lookup of
+each enabled provider's `cliBinary` override or default binary name,
+executable-bit check on Unix). The probe is ENABLED-GATED: only enabled
+providers are probed, so a claude-only config never touches the `codex` /
+`grok` env vars or PATH and operators without those CLIs never see a probe
+failure. Batch failure of preflight short-circuits the entire batch with
+`succeeded:0, failed:1, results:[]` — identical to the existing
+`collect_prd_files` Err shape.
 
 ### Prohibited outcomes (compile-time + test-time)
 
@@ -1054,7 +1058,7 @@ results:[]` — identical to the existing `collect_prd_files` Err shape.
   corruption; never overwrite)
 - Inferring Codex from a model string (`gpt-*` / `o*` / `codex-mini` etc.)
 - Stamping a per-task `model` on `REVIEW-` / `REFACTOR-` / fixup tasks —
-  routing is config-owned via `primaryRunner.byIdPrefix`
+  routing is config-owned via `routing.byIdPrefix`
 
 ## Status mutations — use TaskLifecycle
 
