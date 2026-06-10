@@ -139,7 +139,6 @@ fn resolve_via_builder(
         permission_mode: PermissionMode::Dangerous,
         steering_path: None,
         session_guidance: "",
-        prd_default: None,
         models_config: models,
         routing_config: routing,
         provider_blackouts: blackouts,

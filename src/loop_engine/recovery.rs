@@ -246,6 +246,34 @@ pub(crate) fn escalate_task_model_if_needed_inner(
     Ok((escalated, None))
 }
 
+/// Absorb a consecutive-failure escalation's `tasks.model` write into the
+/// overflow snapshot so the escape valve (`pre_spawn::invalidate_stale_overrides`)
+/// does not mistake the ladder's own write for an out-of-band operator edit.
+///
+/// The escape valve fires its six-channel clear when `tasks.model` diverges from
+/// the snapshot in `ctx.overflow_original_task_model`. Crash escalation records
+/// its new model in `ctx.model_overrides`, so the valve's NULL-original absorb
+/// branch recognizes it; consecutive-failure escalation, however, writes
+/// `tasks.model` WITHOUT touching `model_overrides`, so without this refresh the
+/// valve would treat the ladder's own write as an operator edit and wipe the
+/// recovery (including the effort downgrade) it just set up.
+///
+/// `and_modify` (never `insert`/`or_insert_with`): only an EXISTING snapshot is
+/// refreshed. A task that never overflowed has no snapshot and must NOT gain one
+/// here — otherwise the valve would start tracking a task it should ignore.
+/// No-op when `escalated` is `None` (escalation did not fire).
+fn absorb_escalation_into_overflow_snapshot(
+    ctx: &mut IterationContext,
+    task_id: &str,
+    escalated: Option<&str>,
+) {
+    if let Some(model) = escalated {
+        ctx.overflow_original_task_model
+            .entry(task_id.to_string())
+            .and_modify(|snapshot| *snapshot = Some(model.to_string()));
+    }
+}
+
 /// Escalate the model for a task in the DB when consecutive failures reach the threshold.
 ///
 /// Follows the same sonnet-baseline pattern as `check_crash_escalation`:
@@ -301,6 +329,11 @@ pub fn escalate_task_model_if_needed(
     if let Some(p) = pending {
         apply_pending_promotion(ctx, &p);
     }
+    // Refresh any existing overflow snapshot so the escape valve does not
+    // misread this consecutive-failure escalation as an operator edit. Keyed on
+    // the returned model (post-REFACTOR-006 `pending` is always `None`, so this
+    // must sit OUTSIDE the promotion branch).
+    absorb_escalation_into_overflow_snapshot(ctx, task_id, model.as_deref());
     Ok(model)
 }
 
@@ -329,6 +362,9 @@ pub fn escalate_task_model_if_needed_for_runner(
     if let Some(p) = pending {
         apply_pending_promotion(ctx, &p);
     }
+    // Refresh any existing overflow snapshot (see the convenience variant above
+    // and `absorb_escalation_into_overflow_snapshot`'s rustdoc for why).
+    absorb_escalation_into_overflow_snapshot(ctx, task_id, model.as_deref());
     Ok(model)
 }
 
@@ -450,7 +486,7 @@ pub fn handle_task_failure_with_runner(
     // is acceptable degradation — a crash between commit and auto-block
     // simply means the bumped `consecutive_failures` re-triggers auto-block
     // on the next iteration via the same `should_auto_block` check.
-    let (new_count, max_retries, pending_promotion) = {
+    let (new_count, max_retries, pending_promotion, escalated_model) = {
         let tx = conn.transaction()?;
 
         let new_count = increment_consecutive_failures(&tx, task_id).map_err(|e| {
@@ -479,6 +515,10 @@ pub fn handle_task_failure_with_runner(
         // Only escalate if auto-block won't immediately follow — the escalated
         // model would never be used.
         let mut pending_promotion: Option<PendingPromotion> = None;
+        // Carry the escalated model out of the tx scope so the post-commit ctx
+        // mutation can absorb it into the overflow snapshot (escape-valve
+        // misfire fix). `None` when escalation did not fire or auto-block won.
+        let mut escalated_model: Option<String> = None;
         if !should_auto_block(new_count, max_retries) {
             match escalate_task_model_if_needed_inner(
                 &tx,
@@ -487,7 +527,8 @@ pub fn handle_task_failure_with_runner(
                 runner,
                 &ctx.resolved_models,
             ) {
-                Ok((_model, promotion)) => {
+                Ok((model, promotion)) => {
+                    escalated_model = model;
                     pending_promotion = promotion;
                 }
                 Err(e) => {
@@ -497,13 +538,18 @@ pub fn handle_task_failure_with_runner(
         }
 
         tx.commit()?;
-        (new_count, max_retries, pending_promotion)
+        (new_count, max_retries, pending_promotion, escalated_model)
     };
 
     // Commit succeeded — safe to mutate ctx.
     if let Some(p) = pending_promotion {
         apply_pending_promotion(ctx, &p);
     }
+    // Refresh any existing overflow snapshot so the escape valve does not misread
+    // this consecutive-failure escalation as an operator edit (see
+    // `absorb_escalation_into_overflow_snapshot`). Post-commit, mirroring the
+    // deferred-promotion apply: a rolled-back DB never leaves a dirty ctx.
+    absorb_escalation_into_overflow_snapshot(ctx, task_id, escalated_model.as_deref());
 
     // Phase 2: auto-block (outside the transaction; routed through the
     // lifecycle service via auto_block_task).
@@ -664,6 +710,7 @@ mod tests {
 
     use super::*;
     use crate::loop_engine::model::{FABLE_MODEL, HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL};
+    use crate::loop_engine::project_config::ProjectConfig;
     use crate::loop_engine::reactions::pre_spawn::crash_escalated_model;
     use crate::loop_engine::test_utils::setup_test_db;
 
@@ -1470,6 +1517,201 @@ mod tests {
             model,
             Some(FABLE_MODEL.to_string()),
             "fable model in DB must remain fable"
+        );
+    }
+
+    // --- escape-valve interaction: consecutive-failure escalation must not
+    //     self-trip `invalidate_stale_overrides` (Medium-1 /review-loop fix) ---
+
+    /// Minimal `PromptResult` for driving `handle_overflow` in these tests.
+    fn overflow_prompt_result(task_id: &str) -> crate::loop_engine::prompt::PromptResult {
+        crate::loop_engine::prompt::PromptResult {
+            prompt: "TASK\n\nBASE\n".to_string(),
+            task_id: task_id.to_string(),
+            task_files: Vec::new(),
+            shown_learning_ids: Vec::new(),
+            resolved_model: None,
+            provider_hint: None,
+            dropped_sections: Vec::new(),
+            task_difficulty: Some("high".to_string()),
+            cluster_effort: None,
+            section_sizes: vec![("task", 5), ("base_prompt", 5)],
+        }
+    }
+
+    /// Drive a RUNG-1 (effort downgrade) overflow on a NULL-model task. Rung 1
+    /// sets `effort_overrides` and snapshots the NULL `tasks.model` into
+    /// `overflow_original_task_model` (= `Some(None)`) but does NOT write
+    /// `model_overrides` or `tasks.model` — the exact precondition for the
+    /// escape-valve misfire. Then a consecutive-failure escalation writes
+    /// `tasks.model` (sonnet-baseline → opus) WITHOUT touching `model_overrides`.
+    /// The fix refreshes the snapshot so a follow-up `invalidate_stale_overrides`
+    /// recognizes the ladder's own write and leaves the recovery intact.
+    #[test]
+    fn consecutive_failure_escalation_after_rung1_overflow_does_not_clear_channels() {
+        use crate::loop_engine::reactions::post_output::{HandleOverflowParams, handle_overflow};
+        use crate::loop_engine::reactions::pre_spawn::invalidate_stale_overrides;
+        use tempfile::TempDir;
+
+        let task_id = "T-001";
+        let (_dir, mut conn) = setup_test_db();
+        // NULL model (anchor-resolved): model column defaults to NULL.
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, consecutive_failures) \
+             VALUES ('T-001', 'Test', 'in_progress', 0)",
+            [],
+        )
+        .unwrap();
+
+        let mut ctx = IterationContext::new(8);
+        let pr = overflow_prompt_result(task_id);
+        let project_cfg = ProjectConfig::default();
+        let tmp = TempDir::new().unwrap();
+
+        // Rung 1: `xhigh` is downgradeable, so the ladder takes the effort branch.
+        let action = handle_overflow(HandleOverflowParams {
+            ctx: &mut ctx,
+            conn: &mut conn,
+            task_id,
+            effort: Some("xhigh"),
+            effective_model: None,
+            prompt_result: &pr,
+            iteration: 1,
+            run_id: Some("run-rung1"),
+            base_dir: tmp.path(),
+            slot_index: None,
+            effective_runner: RunnerKind::Claude,
+            project_config: &project_cfg,
+        });
+        assert!(
+            matches!(action, crate::loop_engine::overflow::RecoveryAction::DowngradeEffort { .. }),
+            "xhigh effort must take the rung-1 downgrade branch, got {action:?}",
+        );
+        // Precondition state: effort override set, snapshot is Some(None), and
+        // crucially model_overrides is EMPTY (the misfire trigger).
+        assert!(
+            ctx.effort_overrides.contains_key(task_id),
+            "rung 1 must record the effort downgrade",
+        );
+        assert_eq!(
+            ctx.overflow_original_task_model.get(task_id),
+            Some(&None),
+            "rung 1 snapshots the NULL tasks.model as Some(None)",
+        );
+        assert!(
+            !ctx.model_overrides.contains_key(task_id),
+            "rung 1 does NOT write model_overrides — this is what makes the \
+             escape valve's NULL-original absorb branch fail without the fix",
+        );
+
+        // Consecutive-failure escalation: NULL baseline → opus, writes tasks.model.
+        let escalated = escalate_task_model_if_needed(&conn, task_id, 2, &mut ctx).unwrap();
+        assert_eq!(
+            escalated,
+            Some(OPUS_MODEL.to_string()),
+            "NULL-baseline task at 2 failures escalates to opus",
+        );
+        // The fix refreshed the snapshot to the escalated model.
+        assert_eq!(
+            ctx.overflow_original_task_model.get(task_id),
+            Some(&Some(OPUS_MODEL.to_string())),
+            "the escalation's tasks.model write must be absorbed into the snapshot",
+        );
+
+        // The escape valve must now treat the escalation as the ladder's own
+        // write (snapshot == current) and NOT clear the recovery channels.
+        invalidate_stale_overrides(&mut ctx, &conn, task_id);
+        assert!(
+            ctx.effort_overrides.contains_key(task_id),
+            "the effort downgrade must SURVIVE — the escape valve must not \
+             self-trip on the consecutive-failure escalation's own write",
+        );
+        assert!(
+            ctx.overflow_recovered.contains(task_id),
+            "overflow_recovered must survive the no-op invalidate pass",
+        );
+        assert!(
+            ctx.overflow_original_task_model.contains_key(task_id),
+            "the snapshot must survive (no six-channel clear fired)",
+        );
+    }
+
+    /// `and_modify` discipline: a task that never overflowed has no snapshot, and
+    /// a consecutive-failure escalation must NOT create one — otherwise the
+    /// escape valve would start tracking a task it should ignore.
+    #[test]
+    fn escalation_without_prior_overflow_creates_no_snapshot() {
+        let (_dir, conn) = setup_test_db();
+        conn.execute(
+            &format!(
+                "INSERT INTO tasks (id, title, status, model, consecutive_failures) \
+                 VALUES ('T-001', 'Test', 'in_progress', '{SONNET_MODEL}', 0)"
+            ),
+            [],
+        )
+        .unwrap();
+
+        let mut ctx = IterationContext::new(8);
+        let escalated = escalate_task_model_if_needed(&conn, "T-001", 2, &mut ctx).unwrap();
+        assert_eq!(escalated, Some(OPUS_MODEL.to_string()));
+        assert!(
+            !ctx.overflow_original_task_model.contains_key("T-001"),
+            "a never-overflowed task must not gain an overflow snapshot from escalation",
+        );
+    }
+
+    /// A genuine out-of-band operator edit AFTER a consecutive-failure escalation
+    /// must still fire the six-channel clear — the fix narrows the absorb to the
+    /// ladder's own write, it does not disable the escape valve.
+    #[test]
+    fn operator_edit_after_consecutive_failure_escalation_still_clears() {
+        use crate::loop_engine::reactions::post_output::{HandleOverflowParams, handle_overflow};
+        use crate::loop_engine::reactions::pre_spawn::invalidate_stale_overrides;
+        use tempfile::TempDir;
+
+        let task_id = "T-001";
+        let (_dir, mut conn) = setup_test_db();
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, consecutive_failures) \
+             VALUES ('T-001', 'Test', 'in_progress', 0)",
+            [],
+        )
+        .unwrap();
+
+        let mut ctx = IterationContext::new(8);
+        let pr = overflow_prompt_result(task_id);
+        let project_cfg = ProjectConfig::default();
+        let tmp = TempDir::new().unwrap();
+        handle_overflow(HandleOverflowParams {
+            ctx: &mut ctx,
+            conn: &mut conn,
+            task_id,
+            effort: Some("xhigh"),
+            effective_model: None,
+            prompt_result: &pr,
+            iteration: 1,
+            run_id: Some("run-rung1"),
+            base_dir: tmp.path(),
+            slot_index: None,
+            effective_runner: RunnerKind::Claude,
+            project_config: &project_cfg,
+        });
+        escalate_task_model_if_needed(&conn, task_id, 2, &mut ctx).unwrap();
+
+        // Operator edits tasks.model to a DIFFERENT model out-of-band.
+        conn.execute(
+            &format!("UPDATE tasks SET model = '{HAIKU_MODEL}' WHERE id = 'T-001'"),
+            [],
+        )
+        .unwrap();
+        invalidate_stale_overrides(&mut ctx, &conn, task_id);
+        assert!(
+            !ctx.effort_overrides.contains_key(task_id),
+            "a genuine operator edit after escalation must still fire the clear",
+        );
+        assert!(
+            !ctx.overflow_original_task_model.contains_key(task_id),
+            "the six-channel clear must remove the snapshot on a real operator edit",
         );
     }
 

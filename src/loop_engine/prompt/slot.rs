@@ -197,11 +197,6 @@ pub struct SlotPromptParams<'a> {
     /// Operator pause feedback rendered as a `## Session Guidance` block.
     /// Empty string omits the section entirely (no header).
     pub session_guidance: &'a str,
-    /// Engine-cached PRD default model (`prd_metadata.default_model`). Threaded
-    /// from `WaveIterationParams::default_model` into the slot's execution
-    /// plan so the wave baseline tier equals the sequential baseline tier for
-    /// the same task+config (WIRE-FIX-001).
-    pub prd_default: Option<&'a str>,
     /// Provider-first `models` config block (FR-001). Resolved per build and
     /// fed to [`crate::loop_engine::model::resolve_execution_plan`]. Threaded
     /// from `ProjectConfig::models`.

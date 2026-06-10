@@ -687,8 +687,11 @@ pub struct SlotIterationParams {
     pub permission_mode: PermissionMode,
     /// Shared signal flag (Arc-backed) for SIGINT/SIGTERM coordination.
     pub signal_flag: SignalFlag,
-    /// Default model from PRD metadata (falls through when the task has no
-    /// explicit model and no higher-tier escalation is active).
+    /// PRD-metadata default model. INERT under the models config (hard break):
+    /// no longer consulted by the slot worker or the wave pre-spawn block — a
+    /// None `resolved_model` means "spawn with no model flag", not "widen to the
+    /// PRD default". Retained on the params chain pending the full
+    /// `default_model` removal REFACTOR; populating it has no routing effect.
     pub default_model: Option<String>,
     /// Verbose logging toggle.
     pub verbose: bool,

@@ -130,14 +130,16 @@ pub fn run_slot_iteration(
         ));
     }
 
-    // Effective model: bundle-resolved (per-task) > params.default_model.
-    // Cluster-wide escalation (sequential path) is intentionally not applied
-    // in parallel; the wave engine targets tasks already scored as disjoint,
-    // not clusters.
-    let effective_model: Option<String> = bundle
-        .resolved_model
-        .clone()
-        .or_else(|| params.default_model.clone());
+    // Effective model: the bundle's `resolved_model` verbatim (already carries
+    // any main-thread crash escalation). `prd_metadata.default_model` is NOT
+    // consulted — it is ignored under the models config (hard break), matching
+    // the sequential path and the wave pre-spawn block. A None resolved_model
+    // means "spawn with no model flag" (provider-only Codex spec); widening it
+    // to a Claude PRD default here would mis-emit `-m <claude-id>` to the Codex
+    // CLI and diverge from the sequential baseline. Cluster-wide escalation
+    // (sequential path) is intentionally not applied in parallel; the wave
+    // engine targets tasks already scored as disjoint, not clusters.
+    let effective_model: Option<String> = bundle.resolved_model.clone();
 
     // FEAT-002 / WIRE-FIX-001: prefer the prior-overflow effort override resolved
     // on the main thread (`reactions::pre_spawn::resolve_task_execution` →
@@ -754,7 +756,6 @@ mod tests {
             permission_mode: PermissionMode::Dangerous,
             steering_path: None,
             session_guidance: "",
-            prd_default: None,
             models_config: crate::loop_engine::project_config::default_models_config(),
             routing_config: crate::loop_engine::project_config::default_routing_config(),
             provider_blackouts: Default::default(),

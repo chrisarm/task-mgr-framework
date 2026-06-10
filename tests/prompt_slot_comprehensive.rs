@@ -72,7 +72,6 @@ fn make_params(project_root: PathBuf, base_prompt_path: PathBuf) -> SlotPromptPa
         permission_mode: PermissionMode::Dangerous,
         steering_path: None,
         session_guidance: "",
-        prd_default: None,
         models_config: task_mgr::loop_engine::project_config::default_models_config(),
         routing_config: task_mgr::loop_engine::project_config::default_routing_config(),
         provider_blackouts: Default::default(),

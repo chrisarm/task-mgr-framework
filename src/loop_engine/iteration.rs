@@ -220,15 +220,16 @@ pub fn run_iteration(
         .provider_blackouts
         .active(crate::loop_engine::engine::now_unix_secs());
     let excluded_ids = {
-        let resolved_models = crate::loop_engine::model::resolve_models_config(
-            &params.project_config.models,
-            &params.project_config.routing,
-        );
+        // Reuse the once-per-run resolution threaded onto the context
+        // (orchestrator.rs) rather than reconstructing it from
+        // `params.project_config`; the two are identical projections of the
+        // same already-validated input, and sharing one source prevents drift.
+        let resolved_models = &ctx.resolved_models;
         reactions::pre_spawn::compute_quota_excluded_ids(
             ctx,
             params.conn,
             params.task_prefix,
-            &resolved_models,
+            resolved_models,
             &active_blackouts,
         )
     };
@@ -776,13 +777,10 @@ pub fn run_iteration(
                 outcome: &outcome,
                 output: &claude_output,
             }];
-            // FEAT-008: resolve the provider-first config once so the reaction
-            // records a quota blackout (spillover path) instead of waiting when
-            // difficulty-spillover is enabled. `resolve_models_config` is pure.
-            let resolved_models = crate::loop_engine::model::resolve_models_config(
-                &params.project_config.models,
-                &params.project_config.routing,
-            );
+            // FEAT-008: the reaction records a quota blackout (spillover path)
+            // instead of waiting when difficulty-spillover is enabled. Reuse the
+            // once-per-run resolution on the context rather than rebuilding it.
+            let resolved_models = &ctx.resolved_models;
             let account_params = reactions::account::AccountReactionParams {
                 threshold: params.usage_params.threshold,
                 usage_enabled: params.usage_params.enabled,

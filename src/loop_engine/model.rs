@@ -334,8 +334,9 @@ fn normalize_route_prefix(prefix: &str) -> String {
 
 /// Dash-boundary prefix match against a task ID body (after the 8-hex project
 /// prefix is stripped): the prefix must match a contiguous run of dash-delimited
-/// segments at the start, so `"REVIEW-"` matches `REVIEW-001` but not
-/// `REVIEWER-001`. Kept local to `model` (rather than reusing
+/// segments anywhere in the body (not anchored to the start), so `"REVIEW-"`
+/// matches both `REVIEW-001` and `CODE-REVIEW-001` but not `REVIEWER-001`.
+/// Kept local to `model` (rather than reusing
 /// `commands::next::selection::id_body_matches_prefix`) to avoid a
 /// `loop_engine` → `commands` layer dependency.
 fn id_body_matches_prefix(body: &str, prefix: &str) -> bool {

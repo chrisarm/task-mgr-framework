@@ -291,7 +291,6 @@ fn build_slot_prompt_params<'a>(
         permission_mode: params.permission_mode.clone(),
         steering_path: params.steering_path,
         session_guidance: params.session_guidance,
-        prd_default: params.default_model,
         models_config: &params.project_config.models,
         routing_config: &params.project_config.routing,
         // FEAT-008: the active quota blackouts, so each slot's spawn-time plan
@@ -712,15 +711,15 @@ pub fn run_wave_iteration(
         .provider_blackouts
         .active(crate::loop_engine::engine::now_unix_secs());
     let excluded_ids = {
-        let resolved_models = crate::loop_engine::model::resolve_models_config(
-            &params.project_config.models,
-            &params.project_config.routing,
-        );
+        // Reuse the once-per-run resolution on the context (orchestrator.rs)
+        // rather than reconstructing it from `params.project_config`; identical
+        // projections of the same validated input, one source prevents drift.
+        let resolved_models = &ctx.resolved_models;
         reactions::pre_spawn::compute_quota_excluded_ids(
             ctx,
             params.conn,
             params.task_prefix,
-            &resolved_models,
+            resolved_models,
             &active_blackouts,
         )
     };
@@ -776,14 +775,14 @@ pub fn run_wave_iteration(
     for slot in slot_contexts.iter_mut() {
         let task_id = slot.prompt_bundle.task_id.clone();
         // Baseline model the worker would otherwise spawn with
-        // (`bundle.resolved_model → params.default_model`), captured BEFORE the
-        // coordinator so the crash-escalation + runner resolution see the same
-        // string `run_slot_iteration` resolves internally.
-        let baseline: Option<String> = slot
-            .prompt_bundle
-            .resolved_model
-            .clone()
-            .or_else(|| params.default_model.map(str::to_string));
+        // (`bundle.resolved_model`), captured BEFORE the coordinator so the
+        // crash-escalation + runner resolution see the same string
+        // `run_slot_iteration` resolves internally. `prd_metadata.default_model`
+        // is intentionally NOT consulted here: it is ignored under the models
+        // config (hard break), matching the sequential path and the startup
+        // warning — a None resolved_model means "spawn with no model flag"
+        // (provider-only Codex spec), not "widen to the PRD default".
+        let baseline: Option<String> = slot.prompt_bundle.resolved_model.clone();
 
         let plan = reactions::pre_spawn::resolve_task_execution(
             reactions::pre_spawn::ResolveTaskExecutionParams {
@@ -830,29 +829,28 @@ pub fn run_wave_iteration(
         // discriminant — identical in shape to the sequential path's single
         // `resolve_effective_runner` at the end of its pre-spawn block.
         //
-        // `effective_model` widens to `default_model` when `resolved_model`
-        // is None (provider-only Codex spec: {provider:"codex",model:""}
-        // normalises to resolved_model=None). The hint MUST NOT be dropped
-        // based on this widening — crash escalation (line 1124) and review
-        // routing (line 1157) already clear `slot.prompt_bundle.provider_hint`
-        // when a rewrite fires. Any remaining hint is intentional provider
-        // intent that must survive to the spawn boundary (WIRE-FIX-001).
-        let effective_model = slot
-            .prompt_bundle
-            .resolved_model
-            .as_deref()
-            .or(params.default_model);
+        // `effective_model` is the bundle's `resolved_model` verbatim:
+        // `prd_metadata.default_model` is ignored under the models config (hard
+        // break), so there is NO widening to a PRD default — matching the
+        // sequential path (parity). A provider-only Codex spec
+        // ({provider:"codex",model:""}) still normalises to resolved_model=None;
+        // the provider_hint carries that intent and survives below because
+        // `effective_model == resolved_model` keeps `final_provider_hint` on its
+        // hint-preserving branch (the None→default widening branch is now inert).
+        let effective_model = slot.prompt_bundle.resolved_model.as_deref();
         // Shared with the sequential path via `model::final_provider_hint`
-        // (REFACTOR-009): preserve the hint on the None→default widening
-        // (provider-only Codex spec), drop it only on a genuine rewrite.
-        // Crash escalation (line ~808) and review routing already cleared the
-        // hint at their rewrite sites, so the helper sees `None` there and is a
-        // no-op; any remaining hint is intentional provider intent.
+        // (REFACTOR-009): drop the hint only on a genuine rewrite. Crash
+        // escalation (line ~808) and review routing already cleared the hint at
+        // their rewrite sites, so the helper sees `None` there and is a no-op;
+        // any remaining hint is intentional provider intent. With no default
+        // widening, `effective_model == resolved_model` so the helper always
+        // returns the bundle hint here — `None` for `default_model` documents
+        // that the widening path is dead on the wave side.
         let provider_hint = model::final_provider_hint(
             slot.prompt_bundle.provider_hint,
             effective_model,
             slot.prompt_bundle.resolved_model.as_deref(),
-            params.default_model,
+            None,
         );
         slot.effective_runner = resolve_effective_runner(
             ctx,
@@ -978,13 +976,10 @@ pub fn run_wave_iteration(
                 output: &s.iteration_result.output,
             })
             .collect();
-        // FEAT-008: resolve the provider-first config once so the reaction can
-        // record a quota blackout (spillover path) instead of waiting when
-        // difficulty-spillover is enabled. `resolve_models_config` is pure.
-        let resolved_models = crate::loop_engine::model::resolve_models_config(
-            &params.project_config.models,
-            &params.project_config.routing,
-        );
+        // FEAT-008: the reaction records a quota blackout (spillover path)
+        // instead of waiting when difficulty-spillover is enabled. Reuse the
+        // once-per-run resolution on the context rather than rebuilding it.
+        let resolved_models = &ctx.resolved_models;
         let now_secs = crate::loop_engine::engine::now_unix_secs();
         let account_params = reactions::account::AccountReactionParams {
             threshold: params.usage_params.threshold,
@@ -2201,7 +2196,6 @@ mod tests {
             permission_mode: PermissionMode::Dangerous,
             steering_path: None,
             session_guidance: "",
-            prd_default: None,
             models_config: crate::loop_engine::project_config::default_models_config(),
             routing_config: crate::loop_engine::project_config::default_routing_config(),
             provider_blackouts: Default::default(),

@@ -27,7 +27,7 @@ use task_mgr::db::migrations::run_migrations;
 use task_mgr::db::{create_schema, open_connection};
 use task_mgr::learnings::crud::{RecordLearningParams, record_learning};
 use task_mgr::loop_engine::config::PermissionMode;
-use task_mgr::loop_engine::model::{OPUS_MODEL, SONNET_MODEL};
+use task_mgr::loop_engine::model::OPUS_MODEL;
 use task_mgr::loop_engine::prompt::slot::{
     CRITICAL_OVERFLOW_SENTINEL, SlotPromptBundle, SlotPromptParams, build_prompt,
 };
@@ -81,7 +81,6 @@ fn make_params(project_root: PathBuf, base_prompt_path: PathBuf) -> SlotPromptPa
         permission_mode: PermissionMode::Dangerous,
         steering_path: None,
         session_guidance: "",
-        prd_default: None,
         models_config: task_mgr::loop_engine::project_config::default_models_config(),
         routing_config: task_mgr::loop_engine::project_config::default_routing_config(),
         provider_blackouts: Default::default(),
@@ -386,7 +385,6 @@ fn build_prompt_renders_steering_and_session_guidance_when_set() {
         permission_mode: PermissionMode::Dangerous,
         steering_path: Some(steering_file.as_path()),
         session_guidance: "operator note: focus on edge cases",
-        prd_default: None,
         models_config: task_mgr::loop_engine::project_config::default_models_config(),
         routing_config: task_mgr::loop_engine::project_config::default_routing_config(),
         provider_blackouts: Default::default(),
@@ -587,7 +585,6 @@ fn build_prompt_oversize_drops_trimmable_sections_and_caps_total_budget() {
         permission_mode: PermissionMode::Dangerous,
         steering_path: None,
         session_guidance: "",
-        prd_default: None,
         models_config: task_mgr::loop_engine::project_config::default_models_config(),
         routing_config: task_mgr::loop_engine::project_config::default_routing_config(),
         provider_blackouts: Default::default(),
@@ -673,7 +670,6 @@ fn build_prompt_clears_shown_learning_ids_when_learnings_dropped() {
         permission_mode: PermissionMode::Dangerous,
         steering_path: None,
         session_guidance: "",
-        prd_default: None,
         models_config: task_mgr::loop_engine::project_config::default_models_config(),
         routing_config: task_mgr::loop_engine::project_config::default_routing_config(),
         provider_blackouts: Default::default(),
@@ -725,7 +721,6 @@ fn build_prompt_critical_only_oversize_returns_sentinel_bundle() {
         permission_mode: PermissionMode::Dangerous,
         steering_path: None,
         session_guidance: "",
-        prd_default: None,
         models_config: task_mgr::loop_engine::project_config::default_models_config(),
         routing_config: task_mgr::loop_engine::project_config::default_routing_config(),
         provider_blackouts: Default::default(),
@@ -778,9 +773,10 @@ fn wave_slot_resolves_via_anchor_window() {
     let base_prompt = project.path().join("prompt.md");
     fs::write(&base_prompt, "# base\n").unwrap();
 
-    // Medium-difficulty FEAT task. Even with a legacy primaryRunner config
-    // AND a threaded SONNET prd_default, the FR-003 spawn-side resolver consults
-    // neither — it uses the anchor window: medium → standard tier → OPUS.
+    // Medium-difficulty FEAT task. Even with a legacy primaryRunner config the
+    // FR-003 spawn-side resolver ignores it — it uses the anchor window: medium
+    // → standard tier → OPUS. (`prd_metadata.default_model` is no longer even
+    // threaded into `SlotPromptParams`; its inertness is now structural.)
     let mut task = Task::new("8d71d1f7-FEAT-001", "wave anchor-window resolution");
     task.difficulty = Some("medium".into());
 
@@ -790,7 +786,6 @@ fn wave_slot_resolves_via_anchor_window() {
         permission_mode: PermissionMode::Dangerous,
         steering_path: None,
         session_guidance: "",
-        prd_default: Some(SONNET_MODEL),
         models_config: task_mgr::loop_engine::project_config::default_models_config(),
         routing_config: task_mgr::loop_engine::project_config::default_routing_config(),
         provider_blackouts: Default::default(),
@@ -801,8 +796,8 @@ fn wave_slot_resolves_via_anchor_window() {
         bundle.resolved_model.as_deref(),
         Some(OPUS_MODEL),
         "the slot builder resolves via the FR-003 anchor window (medium→standard→OPUS); \
-         the legacy primaryRunner grok route and the SONNET prd_default are NOT \
-         consulted by the spawn-side resolver (FEAT-004)",
+         the legacy primaryRunner grok route is NOT consulted by the spawn-side \
+         resolver (FEAT-004)",
     );
     assert_eq!(
         bundle.provider_hint, None,
@@ -833,7 +828,6 @@ fn wave_slot_anchor_window_resolves_without_any_default() {
         permission_mode: PermissionMode::Dangerous,
         steering_path: None,
         session_guidance: "",
-        prd_default: None,
         models_config: task_mgr::loop_engine::project_config::default_models_config(),
         routing_config: task_mgr::loop_engine::project_config::default_routing_config(),
         provider_blackouts: Default::default(),
