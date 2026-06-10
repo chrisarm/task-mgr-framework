@@ -65,6 +65,14 @@ pub struct PromptContext<'a> {
     /// the model resolves to the Opus tier). Slot leaves this `None` — wave
     /// slots drop the escalation section entirely.
     pub resolved_model: Option<&'a str>,
+    /// The operator-resolved provider-first config. The escalation render
+    /// (`render_escalation_section`) resolves the Claude ceiling tier against
+    /// THIS config rather than the builtin defaults (REFACTOR-007), so an
+    /// operator who remapped the Claude frontier rung sees the policy omitted at
+    /// their ceiling. Both builders set it from the `resolve_models_config` they
+    /// already build for the spawn-side plan; the slot path carries it for
+    /// consistency even though the slot roster drops the escalation section.
+    pub resolved_models: &'a crate::loop_engine::model::ResolvedModelsConfig,
     /// Sequential-only: the selected task as a [`NextTaskOutput`], the source
     /// for the sequential task-envelope render (which formats it via
     /// `core::format_next_task_json` and truncates to `TASK_CONTEXT_BUDGET`).
@@ -361,6 +369,7 @@ mod tests {
                 reorder_hint: None,
                 batch_sibling_prds: None,
                 resolved_model: None,
+                resolved_models: crate::loop_engine::model::builtin_resolved_models(),
                 next_task_output: None,
                 recalled_learnings: None,
             }

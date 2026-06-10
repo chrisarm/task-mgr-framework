@@ -1,21 +1,17 @@
-//! Integration tests for `task-mgr models` subcommands.
+//! Integration tests for the provider-first `task-mgr models` verb set (FR-009).
 //!
-//! Runs the real CLI binary via `assert_cmd`. Uses an isolated
-//! `XDG_CONFIG_HOME` / `XDG_CACHE_HOME` so tests don't touch the developer's
-//! real user config. The `TASK_MGR_USE_API` env var is forced off in every
-//! test so no HTTP requests are ever made.
-
-#![allow(deprecated)]
+//! Runs the real CLI binary via `assert_cmd`. Uses an isolated `$HOME` /
+//! `XDG_*` so tests don't touch the developer's real config, and forces
+//! `TASK_MGR_USE_API` off so no HTTP requests are ever made.
 
 use assert_cmd::Command;
 use assert_cmd::cargo::cargo_bin;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
-use task_mgr::loop_engine::model::{HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL};
+use task_mgr::loop_engine::model::{FABLE_MODEL, HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL};
 
-/// Handy pair: a tempdir for `--dir` and a second tempdir acting as `$HOME`
-/// so user-config writes land in an isolated location.
+/// A tempdir for `--dir` plus a second tempdir acting as `$HOME`.
 struct Sandbox {
     db_dir: TempDir,
     home: TempDir,
@@ -31,11 +27,9 @@ impl Sandbox {
 
     fn cmd(&self) -> Command {
         let mut cmd = Command::new(cargo_bin("task-mgr"));
-        // Isolate per-user config + cache so tests don't clobber each other.
         cmd.env("HOME", self.home.path());
         cmd.env_remove("XDG_CONFIG_HOME");
         cmd.env_remove("XDG_CACHE_HOME");
-        // Hard-off the remote fetch so nothing ever touches the network.
         cmd.env_remove("TASK_MGR_USE_API");
         cmd.env_remove("ANTHROPIC_API_KEY");
         cmd.args(["--dir", self.db_dir.path().to_str().unwrap()]);
@@ -45,159 +39,213 @@ impl Sandbox {
     fn project_config(&self) -> PathBuf {
         self.db_dir.path().join("config.json")
     }
+
+    fn write_config(&self, contents: &str) {
+        std::fs::write(self.project_config(), contents).unwrap();
+    }
+
+    fn read_config(&self) -> String {
+        std::fs::read_to_string(self.project_config()).unwrap()
+    }
+
+    fn stdout_of(&self, args: &[&str]) -> String {
+        let out = self
+            .cmd()
+            .args(args)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        String::from_utf8(out).unwrap()
+    }
+}
+
+// ---- init ----------------------------------------------------------------
+
+#[test]
+fn init_writes_block_and_show_renders_it() {
+    let sb = Sandbox::new();
+    sb.cmd().args(["models", "init"]).assert().success();
+    let raw = sb.read_config();
+    assert!(raw.contains("\"models\""), "models block written:\n{raw}");
+    assert!(raw.contains("\"anchor\""), "anchor key written:\n{raw}");
+    assert!(raw.contains("standard"), "default anchor standard:\n{raw}");
+
+    let show = sb.stdout_of(&["models", "show"]);
+    assert!(show.contains("primaryProvider: claude"), "{show}");
+    assert!(show.contains("Codex pinning is route-only"), "{show}");
 }
 
 #[test]
-fn list_offline_prints_built_in_models() {
+fn init_dry_run_writes_nothing() {
     let sb = Sandbox::new();
-    let out = sb
-        .cmd()
-        .args(["models", "list"])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let s = String::from_utf8(out).unwrap();
-    assert!(
-        s.contains(OPUS_MODEL),
-        "output should contain opus id:\n{s}"
+    sb.write_config(r#"{"version":1,"defaultModel":"x"}"#);
+    let original = sb.read_config();
+    let out = sb.stdout_of(&["models", "init", "--dry-run"]);
+    assert!(out.contains("dry-run"), "dry-run banner:\n{out}");
+    assert!(out.contains("defaultModel"), "shows legacy half:\n{out}");
+    assert_eq!(sb.read_config(), original, "dry-run must not write");
+}
+
+#[test]
+fn init_force_replace_legacy_deletes_keys() {
+    let sb = Sandbox::new();
+    sb.write_config(
+        r#"{"version":1,"defaultModel":"a","reviewModel":"b","primaryRunner":{},
+            "fallbackRunner":{"enabled":true},"additionalAllowedTools":["Bash(docker:*)"]}"#,
     );
-    assert!(s.contains(SONNET_MODEL));
-    assert!(s.contains(HAIKU_MODEL));
-    assert!(s.contains("Difficulty"), "effort table expected:\n{s}");
-}
-
-#[test]
-fn list_remote_without_opt_in_falls_back_silently() {
-    // With TASK_MGR_USE_API unset (Sandbox default), --remote must not attempt
-    // a live fetch. We can't strictly prove no network call happened from here,
-    // but the built-in list header identifies the offline path.
-    let sb = Sandbox::new();
-    let out = sb
-        .cmd()
-        .args(["models", "list", "--remote"])
+    sb.cmd()
+        .args(["models", "init", "--force-replace-legacy"])
         .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let s = String::from_utf8(out).unwrap();
-    assert!(s.contains("built-in list"), "expected offline path: {s}");
+        .success();
+    let raw = sb.read_config();
+    for key in [
+        "defaultModel",
+        "reviewModel",
+        "primaryRunner",
+        "fallbackRunner",
+    ] {
+        assert!(!raw.contains(key), "{key} must be deleted:\n{raw}");
+    }
+    assert!(
+        raw.contains("additionalAllowedTools"),
+        "unknown key preserved:\n{raw}"
+    );
+}
+
+// ---- show ----------------------------------------------------------------
+
+#[test]
+fn show_default_anchor_maps_difficulties_to_models() {
+    let sb = Sandbox::new();
+    let show = sb.stdout_of(&["models", "show"]);
+    assert!(show.contains(SONNET_MODEL), "low→sonnet:\n{show}");
+    assert!(show.contains(OPUS_MODEL), "medium→opus:\n{show}");
+    assert!(
+        show.contains(FABLE_MODEL),
+        "high→fable + crash escalation:\n{show}"
+    );
+    assert!(show.contains("Crash escalation"), "{show}");
 }
 
 #[test]
-fn set_default_user_round_trips_via_show() {
+fn set_anchor_shifts_difficulty_window() {
+    let sb = Sandbox::new();
+    sb.cmd()
+        .args(["models", "set-anchor", "cost-efficient"])
+        .assert()
+        .success();
+    let show = sb.stdout_of(&["models", "show"]);
+    assert!(show.contains("anchor:          cost-efficient"), "{show}");
+    assert!(
+        show.contains(HAIKU_MODEL),
+        "low→haiku at anchor cost-efficient:\n{show}"
+    );
+}
+
+#[test]
+fn set_anchor_typo_is_config_error() {
+    let sb = Sandbox::new();
+    sb.cmd()
+        .args(["models", "set-anchor", "fronteir"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("CONFIG ERROR"))
+        .stderr(predicates::str::contains("frontier"));
+}
+
+// ---- list ----------------------------------------------------------------
+
+#[test]
+fn list_renders_provider_ladders() {
+    let sb = Sandbox::new();
+    let out = sb.stdout_of(&["models", "list"]);
+    assert!(out.contains("Claude"), "{out}");
+    assert!(out.contains(OPUS_MODEL), "{out}");
+    assert!(out.contains(SONNET_MODEL), "{out}");
+    assert!(out.contains("Grok"), "{out}");
+}
+
+// ---- route ---------------------------------------------------------------
+
+#[test]
+fn route_adds_byidprefix_route() {
+    let sb = Sandbox::new();
+    sb.cmd()
+        .args([
+            "models",
+            "route",
+            "REVIEW-",
+            "--provider",
+            "claude",
+            "--tier",
+            "frontier",
+        ])
+        .assert()
+        .success();
+    let show = sb.stdout_of(&["models", "show"]);
+    assert!(
+        show.contains("REVIEW-"),
+        "route must appear in show:\n{show}"
+    );
+    assert!(
+        show.contains("frontier"),
+        "forced tier must appear:\n{show}"
+    );
+}
+
+// ---- removed verbs + legacy guard ----------------------------------------
+
+#[test]
+fn removed_set_default_verb_prints_replacement_hint() {
     let sb = Sandbox::new();
     sb.cmd()
         .args(["models", "set-default", OPUS_MODEL])
         .assert()
-        .success();
-    let out = sb
-        .cmd()
-        .args(["models", "show"])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let s = String::from_utf8(out).unwrap();
-    assert!(s.contains(OPUS_MODEL));
-    assert!(s.contains("source: user"), "expected source=user:\n{s}");
+        .failure()
+        .stderr(predicates::str::contains("set-anchor"));
 }
 
 #[test]
-fn set_default_project_beats_user_in_show() {
+fn mutating_verb_on_legacy_config_hard_errors() {
     let sb = Sandbox::new();
+    sb.write_config(r#"{"version":1,"defaultModel":"x","fallbackRunner":{"enabled":true}}"#);
     sb.cmd()
-        .args(["models", "set-default", HAIKU_MODEL])
+        .args(["models", "set-anchor", "standard"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("defaultModel"))
+        .stderr(predicates::str::contains(
+            "models init --force-replace-legacy",
+        ));
+}
+
+// ---- enable (end-to-end through the probe) -------------------------------
+
+#[cfg(unix)]
+#[test]
+fn enable_provider_through_cli_with_temp_binaries() {
+    use std::os::unix::fs::PermissionsExt;
+    let sb = Sandbox::new();
+    let exe = sb.home.path().join("fake-bin");
+    std::fs::write(&exe, b"#!/bin/sh\nexit 0\n").unwrap();
+    let mut perms = std::fs::metadata(&exe).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&exe, perms).unwrap();
+    let exe = exe.to_str().unwrap();
+
+    sb.cmd()
+        .env("CLAUDE_BINARY", exe)
+        .env("GROK_BINARY", exe)
+        .args(["models", "enable", "grok"])
         .assert()
         .success();
-    sb.cmd()
-        .args(["models", "set-default", SONNET_MODEL, "--project"])
-        .assert()
-        .success();
-    let out = sb
-        .cmd()
-        .args(["models", "show"])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let s = String::from_utf8(out).unwrap();
-    assert!(s.contains(SONNET_MODEL));
+
+    let show = sb.stdout_of(&["models", "show"]);
+    // Grok now renders as enabled in the ladder block.
     assert!(
-        s.contains("source: project"),
-        "project default must win over user:\n{s}"
-    );
-}
-
-#[test]
-fn unset_default_clears_user_only_by_default() {
-    let sb = Sandbox::new();
-    sb.cmd()
-        .args(["models", "set-default", OPUS_MODEL])
-        .assert()
-        .success();
-    sb.cmd()
-        .args(["models", "set-default", HAIKU_MODEL, "--project"])
-        .assert()
-        .success();
-
-    // Unset (user-level). Project default should still show.
-    sb.cmd()
-        .args(["models", "unset-default"])
-        .assert()
-        .success();
-    let out = sb
-        .cmd()
-        .args(["models", "show"])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let s = String::from_utf8(out).unwrap();
-    assert!(s.contains(HAIKU_MODEL));
-    assert!(s.contains("source: project"));
-}
-
-#[test]
-fn unset_default_project_clears_project_config() {
-    let sb = Sandbox::new();
-    sb.cmd()
-        .args(["models", "set-default", SONNET_MODEL, "--project"])
-        .assert()
-        .success();
-    let raw_before = std::fs::read_to_string(sb.project_config()).unwrap();
-    assert!(raw_before.contains(SONNET_MODEL));
-
-    sb.cmd()
-        .args(["models", "unset-default", "--project"])
-        .assert()
-        .success();
-    let raw_after = std::fs::read_to_string(sb.project_config()).unwrap();
-    assert!(
-        !raw_after.contains("defaultModel"),
-        "defaultModel key should be gone, got:\n{raw_after}"
-    );
-}
-
-#[test]
-fn show_reports_none_when_nothing_set() {
-    let sb = Sandbox::new();
-    let out = sb
-        .cmd()
-        .args(["models", "show"])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let s = String::from_utf8(out).unwrap();
-    assert!(
-        s.contains("No default model set") || s.contains("source: none"),
-        "expected 'none' state in output:\n{s}"
+        show.contains("Grok (enabled)"),
+        "grok must be enabled:\n{show}"
     );
 }

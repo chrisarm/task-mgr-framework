@@ -316,14 +316,18 @@ pub struct PromptResult {
     /// Propagated from `NextTaskOutput.difficulty`. Per-task, NOT cluster-wide — see
     /// `cluster_effort` for the effort flag that mirrors cluster-wide model escalation.
     pub task_difficulty: Option<String>,
-    /// Resolved Claude CLI `--effort` level for this iteration (None → omit flag).
+    /// Resolved CLI `--effort` level for this iteration (None → omit flag).
     ///
-    /// Derived from the **cluster-wide max difficulty** (primary task + pending
-    /// `synergyWith` partners), then mapped through `model::effort_for_difficulty`.
-    /// This parallels `resolved_model`: both scale with the hardest task in the
-    /// cluster so (Opus, `xhigh`) is chosen when a cluster contains a `high`-difficulty
-    /// partner, even if the primary is only `medium`.
-    pub cluster_effort: Option<&'static str>,
+    /// Sourced from the [`ExecutionPlan::effort`](crate::loop_engine::model::ExecutionPlan)
+    /// that `resolve_execution_plan` computes — i.e. `models.effort_for(final_provider,
+    /// difficulty)` over the **final** provider's per-provider effort table — falling
+    /// back to the static `model::effort_for_difficulty` table only when the resolved
+    /// provider has no effort entry for the difficulty. Owned `String` (not
+    /// `&'static str`) because per-provider effort levels come from runtime config.
+    /// Carrying `plan.effort` here is what lets a custom table (e.g.
+    /// `providers.grok.effort.high = "medium"`) reach the runner argv instead of being
+    /// silently overwritten by the static default (WIRE-FIX-001).
+    pub cluster_effort: Option<String>,
     /// Per-section byte counts for the assembled prompt, in assembly order.
     ///
     /// Used by overflow diagnostics to attribute prompt size to specific
@@ -361,18 +365,30 @@ pub struct BuildPromptParams<'a> {
     pub verbose: bool,
     /// Default model from PRD metadata (threaded from engine, not queried here).
     pub default_model: Option<&'a str>,
-    /// Default model from the per-project config (`.task-mgr/config.json`).
-    pub project_default_model: Option<&'a str>,
-    /// Default model from the per-user config (`$XDG_CONFIG_HOME/task-mgr/config.json`).
-    pub user_default_model: Option<&'a str>,
     /// Optional PRD task prefix for scoping task selection to a specific PRD.
     pub task_prefix: Option<&'a str>,
     /// Paths to sibling PRD JSON files (batch mode only, empty otherwise).
     pub batch_sibling_prds: &'a [PathBuf],
     /// Resolved permission mode (for tool-awareness prompt section).
     pub permission_mode: &'a PermissionMode,
-    /// Primary runner routing configuration.
-    pub primary_runner: Option<&'a crate::loop_engine::project_config::PrimaryRunnerConfig>,
+    /// Provider-first `models` config block (FR-001). Resolved per build and
+    /// fed to [`crate::loop_engine::model::resolve_execution_plan`] — the single
+    /// spawn-side resolution path. Threaded from `ProjectConfig::models`.
+    pub models_config: &'a crate::loop_engine::project_config::ModelsConfig,
+    /// Routing policy block (FR-001) consumed by `resolve_execution_plan`.
+    /// Threaded from `ProjectConfig::routing`.
+    pub routing_config: &'a crate::loop_engine::project_config::RoutingConfig,
+    /// FEAT-008: providers under an active quota blackout this iteration
+    /// (`ctx.provider_blackouts.active(now)`). Fed to `resolve_execution_plan`
+    /// so a spillover-eligible task reroutes off a blacked-out provider at spawn
+    /// time, consistent with `excluded_ids`. Empty (the default) → no reroute.
+    pub provider_blackouts: std::collections::HashSet<crate::loop_engine::model::Provider>,
+    /// FEAT-008: todo task ids that are quota-deferred this iteration
+    /// (`reactions::pre_spawn::compute_quota_excluded_ids`). Threaded into
+    /// selection via `next::next_excluding` so a doomed task is never picked;
+    /// an all-excluded queue yields the no-eligible result and the deferral
+    /// branch waits. Empty (the default) → identical to pre-FEAT-008 selection.
+    pub excluded_ids: std::collections::HashSet<String>,
 }
 
 /// Build a prompt for the current iteration.
@@ -387,14 +403,17 @@ pub struct BuildPromptParams<'a> {
 ///
 /// Returns `None` if no tasks remain.
 pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<PromptResult>> {
-    // Step 1: Select and claim a task
-    let next_result = next::next(
+    // Step 1: Select and claim a task. FEAT-008: thread the quota-deferred
+    // `excluded_ids` so a task resolving to a blacked-out provider it cannot
+    // reroute off of is never selected.
+    let next_result = next::next_excluding(
         params.dir,
         params.after_files,
         true,
         params.run_id,
         params.verbose,
         params.task_prefix,
+        &params.excluded_ids,
     )?;
 
     let task_output = match next_result.task {
@@ -402,31 +421,44 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
         None => return Ok(None), // All tasks complete
     };
 
-    // Step 2: Resolve model (needed for escalation section in Phase 1)
-    let defaults = crate::loop_engine::model::ModelResolutionContext {
-        prd_default: params.default_model,
-        project_default: params.project_default_model,
-        user_default: params.user_default_model,
-        primary_runner: params.primary_runner,
-        ..Default::default()
-    };
-    let target = crate::loop_engine::model::resolve_task_execution_target(
-        &crate::loop_engine::model::ModelResolutionContext {
+    // Step 2: Resolve model via the FR-003 single resolution path (FEAT-004).
+    // Both prompt builders call `resolve_execution_plan`; there is no second
+    // spawn-side resolver. `resolve_models_config` is pure (no I/O) so building
+    // it per prompt is cheap and respects the run-level config-caching invariant
+    // (which forbids file I/O on the hot path, not pure projections).
+    let resolved_models = crate::loop_engine::model::resolve_models_config(
+        params.models_config,
+        params.routing_config,
+    );
+    let plan = crate::loop_engine::model::resolve_execution_plan(
+        &crate::loop_engine::model::PlanContext {
+            task_id: &task_output.id,
             task_model: task_output.model.as_deref(),
             difficulty: task_output.difficulty.as_deref(),
-            task_id: Some(&task_output.id),
-            ..defaults
+            models: &resolved_models,
+            // FEAT-008: reroute off any blacked-out provider at spawn time.
+            provider_blackouts: &params.provider_blackouts,
         },
     );
-    let resolved_model = target.model.clone();
-    let provider_hint = target.provider_hint;
-    let cluster_difficulty = task_output
-        .difficulty
-        .as_deref()
-        .filter(|d| !d.trim().is_empty())
-        .map(str::to_string);
-    let cluster_effort =
-        crate::loop_engine::model::effort_for_difficulty(cluster_difficulty.as_deref());
+    let resolved_model = plan.model.clone();
+    // The plan's provider is the authoritative spawn-side provider. Carry it as
+    // an explicit hint only for non-Claude providers — Claude tasks keep `None`
+    // (provider_for_model classifies the model string), matching the historical
+    // hint semantics; Codex needs the hint because its model is `None`.
+    let provider_hint = match plan.provider {
+        crate::loop_engine::model::Provider::Claude => None,
+        other => Some(other),
+    };
+    // WIRE-FIX-001: carry the plan's per-provider effort (computed from the FINAL
+    // provider's effort table by `resolve_execution_plan`) instead of recomputing
+    // from the static `effort_for_difficulty` table — the latter ignores custom
+    // per-provider effort tables. The static table is only the fallback when the
+    // resolved provider has no effort entry for this difficulty, so default-config
+    // behavior is unchanged.
+    let cluster_effort = plan.effort.clone().or_else(|| {
+        crate::loop_engine::model::effort_for_difficulty(task_output.difficulty.as_deref())
+            .map(String::from)
+    });
 
     // ============================================================
     // Phase 1: critical sections — gated together against the budget.
@@ -463,6 +495,7 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
         // The escalation render reads this — the policy section is omitted for
         // the Opus tier. Must be set before the critical assemble below.
         resolved_model: resolved_model.as_deref(),
+        resolved_models: &resolved_models,
         next_task_output: Some(task_output),
         recalled_learnings: Some(&next_result.learnings),
     };
@@ -765,7 +798,7 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::commands::next::output::*;
-    use crate::loop_engine::model::{HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL};
+    use crate::loop_engine::model::{FABLE_MODEL, HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL};
     use crate::loop_engine::test_utils::{
         insert_relationship, insert_run, insert_run_task, insert_task, insert_task_file,
         insert_task_full, insert_test_learning, setup_test_db,
@@ -815,12 +848,13 @@ mod tests {
             steering_path: None,
             verbose: false,
             default_model: None,
-            project_default_model: None,
-            user_default_model: None,
             task_prefix: None,
             batch_sibling_prds: &[],
             permission_mode: &DEFAULT_PERM,
-            primary_runner: None,
+            models_config: crate::loop_engine::project_config::default_models_config(),
+            routing_config: crate::loop_engine::project_config::default_routing_config(),
+            provider_blackouts: Default::default(),
+            excluded_ids: Default::default(),
         }
     }
 
@@ -1029,12 +1063,13 @@ mod tests {
             steering_path: Some(&steering_path),
             verbose: false,
             default_model: None,
-            project_default_model: None,
-            user_default_model: None,
             task_prefix: None,
             batch_sibling_prds: &[],
             permission_mode: &DEFAULT_PERM,
-            primary_runner: None,
+            models_config: crate::loop_engine::project_config::default_models_config(),
+            routing_config: crate::loop_engine::project_config::default_routing_config(),
+            provider_blackouts: Default::default(),
+            excluded_ids: Default::default(),
         };
 
         let result = build_prompt(&params)
@@ -1401,12 +1436,13 @@ pub enum ApiError {
             steering_path: None,
             verbose: false,
             default_model: None,
-            project_default_model: None,
-            user_default_model: None,
             task_prefix: None,
             batch_sibling_prds: &[],
             permission_mode: &DEFAULT_PERM,
-            primary_runner: None,
+            models_config: crate::loop_engine::project_config::default_models_config(),
+            routing_config: crate::loop_engine::project_config::default_routing_config(),
+            provider_blackouts: Default::default(),
+            excluded_ids: Default::default(),
         };
 
         let result = build_prompt(&params)
@@ -1522,12 +1558,13 @@ pub enum ApiError {
             steering_path: None,
             verbose: false,
             default_model: None,
-            project_default_model: None,
-            user_default_model: None,
             task_prefix: None,
             batch_sibling_prds: &[],
             permission_mode: &DEFAULT_PERM,
-            primary_runner: None,
+            models_config: crate::loop_engine::project_config::default_models_config(),
+            routing_config: crate::loop_engine::project_config::default_routing_config(),
+            provider_blackouts: Default::default(),
+            excluded_ids: Default::default(),
         };
 
         let result = build_prompt(&params)
@@ -1572,12 +1609,13 @@ pub enum ApiError {
             steering_path: Some(&steering_path),
             verbose: false,
             default_model: None,
-            project_default_model: None,
-            user_default_model: None,
             task_prefix: None,
             batch_sibling_prds: &[],
             permission_mode: &DEFAULT_PERM,
-            primary_runner: None,
+            models_config: crate::loop_engine::project_config::default_models_config(),
+            routing_config: crate::loop_engine::project_config::default_routing_config(),
+            provider_blackouts: Default::default(),
+            excluded_ids: Default::default(),
         };
 
         let result = build_prompt(&params)
@@ -2106,12 +2144,13 @@ pub enum ApiError {
             steering_path: None,
             verbose: false,
             default_model: None,
-            project_default_model: None,
-            user_default_model: None,
             task_prefix: None,
             batch_sibling_prds: &[],
             permission_mode: &DEFAULT_PERM,
-            primary_runner: None,
+            models_config: crate::loop_engine::project_config::default_models_config(),
+            routing_config: crate::loop_engine::project_config::default_routing_config(),
+            provider_blackouts: Default::default(),
+            excluded_ids: Default::default(),
         };
 
         let result = build_prompt(&params)
@@ -2162,12 +2201,13 @@ pub enum ApiError {
             steering_path: None,
             verbose: false,
             default_model: None,
-            project_default_model: None,
-            user_default_model: None,
             task_prefix: None,
             batch_sibling_prds: &[],
             permission_mode: &DEFAULT_PERM,
-            primary_runner: None,
+            models_config: crate::loop_engine::project_config::default_models_config(),
+            routing_config: crate::loop_engine::project_config::default_routing_config(),
+            provider_blackouts: Default::default(),
+            excluded_ids: Default::default(),
         };
 
         let result = build_prompt(&params)
@@ -2210,12 +2250,13 @@ pub enum ApiError {
             steering_path: None,
             verbose: false,
             default_model: None,
-            project_default_model: None,
-            user_default_model: None,
             task_prefix: None,
             batch_sibling_prds: &[],
             permission_mode: &DEFAULT_PERM,
-            primary_runner: None,
+            models_config: crate::loop_engine::project_config::default_models_config(),
+            routing_config: crate::loop_engine::project_config::default_routing_config(),
+            provider_blackouts: Default::default(),
+            excluded_ids: Default::default(),
         };
 
         // next::next uses dir for DB access — task should be found
@@ -2261,10 +2302,11 @@ pub enum ApiError {
         );
     }
 
-    /// AC2: Task with difficulty='high' and no explicit model → resolved_model is opus.
+    /// AC2 (FR-003): difficulty='high', no explicit model → frontier tier.
+    /// The legacy high→OPUS hardcode is replaced by the anchor window
+    /// (anchor=standard, high→anchor+1=frontier→FABLE). Provider stays Claude.
     #[test]
-
-    fn test_resolved_model_difficulty_high_forces_opus() {
+    fn test_resolved_model_difficulty_high_resolves_to_frontier() {
         let (temp_dir, conn) = setup_test_db();
 
         insert_task(&conn, "MOD-002", "High-difficulty task", "todo", 5);
@@ -2283,15 +2325,18 @@ pub enum ApiError {
 
         assert_eq!(
             result.resolved_model,
-            Some(OPUS_MODEL.to_string()),
-            "difficulty='high' with no explicit model should resolve to opus"
+            Some(FABLE_MODEL.to_string()),
+            "difficulty='high' resolves to the frontier tier (anchor+1) under the \
+             default config — the legacy high→OPUS hardcode is gone (FR-003)"
         );
     }
 
-    /// AC3: Task with no model, no difficulty, prd_default=haiku → resolved_model is haiku.
+    /// AC3 (FR-003): no model, no difficulty, prd_default=haiku → the PRD
+    /// default_model is IGNORED under the models config; resolution flows through
+    /// the anchor window (no difficulty → standard tier → OPUS). The legacy
+    /// prd_default fallback is gone (hard break).
     #[test]
-
-    fn test_resolved_model_prd_default_fallback() {
+    fn test_resolved_model_no_difficulty_resolves_via_anchor_window() {
         let (temp_dir, conn) = setup_test_db();
 
         insert_task(&conn, "MOD-003", "Task with prd default", "todo", 5);
@@ -2306,8 +2351,9 @@ pub enum ApiError {
 
         assert_eq!(
             result.resolved_model,
-            Some(HAIKU_MODEL.to_string()),
-            "No model/difficulty should fall back to prd_default"
+            Some(OPUS_MODEL.to_string()),
+            "no model/difficulty resolves via the anchor window (standard→OPUS); \
+             the haiku prd_default is ignored under the models config (FR-003)"
         );
     }
 
@@ -2353,7 +2399,7 @@ pub enum ApiError {
     /// This test runs against the stub (resolved_model: None) and validates
     /// the expected behavior when no model information is available.
     #[test]
-    fn test_resolved_model_no_defaults_returns_none() {
+    fn test_resolved_model_no_info_resolves_via_anchor_window() {
         let (temp_dir, conn) = setup_test_db();
 
         // Task with no model, no difficulty
@@ -2368,8 +2414,10 @@ pub enum ApiError {
             .expect("Should return a prompt");
 
         assert_eq!(
-            result.resolved_model, None,
-            "No model info at any level should resolve to None"
+            result.resolved_model,
+            Some(OPUS_MODEL.to_string()),
+            "with no model info anywhere the anchor window still resolves \
+             (standard→OPUS) — the legacy 'no info → None' is gone (FR-003)"
         );
     }
 
@@ -2403,9 +2451,9 @@ pub enum ApiError {
             .unwrap()
             .expect("Should return a prompt");
 
-        // medium → "high" per effort_for_difficulty mapping; partner's "high"
-        // difficulty is ignored.
-        assert_eq!(result.cluster_effort, Some("high"));
+        // medium → "medium" per the default claude effort table; partner's
+        // "high" difficulty is ignored.
+        assert_eq!(result.cluster_effort.as_deref(), Some("medium"));
         assert_eq!(result.task_difficulty.as_deref(), Some("medium"));
     }
 
@@ -2435,9 +2483,9 @@ pub enum ApiError {
             .expect("Should return a prompt");
 
         assert_eq!(
-            result.cluster_effort,
-            Some("high"),
-            "done partner must not influence cluster effort — stays at primary's medium→high"
+            result.cluster_effort.as_deref(),
+            Some("medium"),
+            "done partner must not influence cluster effort — stays at primary's medium→medium"
         );
     }
 
@@ -2456,13 +2504,62 @@ pub enum ApiError {
         assert_eq!(result.cluster_effort, None);
     }
 
+    /// WIRE-FIX-001 regression: a custom per-provider effort table must reach
+    /// `cluster_effort` (and thus the runner argv) instead of being silently
+    /// overwritten by the static `effort_for_difficulty` mapping. Here the
+    /// primary provider is grok with `effort.medium = "low"`; the static table
+    /// would map medium → "high", so the two disagree and the assertion pins
+    /// the per-provider value.
+    #[test]
+    fn test_cluster_effort_honors_custom_provider_effort_table() {
+        let (temp_dir, conn) = setup_test_db();
+
+        insert_task(&conn, "CE-004", "Primary medium", "todo", 5);
+        conn.execute(
+            "UPDATE tasks SET difficulty = 'medium' WHERE id = 'CE-004'",
+            [],
+        )
+        .unwrap();
+
+        // Production-shaped models config: grok primary, custom effort table that
+        // maps medium → "low" (differs from the static medium → "high").
+        let models: crate::loop_engine::project_config::ModelsConfig =
+            serde_json::from_value(serde_json::json!({
+                "primaryProvider": "grok",
+                "anchor": "standard",
+                "providers": {
+                    "grok": {
+                        "enabled": true,
+                        "tiers": { "standard": "grok-build" },
+                        "effort": { "low": "low", "medium": "low", "high": "low" },
+                    },
+                },
+            }))
+            .expect("production-shaped models fixture");
+
+        let base_prompt_path = create_base_prompt(temp_dir.path());
+        let mut params = build_params(temp_dir.path(), &conn, &base_prompt_path);
+        params.models_config = &models;
+
+        let result = build_prompt(&params)
+            .unwrap()
+            .expect("Should return a prompt");
+
+        assert_eq!(
+            result.cluster_effort.as_deref(),
+            Some("low"),
+            "custom per-provider effort table must win over the static effort_for_difficulty mapping"
+        );
+    }
+
     // --- Edge case tests for model resolution ---
 
-    /// Edge case: Task with empty string model → normalized to None, not Some("").
-    /// Invariant: resolved_model is never Some("").
+    /// Edge case: Task with empty string model → normalized to None at rung
+    /// EXPLICIT_MODEL (never treated as `Some("")`), so resolution falls through
+    /// to the anchor window (no difficulty → standard → OPUS). Invariant:
+    /// resolved_model is never `Some("")`.
     #[test]
-
-    fn test_resolved_model_empty_string_normalized_to_none() {
+    fn test_resolved_model_empty_string_falls_through_to_anchor_window() {
         let (temp_dir, conn) = setup_test_db();
 
         insert_task(&conn, "MOD-007", "Empty model task", "todo", 5);
@@ -2477,14 +2574,17 @@ pub enum ApiError {
             .expect("Should return a prompt");
 
         assert_eq!(
-            result.resolved_model, None,
-            "Empty string model must be normalized to None, never Some('')"
+            result.resolved_model,
+            Some(OPUS_MODEL.to_string()),
+            "empty string model normalizes to None and resolves via the anchor \
+             window (standard→OPUS), never as an explicit Some('')"
         );
     }
 
     /// Edge case: Multiple legacy synergy partners in the DB must not influence
-    /// the resolved model — synergy escalation was removed. Primary has no
-    /// model and no defaults are supplied, so result is `None`.
+    /// the resolved model — synergy escalation was removed. The primary has no
+    /// model, so it resolves via the anchor window (standard→OPUS), independent
+    /// of the partners' (higher/lower) tiers.
     #[test]
     fn test_resolved_model_ignores_multiple_synergy_partners() {
         let (temp_dir, conn) = setup_test_db();
@@ -2524,8 +2624,10 @@ pub enum ApiError {
             .expect("Should return a prompt");
 
         assert_eq!(
-            result.resolved_model, None,
-            "legacy synergy partners must not influence resolved_model"
+            result.resolved_model,
+            Some(OPUS_MODEL.to_string()),
+            "legacy synergy partners must not influence resolved_model — the \
+             no-model primary resolves via the anchor window (standard→OPUS)"
         );
     }
 
@@ -2629,9 +2731,10 @@ pub enum ApiError {
         );
     }
 
-    /// AC: No model, difficulty=medium, prd_default=sonnet → resolved is sonnet.
+    /// AC (FR-003): No model, difficulty=medium, prd_default=sonnet → the PRD
+    /// default is ignored; the anchor window resolves medium → standard → OPUS.
     #[test]
-    fn test_resolved_model_medium_difficulty_uses_prd_default() {
+    fn test_resolved_model_medium_difficulty_resolves_to_standard() {
         let (temp_dir, conn) = setup_test_db();
 
         insert_task(&conn, "MOD-021", "Medium task", "todo", 5);
@@ -2651,14 +2754,17 @@ pub enum ApiError {
 
         assert_eq!(
             result.resolved_model,
-            Some(SONNET_MODEL.to_string()),
-            "Medium difficulty should NOT escalate to opus; should fall through to prd_default"
+            Some(OPUS_MODEL.to_string()),
+            "medium difficulty maps to the standard tier (anchor+0 → OPUS); the \
+             sonnet prd_default is ignored under the models config (FR-003)"
         );
     }
 
-    /// AC: All synergy partners have None model → falls back to prd_default.
+    /// AC (FR-003): a no-model primary with no-model synergy partners resolves
+    /// via the anchor window (standard→OPUS). The prd_default is ignored and
+    /// legacy synergy partners contribute nothing.
     #[test]
-    fn test_resolved_model_all_synergy_none_falls_to_prd_default() {
+    fn test_resolved_model_no_model_primary_resolves_via_anchor_window() {
         let (temp_dir, conn) = setup_test_db();
 
         // Selected task has no model
@@ -2680,8 +2786,9 @@ pub enum ApiError {
 
         assert_eq!(
             result.resolved_model,
-            Some(HAIKU_MODEL.to_string()),
-            "All partners with None model should fall back to prd_default"
+            Some(OPUS_MODEL.to_string()),
+            "no-model primary resolves via the anchor window (standard→OPUS); the \
+             haiku prd_default is ignored and synergy partners contribute nothing"
         );
     }
 
@@ -2760,17 +2867,28 @@ pub enum ApiError {
         );
     }
 
-    // --- AC4: Escalation section injected when resolved_model is None (Default tier) ---
+    // --- AC4: Escalation section injected for a sub-Opus anchor-window resolution ---
+    //
+    // Under FR-003 a no-model task no longer resolves to None — the anchor window
+    // always picks a concrete model. A low-difficulty task lands on the
+    // cost-efficient tier (anchor−1 → SONNET), which is sub-Opus, so the
+    // escalation section is still injected. (The escalation gate now keys on the
+    // ceiling/frontier capability tier via `tier_of`; a sub-frontier model like
+    // SONNET still receives the policy.)
 
     #[test]
-
-    fn test_escalation_section_injected_for_default_none() {
+    fn test_escalation_section_injected_for_sub_opus_anchor_resolution() {
         let (temp_dir, conn) = setup_test_db();
 
-        // Task with no model, no difficulty, no prd_default → resolved_model = None
-        insert_task(&conn, "ESC-003", "Default tier task", "todo", 5);
+        // Low difficulty, no explicit model → anchor−1 → cost-efficient → SONNET.
+        insert_task(&conn, "ESC-003", "Cost-efficient tier task", "todo", 5);
+        conn.execute(
+            "UPDATE tasks SET difficulty = 'low' WHERE id = 'ESC-003'",
+            [],
+        )
+        .unwrap();
 
-        let template_content = "# Escalation Policy\n\nDefault tier gets policy too.\n";
+        let template_content = "# Escalation Policy\n\nSub-Opus tier gets policy too.\n";
         let base_prompt_path = create_base_prompt(temp_dir.path());
         create_escalation_template(temp_dir.path(), template_content);
 
@@ -2780,28 +2898,31 @@ pub enum ApiError {
             .unwrap()
             .expect("Should return a prompt");
 
+        assert_eq!(
+            result.resolved_model.as_deref(),
+            Some(SONNET_MODEL),
+            "low difficulty resolves to the cost-efficient tier (anchor−1 → SONNET)"
+        );
         assert!(
             result.prompt.contains("Escalation Policy"),
-            "Escalation section should be injected for Default/None tier — \
-             CLI default could be sonnet, policy is informational and safe"
+            "Escalation section should be injected for a sub-Opus resolved model"
         );
     }
 
-    // --- AC5: Escalation section NOT injected when resolved_model is opus ---
+    // --- AC5: Escalation section NOT injected when resolved_model is the ceiling tier ---
 
     #[test]
-
-    fn test_escalation_section_not_injected_for_opus() {
+    fn test_escalation_section_not_injected_for_fable() {
         let (temp_dir, conn) = setup_test_db();
 
-        insert_task(&conn, "ESC-004", "Opus task", "todo", 5);
+        insert_task(&conn, "ESC-004", "Fable task", "todo", 5);
         conn.execute(
             "UPDATE tasks SET model = ?1 WHERE id = 'ESC-004'",
-            params![OPUS_MODEL],
+            params![FABLE_MODEL],
         )
         .unwrap();
 
-        let template_content = "# Escalation Policy\n\nShould not appear for opus.\n";
+        let template_content = "# Escalation Policy\n\nShould not appear for the ceiling tier.\n";
         let base_prompt_path = create_base_prompt(temp_dir.path());
         create_escalation_template(temp_dir.path(), template_content);
 
@@ -2813,12 +2934,14 @@ pub enum ApiError {
 
         assert!(
             !result.prompt.contains("Escalation Policy"),
-            "Escalation section must NOT be injected for opus model — \
-             opus is the highest tier, escalation makes no sense"
+            "Escalation section must NOT be injected for the ceiling (frontier) model — \
+             fable is the highest tier, escalation makes no sense"
         );
         assert!(
-            !result.prompt.contains("Should not appear for opus."),
-            "Escalation template content must be absent for opus"
+            !result
+                .prompt
+                .contains("Should not appear for the ceiling tier."),
+            "Escalation template content must be absent for the ceiling tier"
         );
     }
 
@@ -2894,10 +3017,11 @@ pub enum ApiError {
         assert!(result.prompt.contains("<reorder>"));
     }
 
-    /// AC: Switching from non-opus to opus model → template disappears.
-    /// Verifies by contrast: sonnet task has template, opus task does not.
+    /// AC: Switching from a sub-ceiling to the ceiling-tier model → template
+    /// disappears. Verifies by contrast: sonnet task has template, fable
+    /// (ceiling) task does not.
     #[test]
-    fn test_escalation_template_disappears_for_opus() {
+    fn test_escalation_template_disappears_for_fable() {
         let (temp_dir, conn) = setup_test_db();
 
         // Sonnet task — should have escalation
@@ -2921,22 +3045,23 @@ pub enum ApiError {
             "Sonnet should have escalation template"
         );
 
-        // Now mark sonnet task done, add opus task
+        // Now mark sonnet task done, add fable (ceiling-tier) task
         conn.execute("UPDATE tasks SET status = 'done' WHERE id = 'ESC-031'", [])
             .unwrap();
-        insert_task(&conn, "ESC-032", "Opus task", "todo", 5);
+        insert_task(&conn, "ESC-032", "Fable task", "todo", 5);
         conn.execute(
             "UPDATE tasks SET model = ?1 WHERE id = 'ESC-032'",
-            params![OPUS_MODEL],
+            params![FABLE_MODEL],
         )
         .unwrap();
 
-        let opus_result = build_prompt(&params)
+        let fable_result = build_prompt(&params)
             .unwrap()
             .expect("Should return a prompt");
         assert!(
-            !opus_result.prompt.contains("ESCALATION_MARKER_CHECK"),
-            "Opus should NOT have escalation template — template disappears when tier is Opus"
+            !fable_result.prompt.contains("ESCALATION_MARKER_CHECK"),
+            "Fable (ceiling tier) should NOT have escalation template — template \
+             disappears when the model is already at the top tier"
         );
     }
 
@@ -3102,12 +3227,13 @@ pub enum ApiError {
             steering_path: Some(&steering_path),
             verbose: false,
             default_model: None,
-            project_default_model: None,
-            user_default_model: None,
             task_prefix: None,
             batch_sibling_prds: &[],
             permission_mode: &DEFAULT_PERM,
-            primary_runner: None,
+            models_config: crate::loop_engine::project_config::default_models_config(),
+            routing_config: crate::loop_engine::project_config::default_routing_config(),
+            provider_blackouts: Default::default(),
+            excluded_ids: Default::default(),
         };
 
         let result = build_prompt(&params)
@@ -3194,12 +3320,13 @@ pub enum ApiError {
             steering_path: Some(&steering_path),
             verbose: false,
             default_model: None,
-            project_default_model: None,
-            user_default_model: None,
             task_prefix: None,
             batch_sibling_prds: &[],
             permission_mode: &DEFAULT_PERM,
-            primary_runner: None,
+            models_config: crate::loop_engine::project_config::default_models_config(),
+            routing_config: crate::loop_engine::project_config::default_routing_config(),
+            provider_blackouts: Default::default(),
+            excluded_ids: Default::default(),
         };
 
         let result = build_prompt(&params)
@@ -3346,12 +3473,13 @@ pub enum ApiError {
             steering_path: Some(&steering_path),
             verbose: false,
             default_model: None,
-            project_default_model: None,
-            user_default_model: None,
             task_prefix: None,
             batch_sibling_prds: &[],
             permission_mode: &DEFAULT_PERM,
-            primary_runner: None,
+            models_config: crate::loop_engine::project_config::default_models_config(),
+            routing_config: crate::loop_engine::project_config::default_routing_config(),
+            provider_blackouts: Default::default(),
+            excluded_ids: Default::default(),
         };
 
         let result = build_prompt(&params)
@@ -3472,12 +3600,13 @@ pub enum ApiError {
             steering_path: Some(&steering_path),
             verbose: false,
             default_model: None,
-            project_default_model: None,
-            user_default_model: None,
             task_prefix: None,
             batch_sibling_prds: &[],
             permission_mode: &DEFAULT_PERM,
-            primary_runner: None,
+            models_config: crate::loop_engine::project_config::default_models_config(),
+            routing_config: crate::loop_engine::project_config::default_routing_config(),
+            provider_blackouts: Default::default(),
+            excluded_ids: Default::default(),
         };
 
         let result = build_prompt(&params)

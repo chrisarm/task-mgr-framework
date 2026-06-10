@@ -78,7 +78,7 @@ fn capability_matrix_dispatch_contract() {
     // Mirrors the production support table in
     // src/loop_engine/CLAUDE.md → "Capability surface".
     let matrix: &[(&str, &str, bool, bool, bool)] = &[
-        ("Effort", "effort", true, true, false),
+        ("Effort", "effort", true, true, true),
         ("StreamJson", "stream_json", true, true, true),
         ("Pty", "use_pty", true, false, false),
         ("DisallowedTools", "disallowed_tools", true, true, false),

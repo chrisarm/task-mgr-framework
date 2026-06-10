@@ -25,7 +25,6 @@ use crate::loop_engine::config::{IterationOutcome, PermissionMode};
 use crate::loop_engine::detection;
 use crate::loop_engine::engine::{IterationContext, IterationResult, resolve_effective_runner};
 use crate::loop_engine::model;
-use crate::loop_engine::project_config;
 use crate::loop_engine::runner::RunnerKind;
 use crate::output::ui;
 
@@ -131,13 +130,16 @@ pub(crate) fn apply_pending_promotion(ctx: &mut IterationContext, p: &PendingPro
 /// second time; otherwise `Some(PendingPromotion)` built from the args
 /// verbatim.
 ///
-/// This is the single guard the symmetric-fallback contract anticipated — see
-/// `src/loop_engine/CLAUDE.md` → "Symmetric Claude↔Grok fallback contract":
-/// *"When you add a THIRD cross-provider promotion site, replicate the
-/// `contains_key` guard there too."* All four cross-provider branches —
-/// Claude→Grok, Grok→Claude, Codex→Claude (RuntimeError escalation) and the
-/// overflow rung-4 pivot — now route their idempotency check through here
-/// (REFACTOR-001) instead of inlining their own `contains_key` snapshot.
+/// Historically this was the shared idempotency guard for four cross-provider
+/// promotion sites (Claude→Grok, Grok→Claude, Codex→Claude RuntimeError
+/// escalation, and the overflow rung-4 pivot). REFACTOR-006 deleted the three
+/// RuntimeError promotion arms — unreachable once preflight hard-rejected
+/// `primaryRunner` / `fallbackRunner` — so the **overflow rung-4 pivot**
+/// (`reactions::post_output`) is now the sole caller. The primitive stays
+/// direction-generic (the CONTRACT-PROMO-001 tests still exercise the
+/// Claude→Grok / Grok→Claude / Codex→Claude shapes), so a future cross-provider
+/// escape valve can reuse it — and MUST route its `contains_key` guard through
+/// here rather than inlining its own snapshot.
 ///
 /// Contract (compiler- and test-enforced):
 /// - Reads `ctx` IMMUTABLY (`&IterationContext`) → performs NO ctx mutation.
@@ -176,67 +178,59 @@ pub(crate) fn promote_once(
     })
 }
 
-/// Inner helper: performs the DB writes for escalation/promotion but does
-/// **not** mutate `ctx`. Returns the escalated model AND an optional
-/// `PendingPromotion` the caller must apply via `apply_pending_promotion`
-/// after any enclosing transaction commits. Transactional callers
-/// (`handle_task_failure`) MUST use this variant + apply post-commit to
-/// avoid dirty-ctx on rollback.
+/// Inner helper: performs the DB writes for same-provider Claude tier
+/// escalation but does **not** mutate `ctx`. Returns the escalated model AND an
+/// `Option<PendingPromotion>` the transactional caller (`handle_task_failure`)
+/// applies via `apply_pending_promotion` after `tx.commit()` succeeds.
 ///
-/// Reads `ctx` immutably to resolve the effective runner (for the
-/// idempotency guard). Does not capture override-snapshot state — that is
-/// part of the deferred apply.
+/// Post-hard-break this path performs NO cross-provider promotion. The legacy
+/// `primaryRunner` / `fallbackRunner` RuntimeError-fallback surfaces are
+/// rejected at preflight (`LEGACY_MODEL_KEYS`), so the Claude→Grok /
+/// Grok→Claude / Codex→Claude promotion arms were unreachable and have been
+/// deleted (REFACTOR-006). The `Option<PendingPromotion>` slot is therefore
+/// always `None` here; it is retained because the deferred-apply skeleton
+/// (`apply_pending_promotion`) is the sole non-test reader of
+/// [`PendingPromotion`]'s fields, and [`PendingPromotion`] is still constructed
+/// by [`promote_once`] for the LIVE overflow rung-4 pivot
+/// (`reactions::post_output`). Only the same-provider Claude tier escalation
+/// remains live here.
 ///
-/// `project_default` / `user_default` are the engine-cached config defaults
-/// (`engine.rs` run-config fields), threaded straight through to
-/// `maybe_codex_fallback_to_claude` so a recovering Codex task derives its
-/// baseline tier from the SAME four inputs the primary spawn-site uses (FIX-001).
-#[allow(clippy::too_many_arguments)]
+/// `executed_runner` gates the Codex short-circuit: a Codex task is off the
+/// Claude tier ladder and (with the legacy fallback removed) has no
+/// cross-provider escape, so it must NOT climb the ladder — escalating a
+/// NULL-model Codex task would normalize it to the Sonnet baseline and write
+/// Opus into `tasks.model`, silently pivoting the task to Claude next iteration.
 pub(crate) fn escalate_task_model_if_needed_inner(
     conn: &Connection,
     task_id: &str,
     new_count: i32,
-    ctx: &IterationContext,
     executed_runner: RunnerKind,
-    cfg: Option<&project_config::FallbackRunnerConfig>,
-    primary_cfg: Option<&project_config::PrimaryRunnerConfig>,
-    project_default: Option<&str>,
-    user_default: Option<&str>,
+    models: &model::ResolvedModelsConfig,
 ) -> TaskMgrResult<(Option<String>, Option<PendingPromotion>)> {
     if !should_escalate_for_consecutive_failures(new_count) {
+        return Ok((None, None));
+    }
+    // Codex tasks never climb the Claude ladder (see fn rustdoc).
+    if executed_runner == RunnerKind::Codex {
         return Ok((None, None));
     }
     let current_model: Option<String> =
         conn.query_row("SELECT model FROM tasks WHERE id = ?", [task_id], |r| {
             r.get::<_, Option<String>>(0)
         })?;
-    let effective_runner = executed_runner;
-    if effective_runner == RunnerKind::Codex {
-        // FEAT-005: opt-in Codex→Claude fallback on RUNTIME failure. Auth
-        // failures (CodexAuthFailure) never reach `handle_task_failure` (the
-        // sequential + wave callers short-circuit on the auth crash variant),
-        // so a Codex outcome here is by construction a runtime fault. Promote
-        // to Claude only when:
-        //   1. No prior promotion exists for this task (idempotency — mirrors
-        //      the symmetric Claude↔Grok ping-pong guard below).
-        //   2. The matching `primaryRunner` Codex route has
-        //      `runtimeErrorFallback: true`.
-        // Otherwise return `(None, None)` so the legacy auto-block ladder runs
-        // (existing Codex projects without the opt-in see unchanged behavior).
-        return maybe_codex_fallback_to_claude(
-            conn,
-            task_id,
-            new_count,
-            ctx,
-            primary_cfg,
-            project_default,
-            user_default,
-        );
-    }
     // None / empty / whitespace model: assume sonnet baseline → escalate to opus.
+    // Otherwise step up one DEFINED tier on the Claude ladder (config exact-match
+    // via `escalate_tier`, no substring matching). The Claude ladder is resolved
+    // from the OPERATOR's config (`models`, threaded down from the orchestrator's
+    // `IterationContext::resolved_models`) so an operator who remapped Claude
+    // tiers (custom ladder, null rungs) gets escalations onto models THEIR config
+    // defines — not the builtin defaults (REFACTOR-007, the FIX-001 divergence).
+    // A non-Claude (Grok) `current_model` is off the Claude ladder, so
+    // `escalate_tier` returns `None` and no escalation fires; the task then
+    // proceeds to normal failure accounting (→ `auto_block_task`).
     let escalated = match normalize_baseline(current_model.as_deref()) {
         None => Some(model::OPUS_MODEL.to_string()),
-        Some(m) => model::escalate_model(Some(m)),
+        Some(m) => model::escalate_tier(models, model::Provider::Claude, Some(m)),
     };
     if let Some(ref new_model) = escalated {
         conn.execute(
@@ -249,256 +243,34 @@ pub(crate) fn escalate_task_model_if_needed_inner(
         ));
     }
 
-    // Provider promotion hooks. The effective runner is computed once against
-    // the PRE-escalation model and dispatches one of two mirror branches:
-    //   - Claude→Grok (FEAT-007) when the task is still on Claude.
-    //   - Grok→Claude (FEAT-PRIMARY-003) when the task is on Grok.
-    //
-    // FEAT-PRIMARY-004 idempotency is now owned by `promote_once`
-    // (CONTRACT-PROMO-001): each branch resolves its target and calls
-    // `promote_once`, which returns `None` when a prior promotion already
-    // recorded a `runner_overrides` entry (in EITHER direction). That `None`
-    // makes the branch fall through to `Ok((escalated, None))` — normal failure
-    // accounting → `auto_block_task` — instead of flipping into the OPPOSITE
-    // branch and ping-ponging Claude↔Grok. The per-branch gates below are
-    // side-effect-free, so running them for an already-promoted task before
-    // `promote_once` short-circuits is behavior-neutral; the `tasks.model`
-    // UPDATE fires only when `promote_once` returns `Some`.
-    match effective_runner {
-        // kind-correct: Claude is the source side; Grok is the fallback target — provider identity, not capability.
-        RunnerKind::Claude => {
-            // FEAT-007: Grok fallback promotion. Fires only when the task was
-            // ALREADY at Opus before this call (i.e. the Claude escalation step
-            // was a no-op self-loop or no escalation was needed) — Sonnet-tier
-            // escalations get a fresh chance at Opus before any Grok pivot is
-            // considered.
-            let fallback = match cfg {
-                Some(c) if c.enabled => c,
-                _ => return Ok((escalated, None)),
-            };
-            // H2: use ModelTier-based inclusive check so both OPUS_MODEL and
-            // OPUS_MODEL_1M qualify as "at Opus" — string-eq on OPUS_MODEL
-            // excluded the 1M variant.
-            let was_at_opus = matches!(
-                model::model_tier(current_model.as_deref()),
-                model::ModelTier::Opus
-            );
-            // M1: compare in u32 space; new_count is a DB counter (always >= 0 in
-            // practice) but guard the negative case to keep the cast sound.
-            if !was_at_opus
-                || new_count < 0
-                || (new_count as u32) < fallback.runtime_error_threshold
-            {
-                return Ok((escalated, None));
-            }
-
-            // All gates passed — promote to Grok via `promote_once` (it owns the
-            // idempotency guard + `PendingPromotion` construction). The DB write
-            // and the deferred ctx apply (post-commit, via
-            // `apply_pending_promotion`) are still owned here. The pre-promotion
-            // snapshot of `tasks.model` (`current_model`) is captured BEFORE the
-            // UPDATE rewrites it so the FEAT-008 override-invalidation detector
-            // sees the original value on next iteration. The UPDATE fires only
-            // when the promotion actually fires (`Some`).
-            match promote_once(
-                ctx,
-                task_id,
-                RunnerKind::Claude,
-                RunnerKind::Grok,
-                fallback.model.clone(),
-                current_model,
-                new_count,
-            ) {
-                Some(promotion) => {
-                    conn.execute(
-                        "UPDATE tasks SET model = ? WHERE id = ?",
-                        rusqlite::params![fallback.model, task_id],
-                    )?;
-                    Ok((Some(fallback.model.clone()), Some(promotion)))
-                }
-                None => Ok((escalated, None)),
-            }
-        }
-        // FEAT-PRIMARY-003: inverse Grok→Claude fallback. A task routed to the
-        // Grok primary runner that keeps hitting RuntimeErrors is promoted onto
-        // a Claude model after `primary.runtime_error_threshold` consecutive
-        // failures — the mirror of FEAT-007, opposite direction.
-        RunnerKind::Grok => {
-            let primary = match primary_cfg {
-                Some(p) => p,
-                None => return Ok((escalated, None)),
-            };
-            // `claudeFallbackModel` absent → no inverse promotion target; the
-            // task dead-ends just like a Claude task with no Grok fallback.
-            let Some(claude_model) = primary.claude_fallback_model.as_deref() else {
-                return Ok((escalated, None));
-            };
-            // Guard the gate per AC: the DB model must actually be a Grok model
-            // (provider identity), not merely a stale runner override.
-            if model::provider_for_model(current_model.as_deref()) != model::Provider::Grok {
-                return Ok((escalated, None));
-            }
-            // M1 parity: compare in u32 space and guard the negative case.
-            if new_count < 0 || (new_count as u32) < primary.runtime_error_threshold {
-                return Ok((escalated, None));
-            }
-
-            // All gates passed — promote to Claude. Mirror of the FEAT-007 step:
-            // capture the pre-promotion (Grok) model BEFORE the UPDATE via
-            // `promote_once` (the single idempotency guard + `PendingPromotion`
-            // constructor). The UPDATE fires only when the promotion fires.
-            match promote_once(
-                ctx,
-                task_id,
-                RunnerKind::Grok,
-                RunnerKind::Claude,
-                claude_model.to_string(),
-                current_model,
-                new_count,
-            ) {
-                Some(promotion) => {
-                    conn.execute(
-                        "UPDATE tasks SET model = ? WHERE id = ?",
-                        rusqlite::params![claude_model, task_id],
-                    )?;
-                    Ok((Some(claude_model.to_string()), Some(promotion)))
-                }
-                None => Ok((escalated, None)),
-            }
-        }
-        RunnerKind::Codex => Ok((None, None)),
-    }
+    Ok((escalated, None))
 }
 
-/// FEAT-005: Codex→Claude opt-in promotion helper. Returns `(None, None)`
-/// (auto-block) unless the matching `primaryRunner` Codex route opted in via
-/// `runtimeErrorFallback: true`, in which case the task is promoted onto a Claude
-/// model. Bound to one promotion per task via [`promote_once`], which returns
-/// `None` (→ auto-block) when `ctx.runner_overrides` already holds the task —
-/// the single cross-provider idempotency guard, no longer inlined here.
+/// Absorb a consecutive-failure escalation's `tasks.model` write into the
+/// overflow snapshot so the escape valve (`pre_spawn::invalidate_stale_overrides`)
+/// does not mistake the ladder's own write for an out-of-band operator edit.
 ///
-/// Auth failures must never reach this function — the sequential and wave
-/// callers exclude `Crash(CodexAuthFailure)` before invoking
-/// `handle_task_failure`. Treat any reached call as a runtime fault.
+/// The escape valve fires its six-channel clear when `tasks.model` diverges from
+/// the snapshot in `ctx.overflow_original_task_model`. Crash escalation records
+/// its new model in `ctx.model_overrides`, so the valve's NULL-original absorb
+/// branch recognizes it; consecutive-failure escalation, however, writes
+/// `tasks.model` WITHOUT touching `model_overrides`, so without this refresh the
+/// valve would treat the ladder's own write as an operator edit and wipe the
+/// recovery (including the effort downgrade) it just set up.
 ///
-/// FIX-001: `project_default` / `user_default` are the engine-cached config
-/// defaults threaded from the failure-handler chain. The baseline tier (used to
-/// match a `baselineTierRoutes` route) is derived via
-/// [`model::compute_baseline_model`] from the SAME four inputs the primary
-/// spawn-site (`resolve_task_execution_target`) uses — `difficulty`,
-/// `prd_default`, `project_default`, `user_default` — so a recovering Codex task
-/// matches the route it was originally routed by. Earlier this site substituted
-/// `primary.claude_fallback_model` for `project_default` and omitted
-/// `user_default`, causing a confirmed recovery↔primary divergence.
-fn maybe_codex_fallback_to_claude(
-    conn: &Connection,
+/// `and_modify` (never `insert`/`or_insert_with`): only an EXISTING snapshot is
+/// refreshed. A task that never overflowed has no snapshot and must NOT gain one
+/// here — otherwise the valve would start tracking a task it should ignore.
+/// No-op when `escalated` is `None` (escalation did not fire).
+fn absorb_escalation_into_overflow_snapshot(
+    ctx: &mut IterationContext,
     task_id: &str,
-    new_count: i32,
-    ctx: &IterationContext,
-    primary_cfg: Option<&project_config::PrimaryRunnerConfig>,
-    project_default: Option<&str>,
-    user_default: Option<&str>,
-) -> TaskMgrResult<(Option<String>, Option<PendingPromotion>)> {
-    use crate::loop_engine::model::{
-        Provider, parse_config_provider, primary_runner_baseline_tier_match, primary_runner_match,
-    };
-
-    // Idempotency is enforced by `promote_once` below (the single
-    // `runner_overrides.contains_key` guard); it is no longer inlined here.
-    let Some(primary) = primary_cfg else {
-        return Ok((None, None));
-    };
-    let difficulty: Option<String> = conn
-        .query_row(
-            "SELECT difficulty FROM tasks WHERE id = ?",
-            [task_id],
-            |r| r.get(0),
-        )
-        .ok()
-        .flatten();
-    let prd_default: Option<String> = conn
-        .query_row(
-            "SELECT default_model FROM prd_metadata WHERE id = 1",
-            [],
-            |r| r.get(0),
-        )
-        .ok()
-        .flatten();
-    let baseline_model = model::compute_baseline_model(
-        difficulty.as_deref(),
-        prd_default.as_deref(),
-        project_default,
-        user_default,
-    );
-    // `task_type` is not threaded into recovery; production Codex routing is
-    // dominated by `byIdPrefix` and `baselineTierRoutes`.
-    let Some(spec) = primary_runner_match(primary, Some(task_id), None).or_else(|| {
-        primary_runner_baseline_tier_match(primary, Some(task_id), baseline_model.as_deref())
-    }) else {
-        return Ok((None, None));
-    };
-    if !spec.runtime_error_fallback {
-        return Ok((None, None));
-    }
-    // Guard against misconfiguration: the field is only meaningful on Codex
-    // routes. Treating a Grok/Claude route with `runtimeErrorFallback:true` as a
-    // promotion trigger would silently override the existing fallback paths.
-    if parse_config_provider(&spec.provider).ok() != Some(Provider::Codex) {
-        return Ok((None, None));
-    }
-
-    // Resolve the target Claude model. The AC says "OPUS for difficulty high,
-    // else default" — we read the task's difficulty from the DB and pick:
-    //   - high → OPUS_MODEL (matches `resolve_task_model` rung 3 semantics)
-    //   - else → `primary.claude_fallback_model` if set (mirrors the
-    //     symmetric Grok→Claude branch's source of truth), else OPUS_MODEL
-    //     as the safe baseline. Opting in via `runtimeErrorFallback:true` makes
-    //     the operator's intent explicit, so we never bail on a missing
-    //     `claudeFallbackModel` (unlike the Grok→Claude branch which is
-    //     project-level rather than per-route).
-    let target_model = if difficulty
-        .as_deref()
-        .is_some_and(|d| d.eq_ignore_ascii_case("high"))
-    {
-        model::OPUS_MODEL.to_string()
-    } else {
-        primary
-            .claude_fallback_model
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or(model::OPUS_MODEL)
-            .to_string()
-    };
-
-    // Capture the pre-promotion `tasks.model` BEFORE the UPDATE so the
-    // FEAT-008 override-invalidation detector sees the original value on next
-    // iteration. Same pattern as the Claude→Grok and Grok→Claude branches.
-    let pre_promotion_model: Option<String> =
-        conn.query_row("SELECT model FROM tasks WHERE id = ?", [task_id], |r| {
-            r.get::<_, Option<String>>(0)
-        })?;
-    // `promote_once` owns the idempotency guard + `PendingPromotion`
-    // construction (insert-safe: `target = RunnerKind::Claude`, never Codex,
-    // per learning [4553]). The UPDATE fires only when it returns `Some`; the
-    // caller applies the promotion post-commit via `apply_pending_promotion`.
-    match promote_once(
-        ctx,
-        task_id,
-        RunnerKind::Codex,
-        RunnerKind::Claude,
-        target_model.clone(),
-        pre_promotion_model,
-        new_count,
-    ) {
-        Some(promotion) => {
-            conn.execute(
-                "UPDATE tasks SET model = ? WHERE id = ?",
-                rusqlite::params![target_model, task_id],
-            )?;
-            Ok((Some(target_model), Some(promotion)))
-        }
-        None => Ok((None, None)),
+    escalated: Option<&str>,
+) {
+    if let Some(model) = escalated {
+        ctx.overflow_original_task_model
+            .entry(task_id.to_string())
+            .and_modify(|snapshot| *snapshot = Some(model.to_string()));
     }
 }
 
@@ -506,57 +278,33 @@ fn maybe_codex_fallback_to_claude(
 ///
 /// Follows the same sonnet-baseline pattern as `check_crash_escalation`:
 /// - `None` or empty model assumes sonnet baseline → escalates to opus.
-/// - Sonnet → opus, Haiku → sonnet, Opus → opus (no-op at ceiling).
+/// - Sonnet → opus, Opus → fable, fable → fable (no-op at ceiling).
 ///
-/// **FEAT-007 Grok promotion**: after the Claude-tier escalation runs, when
-/// `cfg.enabled` AND the post-escalation model is Opus AND `effective_runner`
-/// resolves to Claude AND `new_count >= cfg.runtime_error_threshold`, the
-/// task is promoted to the Grok runner. The promotion writes BOTH the
-/// `tasks.model` column AND the in-memory override maps on `ctx`
-/// (`runner_overrides`, `model_overrides`) so the next iteration's
-/// `resolve_task_model` + `resolve_effective_runner` agree. The pre-promotion
-/// `tasks.model` value is captured into `ctx.overflow_original_task_model`
-/// via `entry().or_insert_with(...)` so the FEAT-008 override-invalidation
-/// detector can spot operator edits later.
+/// Same-provider Claude tier escalation only. Post-hard-break there is no
+/// cross-provider promotion here (REFACTOR-006). A Grok task's model is off the
+/// Claude ladder, so it never escalates; a Codex task short-circuits in the
+/// inner helper.
 ///
-/// **FEAT-PRIMARY-003 inverse Grok→Claude promotion**: the mirror branch.
-/// When the task's effective runner is Grok AND `tasks.model` is a Grok model
-/// AND `primary_cfg.claude_fallback_model.is_some()` AND
-/// `new_count >= primary_cfg.runtime_error_threshold`, the task is promoted
-/// onto the configured Claude model (same DB-column-plus-override-maps write
-/// shape as the Claude→Grok hook). When `primary_cfg` is `None` or
-/// `claude_fallback_model` is absent, no inverse promotion fires.
+/// Returns `Some(new_model)` if escalation fired, `None` if below threshold or
+/// the model tier is unknown (e.g. already at Grok) or the fable self-loop
+/// produced no change. The DB is updated in-place when `Some` is returned.
 ///
-/// When `cfg` is `None` or `!enabled`, behavior is byte-identical to the
-/// pre-FEAT-007 ladder (Sonnet → Opus → terminal) for Claude tasks. The `ctx`
-/// argument is otherwise unused in that path.
-///
-/// Returns `Some(new_model)` if escalation OR promotion fired, `None` if
-/// below threshold, the model tier is unknown (e.g. already at Grok), or
-/// the Opus self-loop produced no change AND promotion conditions weren't met.
-/// The DB is updated in-place when `Some` is returned.
-///
-/// This is the convenience variant — DB and ctx writes happen back-to-back.
-/// Transactional callers should prefer `escalate_task_model_if_needed_inner`
-/// + `apply_pending_promotion` (see W5).
-#[allow(clippy::too_many_arguments)]
+/// This is the convenience variant — DB and (deferred) ctx writes happen
+/// back-to-back. Transactional callers should prefer
+/// `escalate_task_model_if_needed_inner` + `apply_pending_promotion` (see W5).
 pub fn escalate_task_model_if_needed(
     conn: &Connection,
     task_id: &str,
     new_count: i32,
     ctx: &mut IterationContext,
-    cfg: Option<&project_config::FallbackRunnerConfig>,
-    primary_cfg: Option<&project_config::PrimaryRunnerConfig>,
-    project_default: Option<&str>,
-    user_default: Option<&str>,
 ) -> TaskMgrResult<Option<String>> {
     // Derive the runner from the DB model before entering the inner helper.
     // The inner function requires an explicit runner; callers that DO know the
     // executed runner (production paths) should use
     // `escalate_task_model_if_needed_for_runner` to avoid this pre-read.
     // For Codex tasks this derivation produces Claude (gpt-* has no provider
-    // hint here), which is safe: the non-Codex escalation path is benign for
-    // Claude and Grok tasks; Codex callers must use the explicit-runner variant.
+    // hint here); Codex callers must use the explicit-runner variant so the
+    // inner helper's Codex short-circuit fires.
     let current_model: Option<String> = conn
         .query_row("SELECT model FROM tasks WHERE id = ?", [task_id], |r| {
             r.get::<_, Option<String>>(0)
@@ -575,16 +323,17 @@ pub fn escalate_task_model_if_needed(
         conn,
         task_id,
         new_count,
-        ctx,
         runner,
-        cfg,
-        primary_cfg,
-        project_default,
-        user_default,
+        &ctx.resolved_models,
     )?;
     if let Some(p) = pending {
         apply_pending_promotion(ctx, &p);
     }
+    // Refresh any existing overflow snapshot so the escape valve does not
+    // misread this consecutive-failure escalation as an operator edit. Keyed on
+    // the returned model (post-REFACTOR-006 `pending` is always `None`, so this
+    // must sit OUTSIDE the promotion branch).
+    absorb_escalation_into_overflow_snapshot(ctx, task_id, model.as_deref());
     Ok(model)
 }
 
@@ -594,34 +343,28 @@ pub fn escalate_task_model_if_needed(
 /// The explicit `executed_runner` bypasses the model-string re-derivation
 /// that the plain `escalate_task_model_if_needed` uses when the runner is not
 /// known. This is critical for Codex tasks: their `gpt-*` model would
-/// otherwise re-classify as Claude and miss the Codex-specific early-return
-/// path. Used in integration tests and by `handle_task_failure_with_runner`.
-#[allow(clippy::too_many_arguments)]
+/// otherwise re-classify as Claude and miss the Codex short-circuit in the
+/// inner helper. Used in integration tests and by `handle_task_failure_with_runner`.
 pub fn escalate_task_model_if_needed_for_runner(
     conn: &Connection,
     task_id: &str,
     new_count: i32,
     executed_runner: RunnerKind,
     ctx: &mut IterationContext,
-    cfg: Option<&project_config::FallbackRunnerConfig>,
-    primary_cfg: Option<&project_config::PrimaryRunnerConfig>,
-    project_default: Option<&str>,
-    user_default: Option<&str>,
 ) -> TaskMgrResult<Option<String>> {
     let (model, pending) = escalate_task_model_if_needed_inner(
         conn,
         task_id,
         new_count,
-        ctx,
         executed_runner,
-        cfg,
-        primary_cfg,
-        project_default,
-        user_default,
+        &ctx.resolved_models,
     )?;
     if let Some(p) = pending {
         apply_pending_promotion(ctx, &p);
     }
+    // Refresh any existing overflow snapshot (see the convenience variant above
+    // and `absorb_escalation_into_overflow_snapshot`'s rustdoc for why).
+    absorb_escalation_into_overflow_snapshot(ctx, task_id, model.as_deref());
     Ok(model)
 }
 
@@ -683,58 +426,30 @@ pub fn auto_block_task(
 /// decay tracking. Escalation is skipped when auto-block fires on the same iteration
 /// (the escalated model would never be used).
 ///
-/// **FEAT-007**: `ctx` threads `IterationContext` through so the embedded
-/// `escalate_task_model_if_needed` call can write Grok promotion overrides
-/// (paired with the DB UPDATE). `cfg` carries the optional fallback-runner
-/// configuration; pass `None` to suppress the Grok branch entirely (preserves
-/// pre-FEAT-007 behavior byte-for-byte). Callers MUST short-circuit BEFORE
-/// invoking this when the iteration outcome is `Crash(GrokAuthFailure)` so
-/// auth lapses do not push healthy tasks toward `auto_block_task`.
-///
-/// **FEAT-PRIMARY-003**: `primary_cfg` carries the optional primary-runner
-/// configuration so the embedded escalation call can fire the inverse
-/// Grok→Claude promotion. Pass `None` to suppress the inverse branch.
-///
-/// **FIX-001**: `project_default` / `user_default` are the engine-cached config
-/// defaults (`engine.rs` run-config fields), threaded through to the embedded
-/// `escalate_task_model_if_needed_inner` → `maybe_codex_fallback_to_claude`
-/// baseline derivation so a recovering Codex task matches the same
-/// `baselineTierRoutes` route the primary spawn-site routed it by.
-#[allow(clippy::too_many_arguments)]
+/// `ctx` threads `IterationContext` through so the embedded escalation can apply
+/// any deferred `PendingPromotion` after `tx.commit()`. Post-hard-break the
+/// escalation never produces a cross-provider promotion (REFACTOR-006), so that
+/// apply step is a no-op in practice; the skeleton is retained because
+/// `apply_pending_promotion` is shared with the live overflow rung-4 pivot
+/// (`promote_once` / [`PendingPromotion`]). Callers MUST short-circuit BEFORE
+/// invoking this when the iteration outcome is `Crash(GrokAuthFailure)` /
+/// `Crash(CodexAuthFailure)` so auth lapses do not push healthy tasks toward
+/// `auto_block_task`.
 pub fn handle_task_failure(
     conn: &mut Connection,
     task_id: &str,
     current_iteration: i64,
     ctx: &mut IterationContext,
-    cfg: Option<&project_config::FallbackRunnerConfig>,
-    primary_cfg: Option<&project_config::PrimaryRunnerConfig>,
-    project_default: Option<&str>,
-    user_default: Option<&str>,
 ) -> TaskMgrResult<()> {
-    handle_task_failure_with_runner(
-        conn,
-        task_id,
-        current_iteration,
-        ctx,
-        None,
-        cfg,
-        primary_cfg,
-        project_default,
-        user_default,
-    )
+    handle_task_failure_with_runner(conn, task_id, current_iteration, ctx, None)
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn handle_task_failure_with_runner(
     conn: &mut Connection,
     task_id: &str,
     current_iteration: i64,
     ctx: &mut IterationContext,
     executed_runner: Option<RunnerKind>,
-    cfg: Option<&project_config::FallbackRunnerConfig>,
-    primary_cfg: Option<&project_config::PrimaryRunnerConfig>,
-    project_default: Option<&str>,
-    user_default: Option<&str>,
 ) -> TaskMgrResult<()> {
     // Resolve the effective runner before entering the transaction.
     // `escalate_task_model_if_needed_inner` requires an explicit RunnerKind;
@@ -771,7 +486,7 @@ pub fn handle_task_failure_with_runner(
     // is acceptable degradation — a crash between commit and auto-block
     // simply means the bumped `consecutive_failures` re-triggers auto-block
     // on the next iteration via the same `should_auto_block` check.
-    let (new_count, max_retries, pending_promotion) = {
+    let (new_count, max_retries, pending_promotion, escalated_model) = {
         let tx = conn.transaction()?;
 
         let new_count = increment_consecutive_failures(&tx, task_id).map_err(|e| {
@@ -791,28 +506,29 @@ pub fn handle_task_failure_with_runner(
             )
             .unwrap_or(3);
 
-        // W5: stage the Grok promotion's ctx mutations as a `PendingPromotion`
-        // and defer applying them until `tx.commit()?` returns Ok below. If
-        // commit fails, the in-memory ctx stays consistent with the rolled-back
-        // DB (no dirty `runner_overrides` / `model_overrides` entries pointing
-        // to a Grok model the DB still records as Opus).
+        // W5: stage any deferred `PendingPromotion` and apply it only after
+        // `tx.commit()?` returns Ok below, so a rolled-back DB never leaves a
+        // dirty ctx. Post-hard-break the escalation never returns a promotion
+        // (REFACTOR-006), so `pending_promotion` stays `None`; the skeleton is
+        // retained for the shared deferred-apply contract (see fn rustdoc).
         //
         // Only escalate if auto-block won't immediately follow — the escalated
         // model would never be used.
         let mut pending_promotion: Option<PendingPromotion> = None;
+        // Carry the escalated model out of the tx scope so the post-commit ctx
+        // mutation can absorb it into the overflow snapshot (escape-valve
+        // misfire fix). `None` when escalation did not fire or auto-block won.
+        let mut escalated_model: Option<String> = None;
         if !should_auto_block(new_count, max_retries) {
             match escalate_task_model_if_needed_inner(
                 &tx,
                 task_id,
                 new_count,
-                ctx,
                 runner,
-                cfg,
-                primary_cfg,
-                project_default,
-                user_default,
+                &ctx.resolved_models,
             ) {
-                Ok((_model, promotion)) => {
+                Ok((model, promotion)) => {
+                    escalated_model = model;
                     pending_promotion = promotion;
                 }
                 Err(e) => {
@@ -822,13 +538,18 @@ pub fn handle_task_failure_with_runner(
         }
 
         tx.commit()?;
-        (new_count, max_retries, pending_promotion)
+        (new_count, max_retries, pending_promotion, escalated_model)
     };
 
     // Commit succeeded — safe to mutate ctx.
     if let Some(p) = pending_promotion {
         apply_pending_promotion(ctx, &p);
     }
+    // Refresh any existing overflow snapshot so the escape valve does not misread
+    // this consecutive-failure escalation as an operator edit (see
+    // `absorb_escalation_into_overflow_snapshot`). Post-commit, mirroring the
+    // deferred-promotion apply: a rolled-back DB never leaves a dirty ctx.
+    absorb_escalation_into_overflow_snapshot(ctx, task_id, escalated_model.as_deref());
 
     // Phase 2: auto-block (outside the transaction; routed through the
     // lifecycle service via auto_block_task).
@@ -988,7 +709,8 @@ mod tests {
     // CLEANUP-001: shims removed; tests now call the relocated functions directly.
 
     use super::*;
-    use crate::loop_engine::model::{HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL};
+    use crate::loop_engine::model::{FABLE_MODEL, HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL};
+    use crate::loop_engine::project_config::ProjectConfig;
     use crate::loop_engine::reactions::pre_spawn::crash_escalated_model;
     use crate::loop_engine::test_utils::setup_test_db;
 
@@ -1150,10 +872,11 @@ mod tests {
         );
     }
 
-    /// AC: same task + crash + already opus → stays opus (ceiling, no panic).
+    /// AC: same task + crash + opus → escalate one DEFINED tier up the Claude
+    /// ladder to the Frontier rung (fable). opus is the Standard rung now; the
+    /// ceiling self-loop happens at fable, not opus.
     #[test]
-
-    fn test_crash_escalation_opus_ceiling() {
+    fn test_crash_escalation_opus_to_fable() {
         let result = crash_escalated_model(
             &crash_map(&[("FEAT-001", true)]),
             "FEAT-001",
@@ -1161,8 +884,24 @@ mod tests {
         );
         assert_eq!(
             result,
-            Some(OPUS_MODEL.to_string()),
-            "opus crash on same task must stay at opus ceiling"
+            Some(FABLE_MODEL.to_string()),
+            "opus crash must escalate up one tier to the frontier (fable)"
+        );
+    }
+
+    /// AC: same task + crash + already at the frontier (fable) → stays fable
+    /// (ceiling self-loop, no panic, no wrap).
+    #[test]
+    fn test_crash_escalation_fable_ceiling() {
+        let result = crash_escalated_model(
+            &crash_map(&[("FEAT-001", true)]),
+            "FEAT-001",
+            Some(FABLE_MODEL),
+        );
+        assert_eq!(
+            result,
+            Some(FABLE_MODEL.to_string()),
+            "fable crash on same task must stay at the frontier ceiling"
         );
     }
 
@@ -1315,9 +1054,8 @@ mod tests {
     }
 
     /// Edge case: multiple consecutive crashes on same task follow the ladder:
-    /// haiku → sonnet → opus → opus (ceiling).
+    /// haiku → sonnet → opus → fable → fable (ceiling self-loop).
     #[test]
-
     fn test_crash_escalation_consecutive_ladder() {
         let crashed = crash_map(&[("FEAT-001", true)]);
         // First crash: haiku → sonnet
@@ -1336,12 +1074,20 @@ mod tests {
             "second crash: sonnet → opus"
         );
 
-        // Third crash: opus → opus (ceiling)
+        // Third crash: opus → fable (Standard → Frontier)
         let third = crash_escalated_model(&crashed, "FEAT-001", second.as_deref());
         assert_eq!(
             third,
-            Some(OPUS_MODEL.to_string()),
-            "third crash: opus stays at ceiling"
+            Some(FABLE_MODEL.to_string()),
+            "third crash: opus → fable (one tier up)"
+        );
+
+        // Fourth crash: fable → fable (Frontier ceiling, self-loop)
+        let fourth = crash_escalated_model(&crashed, "FEAT-001", third.as_deref());
+        assert_eq!(
+            fourth,
+            Some(FABLE_MODEL.to_string()),
+            "fourth crash: fable stays at the frontier ceiling"
         );
     }
 
@@ -1697,9 +1443,7 @@ mod tests {
         .unwrap();
 
         let mut ctx = IterationContext::new(8);
-        let result =
-            escalate_task_model_if_needed(&conn, "T-001", 2, &mut ctx, None, None, None, None)
-                .unwrap();
+        let result = escalate_task_model_if_needed(&conn, "T-001", 2, &mut ctx).unwrap();
         assert_eq!(
             result,
             Some(OPUS_MODEL.to_string()),
@@ -1717,9 +1461,10 @@ mod tests {
         );
     }
 
-    /// Opus task at 2 consecutive failures → model stays at opus (ceiling, no-op).
+    /// Opus task at 2 consecutive failures → escalate one tier to the frontier
+    /// (fable). opus is the Standard rung; Frontier sits above it.
     #[test]
-    fn test_model_escalation_opus_stays_at_ceiling() {
+    fn test_model_escalation_opus_to_fable() {
         let (_dir, conn) = setup_test_db();
         conn.execute(
             &format!("INSERT INTO tasks (id, title, status, model, consecutive_failures) VALUES ('T-001', 'Test', 'in_progress', '{OPUS_MODEL}', 0)"),
@@ -1728,13 +1473,11 @@ mod tests {
         .unwrap();
 
         let mut ctx = IterationContext::new(8);
-        let result =
-            escalate_task_model_if_needed(&conn, "T-001", 2, &mut ctx, None, None, None, None)
-                .unwrap();
+        let result = escalate_task_model_if_needed(&conn, "T-001", 2, &mut ctx).unwrap();
         assert_eq!(
             result,
-            Some(OPUS_MODEL.to_string()),
-            "opus at ceiling must return opus (no-op value)"
+            Some(FABLE_MODEL.to_string()),
+            "opus at 2 failures must escalate up one tier to fable"
         );
         let model: Option<String> = conn
             .query_row("SELECT model FROM tasks WHERE id = 'T-001'", [], |r| {
@@ -1743,8 +1486,232 @@ mod tests {
             .unwrap();
         assert_eq!(
             model,
+            Some(FABLE_MODEL.to_string()),
+            "model column in DB must be updated to fable"
+        );
+    }
+
+    /// Fable task at 2 consecutive failures → stays at fable (Frontier ceiling).
+    #[test]
+    fn test_model_escalation_fable_stays_at_ceiling() {
+        let (_dir, conn) = setup_test_db();
+        conn.execute(
+            &format!("INSERT INTO tasks (id, title, status, model, consecutive_failures) VALUES ('T-001', 'Test', 'in_progress', '{FABLE_MODEL}', 0)"),
+            [],
+        )
+        .unwrap();
+
+        let mut ctx = IterationContext::new(8);
+        let result = escalate_task_model_if_needed(&conn, "T-001", 2, &mut ctx).unwrap();
+        assert_eq!(
+            result,
+            Some(FABLE_MODEL.to_string()),
+            "fable at the frontier ceiling must return fable (self-loop value)"
+        );
+        let model: Option<String> = conn
+            .query_row("SELECT model FROM tasks WHERE id = 'T-001'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            model,
+            Some(FABLE_MODEL.to_string()),
+            "fable model in DB must remain fable"
+        );
+    }
+
+    // --- escape-valve interaction: consecutive-failure escalation must not
+    //     self-trip `invalidate_stale_overrides` (Medium-1 /review-loop fix) ---
+
+    /// Minimal `PromptResult` for driving `handle_overflow` in these tests.
+    fn overflow_prompt_result(task_id: &str) -> crate::loop_engine::prompt::PromptResult {
+        crate::loop_engine::prompt::PromptResult {
+            prompt: "TASK\n\nBASE\n".to_string(),
+            task_id: task_id.to_string(),
+            task_files: Vec::new(),
+            shown_learning_ids: Vec::new(),
+            resolved_model: None,
+            provider_hint: None,
+            dropped_sections: Vec::new(),
+            task_difficulty: Some("high".to_string()),
+            cluster_effort: None,
+            section_sizes: vec![("task", 5), ("base_prompt", 5)],
+        }
+    }
+
+    /// Drive a RUNG-1 (effort downgrade) overflow on a NULL-model task. Rung 1
+    /// sets `effort_overrides` and snapshots the NULL `tasks.model` into
+    /// `overflow_original_task_model` (= `Some(None)`) but does NOT write
+    /// `model_overrides` or `tasks.model` — the exact precondition for the
+    /// escape-valve misfire. Then a consecutive-failure escalation writes
+    /// `tasks.model` (sonnet-baseline → opus) WITHOUT touching `model_overrides`.
+    /// The fix refreshes the snapshot so a follow-up `invalidate_stale_overrides`
+    /// recognizes the ladder's own write and leaves the recovery intact.
+    #[test]
+    fn consecutive_failure_escalation_after_rung1_overflow_does_not_clear_channels() {
+        use crate::loop_engine::reactions::post_output::{HandleOverflowParams, handle_overflow};
+        use crate::loop_engine::reactions::pre_spawn::invalidate_stale_overrides;
+        use tempfile::TempDir;
+
+        let task_id = "T-001";
+        let (_dir, mut conn) = setup_test_db();
+        // NULL model (anchor-resolved): model column defaults to NULL.
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, consecutive_failures) \
+             VALUES ('T-001', 'Test', 'in_progress', 0)",
+            [],
+        )
+        .unwrap();
+
+        let mut ctx = IterationContext::new(8);
+        let pr = overflow_prompt_result(task_id);
+        let project_cfg = ProjectConfig::default();
+        let tmp = TempDir::new().unwrap();
+
+        // Rung 1: `xhigh` is downgradeable, so the ladder takes the effort branch.
+        let action = handle_overflow(HandleOverflowParams {
+            ctx: &mut ctx,
+            conn: &mut conn,
+            task_id,
+            effort: Some("xhigh"),
+            effective_model: None,
+            prompt_result: &pr,
+            iteration: 1,
+            run_id: Some("run-rung1"),
+            base_dir: tmp.path(),
+            slot_index: None,
+            effective_runner: RunnerKind::Claude,
+            project_config: &project_cfg,
+        });
+        assert!(
+            matches!(action, crate::loop_engine::overflow::RecoveryAction::DowngradeEffort { .. }),
+            "xhigh effort must take the rung-1 downgrade branch, got {action:?}",
+        );
+        // Precondition state: effort override set, snapshot is Some(None), and
+        // crucially model_overrides is EMPTY (the misfire trigger).
+        assert!(
+            ctx.effort_overrides.contains_key(task_id),
+            "rung 1 must record the effort downgrade",
+        );
+        assert_eq!(
+            ctx.overflow_original_task_model.get(task_id),
+            Some(&None),
+            "rung 1 snapshots the NULL tasks.model as Some(None)",
+        );
+        assert!(
+            !ctx.model_overrides.contains_key(task_id),
+            "rung 1 does NOT write model_overrides — this is what makes the \
+             escape valve's NULL-original absorb branch fail without the fix",
+        );
+
+        // Consecutive-failure escalation: NULL baseline → opus, writes tasks.model.
+        let escalated = escalate_task_model_if_needed(&conn, task_id, 2, &mut ctx).unwrap();
+        assert_eq!(
+            escalated,
             Some(OPUS_MODEL.to_string()),
-            "opus model in DB must remain opus"
+            "NULL-baseline task at 2 failures escalates to opus",
+        );
+        // The fix refreshed the snapshot to the escalated model.
+        assert_eq!(
+            ctx.overflow_original_task_model.get(task_id),
+            Some(&Some(OPUS_MODEL.to_string())),
+            "the escalation's tasks.model write must be absorbed into the snapshot",
+        );
+
+        // The escape valve must now treat the escalation as the ladder's own
+        // write (snapshot == current) and NOT clear the recovery channels.
+        invalidate_stale_overrides(&mut ctx, &conn, task_id);
+        assert!(
+            ctx.effort_overrides.contains_key(task_id),
+            "the effort downgrade must SURVIVE — the escape valve must not \
+             self-trip on the consecutive-failure escalation's own write",
+        );
+        assert!(
+            ctx.overflow_recovered.contains(task_id),
+            "overflow_recovered must survive the no-op invalidate pass",
+        );
+        assert!(
+            ctx.overflow_original_task_model.contains_key(task_id),
+            "the snapshot must survive (no six-channel clear fired)",
+        );
+    }
+
+    /// `and_modify` discipline: a task that never overflowed has no snapshot, and
+    /// a consecutive-failure escalation must NOT create one — otherwise the
+    /// escape valve would start tracking a task it should ignore.
+    #[test]
+    fn escalation_without_prior_overflow_creates_no_snapshot() {
+        let (_dir, conn) = setup_test_db();
+        conn.execute(
+            &format!(
+                "INSERT INTO tasks (id, title, status, model, consecutive_failures) \
+                 VALUES ('T-001', 'Test', 'in_progress', '{SONNET_MODEL}', 0)"
+            ),
+            [],
+        )
+        .unwrap();
+
+        let mut ctx = IterationContext::new(8);
+        let escalated = escalate_task_model_if_needed(&conn, "T-001", 2, &mut ctx).unwrap();
+        assert_eq!(escalated, Some(OPUS_MODEL.to_string()));
+        assert!(
+            !ctx.overflow_original_task_model.contains_key("T-001"),
+            "a never-overflowed task must not gain an overflow snapshot from escalation",
+        );
+    }
+
+    /// A genuine out-of-band operator edit AFTER a consecutive-failure escalation
+    /// must still fire the six-channel clear — the fix narrows the absorb to the
+    /// ladder's own write, it does not disable the escape valve.
+    #[test]
+    fn operator_edit_after_consecutive_failure_escalation_still_clears() {
+        use crate::loop_engine::reactions::post_output::{HandleOverflowParams, handle_overflow};
+        use crate::loop_engine::reactions::pre_spawn::invalidate_stale_overrides;
+        use tempfile::TempDir;
+
+        let task_id = "T-001";
+        let (_dir, mut conn) = setup_test_db();
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, consecutive_failures) \
+             VALUES ('T-001', 'Test', 'in_progress', 0)",
+            [],
+        )
+        .unwrap();
+
+        let mut ctx = IterationContext::new(8);
+        let pr = overflow_prompt_result(task_id);
+        let project_cfg = ProjectConfig::default();
+        let tmp = TempDir::new().unwrap();
+        handle_overflow(HandleOverflowParams {
+            ctx: &mut ctx,
+            conn: &mut conn,
+            task_id,
+            effort: Some("xhigh"),
+            effective_model: None,
+            prompt_result: &pr,
+            iteration: 1,
+            run_id: Some("run-rung1"),
+            base_dir: tmp.path(),
+            slot_index: None,
+            effective_runner: RunnerKind::Claude,
+            project_config: &project_cfg,
+        });
+        escalate_task_model_if_needed(&conn, task_id, 2, &mut ctx).unwrap();
+
+        // Operator edits tasks.model to a DIFFERENT model out-of-band.
+        conn.execute(
+            &format!("UPDATE tasks SET model = '{HAIKU_MODEL}' WHERE id = 'T-001'"),
+            [],
+        )
+        .unwrap();
+        invalidate_stale_overrides(&mut ctx, &conn, task_id);
+        assert!(
+            !ctx.effort_overrides.contains_key(task_id),
+            "a genuine operator edit after escalation must still fire the clear",
+        );
+        assert!(
+            !ctx.overflow_original_task_model.contains_key(task_id),
+            "the six-channel clear must remove the snapshot on a real operator edit",
         );
     }
 
@@ -1759,9 +1726,7 @@ mod tests {
         .unwrap();
 
         let mut ctx = IterationContext::new(8);
-        let result =
-            escalate_task_model_if_needed(&conn, "T-001", 2, &mut ctx, None, None, None, None)
-                .unwrap();
+        let result = escalate_task_model_if_needed(&conn, "T-001", 2, &mut ctx).unwrap();
         assert_eq!(
             result,
             Some(OPUS_MODEL.to_string()),
@@ -1790,9 +1755,7 @@ mod tests {
         .unwrap();
 
         let mut ctx = IterationContext::new(8);
-        let result =
-            escalate_task_model_if_needed(&conn, "T-001", 1, &mut ctx, None, None, None, None)
-                .unwrap();
+        let result = escalate_task_model_if_needed(&conn, "T-001", 1, &mut ctx).unwrap();
         assert_eq!(result, None, "no escalation at 1 failure (threshold is 2)");
         let model: Option<String> = conn
             .query_row("SELECT model FROM tasks WHERE id = 'T-001'", [], |r| {
@@ -1806,361 +1769,145 @@ mod tests {
         );
     }
 
-    // --- FEAT-005: opt-in Codex→Claude fallback tests ---
+    // --- REFACTOR-007: operator-resolved config threading ---
+    //
+    // Both escalation paths must resolve the Claude tier ladder from the
+    // OPERATOR's config (carried on `IterationContext::resolved_models`), not the
+    // builtin defaults. These use a production-shaped FR-001 JSON config with a
+    // custom Claude ladder that omits the `standard` rung — so a `sonnet`
+    // (cost-efficient) baseline escalates PAST the (undefined) standard rung
+    // straight to the frontier (`fable`). The builtin ladder would give `opus`,
+    // so the two outputs are unambiguously distinguishable.
 
-    use crate::loop_engine::project_config::{PrimaryRunnerConfig, RunnerSpec};
-
-    fn primary_with_codex_route(prefix: &str, runtime_error_fallback: bool) -> PrimaryRunnerConfig {
-        let mut by_id_prefix = std::collections::HashMap::new();
-        by_id_prefix.insert(
-            prefix.to_string(),
-            RunnerSpec {
-                provider: "codex".to_string(),
-                model: String::new(),
-                runtime_error_fallback,
-            },
-        );
-        PrimaryRunnerConfig {
-            claude_fallback_model: None,
-            runtime_error_threshold: 2,
-            by_task_type: std::collections::HashMap::new(),
-            by_id_prefix,
-            ..Default::default()
-        }
+    /// Build a production-shaped (FR-001 JSON, real serde field names) Claude
+    /// ladder with NO `standard` rung. Model ids come from the exported
+    /// constants — never literals — so `no_hardcoded_models` stays green.
+    fn operator_models_no_standard_rung() -> model::ResolvedModelsConfig {
+        let json = serde_json::json!({
+            "primaryProvider": "claude",
+            "anchor": "standard",
+            "providers": {
+                "claude": {
+                    "enabled": true,
+                    "tiers": {
+                        "cheapest": HAIKU_MODEL,
+                        "cost-efficient": SONNET_MODEL,
+                        "frontier": FABLE_MODEL
+                    }
+                }
+            }
+        });
+        let models: crate::loop_engine::project_config::ModelsConfig =
+            serde_json::from_value(json).expect("production-shaped models JSON deserializes");
+        model::resolve_models_config(
+            &models,
+            &crate::loop_engine::project_config::RoutingConfig::default(),
+        )
     }
 
-    fn insert_codex_task_at_threshold(conn: &Connection, id: &str, difficulty: Option<&str>) {
-        // Codex routes carry `model=""` in the spec, so tasks.model is NULL.
-        // The `difficulty` column drives the OPUS_MODEL escalation when
-        // promoting Codex→Claude.
-        let diff_col = if difficulty.is_some() {
-            ", difficulty"
-        } else {
-            ""
-        };
-        let diff_val = difficulty.map(|d| format!(", '{d}'")).unwrap_or_default();
+    /// Consecutive-failure escalation writes a model from the OPERATOR ladder.
+    /// With the standard rung dropped, sonnet escalates to fable — the builtin
+    /// ladder would write opus, so this falsifies a `builtin_resolved_models()`
+    /// regression at `escalate_task_model_if_needed_inner`.
+    #[test]
+    fn test_consecutive_escalation_uses_operator_ladder_not_builtin() {
+        let (_dir, conn) = setup_test_db();
         conn.execute(
-            &format!(
-                "INSERT INTO tasks (id, title, status, consecutive_failures{diff_col}) \
-                 VALUES ('{id}', 'Test', 'in_progress', 0{diff_val})"
-            ),
+            &format!("INSERT INTO tasks (id, title, status, model, consecutive_failures) VALUES ('T-001', 'Test', 'in_progress', '{SONNET_MODEL}', 0)"),
             [],
         )
         .unwrap();
-    }
 
-    /// Thin wrapper: runs the inner with `executed_runner=Some(Codex)` (so
-    /// the Codex branch is exercised regardless of the task's resolved
-    /// model), and applies any PendingPromotion to ctx — matching the
-    /// production sequence inside `handle_task_failure_with_runner`.
-    fn run_codex_escalation(
-        conn: &Connection,
-        task_id: &str,
-        new_count: i32,
-        ctx: &mut IterationContext,
-        primary_cfg: Option<&PrimaryRunnerConfig>,
-    ) -> Option<String> {
-        let (model, pending) = escalate_task_model_if_needed_inner(
-            conn,
-            task_id,
-            new_count,
-            ctx,
-            RunnerKind::Codex,
-            None,
-            primary_cfg,
-            None,
-            None,
-        )
-        .unwrap();
-        if let Some(p) = pending {
-            apply_pending_promotion(ctx, &p);
-        }
-        model
-    }
-
-    /// Positive AC: runtimeErrorFallback:true + Codex RUNTIME failure →
-    /// runner_overrides[id] == RunnerKind::Claude with a Claude model, exactly once.
-    #[test]
-    fn test_codex_fallback_to_claude_true_promotes_to_claude_once() {
-        let (_dir, conn) = setup_test_db();
-        insert_codex_task_at_threshold(&conn, "SPIKE-001", Some("medium"));
-        let cfg = primary_with_codex_route("SPIKE-", true);
         let mut ctx = IterationContext::new(8);
+        ctx.resolved_models = operator_models_no_standard_rung();
 
-        let result = run_codex_escalation(&conn, "SPIKE-001", 2, &mut ctx, Some(&cfg));
-        assert!(result.is_some(), "promotion must return Some(target_model)");
-        let target = result.unwrap();
-
-        // runner_overrides flipped to Claude
+        let result = escalate_task_model_if_needed(&conn, "T-001", 2, &mut ctx).unwrap();
         assert_eq!(
-            ctx.runner_overrides.get("SPIKE-001"),
-            Some(&RunnerKind::Claude),
-            "Codex→Claude promotion must insert Claude into runner_overrides",
+            result,
+            Some(FABLE_MODEL.to_string()),
+            "operator ladder (no standard rung): sonnet must escalate past the \
+             undefined standard rung to the frontier (fable)"
         );
-        // model_overrides carries the Claude model
-        assert_eq!(
-            ctx.model_overrides.get("SPIKE-001").map(String::as_str),
-            Some(target.as_str()),
-            "model_overrides must carry the promoted Claude model",
+        assert_ne!(
+            result,
+            Some(OPUS_MODEL.to_string()),
+            "must NOT fall back to the builtin ladder (which would write opus)"
         );
-        // DB row reflects the same model
-        let db_model: Option<String> = conn
-            .query_row("SELECT model FROM tasks WHERE id = 'SPIKE-001'", [], |r| {
+        let model: Option<String> = conn
+            .query_row("SELECT model FROM tasks WHERE id = 'T-001'", [], |r| {
                 r.get(0)
             })
             .unwrap();
         assert_eq!(
-            db_model.as_deref(),
-            Some(target.as_str()),
-            "tasks.model must reflect the promoted Claude model",
-        );
-
-        // Re-entry with executed_runner=Codex must NOT re-promote
-        // (idempotency — the runner_overrides entry blocks the branch).
-        let again = run_codex_escalation(&conn, "SPIKE-001", 3, &mut ctx, Some(&cfg));
-        assert_eq!(
-            again, None,
-            "already-promoted task must NOT re-promote on the next Codex failure",
-        );
-        assert_eq!(
-            ctx.runner_overrides.get("SPIKE-001"),
-            Some(&RunnerKind::Claude),
-            "runner_overrides must remain Claude — never flipped back to Codex",
+            model,
+            Some(FABLE_MODEL.to_string()),
+            "the DB model column must be written from the operator ladder"
         );
     }
 
-    /// Difficulty=high → target Claude model is OPUS_MODEL.
+    /// Crash escalation resolves the same operator ladder via
+    /// `crash_escalated_model_with_config` (the production path
+    /// `resolve_task_execution` uses): sonnet → fable, not opus.
     #[test]
-    fn test_codex_fallback_to_claude_high_difficulty_uses_opus() {
-        let (_dir, conn) = setup_test_db();
-        insert_codex_task_at_threshold(&conn, "SPIKE-002", Some("high"));
-        let cfg = primary_with_codex_route("SPIKE-", true);
-        let mut ctx = IterationContext::new(8);
+    fn test_crash_escalation_uses_operator_ladder_not_builtin() {
+        use crate::loop_engine::reactions::pre_spawn::crash_escalated_model_with_config;
 
-        let result = run_codex_escalation(&conn, "SPIKE-002", 2, &mut ctx, Some(&cfg));
-        assert_eq!(
-            result.as_deref(),
-            Some(OPUS_MODEL),
-            "high difficulty must promote to OPUS_MODEL",
-        );
-        assert_eq!(
-            ctx.model_overrides.get("SPIKE-002").map(String::as_str),
-            Some(OPUS_MODEL),
-        );
-    }
-
-    /// Non-high difficulty + claude_fallback_model set → uses configured Claude model.
-    #[test]
-    fn test_codex_fallback_to_claude_non_high_uses_configured_claude() {
-        let (_dir, conn) = setup_test_db();
-        insert_codex_task_at_threshold(&conn, "SPIKE-003", Some("medium"));
-        let mut cfg = primary_with_codex_route("SPIKE-", true);
-        cfg.claude_fallback_model = Some(SONNET_MODEL.to_string());
-        let mut ctx = IterationContext::new(8);
-
-        let result = run_codex_escalation(&conn, "SPIKE-003", 2, &mut ctx, Some(&cfg));
-        assert_eq!(
-            result.as_deref(),
+        let operator = operator_models_no_standard_rung();
+        let result = crash_escalated_model_with_config(
+            &crash_map(&[("FEAT-001", true)]),
+            "FEAT-001",
             Some(SONNET_MODEL),
-            "non-high difficulty must use claude_fallback_model when set",
+            &operator,
         );
-    }
-
-    /// Negative AC: runtimeErrorFallback:false → no promotion, auto-block (legacy).
-    #[test]
-    fn test_codex_fallback_to_claude_false_yields_no_promotion() {
-        let (_dir, conn) = setup_test_db();
-        insert_codex_task_at_threshold(&conn, "SPIKE-004", Some("medium"));
-        let cfg = primary_with_codex_route("SPIKE-", false);
-        let mut ctx = IterationContext::new(8);
-
-        let result = run_codex_escalation(&conn, "SPIKE-004", 2, &mut ctx, Some(&cfg));
         assert_eq!(
-            result, None,
-            "runtimeErrorFallback:false must return None (auto-block path)",
+            result,
+            Some(FABLE_MODEL.to_string()),
+            "operator ladder: sonnet crash must escalate to the frontier (fable)"
         );
-        assert!(
-            !ctx.runner_overrides.contains_key("SPIKE-004"),
-            "no runner_overrides entry must be inserted",
+        assert_ne!(
+            result,
+            Some(OPUS_MODEL.to_string()),
+            "must NOT use the builtin ladder (which would give opus)"
         );
-        let db_model: Option<String> = conn
-            .query_row("SELECT model FROM tasks WHERE id = 'SPIKE-004'", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        assert!(
-            db_model.is_none(),
-            "tasks.model must be unchanged (still NULL)",
+
+        // Same inputs against the builtin ladder still give opus — proving the
+        // divergence is the config input, not the model/task arguments.
+        let builtin = crash_escalated_model_with_config(
+            &crash_map(&[("FEAT-001", true)]),
+            "FEAT-001",
+            Some(SONNET_MODEL),
+            model::builtin_resolved_models(),
         );
+        assert_eq!(builtin, Some(OPUS_MODEL.to_string()));
     }
 
-    /// Negative AC: runtimeErrorFallback absent → defaults to false (serde).
-    /// Tests deserialization path end-to-end.
+    /// Default-config behavior is byte-identical: with the builtin ladder on
+    /// the context (the `IterationContext::new` default), consecutive-failure
+    /// escalation still walks sonnet → opus exactly as before the threading.
     #[test]
-    fn test_codex_fallback_to_claude_absent_defaults_to_false() {
+    fn test_consecutive_escalation_default_config_byte_identical() {
         let (_dir, conn) = setup_test_db();
-        insert_codex_task_at_threshold(&conn, "SPIKE-005", Some("medium"));
-        // Build the spec via JSON to exercise the serde default.
-        let cfg: PrimaryRunnerConfig = serde_json::from_str(
-            r#"{
-                "byIdPrefix": {
-                    "SPIKE-": { "provider": "codex" }
-                }
-            }"#,
+        conn.execute(
+            &format!("INSERT INTO tasks (id, title, status, model, consecutive_failures) VALUES ('T-001', 'Test', 'in_progress', '{SONNET_MODEL}', 0)"),
+            [],
         )
         .unwrap();
+
         let mut ctx = IterationContext::new(8);
-
-        let result = run_codex_escalation(&conn, "SPIKE-005", 2, &mut ctx, Some(&cfg));
-        assert_eq!(result, None, "absent runtimeErrorFallback must auto-block");
-        assert!(!ctx.runner_overrides.contains_key("SPIKE-005"));
-    }
-
-    /// Negative: no primaryRunner config → no promotion.
-    #[test]
-    fn test_codex_no_primary_runner_config_no_promotion() {
-        let (_dir, conn) = setup_test_db();
-        insert_codex_task_at_threshold(&conn, "SPIKE-006", Some("medium"));
-        let mut ctx = IterationContext::new(8);
-        // Simulate Codex executing the task even without primary_runner config
-        // (e.g. an orphan ctx.runner_overrides entry from a prior session).
-        ctx.runner_overrides
-            .insert("SPIKE-006".to_string(), RunnerKind::Codex);
-
-        let result = escalate_task_model_if_needed_inner(
-            &conn,
-            "SPIKE-006",
-            2,
-            &ctx,
-            RunnerKind::Codex,
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        let result = escalate_task_model_if_needed(&conn, "T-001", 2, &mut ctx).unwrap();
         assert_eq!(
-            result.0, None,
-            "Codex without primaryRunner config must auto-block",
+            result,
+            Some(OPUS_MODEL.to_string()),
+            "default (builtin) ladder must still escalate sonnet → opus"
         );
-        assert!(result.1.is_none(), "no PendingPromotion must be returned",);
-    }
-
-    /// Negative: non-Codex route with runtimeErrorFallback:true must be ignored.
-    /// The field is only meaningful on Codex routes; a Grok route with the
-    /// flag set must not accidentally trigger a Codex→Claude promotion path.
-    #[test]
-    fn test_codex_fallback_on_non_codex_route_is_ignored() {
-        let (_dir, conn) = setup_test_db();
-        insert_codex_task_at_threshold(&conn, "SPIKE-007", Some("medium"));
-        let mut by_id_prefix = std::collections::HashMap::new();
-        by_id_prefix.insert(
-            "SPIKE-".to_string(),
-            RunnerSpec {
-                provider: "grok".to_string(),
-                model: "grok-build".to_string(),
-                runtime_error_fallback: true, // set on a non-Codex route
-            },
-        );
-        let cfg = PrimaryRunnerConfig {
-            claude_fallback_model: None,
-            runtime_error_threshold: 2,
-            by_task_type: std::collections::HashMap::new(),
-            by_id_prefix,
-            ..Default::default()
-        };
-        let mut ctx = IterationContext::new(8);
-        // Force-mark this task as Codex-executing so we exercise the new branch.
-        ctx.runner_overrides
-            .insert("SPIKE-007".to_string(), RunnerKind::Codex);
-        // The branch should NOT promote: the matching route is Grok, not Codex.
-        // (The Codex branch short-circuits on the provider guard.)
-
-        // But wait — the idempotency guard short-circuits on the existing entry.
-        // Strip it so we exercise the provider check, not idempotency.
-        ctx.runner_overrides.remove("SPIKE-007");
-        let result = escalate_task_model_if_needed_inner(
-            &conn,
-            "SPIKE-007",
-            2,
-            &ctx,
-            RunnerKind::Codex,
-            None,
-            Some(&cfg),
-            None,
-            None,
-        )
-        .unwrap();
-        assert_eq!(
-            result.0, None,
-            "non-Codex route with runtimeErrorFallback:true must NOT promote",
-        );
-    }
-
-    /// Idempotency: a task already promoted (runner_overrides entry exists)
-    /// must NOT promote again — protects against the Codex→Claude→Codex ping-pong
-    /// the symmetric Claude↔Grok guard prevents on the other branches.
-    #[test]
-    fn test_codex_fallback_idempotent_when_already_promoted() {
-        let (_dir, conn) = setup_test_db();
-        insert_codex_task_at_threshold(&conn, "SPIKE-008", Some("medium"));
-        let cfg = primary_with_codex_route("SPIKE-", true);
-        let mut ctx = IterationContext::new(8);
-        // Simulate a prior promotion: task is now on Claude with an existing override.
-        ctx.runner_overrides
-            .insert("SPIKE-008".to_string(), RunnerKind::Claude);
-
-        // Pass executed_runner=Codex to force-enter the Codex branch even
-        // though runner_overrides says Claude (simulates a stale dispatch path).
-        let result = escalate_task_model_if_needed_inner(
-            &conn,
-            "SPIKE-008",
-            3,
-            &ctx,
-            RunnerKind::Codex,
-            None,
-            Some(&cfg),
-            None,
-            None,
-        )
-        .unwrap();
-        assert_eq!(
-            result.0, None,
-            "already-promoted task must NOT re-promote (idempotency guard)",
-        );
-        assert!(
-            result.1.is_none(),
-            "no PendingPromotion must be returned on re-entry",
-        );
-    }
-
-    /// Invariant: the Codex→Claude promotion never inserts RunnerKind::Codex
-    /// into runner_overrides (cf. codex_runner_overrides_invariant.rs). Reads
-    /// every inserted runner_overrides entry and verifies none are Codex.
-    #[test]
-    fn test_codex_fallback_promotion_never_inserts_codex_override() {
-        let (_dir, conn) = setup_test_db();
-        insert_codex_task_at_threshold(&conn, "SPIKE-009", Some("high"));
-        let cfg = primary_with_codex_route("SPIKE-", true);
-        let mut ctx = IterationContext::new(8);
-
-        let _ = run_codex_escalation(&conn, "SPIKE-009", 2, &mut ctx, Some(&cfg));
-        for (id, kind) in &ctx.runner_overrides {
-            assert_ne!(
-                *kind,
-                RunnerKind::Codex,
-                "runner_overrides[{id}] must never be Codex \
-                 (the promotion inserts Claude, never Codex)",
-            );
-        }
     }
 
     /// Known-bad regression: confirms `handle_task_failure_with_runner` is
-    /// NEVER called for `Crash(CodexAuthFailure)` at either caller, so the
-    /// promotion path is unreachable for auth failures even when
-    /// runtimeErrorFallback:true. Both sequential (orchestrator.rs) and wave
-    /// (wave_scheduler.rs) gates must list `CodexAuthFailure` in the
-    /// exclusion match — if a future refactor drops it, this test fails.
+    /// NEVER called for `Crash(CodexAuthFailure)` at either caller, so an auth
+    /// lapse never pushes a healthy task toward `auto_block_task`. Both
+    /// sequential (orchestrator.rs) and wave (wave_scheduler.rs) gates must
+    /// list `CodexAuthFailure` in the exclusion match — if a future refactor
+    /// drops it, this test fails.
     #[test]
     fn test_codex_auth_failure_excluded_at_callers() {
         let orch = std::fs::read_to_string("src/loop_engine/orchestrator.rs")

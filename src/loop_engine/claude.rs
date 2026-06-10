@@ -569,7 +569,7 @@ mod tests {
     use super::*;
     use crate::error::TaskMgrError;
     use crate::loop_engine::config::CODING_ALLOWED_TOOLS;
-    use crate::loop_engine::model::{HAIKU_MODEL, OPUS_MODEL, OPUS_MODEL_1M, SONNET_MODEL};
+    use crate::loop_engine::model::{HAIKU_MODEL, ONE_M_SUFFIX, OPUS_MODEL, SONNET_MODEL};
     use crate::loop_engine::signals::SignalFlag;
     use crate::loop_engine::watchdog::{TimeoutConfig, exit_code_from_status};
     use rstest::rstest;
@@ -1051,13 +1051,14 @@ mod tests {
         );
     }
 
-    /// model=Some(OPUS_MODEL_1M) → --model flag present with the 1M context model ID.
+    /// model=Some(opus[1m]) → --model flag present with the 1M context model ID.
     #[test]
     fn test_spawn_model_opus_1m_includes_model_flag() {
+        let opus_1m = format!("{OPUS_MODEL}{ONE_M_SUFFIX}");
         let result = spawn_claude_echo(
             "test_prompt",
             None,
-            Some(OPUS_MODEL_1M),
+            Some(opus_1m.as_str()),
             false,
             &scoped_coding(),
         );
@@ -1066,10 +1067,10 @@ mod tests {
         let res = result.unwrap();
         let output = res.output.trim();
 
-        let expected = format!("--model {OPUS_MODEL_1M}");
+        let expected = format!("--model {opus_1m}");
         assert!(
             output.contains(&expected),
-            "model=Some(OPUS_MODEL_1M) should include --model flag with 1M variant, got: '{}'",
+            "model=Some(opus[1m]) should include --model flag with 1M variant, got: '{}'",
             output
         );
     }

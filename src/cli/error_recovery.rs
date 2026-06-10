@@ -67,6 +67,42 @@ static WRONG_ARG_HINTS: &[(&str, &str, &str)] = &[
          \x20 task-mgr recall --query <text> --limit 1\n\
          \x20 task-mgr learnings | grep <N>",
     ),
+    // Removed `models` verbs (FR-009 provider-first redesign): point each at its
+    // replacement so muscle memory lands on the new surface.
+    (
+        "models",
+        "set-default",
+        "hint: `task-mgr models set-default` was removed (provider-first redesign).\n\
+         \x20 task-mgr models set-anchor <tier>   set the anchor capability tier\n\
+         \x20 task-mgr models route <PREFIX> --provider <p> [--tier <t>]   pin a route\n\
+         \x20 task-mgr models init                scaffold the FR-001 config",
+    ),
+    (
+        "models",
+        "unset-default",
+        "hint: `task-mgr models unset-default` was removed. Reset with:\n\
+         \x20 task-mgr models init [--force-replace-legacy]",
+    ),
+    (
+        "models",
+        "set-review-model",
+        "hint: `task-mgr models set-review-model` was removed. Review routing is now config-explicit:\n\
+         \x20 task-mgr models route REVIEW- --provider <p> [--tier frontier]",
+    ),
+    (
+        "models",
+        "unset-review-model",
+        "hint: `task-mgr models unset-review-model` was removed. Use:\n\
+         \x20 task-mgr models unroute REVIEW-",
+    ),
+    (
+        "models",
+        "--enable",
+        "hint: `task-mgr models set-fallback` no longer takes --enable/--disable/--provider/--model.\n\
+         The fallback is now per-provider and tier-preserving:\n\
+         \x20 task-mgr models set-fallback <provider> <target-provider>\n\
+         \x20 task-mgr models unset-fallback <provider>",
+    ),
 ];
 
 /// Look up a hint for the given argv slice (including argv[0] / program name).
@@ -170,6 +206,55 @@ mod tests {
             .collect();
         let hint = lookup_hint(&argv).unwrap();
         assert!(hint.contains("loop init") || hint.contains("--append"));
+    }
+
+    #[test]
+    fn removed_models_set_default_points_at_set_anchor() {
+        // The model arg value is irrelevant to the hint; keep it a non-model
+        // literal so the no_hardcoded_models guard doesn't flag this file.
+        let argv: Vec<String> = ["task-mgr", "models", "set-default", "some-model"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let hint = lookup_hint(&argv).unwrap();
+        assert!(
+            hint.contains("set-anchor"),
+            "must point at set-anchor: {hint}"
+        );
+        assert!(
+            !hint.contains("models set-default <"),
+            "must not imply it still exists"
+        );
+    }
+
+    #[test]
+    fn removed_models_set_review_model_points_at_route() {
+        let argv: Vec<String> = ["task-mgr", "models", "set-review-model", "grok-build"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let hint = lookup_hint(&argv).unwrap();
+        assert!(
+            hint.contains("route REVIEW-"),
+            "must point at the route verb: {hint}"
+        );
+    }
+
+    #[test]
+    fn old_set_fallback_enable_flag_points_at_new_shape() {
+        let argv: Vec<String> = [
+            "task-mgr",
+            "models",
+            "set-fallback",
+            "--enable",
+            "--model",
+            "grok-build",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let hint = lookup_hint(&argv).unwrap();
+        assert!(hint.contains("set-fallback <provider> <target"), "{hint}");
     }
 
     #[test]

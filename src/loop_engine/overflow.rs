@@ -30,7 +30,7 @@ pub enum RecoveryAction {
     DowngradeEffort {
         new_effort: String,
     },
-    EscalateModel {
+    EscalateTier {
         new_model: String,
     },
     #[serde(rename = "to_1m_model")]
@@ -70,7 +70,7 @@ impl RecoveryAction {
             Self::DowngradeEffort { new_effort } => format!(
                 "Prompt is too long for {task_id} at effort {eff} — downgrading effort to {new_effort}",
             ),
-            Self::EscalateModel { new_model } => format!(
+            Self::EscalateTier { new_model } => format!(
                 "Prompt is too long for {task_id} at effort {eff}, model {mdl} — escalating model to {new_model} (effort floor reached)",
             ),
             Self::To1mModel { new_model } => format!(
@@ -393,8 +393,8 @@ mod tests {
     }
 
     #[test]
-    fn user_message_escalate_model_exact_string() {
-        let msg = RecoveryAction::EscalateModel {
+    fn user_message_escalate_tier_exact_string() {
+        let msg = RecoveryAction::EscalateTier {
             new_model: model::OPUS_MODEL.to_string(),
         }
         .user_message("MY-TASK-001", Some("high"), Some(model::SONNET_MODEL));
@@ -410,8 +410,9 @@ mod tests {
 
     #[test]
     fn user_message_to_1m_model_exact_string() {
+        let opus_1m = format!("{}{}", model::OPUS_MODEL, model::ONE_M_SUFFIX);
         let msg = RecoveryAction::To1mModel {
-            new_model: model::OPUS_MODEL_1M.to_string(),
+            new_model: opus_1m.clone(),
         }
         .user_message("MY-TASK-001", Some("high"), Some(model::OPUS_MODEL));
         assert_eq!(
@@ -419,7 +420,7 @@ mod tests {
             format!(
                 "Prompt is too long for MY-TASK-001 at effort high, model {} — escalating to 1M-context variant {} (already at Opus)",
                 model::OPUS_MODEL,
-                model::OPUS_MODEL_1M
+                opus_1m
             )
         );
     }
@@ -435,16 +436,17 @@ mod tests {
 
     #[test]
     fn user_message_fallback_to_provider_exact_string() {
+        let opus_1m = format!("{}{}", model::OPUS_MODEL, model::ONE_M_SUFFIX);
         let msg = RecoveryAction::FallbackToProvider {
             provider: "grok".to_string(),
             model: "grok-build".to_string(),
         }
-        .user_message("MY-TASK-001", Some("high"), Some(model::OPUS_MODEL_1M));
+        .user_message("MY-TASK-001", Some("high"), Some(opus_1m.as_str()));
         assert_eq!(
             msg,
             format!(
                 "Prompt is too long for MY-TASK-001 at effort high, model {} — falling back to grok-build (Claude ladder exhausted)",
-                model::OPUS_MODEL_1M,
+                opus_1m,
             )
         );
     }
@@ -494,7 +496,7 @@ mod tests {
                 ("learnings".to_string(), 300),
             ],
             dropped_sections: vec!["progress".to_string()],
-            recovery: RecoveryAction::EscalateModel {
+            recovery: RecoveryAction::EscalateTier {
                 new_model: model::OPUS_MODEL.to_string(),
             },
             dump_path: "/tmp/dump.txt".to_string(),
@@ -536,26 +538,27 @@ mod tests {
     }
 
     #[test]
-    fn recovery_escalate_model_serialization() {
-        let v = serde_json::to_value(RecoveryAction::EscalateModel {
+    fn recovery_escalate_tier_serialization() {
+        let v = serde_json::to_value(RecoveryAction::EscalateTier {
             new_model: model::OPUS_MODEL.to_string(),
         })
         .unwrap();
         assert_eq!(
             v,
-            serde_json::json!({"action": "escalate_model", "new_model": model::OPUS_MODEL})
+            serde_json::json!({"action": "escalate_tier", "new_model": model::OPUS_MODEL})
         );
     }
 
     #[test]
     fn recovery_to_1m_model_serialization() {
+        let opus_1m = format!("{}{}", model::OPUS_MODEL, model::ONE_M_SUFFIX);
         let v = serde_json::to_value(RecoveryAction::To1mModel {
-            new_model: model::OPUS_MODEL_1M.to_string(),
+            new_model: opus_1m.clone(),
         })
         .unwrap();
         assert_eq!(
             v,
-            serde_json::json!({"action": "to_1m_model", "new_model": model::OPUS_MODEL_1M})
+            serde_json::json!({"action": "to_1m_model", "new_model": opus_1m})
         );
     }
 

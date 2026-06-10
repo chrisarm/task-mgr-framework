@@ -56,7 +56,7 @@ use std::time::{Duration, Instant};
 use rusqlite::Connection;
 
 use crate::TaskMgrResult;
-use crate::commands::next::selection::select_parallel_group;
+use crate::commands::next::selection::select_parallel_group_excluding;
 use crate::commands::run as run_cmd;
 use crate::db::prefix::prefix_and;
 use crate::lifecycle::TaskLifecycle;
@@ -65,7 +65,7 @@ use crate::loop_engine::config::{self, IterationOutcome};
 use crate::loop_engine::engine::{
     EffectiveRunnerInput, FailedMerge, IterationContext, MergeFailHaltDecision, SlotContext,
     SlotIterationParams, SlotResult, WaveAggregator, WaveIterationParams, WaveOutcome, WaveResult,
-    WaveTerminal, apply_review_model_override, resolve_effective_runner,
+    WaveTerminal, resolve_effective_runner,
 };
 use crate::loop_engine::git_reconcile::reconcile_merged_slot_completions;
 use crate::loop_engine::merge_resolver;
@@ -283,6 +283,7 @@ fn build_shared_slot_params(
 /// avoids cloning the `PathBuf` per slot.
 fn build_slot_prompt_params<'a>(
     params: &'a WaveIterationParams<'a>,
+    provider_blackouts: &std::collections::HashSet<crate::loop_engine::model::Provider>,
 ) -> prompt::slot::SlotPromptParams<'a> {
     prompt::slot::SlotPromptParams {
         project_root: params.source_root.to_path_buf(),
@@ -290,10 +291,11 @@ fn build_slot_prompt_params<'a>(
         permission_mode: params.permission_mode.clone(),
         steering_path: params.steering_path,
         session_guidance: params.session_guidance,
-        primary_runner: params.project_config.primary_runner.as_ref(),
-        prd_default: params.default_model,
-        project_default: params.project_default_model,
-        user_default: params.user_default_model,
+        models_config: &params.project_config.models,
+        routing_config: &params.project_config.routing,
+        // FEAT-008: the active quota blackouts, so each slot's spawn-time plan
+        // reroutes spillover-eligible work consistently with `excluded_ids`.
+        provider_blackouts: provider_blackouts.clone(),
     }
 }
 
@@ -701,13 +703,34 @@ pub fn run_wave_iteration(
         })
         .collect();
 
-    let result = match select_parallel_group(
+    // FEAT-008: under an active quota blackout, exclude the todo tasks that
+    // resolve to a blacked-out provider they cannot reroute off of, so the wave
+    // fills its slots with spillover-eligible work and defers the rest. Empty
+    // blackout set → empty excluded set → identical to the pre-FEAT-008 group.
+    let active_blackouts = ctx
+        .provider_blackouts
+        .active(crate::loop_engine::engine::now_unix_secs());
+    let excluded_ids = {
+        // Reuse the once-per-run resolution on the context (orchestrator.rs)
+        // rather than reconstructing it from `params.project_config`; identical
+        // projections of the same validated input, one source prevents drift.
+        let resolved_models = &ctx.resolved_models;
+        reactions::pre_spawn::compute_quota_excluded_ids(
+            ctx,
+            params.conn,
+            params.task_prefix,
+            resolved_models,
+            &active_blackouts,
+        )
+    };
+    let result = match select_parallel_group_excluding(
         params.conn,
         &ctx.last_files,
         params.task_prefix,
         params.parallel_slots,
         &extra_implicit,
         &ephemeral_overlay,
+        &excluded_ids,
     ) {
         Ok(r) => r,
         Err(e) => {
@@ -738,7 +761,7 @@ pub fn run_wave_iteration(
 
     let n_slots = group.len();
     let slot_paths: &[PathBuf] = &params.slot_worktree_paths[..n_slots];
-    let slot_prompt_params = build_slot_prompt_params(&params);
+    let slot_prompt_params = build_slot_prompt_params(&params, &active_blackouts);
     let mut slot_contexts =
         build_slot_contexts(params.conn, group, slot_paths, &slot_prompt_params);
     // FEAT-002: resolve the pre-spawn execution plan per slot on the main
@@ -752,14 +775,14 @@ pub fn run_wave_iteration(
     for slot in slot_contexts.iter_mut() {
         let task_id = slot.prompt_bundle.task_id.clone();
         // Baseline model the worker would otherwise spawn with
-        // (`bundle.resolved_model → params.default_model`), captured BEFORE the
-        // coordinator so the crash-escalation + runner resolution see the same
-        // string `run_slot_iteration` resolves internally.
-        let baseline: Option<String> = slot
-            .prompt_bundle
-            .resolved_model
-            .clone()
-            .or_else(|| params.default_model.map(str::to_string));
+        // (`bundle.resolved_model`), captured BEFORE the coordinator so the
+        // crash-escalation + runner resolution see the same string
+        // `run_slot_iteration` resolves internally. `prd_metadata.default_model`
+        // is intentionally NOT consulted here: it is ignored under the models
+        // config (hard break), matching the sequential path and the startup
+        // warning — a None resolved_model means "spawn with no model flag"
+        // (provider-only Codex spec), not "widen to the PRD default".
+        let baseline: Option<String> = slot.prompt_bundle.resolved_model.clone();
 
         let plan = reactions::pre_spawn::resolve_task_execution(
             reactions::pre_spawn::ResolveTaskExecutionParams {
@@ -795,47 +818,40 @@ pub fn run_wave_iteration(
         }
         slot.effective_effort = plan.effort;
 
-        // Route review-class slots to `reviewModel` AFTER the escape valve /
-        // crash escalation (so neither overwrites the routing). Mutating the
-        // bundle's `resolved_model` (not just a local) keeps runner selection,
-        // the `--model` flag in `run_slot_iteration`, and the prompt-baked
-        // model consistent — a drift-`assert!` cross-check on
-        // `slot_result.effective_runner` would panic if these disagreed.
-        if let Some(review_model_override) =
-            apply_review_model_override(params.project_config.review_model.as_deref(), &task_id)
-        {
-            let old = slot
-                .prompt_bundle
-                .resolved_model
-                .as_deref()
-                .unwrap_or("(default)");
-            ui::emit(&format!(
-                "Review-class routing [slot {}]: {} → {} (reviewModel)",
-                slot.slot_index, old, review_model_override,
-            ));
-            slot.prompt_bundle.resolved_model = Some(review_model_override);
-            slot.prompt_bundle.provider_hint = None;
-        }
+        // Review-class routing now flows from `resolve_execution_plan` rung 3
+        // (FEAT-004): the slot bundle's `resolved_model`/`provider_hint` already
+        // carry the review→frontier route from build time. The legacy
+        // review-model per-slot rewrite is deleted.
 
-        // Resolve the runner over the FINAL model (post crash escalation +
-        // review routing). `plan.runner` reflects only the pre-routing
+        // Resolve the runner over the FINAL model (post crash escalation).
+        // `plan.runner` reflects only the pre-routing
         // baseline, so this re-resolution is the authoritative spawn
         // discriminant — identical in shape to the sequential path's single
         // `resolve_effective_runner` at the end of its pre-spawn block.
         //
-        // `effective_model` widens to `default_model` when `resolved_model`
-        // is None (provider-only Codex spec: {provider:"codex",model:""}
-        // normalises to resolved_model=None). The hint MUST NOT be dropped
-        // based on this widening — crash escalation (line 1124) and review
-        // routing (line 1157) already clear `slot.prompt_bundle.provider_hint`
-        // when a rewrite fires. Any remaining hint is intentional provider
-        // intent that must survive to the spawn boundary (WIRE-FIX-001).
-        let effective_model = slot
-            .prompt_bundle
-            .resolved_model
-            .as_deref()
-            .or(params.default_model);
-        let provider_hint = slot.prompt_bundle.provider_hint;
+        // `effective_model` is the bundle's `resolved_model` verbatim:
+        // `prd_metadata.default_model` is ignored under the models config (hard
+        // break), so there is NO widening to a PRD default — matching the
+        // sequential path (parity). A provider-only Codex spec
+        // ({provider:"codex",model:""}) still normalises to resolved_model=None;
+        // the provider_hint carries that intent and survives below because
+        // `effective_model == resolved_model` keeps `final_provider_hint` on its
+        // hint-preserving branch (the None→default widening branch is now inert).
+        let effective_model = slot.prompt_bundle.resolved_model.as_deref();
+        // Shared with the sequential path via `model::final_provider_hint`
+        // (REFACTOR-009): drop the hint only on a genuine rewrite. Crash
+        // escalation (line ~808) and review routing already cleared the hint at
+        // their rewrite sites, so the helper sees `None` there and is a no-op;
+        // any remaining hint is intentional provider intent. With no default
+        // widening, `effective_model == resolved_model` so the helper always
+        // returns the bundle hint here — `None` for `default_model` documents
+        // that the widening path is dead on the wave side.
+        let provider_hint = model::final_provider_hint(
+            slot.prompt_bundle.provider_hint,
+            effective_model,
+            slot.prompt_bundle.resolved_model.as_deref(),
+            None,
+        );
         slot.effective_runner = resolve_effective_runner(
             ctx,
             &task_id,
@@ -960,6 +976,11 @@ pub fn run_wave_iteration(
                 output: &s.iteration_result.output,
             })
             .collect();
+        // FEAT-008: the reaction records a quota blackout (spillover path)
+        // instead of waiting when difficulty-spillover is enabled. Reuse the
+        // once-per-run resolution on the context rather than rebuilding it.
+        let resolved_models = &ctx.resolved_models;
+        let now_secs = crate::loop_engine::engine::now_unix_secs();
         let account_params = reactions::account::AccountReactionParams {
             threshold: params.usage_params.threshold,
             usage_enabled: params.usage_params.enabled,
@@ -968,11 +989,27 @@ pub fn run_wave_iteration(
             prefix: params.task_prefix.unwrap_or(""),
             run_id: params.run_id,
             permission_mode: params.permission_mode,
+            spillover_enabled: resolved_models.routing.spillover.max_difficulty.is_some(),
+            primary_provider: resolved_models.primary_provider,
+            blackout_fallback_secs: resolved_models.routing.spillover.blackout_fallback_secs,
+            now_secs,
         };
-        match reactions::account::react_to_outputs(params.conn, &rate_limit_items, &account_params)
-        {
+        match reactions::account::react_to_outputs(
+            params.conn,
+            &rate_limit_items,
+            &account_params,
+            &mut ctx.provider_blackouts,
+        ) {
             reactions::account::AccountReaction::None => {}
-            reactions::account::AccountReaction::WaitedAndRetry => {
+            // A completed wait OR a recorded quota blackout (FEAT-008
+            // RerouteAndRetry / ProceedWithSpillover): the wave retries WITHOUT
+            // consuming the loop-bound iteration (B2) and WITHOUT zeroing the
+            // merge-fail streak (B3). The blackout path skipped the wait; the
+            // next wave reroutes spillover-eligible work and the no-eligible
+            // deferral branch waits only if everything is quota-deferred.
+            reactions::account::AccountReaction::WaitedAndRetry
+            | reactions::account::AccountReaction::RerouteAndRetry
+            | reactions::account::AccountReaction::ProceedWithSpillover => {
                 return WaveOutcome {
                     tasks_completed: agg.tasks_completed,
                     iteration_consumed: false,
@@ -1103,10 +1140,6 @@ pub fn run_wave_iteration(
             params.iteration as i64,
             ctx,
             Some(slot_result.effective_runner),
-            params.project_config.fallback_runner.as_ref(),
-            params.project_config.primary_runner.as_ref(),
-            params.project_default_model,
-            params.user_default_model,
         ) {
             tracing::warn!(
                 "failed to start retry tracking transaction for slot {} task {}: {}",
@@ -1494,6 +1527,7 @@ mod tests {
             shown_learning_ids: Vec::new(),
             resolved_model: None,
             difficulty: None,
+            cluster_effort: None,
             provider_hint: None,
             section_sizes: Vec::new(),
             dropped_sections: Vec::new(),
@@ -1556,8 +1590,6 @@ mod tests {
             permission_mode,
             signal_flag,
             default_model: None,
-            project_default_model: None,
-            user_default_model: None,
             verbose: false,
             task_prefix: None,
             prd_path,
@@ -2093,8 +2125,6 @@ mod tests {
                 permission_mode: &mode,
                 signal_flag: &signal,
                 default_model: None,
-                project_default_model: None,
-                user_default_model: None,
                 verbose: false,
                 task_prefix: None,
                 prd_path: &prd,
@@ -2166,10 +2196,9 @@ mod tests {
             permission_mode: PermissionMode::Dangerous,
             steering_path: None,
             session_guidance: "",
-            primary_runner: None,
-            prd_default: None,
-            project_default: None,
-            user_default: None,
+            models_config: crate::loop_engine::project_config::default_models_config(),
+            routing_config: crate::loop_engine::project_config::default_routing_config(),
+            provider_blackouts: Default::default(),
         };
         let slot_paths = vec![tmp.path().to_path_buf()];
         let slots = build_slot_contexts(&conn, vec![scored], &slot_paths, &prompt_params);
@@ -2302,8 +2331,6 @@ mod tests {
                 permission_mode,
                 signal_flag,
                 default_model: None,
-                project_default_model: None,
-                user_default_model: None,
                 verbose: false,
                 task_prefix: None,
                 prd_path,

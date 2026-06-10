@@ -23,7 +23,7 @@ use task_mgr::db::migrations::run_migrations;
 use task_mgr::db::{create_schema, open_connection};
 use task_mgr::learnings::crud::{RecordLearningParams, record_learning};
 use task_mgr::loop_engine::config::PermissionMode;
-use task_mgr::loop_engine::model::{OPUS_MODEL, SONNET_MODEL};
+use task_mgr::loop_engine::model::{FABLE_MODEL, SONNET_MODEL, builtin_resolved_models};
 use task_mgr::loop_engine::prompt::assembler::{PromptContext, SectionSpec, assemble};
 use task_mgr::loop_engine::prompt::core;
 use task_mgr::loop_engine::prompt::sequential::{
@@ -157,6 +157,7 @@ fn ctx_with_files<'a>(
         reorder_hint: None,
         batch_sibling_prds: None,
         resolved_model: None,
+        resolved_models: builtin_resolved_models(),
         next_task_output,
         recalled_learnings: None,
     }
@@ -574,6 +575,7 @@ fn sequential_learnings_render_matches_legacy() {
         reorder_hint: None,
         batch_sibling_prds: None,
         resolved_model: None,
+        resolved_models: builtin_resolved_models(),
         next_task_output: None,
         recalled_learnings: Some(&recalled),
     };
@@ -634,6 +636,7 @@ fn sequential_learnings_dropped_clears_shown_ids() {
         reorder_hint: None,
         batch_sibling_prds: None,
         resolved_model: None,
+        resolved_models: builtin_resolved_models(),
         next_task_output: None,
         recalled_learnings: Some(&recalled),
     };
@@ -755,6 +758,7 @@ fn shared_trimmable_ctx<'a>(
         reorder_hint: None,
         batch_sibling_prds: None,
         resolved_model: None,
+        resolved_models: builtin_resolved_models(),
         next_task_output: None,
         recalled_learnings: None,
     }
@@ -979,6 +983,7 @@ fn missing_steering_and_empty_source_render_empty_no_panic() {
         reorder_hint: None,
         batch_sibling_prds: None,
         resolved_model: None,
+        resolved_models: builtin_resolved_models(),
         next_task_output: None,
         recalled_learnings: None,
     };
@@ -1146,6 +1151,7 @@ fn sequential_siblings_render_matches_legacy() {
         reorder_hint: None,
         batch_sibling_prds: Some(&prds),
         resolved_model: None,
+        resolved_models: builtin_resolved_models(),
         next_task_output: None,
         recalled_learnings: None,
     };
@@ -1238,6 +1244,7 @@ fn sequential_escalation_render_matches_legacy() {
         reorder_hint: None,
         batch_sibling_prds: None,
         resolved_model: Some(SONNET_MODEL),
+        resolved_models: builtin_resolved_models(),
         next_task_output: None,
         recalled_learnings: None,
     };
@@ -1252,14 +1259,18 @@ fn sequential_escalation_render_matches_legacy() {
     assert_eq!(assembled.prompt, legacy);
     assert!(assembled.dropped_sections.is_empty());
 
-    // Opus tier → the section disappears (parity with the live builder).
-    let opus_legacy = build_escalation_section(&base, Some(OPUS_MODEL));
-    assert_eq!(opus_legacy, "", "guard: opus omits the escalation policy");
-    let ctx_opus = PromptContext {
-        resolved_model: Some(OPUS_MODEL),
+    // Ceiling (frontier) tier → the section disappears (parity with the live builder).
+    let fable_legacy = build_escalation_section(&base, Some(FABLE_MODEL));
+    assert_eq!(
+        fable_legacy, "",
+        "guard: the ceiling (fable) tier omits the escalation policy"
+    );
+    let ctx_fable = PromptContext {
+        resolved_model: Some(FABLE_MODEL),
+        resolved_models: builtin_resolved_models(),
         ..clone_ctx(&ctx_sonnet)
     };
-    assert_eq!((spec.render)(&ctx_opus, spec.kind).text, opus_legacy);
+    assert_eq!((spec.render)(&ctx_fable, spec.kind).text, fable_legacy);
 }
 
 // ---------------------------------------------------------------------------
@@ -1292,6 +1303,7 @@ fn sequential_reorder_hint_render_matches_legacy() {
         reorder_hint: Some("OTHER-002"),
         batch_sibling_prds: None,
         resolved_model: None,
+        resolved_models: builtin_resolved_models(),
         next_task_output: None,
         recalled_learnings: None,
     };
@@ -1409,6 +1421,7 @@ fn clone_ctx<'a>(ctx: &PromptContext<'a>) -> PromptContext<'a> {
         reorder_hint: ctx.reorder_hint,
         batch_sibling_prds: ctx.batch_sibling_prds,
         resolved_model: ctx.resolved_model,
+        resolved_models: ctx.resolved_models,
         next_task_output: ctx.next_task_output,
         recalled_learnings: ctx.recalled_learnings,
     }

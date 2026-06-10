@@ -33,76 +33,64 @@ File-scoped invariants are stored as learnings and surface via
 
 ## Model IDs and Effort Mapping
 
-All Claude model IDs and the difficulty→effort mapping live in a single file:
-`src/loop_engine/model.rs` (`OPUS_MODEL` / `SONNET_MODEL` / `HAIKU_MODEL` constants
-and the `EFFORT_FOR_DIFFICULTY` table). After bumping a value there:
+All model IDs (Claude + cross-provider) and the difficulty→effort tables live in a
+single file: `src/loop_engine/model.rs` (`FABLE_MODEL` / `OPUS_MODEL` /
+`SONNET_MODEL` / `HAIKU_MODEL` constants, `EFFORT_FOR_DIFFICULTY`,
+`CODEX_EFFORT_FOR_DIFFICULTY`, and the declarative `*_DEFAULT_TIER_MODELS`
+tables). After bumping a value or table there:
 
 ```sh
-cargo run --bin gen-docs   # regenerates the MODELS block in .claude/commands/tasks.md
+cargo run --bin gen-docs   # regenerates the MODELS block (with tier matrix + anchor explanation) in .claude/commands/tasks.md and plan-tasks.md
 ```
 
 CI runs `cargo run --bin gen-docs -- --check` which fails if the doc is stale.
-Tests import the constants; JSON fixtures use `{{OPUS_MODEL}}` placeholders in
-`tests/fixtures/*.json.tmpl` rendered at load time by
-`tests/common/mod.rs::render_fixture_tmpl`. A regression test
-(`tests/no_hardcoded_models.rs`) ensures literal model strings don't creep back
-in outside `model.rs`.
+Tests import the constants; JSON fixtures use tier placeholders
+(`{{FRONTIER_MODEL}}` / `{{STANDARD_MODEL}}` / `{{COST_EFFICIENT_MODEL}}` /
+`{{CHEAPEST_MODEL}}` and legacy const-style) in `tests/fixtures/*.json.tmpl`
+rendered at load time by `tests/common/mod.rs::render_fixture_tmpl`. A regression
+test (`tests/no_hardcoded_models.rs`) ensures literal model strings don't creep
+back in outside `model.rs`.
 
 ## `task-mgr models` subcommand
 
-List and pin Claude models, and manage the provider/model routing surfaces:
+Manage the provider-first `models` + `routing` config (FR-001 hard break). All
+writes target project `.task-mgr/config.json` (or user config) and round-trip via
+`serde_json::Value` so unrelated keys are preserved. Legacy surfaces are rejected
+at preflight.
 
 ```sh
-task-mgr models list                     # offline — built-in model IDs + effort table
-task-mgr models list --remote            # live /v1/models (requires both env vars below)
-task-mgr models list --refresh           # busts cache before fetch; implies --remote
-task-mgr models set-default [<model>]    # prompts interactively when model omitted
-task-mgr models set-default <id> --project   # writes .task-mgr/config.json instead
-task-mgr models unset-default [--project]
-task-mgr models show                     # default + reviewModel/fallbackRunner/primaryRunner routing table
-
-# Reviewer (review-class tasks: CODE-REVIEW-*, MILESTONE-FINAL, REVIEW-*)
-task-mgr models set-review-model <id> [--project]   # plain model string; provider inferred (grok-build → Grok)
-task-mgr models unset-review-model [--project]
-
-# Fallback runner (Grok overflow/RuntimeError escape; v1 provider must be grok)
-task-mgr models set-fallback --enable --model grok-build [--cli-binary /path/grok] [--runtime-error-threshold N] [--project]
-task-mgr models set-fallback --disable [--project]
-task-mgr models unset-fallback [--project]
+task-mgr models list                     # offline — built-in model IDs + per-provider tier/effort tables + anchor
+task-mgr models list --remote            # live /v1/models (Anthropic; requires ANTHROPIC_API_KEY + TASK_MGR_USE_API=1)
+task-mgr models list --refresh           # bust cache before fetch
+task-mgr models show                     # resolved models/routing table, anchor window, blackout note, codex route-only note, empty states
+task-mgr models init [--force-replace-legacy] [--dry-run]  # write default models+routing block (migration deletes old keys)
+task-mgr models set-anchor <tier>        # cheapest|cost-efficient|standard|frontier
+task-mgr models enable|disable <provider>   # claude|grok|codex (claude defaults enabled)
+task-mgr models set-tier <provider> <tier> [model-or-null]   # set rung (null = no -m flag)
+task-mgr models unset-tier <provider> <tier>
+task-mgr models set-effort <provider> <difficulty> [level-or-null]
+task-mgr models set-fallback <provider> [target-provider]   # tier-preserving rung-4 pivot target (different + enabled)
+task-mgr models unset-fallback <provider>
+task-mgr models route <prefix> [--provider <p>] [--tier <t>]   # byIdPrefix forcing
+task-mgr models unroute <prefix>
 ```
 
-`set-review-model` / `set-fallback` write the **config** routing surfaces
-(`reviewModel` / `fallbackRunner` in `.task-mgr/config.json`, or the user
-config without `--project`); they never stamp a per-task `model`. Every setter
-round-trips the config file via `serde_json::Value` so unrelated keys
-(`additionalAllowedTools`, `embeddingModel`, …) are preserved, and probes the
-target binary **before** writing when a Grok model/runner is involved (same
-resolver the loop startup probe uses). `set-fallback` rejects any provider other
-than `grok` in v1. `models show` reads the resolved `ProjectConfig` and prints
-the full routing table with explicit empty states — `(unset)`, `disabled`,
-`(no routes)` — so an unset surface is never confused with one that simply
-wasn't printed.
+`models show` prints the full merged routing table, the anchor-derived
+difficulty→model matrix for the primary, escalation cost note, and explicit
+`(unset)` / `disabled` / `(no routes)` / codex-route-only markers.
 
-**Remote opt-in** (prevents surprise HTTP calls on a globally-exported SDK key):
+**Remote / cache** (same as before for `list --remote`): `ANTHROPIC_API_KEY` +
+`TASK_MGR_USE_API=1`; cache under `$XDG_CACHE_HOME/task-mgr/models-cache.json`
+(24h).
 
-- `ANTHROPIC_API_KEY` — your Anthropic API key
-- `TASK_MGR_USE_API=1` — explicit opt-in; both must be set or we silently fall
-  back to the built-in list
+**Picker** (anchor-tier, FR-009): fires on `task-mgr init` (and the permanent
+shim) when no `models` block is configured and stdin/stderr are TTYs — never in
+auto mode, never on `loop init` / `batch init`. Legacy-key configs are NOT
+auto-migrated; it prints the `models init --force-replace-legacy` hint and skips.
 
-Cache: `$XDG_CACHE_HOME/task-mgr/models-cache.json` (24h TTL, stale treated as miss).
-
-**Config locations & precedence** (highest to lowest): explicit task `model` →
-direct `primaryRunner` match → baseline model (`difficulty==high` or
-PRD/project/user default) → `primaryRunner.baselineTierRoutes` remap using the
-provider-neutral baseline tier (`low`/`standard`/`high`) → baseline model → none.
-`difficulty==high` always escalates to `OPUS_MODEL`, independent of any
-default.
-
-The interactive picker fires from `task-mgr init` (project-level scaffold) and
-from the deprecated `task-mgr init --from-json X` shim path when nothing
-resolves and stdin+stderr are both TTYs. Non-TTY / auto-mode runs print a
-one-line stderr hint and skip — no hang. The picker does NOT fire from
-`task-mgr loop init` or `task-mgr batch init` directly.
+Codex routes are config-explicit only (byIdPrefix / taskClasses with
+`provider:"codex"`); never inferred from a model string. Blackout channel
+(`provider_blackouts`) is separate from permanent `runner_overrides` promotions.
 
 ## Deprecation policy
 
@@ -300,15 +288,20 @@ yourself.
 | `task-mgr decisions resolve` | Resolve a key decision by selecting an option |
 | `task-mgr decisions decline` | Decline a key decision (mark as not needed) |
 | `task-mgr decisions revert` | Revert a resolved or deferred decision back to pending |
-| `task-mgr models` | List Claude models and pin a default |
-| `task-mgr models list` | Print the available model IDs |
-| `task-mgr models set-default` | Pin a default model (user config by default, `--project` for project) |
-| `task-mgr models unset-default` | Clear the pinned default model |
-| `task-mgr models show` | Show the currently resolved default model and where it came from |
-| `task-mgr models set-review-model` | Set the reviewModel (routes CODE-REVIEW-*, MILESTONE-FINAL, REVIEW-* tasks) |
-| `task-mgr models unset-review-model` | Clear the reviewModel |
-| `task-mgr models set-fallback` | Set the fallbackRunner block (Grok overflow-fallback configuration) |
-| `task-mgr models unset-fallback` | Remove the fallbackRunner block entirely |
+| `task-mgr models` | Manage the provider-first `models` + `routing` config (tiers, anchor, routes) |
+| `task-mgr models init` | Write the FR-001 default `models`/`routing` config block |
+| `task-mgr models show` | Show the resolved routing table, anchor-derived mapping, and notes |
+| `task-mgr models list` | List the merged provider tier ladders (reverse lookup) |
+| `task-mgr models set-anchor` | Set the anchor capability tier (centers the difficulty window) |
+| `task-mgr models enable` | Enable a provider (probes its CLI binary BEFORE writing) |
+| `task-mgr models disable` | Disable a provider (never probes) |
+| `task-mgr models set-tier` | Pin a model to a provider's capability tier (omit MODEL to route with no model … |
+| `task-mgr models unset-tier` | Clear a provider tier override (the built-in default rung, if any, reapplies) |
+| `task-mgr models set-effort` | Set a provider's per-difficulty effort level (omit EFFORT for no flag) |
+| `task-mgr models set-fallback` | Set a provider's tier-preserving cross-provider fallback target |
+| `task-mgr models unset-fallback` | Remove a provider's fallback target |
+| `task-mgr models route` | Add or replace a routing.byIdPrefix forced route |
+| `task-mgr models unroute` | Remove a routing.byIdPrefix route |
 | `task-mgr current` | Show the currently resolved active PRD context (prefix, source, target path) |
 | `task-mgr enhance` | Manage the task-mgr-fenced block in CLAUDE.md / AGENTS.md |
 | `task-mgr enhance agents` | Write or update the marker-fenced workflow block in target files |
@@ -321,71 +314,41 @@ yourself.
 ### Codex runner (provider-only routing)
 
 The loop engine supports OpenAI Codex as a third `RunnerKind` reachable
-EXCLUSIVELY through `primaryRunner` entries with `provider: "codex"`.
-Codex is NEVER inferred from a model string. The merged path adds three
-load-bearing defenses: (1) `preflight_validate_and_probe` runs from BOTH
-`task-mgr loop run` AND `task-mgr batch run` to fail fast on a missing
-`codex` binary when any route requires it; (2) `protected_state` snapshots
-orchestrator-owned files pre-spawn and verify-and-restore post-spawn for
+EXCLUSIVELY through `routing` entries (`byIdPrefix` / `taskClasses`) with
+`provider: "codex"` plus an enabled `models.providers.codex` block. Codex
+is NEVER inferred from a model string (token-equality `provider_for_model`
+never yields Codex). Three load-bearing defenses: (1)
+`preflight_validate_and_probe` runs from BOTH `task-mgr loop run` AND
+`task-mgr batch run`, probing every enabled provider's CLI binary to fail
+fast before the first iteration; (2) `protected_state` snapshots
+orchestrator-owned files pre-spawn and verify-and-restores post-spawn for
 every Codex iteration (sequential + per-slot + wave); (3)
 `CodexAuthFailure` is excluded from `handle_task_failure` at both callers
 so an auth lapse never pushes healthy tasks toward auto-block.
 
-Opt-in Codex→Claude RuntimeError fallback (separate from the Claude/Grok
-overflow rung-4 pivot):
+Codex routes provider-only when its tier maps to `null` (no `-m` flag);
+its effort flows as `-c model_reasoning_effort=<level>` BEFORE `exec`,
+capped at `high`. The legacy `primaryRunner` block (including
+`runtimeErrorFallback` / `claudeFallbackModel`) is hard-rejected at
+preflight — migrate via `task-mgr models init`. See
+`src/loop_engine/CLAUDE.md` "Codex provider integration" and "models +
+routing config and capability tiers (FR-001)".
 
-```json
-{
-  "primaryRunner": {
-    "claudeFallbackModel": "<claude model id>",
-    "byIdPrefix": {
-      "FEAT-": { "provider": "codex", "runtimeErrorFallback": true }
-    }
-  }
-}
-```
+### Provider fallback (rung-4 pivot)
 
-When `runtimeErrorFallback: true` AND consecutive RuntimeErrors reach
-`primaryRunner.runtimeErrorThreshold`, the task is promoted to Claude
-(`runner_overrides[id] = Claude`, never Codex) — once per loop run.
-Field defaults: `runtimeErrorFallback=false`; absent → no Codex→Claude
-promotion. See `src/loop_engine/CLAUDE.md` "Codex provider integration"
-for the full design notes (schema, auth detection, protected-state guard,
-binary probe contract, prohibited outcomes).
-
-### Fallback runner config (Grok)
-
-The loop engine supports a Grok CLI fallback that promotes a stuck task off
-Claude after the overflow ladder is exhausted (rung 4) or after repeated
-`RuntimeError` crashes at the Opus ceiling. Disabled by default; opt-in via
-`.task-mgr/config.json`:
-
-```json
-{
-  "version": 1,
-  "fallbackRunner": {
-    "enabled": true,
-    "provider": "grok",
-    "model": "grok-build",
-    "cliBinary": "/usr/local/bin/grok",
-    "runtimeErrorThreshold": 2
-  }
-}
-```
-
-Field defaults: `enabled=false`, `provider="grok"`, `model="grok-build"`,
-`cliBinary=null` (resolves bare `grok` on PATH), `runtimeErrorThreshold=2`.
-With the block absent or `enabled:false`, loop behavior is byte-identical
-to the pure-Claude 4-rung overflow ladder ending in `Blocked`.
-
-`task-mgr loop run` performs a startup binary check: when `enabled=true`,
-the configured `cliBinary` (or bare `grok` on PATH) must resolve to an
-existing file or the loop exits with a helpful error before the first
-iteration. Subsystem design notes are in
+Cross-provider fallback for stuck tasks is configured per provider via
+`models.providers.<source>.fallback` (`task-mgr models set-fallback claude
+grok`): when the overflow ladder exhausts on the source provider, the task
+pivots tier-preserving to the (different + enabled) target provider — at
+most once per run via `runner_overrides` / `promote_once`. The legacy
+`fallbackRunner` block is hard-rejected at preflight; with no fallback
+target configured the ladder ends in `Blocked`, byte-identical to the
+pure-Claude behavior. Quota blackouts use a SEPARATE ephemeral channel
+(`provider_blackouts`) that never touches `runner_overrides`. Subsystem
+design notes are in
 [`src/loop_engine/CLAUDE.md`](src/loop_engine/CLAUDE.md) — see "Overflow
-recovery and diagnostics" for the 5-rung ladder, "Operator escape valve" for
-the override-invalidation contract, and "Provider routing" for the
-token-equality classification algorithm.
+recovery and diagnostics", "Blackout channel contract (FEAT-008)", and
+"models + routing config and capability tiers (FR-001)".
 
 ## LLM coding guidelines
 

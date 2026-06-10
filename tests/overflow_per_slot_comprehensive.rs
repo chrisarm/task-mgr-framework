@@ -10,7 +10,7 @@ use rusqlite::Connection;
 use tempfile::TempDir;
 
 use task_mgr::loop_engine::engine::IterationContext;
-use task_mgr::loop_engine::model::{HAIKU_MODEL, OPUS_MODEL, OPUS_MODEL_1M, SONNET_MODEL};
+use task_mgr::loop_engine::model::{HAIKU_MODEL, ONE_M_SUFFIX, OPUS_MODEL, SONNET_MODEL};
 use task_mgr::loop_engine::overflow::{OverflowEvent, RecoveryAction, sanitize_id_for_filename};
 use task_mgr::loop_engine::project_config::ProjectConfig;
 use task_mgr::loop_engine::prompt::PromptResult;
@@ -459,6 +459,7 @@ fn jsonl_deserialization_tolerates_explicit_null_slot_index() {
 /// A JSONL line with a numeric `slot_index` round-trips with the value intact.
 #[test]
 fn jsonl_deserialization_round_trips_numeric_slot_index() {
+    let opus_1m = format!("{OPUS_MODEL}{ONE_M_SUFFIX}");
     let json = serde_json::json!({
         "ts": "2026-05-07T10:00:00+00:00",
         "task_id": "SLOT-TASK-007",
@@ -469,7 +470,7 @@ fn jsonl_deserialization_round_trips_numeric_slot_index() {
         "prompt_bytes": 99000,
         "sections": [["task", 1000], ["learnings", 2000], ["base_prompt", 96000]],
         "dropped_sections": ["progress"],
-        "recovery": {"action": "to_1m_model", "new_model": OPUS_MODEL_1M},
+        "recovery": {"action": "to_1m_model", "new_model": opus_1m},
         "dump_path": "/tmp/slot7.txt"
     });
 
@@ -542,11 +543,12 @@ fn dump_rotation_keeps_newest_3_across_wave_iterations() {
 
     // 4 overflow calls for the same task_id, ascending iteration numbers.
     // Rungs: 1 (xhigh→high), 2 (Sonnet→Opus), 3 (Opus→1M), 4 (Blocked).
+    let opus_1m = format!("{OPUS_MODEL}{ONE_M_SUFFIX}");
     let calls: &[(Option<&str>, Option<&str>)] = &[
         (Some("xhigh"), Some(SONNET_MODEL)),
         (Some("high"), Some(SONNET_MODEL)),
         (Some("high"), Some(OPUS_MODEL)),
-        (Some("high"), Some(OPUS_MODEL_1M)),
+        (Some("high"), Some(opus_1m.as_str())),
     ];
     for (iter, &(effort, model)) in calls.iter().enumerate() {
         reset_to_in_progress(&conn, task_id);
@@ -710,7 +712,7 @@ fn overflow_recovered_persists_from_wave_through_sequential_transition() {
 
     reset_to_in_progress(&conn, task_id);
 
-    // Sequential overflow: same task_id, now at high effort → rung 2 (EscalateModel).
+    // Sequential overflow: same task_id, now at high effort → rung 2 (EscalateTier).
     let seq_action = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
         conn: &mut conn,
@@ -726,7 +728,7 @@ fn overflow_recovered_persists_from_wave_through_sequential_transition() {
         project_config: &ProjectConfig::default(),
     });
     assert!(
-        matches!(seq_action, RecoveryAction::EscalateModel { .. }),
+        matches!(seq_action, RecoveryAction::EscalateTier { .. }),
         "rung 2 expected: {seq_action:?}"
     );
 
@@ -769,7 +771,7 @@ fn overflow_recovered_persists_from_wave_through_sequential_transition() {
     ));
     assert!(matches!(
         seq_ev.recovery,
-        RecoveryAction::EscalateModel { .. }
+        RecoveryAction::EscalateTier { .. }
     ));
 }
 
@@ -807,7 +809,7 @@ fn overflow_recovered_persists_from_sequential_through_wave_transition() {
 
     reset_to_in_progress(&conn, task_id);
 
-    // Wave overflow: Haiku at high → rung 2 (EscalateModel: Haiku → Sonnet).
+    // Wave overflow: Haiku at high → rung 2 (EscalateTier: Haiku → Sonnet).
     let wave_action = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
         conn: &mut conn,
@@ -823,7 +825,7 @@ fn overflow_recovered_persists_from_sequential_through_wave_transition() {
         project_config: &ProjectConfig::default(),
     });
     assert!(
-        matches!(wave_action, RecoveryAction::EscalateModel { ref new_model } if new_model == SONNET_MODEL),
+        matches!(wave_action, RecoveryAction::EscalateTier { ref new_model } if new_model == SONNET_MODEL),
         "Haiku at high → escalate to Sonnet: {wave_action:?}"
     );
 

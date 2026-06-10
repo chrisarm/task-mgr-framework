@@ -1,0 +1,1166 @@
+{
+  "branchName": "feat/model-selection-redesign",
+  "description": "Model-selection redesign: provider-first models+routing config block (hard break with 5 legacy surfaces), capability tiers (frontier/standard/cost-efficient/cheapest) with anchor-window selection, per-provider effort tables incl. codex -c model_reasoning_effort, role split + difficulty spillover + quota-aware failover, tier-based escalation ladders, provider stamping (migration v20). Review cascade DEFERRED to tasks/prd-review-cascade.md; engine-side frontier forcing REMOVED (FR-011 generator guidance already delivered — do NOT implement it here).",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "Rust: No warnings in `cargo check` output",
+      "Rust: No warnings in `cargo clippy -- -D warnings` output",
+      "Rust: Scoped tests pass per iteration; full `cargo test` green at milestones",
+      "Rust: `cargo fmt --check` passes",
+      "`cargo run --bin gen-docs -- --check` passes after any src/loop_engine/model.rs constant/table change",
+      "All tasks.status writes via TaskLifecycle verbs — no raw UPDATEs",
+      "Model-ID literals live only in src/loop_engine/model.rs",
+      "No breaking changes to existing APIs unless explicitly required by the PRD hard break"
+    ],
+    "description": "These criteria apply to ALL implementation tasks"
+  },
+  "mergeStrategy": "Merge to main after MILESTONE-FINAL passes. Squash commits optional.",
+  "model": "claude-sonnet-4-6",
+  "priorityPhilosophy": {
+    "description": "Hierarchy of what matters most when implementing tasks",
+    "hierarchy": [
+      "1. PLAN — Anticipate edge cases before coding",
+      "2. PHASE 2 FOUNDATION — ~1 day now to save ~2+ weeks later (1:10+ ratio); tier abstraction makes every future model launch a config edit",
+      "3. FUNCTIONING CODE — Pragmatic, reliable, wired in per plan",
+      "4. CORRECTNESS — Compiles, type-checks, scoped tests pass deterministically",
+      "5. CODE QUALITY — Clean code, qualityDimensions satisfied, no warnings",
+      "6. POLISH — Docs, formatting, minor improvements"
+    ],
+    "principles": [
+      "Quality dimensions explicit — qualityDimensions on every task tells you what 'good' looks like",
+      "Edge cases = test cases — every PRD Known Edge Case has a corresponding test",
+      "Scoped per-iteration tests, full suite at milestones — milestones leave the trunk green including pre-existing failures",
+      "Resolution determinism — resolve_execution_plan is a pure function of (task fields, config); identical inputs → identical plan in sequential and wave paths",
+      "Channel discipline — runner_overrides (permanent promotion) and provider_blackouts (temporary quota reroute) are strictly separate; blackout never touches overrides",
+      "Ship working code with tests to prove it; handle Option/Result explicitly; avoid unwrap() in production"
+    ]
+  },
+  "prohibitedOutcomes": [
+    "resolve_execution_plan (or any resolution-path function) writing tasks.model — escalation/promotion paths are the ONLY writers (escape-valve contract)",
+    "BlackoutState persisted to disk/DB, or read/written by promote_once / runner_overrides paths",
+    "Substring-based model→tier or model→provider matching anywhere — provider inference stays token-equality, tier lookup is config exact-match",
+    "A second difficulty/effort normalizer — reuse the one normalize_difficulty everywhere",
+    "Legacy alias tier keys (opus/sonnet/haiku) accepted in the new tiers map",
+    "Codex inferred from a model string — Codex routing is config-explicit only (byIdPrefix route or taskClasses)",
+    "Model-ID literals outside src/loop_engine/model.rs (no_hardcoded_models discipline)",
+    "Raw UPDATE on tasks.status — all status writes via TaskLifecycle verbs",
+    "Tests that only assert 'no crash' or check type without verifying content",
+    "Tests that hand-build config maps not matching the FR-001 JSON schema — use production-shaped fixtures",
+    "Error messages that don't identify what went wrong (CONFIG ERRORs must name the offending key and the accepted set)",
+    "Catch-all error handlers that swallow context"
+  ],
+  "project": "task-mgr",
+  "requires": [],
+  "reviewGuidelines": {
+    "priorityGuidelines": {
+      "critical": "1-10: Blocks further work, fix immediately",
+      "high": "11-20: Fix before phase completion",
+      "low": "51-99: Defer to hardening phase",
+      "medium": "21-50: Fix in current phase if time permits"
+    }
+  },
+  "taskPrefix": "cd8d4641",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "CapabilityTier ordered enum with strict CapabilityTier::parse (typos → Err naming the accepted set) and as_str() emitting kebab-case exactly ('cost-efficient', not 'cost_efficient')",
+        "ModelsConfig/ProviderConfig/RoutingConfig deserialize the FR-001 canonical JSON verbatim; field defaults per FR-001 (claude enabled, grok/codex disabled, anchor=standard, primaryProvider=claude); field-wise merge so {\"grok\":{\"enabled\":true}} is a complete opt-in",
+        "ResolvedModelsConfig::model_for(Provider, CapabilityTier) -> Option<&str> with sparse-ladder clamping: nearest defined tier, down first then up; tiers null value = route-with-no-model-flag, absent = undefined rung",
+        "ResolvedModelsConfig::tier_of(Provider, &str) -> Option<CapabilityTier> strips the [1m] suffix before exact match (claude-fable-5[1m] → Frontier)",
+        "ResolvedModelsConfig::effort_for(Provider, Option<&str>) uses the existing normalize_difficulty — no second normalizer",
+        "Exhaustive clamping matrix tests: single-tier ladder, gap ladder (cheapest+frontier only), anchor=cheapest+high / anchor=frontier+low clamped at ladder ends (offset never wraps)",
+        "validate_models_config is pure (no I/O) and rejects: unknown/legacy-alias tier keys, disabled primaryProvider, ambiguous reverse model lookup, codex effort xhigh, fallback to self or disabled provider, routes referencing disabled providers, premature routing.reviewCascade key ('not yet supported' note)",
+        "detect_legacy_model_keys(&serde_json::Value) -> Vec<&'static str> names each legacy key found (defaultModel, reviewModel, primaryRunner, fallbackRunner)",
+        "probe_enabled_provider_binaries(&ResolvedModelsConfig) is a separate function, enabled-gated, NEVER invoked from validate_models_config",
+        "FABLE_MODEL and ONE_M_SUFFIX constants added to src/loop_engine/model.rs; tests/no_hardcoded_models.rs regex gains fable",
+        "CONTRACT: signatures match the PRD Public Contracts table exactly — every downstream task compiles against them unchanged"
+      ],
+      "completionCheck": "cargo test capability_tier && cargo test no_hardcoded_models",
+      "dependsOn": [],
+      "description": "The keystone abstraction every downstream task consumes. Define CapabilityTier {Cheapest, CostEfficient, Standard, Frontier} (ordered), ModelsConfig/ProviderConfig/RoutingConfig serde matching the FR-001 canonical schema, built-in defaults with field-wise merge, ResolvedModelsConfig (model_for / tier_of / effort_for with sparse-ladder clamping), ExecutionPlan {provider, model, tier, effort}, FABLE_MODEL + ONE_M_SUFFIX constants, validate_models_config (pure — schema/semantic validation ONLY, no I/O), detect_legacy_model_keys, and probe_enabled_provider_binaries as a SEPARATE enabled-gated function never called from the validator. Signatures must match the PRD §6 Public Contracts table exactly.",
+      "estimatedEffort": "high",
+      "id": "CONTRACT-001",
+      "model": "claude-opus-4-8",
+      "modifiesBehavior": false,
+      "notes": "KEYSTONE TASK (FR-011 generator rule): highest transitive fan-out — every FEAT/REFACTOR in this PRD consumes these signatures; stamped estimatedEffort=high so the loop escalates the model. Strictly pure: no filesystem, no PATH probes inside the validator. Learning 4959: prefix/ID matching uses dash-boundary token matching, never substring. Learning 4729: no_hardcoded_models keeps literals in model.rs only. Data contract: cfg.providers is HashMap<String, ProviderConfig> (lowercase provider-name keys); p.tiers is HashMap<String, Option<String>> (kebab-case tier keys → model id). Modularity rule (PRD §2.6): anchor/tier derivation lives in exactly ONE function shared by spawn site and every recovery path.",
+      "passes": true,
+      "priority": 1,
+      "qualityDimensions": [
+        "Strict parse for all config enums — typos are CONFIG ERRORs naming the accepted set, never silent fall-throughs",
+        "Pure functions: validate_models_config performs zero I/O; binary probes live in a separate enabled-gated function",
+        "Sparse-ladder clamping is deterministic and pinned by an exhaustive test matrix (down first, then up)",
+        "tier_of is config exact-match after [1m] strip — substring matching is dead",
+        "Model-ID literals only in model.rs; FABLE_MODEL covered by the no_hardcoded_models regression regex",
+        "Allocation-light: resolution structures built once per run, cheap lookups after"
+      ],
+      "requiresHuman": false,
+      "taskType": "contract",
+      "title": "Foundation: CapabilityTier, models/routing config types, ResolvedModelsConfig, ExecutionPlan (pure, no I/O)",
+      "touchesFiles": [
+        "src/loop_engine/model.rs",
+        "src/loop_engine/project_config.rs",
+        "tests/no_hardcoded_models.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Happy path: default config + anchor=standard resolves low→claude-sonnet-4-6, medium→claude-opus-4-8, high→claude-fable-5; anchor=cost-efficient shifts to haiku/sonnet/opus",
+        "Edge case tests cover all five entries in edgeCases (1:1)",
+        "Known-bad discriminator: a substring-style tier lookup (e.g. model id 'my-claude-fable-5-custom') must NOT reverse-map to any tier — only exact config match (post-[1m]-strip) does",
+        "Invariant assertions: clamping never wraps past ladder ends; tier_of(model_for(p, t)) round-trips for every defined rung; provider_for_model token-equality unchanged (groq-llama-* → Claude)",
+        "Structural assertion: serde_json::from_value::<ModelsConfig>(FR-001 canonical JSON).is_ok() — fixture derives field names from the actual struct definitions, never invented",
+        "Test file compiles and runs green against CONTRACT-001"
+      ],
+      "completionCheck": "cargo test --test capability_tier_matrix",
+      "dependsOn": [
+        "CONTRACT-001"
+      ],
+      "description": "TDD edge-case suite against the CONTRACT-001 pure surface. Covers the PRD Known Edge Cases that live entirely in the config/tier layer. Tests compile against CONTRACT-001 signatures and pass immediately (the foundation implements them) — they exist to pin the contract so later FEATs cannot regress it.",
+      "edgeCases": [
+        "claude-fable-5[1m] in tasks.model: tier_of strips [1m] before exact match → reverse-maps to Frontier",
+        "Sparse grok ladder (only standard defined), anchor window lands on frontier: clamp prefers stepping down, then up",
+        "Anchor=cheapest + difficulty=high and anchor=frontier + difficulty=low: clamped to cheapest/frontier respectively — offset never wraps",
+        "Single-tier ladder (codex default) and gap ladder (only cheapest + frontier defined): single tier always wins; gap ladders clamp down-first across the gap, then up — exhaustive matrix",
+        "groq-llama-* model string: token-equality keeps it Claude — substring matching would mis-route to xAI Grok runner"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Ambiguous reverse model lookup (same id in two providers' ladders)",
+          "expectedBehavior": "validate_models_config returns CONFIG ERROR naming the model id and both providers"
+        },
+        {
+          "cause": "Lookup on a provider with an empty/undefined ladder",
+          "expectedBehavior": "model_for returns None; no panic"
+        }
+      ],
+      "id": "TEST-INIT-001",
+      "invariants": [
+        "Clamping never wraps past ladder ends",
+        "tier_of(model_for(p, t)) == Some(t) for every defined rung (round-trip)",
+        "provider_for_model token-equality behavior is byte-identical before/after this PRD"
+      ],
+      "model": "claude-opus-4-8",
+      "modifiesBehavior": false,
+      "notes": "TDD: pin the contract before downstream FEATs build on it. Use production-shaped fixtures (the FR-001 JSON block verbatim from the PRD), NEVER hand-built maps — wrong key format (snake_case vs kebab-case tier keys) silently passes otherwise. Data contract: JSON tier keys are kebab-case strings ('cost-efficient'); CapabilityTier::as_str() must emit exactly that.",
+      "passes": true,
+      "priority": 2,
+      "qualityDimensions": [
+        "Tests are specific enough to reject wrong implementations (known-bad discriminator present)",
+        "Fixtures are production-shaped: FR-001 canonical JSON, real struct field names",
+        "Every assertion verifies content (exact model id / tier), not just is_some()"
+      ],
+      "requiresHuman": false,
+      "taskType": "test",
+      "title": "Pure-layer edge-case tests: tier matrix, [1m] strip, ladder clamps, token-equality",
+      "touchesFiles": [
+        "tests/capability_tier_matrix.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Edge case tests cover all four entries in edgeCases (1:1), each mapped to its owning FEAT in the #[ignore] note",
+        "Escape-valve test skeleton: anchor-resolved task (NULL tasks.model) → overflow → escalation writes tasks.model → operator edit → six-channel clear fires exactly once with one stderr line (un-ignored by FEAT-004)",
+        "Deferral-first test skeleton: wave whose only candidates are quota-deferred waits for reset and NEVER increments the stale tracker — parity-tested in BOTH sequential and wave paths (un-ignored by FEAT-008)",
+        "Codex effort test skeleton: difficulty=high on a codex route caps effort at high; -c model_reasoning_effort=<level> appears BEFORE the exec subcommand in argv (un-ignored by FEAT-006)",
+        "Legacy-key coverage skeleton: loop/batch entry hard-errors naming each key; read_project_config warns once on stderr and proceeds; models mutating verbs hard-error (un-ignored by FEAT-002)",
+        "Known-bad discriminator: a blackout-reroute test asserting runner_overrides remains UNTOUCHED — an implementation that promotes via overrides fails this test",
+        "All non-ignored assertions compile and run green; ignored tests compile"
+      ],
+      "completionCheck": "cargo test --test model_selection_engine_edges -- --include-ignored --list",
+      "dependsOn": [
+        "CONTRACT-001"
+      ],
+      "description": "TDD suite for the engine-level PRD Known Edge Cases. Write tests against EXISTING engine functions (invalidate_stale_overrides, build_codex_argv, handle_no_eligible_tasks, config read paths) plus CONTRACT-001 types. Tests asserting not-yet-implemented behavior are #[ignore = \"un-ignored by FEAT-00X\"] with the owning task named; FEAT-002/004/006/008 un-ignore and make them pass.",
+      "edgeCases": [
+        "Anchor-resolved task (NULL tasks.model) → overflow → escalation → operator edit: escape-valve snapshot recorded NULL; comparison must still fire the six-channel clear with one stderr line",
+        "Wave where ALL candidates are quota-deferred: deferral-first branch waits for reset; stale counter untouched (empty selection historically fed the stale-abort counter)",
+        "Codex route + difficulty=high: xhigh must never reach codex — validation caps codex effort at high; -c model_reasoning_effort= precedes exec",
+        "Legacy config keys + non-loop command (recall, models show): warn-and-proceed / detect-and-instruct; hard error ONLY at loop/batch entry + models mutating verbs"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Codex route receives difficulty=high with a naive global effort table",
+          "expectedBehavior": "Effort capped at high (validation), never xhigh in argv"
+        },
+        {
+          "cause": "Legacy keys present at loop run",
+          "expectedBehavior": "Hard error naming each key, printing the schema skeleton, pointing at models init --force-replace-legacy"
+        },
+        {
+          "cause": "Claude RateLimit with no spillover-eligible work",
+          "expectedBehavior": "Wait for reset (existing wait_for_usage_reset machinery); no busy-spin, no stale increment"
+        }
+      ],
+      "id": "TEST-INIT-002",
+      "invariants": [
+        "Stale-abort counter is never incremented by a quota-deferred empty selection",
+        "provider_blackouts never reads or writes runner_overrides; promote_once remains the single permanent-promotion guard",
+        "resolve_execution_plan never writes tasks.model — only escalation/promotion paths do",
+        "Six-channel override clear fires on operator edit even when the recorded original model is NULL"
+      ],
+      "model": "claude-opus-4-8",
+      "modifiesBehavior": false,
+      "notes": "Learning 3019/3736/3065: check_override_invalidation (engine.rs) snapshots tasks.model vs ctx.overflow_original_task_model — the NEW NULL-original semantics (anchor-resolved tasks recorded NULL) is exactly what these tests pin. Learning 3927: handle_no_eligible_tasks (wave path) historically went straight to the stale tracker on empty selection — the documented false-abort bug class this PRD's deferral-first branch fixes. Learning 4921/4672: promote_once owns the single runner_overrides idempotency guard; blackout channel must never read/write it. Use production-shaped fixtures (render via tests/common/mod.rs::render_fixture_tmpl where model placeholders are needed).",
+      "passes": true,
+      "priority": 3,
+      "qualityDimensions": [
+        "Each #[ignore] names the FEAT that un-ignores it — no orphaned skeletons",
+        "Parity assertions cover BOTH sequential and wave paths (learning 4913: parameter threading diverges silently)",
+        "Channel-discipline assertions verify runner_overrides untouched, not merely that rerouting happened"
+      ],
+      "requiresHuman": false,
+      "taskType": "test",
+      "title": "Engine-integration edge-case tests: escape valve NULL semantics, deferral-first, codex effort cap, legacy-key coverage",
+      "touchesFiles": [
+        "tests/model_selection_engine_edges.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "preflight_validate_and_probe hard-errors on legacy keys from BOTH task-mgr loop run AND task-mgr batch run: names each key, prints the FR-001 schema skeleton, points at models init --force-replace-legacy",
+        "read_project_config (recall, curate, next, show, ...) emits ONE stderr warning line and proceeds with defaults — never hard-fails",
+        "Existing models mutating verbs hard-error when legacy keys present (never write new keys beside legacy)",
+        "Legacy ProjectConfig fields + migrate_project_config_value + update_project_config_format + canonical_baseline_tier_key + all serde aliases are deleted",
+        "loop init / batch init / loop run emit one stderr line when PRD JSON or prd_metadata carries default_model ('ignored under the models config; use models.anchor / routing instead'); user-config defaultModel warning at loop/batch preflight only",
+        "prd_metadata.default_model column unchanged: still parsed, imported, exported verbatim — just never read by resolution",
+        "validate_models_config + probe_enabled_provider_binaries called in sequence at preflight (validation pure, probes separate, probes only for enabled providers)",
+        "TEST-INIT-002 legacy-key coverage tests un-ignored and green"
+      ],
+      "completionCheck": "cargo test --test model_selection_engine_edges legacy",
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/loop_engine/startup.rs",
+            "impact": "BREAKS",
+            "line": 0,
+            "mitigation": "Intentional hard break per FR-002; error points at models init --force-replace-legacy",
+            "usage": "preflight_validate_and_probe at loop/batch entry"
+          },
+          {
+            "file": "src/loop_engine/project_config.rs",
+            "impact": "NEEDS_REVIEW",
+            "line": 0,
+            "mitigation": "Warn-and-proceed with defaults; routing not consumed there",
+            "usage": "read_project_config consumed by recall/curate/next/show"
+          },
+          {
+            "file": "src/commands/models/handlers.rs",
+            "impact": "BREAKS",
+            "line": 0,
+            "mitigation": "Interim hard-error guard; FEAT-009 replaces the verb set",
+            "usage": "legacy verbs write defaultModel/reviewModel/fallbackRunner"
+          }
+        ],
+        "semanticDistinctions": [
+          {
+            "context": "Loop/batch entry (routing consumed)",
+            "currentBehavior": "Legacy keys silently honored",
+            "requiredBehavior": "Hard error naming keys + skeleton + migration pointer"
+          },
+          {
+            "context": "Non-loop commands (routing not consumed)",
+            "currentBehavior": "Legacy keys silently honored",
+            "requiredBehavior": "One stderr warning, proceed with defaults"
+          }
+        ]
+      },
+      "dependsOn": [
+        "CONTRACT-001",
+        "TEST-INIT-002"
+      ],
+      "description": "Wire detect_legacy_model_keys into every surface per the FR-002 coverage table: hard error at loop/batch entry (preflight_validate_and_probe in startup.rs, covering BOTH loop run and batch run), one-line stderr warning at read_project_config for non-loop commands, hard error in models mutating verbs (interim guard on existing handlers until FEAT-009 replaces them). Delete legacy ProjectConfig fields (defaultModel, reviewModel, primaryRunner, fallbackRunner) and ALL migration machinery (migrate_project_config_value, update_project_config_format, canonical_baseline_tier_key, serde aliases). Add default_model warning sites: loop init / batch init / loop run warn when PRD JSON or prd_metadata carries default_model; prd_metadata.default_model column STAYS, exports/imports round-trip verbatim, resolution chain stops reading it.",
+      "estimatedEffort": "high",
+      "id": "FEAT-002",
+      "model": "claude-opus-4-8",
+      "modifiesBehavior": true,
+      "notes": "DELIBERATE deviation from learnings #4670/#4633 (read-time normalizers) per operator decision — hard break, no soft migration. Per-command coverage table in PRD FR-002 is the spec. The interim mutating-verb guard keeps old verbs safe until FEAT-009 deletes them. Grep for every read site of the four legacy fields before deleting (learning 4915: systematic construction/usage-site discovery — production, test helpers, fixtures).",
+      "passes": false,
+      "priority": 6,
+      "qualityDimensions": [
+        "Hard error text is actionable: names each offending key, shows the schema skeleton, names the one sanctioned migration command",
+        "Non-loop commands stay usable: warn-and-proceed, never strand the operator",
+        "Config resolved once per run and cached — never re-read inside wave hot paths",
+        "Deletions are complete: no dead serde aliases, no orphaned helpers (clippy -D warnings enforces)"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Hard break: legacy-key detection wired per-command, migration machinery deleted, default_model warning sites",
+      "touchesFiles": [
+        "src/loop_engine/project_config.rs",
+        "src/loop_engine/startup.rs",
+        "src/loop_engine/batch.rs",
+        "src/commands/models/handlers.rs",
+        "src/loop_engine/config.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "src/db/migrations/v20.rs adds the three columns; down migration follows the version-only column convention (learning #348)",
+        "Exactly three edits in migrations/mod.rs to register v20 (learning #503)",
+        "Migration tests go through run_migrations, not bare create_schema (learning #1550)",
+        "Stamping lives ONLY in process_iteration_output and fires on the completion arm for BOTH sequential and wave paths",
+        "tasks.completed_by_provider stores 'claude'/'grok'/'codex' (Provider::as_str), never a model string; run_tasks.provider/model store the effective pair",
+        "Existing exports/imports round-trip the new columns without error (NULL for historical rows)",
+        "CONTRACT: serde/TryFrom<Row> mappings updated wherever tasks/run_tasks rows are hydrated (grep to verify)"
+      ],
+      "completionCheck": "cargo test migrations && cargo test --test cli_tests migrate",
+      "dependsOn": [
+        "FEAT-002"
+      ],
+      "description": "Schema v20 adds tasks.completed_by_provider, run_tasks.provider, run_tasks.model — columns only, NO review_rounds table (deferred with the cascade PRD). Stamping happens in iteration_pipeline::process_iteration_output (single home, both sequential and wave paths) reading effective_runner/effective_model already present on the result structs. Store lowercase provider names via Provider::as_str ('claude'/'grok'/'codex'), never model strings, in completed_by_provider.",
+      "estimatedEffort": "medium",
+      "id": "FEAT-003",
+      "modifiesBehavior": false,
+      "notes": "Rationale for shipping now (FR-006): audit value on its own + the deferred cascade's reviewer≠implementer rule gets real history from day one instead of a NULL backlog. Data contract: IterationResult.effective_runner: RunnerKind / SlotResult.effective_runner → tasks.completed_by_provider TEXT (lowercase via Provider::as_str). Stamp in the completion arm of process_iteration_output — single home, learning #4865/#4186 (single-home coordinators).",
+      "passes": true,
+      "priority": 7,
+      "qualityDimensions": [
+        "Additive-only schema change: no existing column touched, NULL-safe hydration for historical rows",
+        "Single stamping home — no second write site in slot.rs/engine.rs",
+        "Down migration is version-only per repo convention",
+        "Provider names lowercase and canonical — never free-form strings"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Migration v20: provider stamping columns + pipeline stamping (cascade prerequisite)",
+      "touchesFiles": [
+        "src/db/migrations/v20.rs",
+        "src/db/migrations/mod.rs",
+        "src/loop_engine/iteration_pipeline.rs",
+        "src/models/task.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Single resolve_execution_plan called by prompt/sequential.rs and prompt/slot.rs — no second resolution path; reaction-parity pinned (identical inputs → identical plan both paths)",
+        "Precedence table test: every rung beats all lower rungs (explicit model > byIdPrefix > class route > blackout reroute > anchor window)",
+        "resolve_execution_plan NEVER writes tasks.model; escalation/promotion paths in recovery.rs continue writing it unchanged (escape-valve contract)",
+        "invalidate_stale_overrides handles NULL-original semantics: anchor-resolved task escalated then operator-edited → six-channel clear fires, one stderr line (TEST-INIT-002 escape-valve test un-ignored and green)",
+        "classify_task is the SSoT: rung 3 and spillover eligibility both consume it; unmatched IDs → class default; review class built-in and not redefinable",
+        "Consistency test: SPAWNED_FIXUP_PREFIXES ⊆ classify.implementation defaults — flags drift between the prefix sets",
+        "byDifficulty matched lowercase-trimmed via the same normalize_difficulty used by effort lookup — no second normalizer",
+        "ctx.effort_overrides (overflow downgrade) still wins over plan effort at spawn",
+        "apply_review_model_override deleted from iteration.rs and wave_scheduler.rs call sites; review routing flows from rung 3",
+        "resolve_iteration_model rewritten on tier_of: None < Some(Cheapest), last-wins tie-break preserved (existing synergy/iteration-model tests updated in place)",
+        "Explicit tasks.model and routing.byIdPrefix win over class routes (US-004 AC); high-difficulty implementation stays on claude under default routing"
+      ],
+      "completionCheck": "cargo test resolve_execution_plan && cargo test --test model_selection_engine_edges escape_valve",
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/loop_engine/prompt/sequential.rs",
+            "impact": "BREAKS",
+            "line": 413,
+            "mitigation": "Rewired to resolve_execution_plan",
+            "usage": "calls resolve_task_execution_target"
+          },
+          {
+            "file": "src/loop_engine/prompt/slot.rs",
+            "impact": "BREAKS",
+            "line": 335,
+            "mitigation": "Rewired to resolve_execution_plan",
+            "usage": "calls resolve_task_execution_target"
+          },
+          {
+            "file": "src/loop_engine/iteration.rs",
+            "impact": "BREAKS",
+            "line": 426,
+            "mitigation": "Deleted — plan carries review routing (rung 3)",
+            "usage": "apply_review_model_override"
+          },
+          {
+            "file": "src/loop_engine/wave_scheduler.rs",
+            "impact": "BREAKS",
+            "line": 805,
+            "mitigation": "Deleted — plan carries review routing (rung 3)",
+            "usage": "apply_review_model_override"
+          },
+          {
+            "file": "src/loop_engine/recovery.rs",
+            "impact": "OK",
+            "line": 242,
+            "mitigation": "Contractually preserved; escape-valve lifecycle test",
+            "usage": "writes tasks.model on escalation/promotion"
+          },
+          {
+            "file": "src/loop_engine/reactions/pre_spawn.rs",
+            "impact": "NEEDS_REVIEW",
+            "line": 186,
+            "mitigation": "Explicit NULL-original semantics + AC test",
+            "usage": "invalidate_stale_overrides snapshot vs tasks.model"
+          }
+        ],
+        "semanticDistinctions": [
+          {
+            "context": "provider_for_model (provider inference)",
+            "currentBehavior": "token-equality",
+            "requiredBehavior": "Unchanged — token-equality untouched"
+          },
+          {
+            "context": "tier_of (capability ranking)",
+            "currentBehavior": "substring ModelTier classification",
+            "requiredBehavior": "Config exact-match after [1m] strip — substring dies"
+          },
+          {
+            "context": "tasks.model pin (Claude/Grok)",
+            "currentBehavior": "covers all providers",
+            "requiredBehavior": "Cannot express Codex (invariant); codex pinning is route-only via models route"
+          }
+        ]
+      },
+      "dependsOn": [
+        "FEAT-002",
+        "TEST-INIT-001",
+        "TEST-INIT-002"
+      ],
+      "description": "The 6-rung precedence chain (FR-003) as a single pure function resolve_execution_plan(ctx: &PlanContext) -> ExecutionPlan, called by BOTH prompt builders (sequential.rs + slot.rs). Rungs: (1) explicit tasks.model → provider via provider_for_model, tier via tier_of; (2) routing.byIdPrefix; (3) task class → provider preference + forced tier (review/planning → frontier) with byDifficulty remap; (4) quota-blackout reroute (spillover-eligible only, derived per pass, never stored); (5) anchor window (difficulty offset low→anchor−1 / medium→anchor / high→anchor+1, clamped); (6) tier → model via model_for; effort last from the FINAL provider's table. Name rungs in code by constant, not ordinal (the deferred cascade PRD inserts a rung between 1 and 2). classify_task(id, &RoutingConfig) -> TaskClass built on id_body_matches_prefix is the classification SSoT consumed by rung 3 AND spillover eligibility. is_review_class → is_frontier_class (review class built-in: CODE-REVIEW-, MILESTONE-FINAL, REVIEW-, excluding REFACTOR-REVIEW; not redefinable via classify). resolve_iteration_model rewritten on tier_of (None < Some(Cheapest); last-wins tie-break preserved). Thread ExecutionPlan through SlotPromptBundle, resolve_effective_runner input, wave_scheduler, iteration.rs — delete apply_review_model_override call sites (plan already carries review routing).",
+      "estimatedEffort": "high",
+      "id": "FEAT-004",
+      "model": "claude-opus-4-8",
+      "modifiesBehavior": true,
+      "notes": "Heart of the PRD. Learning 3019/3736: check_override_invalidation keys off tasks.model vs ctx.overflow_original_task_model — NULL-original is the new case to handle explicitly. Learning 4913: sequential/wave parity requires matching parameter threading — verify every input influencing the plan reaches both builders. Learning 4915: adding fields to SlotPromptBundle requires systematic construction-site discovery (production + test helpers + fixtures). Old fns (resolve_task_execution_target, resolve_task_model, compute_baseline_model) remain in place until REFACTOR-005 deletes them — integration tests still reference them, so no dead-code warnings; do NOT delete here. Data contract: ExecutionPlan.effort: Option<String>; spawn-time precedence: ctx.effort_overrides.get(task_id) wins over plan.effort.",
+      "passes": true,
+      "priority": 8,
+      "qualityDimensions": [
+        "Resolution determinism: pure function of (task fields, config); zero hidden state",
+        "Rungs named by constant, not ordinal — cascade PRD inserts between 1 and 2 without renumbering churn",
+        "Allocation-light on the per-slot hot path: config resolved once per run, cached",
+        "Escape-valve contract: resolution never writes tasks.model; NULL-original handled explicitly",
+        "One classifier, one normalizer — no parallel prefix sets or difficulty parsing"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Resolution rewrite: resolve_execution_plan + classify_task + anchor window + is_frontier_class, wired into both prompt builders",
+      "touchesFiles": [
+        "src/loop_engine/model.rs",
+        "src/loop_engine/prompt/sequential.rs",
+        "src/loop_engine/prompt/slot.rs",
+        "src/loop_engine/slot.rs",
+        "src/loop_engine/wave_scheduler.rs",
+        "src/loop_engine/iteration.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/reactions/pre_spawn.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Both prompt builders verified to call resolve_execution_plan on the production path (not bypassed by test mocks)",
+        "No resolution-path function writes tasks.model (grep-verified)",
+        "validate_models_config performs zero I/O (grep for fs/PATH usage)",
+        "Stamping single-home verified: process_iteration_output is the only writer of completed_by_provider",
+        "Any issues found have corresponding CODE-FIX-xxx / WIRE-FIX-xxx tasks added via task-mgr add --stdin --depended-on-by MILESTONE-1"
+      ],
+      "dependsOn": [
+        "CONTRACT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004"
+      ],
+      "description": "Review CONTRACT-001, FEAT-002, FEAT-003, FEAT-004 with full context: escape-valve contract adherence (no resolution-path writes to tasks.model), channel discipline (no blackout/override cross-talk yet), purity of validate_models_config, strict-parse coverage, error-message actionability, wiring reachability (resolve_execution_plan actually called from BOTH prompt builders in production paths, not just tests), qualityDimensions satisfied, no unwrap() in production code.",
+      "estimatedEffort": "medium",
+      "id": "CODE-REVIEW-1",
+      "modifiesBehavior": false,
+      "notes": "For each issue: echo '{...}' | task-mgr add --stdin --depended-on-by MILESTONE-1 — atomic DB+JSON sync, no manual edit. If no issues, emit <task-status>CODE-REVIEW-1:done</task-status> with a one-line progress note. Use the rust-python-code-reviewer agent.",
+      "passes": true,
+      "priority": 13,
+      "qualityDimensions": [
+        "Review verifies contracts (escape valve, purity, single-home stamping) by grep/read, not by trusting task notes"
+      ],
+      "requiresHuman": false,
+      "taskType": "review",
+      "title": "Code review: foundation + hard break + resolution rewrite",
+      "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": [
+        "Full test suite green (including pre-existing failures fixed)",
+        "cargo clippy -- -D warnings clean; cargo fmt --check passes",
+        "cargo run --bin gen-docs -- --check passes",
+        "All dependsOn tasks have passes: true"
+      ],
+      "dependsOn": [
+        "CODE-REVIEW-1"
+      ],
+      "description": "Full unscoped gate after the core rewrite: cargo fmt --check, cargo check, cargo clippy -- -D warnings, full cargo test, cargo run --bin gen-docs -- --check. Every failure — including pre-existing ones — fixed or spawned per the milestone protocol. This is the checkpoint proving the new resolution path coexists with the not-yet-deleted legacy fns.",
+      "estimatedEffort": "medium",
+      "id": "MILESTONE-1",
+      "model": "claude-opus-4-8",
+      "modifiesBehavior": false,
+      "notes": "If fixture-reading test binaries fail en masse pointing at a removed -slot-N worktree path, that's stale shared-target binaries, not a regression — touch tests/<binary>.rs and re-run (learning #4753) before spawning FIX tasks.",
+      "passes": true,
+      "priority": 20,
+      "qualityDimensions": [
+        "Trunk-green invariant: zero failures left behind, zero punted without a spawned FIX task"
+      ],
+      "requiresHuman": false,
+      "taskType": "milestone",
+      "timeoutSecs": 1800,
+      "title": "Milestone: foundation + resolution core green (full gate)",
+      "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": [
+        "Implementation matches the CONFIRMED spike values (key model_reasoning_effort, before-exec placement) — no re-verification needed; cap-at-high validation error message states it is a policy cap (CLI accepts xhigh)",
+        "build_codex_argv emits -c model_reasoning_effort=<level> BEFORE exec; existing argv structure otherwise byte-identical",
+        "CodexRunner::supports(Effort) == true; capability matrix updated",
+        "Claude/grok continue receiving --effort from their own per-provider tables",
+        "TEST-INIT-002 codex effort tests un-ignored and green (difficulty=high → effort capped at high on codex routes)",
+        "Codex protected-state guard untouched (snapshot/verify-restore still wraps all codex iterations)"
+      ],
+      "completionCheck": "cargo test --test model_selection_engine_edges codex_effort",
+      "dependsOn": [
+        "MILESTONE-1"
+      ],
+      "description": "Flip CodexRunner::supports(Effort) to true; build_codex_argv gains -c model_reasoning_effort=<level> positioned BEFORE the exec subcommand. SPIKE ALREADY RESOLVED pre-loop (2026-06-09, vs pinned codex-cli 0.136.0): key = model_reasoning_effort; CLI-accepted levels = none|minimal|low|medium|high|xhigh; -c valid both before and after exec — before-exec placement pinned. The CLI ACCEPTS xhigh: the validation cap at high is deliberate cost/latency POLICY (operator decision 2026-06-09), not a CLI constraint — do NOT re-run the spike, and do NOT loosen the cap. Per-provider effort: claude/grok from their own tables via --effort; codex effort values validated ∈ {low, medium, high} (xhigh rejected by CONTRACT-001 validation, error message says 'by policy').",
+      "estimatedEffort": "medium",
+      "id": "FEAT-006",
+      "modifiesBehavior": false,
+      "notes": "PRD Open Question RESOLVED 2026-06-09 (pre-loop spike, codex-cli 0.136.0): verification method was --strict-config with an invalid value (errors pre-API enumerating the accepted set) + unknown-key tripwire (proves valid values parse). Do not re-run. Learning 4552/4983: protected-state guard sites (iteration.rs, slot.rs, wave_scheduler.rs) must remain wrapped.",
+      "passes": true,
+      "priority": 25,
+      "qualityDimensions": [
+        "Spike-verified (resolved 2026-06-09): key name, levels, position confirmed against pinned codex-cli 0.136.0; cap-at-high is policy, surfaced in the validation message",
+        "Capability loosening only — no behavior change for claude/grok argv",
+        "Effort decoupled from tier: per-provider tables, no global EFFORT_FOR_DIFFICULTY consumption on codex path"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Codex effort: capability flip + -c model_reasoning_effort argv (spike-verified)",
+      "touchesFiles": [
+        "src/loop_engine/runner.rs",
+        "src/loop_engine/model.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "escalate_tier steps up exactly one DEFINED tier on the same provider's ladder; at ceiling, self-loop (no wrap, no provider hop)",
+        "escalate_below_ceiling returns None at top (replaces escalate_below_opus semantics)",
+        "to_1m_model is suffix-append via ONE_M_SUFFIX, Claude-only, covers claude-fable-5 → claude-fable-5[1m]",
+        "select_fallback_target reads providers.<p>.fallback: tier-preserving cross-provider pivot; absent fallback = no pivot; fallback to self/disabled already rejected by validation",
+        "maybe_codex_fallback_to_claude renamed/generalized to maybe_provider_runtime_fallback with per-provider runtimeErrorThreshold",
+        "promote_once, deferred-apply, and invalidate_stale_overrides diffs are EMPTY (grep the diff)",
+        "Escalation writes to tasks.model preserved (recovery.rs lines ~242/314/361/495 behavior unchanged in kind)",
+        "Existing escalation/overflow/recovery tests updated in place to tier semantics and green"
+      ],
+      "completionCheck": "cargo test escalate && cargo test --test overflow_fallback_rung",
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/loop_engine/recovery.rs",
+            "impact": "OK",
+            "line": 242,
+            "mitigation": "Contractually preserved — escape-valve lifecycle test covers",
+            "usage": "escalation writes tasks.model"
+          },
+          {
+            "file": "src/loop_engine/reactions/post_output.rs",
+            "impact": "BREAKS",
+            "line": 0,
+            "mitigation": "Rewired to escalate_tier/escalate_below_ceiling in this task",
+            "usage": "overflow ladder rungs consume escalate fns"
+          }
+        ],
+        "semanticDistinctions": [
+          {
+            "context": "Overflow downgrade (ctx.effort_overrides)",
+            "currentBehavior": "global EFFORT_FOR_DIFFICULTY",
+            "requiredBehavior": "Override channel unchanged and still wins at spawn"
+          },
+          {
+            "context": "Permanent promotion (runner_overrides)",
+            "currentBehavior": "promote_once single guard",
+            "requiredBehavior": "Untouched — no new write sites"
+          }
+        ]
+      },
+      "dependsOn": [
+        "MILESTONE-1"
+      ],
+      "description": "Rewrite the recovery ladders in tier terms: escalate_tier (up one DEFINED tier, same provider; ceiling self-loop), escalate_below_ceiling (None at top), to_1m_model as suffix-append (Claude-only, covers fable via ONE_M_SUFFIX). select_fallback_target becomes config-derived from providers.<p>.fallback (tier-preserving); codex gains rung-4 fallback iff its fallback is set. maybe_codex_fallback_to_claude generalizes to maybe_provider_runtime_fallback. promote_once / deferred-apply / invalidate_stale_overrides remain UNTOUCHED.",
+      "estimatedEffort": "high",
+      "id": "FEAT-007",
+      "model": "claude-opus-4-8",
+      "modifiesBehavior": true,
+      "notes": "Learning 4921: promote_once owns the single ctx.runner_overrides idempotency guard across all four promotion sites — this task must not add a fifth site or a second guard. Learning 4672/4689: test idempotency explicitly (already-promoted → None). Old escalate_model/escalate_below_opus stay deleted-or-delegating per REFACTOR-005's sweep — this task rewrites their internals to CapabilityTier; final deletion of any remaining shims happens in REFACTOR-005. Ladder behaviors are reactions: honor the single-home contract (exhaustive param-struct destructure, hermetic _inner + injected seams).",
+      "passes": false,
+      "priority": 26,
+      "qualityDimensions": [
+        "Tier ladders are config-driven — zero Claude-constant ladders remain",
+        "Ceiling semantics pinned by tests: self-loop at top for escalate_tier, None for escalate_below_ceiling",
+        "Reactions single-home contract: #[deprecated] leaf locks, exhaustive destructure (no ..), injected seams",
+        "Cross-provider pivot is tier-preserving and validation-backed"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Tier-based escalation/overflow/recovery ladders + config-derived cross-provider fallback",
+      "touchesFiles": [
+        "src/loop_engine/recovery.rs",
+        "src/loop_engine/reactions/post_output.rs",
+        "src/loop_engine/model.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "BlackoutState newtype on IterationContext with doc comment stating the three rules; never serialized, cleared on restart by design",
+        "Claude RateLimit + eligible todo work → blackout recorded from parse_reset_from_output, wait skipped, RerouteAndRetry returned with budget give-back and zero merge-fail-counter zeroing",
+        "Frontier-class tasks DEFER under blackout (never spill); spillover only for implementation-class ≤ maxDifficulty with no runner override (classify_task is the eligibility SSoT)",
+        "select_parallel_group + sequential selection accept excluded_ids; both callers updated in this task",
+        "Deferral-first branch ordered BEFORE auto-recovery/stale logic in BOTH handle_no_eligible_tasks (wave) and the sequential no-eligible branch; TEST-INIT-002 parity test un-ignored and green",
+        "Blackout self-clears on expiry (blackoutFallbackSecs default when reset unparseable); never touches runner_overrides (TEST-INIT-002 known-bad discriminator green)",
+        "reaction_parity gains the RerouteAndRetry case in both paths",
+        "No busy-spin: deferral wait reuses wait_for_usage_reset / probe machinery",
+        "loop_engine/CLAUDE.md footgun section gains the blackout-channel paragraph (promote_once must never read/write it)"
+      ],
+      "completionCheck": "cargo test --test model_selection_engine_edges deferral && cargo test reaction_parity",
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/loop_engine/wave_orchestration.rs",
+            "impact": "NEEDS_REVIEW",
+            "line": 0,
+            "mitigation": "Deferral-first branch ordered before it; parity test both paths",
+            "usage": "handle_no_eligible_tasks: empty-selection → auto-recovery → stale counter"
+          },
+          {
+            "file": "src/commands/next/selection.rs",
+            "impact": "BREAKS",
+            "line": 0,
+            "mitigation": "excluded_ids param added; both callers updated in this task",
+            "usage": "select_parallel_group signature"
+          }
+        ],
+        "semanticDistinctions": [
+          {
+            "context": "Permanent promotion (runner_overrides)",
+            "currentBehavior": "only channel that reroutes providers",
+            "requiredBehavior": "Unchanged; keeps higher precedence than blackout reroute"
+          },
+          {
+            "context": "Temporary quota reroute (provider_blackouts)",
+            "currentBehavior": "does not exist",
+            "requiredBehavior": "Strictly separate channel; derived per pass; never stored"
+          }
+        ]
+      },
+      "dependsOn": [
+        "MILESTONE-1"
+      ],
+      "description": "FR-008: BlackoutState newtype living ONLY on IterationContext (in-memory, self-expiring, provider-keyed map though Claude-only in v1) with the three documented rules: never persisted, never read/written by promote_once/runner_overrides paths, set only by account-level rate-limit signals. On Claude RateLimit with spillover-eligible todo work: record blackout from parse_reset_from_output, skip the wait, return RerouteAndRetry (budget give-back; NO merge-fail-counter zeroing). Add ProceedWithSpillover variant. select_parallel_group gains excluded_ids: &HashSet<String> (+ sequential equivalent). Deferral-first branch in handle_no_eligible_tasks AND the sequential no-eligible branch: when all candidates are quota-deferred, wait for reset (reuse wait_for_usage_reset), clear blackout, return WITHOUT stale increment / auto-recovery churn / drained classification. Spillover eligibility = classify_task == implementation AND difficulty ≤ spillover.maxDifficulty AND no runner override.",
+      "estimatedEffort": "high",
+      "id": "FEAT-008",
+      "model": "claude-opus-4-8",
+      "modifiesBehavior": true,
+      "notes": "Learning 3927 is the bug class this prevents: wave-mode empty-group path went straight to the stale tracker, causing false stale-abort. Learning 4171: wave-mode rate-limit reaction fires once per wave (post-wave aggregation), not per slot — hook the blackout recording there. Learning 4921/4672: promote_once is the only permanent-promotion guard; the blackout channel is derived per pass, never stored in overrides. Reactions single-home contract applies (account.rs coordinators, learning 4865/4186).",
+      "passes": true,
+      "priority": 27,
+      "qualityDimensions": [
+        "Channel discipline type-enforced: BlackoutState newtype, three rules in the doc comment, consistency pinned by tests",
+        "Deferral-first ordering is structural (branch position), not flag-guarded",
+        "Selection stays provider-agnostic — only hard exclusion added, no preference weighting (non-goal)",
+        "Parity: sequential and wave no-eligible branches behave identically (learning 4913)"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Quota-aware failover: provider_blackouts channel, RerouteAndRetry/ProceedWithSpillover, excluded_ids, deferral-first branch",
+      "touchesFiles": [
+        "src/loop_engine/reactions/account.rs",
+        "src/loop_engine/reactions/pre_spawn.rs",
+        "src/loop_engine/context.rs",
+        "src/loop_engine/wave_orchestration.rs",
+        "src/loop_engine/engine.rs",
+        "src/commands/next/selection.rs",
+        "src/loop_engine/CLAUDE.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Zero references remain to: ModelTier, model_tier, resolve_task_execution_target, resolve_task_model, compute_baseline_model, parse_baseline_tier_key, OPUS_MODEL_1M, escalate_model, escalate_below_opus, apply_review_model_override (grep-verified, src + tests)",
+        "Workspace compiles and full crate tests pass after the deletion (cargo test green this iteration — deletions may not strand test files)",
+        "Diff contains deletions + mechanical caller migration ONLY — no new features smuggled in",
+        "cargo run --bin gen-docs -- --check still passes (constants consumed by gen-docs updated atomically if touched)"
+      ],
+      "completionCheck": "! grep -rn \"ModelTier\\|resolve_task_execution_target\\|compute_baseline_model\\|OPUS_MODEL_1M\" src/ tests/ --include=*.rs && cargo test",
+      "dependsOn": [
+        "FEAT-006",
+        "FEAT-007",
+        "FEAT-008"
+      ],
+      "description": "Delete everything the rewrite superseded, as its own reviewable diff: resolve_task_execution_target, resolve_task_model, compute_baseline_model, ModelTier + model_tier + parse_baseline_tier_key, OPUS_MODEL_1M (replaced by ONE_M_SUFFIX), apply_review_model_override remnants, any escalate_model/escalate_below_opus shims left by FEAT-007. Update ALL remaining callers — including the ~10 integration test files (grep-derived: codex_provider_hint_threading, codex_recovery, codex_runner_overrides_invariant, grok_to_claude_fallback, overflow_fallback_rung, primary_runner_routing, prompt_slot, provider_routing, runtime_error_fallback, plus src unit tests in lifecycle/recovery.rs, prompt_sections/{escalation,synergy}.rs) — mechanically so the workspace compiles and tests stay green in THIS iteration. Semantic test-coverage parity is TEST-010's job; this task owns compile-green.",
+      "estimatedEffort": "high",
+      "id": "REFACTOR-005",
+      "model": "claude-opus-4-8",
+      "modifiesBehavior": false,
+      "notes": "Isolated deletion diff per PRD risk mitigation (test blast radius). Runs AFTER FEAT-006/007/008 so no production caller of the deleted fns remains (FEAT-007 rewrote the escalation internals; FEAT-004 rewired both prompt builders). Mechanical test migration = swap deleted-fn calls for resolve_execution_plan/tier_of equivalents asserting the SAME behavior; if a test's premise no longer exists (e.g. baselineTierRoutes remap), delete it and note it in the progress log for TEST-010 to re-cover under the new system.",
+      "passes": true,
+      "priority": 28,
+      "qualityDimensions": [
+        "Deletion-only discipline: reviewers can read the diff as pure removal + mechanical rewiring",
+        "No #[allow(dead_code)] left behind — dead paths are removed, not silenced",
+        "Every migrated test still asserts equivalent behavior or is explicitly logged as premise-dead for TEST-010"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Deletion sweep: superseded resolution fns, ModelTier, OPUS_MODEL_1M, baseline-tier machinery — own diff",
+      "touchesFiles": [
+        "src/loop_engine/model.rs",
+        "src/loop_engine/project_config.rs",
+        "src/loop_engine/prompt/sequential.rs",
+        "src/loop_engine/prompt/slot.rs",
+        "src/lifecycle/recovery.rs",
+        "src/loop_engine/prompt_sections/escalation.rs",
+        "src/loop_engine/prompt_sections/synergy.rs",
+        "tests/primary_runner_routing.rs",
+        "tests/provider_routing.rs",
+        "tests/overflow_fallback_rung.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "models init writes the FR-001 default block; --force-replace-legacy deletes exactly the 4 legacy keys and writes the default block; --dry-run prints both halves of the diff without writing",
+        "models show renders the full routing table with explicit empty states, the anchor-derived difficulty→model mapping, and the one-line crash-escalation cost note (anchor+1 with resolved model + relative cost)",
+        "models show / list never hard-fail on legacy keys — detect-and-instruct banner; mutating verbs hard-error",
+        "enable <provider> probes the binary BEFORE writing (probe_enabled_provider_binaries); disable never probes",
+        "Legacy verbs removed; invoking them errors pointing at the replacement verb",
+        "Every setter round-trips the config file via serde_json::Value preserving unknown keys (additionalAllowedTools, embeddingModel, ...)",
+        "route/unroute manage routing.byIdPrefix; models show documents that codex pinning is route-only (tasks.model cannot express Codex)",
+        "Picker (task-mgr init scaffold path) retargets to anchor selection; non-TTY skips with one-line stderr hint",
+        "Strict validation on every mutating verb input (CapabilityTier::parse, parse_config_provider) — typos are CONFIG ERRORs",
+        "models show round-trips: a config written by init validates clean through validate_models_config"
+      ],
+      "completionCheck": "cargo test models_command",
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/commands/models/handlers.rs",
+            "impact": "BREAKS",
+            "line": 0,
+            "mitigation": "FR-009 verb redesign; tests rewritten in this task",
+            "usage": "legacy verbs + their tests write legacy keys"
+          },
+          {
+            "file": "src/main.rs",
+            "impact": "BREAKS",
+            "line": 0,
+            "mitigation": "Dispatcher updated for the new verb set",
+            "usage": "clap dispatch for models subcommands"
+          }
+        ],
+        "semanticDistinctions": [
+          {
+            "context": "Operator migration (legacy → v2)",
+            "currentBehavior": "no path",
+            "requiredBehavior": "models init --force-replace-legacy is the ONE sanctioned migration; --dry-run previews it"
+          }
+        ]
+      },
+      "dependsOn": [
+        "REFACTOR-005"
+      ],
+      "description": "FR-009 verb set: init (+--force-replace-legacy: the one sanctioned migration deleting the 4 legacy keys and writing the default block; +--dry-run: print legacy keys with current values and the new block WITHOUT writing), show (full routing table + anchor-derived difficulty→model mapping + crash-escalation cost note + codex route-only pinning note + legacy detect-and-instruct banner), set-anchor, enable|disable <provider> (probe_enabled_provider_binaries on enable), set-tier/unset-tier, set-effort, set-fallback/unset-fallback (new per-provider semantics), route/unroute (byIdPrefix), list (config reverse lookup). REMOVE legacy verbs set-default/set-review-model/unset-* (+ legacy set-fallback semantics) — removal error points at the new verbs. All writes preserve unknown config keys (serde_json::Value round-trip). Interactive picker retargets to anchor selection.",
+      "estimatedEffort": "high",
+      "id": "FEAT-009",
+      "model": "claude-opus-4-8",
+      "modifiesBehavior": true,
+      "notes": "Existing handlers.rs already round-trips via serde_json::Value and probes before writing — preserve those patterns under the new verb set. The clap surface changes are operator-facing: keep man-pages/completions generation working (cargo test cli_tests if touched). gen-docs MODELS-block regeneration is FEAT-011's scope; here only ensure constants stay in model.rs.",
+      "passes": false,
+      "priority": 29,
+      "qualityDimensions": [
+        "Operator-facing errors are actionable: removed verbs name their replacement; CONFIG ERRORs name key + accepted set",
+        "Writes never clobber unrelated config keys (Value round-trip pinned by test)",
+        "Probe-before-write on enable — never strand a config pointing at a missing binary",
+        "Cost posture surfaced, not buried: show prints the anchor mapping + escalation cost note"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "models CLI redesign: init/show/set-anchor/enable/disable/set-tier/set-effort/set-fallback/route/list",
+      "touchesFiles": [
+        "src/commands/models/handlers.rs",
+        "src/commands/models/mod.rs",
+        "src/commands/models/picker.rs",
+        "src/commands/models/ensure_default.rs",
+        "src/main.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Every file on the grep-derived sweep list reviewed; semantic parity confirmed or new coverage added (documented per file in the progress log)",
+        "Premise-dead tests from REFACTOR-005's log re-covered under new-system equivalents or explicitly retired with rationale",
+        "End-to-end precedence matrix test exists: explicit model > byIdPrefix > class route > blackout reroute > anchor window, through real prompt-builder calls",
+        "Escape-valve lifecycle e2e: NULL-model task → escalation → operator edit → six-channel clear (full path, not unit-only)",
+        "Simulated Claude rate limit: medium FEAT task reroutes to grok while a frontier REVIEW task defers — zero stale-counter increments (PRD success metric)",
+        "Completed tasks carry completed_by_provider; run_tasks rows carry provider+model (stamping e2e)",
+        "Coverage on new resolution/failover modules ≥ 80% of public functions exercised"
+      ],
+      "completionCheck": "cargo test",
+      "dependsOn": [
+        "FEAT-009"
+      ],
+      "description": "The grep-derived sweep (FR-010): verify every test file REFACTOR-005 mechanically migrated still asserts equivalent SEMANTIC coverage under tiers, and re-cover anything logged as premise-dead. Sweep list (re-derive by grepping for old symbols and reading REFACTOR-005's progress-log notes): recovery.rs unit tests, runtime_error_fallback, primary_runner_*, reaction_parity, review_model_routing, fallback_config, overflow_*, models_command, synergy/iteration-model tests, escalation tests, prompt-section tests. Add: precedence-matrix integration test (every rung beats lower rungs, end-to-end through the prompt builders), full escape-valve lifecycle e2e on a model-less task, blackout reroute + frontier-deferral e2e, provider-stamping assertion on completed tasks.",
+      "estimatedEffort": "high",
+      "id": "TEST-010",
+      "modifiesBehavior": false,
+      "notes": "Use production-shaped fixtures: tests/fixtures/*.json.tmpl with placeholders rendered by tests/common/mod.rs::render_fixture_tmpl (FEAT-011 adds {{FRONTIER_MODEL}} etc. — coordinate: if this task needs the new placeholders first, add them here and note it for FEAT-011). assert_eq! on exact model-id strings, never contains().",
+      "passes": false,
+      "priority": 30,
+      "qualityDimensions": [
+        "Semantic parity, not just compilation: each migrated test still rejects the bug it was written to catch",
+        "E2e paths exercised through production wiring (prompt builders, reactions), not test-only seams",
+        "PRD success metrics encoded as tests (anchor mapping, heterogeneous wave stamping, rate-limit reroute/defer)"
+      ],
+      "requiresHuman": false,
+      "taskType": "test",
+      "title": "Test-migration sweep: semantic coverage parity under the tier system",
+      "touchesFiles": [
+        "tests/primary_runner_routing.rs",
+        "tests/provider_routing.rs",
+        "tests/overflow_fallback_rung.rs",
+        "tests/runtime_error_fallback.rs",
+        "tests/grok_to_claude_fallback.rs",
+        "tests/codex_recovery.rs",
+        "tests/codex_runner_overrides_invariant.rs",
+        "tests/prompt_slot.rs",
+        "tests/model_selection_engine_edges.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "cargo run --bin gen-docs regenerates the MODELS block with tier matrix + anchor explanation; -- --check passes in CI",
+        "render_fixture_tmpl supports the new tier placeholders; all *.json.tmpl fixtures swept (no stale {{OPUS_MODEL}}-style placeholders left referencing deleted constants)",
+        "src/loop_engine/CLAUDE.md routing/fallback/capability sections rewritten for models/routing config; blackout-channel paragraph present",
+        "Root CLAUDE.md model/verb sections match the shipped CLI exactly (every documented verb exists; no removed verb documented)",
+        "docs/designs/model-selection-redesign.md created: tiers, anchor window, precedence rungs, blackout channel, codex route-only pinning",
+        "No model-ID literal leaks into docs templates outside the gen-docs extraction path"
+      ],
+      "completionCheck": "cargo run --bin gen-docs -- --check && cargo test",
+      "dependsOn": [
+        "TEST-010"
+      ],
+      "description": "FR-010 docs/fixtures: gen-docs extracts FABLE_MODEL + per-provider tier/effort tables, renders the tier matrix + anchor explanation into .claude/commands/tasks.md (CI --check enforced). Fixture placeholders {{FRONTIER_MODEL}}/{{STANDARD_MODEL}}/etc. added to render_fixture_tmpl; sweep tests/fixtures/*.json.tmpl. Rewrite src/loop_engine/CLAUDE.md routing/fallback/capability sections (routing-precedence diagram, primaryRunner/fallbackRunner → models/routing, blackout-channel contract paragraph if FEAT-008 left it thin). Update root CLAUDE.md ('Model IDs and Effort Mapping' + 'task-mgr models' sections for the new verb set, anchor, tiers). Create docs/designs/model-selection-redesign.md (condensed architecture record: tiers/anchor/blackout).",
+      "estimatedEffort": "medium",
+      "id": "FEAT-011",
+      "modifiesBehavior": false,
+      "notes": "gen-docs reads constants/tables from src/loop_engine/model.rs — keep extraction declarative (the MODELS block in .claude/commands/tasks.md is machine-managed; hand edits get overwritten). Root CLAUDE.md edits: only the model/models-subcommand sections; do not touch the task-mgr-enhance-managed block.",
+      "passes": true,
+      "priority": 32,
+      "qualityDimensions": [
+        "Docs generated from code where possible (gen-docs), hand-written only for architecture rationale",
+        "CI-enforced freshness: --check fails on stale MODELS block",
+        "Operator docs match shipped behavior verb-for-verb"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "gen-docs, fixtures, CLAUDE.md rewrite, architecture record",
+      "touchesFiles": [
+        "src/bin/gen-docs.rs",
+        "tests/common/mod.rs",
+        "tests/fixtures/prd_model_resolution_integration.json.tmpl",
+        "src/loop_engine/CLAUDE.md",
+        "CLAUDE.md",
+        "docs/designs/model-selection-redesign.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Full test suite green (including pre-existing failures fixed)",
+        "cargo clippy -- -D warnings clean; cargo fmt --check passes",
+        "cargo run --bin gen-docs -- --check passes",
+        "All dependsOn tasks have passes: true"
+      ],
+      "dependsOn": [
+        "MILESTONE-1",
+        "FEAT-009",
+        "TEST-010",
+        "FEAT-011"
+      ],
+      "description": "Full unscoped gate after ladders, failover, deletion sweep, CLI, test sweep, and docs: fmt, check, clippy -D warnings, full cargo test, gen-docs --check. Fix every failure including pre-existing; spawn FIX tasks per protocol only for non-trivial unrelated failures.",
+      "estimatedEffort": "medium",
+      "id": "MILESTONE-2",
+      "model": "claude-opus-4-8",
+      "modifiesBehavior": false,
+      "notes": "Stale slot-worktree binaries caveat applies (learning #4753): fixture-path failures naming a removed -slot-N worktree → recompile, don't spawn FIX tasks.",
+      "passes": true,
+      "priority": 50,
+      "qualityDimensions": [
+        "Trunk-green invariant: zero failures left behind, zero punted without a spawned FIX task"
+      ],
+      "requiresHuman": false,
+      "taskType": "milestone",
+      "timeoutSecs": 1800,
+      "title": "Milestone: full feature set green (full gate)",
+      "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": [
+        "Each handoff point verified by reading production call sites (file:line documented in the progress log)",
+        "Kebab-case tier keys survive JSON → typed lookup; lowercase provider keys verified at the HashMap boundary",
+        "Effort precedence at spawn verified: ctx.effort_overrides beats plan.effort in both paths",
+        "Config caching verified: one read per run, zero re-reads in per-slot hot paths",
+        "Any missing wiring found → WIRE-FIX-xxx spawned via task-mgr add --stdin --depended-on-by MILESTONE-FINAL"
+      ],
+      "dependsOn": [
+        "MILESTONE-2"
+      ],
+      "description": "Trace the primary data path end-to-end: .task-mgr/config.json models+routing block → read_project_config → validate_models_config → ResolvedModelsConfig (cached once per run) → resolve_execution_plan in BOTH prompt builders → RunnerOpts (model + effort) → runner argv (claude --effort / grok --effort / codex -c model_reasoning_effort= before exec). Verify each handoff's key types match the Data Flow Contracts; verify config is resolved once per run (no re-reads in wave hot paths). Does NOT write new code unless wiring is missing.",
+      "estimatedEffort": "medium",
+      "id": "INT-001",
+      "modifiesBehavior": false,
+      "passes": true,
+      "priority": 55,
+      "qualityDimensions": [
+        "Verification by reading production wiring, not by trusting tests alone"
+      ],
+      "requiresHuman": false,
+      "taskType": "verification",
+      "title": "Integration trace: config.json → validation → resolve_execution_plan → prompt builder → runner argv",
+      "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": [
+        "Each handoff verified at production call sites in BOTH sequential and wave paths (file:line in progress log)",
+        "Grep-verified: no code path reads or writes runner_overrides from blackout handling",
+        "Deferral-first branch position verified BEFORE auto-recovery/stale logic in both no-eligible branches",
+        "Blackout expiry self-clear verified (and blackoutFallbackSecs fallback when reset header unparseable)",
+        "Any missing wiring found → WIRE-FIX-xxx spawned via task-mgr add --stdin --depended-on-by MILESTONE-FINAL"
+      ],
+      "dependsOn": [
+        "MILESTONE-2"
+      ],
+      "description": "Trace the quota-failover control path: Claude RateLimit detection (account.rs, once-per-wave aggregation) → parse_reset_from_output → BlackoutState on IterationContext → spillover eligibility via classify_task → excluded_ids into select_parallel_group / sequential selection → RerouteAndRetry vs frontier deferral → all-deferred wave hits the deferral-first branch (wait, clear, return) → stale counter verified untouched → blackout expiry self-clear. Verify channel discipline: zero touch points between blackout and runner_overrides/promote_once.",
+      "estimatedEffort": "medium",
+      "id": "INT-002",
+      "modifiesBehavior": false,
+      "passes": true,
+      "priority": 56,
+      "qualityDimensions": [
+        "Channel-discipline verification is structural (grep + read), not inferred from test outcomes"
+      ],
+      "requiresHuman": false,
+      "taskType": "verification",
+      "title": "Integration trace: rate-limit signal → blackout → reroute/deferral → stale counter untouched → expiry",
+      "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": [
+        "Stamping fires for sequential AND wave completions (verified at the single home in process_iteration_output)",
+        "Grep-verified: no other writer of completed_by_provider / run_tasks.provider exists",
+        "Export → import round-trips the new columns and the untouched prd_metadata.default_model verbatim",
+        "Historical rows (NULL provider) hydrate without error",
+        "Any missing wiring found → WIRE-FIX-xxx spawned via task-mgr add --stdin --depended-on-by MILESTONE-FINAL"
+      ],
+      "dependsOn": [
+        "MILESTONE-2"
+      ],
+      "description": "Trace the stamping path: IterationResult/SlotResult.effective_runner + effective_model → process_iteration_output completion arm → tasks.completed_by_provider + run_tasks.provider/model → TryFrom<Row> hydration → task-mgr export JSON round-trip (column exported and re-imported verbatim, including prd_metadata.default_model disposition). Verify single-home stamping (no second write site) and lowercase canonical provider names.",
+      "estimatedEffort": "low",
+      "id": "INT-003",
+      "modifiesBehavior": false,
+      "passes": true,
+      "priority": 57,
+      "qualityDimensions": [
+        "Round-trip verified with real export/import, not schema inspection alone"
+      ],
+      "requiresHuman": false,
+      "taskType": "verification",
+      "title": "Integration trace: completion result → provider stamping → DB columns → export round-trip",
+      "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": [
+        "Anchor/tier derivation confirmed to live in exactly ONE function shared by spawn site and every recovery path (§2.6 modularity rule — the FIX-001 divergence lesson)",
+        "No duplicated precedence logic between sequential and wave paths",
+        "Config types free of dead fields/aliases; error strings consistent in voice and actionability",
+        "Any issues found have corresponding REFACTOR-xxx tasks added via task-mgr add --stdin --depended-on-by MILESTONE-FINAL"
+      ],
+      "dependsOn": [
+        "INT-001",
+        "INT-002",
+        "INT-003"
+      ],
+      "description": "Full-context final pass over everything this PRD touched: DRY (one anchor/tier derivation function — the §2.6 modularity rule), complexity, coupling (BlackoutState isolation), clarity (rung constants readable), pattern adherence (reactions single-home, lifecycle verbs, ui:: vs tracing). Spawn REFACTOR-xxx tasks (priority 71-85) for anything substantive; small touch-ups may be fixed inline.",
+      "estimatedEffort": "high",
+      "id": "REFACTOR-REVIEW-FINAL",
+      "model": "claude-fable-5",
+      "modifiesBehavior": false,
+      "notes": "For each issue: echo '{...}' | task-mgr add --stdin --depended-on-by MILESTONE-FINAL. If no issues, emit <task-status>REFACTOR-REVIEW-FINAL:done</task-status> with a one-line progress note. Use the rust-python-code-reviewer agent.",
+      "passes": true,
+      "priority": 70,
+      "qualityDimensions": [
+        "Full-context review: reads the cumulative diff against main, not per-task slices"
+      ],
+      "requiresHuman": false,
+      "taskType": "review",
+      "title": "Final refactoring review: full-context pass over all new/changed code",
+      "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": [
+        "All four PRD success metrics demonstrated (test names / commands recorded in the progress log)",
+        "src/loop_engine/CLAUDE.md + root CLAUDE.md updated and accurate (FEAT-011 output verified against shipped behavior)",
+        "docs/designs/model-selection-redesign.md exists and matches the implementation",
+        "Grep-verified reachability: every new public function and CLI verb has a production call site / dispatch entry",
+        "No .unwrap() in new production code (test code exempt)",
+        "Test fixtures use real struct field names (spot-check serde round-trips)",
+        "cargo test && cargo clippy -- -D warnings && cargo fmt --check && cargo run --bin gen-docs -- --check all green"
+      ],
+      "dependsOn": [
+        "REFACTOR-REVIEW-FINAL"
+      ],
+      "description": "Authoritative final check against the PRD success metrics: (1) default config + anchor=standard reproduces low→sonnet / medium→opus-4-8 / high→fable, anchor=cost-efficient shifts to haiku/sonnet/opus; (2) heterogeneous-provider wave completes with completed_by_provider stamped; (3) simulated Claude rate limit reroutes medium FEAT to grok while frontier REVIEW defers, zero stale-counter increments; (4) full gate green. Plus documentation and reachability audit.",
+      "estimatedEffort": "high",
+      "id": "VERIFY-001",
+      "model": "claude-fable-5",
+      "modifiesBehavior": false,
+      "passes": false,
+      "priority": 90,
+      "qualityDimensions": [
+        "Success metrics demonstrated by executable evidence, not assertion"
+      ],
+      "requiresHuman": false,
+      "taskType": "verification",
+      "timeoutSecs": 1800,
+      "title": "Final verification: success metrics, docs, reachability, no-unwrap audit",
+      "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": [
+        "All userStories have passes: true (including spawned CODE-FIX/WIRE-FIX/REFACTOR tasks)",
+        "Full test suite green including pre-existing failures",
+        "cargo clippy -- -D warnings, cargo fmt --check, cargo run --bin gen-docs -- --check all pass",
+        "Branch ready to merge to main"
+      ],
+      "dependsOn": [
+        "VERIFY-001",
+        "WIRE-FIX-001",
+        "REFACTOR-006",
+        "REFACTOR-007",
+        "REFACTOR-008",
+        "REFACTOR-009"
+      ],
+      "description": "Final full gate. Verify ALL stories pass, no spawned tasks remain open, full unscoped suite + lint + fmt + gen-docs --check green, branch merge-ready per mergeStrategy.",
+      "estimatedEffort": "high",
+      "id": "MILESTONE-FINAL",
+      "model": "claude-fable-5",
+      "modifiesBehavior": false,
+      "passes": false,
+      "priority": 99,
+      "qualityDimensions": [
+        "Trunk-green invariant holds at merge time"
+      ],
+      "requiresHuman": false,
+      "taskType": "milestone",
+      "timeoutSecs": 1800,
+      "title": "Final milestone: trunk green, all tasks passed, merge-ready",
+      "touchesFiles": []
+    },
+    {
+      "dependsOn": [
+        "INT-001"
+      ],
+      "description": "resolve_execution_plan correctly computes ExecutionPlan.effort = models.effort_for(final_provider, difficulty) (per-provider config table) but both prompt builders drop it. Both builders independently recompute base effort from the static EFFORT_FOR_DIFFICULTY table via effort_for_difficulty(). For the default config the tables match, but custom per-provider effort tables (e.g. providers.grok.effort.high = medium) are silently ignored. Fix: carry plan.effort (Option<String>) through PromptResult and SlotPromptBundle instead of (or as the initializer for) the static effort_for_difficulty fallback. Requires PromptResult::cluster_effort type change from Option<&'static str> to Option<String> and SlotPromptBundle to carry computed effort instead of raw difficulty (or in addition to it). Both dispatch sites (iteration.rs:456, slot.rs:148) must prefer plan.effort over the static fallback.",
+      "estimatedEffort": "medium",
+      "id": "WIRE-FIX-001",
+      "passes": true,
+      "priority": 56,
+      "title": "Wire ExecutionPlan.effort through prompt builders to runner argv",
+      "touchesFiles": [
+        "src/loop_engine/prompt/sequential.rs",
+        "src/loop_engine/prompt/slot.rs",
+        "src/loop_engine/iteration.rs",
+        "src/loop_engine/slot.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Key decision (migrate vs delete) resolved and recorded before implementation",
+        "No production code path remains gated on a config value that preflight unconditionally rejects",
+        "If delete: ProjectConfig carries no always-None legacy fields; test-only fns removed with their tests; six-signature threading pruned",
+        "If migrate: RuntimeError promotion reachable via the models/routing surface with production-shaped fixture tests (FR-001 JSON schema)",
+        "src/loop_engine/CLAUDE.md sections describing primaryRunner/fallbackRunner-driven RuntimeError fallback rewritten to match the chosen reality",
+        "Full unscoped cargo test green (deletions can strand test files)"
+      ],
+      "description": "Preflight hard-rejects primaryRunner/fallbackRunner (LEGACY_MODEL_KEYS, project_config.rs:412; reject_legacy_model_config called from main.rs:1130 and batch.rs:508), so ProjectConfig.primary_runner/.fallback_runner are always None at loop time. The three cross-provider RuntimeError promotion branches in recovery.rs (Claude->Grok, Grok->Claude, Codex->Claude maybe_provider_runtime_fallback) can therefore never fire in production; tests/runtime_error_fallback.rs, tests/primary_runner_fallback.rs, tests/wave_runtime_error_fallback.rs stay green only by constructing the legacy structs directly. The overflow rung-4 pivot WAS migrated to providers.<source>.fallback; the RuntimeError path was not. Resolve the recorded key decision: (A) re-home the promotion on the provider-first surface (per-provider runtimeErrorThreshold, opt-in route flag, target via ResolvedModelsConfig::fallback_provider), or (B) delete the dead machinery. Dead inventory if deleting: promotion arms in escalate_task_model_if_needed_inner + maybe_provider_runtime_fallback gates; PrimaryRunnerConfig/FallbackRunnerConfig/RunnerSpec types; primary_runner_match (model.rs); validate_runner_routing_config and write_default_model (test-only callers); ProjectConfig fields default_model/review_model/primary_runner/fallback_runner; check_fallback_runner_binary/check_grok_review_binary; dead prompt-builder params primary_runner/project_default_model/user_default_model threaded through six signatures; the vacuous legacy tests. Keep the user-config defaultModel deprecation warning. The same-provider Claude tier escalation (recovery.rs:245) is live and must be preserved either way.",
+      "estimatedEffort": "high",
+      "id": "REFACTOR-006",
+      "notes": "Found by REFACTOR-REVIEW-FINAL (own analysis + rust-python-code-reviewer agent, SUBSTANTIVE #1). The rustdoc at recovery.rs:412 already flags the params as retained-for-a-follow-up; this is that follow-up plus the migrate-or-delete decision. promote_once / deferred-apply / invalidate_stale_overrides stay UNTOUCHED regardless of branch.",
+      "passes": true,
+      "priority": 72,
+      "title": "RuntimeError cross-provider promotion: migrate to provider-first config or delete (unreachable dead code post-hard-break)",
+      "touchesFiles": [
+        "src/loop_engine/recovery.rs",
+        "src/loop_engine/project_config.rs",
+        "src/loop_engine/model.rs",
+        "src/loop_engine/orchestrator.rs",
+        "src/loop_engine/wave_scheduler.rs",
+        "src/loop_engine/iteration.rs",
+        "src/loop_engine/prompt/sequential.rs",
+        "src/loop_engine/prompt/slot.rs",
+        "src/loop_engine/CLAUDE.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "escalate_tier/tier_of calls in recovery.rs, reactions/pre_spawn.rs, and prompt_sections/escalation.rs receive the operator-resolved config, not builtin_resolved_models()",
+        "Remaining production builtin_resolved_models() callers are genuinely config-independent surfaces only (models CLI offline display, picker ensure_default)",
+        "Regression test with a production-shaped custom Claude tier map: crash escalation writes a model from the operator ladder, not the builtin ladder",
+        "Default-config behavior byte-identical (existing escalation/recovery tests pass unchanged)"
+      ],
+      "dependsOn": [
+        "REFACTOR-006"
+      ],
+      "description": "The spawn site (resolve_execution_plan via both prompt builders) and the overflow ladder (post_output.rs:193) resolve the OPERATOR's config via resolve_models_config(&project_config.models, &project_config.routing) — but three live paths walk builtin_resolved_models() instead: (1) consecutive-failure escalation escalate_task_model_if_needed_inner (recovery.rs:248, writes tasks.model), (2) crash-escalation suggestion crash_escalated_model (reactions/pre_spawn.rs:173), (3) the at-ceiling check in build_escalation_section (prompt_sections/escalation.rs:52, prompt-text only). The derivation FUNCTION is single-homed (escalate_tier/tier_of in model.rs) but the config INPUT diverges — the exact FIX-001 divergence class the section-2.6 modularity rule guards: an operator who remaps Claude tiers (custom ladder, null rungs) gets recovery escalations onto models their config never defined. The acknowledged-tech-debt comment at recovery.rs:241 (call sites predate the provider-first config) marks the seam. Callers (orchestrator/wave_scheduler/iteration) already hold project_config; thread the resolved config through.",
+      "estimatedEffort": "medium",
+      "id": "REFACTOR-007",
+      "notes": "Found by REFACTOR-REVIEW-FINAL. Sequenced after REFACTOR-006 because both rework recovery.rs signatures — if 006 chooses delete, fewer signatures need the new parameter. anchored_tier/normalize_difficulty single-homing is confirmed intact; this task only fixes the config-input divergence.",
+      "passes": false,
+      "priority": 74,
+      "title": "Thread operator-resolved ModelsConfig into recovery/pre_spawn crash escalation (replace builtin_resolved_models at live sites)",
+      "touchesFiles": [
+        "src/loop_engine/recovery.rs",
+        "src/loop_engine/reactions/pre_spawn.rs",
+        "src/loop_engine/prompt_sections/escalation.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "One source of truth for default tier->model assignments: builders derive from the tables, or an equality test pins the two representations",
+        "No model-id literal (grok-build included) outside src/loop_engine/model.rs in non-test production code",
+        "tests/no_hardcoded_models.rs catches grok model-id literals",
+        "cargo run --bin gen-docs -- --check passes"
+      ],
+      "description": "CLAUDE/GROK/CODEX_DEFAULT_TIER_MODELS (model.rs:228-235, consumed by gen-docs) restate the tier->model assignments that default_claude_provider/default_grok_provider/default_codex_provider build at runtime in project_config.rs:290-328 — two homes with no drift guard, so a rung added to one silently desyncs models-list/gen-docs documentation from actual routing. Additionally the \"grok-build\" literal at project_config.rs:310 (and the dead default_fallback_model at :974) escapes tests/no_hardcoded_models.rs, whose regex only matches claude-(opus|sonnet|haiku|fable) ids. Make the runtime builders consume the *_DEFAULT_TIER_MODELS tables (preferred) or pin table<->builder equality in a test, and extend the no_hardcoded_models guard to grok model ids.",
+      "estimatedEffort": "low",
+      "id": "REFACTOR-008",
+      "notes": "Found by REFACTOR-REVIEW-FINAL (reviewer agent Warnings #2+#3, merged — same SSoT concern). overflow.rs grok-build hits are #[cfg(test)] code, out of scope.",
+      "passes": false,
+      "priority": 76,
+      "title": "Single-source default tier tables: derive default_*_provider from *_DEFAULT_TIER_MODELS and widen no_hardcoded_models to grok ids",
+      "touchesFiles": [
+        "src/loop_engine/model.rs",
+        "src/loop_engine/project_config.rs",
+        "tests/no_hardcoded_models.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "The hint-drop rule is expressed once (shared helper called by both paths) OR a parity test fails if either path changes its handling of the model-widening case",
+        "Codex route with empty model still carries provider_hint through to dispatch in BOTH paths (current wave behavior preserved; verify sequential against it)",
+        "Existing reaction_parity, prompt_slot, and provider_routing tests green"
+      ],
+      "description": "Sequential (iteration.rs:478) drops the spawn provider_hint whenever effective_model != prompt_result.resolved_model; wave (wave_scheduler.rs:836-848) deliberately KEEPS it when effective_model widens to default_model (the Codex provider:codex/model-empty case) and drops only on the crash-escalation/review-routing rewrites. The asymmetry is reasoned and commented, but it lives OUTSIDE the reaction_parity harness (which pins resolve_task_execution, not the post-plan hint handling), so a future edit to either site can silently diverge the paths — the parity-divergence bug class the reactions framework exists to prevent. Extract a shared helper (e.g. final_provider_hint(plan_provider, effective_model, resolved_model, default_model) in reactions or model.rs) used by both dispatch sites, or add an explicit parity test covering the widening case so divergence fails at test time.",
+      "estimatedEffort": "low",
+      "id": "REFACTOR-009",
+      "notes": "Found by REFACTOR-REVIEW-FINAL (reviewer agent Warning #1). Investigate whether the sequential blanket-drop is actually wrong for the widening case (a latent bug) before choosing helper shape — if sequential drops a hint wave keeps, a Codex task could dispatch to Claude in sequential mode only.",
+      "passes": false,
+      "priority": 78,
+      "title": "Share the post-plan provider_hint drop rule between sequential and wave paths (or pin the widening case in reaction_parity)",
+      "touchesFiles": [
+        "src/loop_engine/iteration.rs",
+        "src/loop_engine/wave_scheduler.rs",
+        "tests/reaction_parity.rs"
+      ]
+    }
+  ],
+  "version": "1.0"
+}

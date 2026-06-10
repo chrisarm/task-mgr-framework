@@ -192,6 +192,7 @@ fn process_iteration_output_extracts_learnings_from_fixture_output() {
         files_modified: &[],
         effective_model: None,
         effective_effort: None,
+        effective_runner: None,
         slot_index: None,
     });
 
@@ -257,6 +258,7 @@ fn process_iteration_output_records_bandit_feedback_for_shown_learnings() {
         files_modified: &[],
         effective_model: None,
         effective_effort: None,
+        effective_runner: None,
         slot_index: None,
     });
 
@@ -322,6 +324,7 @@ fn process_iteration_output_skip_git_true_does_not_attempt_git_detection() {
         files_modified: &[],
         effective_model: None,
         effective_effort: None,
+        effective_runner: None,
         slot_index: None,
     });
 
@@ -415,6 +418,7 @@ fn process_iteration_output_skip_git_false_attempts_git_detection() {
         files_modified: &[],
         effective_model: None,
         effective_effort: None,
+        effective_runner: None,
         slot_index: None,
     });
 
@@ -466,6 +470,7 @@ fn already_complete_fallback_fires_in_skip_git_true_mode() {
         files_modified: &[],
         effective_model: None,
         effective_effort: None,
+        effective_runner: None,
         slot_index: None,
     });
 
@@ -508,6 +513,7 @@ fn already_complete_fallback_fires_in_skip_git_false_mode() {
         files_modified: &[],
         effective_model: None,
         effective_effort: None,
+        effective_runner: None,
         slot_index: None,
     });
 
@@ -562,6 +568,7 @@ fn tasks_completed_dedups_across_status_and_completed_branches() {
         files_modified: &[],
         effective_model: None,
         effective_effort: None,
+        effective_runner: None,
         slot_index: None,
     });
 
@@ -621,6 +628,7 @@ fn process_iteration_output_mutates_empty_outcome_to_completed_on_retroactive_co
         files_modified: &[],
         effective_model: None,
         effective_effort: None,
+        effective_runner: None,
         slot_index: None,
     });
 
@@ -676,6 +684,7 @@ fn completed_task_ids_includes_processed_task_and_cross_task_ids() {
         files_modified: &[],
         effective_model: None,
         effective_effort: None,
+        effective_runner: None,
         slot_index: None,
     });
 
@@ -748,6 +757,7 @@ fn process_iteration_output_does_not_invoke_wrapper_commit() {
         files_modified: &[],
         effective_model: None,
         effective_effort: None,
+        effective_runner: None,
         slot_index: None,
     });
 
@@ -807,6 +817,7 @@ fn no_op_stub_fails_combined_contract_assertions() {
         files_modified: &[],
         effective_model: None,
         effective_effort: None,
+        effective_runner: None,
         slot_index: None,
     });
 
@@ -883,6 +894,7 @@ fn crash_tracker_record_success_fires_exactly_once_after_completion_ladder() {
         files_modified: &[],
         effective_model: None,
         effective_effort: None,
+        effective_runner: None,
         slot_index: None,
     });
 
@@ -955,6 +967,7 @@ fn processing_params_constructs_against_real_signature() {
         files_modified: &[],
         effective_model: None,
         effective_effort: None,
+        effective_runner: None,
         slot_index: None,
     };
 }

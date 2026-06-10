@@ -22,23 +22,27 @@ pub struct ModelChoice {
 /// `None`. Keeps the prompt from blocking forever on bad pipes.
 const MAX_RETRIES: u32 = 3;
 
-/// Render the list and read a choice. Returns:
+/// Render `choices` under `header` and read a numbered choice. Returns:
 /// - `Ok(Some(id))` when the user picks a valid number.
 /// - `Ok(None)` when the user submits a blank line, hits EOF, or exhausts retries.
-pub fn select_model_interactive<R: BufRead, W: Write>(
+///
+/// Generalized from the model picker so the `task-mgr init` scaffold can reuse
+/// it for anchor-tier selection (FR-009) without a second prompt loop.
+pub fn select_choice_interactive<R: BufRead, W: Write>(
     mut reader: R,
     mut writer: W,
+    header: &str,
     choices: &[ModelChoice],
 ) -> io::Result<Option<String>> {
     if choices.is_empty() {
         writeln!(
             writer,
-            "(no models available; set ANTHROPIC_API_KEY + TASK_MGR_USE_API=1 for live list)"
+            "(no choices available; set ANTHROPIC_API_KEY + TASK_MGR_USE_API=1 for live list)"
         )?;
         return Ok(None);
     }
 
-    writeln!(writer, "Available Claude models:")?;
+    writeln!(writer, "{header}")?;
     writeln!(writer)?;
     for (i, choice) in choices.iter().enumerate() {
         let tier = if choice.tier.is_empty() {
@@ -121,7 +125,9 @@ mod tests {
     fn run(input: &str) -> (Option<String>, String) {
         let reader = Cursor::new(input.as_bytes());
         let mut output = Vec::new();
-        let picked = select_model_interactive(reader, &mut output, &choices()).unwrap();
+        let picked =
+            select_choice_interactive(reader, &mut output, "Available models:", &choices())
+                .unwrap();
         (picked, String::from_utf8(output).unwrap())
     }
 
@@ -180,10 +186,11 @@ mod tests {
     fn empty_choices_returns_none() {
         let reader = Cursor::new(b"1\n".to_vec());
         let mut output = Vec::new();
-        let picked = select_model_interactive(reader, &mut output, &[]).unwrap();
+        let picked =
+            select_choice_interactive(reader, &mut output, "Available models:", &[]).unwrap();
         assert_eq!(picked, None);
         let out = String::from_utf8(output).unwrap();
-        assert!(out.contains("no models available"));
+        assert!(out.contains("no choices available"));
     }
 
     #[test]

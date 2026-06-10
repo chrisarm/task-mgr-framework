@@ -277,7 +277,7 @@ fn jsonl_append_atomic_for_large_event() {
         prompt_bytes: total_bytes,
         sections,
         dropped_sections: vec!["progress".to_string(), "guidance".to_string()],
-        recovery: RecoveryAction::EscalateModel {
+        recovery: RecoveryAction::EscalateTier {
             new_model: model::OPUS_MODEL.to_string(),
         },
         dump_path: "/tmp/large-dump.txt".to_string(),

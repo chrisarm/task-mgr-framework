@@ -317,6 +317,7 @@ fn pipeline_gate_uses_per_entry_success_not_global_count() {
         files_modified: &[],
         effective_model: None,
         effective_effort: None,
+        effective_runner: None,
         slot_index: None,
     });
 

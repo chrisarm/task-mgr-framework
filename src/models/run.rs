@@ -274,6 +274,15 @@ pub struct RunTask {
     /// Additional notes about this execution
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
+
+    /// Provider used for this execution attempt (set on completion stamp in
+    /// iteration pipeline). "claude" | "grok" | "codex" via Provider::as_str.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+
+    /// Model used for this execution attempt (paired with provider on stamp).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 impl RunTask {
@@ -290,6 +299,8 @@ impl RunTask {
             ended_at: None,
             duration_seconds: None,
             notes: None,
+            provider: None,
+            model: None,
         }
     }
 
@@ -333,6 +344,8 @@ impl TryFrom<&Row<'_>> for RunTask {
             ended_at: parse_optional_datetime(ended_at_str)?,
             duration_seconds: row.get("duration_seconds")?,
             notes: row.get("notes")?,
+            provider: row.get("provider").ok().flatten(),
+            model: row.get("model").ok().flatten(),
         })
     }
 }

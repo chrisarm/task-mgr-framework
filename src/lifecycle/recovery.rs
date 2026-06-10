@@ -77,7 +77,7 @@ impl<'a> TaskLifecycle<'a> {
     ///
     /// Used by the rung-4 `FallbackToProvider` overflow recovery arm to
     /// atomically persist the Grok model before clearing `started_at`, so
-    /// `resolve_task_model` picks it up on the next iteration without an
+    /// model resolution picks it up on the next iteration without an
     /// intermediate state window. Source: [`TransitionSource::Recovery`].
     ///
     /// Returns `Ok(true)` when one row was updated.

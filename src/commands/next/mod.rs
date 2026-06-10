@@ -113,7 +113,7 @@ pub use output::{
 };
 pub use selection::{
     FILE_OVERLAP_SCORE, PRIORITY_BASE, ScoreBreakdown, ScoredTask, SelectionResult, format_text,
-    select_next_task,
+    select_next_task, select_next_task_excluding,
 };
 
 /// Main entry point for the next command.
@@ -142,11 +142,40 @@ pub fn next(
     verbose: bool,
     task_prefix: Option<&str>,
 ) -> TaskMgrResult<NextResult> {
+    next_excluding(
+        dir,
+        after_files,
+        claim,
+        run_id,
+        verbose,
+        task_prefix,
+        &std::collections::HashSet::new(),
+    )
+}
+
+/// [`next`] with a FEAT-008 `excluded_ids` set threaded into selection. The
+/// sequential loop computes the quota-deferred ids
+/// (`reactions::pre_spawn::compute_quota_excluded_ids`) and passes them here so
+/// a task resolving to a blacked-out provider it cannot reroute off of is never
+/// selected; an all-excluded queue returns the "no eligible tasks" result and
+/// the no-eligible deferral branch waits for the reset. With an empty set,
+/// behavior is identical to [`next`]. The CLI `next` command passes the empty
+/// set.
+#[allow(clippy::too_many_arguments)]
+pub fn next_excluding(
+    dir: &Path,
+    after_files: &[String],
+    claim: bool,
+    run_id: Option<&str>,
+    verbose: bool,
+    task_prefix: Option<&str>,
+    excluded_ids: &std::collections::HashSet<String>,
+) -> TaskMgrResult<NextResult> {
     // Open connection once and reuse for all operations
     let mut conn = open_connection(dir)?;
 
     // Step 1: Run task selection
-    let selection = select_next_task(&conn, after_files, task_prefix)?;
+    let selection = select_next_task_excluding(&conn, after_files, task_prefix, excluded_ids)?;
 
     // Build top candidates for verbose output
     let top_candidates = if verbose {

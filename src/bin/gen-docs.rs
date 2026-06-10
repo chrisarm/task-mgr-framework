@@ -15,7 +15,8 @@ use task_mgr::util::marker_splice;
 
 const MODELS_BEGIN: &str = "<!-- MODELS:BEGIN -->";
 const MODELS_END: &str = "<!-- MODELS:END -->";
-const EXPECTED_MODEL_CONSTS: &[&str] = &["OPUS_MODEL", "SONNET_MODEL", "HAIKU_MODEL"];
+const EXPECTED_MODEL_CONSTS: &[&str] =
+    &["FABLE_MODEL", "OPUS_MODEL", "SONNET_MODEL", "HAIKU_MODEL"];
 
 fn main() -> ExitCode {
     let check_mode = std::env::args().any(|a| a == "--check");
@@ -133,13 +134,14 @@ fn repo_root() -> Result<PathBuf, String> {
 fn render_block(model_rs: &Path) -> Result<String, String> {
     let source = fs::read_to_string(model_rs).map_err(|e| e.to_string())?;
 
-    let model_re = Regex::new(r#"pub const (\w+): &str = "([^"]+)";"#).unwrap();
+    let model_re = Regex::new(r#"pub const (\w+): &str = "([^"]+)";"#)
+        .expect("static model-const pattern is valid");
     let mut models: Vec<(String, String)> = model_re
         .captures_iter(&source)
         .map(|c| (c[1].to_string(), c[2].to_string()))
         .filter(|(name, _)| EXPECTED_MODEL_CONSTS.contains(&name.as_str()))
         .collect();
-    // Preserve canonical order (Opus, Sonnet, Haiku) regardless of file order.
+    // Preserve canonical order (Fable/frontier, Opus/standard, Sonnet, Haiku) regardless of file order.
     models.sort_by_key(|(name, _)| {
         EXPECTED_MODEL_CONSTS
             .iter()
@@ -156,24 +158,88 @@ fn render_block(model_rs: &Path) -> Result<String, String> {
         ));
     }
 
-    // Parse EFFORT_FOR_DIFFICULTY: &[("difficulty", "effort"), ...];
+    // Parse EFFORT_FOR_DIFFICULTY (Claude + Grok share it).
     let effort_re = Regex::new(
         r"pub const EFFORT_FOR_DIFFICULTY:\s*&\[\(&str,\s*&str\)\]\s*=\s*&\[(?P<body>[^\]]+)\]",
     )
-    .unwrap();
+    .expect("static EFFORT_FOR_DIFFICULTY pattern is valid");
     let body = effort_re
         .captures(&source)
         .ok_or_else(|| "could not find EFFORT_FOR_DIFFICULTY constant".to_string())?
         .name("body")
-        .unwrap()
+        .expect("pattern defines the `body` group")
         .as_str();
-    let row_re = Regex::new(r#"\("([^"]+)",\s*"([^"]+)"\)"#).unwrap();
-    let effort: Vec<(String, String)> = row_re
-        .captures_iter(body)
-        .map(|c| (c[1].to_string(), c[2].to_string()))
-        .collect();
-    if effort.is_empty() {
+    // Row parser supports both "literal" values and bare IDENT (e.g. HAIKU_MODEL)
+    // so tier tables can stay DRY by referencing the *_MODEL consts.
+    let row_re = Regex::new(r#"\("([^"]+)",\s*(?:"([^"]*)"|"([^"]+)"|([A-Za-z_][A-Za-z0-9_]*))\)"#)
+        .expect("static row pattern is valid");
+    // Helper: given a row match, return (key, value) — value may come from quoted group or bare ident group.
+    let extract_kv = |cap: &regex::Captures| -> (String, String) {
+        let k = cap[1].to_string();
+        // groups: 2=first-quoted, 3=second-quoted, 4=bare-ident
+        let v = cap
+            .get(2)
+            .or_else(|| cap.get(3))
+            .or_else(|| cap.get(4))
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default();
+        (k, v)
+    };
+    let claude_grok_effort: Vec<(String, String)> =
+        row_re.captures_iter(body).map(|c| extract_kv(&c)).collect();
+    if claude_grok_effort.is_empty() {
         return Err("EFFORT_FOR_DIFFICULTY contains no rows".into());
+    }
+
+    // Parse CODEX_EFFORT_FOR_DIFFICULTY (capped at high by policy).
+    let codex_effort_re = Regex::new(
+        r"pub const CODEX_EFFORT_FOR_DIFFICULTY:\s*&\[\(&str,\s*&str\)\]\s*=\s*&\[(?P<body>[^\]]+)\]",
+    )
+    .expect("static CODEX_EFFORT_FOR_DIFFICULTY pattern is valid");
+    let codex_body = codex_effort_re
+        .captures(&source)
+        .ok_or_else(|| "could not find CODEX_EFFORT_FOR_DIFFICULTY constant".to_string())?
+        .name("body")
+        .expect("pattern defines the `body` group")
+        .as_str();
+    let codex_effort: Vec<(String, String)> = row_re
+        .captures_iter(codex_body)
+        .map(|c| extract_kv(&c))
+        .collect();
+
+    // Parse the declarative default tier tables (per-provider). Use a closure so it
+    // can capture the outer `row_re` (a bare `fn` item cannot).
+    let parse_tier_table = |const_name: &str| -> Result<Vec<(String, String)>, String> {
+        let re = Regex::new(&format!(
+            r"pub const {}:\s*&\[\(&str,\s*&str\)\]\s*=\s*&\[(?P<body>[^\]]+)\]",
+            const_name
+        ))
+        .expect("tier-table pattern with const-name interpolation is valid");
+        let body = re
+            .captures(&source)
+            .ok_or_else(|| format!("could not find {} constant", const_name))?
+            .name("body")
+            .expect("pattern defines the `body` group")
+            .as_str();
+        Ok(row_re.captures_iter(body).map(|c| extract_kv(&c)).collect())
+    };
+    let mut claude_tiers = parse_tier_table("CLAUDE_DEFAULT_TIER_MODELS")?;
+    let mut grok_tiers = parse_tier_table("GROK_DEFAULT_TIER_MODELS")?;
+    let mut codex_tiers = parse_tier_table("CODEX_DEFAULT_TIER_MODELS")?;
+
+    // Post-process: resolve any bare model-const identifiers (e.g. "HAIKU_MODEL")
+    // to their actual ID strings using the already-parsed top-level model consts.
+    // This lets the tier tables in model.rs stay DRY (ref the *_MODEL consts).
+    let model_map: std::collections::HashMap<&str, &str> = models
+        .iter()
+        .map(|(n, v)| (n.as_str(), v.as_str()))
+        .collect();
+    for tiers in [&mut claude_tiers, &mut grok_tiers, &mut codex_tiers] {
+        for (_k, v) in tiers.iter_mut() {
+            if let Some(resolved) = model_map.get(v.as_str()) {
+                *v = resolved.to_string();
+            }
+        }
     }
 
     let mut out = String::new();
@@ -183,19 +249,86 @@ fn render_block(model_rs: &Path) -> Result<String, String> {
     out.push('\n');
     for (name, value) in &models {
         let tier = match name.as_str() {
-            "OPUS_MODEL" => "Opus",
-            "SONNET_MODEL" => "Sonnet",
-            "HAIKU_MODEL" => "Haiku",
+            "FABLE_MODEL" => "Fable (frontier)",
+            "OPUS_MODEL" => "Opus (standard)",
+            "SONNET_MODEL" => "Sonnet (cost-efficient)",
+            "HAIKU_MODEL" => "Haiku (cheapest)",
             _ => name.as_str(),
         };
         out.push_str(&format!("- **{tier}** → `{name}` = `{value}`\n"));
     }
     out.push('\n');
-    out.push_str("**Difficulty → `--effort` mapping** (from `EFFORT_FOR_DIFFICULTY`):\n");
+    out.push_str("**Difficulty → `--effort` mapping**:\n");
     out.push('\n');
-    for (difficulty, e) in &effort {
-        out.push_str(&format!("- `{difficulty}` → `{e}`\n"));
+    out.push_str("- Claude / Grok (`EFFORT_FOR_DIFFICULTY`): ");
+    for (i, (d, e)) in claude_grok_effort.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&format!("`{d}` → `{e}`"));
     }
+    out.push('\n');
+    out.push_str("- Codex (`CODEX_EFFORT_FOR_DIFFICULTY`, capped at `high` by policy): ");
+    for (i, (d, e)) in codex_effort.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&format!("`{d}` → `{e}`"));
+    }
+    out.push('\n');
+    out.push('\n');
+
+    // Tier matrix + anchor explanation (FR-010 / FR-001).
+    out.push_str("**Capability tiers + anchor window (default `models` config)**:\n");
+    out.push('\n');
+    out.push_str(
+        "Provider-neutral tiers (ordered Cheapest < CostEfficient < Standard < Frontier). ",
+    );
+    out.push_str(
+        "The anchor (default `standard`) + difficulty offset produces the starting tier:\n",
+    );
+    out.push_str("- low difficulty → anchor − 1 (clamped at ladder bottom)\n");
+    out.push_str("- medium → anchor\n");
+    out.push_str("- high → anchor + 1 (clamped at ladder top)\n");
+    out.push_str("See `anchored_tier` + `difficulty_offset` (single normalizer). ");
+    out.push_str(
+        "Sparse ladders: only defined rungs participate in clamp / escalate; gaps are skipped.\n",
+    );
+    out.push('\n');
+    out.push_str("Default tier matrix (from the `_DEFAULT_TIER_MODELS` tables; empty = route with no model flag):\n");
+    out.push('\n');
+    // Simple markdown table. Columns: Tier | Claude | Grok | Codex
+    out.push_str("| Tier | Claude | Grok | Codex |\n");
+    out.push_str("|------|--------|------|-------|\n");
+    // Use the tier order from ALL (cheapest first for table, or reverse for "high first").
+    // Render in descending capability to match historical "frontier first" docs.
+    let tier_order = ["frontier", "standard", "cost-efficient", "cheapest"];
+    for t in tier_order {
+        let claude = claude_tiers
+            .iter()
+            .find(|(k, _)| k == t)
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("(n/a)");
+        let grok = grok_tiers
+            .iter()
+            .find(|(k, _)| k == t)
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("(n/a)");
+        let codex = codex_tiers
+            .iter()
+            .find(|(k, _)| k == t)
+            .map(|(_, v)| {
+                if v.is_empty() {
+                    "(no -m flag)"
+                } else {
+                    v.as_str()
+                }
+            })
+            .unwrap_or("(n/a)");
+        out.push_str(&format!("| {t} | {claude} | {grok} | {codex} |\n"));
+    }
+    out.push('\n');
+    out.push_str("Codex routes are always explicit (`byIdPrefix` or `taskClasses` in `routing`); Codex is never inferred from a model string.\n");
     Ok(out)
 }
 

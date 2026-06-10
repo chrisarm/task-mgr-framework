@@ -8,8 +8,8 @@
 //! ladder hand-off, and tracker updates.
 //!
 //! The hand-off data types (`IterationContext`, `IterationParams`,
-//! `IterationResult`) and the per-iteration runner-resolution helpers
-//! (`resolve_effective_runner`, `apply_review_model_override`) remain in
+//! `IterationResult`) and the per-iteration runner-resolution helper
+//! (`resolve_effective_runner`) remain in
 //! `engine.rs` and are imported here — `run_loop` and the inline engine test
 //! modules also consume them, so moving them would widen the carve's blast
 //! radius. The pre-spawn per-task recovery reactions (crash escalation, the
@@ -55,7 +55,7 @@ use crate::loop_engine::detection;
 use crate::loop_engine::display;
 use crate::loop_engine::engine::{
     IterationContext, IterationParams, IterationResult, MAX_CONSECUTIVE_REORDERS,
-    apply_review_model_override, resolve_effective_runner,
+    resolve_effective_runner,
 };
 use crate::loop_engine::monitor;
 use crate::loop_engine::prd_reconcile::reconcile_passes_with_db;
@@ -213,6 +213,27 @@ pub fn run_iteration(
     let session_guidance_text = ctx.session_guidance.format_for_prompt();
     let effective_reorder_hint_str = effective_reorder_hint.as_deref();
 
+    // FEAT-008: under an active quota blackout, compute the spillover-deferred
+    // todo ids so selection skips them (and resolve spawns reroute consistently).
+    // Empty blackout set → empty excluded set → identical to pre-FEAT-008.
+    let active_blackouts = ctx
+        .provider_blackouts
+        .active(crate::loop_engine::engine::now_unix_secs());
+    let excluded_ids = {
+        // Reuse the once-per-run resolution threaded onto the context
+        // (orchestrator.rs) rather than reconstructing it from
+        // `params.project_config`; the two are identical projections of the
+        // same already-validated input, and sharing one source prevents drift.
+        let resolved_models = &ctx.resolved_models;
+        reactions::pre_spawn::compute_quota_excluded_ids(
+            ctx,
+            params.conn,
+            params.task_prefix,
+            resolved_models,
+            &active_blackouts,
+        )
+    };
+
     let first_attempt = prompt::build_prompt(&BuildPromptParams {
         dir: params.db_dir,
         project_root: params.project_root,
@@ -226,12 +247,13 @@ pub fn run_iteration(
         steering_path: params.steering_path,
         verbose: params.verbose,
         default_model: params.default_model,
-        project_default_model: params.project_default_model,
-        user_default_model: params.user_default_model,
         task_prefix: params.task_prefix,
         batch_sibling_prds: params.batch_sibling_prds,
         permission_mode: params.permission_mode,
-        primary_runner: params.project_config.primary_runner.as_ref(),
+        models_config: &params.project_config.models,
+        routing_config: &params.project_config.routing,
+        provider_blackouts: active_blackouts.clone(),
+        excluded_ids: excluded_ids.clone(),
     });
 
     let prompt_result = match first_attempt {
@@ -305,12 +327,13 @@ pub fn run_iteration(
                     steering_path: params.steering_path,
                     verbose: params.verbose,
                     default_model: params.default_model,
-                    project_default_model: params.project_default_model,
-                    user_default_model: params.user_default_model,
                     task_prefix: params.task_prefix,
                     batch_sibling_prds: params.batch_sibling_prds,
                     permission_mode: params.permission_mode,
-                    primary_runner: params.project_config.primary_runner.as_ref(),
+                    models_config: &params.project_config.models,
+                    routing_config: &params.project_config.routing,
+                    provider_blackouts: active_blackouts.clone(),
+                    excluded_ids: excluded_ids.clone(),
                 });
                 match retry_attempt {
                     Ok(Some(result)) => result,
@@ -417,32 +440,27 @@ pub fn run_iteration(
         effective_model = Some(override_model.clone());
     }
 
-    // Route review-class tasks to `reviewModel` after the crash / overflow
-    // escalation so escalation can't overwrite this routing. The single
-    // `effective_model` here feeds both `resolve_effective_runner` (runner
-    // selection) and the `--model` flag passed to the runner, so one assignment
-    // keeps selection and dispatch in sync.
-    if let Some(review_model_override) =
-        apply_review_model_override(params.project_config.review_model.as_deref(), &task_id)
-    {
-        let old = effective_model.as_deref().unwrap_or("(default)");
-        ui::emit(&format!(
-            "Review-class routing: {} → {} (reviewModel)",
-            old, review_model_override,
-        ));
-        effective_model = Some(review_model_override);
-    }
+    // Review-class routing now flows from `resolve_execution_plan` rung 3
+    // (FEAT-004): the plan already carries the review→frontier provider/model,
+    // baked into `resolved_model`/`provider_hint` above. The legacy
+    // review-model post-hoc rewrite is deleted.
 
     // Effort: the plan's prior-overflow override wins, else the cluster-wide
     // effort `build_prompt` computed (parallels the cluster-wide
     // `resolved_model` so both axes scale with the hardest task in the cluster).
-    let base_effort = prompt_result.cluster_effort;
-    let effort = plan.effort.or(base_effort);
+    // `base_effort` is the plan/per-provider effort the builder carried
+    // (WIRE-FIX-001). `plan.effort` here is the prior-overflow effort override
+    // (static escalation levels) which wins when present.
+    let base_effort = prompt_result.cluster_effort.clone();
+    let effort = plan
+        .effort
+        .map(String::from)
+        .or_else(|| base_effort.clone());
     if effort != base_effort {
         ui::emit(&format!(
             "Effort override (prior prompt overflow): {} → {}",
-            base_effort.unwrap_or("(default)"),
-            effort.unwrap_or("(default)"),
+            base_effort.as_deref().unwrap_or("(default)"),
+            effort.as_deref().unwrap_or("(default)"),
         ));
     }
 
@@ -452,10 +470,18 @@ pub fn run_iteration(
     // pre-rewrite baseline, so this re-resolution is the authoritative spawn
     // discriminant. Placed before the banner so the "(via grok)" annotation
     // can be included in the iteration header.
-    let mut provider_hint = prompt_result.provider_hint;
-    if effective_model != prompt_result.resolved_model {
-        provider_hint = None;
-    }
+    // Drop the hint on a model REWRITE (crash escalation / prior-overflow 1M),
+    // preserve it on a None→default widening — the shared rule lives in
+    // `model::final_provider_hint` so the sequential and wave paths cannot
+    // diverge (REFACTOR-009). Sequential does not widen `effective_model`
+    // today, but routing through the helper keeps that an implementation
+    // detail rather than a latent Codex→Claude misroute.
+    let provider_hint = crate::loop_engine::model::final_provider_hint(
+        prompt_result.provider_hint,
+        effective_model.as_deref(),
+        prompt_result.resolved_model.as_deref(),
+        params.default_model,
+    );
     let effective_runner = resolve_effective_runner(
         ctx,
         &task_id,
@@ -476,7 +502,7 @@ pub fn run_iteration(
         &task_id,
         params.elapsed_secs,
         effective_model.as_deref(),
-        effort,
+        effort.as_deref(),
         &ctx.overflow_recovered,
         &ctx.overflow_original_model,
         effective_runner,
@@ -496,7 +522,7 @@ pub fn run_iteration(
         effective_runner,
     );
     let runner_effort = if effective_runner.supports(runner::RunnerCapability::Effort) {
-        effort
+        effort.as_deref()
     } else {
         None
     };
@@ -564,7 +590,7 @@ pub fn run_iteration(
                 should_stop: false,
                 output: hint,
                 effective_model,
-                effective_effort: effort,
+                effective_effort: effort.clone(),
                 effective_runner: Some(effective_runner),
                 key_decisions_count: 0,
                 conversation: None,
@@ -583,7 +609,7 @@ pub fn run_iteration(
                 should_stop: false,
                 output: hint,
                 effective_model,
-                effective_effort: effort,
+                effective_effort: effort.clone(),
                 effective_runner: Some(effective_runner),
                 key_decisions_count: 0,
                 conversation: None,
@@ -610,7 +636,7 @@ pub fn run_iteration(
                 should_stop: false,
                 output: String::new(),
                 effective_model,
-                effective_effort: effort,
+                effective_effort: effort.clone(),
                 effective_runner: Some(effective_runner),
                 key_decisions_count: 0,
                 conversation: None,
@@ -692,7 +718,7 @@ pub fn run_iteration(
             should_stop: false,
             output: claude_result.output,
             effective_model,
-            effective_effort: effort,
+            effective_effort: effort.clone(),
             effective_runner: Some(effective_runner),
             key_decisions_count: 0,
             conversation: None,
@@ -751,6 +777,10 @@ pub fn run_iteration(
                 outcome: &outcome,
                 output: &claude_output,
             }];
+            // FEAT-008: the reaction records a quota blackout (spillover path)
+            // instead of waiting when difficulty-spillover is enabled. Reuse the
+            // once-per-run resolution on the context rather than rebuilding it.
+            let resolved_models = &ctx.resolved_models;
             let account_params = reactions::account::AccountReactionParams {
                 threshold: params.usage_params.threshold,
                 usage_enabled: params.usage_params.enabled,
@@ -759,9 +789,24 @@ pub fn run_iteration(
                 prefix: params.task_prefix.unwrap_or(""),
                 run_id: params.run_id,
                 permission_mode: params.permission_mode,
+                spillover_enabled: resolved_models.routing.spillover.max_difficulty.is_some(),
+                primary_provider: resolved_models.primary_provider,
+                blackout_fallback_secs: resolved_models.routing.spillover.blackout_fallback_secs,
+                now_secs: crate::loop_engine::engine::now_unix_secs(),
             };
-            reactions::account::react_to_outputs(params.conn, &items, &account_params)
+            reactions::account::react_to_outputs(
+                params.conn,
+                &items,
+                &account_params,
+                &mut ctx.provider_blackouts,
+            )
         };
+        // `RerouteAndRetry` / `ProceedWithSpillover` (FEAT-008) and
+        // `WaitedAndRetry` all fall through with the outcome still `RateLimit`,
+        // which `run_loop` marks non-counting (budget give-back). The blackout
+        // recorded on `ctx.provider_blackouts` reroutes spillover-eligible work
+        // on the next iteration; the no-eligible deferral branch waits only if
+        // everything is quota-deferred. Only `Stop` exits early here.
         if reaction == reactions::account::AccountReaction::Stop {
             return Ok(IterationResult {
                 outcome: IterationOutcome::RateLimit,
@@ -790,10 +835,10 @@ pub fn run_iteration(
     //
     // The four rungs (first matching precondition wins, see
     // `overflow::handle_prompt_too_long`):
-    //   1. `downgrade_effort`   — effort floor preserved at `high`.
-    //   2. `escalate_below_opus` — `haiku → sonnet`, `sonnet → opus`.
-    //   3. `to_1m_model`        — `opus → opus[1m]`.
-    //   4. blocked              — no recovery left.
+    //   1. `downgrade_effort`     — effort floor preserved at `high`.
+    //   2. `escalate_below_ceiling` — up one tier (`haiku → sonnet → opus → fable`).
+    //   3. `to_1m_model`          — `fable → fable[1m]`.
+    //   4. blocked                — no recovery left.
     //
     // Each rung emits a distinct stderr message that names the current task,
     // current effort/model, and the chosen action. The Blocked phrasing makes
@@ -817,7 +862,7 @@ pub fn run_iteration(
                 ctx,
                 conn: params.conn,
                 task_id: &task_id,
-                effort,
+                effort: effort.as_deref(),
                 effective_model: effective_model.as_deref(),
                 prompt_result: &prompt_result,
                 iteration: params.iteration,
@@ -865,7 +910,7 @@ pub fn run_iteration(
         should_stop,
         output: claude_output,
         effective_model,
-        effective_effort: effort,
+        effective_effort: effort.clone(),
         effective_runner: Some(effective_runner),
         key_decisions_count: 0,
         conversation: claude_conversation,

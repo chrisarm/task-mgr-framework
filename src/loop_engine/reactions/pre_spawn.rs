@@ -25,14 +25,14 @@
 //! Wired into both paths by FEAT-002/FEAT-008 (sequential: `iteration.rs`
 //! ~L367/L419; wave: per-slot, folded in `wave_scheduler.rs` ~L983).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use rusqlite::Connection;
 
 use crate::loop_engine::engine::{
     EffectiveRunnerInput, IterationContext, resolve_effective_runner,
 };
-use crate::loop_engine::model;
+use crate::loop_engine::model::{self, Provider, ResolvedModelsConfig};
 use crate::loop_engine::recovery::normalize_baseline;
 use crate::loop_engine::runner::RunnerKind;
 
@@ -98,9 +98,8 @@ pub struct ResolveTaskExecutionParams<'a> {
 /// `(ctx, task, resolved_model, conn)` inputs MUST produce an identical plan.
 ///
 /// Model-string layers that are NOT account-global recovery channels —
-/// `ctx.model_overrides` (prior-overflow model) and `apply_review_model_override`
-/// (review-class routing) — stay at the call sites: they rewrite the `--model`
-/// string and, for review routing, re-resolve the runner, AFTER this plan is
+/// `ctx.model_overrides` (prior-overflow model) — stays at the call sites: it
+/// rewrites the `--model` string AFTER this plan is
 /// produced. `model_overrides` is always paired with a `runner_overrides`
 /// entry, so [`TaskExecutionPlan::runner`] already reflects it.
 pub fn resolve_task_execution(params: ResolveTaskExecutionParams<'_>) -> TaskExecutionPlan {
@@ -116,8 +115,16 @@ pub fn resolve_task_execution(params: ResolveTaskExecutionParams<'_>) -> TaskExe
     invalidate_stale_overrides(ctx, conn, task_id);
 
     // 2. Crash escalation (None when the last iteration on this task did not
-    //    crash — the caller keeps its already-resolved model).
-    let model = crash_escalated_model(&ctx.crashed_last_iteration, task_id, resolved_model);
+    //    crash — the caller keeps its already-resolved model). Resolves the
+    //    Claude ladder from the OPERATOR's config carried on the context, so a
+    //    remapped Claude ladder escalates onto models that config defines, not
+    //    the builtin defaults (REFACTOR-007).
+    let model = crash_escalated_model_with_config(
+        &ctx.crashed_last_iteration,
+        task_id,
+        resolved_model,
+        &ctx.resolved_models,
+    );
 
     // 3. Prior-overflow effort override, read AFTER invalidation.
     let effort = ctx.effort_overrides.get(task_id).copied();
@@ -156,10 +163,41 @@ pub fn resolve_task_execution(params: ResolveTaskExecutionParams<'_>) -> TaskExe
 /// not a crash. A `None`/empty/whitespace `resolved_model` is treated as the
 /// sonnet baseline and escalates to opus. Escalation is independent of
 /// `CrashTracker` backoff.
+///
+/// This is the **builtin-ladder convenience variant** — it resolves the Claude
+/// tier ladder from [`model::builtin_resolved_models`]. The production
+/// coordinator [`resolve_task_execution`] calls
+/// [`crash_escalated_model_with_config`] with the operator-resolved config from
+/// the context instead (REFACTOR-007); this 3-arg form is retained for the
+/// equivalence tests (and the `engine::check_crash_escalation` re-export) that
+/// exercise the default ladder.
 pub fn crash_escalated_model(
     crashed_last_iteration: &HashMap<String, bool>,
     current_task_id: &str,
     resolved_model: Option<&str>,
+) -> Option<String> {
+    crash_escalated_model_with_config(
+        crashed_last_iteration,
+        current_task_id,
+        resolved_model,
+        model::builtin_resolved_models(),
+    )
+}
+
+/// Operator-config-aware crash-recovery model escalation: identical to
+/// [`crash_escalated_model`] but resolves the Claude tier ladder from the
+/// supplied `models` config rather than the builtin defaults.
+///
+/// This is the production path (REFACTOR-007): [`resolve_task_execution`] passes
+/// `&ctx.resolved_models` so an operator who remapped Claude tiers (custom
+/// ladder, null rungs) gets a crash escalation onto a model THEIR config defines
+/// — closing the FIX-001 config-input divergence where the recovery paths walked
+/// the builtin ladder regardless of operator config.
+pub fn crash_escalated_model_with_config(
+    crashed_last_iteration: &HashMap<String, bool>,
+    current_task_id: &str,
+    resolved_model: Option<&str>,
+    models: &ResolvedModelsConfig,
 ) -> Option<String> {
     if !crashed_last_iteration
         .get(current_task_id)
@@ -170,7 +208,7 @@ pub fn crash_escalated_model(
     }
     match normalize_baseline(resolved_model) {
         None => Some(model::OPUS_MODEL.to_string()),
-        Some(m) => model::escalate_model(Some(m)),
+        Some(m) => model::escalate_tier(models, model::Provider::Claude, Some(m)),
     }
 }
 
@@ -200,8 +238,41 @@ pub fn invalidate_stale_overrides(ctx: &mut IterationContext, conn: &Connection,
         }
     };
 
-    let snapshotted = ctx.overflow_original_task_model.get(task_id);
-    if snapshotted.map(Option::as_deref) == Some(current_model.as_deref()) {
+    // The snapshot's inner value: `None` = anchor-resolved (NULL `tasks.model`
+    // at first overflow); `Some(m)` = the task carried an explicit model.
+    let snapshot_inner: Option<String> = match ctx.overflow_original_task_model.get(task_id) {
+        Some(inner) => inner.clone(),
+        None => return,
+    };
+
+    // No divergence from the snapshot → no-op (the dominant steady state).
+    if snapshot_inner.as_deref() == current_model.as_deref() {
+        return;
+    }
+
+    // Ladder-write absorb (FEAT-004 + rung-4 Some-original): a model-changing
+    // recovery rung records its target in `model_overrides` and then writes the
+    // SAME value to `tasks.model`. That write is the LADDER's, NOT an operator
+    // edit — absorb it into the snapshot so the next pass compares against the
+    // model the ladder set. Only a SUBSEQUENT edit to a DIFFERENT model fires
+    // the six-channel clear.
+    //
+    // This applies whether the snapshot's inner value is `None` (anchor-resolved
+    // task: rung-1/2/3 escalation, or a rung-4 pivot off a NULL model) OR
+    // `Some(original)` (a task that carried an explicit model and pivoted
+    // cross-provider at the ceiling — rung 4). Without covering the
+    // `Some(original)` case the pivot's own write (`Some(opus) != Some(grok)`)
+    // would self-trip the valve and wipe the just-installed promotion,
+    // including `runner_overrides` — weakening the `promote_once` guard.
+    //
+    // The consecutive-failure escalation path does NOT write `model_overrides`;
+    // it refreshes this snapshot directly at the write site
+    // (`recovery::absorb_escalation_into_overflow_snapshot`), so it reaches the
+    // `snapshot == current` early return above and never depends on this branch.
+    let ladder_model = ctx.model_overrides.get(task_id).map(String::as_str);
+    if current_model.is_some() && current_model.as_deref() == ladder_model {
+        ctx.overflow_original_task_model
+            .insert(task_id.to_string(), current_model);
         return;
     }
 
@@ -215,4 +286,100 @@ pub fn invalidate_stale_overrides(ctx: &mut IterationContext, conn: &Connection,
     eprintln!(
         "Operator changed task model for {task_id} — clearing auto-recovery overrides; resolving fresh."
     );
+}
+
+/// FEAT-008: the set of todo task ids that are QUOTA-DEFERRED under the active
+/// provider blackouts — their effective provider is still blacked out and they
+/// cannot reroute off it. This is the `excluded_ids` set passed to
+/// `select_next_task_excluding` / `select_parallel_group_excluding`; its
+/// complement (todo tasks NOT returned) are the spillover-eligible tasks
+/// selection may run on an alternate provider.
+///
+/// Per-task effective provider — the spillover-eligibility SSoT:
+/// - A task carrying a `ctx.runner_overrides` entry is PINNED to that runner
+///   (the permanent cross-provider promotion owned by `promote_once`). It is
+///   never spillover-eligible: if its pinned provider is blacked out it defers,
+///   otherwise it runs. This is the "no runner override" half of the FR-008
+///   eligibility rule — a pinned task is read here but `runner_overrides` is
+///   NEVER written.
+/// - Otherwise the spawn-side resolver `model::resolve_execution_plan` (WITH the
+///   active blackouts) decides: a spillover-eligible implementation task at or
+///   below `spillover.maxDifficulty` reroutes to a non-blacked provider (→ NOT
+///   deferred); a frontier/review task, an explicit-model task, or one with no
+///   enabled alternative stays on the blacked-out provider (→ deferred).
+///
+/// Returns an empty set when no provider is blacked out (the dominant case), so
+/// the DB scan only runs while a blackout is live. Read-only — DB errors are
+/// logged and treated as "nothing excluded" so a transient failure degrades to
+/// the pre-FEAT-008 selection rather than stranding the wave.
+pub fn compute_quota_excluded_ids(
+    ctx: &IterationContext,
+    conn: &Connection,
+    task_prefix: Option<&str>,
+    models: &ResolvedModelsConfig,
+    active_blackouts: &HashSet<Provider>,
+) -> HashSet<String> {
+    if active_blackouts.is_empty() {
+        return HashSet::new();
+    }
+
+    // `id LIKE '' || '%'` collapses to `id LIKE '%'` (every non-null id) when no
+    // prefix is given, so one parameterized query covers both cases.
+    let like_prefix = task_prefix.unwrap_or("");
+    let mut stmt = match conn.prepare(
+        "SELECT id, model, difficulty FROM tasks \
+         WHERE status = 'todo' AND id LIKE ?1 || '%' AND archived_at IS NULL",
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Warning: compute_quota_excluded_ids: prepare failed: {e}");
+            return HashSet::new();
+        }
+    };
+    let rows = stmt.query_map(rusqlite::params![like_prefix], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+        ))
+    });
+    let rows = match rows {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Warning: compute_quota_excluded_ids: query failed: {e}");
+            return HashSet::new();
+        }
+    };
+
+    let mut excluded = HashSet::new();
+    for (id, model_col, difficulty) in rows.flatten() {
+        let effective_provider = match ctx.runner_overrides.get(&id) {
+            Some(kind) => provider_of_runner(*kind),
+            None => {
+                model::resolve_execution_plan(&model::PlanContext {
+                    task_id: &id,
+                    task_model: model_col.as_deref(),
+                    difficulty: difficulty.as_deref(),
+                    models,
+                    provider_blackouts: active_blackouts,
+                })
+                .provider
+            }
+        };
+        if active_blackouts.contains(&effective_provider) {
+            excluded.insert(id);
+        }
+    }
+    excluded
+}
+
+/// `RunnerKind → Provider` identity translation (the inverse of the match in
+/// `resolve_effective_runner`). Local to the blackout-exclusion computation so a
+/// pinned runner override can be compared against the active blackout set.
+fn provider_of_runner(kind: RunnerKind) -> Provider {
+    match kind {
+        RunnerKind::Claude => Provider::Claude,
+        RunnerKind::Grok => Provider::Grok,
+        RunnerKind::Codex => Provider::Codex,
+    }
 }

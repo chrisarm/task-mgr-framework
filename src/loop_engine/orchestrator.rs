@@ -16,8 +16,8 @@
 //!
 //! The shared hand-off data types (`IterationContext`, `LoopRunConfig`,
 //! `LoopResult`, the slot/wave structs, etc.), the per-iteration
-//! runner-resolution helpers (`resolve_effective_runner`,
-//! `apply_review_model_override`), and the `<task-status>` dispatcher
+//! runner-resolution helper (`resolve_effective_runner`),
+//! and the `<task-status>` dispatcher
 //! (`apply_status_updates`, consumed by `iteration_pipeline`) remain in
 //! `engine.rs` and are glob-imported here. `engine.rs` re-exports `run_loop`
 //! and `on_run_completed` `pub` so the external import paths callers and
@@ -93,8 +93,6 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
         task_prefix,
         default_model,
         project_config,
-        project_default_model,
-        user_default_model,
         prd_implicit_overlap_files,
         external_repo_path,
         actual_worktree_path,
@@ -120,6 +118,15 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
     let start_time = Instant::now();
     let inter_iteration_delay = Duration::from_secs(run_config.config.iteration_delay_secs);
     let mut ctx = IterationContext::new(run_config.config.max_crashes as u32);
+    // Thread the operator-resolved provider-first config into the recovery
+    // paths (consecutive-failure + crash escalation). Without this they walk
+    // `builtin_resolved_models()` and an operator who remapped Claude tiers gets
+    // escalations onto models their config never defined (FIX-001 divergence).
+    // `resolve_models_config` is a pure projection of already-validated input.
+    ctx.resolved_models = crate::loop_engine::model::resolve_models_config(
+        &project_config.models,
+        &project_config.routing,
+    );
     let mut iterations_completed: u32 = 0;
     let mut tasks_completed: u32 = 0;
     let mut last_claimed_task: Option<String> = None;
@@ -220,8 +227,6 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                 permission_mode: &permission_mode,
                 signal_flag: &signal_flag,
                 default_model: default_model.as_deref(),
-                project_default_model: project_default_model.as_deref(),
-                user_default_model: user_default_model.as_deref(),
                 verbose: run_config.config.verbose,
                 task_prefix: task_prefix.as_deref(),
                 prd_path: paths.prd_file.as_path(),
@@ -314,8 +319,6 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
             prd_path: Some(paths.prd_file.as_path()),
             task_prefix: task_prefix.as_deref(),
             default_model: default_model.as_deref(),
-            project_default_model: project_default_model.as_deref(),
-            user_default_model: user_default_model.as_deref(),
             permission_mode: &permission_mode,
             batch_sibling_prds: &run_config.batch_sibling_prds,
             project_config: &project_config,
@@ -381,7 +384,8 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                 ctx: &mut ctx,
                 files_modified: &result.files_modified,
                 effective_model: result.effective_model.as_deref(),
-                effective_effort: result.effective_effort,
+                effective_effort: result.effective_effort.as_deref(),
+                effective_runner: result.effective_runner,
                 slot_index: None,
             });
         tasks_completed += processing_outcome.tasks_completed;
@@ -561,10 +565,6 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                 iteration as i64,
                 &mut ctx,
                 result.effective_runner,
-                project_config.fallback_runner.as_ref(),
-                project_config.primary_runner.as_ref(),
-                project_default_model.as_deref(),
-                user_default_model.as_deref(),
             )
         {
             tracing::warn!("failed to start retry tracking transaction: {}", e);
@@ -572,6 +572,33 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
 
         // Track consecutive stale iterations and abort if stuck
         if matches!(result.outcome, IterationOutcome::NoEligibleTasks) {
+            // FEAT-008 deferral-first — ordered BEFORE drained classification
+            // and the stale tracker, in parity with the wave path's
+            // `handle_no_eligible_tasks`. When a provider blackout is active and
+            // todo work remains, the empty selection is quota-DEFERRAL, not a
+            // stale or drained queue: wait for the reset (reusing
+            // `wait_for_usage_reset`), clear the blackout, and retry WITHOUT
+            // marking the stale tracker (learning 3927).
+            let now = crate::loop_engine::engine::now_unix_secs();
+            match reactions::account::handle_quota_deferral(
+                &conn,
+                task_prefix.as_deref(),
+                &mut ctx.provider_blackouts,
+                now,
+                &paths.tasks_dir,
+                usage_params.fallback_wait,
+            ) {
+                reactions::account::QuotaDeferral::Inactive => {}
+                reactions::account::QuotaDeferral::Deferred { stopped: true } => {
+                    exit_code = 130;
+                    exit_reason = "stop signal during quota-blackout wait".to_string();
+                    break;
+                }
+                reactions::account::QuotaDeferral::Deferred { stopped: false } => {
+                    ui::emit("Quota blackout reset — retrying task selection...");
+                    continue;
+                }
+            }
             // Drained-but-stuck short-circuit (shared with the wave path): if
             // no schedulable work remains and only blocked/skipped tasks are
             // left, exit immediately with the classifier's named verdict

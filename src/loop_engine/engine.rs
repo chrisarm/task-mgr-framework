@@ -155,10 +155,6 @@ pub struct IterationParams<'a> {
     pub task_prefix: Option<&'a str>,
     /// Default model from PRD metadata (threaded from run_loop via PrdMetadata).
     pub default_model: Option<&'a str>,
-    /// Default model from the per-project config (`.task-mgr/config.json`).
-    pub project_default_model: Option<&'a str>,
-    /// Default model from the per-user config (`$XDG_CONFIG_HOME/task-mgr/config.json`).
-    pub user_default_model: Option<&'a str>,
     /// Permission mode for Claude subprocess invocation.
     pub permission_mode: &'a PermissionMode,
     /// Paths to sibling PRD JSON files (batch mode only, empty otherwise).
@@ -187,9 +183,11 @@ pub struct IterationResult {
     /// Effective model used for this iteration (post-crash-escalation).
     /// None for early exits (signal, rate-limit, etc.).
     pub effective_model: Option<String>,
-    /// Effective `--effort` level used for this iteration, derived from task difficulty.
+    /// Effective `--effort` level used for this iteration. Carries the plan's
+    /// per-provider effort (or the prior-overflow override) — owned `String`
+    /// because per-provider effort levels come from runtime config (WIRE-FIX-001).
     /// None when difficulty is unset/unknown or for early exits.
-    pub effective_effort: Option<&'static str>,
+    pub effective_effort: Option<String>,
     /// Effective runner that executed this iteration.
     /// None for pre-dispatch early exits.
     pub effective_runner: Option<RunnerKind>,
@@ -213,6 +211,100 @@ pub struct IterationResult {
     /// `iteration_pipeline::process_iteration_output` consumes this via
     /// `ProcessingParams.shown_learning_ids` to record bandit feedback.
     pub shown_learning_ids: Vec<i64>,
+}
+
+/// Current wall-clock time as whole seconds since the Unix epoch.
+///
+/// Single home for the "now" the in-memory quota-blackout channel
+/// ([`BlackoutState`]) and its deferral wait are keyed on. A pre-epoch clock
+/// (only possible on a badly-misconfigured host) saturates to `0` rather than
+/// panicking, so a blackout simply reads as already-expired.
+pub fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// In-memory, self-expiring, provider-keyed quota-blackout channel that lives
+/// ONLY on [`IterationContext`] (FR-008). Three load-bearing rules — encoded
+/// here so the next reader does not have to reconstruct them:
+///
+/// 1. **Never persisted.** No DB column, no serde, no disk. A blackout reflects
+///    transient account-level quota state, not durable task state. The channel
+///    is empty at process start and is **cleared on restart by design** — a
+///    fresh loop never inherits a stale blackout.
+/// 2. **Never read or written by `promote_once` / `runner_overrides`.** This is
+///    the EPHEMERAL per-pass reroute channel; `runner_overrides` is the
+///    PERMANENT cross-provider promotion channel owned by
+///    `recovery::promote_once`. Mixing them would pin a task to the spillover
+///    provider for the rest of the run (the `blackout_reroute_*` known-bad in
+///    `tests/model_selection_engine_edges.rs`). The two channels never touch.
+/// 3. **Set only by account-level rate-limit signals.** `record` is called
+///    exclusively from the post-output rate-limit reaction
+///    (`reactions::account::react_to_outputs`); a per-task crash, overflow, or
+///    RuntimeError never writes here.
+///
+/// Each entry maps a [`model::Provider`] to the Unix-epoch second at which its
+/// blackout expires. Queries take an explicit `now_secs` (so callers/tests
+/// control the clock); expired entries are filtered lazily, so the channel
+/// self-clears on expiry without a sweep.
+#[derive(Debug, Default)]
+pub struct BlackoutState {
+    /// provider → Unix-epoch-seconds expiry.
+    until: std::collections::HashMap<model::Provider, u64>,
+}
+
+impl BlackoutState {
+    /// Record `provider` blacked out until `now_secs + reset_secs`. A later
+    /// signal for the same provider extends (never shortens) the window.
+    pub fn record(&mut self, provider: model::Provider, now_secs: u64, reset_secs: u64) {
+        let expiry = now_secs.saturating_add(reset_secs);
+        self.until
+            .entry(provider)
+            .and_modify(|e| *e = (*e).max(expiry))
+            .or_insert(expiry);
+    }
+
+    /// The set of providers still under blackout at `now_secs` (expired entries
+    /// excluded — the self-clearing read). This is the `HashSet<Provider>`
+    /// threaded into `model::PlanContext::provider_blackouts`.
+    pub fn active(&self, now_secs: u64) -> std::collections::HashSet<model::Provider> {
+        self.until
+            .iter()
+            .filter(|(_, expiry)| **expiry > now_secs)
+            .map(|(p, _)| *p)
+            .collect()
+    }
+
+    /// Whether any provider is still blacked out at `now_secs`.
+    pub fn any_active(&self, now_secs: u64) -> bool {
+        self.until.values().any(|&expiry| expiry > now_secs)
+    }
+
+    /// Longest remaining blackout window in seconds at `now_secs` (`0` when no
+    /// entry is still active). Drives the deferral-first wait so it sleeps until
+    /// the LAST blacked-out provider reopens.
+    pub fn max_remaining_secs(&self, now_secs: u64) -> u64 {
+        self.until
+            .values()
+            .filter(|&&expiry| expiry > now_secs)
+            .map(|&expiry| expiry - now_secs)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Drop every blackout entry — called after a deferral wait completes so the
+    /// next selection pass re-evaluates eligibility against a clean channel.
+    pub fn clear(&mut self) {
+        self.until.clear();
+    }
+
+    /// Whether the channel currently holds no entries at all (used by the
+    /// runner-overrides-untouched discriminator and restart semantics).
+    pub fn is_empty(&self) -> bool {
+        self.until.is_empty()
+    }
 }
 
 /// Mutable context carried between iterations.
@@ -329,6 +421,26 @@ pub struct IterationContext {
     /// path. Loop-thread-local (the reaction runs on the main thread in both
     /// paths), preserving the no-Mutex contract.
     pub transient_backend_attempts: u32,
+    /// In-memory quota-blackout channel (FR-008, FEAT-008). Provider-keyed,
+    /// self-expiring, NEVER persisted, and NEVER touched by
+    /// `promote_once` / `runner_overrides`. Written only by the account-level
+    /// rate-limit reaction (`reactions::account::react_to_outputs`) and read at
+    /// the spawn-side resolver (`model::resolve_execution_plan` via
+    /// [`BlackoutState::active`]), the quota-deferral wait, and the
+    /// excluded-id computation. See [`BlackoutState`] for the three rules.
+    pub provider_blackouts: BlackoutState,
+    /// The operator-resolved provider-first config (`models` + `routing`),
+    /// built ONCE per run in `run_loop` from `ProjectConfig` and threaded to the
+    /// per-task recovery paths that resolve Claude tier ladders — consecutive-
+    /// failure escalation (`recovery::escalate_task_model_if_needed*`) and crash
+    /// escalation (`pre_spawn::crash_escalated_model_with_config`). These call
+    /// sites historically walked `model::builtin_resolved_models()`, so an
+    /// operator who remapped Claude tiers (custom ladder, null rungs) got
+    /// recovery escalations onto models their config never defined (the FIX-001
+    /// config-input divergence). Defaults to `builtin_resolved_models()` so every
+    /// test/`IterationContext::new` construction stays byte-identical to the
+    /// pre-threading builtin behavior.
+    pub resolved_models: model::ResolvedModelsConfig,
 }
 
 impl IterationContext {
@@ -353,6 +465,8 @@ impl IterationContext {
             runner_overrides: std::collections::HashMap::new(),
             overflow_original_task_model: std::collections::HashMap::new(),
             transient_backend_attempts: 0,
+            provider_blackouts: BlackoutState::default(),
+            resolved_models: model::builtin_resolved_models().clone(),
         }
     }
 }
@@ -360,10 +474,9 @@ impl IterationContext {
 /// Explicit input to [`resolve_effective_runner`].
 ///
 /// Carries both the effective model string AND the optional `provider_hint`
-/// that flowed from a `primaryRunner` spec match (see
-/// [`model::resolve_task_execution_target`]). Production callers MUST
-/// construct this struct explicitly so a missed-thread (model-only) call
-/// site is a compile-time error rather than a silent Codex→Claude misroute.
+/// that flowed from the resolved execution plan's provider intent. Production
+/// callers MUST construct this struct explicitly so a missed-thread (model-only)
+/// call site is a compile-time error rather than a silent Codex→Claude misroute.
 ///
 /// The `From<Option<&str>>` ergonomic conversion (`provider_hint = None`) is
 /// `#[cfg(test)]`-gated so tests can stay terse without weakening the
@@ -436,38 +549,6 @@ pub fn resolve_effective_runner(
         model::Provider::Grok => RunnerKind::Grok,
         model::Provider::Codex => RunnerKind::Codex,
         model::Provider::Claude => RunnerKind::Claude,
-    }
-}
-
-/// Compute the `reviewModel` routing override for a single task.
-///
-/// Returns `Some(trimmed_model_id)` when both conditions hold:
-/// - [`model::is_review_class`] classifies `task_id` as review-class
-///   (`CODE-REVIEW-*`, `MILESTONE-FINAL`, `REVIEW-*`; project-prefixed ids
-///   are matched after stripping the leading 8-hex-char prefix).
-/// - `review_model` is `Some(v)` with non-whitespace content.
-///
-/// Returns `None` in every other case — non-review tasks, unset/empty
-/// `reviewModel`. Pure function: no side effects, no I/O, no access to
-/// `IterationContext`. Used at both dispatch sites (`run_iteration` for
-/// the sequential path, `run_wave_iteration` for the wave path) so the
-/// routing decision is identical regardless of execution mode.
-///
-/// The override deliberately changes the **model string** that flows into
-/// [`resolve_effective_runner`] and the `--model` CLI flag, NOT
-/// `ctx.runner_overrides`. The override map is reserved for the overflow
-/// ladder's promotion writes — leaving it untouched preserves its
-/// precedence over `provider_for_model(...)` so an in-flight overflow
-/// promotion isn't shadowed by review-model routing.
-pub fn apply_review_model_override(review_model: Option<&str>, task_id: &str) -> Option<String> {
-    if !model::is_review_class(task_id) {
-        return None;
-    }
-    let trimmed = review_model?.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
     }
 }
 
@@ -606,8 +687,11 @@ pub struct SlotIterationParams {
     pub permission_mode: PermissionMode,
     /// Shared signal flag (Arc-backed) for SIGINT/SIGTERM coordination.
     pub signal_flag: SignalFlag,
-    /// Default model from PRD metadata (falls through when the task has no
-    /// explicit model and no higher-tier escalation is active).
+    /// PRD-metadata default model. INERT under the models config (hard break):
+    /// no longer consulted by the slot worker or the wave pre-spawn block — a
+    /// None `resolved_model` means "spawn with no model flag", not "widen to the
+    /// PRD default". Retained on the params chain pending the full
+    /// `default_model` removal REFACTOR; populating it has no routing effect.
     pub default_model: Option<String>,
     /// Verbose logging toggle.
     pub verbose: bool,
@@ -639,7 +723,7 @@ pub(super) struct SlotEarlyExit {
     pub(super) should_stop: bool,
     pub(super) output: String,
     pub(super) effective_model: Option<String>,
-    pub(super) effective_effort: Option<&'static str>,
+    pub(super) effective_effort: Option<String>,
 }
 
 /// Borrowed parameters for one parallel wave iteration (FEAT-010).
@@ -666,15 +750,6 @@ pub struct WaveIterationParams<'a> {
     pub permission_mode: &'a PermissionMode,
     pub signal_flag: &'a SignalFlag,
     pub default_model: Option<&'a str>,
-    /// Default model from the per-project config (`.task-mgr/config.json`),
-    /// cached once at `run_loop` startup. Threaded into the post-wave
-    /// `handle_task_failure_with_runner` call so the recovery baseline-tier
-    /// derivation uses the SAME defaults the primary spawn-site does (FIX-001).
-    pub project_default_model: Option<&'a str>,
-    /// Default model from the per-user config
-    /// (`$XDG_CONFIG_HOME/task-mgr/config.json`), cached at `run_loop` startup.
-    /// See `project_default_model` (FIX-001).
-    pub user_default_model: Option<&'a str>,
     pub verbose: bool,
     pub task_prefix: Option<&'a str>,
     pub prd_path: &'a Path,
@@ -1130,132 +1205,6 @@ mod tests {
         assert!(
             ctx.overflow_original_task_model.is_empty(),
             "fresh IterationContext.overflow_original_task_model MUST be empty",
-        );
-    }
-
-    // --- FEAT-002: apply_review_model_override ---
-    //
-    // Pure-function tests for the predicate used at both dispatch sites
-    // (sequential `run_iteration` + wave `run_wave_iteration`). Failure here
-    // means review-class routing fired on a non-review task, or vice versa.
-
-    #[test]
-    fn feat_002_review_override_fires_for_review_class_ids() {
-        for id in &[
-            "CODE-REVIEW-1",
-            "CODE-REVIEW-007",
-            "MILESTONE-FINAL",
-            "REVIEW-001",
-            // Prefixed (production shape) — strips ^[0-9a-f]{8}- before matching.
-            "8d71d1f7-CODE-REVIEW-1",
-            "8d71d1f7-MILESTONE-FINAL",
-            "8d71d1f7-REVIEW-001",
-        ] {
-            assert_eq!(
-                apply_review_model_override(Some("grok-build"), id),
-                Some("grok-build".to_string()),
-                "review-class id {id} MUST receive the reviewModel override",
-            );
-        }
-    }
-
-    #[test]
-    fn feat_002_review_override_skips_non_review_ids() {
-        for id in &[
-            "FEAT-001",
-            "VERIFY-001",
-            "MILESTONE-1",
-            "MILESTONE-2",
-            "REFACTOR-001",
-            "REFACTOR-REVIEW-FINAL",
-            // Prefixed non-review ids must also be skipped — the `is_review_class`
-            // strip-then-match keeps REFACTOR-REVIEW-FINAL out of the REVIEW-* path.
-            "8d71d1f7-FEAT-001",
-            "8d71d1f7-VERIFY-001",
-            "8d71d1f7-MILESTONE-1",
-            "8d71d1f7-REFACTOR-REVIEW-FINAL",
-        ] {
-            assert_eq!(
-                apply_review_model_override(Some("grok-build"), id),
-                None,
-                "non-review id {id} MUST NOT receive the reviewModel override",
-            );
-        }
-    }
-
-    #[test]
-    fn feat_002_review_override_returns_none_when_review_model_unset() {
-        // Absent / empty / whitespace-only — review tasks stay on whatever
-        // model was already baked in (typically Opus).
-        for review_model in &[None, Some(""), Some("   "), Some("\t\n")] {
-            assert_eq!(
-                apply_review_model_override(*review_model, "CODE-REVIEW-1"),
-                None,
-                "unset/empty reviewModel ({review_model:?}) MUST NOT override review-class tasks",
-            );
-        }
-    }
-
-    #[test]
-    fn feat_002_review_override_trims_whitespace() {
-        // Outer whitespace is trimmed so a `"reviewModel": "  grok-build  "` config
-        // doesn't ship a model id with surprise whitespace to the runner.
-        assert_eq!(
-            apply_review_model_override(Some("  grok-build  "), "CODE-REVIEW-1"),
-            Some("grok-build".to_string()),
-        );
-    }
-
-    #[test]
-    fn feat_002_review_override_passes_through_any_provider() {
-        // The helper itself does not classify provider — it only routes
-        // review-class tasks. A Claude id, an unknown id, or Grok id all
-        // propagate identically; provider classification happens later in
-        // `resolve_effective_runner` via `provider_for_model`.
-        assert_eq!(
-            apply_review_model_override(Some(OPUS_MODEL), "REVIEW-001"),
-            Some(OPUS_MODEL.to_string()),
-        );
-        assert_eq!(
-            apply_review_model_override(Some("gpt-4"), "REVIEW-001"),
-            Some("gpt-4".to_string()),
-        );
-        assert_eq!(
-            apply_review_model_override(Some("grok-build"), "REVIEW-001"),
-            Some("grok-build".to_string()),
-        );
-    }
-
-    #[test]
-    fn feat_002_review_override_into_resolver_yields_grok_runner() {
-        // End-to-end shape: when the override fires for a review task with a
-        // Grok model id, feeding the result into `resolve_effective_runner`
-        // selects `RunnerKind::Grok`. This is the contract the sequential
-        // dispatch site relies on to keep selection + `--model` consistent.
-        let ctx = IterationContext::new(8);
-        let task_id = "8d71d1f7-CODE-REVIEW-1";
-        let effective_model = apply_review_model_override(Some("grok-build"), task_id);
-        assert_eq!(effective_model.as_deref(), Some("grok-build"));
-        assert_eq!(
-            resolve_effective_runner(&ctx, task_id, effective_model.as_deref().into()),
-            RunnerKind::Grok,
-        );
-    }
-
-    #[test]
-    fn feat_002_no_override_leaves_resolver_on_claude_for_review_tasks() {
-        // Negative path: reviewModel unset → effective_model is unchanged at
-        // the baked-in Opus, and the resolver returns Claude. This locks in
-        // the "no behavior change when reviewModel is absent" guarantee.
-        let ctx = IterationContext::new(8);
-        let task_id = "8d71d1f7-CODE-REVIEW-1";
-        let override_model = apply_review_model_override(None, task_id);
-        assert_eq!(override_model, None);
-        // Caller keeps the baked-in model — here, Opus.
-        let effective_model = override_model.or(Some(OPUS_MODEL.to_string()));
-        assert_eq!(
-            resolve_effective_runner(&ctx, task_id, effective_model.as_deref().into()),
-            RunnerKind::Claude,
         );
     }
 

@@ -131,7 +131,7 @@ pub(crate) fn load_runs(conn: &Connection) -> TaskMgrResult<Vec<RunExport>> {
 fn load_all_run_tasks(conn: &Connection) -> TaskMgrResult<HashMap<String, Vec<RunTaskExport>>> {
     let mut stmt = conn.prepare(
         r#"SELECT run_id, task_id, status, iteration, started_at, ended_at,
-           duration_seconds, notes
+           duration_seconds, notes, provider, model
            FROM run_tasks WHERE archived_at IS NULL ORDER BY run_id, iteration, started_at"#,
     )?;
 
@@ -144,6 +144,8 @@ fn load_all_run_tasks(conn: &Connection) -> TaskMgrResult<HashMap<String, Vec<Ru
         let ended_at_str: Option<String> = row.get(5)?;
         let duration_seconds: Option<i64> = row.get(6)?;
         let notes: Option<String> = row.get(7)?;
+        let provider: Option<String> = row.get(8)?;
+        let model: Option<String> = row.get(9)?;
 
         Ok((
             run_id,
@@ -154,6 +156,8 @@ fn load_all_run_tasks(conn: &Connection) -> TaskMgrResult<HashMap<String, Vec<Ru
             ended_at_str,
             duration_seconds,
             notes,
+            provider,
+            model,
         ))
     })?;
 
@@ -168,6 +172,8 @@ fn load_all_run_tasks(conn: &Connection) -> TaskMgrResult<HashMap<String, Vec<Ru
             ended_at_str,
             duration_seconds,
             notes,
+            provider,
+            model,
         ) = row?;
 
         let started_at = parse_datetime(&started_at_str)?;
@@ -182,6 +188,8 @@ fn load_all_run_tasks(conn: &Connection) -> TaskMgrResult<HashMap<String, Vec<Ru
             ended_at,
             duration_seconds,
             notes,
+            provider,
+            model,
         };
 
         map.entry(run_id).or_default().push(task_export);

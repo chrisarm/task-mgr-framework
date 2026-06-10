@@ -81,10 +81,6 @@ pub(crate) struct LoopInitContext {
     pub(crate) default_model: Option<String>,
     /// Project config loaded once at startup and threaded through every wave.
     pub(crate) project_config: ProjectConfig,
-    /// Project-level default model (`.task-mgr/config.json`).
-    pub(crate) project_default_model: Option<String>,
-    /// User-level default model (XDG user config).
-    pub(crate) user_default_model: Option<String>,
     /// PRD-side implicit-overlap file basenames (cached; extends the baseline list).
     pub(crate) prd_implicit_overlap_files: Vec<String>,
     /// Resolved external git repo path (CLI flag overrides PRD metadata).
@@ -489,6 +485,15 @@ pub(crate) fn initialize_loop(
     let task_count = prd_metadata.task_count;
     let task_prefix = prd_metadata.task_prefix;
     let default_model = prd_metadata.default_model;
+    // FR-002 hard break: a PRD-level `default_model` is parsed/stored/exported
+    // verbatim but is ignored by model resolution under the provider-first
+    // `models`/`routing` config. Warn once at loop run so the operator knows.
+    if default_model.is_some() {
+        crate::output::warn(
+            "PRD metadata `default_model` is ignored under the models config; use \
+             models.anchor / routing instead",
+        );
+    }
     // Config-level defaults: fall below PRD default in the resolution chain.
     // The loop engine never prompts — it runs non-interactively — so these
     // are pure reads. Users pin a default via `task-mgr init` or
@@ -503,8 +508,6 @@ pub(crate) fn initialize_loop(
     // apply config changes — matching every other run-scoped knob.
     let project_config =
         crate::loop_engine::project_config::read_project_config(&run_config.db_dir);
-    let project_default_model = project_config.default_model.clone();
-    let user_default_model = crate::loop_engine::user_config::read_user_config().default_model;
     // Same caching rationale for the PRD-side `implicit_overlap_files`
     // override. Field is rare and small (a list of file basenames), so
     // an empty Vec when the PRD JSON is absent / malformed is safe.
@@ -743,11 +746,10 @@ pub(crate) fn initialize_loop(
                 // SIGINT/SIGTERM during the brief recovery window proceeds via
                 // the spawned Claude's own signal handling.
                 let recovery_signal_flag = SignalFlag::new();
-                let recovery_model = project_default_model
-                    .as_deref()
-                    .filter(|m| !m.trim().is_empty())
-                    .unwrap_or(model::SONNET_MODEL)
-                    .to_string();
+                // The legacy project-level `defaultModel` surface was hard-broken
+                // (REFACTOR-006); the startup merge-back auto-recovery resolver
+                // uses the Sonnet baseline directly.
+                let recovery_model = model::SONNET_MODEL.to_string();
                 let recovery_effort = project_config
                     .merge_resolver_effort
                     .clone()
@@ -989,8 +991,6 @@ pub(crate) fn initialize_loop(
         task_prefix,
         default_model,
         project_config,
-        project_default_model,
-        user_default_model,
         prd_implicit_overlap_files,
         external_repo_path,
         actual_worktree_path,

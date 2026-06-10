@@ -197,21 +197,19 @@ pub struct SlotPromptParams<'a> {
     /// Operator pause feedback rendered as a `## Session Guidance` block.
     /// Empty string omits the section entirely (no header).
     pub session_guidance: &'a str,
-    /// Primary runner routing configuration.
-    pub primary_runner: Option<&'a crate::loop_engine::project_config::PrimaryRunnerConfig>,
-    /// Engine-cached PRD default model (`prd_metadata.default_model`). Threaded
-    /// from `WaveIterationParams::default_model` into the slot's
-    /// `ModelResolutionContext` so the wave baseline tier equals the sequential
-    /// baseline tier for the same task+config (WIRE-FIX-001). Without it,
-    /// `compute_baseline_model` only escalates `difficulty==high`, so non-high
-    /// `baselineTierRoutes` never fire in wave mode.
-    pub prd_default: Option<&'a str>,
-    /// Engine-cached project default model (`.task-mgr/config.json`). See
-    /// [`Self::prd_default`].
-    pub project_default: Option<&'a str>,
-    /// Engine-cached user default model (`$XDG_CONFIG_HOME/task-mgr/config.json`).
-    /// See [`Self::prd_default`].
-    pub user_default: Option<&'a str>,
+    /// Provider-first `models` config block (FR-001). Resolved per build and
+    /// fed to [`crate::loop_engine::model::resolve_execution_plan`]. Threaded
+    /// from `ProjectConfig::models`.
+    pub models_config: &'a crate::loop_engine::project_config::ModelsConfig,
+    /// Routing policy block (FR-001) consumed by `resolve_execution_plan`.
+    /// Threaded from `ProjectConfig::routing`.
+    pub routing_config: &'a crate::loop_engine::project_config::RoutingConfig,
+    /// FEAT-008: providers under an active quota blackout this wave
+    /// (`ctx.provider_blackouts.active(now)`). Fed to `resolve_execution_plan`
+    /// so a spillover-eligible task reroutes off a blacked-out provider at spawn
+    /// time, consistent with the wave's `excluded_ids` computation. Empty (the
+    /// default) → no reroute, byte-identical to the pre-FEAT-008 plan.
+    pub provider_blackouts: std::collections::HashSet<crate::loop_engine::model::Provider>,
 }
 
 /// Send-safe bundle of everything a slot worker needs to invoke Claude and
@@ -241,12 +239,20 @@ pub struct SlotPromptBundle {
     pub resolved_model: Option<String>,
     /// Explicit provider intent from `primaryRunner`, when present.
     pub provider_hint: Option<crate::loop_engine::model::Provider>,
-    /// Task difficulty at bundle-build time. The slot worker derives effort
-    /// (`model::effort_for_difficulty`) and watchdog timeout
-    /// (`watchdog::TimeoutConfig::from_difficulty`) from this without needing
-    /// the original `Task` reference. `None` when the task has no difficulty
-    /// set; downstream callers fall back to defaults.
+    /// Task difficulty at bundle-build time. The slot worker derives the
+    /// watchdog timeout (`watchdog::TimeoutConfig::from_difficulty`) from this
+    /// without needing the original `Task` reference. `None` when the task has
+    /// no difficulty set; downstream callers fall back to defaults.
     pub difficulty: Option<String>,
+    /// Resolved CLI `--effort` level for this slot (None → omit flag). Carries
+    /// the [`ExecutionPlan::effort`](crate::loop_engine::model::ExecutionPlan)
+    /// the slot prompt builder computed — `models.effort_for(final_provider,
+    /// difficulty)` over the FINAL provider's per-provider effort table, with the
+    /// static `effort_for_difficulty` table as fallback. The slot worker prefers
+    /// this over re-deriving from `difficulty`, so a custom per-provider effort
+    /// table reaches the runner argv (WIRE-FIX-001). Mirrors
+    /// `PromptResult::cluster_effort` on the sequential path.
+    pub cluster_effort: Option<String>,
     /// Per-section byte sizes in prompt-assembly order. Mirrors
     /// `PromptResult::section_sizes` so overflow dumps include a meaningful
     /// section breakdown (instead of an empty `[]`) when a slot hits
@@ -332,20 +338,37 @@ pub fn build_prompt(
 ) -> SlotPromptBundle {
     let task_files = load_task_files(conn, &task.id);
 
-    let target = crate::loop_engine::model::resolve_task_execution_target(
-        &crate::loop_engine::model::ModelResolutionContext {
+    // FR-003 single resolution path (FEAT-004) — identical to the sequential
+    // builder so the two paths compute the same plan for the same task+config
+    // (reaction parity). `resolve_models_config` is a pure projection (no I/O).
+    let resolved_models = crate::loop_engine::model::resolve_models_config(
+        params.models_config,
+        params.routing_config,
+    );
+    let plan = crate::loop_engine::model::resolve_execution_plan(
+        &crate::loop_engine::model::PlanContext {
+            task_id: &task.id,
             task_model: task.model.as_deref(),
             difficulty: task.difficulty.as_deref(),
-            task_id: Some(&task.id),
-            primary_runner: params.primary_runner,
-            prd_default: params.prd_default,
-            project_default: params.project_default,
-            user_default: params.user_default,
-            ..Default::default()
+            models: &resolved_models,
+            // FEAT-008: reroute off any blacked-out provider at spawn time.
+            provider_blackouts: &params.provider_blackouts,
         },
     );
-    let resolved_model = target.model;
-    let provider_hint = target.provider_hint;
+    let resolved_model = plan.model;
+    let provider_hint = match plan.provider {
+        crate::loop_engine::model::Provider::Claude => None,
+        other => Some(other),
+    };
+    // WIRE-FIX-001: carry the plan's per-provider effort onto the bundle so the
+    // slot worker uses it instead of recomputing from the static
+    // `effort_for_difficulty` table (which ignores custom per-provider tables).
+    // Static fallback only when the resolved provider has no entry for this
+    // difficulty, keeping default-config behavior unchanged.
+    let cluster_effort = plan.effort.or_else(|| {
+        crate::loop_engine::model::effort_for_difficulty(task.difficulty.as_deref())
+            .map(String::from)
+    });
 
     // The `&Connection` lives only in this main-thread `PromptContext`, which is
     // dropped before the bundle crosses the worker boundary — no `&Connection`
@@ -365,6 +388,7 @@ pub fn build_prompt(
         reorder_hint: None,
         batch_sibling_prds: None,
         resolved_model: None,
+        resolved_models: &resolved_models,
         next_task_output: None,
         recalled_learnings: None,
     };
@@ -407,6 +431,7 @@ pub fn build_prompt(
             resolved_model,
             provider_hint,
             difficulty: task.difficulty.clone(),
+            cluster_effort,
             // `assemble` populates `section_sizes` on overflow (criticals in
             // roster order), the same breakdown the legacy sentinel reported.
             section_sizes: critical_assembled.section_sizes,
@@ -538,6 +563,7 @@ pub fn build_prompt(
         resolved_model,
         provider_hint,
         difficulty: task.difficulty.clone(),
+        cluster_effort,
         section_sizes,
         dropped_sections,
     }

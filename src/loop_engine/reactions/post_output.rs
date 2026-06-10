@@ -34,7 +34,7 @@ use rusqlite::Connection;
 
 use crate::lifecycle::TaskLifecycle;
 use crate::loop_engine::engine::IterationContext;
-use crate::loop_engine::model;
+use crate::loop_engine::model::{self, Provider};
 use crate::loop_engine::overflow::{
     DumpHeader, OverflowEvent, RecoveryAction, append_event_log, dump_prompt, rotate_dumps_keep_n,
     sanitize_id_for_filename,
@@ -44,44 +44,65 @@ use crate::loop_engine::prompt::PromptResult;
 use crate::loop_engine::recovery::promote_once;
 use crate::loop_engine::runner::RunnerKind;
 
-/// Select the rung-4 fallback target for the given effective runner, or
-/// `None` when no cross-provider promotion is configured for that direction.
-///
-/// Two mirror directions (PRD §2.5, FEAT-006 + FEAT-PRIMARY-004):
-///   - **Claude → Grok**: fires when `fallback_runner` is `Some(cfg)` with
-///     `cfg.enabled = true`. Target = `cfg.model`, provider = `cfg.provider`.
-///   - **Grok → Claude**: fires when `primary_runner` is `Some(pr)` with
-///     `pr.claude_fallback_model = Some(model)`. Target = that model,
-///     provider = `"claude"`.
-///
-/// Returns `(provider, model, target_runner)` so the caller writes a single
-/// `RecoveryAction::FallbackToProvider` plus matching `runner_overrides` /
-/// `model_overrides` entries without branching on direction itself. The
-/// idempotency guard (a task already carrying a promotion override skips
-/// rung 4 entirely) is enforced by the caller, not here.
-fn select_fallback_target(
-    effective_runner: RunnerKind,
-    project_config: &ProjectConfig,
-) -> Option<(String, String, RunnerKind)> {
-    match effective_runner {
-        RunnerKind::Claude => {
-            let cfg = project_config.fallback_runner.as_ref()?;
-            if !cfg.enabled {
-                return None;
-            }
-            Some((cfg.provider.clone(), cfg.model.clone(), RunnerKind::Grok))
-        }
-        RunnerKind::Grok => {
-            let primary = project_config.primary_runner.as_ref()?;
-            let claude_model = primary.claude_fallback_model.as_ref()?;
-            Some((
-                "claude".to_string(),
-                claude_model.clone(),
-                RunnerKind::Claude,
-            ))
-        }
-        RunnerKind::Codex => None,
+/// The provider that owns `runner` (the inverse of [`provider_of_runner`]).
+/// Total: every `RunnerKind` maps to exactly one provider and back.
+fn provider_of_runner(runner: RunnerKind) -> Provider {
+    match runner {
+        RunnerKind::Claude => Provider::Claude,
+        RunnerKind::Grok => Provider::Grok,
+        RunnerKind::Codex => Provider::Codex,
     }
+}
+
+/// The runner that executes `provider`. Inverse of [`provider_of_runner`].
+fn runner_of_provider(provider: Provider) -> RunnerKind {
+    match provider {
+        Provider::Claude => RunnerKind::Claude,
+        Provider::Grok => RunnerKind::Grok,
+        Provider::Codex => RunnerKind::Codex,
+    }
+}
+
+/// Select the rung-4 cross-provider fallback target for the source runner, or
+/// `None` when the source provider has no configured fallback.
+///
+/// Config-derived from the provider-first `models` block (FR-001): the pivot
+/// target is `providers.<source>.fallback`. Validation
+/// (`validate_models_config`) already guarantees a configured fallback is a
+/// DIFFERENT, enabled provider, so a self-pivot or a disabled target can never
+/// reach here. With no `fallback` key the source provider has no rung-4 pivot
+/// and the overflow ladder falls through to `Blocked` — this is what makes the
+/// rung opt-in per provider (Codex gains a rung-4 pivot iff its `fallback` is
+/// set, exactly like Claude and Grok).
+///
+/// The pivot is **tier-preserving**: the target model is resolved for the SAME
+/// capability tier the source model occupied (`tier_of`), falling back to the
+/// config anchor tier when the source model is off-ladder or absent. Returns
+/// `(provider_name, target_model, target_runner)` so the caller writes a single
+/// `RecoveryAction::FallbackToProvider` plus matching `runner_overrides` /
+/// `model_overrides` without branching on direction. The idempotency guard (a
+/// task already carrying a promotion override skips rung 4) is enforced by the
+/// caller via `promote_once`, not here.
+fn select_fallback_target(
+    source_provider: Provider,
+    effective_model: Option<&str>,
+    resolved: &model::ResolvedModelsConfig,
+) -> Option<(String, String, RunnerKind)> {
+    let target_provider = resolved.fallback_provider(source_provider)?;
+    // Tier-preserving: keep the source model's tier across the pivot; if the
+    // source model is off-ladder or absent, preserve the config anchor tier.
+    let tier = effective_model
+        .and_then(|m| resolved.tier_of(source_provider, m))
+        .unwrap_or(resolved.anchor);
+    let target_model = resolved
+        .model_for(target_provider, tier)
+        .unwrap_or_default()
+        .to_string();
+    Some((
+        target_provider.as_str().to_string(),
+        target_model,
+        runner_of_provider(target_provider),
+    ))
 }
 
 /// Read the current `tasks.model` column for a task, returning `Ok(None)` when
@@ -164,11 +185,19 @@ pub fn handle_overflow(params: HandleOverflowParams<'_>) -> RecoveryAction {
         project_config,
     } = params;
 
+    // Resolve the provider-first config ONCE for this overflow. The tier
+    // ladders (rungs 2-4) are config-driven: rung 2 walks the SOURCE provider's
+    // capability ladder, rung 4 pivots to `providers.<source>.fallback`. The
+    // source provider is the spawn-site `effective_runner`'s provider — never
+    // re-derived from the model string (which can't tell Codex from Claude).
+    let resolved = model::resolve_models_config(&project_config.models, &project_config.routing);
+    let source_provider = provider_of_runner(effective_runner);
+
     // Step 1: pick recovery rung. Rung 4 (FallbackToProvider) sits between
     // rung 3 (to_1m_model) and rung 5 (Blocked); its precondition is a
     // SINGLE-predicate guard (PRD §2.5): the computed `effective_runner`
-    // value MUST be `RunnerKind::Claude` AND the fallback config MUST be
-    // enabled. Re-deriving the guard via
+    // value drives the source provider, and a rung-4 pivot exists only when
+    // that provider has a configured `fallback`. Re-deriving the guard via
     // `runner_overrides.get(...).is_none() || provider_for_model(...) == Claude`
     // is explicitly prohibited because it can silently drift between the
     // spawn-site value and the rung-4 check.
@@ -178,21 +207,26 @@ pub fn handle_overflow(params: HandleOverflowParams<'_>) -> RecoveryAction {
         RecoveryAction::DowngradeEffort {
             new_effort: next_effort.to_string(),
         }
-    } else if let Some(next_model) = model::escalate_below_opus(effective_model) {
+    } else if let Some(next_model) =
+        model::escalate_below_ceiling(&resolved, source_provider, effective_model)
+    {
+        // Rung 2: step up one DEFINED tier on the SOURCE provider's ladder.
+        // Returns None at the ceiling (and for single-rung providers like Grok /
+        // Codex, whose model already sits at the ceiling) so the ladder advances.
         ctx.model_overrides
-            .insert(task_id.to_string(), next_model.to_string());
-        RecoveryAction::EscalateModel {
-            new_model: next_model.to_string(),
+            .insert(task_id.to_string(), next_model.clone());
+        RecoveryAction::EscalateTier {
+            new_model: next_model,
         }
-    } else if let Some(m1m) = model::to_1m_model(effective_model) {
-        ctx.model_overrides
-            .insert(task_id.to_string(), m1m.to_string());
-        RecoveryAction::To1mModel {
-            new_model: m1m.to_string(),
-        }
+    } else if source_provider == Provider::Claude
+        && let Some(m1m) = model::to_1m_model(effective_model)
+    {
+        // Rung 3: 1M-context suffix-append. Claude-only — gated on the source
+        // provider (not the model string) so a Codex/Grok task never reaches it.
+        ctx.model_overrides.insert(task_id.to_string(), m1m.clone());
+        RecoveryAction::To1mModel { new_model: m1m }
     // kind-correct: rung 4 gate — a task NOT yet promoted is eligible for a
-    // cross-provider pivot whose direction follows `effective_runner`
-    // (Claude→Grok via fallback_runner, Grok→Claude via primary_runner).
+    // cross-provider pivot to `providers.<source>.fallback` (tier-preserving).
     // `promote_once` (CONTRACT-PROMO-001) is the single idempotency guard: it
     // returns `None` when a promotion override already exists (in EITHER
     // direction), so an already-promoted task skips rung 4 and falls through to
@@ -207,7 +241,7 @@ pub fn handle_overflow(params: HandleOverflowParams<'_>) -> RecoveryAction {
     // centralized `contains_key` guard. Do NOT collapse this into
     // `apply_pending_promotion` (it emits a different banner keyed on `new_count`).
     } else if let Some((provider, model, target_runner)) =
-        select_fallback_target(effective_runner, project_config)
+        select_fallback_target(source_provider, effective_model, &resolved)
         && promote_once(
             ctx,
             task_id,
@@ -261,7 +295,7 @@ pub fn handle_overflow(params: HandleOverflowParams<'_>) -> RecoveryAction {
     //   - FallbackToProvider → status='todo' + clear started_at + set tasks.model
     //                          to the cross-provider target (Grok model for
     //                          Claude→Grok, Claude model for Grok→Claude) so
-    //                          `resolve_task_model` picks it up next iteration.
+    //                          model resolution picks it up next iteration.
     //                          The DB UPDATE and the rung-1 ctx override inserts
     //                          (above) run together — never split across a
     //                          deferred-commit boundary — so the in-memory

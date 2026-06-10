@@ -46,7 +46,6 @@ use crate::loop_engine::engine::{
     SlotIterationParams, SlotResult, WaveAggregator, WaveIterationParams, resolve_effective_runner,
 };
 use crate::loop_engine::iteration_pipeline;
-use crate::loop_engine::model;
 use crate::loop_engine::monitor;
 use crate::loop_engine::reactions;
 use crate::loop_engine::runner::{self, RunnerKind};
@@ -131,23 +130,28 @@ pub fn run_slot_iteration(
         ));
     }
 
-    // Effective model: bundle-resolved (per-task) > params.default_model.
-    // Cluster-wide escalation (sequential path) is intentionally not applied
-    // in parallel; the wave engine targets tasks already scored as disjoint,
-    // not clusters.
-    let effective_model: Option<String> = bundle
-        .resolved_model
-        .clone()
-        .or_else(|| params.default_model.clone());
+    // Effective model: the bundle's `resolved_model` verbatim (already carries
+    // any main-thread crash escalation). `prd_metadata.default_model` is NOT
+    // consulted — it is ignored under the models config (hard break), matching
+    // the sequential path and the wave pre-spawn block. A None resolved_model
+    // means "spawn with no model flag" (provider-only Codex spec); widening it
+    // to a Claude PRD default here would mis-emit `-m <claude-id>` to the Codex
+    // CLI and diverge from the sequential baseline. Cluster-wide escalation
+    // (sequential path) is intentionally not applied in parallel; the wave
+    // engine targets tasks already scored as disjoint, not clusters.
+    let effective_model: Option<String> = bundle.resolved_model.clone();
 
-    // FEAT-002: prefer the prior-overflow effort override resolved on the main
-    // thread (`reactions::pre_spawn::resolve_task_execution` → SlotContext),
-    // falling back to the difficulty-derived effort when there is none. Mirrors
-    // the sequential path's `plan.effort.or(base_effort)`. `None` here is the
-    // common (no-overflow) case and keeps behavior byte-identical to before.
-    let effort = slot
+    // FEAT-002 / WIRE-FIX-001: prefer the prior-overflow effort override resolved
+    // on the main thread (`reactions::pre_spawn::resolve_task_execution` →
+    // SlotContext), then the plan's per-provider effort the slot prompt builder
+    // carried on the bundle (`models.effort_for(final_provider, difficulty)`, which
+    // already bakes in the static `effort_for_difficulty` fallback). Mirrors the
+    // sequential path's `plan.effort.or(base_effort)`. `None` from the override is
+    // the common (no-overflow) case.
+    let effort: Option<String> = slot
         .effective_effort
-        .or_else(|| model::effort_for_difficulty(bundle.difficulty.as_deref()));
+        .map(String::from)
+        .or_else(|| bundle.cluster_effort.clone());
 
     if params.verbose {
         ui::emit(&format!(
@@ -155,7 +159,7 @@ pub fn run_slot_iteration(
             slot.slot_index,
             task_id,
             effective_model.as_deref().unwrap_or("(default)"),
-            effort.unwrap_or("(default)"),
+            effort.as_deref().unwrap_or("(default)"),
             slot.working_root.display(),
         ));
     }
@@ -175,7 +179,7 @@ pub fn run_slot_iteration(
         task_id,
         params.elapsed_secs,
         effective_model.as_deref(),
-        effort,
+        effort.as_deref(),
     );
     ui::emit_prefixed(Some(&slot_label_buf), banner.trim_start_matches('\n'));
 
@@ -208,7 +212,7 @@ pub fn run_slot_iteration(
         .effective_runner
         .supports(runner::RunnerCapability::Effort)
     {
-        effort
+        effort.as_deref()
     } else {
         None
     };
@@ -274,7 +278,7 @@ pub fn run_slot_iteration(
                     should_stop: false,
                     output: hint,
                     effective_model,
-                    effective_effort: effort,
+                    effective_effort: effort.clone(),
                 },
             ));
         }
@@ -291,7 +295,7 @@ pub fn run_slot_iteration(
                     should_stop: false,
                     output: hint,
                     effective_model,
-                    effective_effort: effort,
+                    effective_effort: effort.clone(),
                 },
             ));
         }
@@ -315,7 +319,7 @@ pub fn run_slot_iteration(
                     should_stop: false,
                     output: String::new(),
                     effective_model,
-                    effective_effort: effort,
+                    effective_effort: effort.clone(),
                 },
             ));
         }
@@ -335,7 +339,7 @@ pub fn run_slot_iteration(
                 should_stop: false,
                 output: claude_result.output,
                 effective_model,
-                effective_effort: effort,
+                effective_effort: effort.clone(),
             },
         ));
     }
@@ -391,7 +395,7 @@ pub fn run_slot_iteration(
             should_stop: false,
             output: claude_result.output,
             effective_model,
-            effective_effort: effort,
+            effective_effort: effort.clone(),
             effective_runner: Some(slot.effective_runner),
             key_decisions_count: 0,
             conversation,
@@ -561,7 +565,7 @@ pub(super) fn process_slot_result(
             // events match what the agent actually saw.
             dropped_sections: slot_result.dropped_sections.clone(),
             task_difficulty: slot_result.task_difficulty.clone(),
-            cluster_effort: slot_result.iteration_result.effective_effort,
+            cluster_effort: slot_result.iteration_result.effective_effort.clone(),
             provider_hint: None,
             section_sizes: slot_result.section_sizes.clone(),
         };
@@ -600,7 +604,7 @@ pub(super) fn process_slot_result(
                 ctx,
                 conn: params.conn,
                 task_id: tid,
-                effort: slot_result.iteration_result.effective_effort,
+                effort: slot_result.iteration_result.effective_effort.as_deref(),
                 effective_model: slot_result.iteration_result.effective_model.as_deref(),
                 prompt_result: &synthetic_prompt,
                 iteration: params.iteration,
@@ -643,7 +647,8 @@ pub(super) fn process_slot_result(
             ctx,
             files_modified: &slot_result.iteration_result.files_modified,
             effective_model: slot_result.iteration_result.effective_model.as_deref(),
-            effective_effort: slot_result.iteration_result.effective_effort,
+            effective_effort: slot_result.iteration_result.effective_effort.as_deref(),
+            effective_runner: slot_result.iteration_result.effective_runner,
             slot_index: Some(slot_idx),
         });
 
@@ -751,10 +756,9 @@ mod tests {
             permission_mode: PermissionMode::Dangerous,
             steering_path: None,
             session_guidance: "",
-            primary_runner: None,
-            prd_default: None,
-            project_default: None,
-            user_default: None,
+            models_config: crate::loop_engine::project_config::default_models_config(),
+            routing_config: crate::loop_engine::project_config::default_routing_config(),
+            provider_blackouts: Default::default(),
         }
     }
 
@@ -769,6 +773,7 @@ mod tests {
             shown_learning_ids: Vec::new(),
             resolved_model: None,
             difficulty: None,
+            cluster_effort: None,
             provider_hint: None,
             section_sizes: Vec::new(),
             dropped_sections: Vec::new(),

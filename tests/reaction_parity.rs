@@ -42,6 +42,8 @@ use tempfile::TempDir;
 use task_mgr::db::migrations::run_migrations;
 use task_mgr::db::{create_schema, open_connection};
 use task_mgr::loop_engine::config::{IterationOutcome, PermissionMode};
+use task_mgr::loop_engine::engine::BlackoutState;
+use task_mgr::loop_engine::model::Provider;
 use task_mgr::loop_engine::reactions::account::{
     AccountReaction, AccountReactionParams, OutputReactionItem, WaitFn, react_to_outputs_inner,
 };
@@ -187,6 +189,13 @@ fn params<'a>(tasks_dir: &'a Path, fallback_wait: u64) -> AccountReactionParams<
         prefix: PREFIX,
         run_id: RUN_ID,
         permission_mode: &PERMISSION_MODE,
+        // Spillover disabled: the existing parity cases exercise the legacy
+        // reset-and-wait path (WaitedAndRetry / Stop). FEAT-008's
+        // RerouteAndRetry case sets `spillover_enabled: true` explicitly.
+        spillover_enabled: false,
+        primary_provider: Provider::Claude,
+        blackout_fallback_secs: 3600,
+        now_secs: 0,
     }
 }
 
@@ -230,6 +239,7 @@ fn wait_once_fires_wait_exactly_once_for_multi_rate_limit_wave() {
         &mut conn,
         &items,
         &params(db_temp.path(), 600),
+        &mut BlackoutState::default(),
         &wait as WaitFn,
     );
 
@@ -279,6 +289,7 @@ fn mixed_wave_resets_only_rate_limited_task_and_preserves_completed() {
         &mut conn,
         &items,
         &params(db_temp.path(), 600),
+        &mut BlackoutState::default(),
         &wait as WaitFn,
     );
 
@@ -329,6 +340,7 @@ fn rate_limit_output_does_not_trigger_completions_or_learnings() {
         &mut conn,
         &items,
         &params(db_temp.path(), 600),
+        &mut BlackoutState::default(),
         &wait as WaitFn,
     );
 
@@ -374,6 +386,7 @@ fn parse_fail_falls_back_to_fallback_wait_and_both_shapes_agree() {
         &mut seq_conn,
         &seq_items,
         &params(seq_temp.path(), FALLBACK),
+        &mut BlackoutState::default(),
         &seq_wait as WaitFn,
     );
 
@@ -401,6 +414,7 @@ fn parse_fail_falls_back_to_fallback_wait_and_both_shapes_agree() {
         &mut wave_conn,
         &wave_items,
         &params(wave_temp.path(), FALLBACK),
+        &mut BlackoutState::default(),
         &wave_wait as WaitFn,
     );
 
@@ -453,6 +467,7 @@ fn no_rate_limit_returns_none_and_writes_nothing() {
         &mut conn,
         &items,
         &params(db_temp.path(), 600),
+        &mut BlackoutState::default(),
         &wait as WaitFn,
     );
 
@@ -497,6 +512,7 @@ fn stop_signal_during_wait_returns_stop() {
         &mut conn,
         &items,
         &params(db_temp.path(), 600),
+        &mut BlackoutState::default(),
         &wait as WaitFn,
     );
 
@@ -505,6 +521,120 @@ fn stop_signal_during_wait_returns_stop() {
         reaction,
         AccountReaction::Stop,
         "a wait interrupted by the .stop signal must return AccountReaction::Stop",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// AC (FEAT-008): RerouteAndRetry — with difficulty-spillover enabled, a Claude
+// rate-limit records a provider blackout from the (unparseable here → fallback)
+// reset, resets the rate-limited task to `todo`, and SKIPS the wait. The
+// sequential (1-item) and wave (N-item) shapes compute the identical verdict.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn reroute_and_retry_records_blackout_and_skips_wait_both_shapes() {
+    disable_llm_extraction();
+    const NOW: u64 = 1_000;
+    const FALLBACK: u64 = 1800;
+    let rate = IterationOutcome::RateLimit;
+
+    // Sequential shape: one rate-limited item with no parseable reset token.
+    let (seq_temp, mut seq_conn) = setup_migrated_db();
+    insert_run(&seq_conn);
+    insert_in_progress_task(&seq_conn, "RP-RATE-1");
+    let seq_items = [OutputReactionItem {
+        task_id: Some("RP-RATE-1"),
+        outcome: &rate,
+        output: "rate limited but NO parseable reset token here",
+    }];
+    let mut seq_params = params(seq_temp.path(), 600);
+    seq_params.spillover_enabled = true;
+    seq_params.now_secs = NOW;
+    seq_params.blackout_fallback_secs = FALLBACK;
+    let mut seq_blackout = BlackoutState::default();
+    let seq_spy = WaitSpy::completing();
+    let seq_wait = seq_spy.closure();
+    let seq_reaction = react_to_outputs_inner(
+        &mut seq_conn,
+        &seq_items,
+        &seq_params,
+        &mut seq_blackout,
+        &seq_wait as WaitFn,
+    );
+
+    assert_eq!(
+        seq_reaction,
+        AccountReaction::RerouteAndRetry,
+        "a spillover-enabled rate-limit records a blackout and reroutes, never waiting",
+    );
+    assert_eq!(
+        seq_spy.calls.get(),
+        0,
+        "RerouteAndRetry must SKIP the wait entirely",
+    );
+    assert!(
+        seq_blackout.active(NOW).contains(&Provider::Claude),
+        "a Claude provider blackout must be recorded from the (fallback) reset",
+    );
+    assert_eq!(
+        task_status(&seq_conn, "RP-RATE-1").as_deref(),
+        Some("todo"),
+        "the rate-limited task is still reset to `todo` so it re-selects and reroutes",
+    );
+
+    // Wave shape: same rate-limited item plus a completed sibling. Must compute
+    // the IDENTICAL verdict and likewise skip the wait, leaving the done sibling.
+    let (wave_temp, mut wave_conn) = setup_migrated_db();
+    insert_run(&wave_conn);
+    insert_in_progress_task(&wave_conn, "RP-RATE-1");
+    insert_done_task(&wave_conn, "RP-DONE-2");
+    let done = IterationOutcome::Completed;
+    let wave_items = [
+        OutputReactionItem {
+            task_id: Some("RP-RATE-1"),
+            outcome: &rate,
+            output: "rate limited but NO parseable reset token here",
+        },
+        OutputReactionItem {
+            task_id: Some("RP-DONE-2"),
+            outcome: &done,
+            output: "<completed>RP-DONE-2</completed>",
+        },
+    ];
+    let mut wave_params = params(wave_temp.path(), 600);
+    wave_params.spillover_enabled = true;
+    wave_params.now_secs = NOW;
+    wave_params.blackout_fallback_secs = FALLBACK;
+    let mut wave_blackout = BlackoutState::default();
+    let wave_spy = WaitSpy::completing();
+    let wave_wait = wave_spy.closure();
+    let wave_reaction = react_to_outputs_inner(
+        &mut wave_conn,
+        &wave_items,
+        &wave_params,
+        &mut wave_blackout,
+        &wave_wait as WaitFn,
+    );
+
+    assert_eq!(
+        wave_reaction,
+        AccountReaction::RerouteAndRetry,
+        "the wave (N-item) shape must compute the SAME RerouteAndRetry verdict",
+    );
+    assert_eq!(
+        wave_spy.calls.get(),
+        0,
+        "the wave RerouteAndRetry must SKIP the wait too",
+    );
+    assert!(wave_blackout.active(NOW).contains(&Provider::Claude));
+    assert_eq!(
+        task_status(&wave_conn, "RP-DONE-2").as_deref(),
+        Some("done"),
+        "the completed sibling must remain `done` (reset filters on in_progress)",
+    );
+    assert_eq!(
+        task_status(&wave_conn, "RP-RATE-1").as_deref(),
+        Some("todo"),
     );
 }
 
@@ -620,7 +750,9 @@ fn harness_fixtures_are_production_shaped_and_setup_works() {
 // ===========================================================================
 
 use task_mgr::loop_engine::engine::IterationContext;
-use task_mgr::loop_engine::model::{HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL};
+use task_mgr::loop_engine::model::{
+    FABLE_MODEL, HAIKU_MODEL, ONE_M_SUFFIX, OPUS_MODEL, SONNET_MODEL,
+};
 use task_mgr::loop_engine::reactions::account::{
     AccountUsageGateParams, UsageGateFn, account_usage_gate_inner,
 };
@@ -1043,9 +1175,9 @@ fn pre_spawn_and_gate_harness_compiles_and_setup_works() {
 //   AC5  → known_bad_overflow_skipping_rung1_fails_the_downgrade_assertion (LIVE)
 // ===========================================================================
 
-use task_mgr::loop_engine::model::{OPUS_MODEL_1M, escalate_below_opus, to_1m_model};
+use task_mgr::loop_engine::model::{builtin_resolved_models, escalate_below_ceiling, to_1m_model};
 use task_mgr::loop_engine::overflow::{OverflowEvent, RecoveryAction, sanitize_id_for_filename};
-use task_mgr::loop_engine::project_config::{FallbackRunnerConfig, ProjectConfig};
+use task_mgr::loop_engine::project_config::{ModelsConfig, ProjectConfig};
 use task_mgr::loop_engine::prompt::PromptResult;
 use task_mgr::loop_engine::reactions::post_output::{HandleOverflowParams, handle_overflow};
 
@@ -1078,14 +1210,20 @@ fn read_overflow_events(base_dir: &Path) -> Vec<OverflowEvent> {
         .collect()
 }
 
-/// A `ProjectConfig` with the Grok fallback runner ENABLED — the precondition
-/// for rung 4 (`FallbackToProvider`) on the Claude → Grok direction.
+/// A `ProjectConfig` wiring the Claude → Grok cross-provider fallback via the
+/// provider-first surface (`providers.claude.fallback = "grok"`, grok enabled) —
+/// the precondition for rung 4 (`FallbackToProvider`) on the Claude → Grok
+/// direction.
 fn config_with_fallback_enabled() -> ProjectConfig {
+    let mut models = ModelsConfig::builtin_default();
+    if let Some(p) = models.providers.get_mut("grok") {
+        p.enabled = true;
+    }
+    if let Some(p) = models.providers.get_mut("claude") {
+        p.fallback = Some("grok".to_string());
+    }
     ProjectConfig {
-        fallback_runner: Some(FallbackRunnerConfig {
-            enabled: true,
-            ..FallbackRunnerConfig::default()
-        }),
+        models,
         ..ProjectConfig::default()
     }
 }
@@ -1181,7 +1319,7 @@ fn handle_overflow_rung_ladder_matches_pre_relocation() {
         );
         assert_eq!(
             action,
-            RecoveryAction::EscalateModel {
+            RecoveryAction::EscalateTier {
                 new_model: expected.to_string()
             },
             "rung 2: at the high effort floor, {model} must escalate to {expected}",
@@ -1193,7 +1331,7 @@ fn handle_overflow_rung_ladder_matches_pre_relocation() {
         );
     }
 
-    // Rung 3 — 1M-context escalation once at the Opus ceiling.
+    // Rung 3 — 1M-context escalation once at the Frontier (fable) ceiling.
     {
         let (tmp, mut conn) = setup_migrated_db();
         insert_run(&conn);
@@ -1204,7 +1342,7 @@ fn handle_overflow_rung_ladder_matches_pre_relocation() {
             &mut ctx,
             "OF-R3",
             Some("high"),
-            Some(OPUS_MODEL),
+            Some(FABLE_MODEL),
             1,
             tmp.path(),
             None,
@@ -1214,26 +1352,27 @@ fn handle_overflow_rung_ladder_matches_pre_relocation() {
         assert_eq!(
             action,
             RecoveryAction::To1mModel {
-                new_model: OPUS_MODEL_1M.to_string()
+                new_model: format!("{FABLE_MODEL}{ONE_M_SUFFIX}")
             },
-            "rung 3: opus must escalate to the 1M-context variant",
+            "rung 3: fable at the ceiling must escalate to the 1M-context variant",
         );
         assert_eq!(task_status(&conn, "OF-R3").as_deref(), Some("todo"));
     }
 
-    // Rung 5 — no recovery available (Opus[1M] at high effort, no fallback). The
+    // Rung 5 — no recovery available (Fable[1M] at high effort, no fallback). The
     // task is blocked, NOT reset to todo.
     {
         let (tmp, mut conn) = setup_migrated_db();
         insert_run(&conn);
         insert_task_with_model(&conn, "OF-R5", None);
         let mut ctx = IterationContext::new(10);
+        let fable_1m = format!("{FABLE_MODEL}{ONE_M_SUFFIX}");
         let action = run_handle_overflow(
             &mut conn,
             &mut ctx,
             "OF-R5",
             Some("high"),
-            Some(OPUS_MODEL_1M),
+            Some(&fable_1m),
             1,
             tmp.path(),
             None,
@@ -1243,7 +1382,7 @@ fn handle_overflow_rung_ladder_matches_pre_relocation() {
         assert_eq!(
             action,
             RecoveryAction::Blocked,
-            "rung 5: Opus[1M] at high effort with no fallback config has no recovery",
+            "rung 5: Fable[1M] at high effort with no fallback config has no recovery",
         );
         assert_eq!(
             task_status(&conn, "OF-R5").as_deref(),
@@ -1265,7 +1404,8 @@ fn handle_overflow_rung4_fallback_to_provider_when_enabled() {
     disable_llm_extraction();
     let (tmp, mut conn) = setup_migrated_db();
     insert_run(&conn);
-    insert_task_with_model(&conn, "OF-R4", Some(OPUS_MODEL_1M));
+    let fable_1m = format!("{FABLE_MODEL}{ONE_M_SUFFIX}");
+    insert_task_with_model(&conn, "OF-R4", Some(&fable_1m));
     let mut ctx = IterationContext::new(10);
 
     let action = run_handle_overflow(
@@ -1273,7 +1413,7 @@ fn handle_overflow_rung4_fallback_to_provider_when_enabled() {
         &mut ctx,
         "OF-R4",
         Some("high"),
-        Some(OPUS_MODEL_1M),
+        Some(&fable_1m),
         1,
         tmp.path(),
         None,
@@ -1562,7 +1702,7 @@ fn handle_overflow_emits_jsonl_event_with_core_fields() {
 // ---------------------------------------------------------------------------
 // AC5 (RUNS LIVE): known-bad discriminator. A stub overflow ladder that SKIPS
 // rung 1 (effort downgrade) jumps straight to model escalation, so on the
-// (xhigh, sonnet) input it yields EscalateModel{opus} instead of
+// (xhigh, sonnet) input it yields EscalateTier{opus} instead of
 // DowngradeEffort{high}. This proves the rung-1 assertion in
 // `handle_overflow_rung_ladder_matches_pre_relocation` actually discriminates:
 // a regression that drops the effort-downgrade rung is rejected.
@@ -1570,14 +1710,15 @@ fn handle_overflow_emits_jsonl_event_with_core_fields() {
 
 /// A deliberately-wrong ladder: ignores `effort` and never tries rung 1.
 fn naive_overflow_skipping_rung1(_effort: Option<&str>, model: Option<&str>) -> RecoveryAction {
-    if let Some(next) = escalate_below_opus(model) {
-        RecoveryAction::EscalateModel {
-            new_model: next.to_string(),
-        }
+    let resolved = builtin_resolved_models();
+    if let Some(next) = escalate_below_ceiling(
+        resolved,
+        task_mgr::loop_engine::model::Provider::Claude,
+        model,
+    ) {
+        RecoveryAction::EscalateTier { new_model: next }
     } else if let Some(m1m) = to_1m_model(model) {
-        RecoveryAction::To1mModel {
-            new_model: m1m.to_string(),
-        }
+        RecoveryAction::To1mModel { new_model: m1m }
     } else {
         RecoveryAction::Blocked
     }
@@ -1589,10 +1730,10 @@ fn known_bad_overflow_skipping_rung1_fails_the_downgrade_assertion() {
     let action = naive_overflow_skipping_rung1(Some("xhigh"), Some(SONNET_MODEL));
 
     // The real coordinator returns DowngradeEffort{high}; the rung-1-skipping
-    // stub returns EscalateModel{opus}, so it WOULD fail that assertion.
+    // stub returns EscalateTier{opus}, so it WOULD fail that assertion.
     assert_eq!(
         action,
-        RecoveryAction::EscalateModel {
+        RecoveryAction::EscalateTier {
             new_model: OPUS_MODEL.to_string()
         },
         "rung-1-skipping stub jumps to model escalation on xhigh effort",
