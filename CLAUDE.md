@@ -83,8 +83,10 @@ difficulty→model matrix for the primary, escalation cost note, and explicit
 `TASK_MGR_USE_API=1`; cache under `$XDG_CACHE_HOME/task-mgr/models-cache.json`
 (24h).
 
-**Picker**: still fires on `task-mgr init` (and the permanent shim) when no
-default resolves and TTY; never on `loop init` / `batch init`.
+**Picker** (anchor-tier, FR-009): fires on `task-mgr init` (and the permanent
+shim) when no `models` block is configured and stdin/stderr are TTYs — never in
+auto mode, never on `loop init` / `batch init`. Legacy-key configs are NOT
+auto-migrated; it prints the `models init --force-replace-legacy` hint and skips.
 
 Codex routes are config-explicit only (byIdPrefix / taskClasses with
 `provider:"codex"`); never inferred from a model string. Blackout channel
@@ -286,15 +288,20 @@ yourself.
 | `task-mgr decisions resolve` | Resolve a key decision by selecting an option |
 | `task-mgr decisions decline` | Decline a key decision (mark as not needed) |
 | `task-mgr decisions revert` | Revert a resolved or deferred decision back to pending |
-| `task-mgr models` | List Claude models and pin a default |
-| `task-mgr models list` | Print the available model IDs |
-| `task-mgr models set-default` | Pin a default model (user config by default, `--project` for project) |
-| `task-mgr models unset-default` | Clear the pinned default model |
-| `task-mgr models show` | Show the currently resolved default model and where it came from |
-| `task-mgr models set-review-model` | Set the reviewModel (routes CODE-REVIEW-*, MILESTONE-FINAL, REVIEW-* tasks) |
-| `task-mgr models unset-review-model` | Clear the reviewModel |
-| `task-mgr models set-fallback` | Set the fallbackRunner block (Grok overflow-fallback configuration) |
-| `task-mgr models unset-fallback` | Remove the fallbackRunner block entirely |
+| `task-mgr models` | Manage the provider-first `models` + `routing` config (tiers, anchor, routes) |
+| `task-mgr models init` | Write the FR-001 default `models`/`routing` config block |
+| `task-mgr models show` | Show the resolved routing table, anchor-derived mapping, and notes |
+| `task-mgr models list` | List the merged provider tier ladders (reverse lookup) |
+| `task-mgr models set-anchor` | Set the anchor capability tier (centers the difficulty window) |
+| `task-mgr models enable` | Enable a provider (probes its CLI binary BEFORE writing) |
+| `task-mgr models disable` | Disable a provider (never probes) |
+| `task-mgr models set-tier` | Pin a model to a provider's capability tier (omit MODEL to route with no model … |
+| `task-mgr models unset-tier` | Clear a provider tier override (the built-in default rung, if any, reapplies) |
+| `task-mgr models set-effort` | Set a provider's per-difficulty effort level (omit EFFORT for no flag) |
+| `task-mgr models set-fallback` | Set a provider's tier-preserving cross-provider fallback target |
+| `task-mgr models unset-fallback` | Remove a provider's fallback target |
+| `task-mgr models route` | Add or replace a routing.byIdPrefix forced route |
+| `task-mgr models unroute` | Remove a routing.byIdPrefix route |
 | `task-mgr current` | Show the currently resolved active PRD context (prefix, source, target path) |
 | `task-mgr enhance` | Manage the task-mgr-fenced block in CLAUDE.md / AGENTS.md |
 | `task-mgr enhance agents` | Write or update the marker-fenced workflow block in target files |
@@ -307,71 +314,41 @@ yourself.
 ### Codex runner (provider-only routing)
 
 The loop engine supports OpenAI Codex as a third `RunnerKind` reachable
-EXCLUSIVELY through `primaryRunner` entries with `provider: "codex"`.
-Codex is NEVER inferred from a model string. The merged path adds three
-load-bearing defenses: (1) `preflight_validate_and_probe` runs from BOTH
-`task-mgr loop run` AND `task-mgr batch run` to fail fast on a missing
-`codex` binary when any route requires it; (2) `protected_state` snapshots
-orchestrator-owned files pre-spawn and verify-and-restore post-spawn for
+EXCLUSIVELY through `routing` entries (`byIdPrefix` / `taskClasses`) with
+`provider: "codex"` plus an enabled `models.providers.codex` block. Codex
+is NEVER inferred from a model string (token-equality `provider_for_model`
+never yields Codex). Three load-bearing defenses: (1)
+`preflight_validate_and_probe` runs from BOTH `task-mgr loop run` AND
+`task-mgr batch run`, probing every enabled provider's CLI binary to fail
+fast before the first iteration; (2) `protected_state` snapshots
+orchestrator-owned files pre-spawn and verify-and-restores post-spawn for
 every Codex iteration (sequential + per-slot + wave); (3)
 `CodexAuthFailure` is excluded from `handle_task_failure` at both callers
 so an auth lapse never pushes healthy tasks toward auto-block.
 
-Opt-in Codex→Claude RuntimeError fallback (separate from the Claude/Grok
-overflow rung-4 pivot):
+Codex routes provider-only when its tier maps to `null` (no `-m` flag);
+its effort flows as `-c model_reasoning_effort=<level>` BEFORE `exec`,
+capped at `high`. The legacy `primaryRunner` block (including
+`runtimeErrorFallback` / `claudeFallbackModel`) is hard-rejected at
+preflight — migrate via `task-mgr models init`. See
+`src/loop_engine/CLAUDE.md` "Codex provider integration" and "models +
+routing config and capability tiers (FR-001)".
 
-```json
-{
-  "primaryRunner": {
-    "claudeFallbackModel": "<claude model id>",
-    "byIdPrefix": {
-      "FEAT-": { "provider": "codex", "runtimeErrorFallback": true }
-    }
-  }
-}
-```
+### Provider fallback (rung-4 pivot)
 
-When `runtimeErrorFallback: true` AND consecutive RuntimeErrors reach
-`primaryRunner.runtimeErrorThreshold`, the task is promoted to Claude
-(`runner_overrides[id] = Claude`, never Codex) — once per loop run.
-Field defaults: `runtimeErrorFallback=false`; absent → no Codex→Claude
-promotion. See `src/loop_engine/CLAUDE.md` "Codex provider integration"
-for the full design notes (schema, auth detection, protected-state guard,
-binary probe contract, prohibited outcomes).
-
-### Fallback runner config (Grok)
-
-The loop engine supports a Grok CLI fallback that promotes a stuck task off
-Claude after the overflow ladder is exhausted (rung 4) or after repeated
-`RuntimeError` crashes at the Opus ceiling. Disabled by default; opt-in via
-`.task-mgr/config.json`:
-
-```json
-{
-  "version": 1,
-  "fallbackRunner": {
-    "enabled": true,
-    "provider": "grok",
-    "model": "grok-build",
-    "cliBinary": "/usr/local/bin/grok",
-    "runtimeErrorThreshold": 2
-  }
-}
-```
-
-Field defaults: `enabled=false`, `provider="grok"`, `model="grok-build"`,
-`cliBinary=null` (resolves bare `grok` on PATH), `runtimeErrorThreshold=2`.
-With the block absent or `enabled:false`, loop behavior is byte-identical
-to the pure-Claude 4-rung overflow ladder ending in `Blocked`.
-
-`task-mgr loop run` performs a startup binary check: when `enabled=true`,
-the configured `cliBinary` (or bare `grok` on PATH) must resolve to an
-existing file or the loop exits with a helpful error before the first
-iteration. Subsystem design notes are in
+Cross-provider fallback for stuck tasks is configured per provider via
+`models.providers.<source>.fallback` (`task-mgr models set-fallback claude
+grok`): when the overflow ladder exhausts on the source provider, the task
+pivots tier-preserving to the (different + enabled) target provider — at
+most once per run via `runner_overrides` / `promote_once`. The legacy
+`fallbackRunner` block is hard-rejected at preflight; with no fallback
+target configured the ladder ends in `Blocked`, byte-identical to the
+pure-Claude behavior. Quota blackouts use a SEPARATE ephemeral channel
+(`provider_blackouts`) that never touches `runner_overrides`. Subsystem
+design notes are in
 [`src/loop_engine/CLAUDE.md`](src/loop_engine/CLAUDE.md) — see "Overflow
-recovery and diagnostics" for the 5-rung ladder, "Operator escape valve" for
-the override-invalidation contract, and "Provider routing" for the
-token-equality classification algorithm.
+recovery and diagnostics", "Blackout channel contract (FEAT-008)", and
+"models + routing config and capability tiers (FR-001)".
 
 ## LLM coding guidelines
 

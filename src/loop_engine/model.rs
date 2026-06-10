@@ -300,33 +300,6 @@ fn normalize(s: Option<&str>) -> Option<&str> {
     })
 }
 
-/// Resolve the model for an iteration by selecting the highest capability-tier
-/// model from a cluster of tasks.
-///
-/// When multiple tasks run in the same iteration, the highest-tier model wins
-/// so that all tasks get adequate capability. Tier membership is the new
-/// **config exact-match** [`ResolvedModelsConfig::tier_of`] (keyed by the
-/// model's provider via [`provider_for_model`]), NOT the dead substring tier
-/// classification it replaced. The comparison key is `Option<CapabilityTier>`, so a model
-/// absent from the config (`tier_of == None`) ranks BELOW any configured rung
-/// (`None < Some(Cheapest)`), and a configured `Cheapest` rung beats it.
-///
-/// `max_by_key` returns the **last** element when keys are tied, so the model
-/// from the last task in the slice wins among equal tiers — the historical
-/// tie-break, preserved.
-///
-/// Returns `None` if the slice is empty or all entries are `None`.
-pub fn resolve_iteration_model(
-    models: &ResolvedModelsConfig,
-    task_models: &[Option<String>],
-) -> Option<String> {
-    task_models
-        .iter()
-        .filter_map(|m| m.as_deref())
-        .max_by_key(|m| models.tier_of(provider_for_model(Some(m)), m))
-        .map(String::from)
-}
-
 /// Step one tier down on the effort ladder.
 ///
 /// Currently only `xhigh → high` is defined — `high` is the floor for overflow
@@ -1084,147 +1057,11 @@ fn finalize_plan(
 mod tests {
     use super::*;
 
-    // ============ resolve_iteration_model tests ============
-
-    /// Default provider-first config (Claude full ladder enabled) for tier
-    /// reverse-lookup in the iteration-model + plan tests:
-    /// haiku→Cheapest, sonnet→CostEfficient, opus→Standard, fable→Frontier.
-    fn default_models_cfg() -> ResolvedModelsConfig {
-        resolve_models_config(&ModelsConfig::builtin_default(), &RoutingConfig::default())
-    }
-
     #[test]
-    fn test_resolve_iteration_model_highest_tier_wins() {
-        let models = vec![
-            Some(HAIKU_MODEL.to_string()),
-            Some(OPUS_MODEL.to_string()),
-            Some(SONNET_MODEL.to_string()),
-        ];
-        let result = resolve_iteration_model(&default_models_cfg(), &models);
-        assert_eq!(result, Some(OPUS_MODEL.to_string()));
-    }
-
-    #[test]
-    fn test_resolve_iteration_model_all_none() {
-        let models: Vec<Option<String>> = vec![None, None, None];
-        let result = resolve_iteration_model(&default_models_cfg(), &models);
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn test_resolve_iteration_model_empty_list() {
-        let models: Vec<Option<String>> = vec![];
-        let result = resolve_iteration_model(&default_models_cfg(), &models);
-        assert_eq!(result, None);
-    }
-
-    /// Empty touchesFiles yields a single-task cluster.
-    #[test]
-    fn test_resolve_iteration_model_single_task_cluster() {
-        let models = vec![Some(SONNET_MODEL.to_string())];
-        let result = resolve_iteration_model(&default_models_cfg(), &models);
-        assert_eq!(result, Some(SONNET_MODEL.to_string()));
-    }
-
-    #[test]
-    fn test_resolve_iteration_model_mixed_none_and_some() {
-        let models = vec![None, Some(HAIKU_MODEL.to_string()), None];
-        let result = resolve_iteration_model(&default_models_cfg(), &models);
-        assert_eq!(result, Some(HAIKU_MODEL.to_string()));
-    }
-
-    #[test]
-    fn test_resolve_iteration_model_same_tier_returns_consistent_result() {
-        let models = vec![
-            Some(SONNET_MODEL.to_string()),
-            Some(SONNET_MODEL.to_string()),
-        ];
-        let result = resolve_iteration_model(&default_models_cfg(), &models);
-        assert_eq!(result, Some(SONNET_MODEL.to_string()));
-    }
-
-    #[test]
-    fn test_resolve_iteration_model_sonnet_beats_haiku() {
-        let models = vec![
-            Some(HAIKU_MODEL.to_string()),
-            Some(SONNET_MODEL.to_string()),
-        ];
-        let result = resolve_iteration_model(&default_models_cfg(), &models);
-        assert_eq!(result, Some(SONNET_MODEL.to_string()));
-    }
-
-    /// AC: synergy cluster with 3+ overlapping tasks at different tiers.
-    /// Opus in position 1 (not last) still wins.
-    #[test]
-    fn test_resolve_iteration_model_three_plus_tasks_opus_not_last() {
-        let models = vec![
-            Some(SONNET_MODEL.to_string()),
-            Some(OPUS_MODEL.to_string()),
-            Some(HAIKU_MODEL.to_string()),
-            Some(SONNET_MODEL.to_string()),
-        ];
-        let result = resolve_iteration_model(&default_models_cfg(), &models);
-        assert_eq!(result, Some(OPUS_MODEL.to_string()));
-    }
-
-    /// AC: partial file overlap—some tasks have models, some are None.
-    /// Only the non-None entries participate in tier selection.
-    #[test]
-    fn test_resolve_iteration_model_partial_overlap_with_none() {
-        let models = vec![
-            None,
-            Some(HAIKU_MODEL.to_string()),
-            None,
-            Some(SONNET_MODEL.to_string()),
-            None,
-        ];
-        let result = resolve_iteration_model(&default_models_cfg(), &models);
-        assert_eq!(
-            result,
-            Some(SONNET_MODEL.to_string()),
-            "sonnet should win among partial-overlap cluster"
-        );
-    }
-
-    /// 3+ tasks all at the same tier—should return one of them.
-    #[test]
-    fn test_resolve_iteration_model_all_same_tier() {
-        let models = vec![
-            Some(HAIKU_MODEL.to_string()),
-            Some(HAIKU_MODEL.to_string()),
-            Some(HAIKU_MODEL.to_string()),
-        ];
-        let result = resolve_iteration_model(&default_models_cfg(), &models);
-        assert_eq!(result, Some(HAIKU_MODEL.to_string()));
-    }
-
-    /// Mix of known tiers and unknown model strings.
-    /// Unknown strings are off-ladder (`tier_of == None`, lowest), so the known tier wins.
-    #[test]
-    fn test_resolve_iteration_model_unknown_mixed_with_known() {
-        let models = vec![
-            Some("gpt-4-turbo".to_string()),
-            Some(HAIKU_MODEL.to_string()),
-            Some("llama-3".to_string()),
-        ];
-        let result = resolve_iteration_model(&default_models_cfg(), &models);
-        assert_eq!(
-            result,
-            Some(HAIKU_MODEL.to_string()),
-            "known tier (haiku) should beat unknown tiers"
-        );
-    }
-
-    /// All entries are unknown model strings—one of them should be returned.
-    #[test]
-    fn test_resolve_iteration_model_all_unknown() {
-        let models = vec![Some("gpt-4".to_string()), Some("llama-3".to_string())];
-        let result = resolve_iteration_model(&default_models_cfg(), &models);
-        // All are off-ladder (tier_of == None); max_by_key picks the last tied element
-        assert!(
-            result.is_some(),
-            "should return some model even if all are unknown tier"
-        );
+    fn test_id_body_prefix_matching_keeps_dash_segment_boundary() {
+        assert!(id_body_matches_prefix("REVIEW-001", "REVIEW"));
+        assert!(id_body_matches_prefix("MILESTONE-FINAL", "MILESTONE-FINAL"));
+        assert!(!id_body_matches_prefix("REVIEWER-001", "REVIEW"));
     }
 
     // ============ escalate_tier tests ============

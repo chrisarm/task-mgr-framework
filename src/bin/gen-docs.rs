@@ -134,7 +134,8 @@ fn repo_root() -> Result<PathBuf, String> {
 fn render_block(model_rs: &Path) -> Result<String, String> {
     let source = fs::read_to_string(model_rs).map_err(|e| e.to_string())?;
 
-    let model_re = Regex::new(r#"pub const (\w+): &str = "([^"]+)";"#).unwrap();
+    let model_re = Regex::new(r#"pub const (\w+): &str = "([^"]+)";"#)
+        .expect("static model-const pattern is valid");
     let mut models: Vec<(String, String)> = model_re
         .captures_iter(&source)
         .map(|c| (c[1].to_string(), c[2].to_string()))
@@ -161,17 +162,17 @@ fn render_block(model_rs: &Path) -> Result<String, String> {
     let effort_re = Regex::new(
         r"pub const EFFORT_FOR_DIFFICULTY:\s*&\[\(&str,\s*&str\)\]\s*=\s*&\[(?P<body>[^\]]+)\]",
     )
-    .unwrap();
+    .expect("static EFFORT_FOR_DIFFICULTY pattern is valid");
     let body = effort_re
         .captures(&source)
         .ok_or_else(|| "could not find EFFORT_FOR_DIFFICULTY constant".to_string())?
         .name("body")
-        .unwrap()
+        .expect("pattern defines the `body` group")
         .as_str();
     // Row parser supports both "literal" values and bare IDENT (e.g. HAIKU_MODEL)
     // so tier tables can stay DRY by referencing the *_MODEL consts.
-    let row_re =
-        Regex::new(r#"\("([^"]+)",\s*(?:"([^"]*)"|"([^"]+)"|([A-Za-z_][A-Za-z0-9_]*))\)"#).unwrap();
+    let row_re = Regex::new(r#"\("([^"]+)",\s*(?:"([^"]*)"|"([^"]+)"|([A-Za-z_][A-Za-z0-9_]*))\)"#)
+        .expect("static row pattern is valid");
     // Helper: given a row match, return (key, value) — value may come from quoted group or bare ident group.
     let extract_kv = |cap: &regex::Captures| -> (String, String) {
         let k = cap[1].to_string();
@@ -194,12 +195,12 @@ fn render_block(model_rs: &Path) -> Result<String, String> {
     let codex_effort_re = Regex::new(
         r"pub const CODEX_EFFORT_FOR_DIFFICULTY:\s*&\[\(&str,\s*&str\)\]\s*=\s*&\[(?P<body>[^\]]+)\]",
     )
-    .unwrap();
+    .expect("static CODEX_EFFORT_FOR_DIFFICULTY pattern is valid");
     let codex_body = codex_effort_re
         .captures(&source)
         .ok_or_else(|| "could not find CODEX_EFFORT_FOR_DIFFICULTY constant".to_string())?
         .name("body")
-        .unwrap()
+        .expect("pattern defines the `body` group")
         .as_str();
     let codex_effort: Vec<(String, String)> = row_re
         .captures_iter(codex_body)
@@ -213,12 +214,12 @@ fn render_block(model_rs: &Path) -> Result<String, String> {
             r"pub const {}:\s*&\[\(&str,\s*&str\)\]\s*=\s*&\[(?P<body>[^\]]+)\]",
             const_name
         ))
-        .unwrap();
+        .expect("tier-table pattern with const-name interpolation is valid");
         let body = re
             .captures(&source)
             .ok_or_else(|| format!("could not find {} constant", const_name))?
             .name("body")
-            .unwrap()
+            .expect("pattern defines the `body` group")
             .as_str();
         Ok(row_re.captures_iter(body).map(|c| extract_kv(&c)).collect())
     };

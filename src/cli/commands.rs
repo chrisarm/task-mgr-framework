@@ -1165,7 +1165,7 @@ GENERATED MAN PAGES:
         action: DecisionAction,
     },
 
-    /// List Claude models and pin a default
+    /// Manage the provider-first `models` + `routing` config (tiers, anchor, routes)
     Models {
         #[command(subcommand)]
         action: ModelsAction,
