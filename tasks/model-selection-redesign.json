@@ -906,7 +906,7 @@
       "estimatedEffort": "medium",
       "id": "INT-001",
       "modifiesBehavior": false,
-      "passes": false,
+      "passes": true,
       "priority": 55,
       "qualityDimensions": [
         "Verification by reading production wiring, not by trusting tests alone"
@@ -931,7 +931,7 @@
       "estimatedEffort": "medium",
       "id": "INT-002",
       "modifiesBehavior": false,
-      "passes": false,
+      "passes": true,
       "priority": 56,
       "qualityDimensions": [
         "Channel-discipline verification is structural (grep + read), not inferred from test outcomes"
@@ -956,7 +956,7 @@
       "estimatedEffort": "low",
       "id": "INT-003",
       "modifiesBehavior": false,
-      "passes": false,
+      "passes": true,
       "priority": 57,
       "qualityDimensions": [
         "Round-trip verified with real export/import, not schema inspection alone"
@@ -1032,7 +1032,11 @@
       ],
       "dependsOn": [
         "VERIFY-001",
-        "WIRE-FIX-001"
+        "WIRE-FIX-001",
+        "REFACTOR-006",
+        "REFACTOR-007",
+        "REFACTOR-008",
+        "REFACTOR-009"
       ],
       "description": "Final full gate. Verify ALL stories pass, no spawned tasks remain open, full unscoped suite + lint + fmt + gen-docs --check green, branch merge-ready per mergeStrategy.",
       "estimatedEffort": "high",
@@ -1057,7 +1061,7 @@
       "description": "resolve_execution_plan correctly computes ExecutionPlan.effort = models.effort_for(final_provider, difficulty) (per-provider config table) but both prompt builders drop it. Both builders independently recompute base effort from the static EFFORT_FOR_DIFFICULTY table via effort_for_difficulty(). For the default config the tables match, but custom per-provider effort tables (e.g. providers.grok.effort.high = medium) are silently ignored. Fix: carry plan.effort (Option<String>) through PromptResult and SlotPromptBundle instead of (or as the initializer for) the static effort_for_difficulty fallback. Requires PromptResult::cluster_effort type change from Option<&'static str> to Option<String> and SlotPromptBundle to carry computed effort instead of raw difficulty (or in addition to it). Both dispatch sites (iteration.rs:456, slot.rs:148) must prefer plan.effort over the static fallback.",
       "estimatedEffort": "medium",
       "id": "WIRE-FIX-001",
-      "passes": false,
+      "passes": true,
       "priority": 56,
       "title": "Wire ExecutionPlan.effort through prompt builders to runner argv",
       "touchesFiles": [
@@ -1065,6 +1069,96 @@
         "src/loop_engine/prompt/slot.rs",
         "src/loop_engine/iteration.rs",
         "src/loop_engine/slot.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Key decision (migrate vs delete) resolved and recorded before implementation",
+        "No production code path remains gated on a config value that preflight unconditionally rejects",
+        "If delete: ProjectConfig carries no always-None legacy fields; test-only fns removed with their tests; six-signature threading pruned",
+        "If migrate: RuntimeError promotion reachable via the models/routing surface with production-shaped fixture tests (FR-001 JSON schema)",
+        "src/loop_engine/CLAUDE.md sections describing primaryRunner/fallbackRunner-driven RuntimeError fallback rewritten to match the chosen reality",
+        "Full unscoped cargo test green (deletions can strand test files)"
+      ],
+      "description": "Preflight hard-rejects primaryRunner/fallbackRunner (LEGACY_MODEL_KEYS, project_config.rs:412; reject_legacy_model_config called from main.rs:1130 and batch.rs:508), so ProjectConfig.primary_runner/.fallback_runner are always None at loop time. The three cross-provider RuntimeError promotion branches in recovery.rs (Claude->Grok, Grok->Claude, Codex->Claude maybe_provider_runtime_fallback) can therefore never fire in production; tests/runtime_error_fallback.rs, tests/primary_runner_fallback.rs, tests/wave_runtime_error_fallback.rs stay green only by constructing the legacy structs directly. The overflow rung-4 pivot WAS migrated to providers.<source>.fallback; the RuntimeError path was not. Resolve the recorded key decision: (A) re-home the promotion on the provider-first surface (per-provider runtimeErrorThreshold, opt-in route flag, target via ResolvedModelsConfig::fallback_provider), or (B) delete the dead machinery. Dead inventory if deleting: promotion arms in escalate_task_model_if_needed_inner + maybe_provider_runtime_fallback gates; PrimaryRunnerConfig/FallbackRunnerConfig/RunnerSpec types; primary_runner_match (model.rs); validate_runner_routing_config and write_default_model (test-only callers); ProjectConfig fields default_model/review_model/primary_runner/fallback_runner; check_fallback_runner_binary/check_grok_review_binary; dead prompt-builder params primary_runner/project_default_model/user_default_model threaded through six signatures; the vacuous legacy tests. Keep the user-config defaultModel deprecation warning. The same-provider Claude tier escalation (recovery.rs:245) is live and must be preserved either way.",
+      "estimatedEffort": "high",
+      "id": "REFACTOR-006",
+      "notes": "Found by REFACTOR-REVIEW-FINAL (own analysis + rust-python-code-reviewer agent, SUBSTANTIVE #1). The rustdoc at recovery.rs:412 already flags the params as retained-for-a-follow-up; this is that follow-up plus the migrate-or-delete decision. promote_once / deferred-apply / invalidate_stale_overrides stay UNTOUCHED regardless of branch.",
+      "passes": false,
+      "priority": 72,
+      "title": "RuntimeError cross-provider promotion: migrate to provider-first config or delete (unreachable dead code post-hard-break)",
+      "touchesFiles": [
+        "src/loop_engine/recovery.rs",
+        "src/loop_engine/project_config.rs",
+        "src/loop_engine/model.rs",
+        "src/loop_engine/orchestrator.rs",
+        "src/loop_engine/wave_scheduler.rs",
+        "src/loop_engine/iteration.rs",
+        "src/loop_engine/prompt/sequential.rs",
+        "src/loop_engine/prompt/slot.rs",
+        "src/loop_engine/CLAUDE.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "escalate_tier/tier_of calls in recovery.rs, reactions/pre_spawn.rs, and prompt_sections/escalation.rs receive the operator-resolved config, not builtin_resolved_models()",
+        "Remaining production builtin_resolved_models() callers are genuinely config-independent surfaces only (models CLI offline display, picker ensure_default)",
+        "Regression test with a production-shaped custom Claude tier map: crash escalation writes a model from the operator ladder, not the builtin ladder",
+        "Default-config behavior byte-identical (existing escalation/recovery tests pass unchanged)"
+      ],
+      "dependsOn": [
+        "REFACTOR-006"
+      ],
+      "description": "The spawn site (resolve_execution_plan via both prompt builders) and the overflow ladder (post_output.rs:193) resolve the OPERATOR's config via resolve_models_config(&project_config.models, &project_config.routing) — but three live paths walk builtin_resolved_models() instead: (1) consecutive-failure escalation escalate_task_model_if_needed_inner (recovery.rs:248, writes tasks.model), (2) crash-escalation suggestion crash_escalated_model (reactions/pre_spawn.rs:173), (3) the at-ceiling check in build_escalation_section (prompt_sections/escalation.rs:52, prompt-text only). The derivation FUNCTION is single-homed (escalate_tier/tier_of in model.rs) but the config INPUT diverges — the exact FIX-001 divergence class the section-2.6 modularity rule guards: an operator who remaps Claude tiers (custom ladder, null rungs) gets recovery escalations onto models their config never defined. The acknowledged-tech-debt comment at recovery.rs:241 (call sites predate the provider-first config) marks the seam. Callers (orchestrator/wave_scheduler/iteration) already hold project_config; thread the resolved config through.",
+      "estimatedEffort": "medium",
+      "id": "REFACTOR-007",
+      "notes": "Found by REFACTOR-REVIEW-FINAL. Sequenced after REFACTOR-006 because both rework recovery.rs signatures — if 006 chooses delete, fewer signatures need the new parameter. anchored_tier/normalize_difficulty single-homing is confirmed intact; this task only fixes the config-input divergence.",
+      "passes": false,
+      "priority": 74,
+      "title": "Thread operator-resolved ModelsConfig into recovery/pre_spawn crash escalation (replace builtin_resolved_models at live sites)",
+      "touchesFiles": [
+        "src/loop_engine/recovery.rs",
+        "src/loop_engine/reactions/pre_spawn.rs",
+        "src/loop_engine/prompt_sections/escalation.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "One source of truth for default tier->model assignments: builders derive from the tables, or an equality test pins the two representations",
+        "No model-id literal (grok-build included) outside src/loop_engine/model.rs in non-test production code",
+        "tests/no_hardcoded_models.rs catches grok model-id literals",
+        "cargo run --bin gen-docs -- --check passes"
+      ],
+      "description": "CLAUDE/GROK/CODEX_DEFAULT_TIER_MODELS (model.rs:228-235, consumed by gen-docs) restate the tier->model assignments that default_claude_provider/default_grok_provider/default_codex_provider build at runtime in project_config.rs:290-328 — two homes with no drift guard, so a rung added to one silently desyncs models-list/gen-docs documentation from actual routing. Additionally the \"grok-build\" literal at project_config.rs:310 (and the dead default_fallback_model at :974) escapes tests/no_hardcoded_models.rs, whose regex only matches claude-(opus|sonnet|haiku|fable) ids. Make the runtime builders consume the *_DEFAULT_TIER_MODELS tables (preferred) or pin table<->builder equality in a test, and extend the no_hardcoded_models guard to grok model ids.",
+      "estimatedEffort": "low",
+      "id": "REFACTOR-008",
+      "notes": "Found by REFACTOR-REVIEW-FINAL (reviewer agent Warnings #2+#3, merged — same SSoT concern). overflow.rs grok-build hits are #[cfg(test)] code, out of scope.",
+      "passes": false,
+      "priority": 76,
+      "title": "Single-source default tier tables: derive default_*_provider from *_DEFAULT_TIER_MODELS and widen no_hardcoded_models to grok ids",
+      "touchesFiles": [
+        "src/loop_engine/model.rs",
+        "src/loop_engine/project_config.rs",
+        "tests/no_hardcoded_models.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "The hint-drop rule is expressed once (shared helper called by both paths) OR a parity test fails if either path changes its handling of the model-widening case",
+        "Codex route with empty model still carries provider_hint through to dispatch in BOTH paths (current wave behavior preserved; verify sequential against it)",
+        "Existing reaction_parity, prompt_slot, and provider_routing tests green"
+      ],
+      "description": "Sequential (iteration.rs:478) drops the spawn provider_hint whenever effective_model != prompt_result.resolved_model; wave (wave_scheduler.rs:836-848) deliberately KEEPS it when effective_model widens to default_model (the Codex provider:codex/model-empty case) and drops only on the crash-escalation/review-routing rewrites. The asymmetry is reasoned and commented, but it lives OUTSIDE the reaction_parity harness (which pins resolve_task_execution, not the post-plan hint handling), so a future edit to either site can silently diverge the paths — the parity-divergence bug class the reactions framework exists to prevent. Extract a shared helper (e.g. final_provider_hint(plan_provider, effective_model, resolved_model, default_model) in reactions or model.rs) used by both dispatch sites, or add an explicit parity test covering the widening case so divergence fails at test time.",
+      "estimatedEffort": "low",
+      "id": "REFACTOR-009",
+      "notes": "Found by REFACTOR-REVIEW-FINAL (reviewer agent Warning #1). Investigate whether the sequential blanket-drop is actually wrong for the widening case (a latent bug) before choosing helper shape — if sequential drops a hint wave keeps, a Codex task could dispatch to Claude in sequential mode only.",
+      "passes": false,
+      "priority": 78,
+      "title": "Share the post-plan provider_hint drop rule between sequential and wave paths (or pin the widening case in reaction_parity)",
+      "touchesFiles": [
+        "src/loop_engine/iteration.rs",
+        "src/loop_engine/wave_scheduler.rs",
+        "tests/reaction_parity.rs"
       ]
     }
   ],

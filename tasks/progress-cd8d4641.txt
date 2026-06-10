@@ -142,3 +142,40 @@ Root cause: `resolve_execution_plan` correctly computed `ExecutionPlan.effort = 
 **Gate:** `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check` clean. `cargo test --lib loop_engine::` 1945/0. Integration: iteration_pipeline_parity, reaction_parity, prompt_slot, overflow_per_slot, iteration_result_conversation, grok_to_claude_fallback all green.
 
 ---
+## 2026-06-09 - cd8d4641-INT-003
+
+### Integration trace: completion result → provider stamping → DB columns → export round-trip
+
+**Trace verified:**
+1. Single home: `iteration_pipeline.rs:474-498` — stamps both `tasks.completed_by_provider` and `run_tasks.provider/model` in the `task_marked_done && effective_runner.is_some()` arm. Fires for sequential AND wave completions (both call `process_iteration_output`).
+2. Grep-verified: no other writers of `completed_by_provider` or `run_tasks.provider`.
+3. TryFrom<Row> hydration: `models/task.rs:379` uses `.ok().flatten()` — graceful for NULL historical rows.
+4. Export gap found and fixed: `ExportedUserStory` was missing `completed_by_provider`. Added field to struct, SQL SELECT, tuple, and struct construction in `export/prd.rs`.
+5. prd_metadata.default_model: already exported correctly via `load_prd_metadata` → `ExportedPrd.model`.
+
+**Tests added:** 3 new tests in `export/tests.rs` covering absent-when-None, present-when-stamped, and full DB round-trip.
+
+---
+## 2026-06-10 - cd8d4641-REFACTOR-REVIEW-FINAL
+
+### Final refactoring review: full-context pass over all new/changed code
+
+Reviewed the full PRD diff (main...HEAD: 98 files, ~11.5k insertions; 48 src files) — own targeted architecture pass + rust-python-code-reviewer agent broad pass (per task notes).
+
+**Acceptance-criteria verdicts:**
+1. **Single anchor/tier derivation — PASS (function level), with one input-divergence finding.** `anchored_tier`/`difficulty_offset`/`normalize_difficulty`/`escalate_tier`/`tier_of` live only in model.rs; spawn sites (prompt/sequential.rs:440, prompt/slot.rs:361), pre_spawn (reactions/pre_spawn.rs:315), the overflow ladder, and the `models show` matrix all call them. BUT recovery.rs:248, pre_spawn.rs:173, and escalation.rs:52 pass `builtin_resolved_models()` while spawn + overflow pass the OPERATOR-resolved config → REFACTOR-007.
+2. **No duplicated sequential/wave precedence — PASS.** `resolve_execution_plan` is the single spawn-side decision site (rung order pinned by tests/precedence_matrix.rs); `resolve_effective_runner` the single dispatch discriminant; effort dispatch is a documented 2-line mirror at both sites (WIRE-FIX-001 shape). One reasoned, commented asymmetry in post-plan provider_hint dropping → REFACTOR-009 (helper or parity pin).
+3. **Config types / error strings — FAIL on dead legacy plumbing → REFACTOR-006.** Preflight hard-rejects primaryRunner/fallbackRunner (LEGACY_MODEL_KEYS), so ProjectConfig.{default_model,review_model,primary_runner,fallback_runner} are always None at loop time; all three cross-provider RuntimeError promotion branches in recovery.rs are UNREACHABLE in production (tests construct the legacy structs directly). validate_runner_routing_config + write_default_model have test-only callers; prompt builders carry dead primary_runner/project_default_model/user_default_model params. Error strings PASS: every validate_models_config message names the key path + accepted set; legacy tier aliases (opus/sonnet/haiku) rejected with the accepted set named; handlers funnel through the CONFIG ERROR voice.
+4. **BlackoutState isolation — PASS** (re-confirmed by agent: no serde/DB, zero runner_overrides cross-touches; INT-002 trace + `blackout_reroute_leaves_runner_overrides_untouched` still hold). Rung constants readable; lifecycle-verb discipline clean (the one raw status UPDATE in the diff is test setup in sequential.rs:3079); ui:: vs tracing clean; no production unwrap(); provider token-equality / tier exact-match confirmed.
+
+**Spawned (all --depended-on-by MILESTONE-FINAL):**
+- REFACTOR-006 (pri 72, high): RuntimeError cross-provider promotion migrate-or-delete — unreachable post-hard-break; <key-decision> emitted (migrate to provider-first surface vs delete).
+- REFACTOR-007 (pri 74, medium, dependsOn 006): thread operator-resolved ModelsConfig into recovery/pre_spawn/escalation-section builtin_resolved_models() sites.
+- REFACTOR-008 (pri 76, low): single-source *_DEFAULT_TIER_MODELS vs default_*_provider builders; grok-build literal (project_config.rs:310) escapes no_hardcoded_models — widen guard.
+- REFACTOR-009 (pri 78, low): share/pin the post-plan provider_hint drop rule (sequential blanket-drop vs wave keep-on-widening; possible latent sequential bug for Codex empty-model routes — investigate first).
+
+**Fixed inline:** src/loop_engine/CLAUDE.md routing-precedence list was stale — review-class force was listed as its own rung ABOVE byIdPrefix, contradicting code + the pinning test (precedence_matrix::byidprefix_route_beats_review_class_force). Folded the review force into the taskClasses rung with the test reference.
+
+No Rust code changed this iteration (doc + task adds only) — quality gate not applicable.
+
+---

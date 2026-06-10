@@ -106,11 +106,10 @@ Implemented in `resolve_execution_plan` (the single decision site; `ExecutionPla
 carries final provider/tier/effort for prompt + runner dispatch):
 
 1. Explicit task `"model"` (from DB / prd_default) — wins, bypasses all routing.
-2. Review class (`is_frontier_class` after 8-hex prefix strip: CODE-REVIEW-*, MILESTONE-FINAL, REVIEW-*; REFACTOR-REVIEW-* excluded). Built-in force to Frontier tier; never blackout-eligible; not redefinable via config.
-3. `routing.byIdPrefix` (dash-boundary token match on ID body post-prefix-strip). Optional forced tier; otherwise anchor window for difficulty.
-4. `routing.taskClasses` (implementation/planning/review keys). Review forces frontier built-in. `providerPreference` + `byDifficulty` can select provider; falls back to anchor window tier if no forceTier.
-5. QUOTA_BLACKOUT reroute (default-path tasks only): if the would-be provider is blacked out *and* task is spillover-eligible (difficulty ≤ `spillover.maxDifficulty` or max unset), tier-preserving reroute to first enabled non-blacked provider. Beats plain anchor window.
-6. ANCHOR_WINDOW (floor): `models.primaryProvider` + `anchored_tier(anchor, difficulty)`.
+2. `routing.byIdPrefix` (dash-boundary token match on ID body post-prefix-strip). Optional forced tier; otherwise anchor window for difficulty. Beats the built-in review→frontier force (pinned by `precedence_matrix::byidprefix_route_beats_review_class_force`).
+3. `routing.taskClasses` (implementation/planning/review keys). The review class (`is_frontier_class` after 8-hex prefix strip: CODE-REVIEW-*, MILESTONE-FINAL, REVIEW-*; REFACTOR-REVIEW-* excluded) forces the Frontier tier built-in at this rung — not redefinable via config, never spillover-eligible. `providerPreference` + `byDifficulty` can select provider; falls back to anchor window tier if no forceTier.
+4. QUOTA_BLACKOUT reroute (default-path tasks only): if the would-be provider is blacked out *and* task is spillover-eligible (difficulty ≤ `spillover.maxDifficulty` or max unset), tier-preserving reroute to first enabled non-blacked provider. Beats plain anchor window.
+5. ANCHOR_WINDOW (floor): `models.primaryProvider` + `anchored_tier(anchor, difficulty)`.
 
 After route selection, finalize:
 - model = `models.model_for(final_provider, final_tier)` (sparse clamp; null = omit -m flag)
