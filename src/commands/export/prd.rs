@@ -64,6 +64,11 @@ pub struct ExportedUserStory {
     /// Absent from JSON when not set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub human_review_timeout: Option<u32>,
+    /// Provider that completed this task (stamped at runtime by the loop engine).
+    /// Lowercase canonical value: "claude", "grok", or "codex".
+    /// Absent from JSON when NULL (task not yet completed or pre-v20 row).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_by_provider: Option<String>,
 }
 
 /// JSON structure for the exported PRD file.
@@ -163,7 +168,7 @@ pub(crate) fn load_tasks(conn: &Connection) -> TaskMgrResult<Vec<ExportedUserSto
         r#"SELECT id, title, description, priority, status, notes,
            acceptance_criteria, review_scope, severity, source_review,
            model, difficulty, escalation_note, max_retries,
-           requires_human, human_review_timeout
+           requires_human, human_review_timeout, completed_by_provider
            FROM tasks WHERE archived_at IS NULL ORDER BY id"#,
     )?;
 
@@ -194,6 +199,11 @@ pub(crate) fn load_tasks(conn: &Connection) -> TaskMgrResult<Vec<ExportedUserSto
             .ok()
             .flatten()
             .and_then(|v| u32::try_from(v).ok());
+        // Graceful fallback: column added in v20; pre-migration rows return None.
+        let completed_by_provider: Option<String> = row
+            .get::<_, Option<String>>("completed_by_provider")
+            .ok()
+            .flatten();
 
         Ok((
             id,
@@ -212,6 +222,7 @@ pub(crate) fn load_tasks(conn: &Connection) -> TaskMgrResult<Vec<ExportedUserSto
             max_retries,
             requires_human,
             human_review_timeout,
+            completed_by_provider,
         ))
     })?;
 
@@ -240,6 +251,7 @@ pub(crate) fn load_tasks(conn: &Connection) -> TaskMgrResult<Vec<ExportedUserSto
             max_retries,
             requires_human,
             human_review_timeout,
+            completed_by_provider,
         ) = row?;
 
         // Map status to passes boolean
@@ -281,6 +293,7 @@ pub(crate) fn load_tasks(conn: &Connection) -> TaskMgrResult<Vec<ExportedUserSto
             max_retries,
             requires_human,
             human_review_timeout,
+            completed_by_provider,
         });
     }
 

@@ -770,6 +770,7 @@ fn test_exported_story_requires_human_absent_when_none() {
         max_retries: 3,
         requires_human: None,
         human_review_timeout: None,
+        completed_by_provider: None,
     };
     let json = serde_json::to_string(&story).unwrap();
     assert!(
@@ -804,6 +805,7 @@ fn test_exported_story_requires_human_true_in_json() {
         max_retries: 3,
         requires_human: Some(true),
         human_review_timeout: None,
+        completed_by_provider: None,
     };
     let json = serde_json::to_string(&story).unwrap();
     assert!(
@@ -834,6 +836,7 @@ fn test_exported_story_human_review_timeout_in_json() {
         max_retries: 3,
         requires_human: Some(true),
         human_review_timeout: Some(60),
+        completed_by_provider: None,
     };
     let json = serde_json::to_string(&story).unwrap();
     assert!(
@@ -864,6 +867,7 @@ fn test_exported_story_requires_human_round_trip() {
         max_retries: 3,
         requires_human: Some(true),
         human_review_timeout: Some(120),
+        completed_by_provider: None,
     };
     let json = serde_json::to_string(&story).unwrap();
     let deserialized: prd::ExportedUserStory = serde_json::from_str(&json).unwrap();
@@ -917,4 +921,151 @@ fn test_export_round_trips_requires_human_field() {
         .unwrap();
     assert_eq!(story.requires_human, Some(true));
     assert_eq!(story.human_review_timeout, Some(60));
+}
+
+// ============ completed_by_provider export tests (v20) ============
+
+/// ExportedUserStory with completed_by_provider=None must omit the field from JSON.
+#[test]
+fn test_exported_story_completed_by_provider_absent_when_none() {
+    let story = prd::ExportedUserStory {
+        id: "US-001".to_string(),
+        title: "Test".to_string(),
+        description: None,
+        priority: 1,
+        passes: false,
+        notes: None,
+        acceptance_criteria: vec![],
+        review_scope: None,
+        severity: None,
+        source_review: None,
+        touches_files: vec![],
+        depends_on: vec![],
+        model: None,
+        difficulty: None,
+        escalation_note: None,
+        max_retries: 3,
+        requires_human: None,
+        human_review_timeout: None,
+        completed_by_provider: None,
+    };
+    let json = serde_json::to_string(&story).unwrap();
+    assert!(
+        !json.contains("completedByProvider"),
+        "completedByProvider must be absent from JSON when None; got: {json}"
+    );
+}
+
+/// ExportedUserStory with completed_by_provider=Some("claude") must include the field in JSON.
+#[test]
+fn test_exported_story_completed_by_provider_present_in_json() {
+    let story = prd::ExportedUserStory {
+        id: "US-001".to_string(),
+        title: "Test".to_string(),
+        description: None,
+        priority: 1,
+        passes: true,
+        notes: None,
+        acceptance_criteria: vec![],
+        review_scope: None,
+        severity: None,
+        source_review: None,
+        touches_files: vec![],
+        depends_on: vec![],
+        model: None,
+        difficulty: None,
+        escalation_note: None,
+        max_retries: 3,
+        requires_human: None,
+        human_review_timeout: None,
+        completed_by_provider: Some("claude".to_string()),
+    };
+    let json = serde_json::to_string(&story).unwrap();
+    assert!(
+        json.contains("\"completedByProvider\":\"claude\""),
+        "completedByProvider:claude must be in JSON when Some(\"claude\"); got: {json}"
+    );
+}
+
+/// Full DB round-trip: stamp completed_by_provider → export → JSON contains the field.
+/// Historical rows (NULL) hydrate without error.
+#[test]
+fn test_export_round_trips_completed_by_provider() {
+    use crate::commands::init;
+    use crate::db::open_and_migrate;
+
+    let prd_json = r#"{
+        "project": "test-project",
+        "userStories": [
+            {
+                "id": "US-001",
+                "title": "Stamped Task",
+                "priority": 1,
+                "passes": false
+            },
+            {
+                "id": "US-002",
+                "title": "Unstamped Task",
+                "priority": 2,
+                "passes": false
+            }
+        ]
+    }"#;
+
+    let temp_dir = TempDir::new().unwrap();
+    let json_path = temp_dir.path().join("prd.json");
+    fs::write(&json_path, prd_json).unwrap();
+
+    init::init(
+        temp_dir.path(),
+        &[&json_path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Disabled,
+    )
+    .unwrap();
+
+    // Simulate the stamping that process_iteration_output does.
+    let conn = open_and_migrate(temp_dir.path()).unwrap();
+    conn.execute(
+        "UPDATE tasks SET completed_by_provider = 'claude' WHERE id = 'US-001'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let export_path = temp_dir.path().join("exported.json");
+    export(temp_dir.path(), &export_path, false, None).unwrap();
+
+    let exported_json = fs::read_to_string(&export_path).unwrap();
+    let exported: prd::ExportedPrd = serde_json::from_str(&exported_json).unwrap();
+
+    let stamped = exported
+        .user_stories
+        .iter()
+        .find(|s| s.id == "US-001")
+        .unwrap();
+    assert_eq!(
+        stamped.completed_by_provider.as_deref(),
+        Some("claude"),
+        "stamped task must export completed_by_provider=claude"
+    );
+
+    // Historical NULL row hydrates without error and emits nothing.
+    let unstamped = exported
+        .user_stories
+        .iter()
+        .find(|s| s.id == "US-002")
+        .unwrap();
+    assert_eq!(
+        unstamped.completed_by_provider, None,
+        "unstamped task must export completed_by_provider=None"
+    );
+    assert!(
+        !exported_json.contains("\"id\":\"US-002\",")
+            || !exported_json.contains("completedByProvider"),
+        "completedByProvider must not appear in JSON for NULL row"
+    );
 }
