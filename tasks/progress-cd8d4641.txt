@@ -179,3 +179,50 @@ Reviewed the full PRD diff (main...HEAD: 98 files, ~11.5k insertions; 48 src fil
 No Rust code changed this iteration (doc + task adds only) — quality gate not applicable.
 
 ---
+## 2026-06-10 - cd8d4641-REFACTOR-006
+
+RuntimeError cross-provider promotion: RESOLVED migrate-vs-delete as **DELETE** (option B).
+Recorded via learning #5108 + <key-decision> tag.
+
+Rationale: post-hard-break preflight rejects primaryRunner/fallbackRunner (LEGACY_MODEL_KEYS),
+so the 3 RuntimeError cross-provider promotion arms were unreachable in production. Migrating
+would re-accrete an un-specced config surface into the very models/routing block FR-001 exists
+to eliminate; the PRD migrated only the overflow rung-4 pivot (providers.<source>.fallback).
+
+Deleted:
+- recovery.rs: Claude->Grok + Grok->Claude promotion branches in escalate_task_model_if_needed_inner;
+  maybe_provider_runtime_fallback (Codex->Claude); cfg/primary_cfg/project_default/user_default params
+  pruned from the 5 recovery fns + 2 production callers (orchestrator/wave_scheduler).
+- project_config.rs: FallbackRunnerConfig/PrimaryRunnerConfig/RunnerSpec + default fns;
+  validate_runner_routing_config + validate_*_prefix_routes + check_codex_runner_binary +
+  check_fallback_runner_binary + check_review_model_binary + primary_runner_specs +
+  primary_runner_contains_codex_review_route + resolve_and_verify_grok/codex_binary + write_default_model;
+  ProjectConfig fields default_model/review_model/primary_runner/fallback_runner (+ Default + serde).
+- model.rs: primary_runner_match + route_prefixes_overlap (id_body_matches_prefix/normalize_route_prefix/
+  segments_contain RESTORED — used by live classify_task + byIdPrefix resolver).
+- user_config.rs: write_fallback_runner(_at).
+- prompt/sequential.rs + slot.rs + engine.rs + startup.rs: dead prompt-builder params
+  primary_runner/project_default_model/user_default_model pruned (six-signature threading).
+- Tests: deleted runtime_error_fallback.rs, wave_runtime_error_fallback.rs, primary_runner_fallback.rs,
+  fallback_config.rs; preserved the 2 slot thread-safety source-grep contracts into a new
+  tests/slot_worker_thread_safety.rs; surgically updated codex_recovery.rs / prompt_slot.rs /
+  retry_tracking.rs / e2e_loop.rs / project_config.rs (39 legacy test fns) / model.rs.
+
+Preserved (UNTOUCHED per task notes): same-provider Claude tier escalation (recovery.rs escalate_tier);
+Codex short-circuit guard (executed_runner==Codex -> no escalation, so NULL-model Codex never writes Opus);
+promote_once + PendingPromotion + apply_pending_promotion (shared with the LIVE overflow rung-4 pivot in
+reactions/post_output.rs; apply_pending_promotion retained as the sole non-test reader of PendingPromotion
+fields, keeping the deferred-apply skeleton); check_override_invalidation.
+
+CLAUDE.md (src/loop_engine): rewrote the deferred-apply, overflow rung-4 RuntimeError note, blackout-channel,
+Codex auth-exclusion, the "Opt-in Codex->Claude RuntimeError fallback" section (-> REMOVED note), Touchpoints
+table, and promote_once rustdoc to match the delete reality.
+
+Follow-up (out of scope, flagged): top-level CLAUDE.md "### Codex runner" / "### Fallback runner config"
+blocks still describe runtimeErrorFallback/fallbackRunner (stale post-hard-break); write_review_model
+(project_config.rs) still writes the legacy reviewModel key (no production caller).
+
+Gate: cargo fmt --check OK; clippy --all-targets -D warnings clean; gen-docs --check OK;
+full `cargo test` GREEN (4675 passed, 0 failed, 72 binaries).
+
+---

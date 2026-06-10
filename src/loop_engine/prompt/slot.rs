@@ -197,19 +197,11 @@ pub struct SlotPromptParams<'a> {
     /// Operator pause feedback rendered as a `## Session Guidance` block.
     /// Empty string omits the section entirely (no header).
     pub session_guidance: &'a str,
-    /// Primary runner routing configuration.
-    pub primary_runner: Option<&'a crate::loop_engine::project_config::PrimaryRunnerConfig>,
     /// Engine-cached PRD default model (`prd_metadata.default_model`). Threaded
     /// from `WaveIterationParams::default_model` into the slot's execution
     /// plan so the wave baseline tier equals the sequential baseline tier for
     /// the same task+config (WIRE-FIX-001).
     pub prd_default: Option<&'a str>,
-    /// Engine-cached project default model (`.task-mgr/config.json`). See
-    /// [`Self::prd_default`].
-    pub project_default: Option<&'a str>,
-    /// Engine-cached user default model (`$XDG_CONFIG_HOME/task-mgr/config.json`).
-    /// See [`Self::prd_default`].
-    pub user_default: Option<&'a str>,
     /// Provider-first `models` config block (FR-001). Resolved per build and
     /// fed to [`crate::loop_engine::model::resolve_execution_plan`]. Threaded
     /// from `ProjectConfig::models`.

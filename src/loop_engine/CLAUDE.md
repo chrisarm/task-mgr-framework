@@ -122,7 +122,7 @@ Codex is **route-only**: only reachable via explicit `byIdPrefix` or `taskClasse
 `IterationContext::provider_blackouts` (a `BlackoutState`) is a SEPARATE, EPHEMERAL channel from `runner_overrides`:
 
 - Blackouts: per-pass, self-expiring, never persisted (no DB/serde). Written only by account rate-limit reaction (`reactions::account`). Read by spawn resolver (`resolve_execution_plan` for QUOTA_BLACKOUT reroute), quota deferral, and excluded-id computation. Cleared on restart by design.
-- `runner_overrides` (and `promote_once`): permanent (cross-provider at most once per run) for overflow-ladder rung-4 fallback and RuntimeError escape valves. Cleared on restart.
+- `runner_overrides` (and `promote_once`): permanent (cross-provider at most once per run) for the overflow-ladder rung-4 fallback. (The RuntimeError cross-provider escape valve was removed in REFACTOR-006; the overflow rung-4 pivot is now the only `runner_overrides` writer via `promote_once`.) Cleared on restart.
 
 **Invariants**:
 - `promote_once` / every `runner_overrides` writer MUST NOT read or write `provider_blackouts`.
@@ -328,10 +328,15 @@ drive this rung.
 `providers.codex.fallback` (FEAT-007) — set it and Codex pivots tier-preservingly
 like any other provider; leave it unset and Codex overflow falls through to
 block. The RuntimeError retry path (separate from overflow) receives the
-executed runner explicitly via `IterationResult.effective_runner` or
-`SlotResult.effective_runner` and short-circuits Codex into the opt-in
-`maybe_provider_runtime_fallback` path rather than the Claude model
-escalation/Grok promotion.
+executed runner explicitly via `IterationResult.effective_runner` /
+`SlotResult.effective_runner` and uses it ONLY to short-circuit Codex out of the
+Claude tier ladder (a Codex task must not normalize a NULL model to the Sonnet
+baseline and escalate onto Opus). It performs NO cross-provider promotion:
+REFACTOR-006 deleted the Claude→Grok / Grok→Claude / Codex→Claude RuntimeError
+promotion arms (they were unreachable once preflight hard-rejected
+`primaryRunner` / `fallbackRunner`). A repeatedly-RuntimeError-crashing task now
+climbs the same-provider Claude tier ladder (Claude tasks only) and then
+auto-blocks; cross-provider rescue exists only on the overflow rung-4 pivot.
 
 In both cases, the rung writes the target model to the `tasks.model` DB column
 AND inserts matching entries into `ctx.runner_overrides` / `ctx.model_overrides`
@@ -422,19 +427,25 @@ on common error phrases like "file not found" or "rate limit exceeded".
 
 **Transactional promotion ctx writes are deferred** (`recovery.rs::handle_task_failure`
 + `escalate_task_model_if_needed_inner` + `apply_pending_promotion`): the
-RuntimeError fallback hook runs inside the same DB transaction that
-increments `consecutive_failures` and (optionally) auto-blocks. If the ctx
-mutations (`runner_overrides`, `model_overrides`,
-`overflow_original_task_model`) happened inside the transaction body and
-`tx.commit()` failed, the in-memory ctx would claim a promotion the DB
-rolled back. The pattern is: inner helper performs DB writes only and
-returns an `Option<PendingPromotion>`; the caller applies it via
-`apply_pending_promotion` **only after `tx.commit()?` returns Ok**. Direct
-callers (tests, sequential non-transactional paths) use the convenience
-wrapper `escalate_task_model_if_needed` which applies immediately. Same
-shape applies to any future "in-memory state mutation paired with DB
-write inside a transaction" — split inner-helper / apply-pending /
-defer-until-commit.
+consecutive-failure escalation runs inside the same DB transaction that
+increments `consecutive_failures` and (optionally) auto-blocks. The pattern is:
+inner helper performs DB writes only and returns an `Option<PendingPromotion>`;
+the caller applies it via `apply_pending_promotion` **only after `tx.commit()?`
+returns Ok** — so a rolled-back DB can never leave the in-memory ctx claiming a
+promotion. Direct callers (tests, sequential non-transactional paths) use the
+convenience wrapper `escalate_task_model_if_needed` which applies immediately.
+Same shape applies to any future "in-memory state mutation paired with DB write
+inside a transaction" — split inner-helper / apply-pending / defer-until-commit.
+
+REFACTOR-006 deleted the RuntimeError cross-provider promotion arms, so
+`escalate_task_model_if_needed_inner` no longer produces a `PendingPromotion`
+(it always returns `None` for that slot; only the same-provider Claude tier
+escalation remains). The deferred-apply skeleton is retained intact because
+`apply_pending_promotion` is the sole non-test reader of [`PendingPromotion`]'s
+fields, and [`PendingPromotion`] is still constructed by `promote_once` for the
+LIVE overflow rung-4 pivot (`reactions::post_output`). `promote_once` /
+deferred-apply / the override-invalidation escape valve are shared with that
+live pivot and stay untouched.
 
 **Binary-resolution env var "" must fall through, and existence ≠
 executable** (`runner.rs::resolve_grok_binary`
@@ -957,51 +968,30 @@ centrally by the stream accumulator from any `StreamEvent::Error` (top-level
 
 `CodexAuthFailure` is excluded from `handle_task_failure` at BOTH callers —
 `orchestrator.rs` (sequential) and `wave_scheduler.rs` (wave) — so auth lapses
-never push healthy tasks toward `auto_block_after_failures` or the
-RuntimeError escalation path. A sentinel test
+never push healthy tasks toward `auto_block_after_failures`. A sentinel test
 (`test_codex_auth_failure_excluded_at_callers`) reads both files and asserts
 the `CrashType::CodexAuthFailure` pattern is still listed; deleting the
 exclusion fails at unit-test time.
 
-### Opt-in Codex→Claude RuntimeError fallback (`runtimeErrorFallback`)
+### Codex→Claude RuntimeError fallback — REMOVED (REFACTOR-006)
 
-Codex is closed in v1 to the overflow rung-4 cross-provider pivot. The
-SEPARATE RuntimeError repeated-crash escalation, however, supports an opt-in
-promotion via `primaryRunner.<route>.runtimeErrorFallback: true`:
+The opt-in `primaryRunner.<route>.runtimeErrorFallback` promotion (Codex→Claude
+on repeated RuntimeError crashes, via `maybe_provider_runtime_fallback`) was
+DELETED. Post-hard-break, `primaryRunner` / `fallbackRunner` are rejected at
+preflight (`LEGACY_MODEL_KEYS`), so `ProjectConfig.primary_runner` /
+`.fallback_runner` are always `None` at loop time and the promotion could never
+fire in production. The migrate-vs-delete decision resolved to DELETE rather
+than re-home it on the provider-first surface (migrating would re-accrete a
+config surface the FR-001 redesign exists to eliminate; the PRD migrated only
+the overflow rung-4 pivot to `providers.<source>.fallback`).
 
-```json
-{
-  "primaryRunner": {
-    "claudeFallbackModel": "<sonnet/opus id>",
-    "byIdPrefix": {
-      "FEAT-": { "provider": "codex", "runtimeErrorFallback": true }
-    }
-  }
-}
-```
-
-When `runtimeErrorFallback` is `true` on a Codex route AND the matching task
-accumulates RuntimeError crashes past `runtimeErrorThreshold`,
-`maybe_provider_runtime_fallback` (in `recovery.rs`) writes a
-`PendingPromotion { source_runner: Codex, target_runner: Claude }` to
-`tasks.model` and threads it into `ctx.runner_overrides` AFTER `tx.commit()`
-returns Ok (same deferred-apply pattern as the Claude↔Grok promotions). The
-promotion ALWAYS inserts `RunnerKind::Claude` into `runner_overrides`, never
-`RunnerKind::Codex` — a once-promoted task cannot route back to Codex
-within the same loop run (idempotency via `runner_overrides.contains_key`).
-
-Target Claude model: `difficulty=high` → `OPUS_MODEL`; else
-`primary.claude_fallback_model` if set, else `OPUS_MODEL` baseline (unlike
-the Grok→Claude branch, which bails when `claudeFallbackModel` is absent —
-the per-route `runtimeErrorFallback:true` is an explicit operator opt-in, so we
-resolve a safe Opus default rather than silently auto-blocking).
-
-Field defaults: `runtimeErrorFallback=false`. Absent → no Codex→Claude promotion;
-loop behavior is byte-identical to a pure-Claude or Codex-without-fallback
-run. The flag is meaningful ONLY on routes whose `provider` parses to
-`Codex` — set on a Grok/Claude route, it is silently ignored.
-`tests/codex_runner_overrides_invariant.rs` pins the never-insert-Codex
-invariant.
+Current Codex RuntimeError behavior: a Codex task short-circuits OUT of the
+same-provider Claude tier escalation (so its NULL/`gpt-*` model is never
+rewritten to Opus) and proceeds to normal failure accounting → `auto_block`.
+The `tests/codex_runner_overrides_invariant.rs` never-insert-Codex invariant
+and the `codex_recovery.rs` "Codex never promotes" contract tests still pin
+this. Cross-provider rescue for Codex exists ONLY via the explicit overflow
+rung-4 `providers.codex.fallback` (FEAT-007), not on the RuntimeError path.
 
 ### Protected-state guard — post-hoc detect-and-revert
 
@@ -1108,10 +1098,8 @@ For the full site→verb audit table and source-allowance matrix see
 | Provider routing | `src/loop_engine/model.rs` | `Provider`, `ExecutionPlan`, `provider_for_model`, `resolve_execution_plan` |
 | Operator escape valve | `src/loop_engine/recovery.rs` | `check_override_invalidation` |
 | Overflow original model snapshot | `src/loop_engine/engine.rs` | `IterationContext::overflow_original_task_model` |
-| Fallback runner config | `src/loop_engine/project_config.rs` | `FallbackRunnerConfig`, `check_fallback_runner_binary` |
-| Primary runner config + routing | `src/loop_engine/project_config.rs` | `PrimaryRunnerConfig`, `RunnerSpec` |
 | Spawn-side model/provider routing | `src/loop_engine/model.rs` | `resolve_execution_plan`, `ExecutionPlan`, `PlanContext`, `ResolvedModelsConfig` |
-| Primary runner match (recovery fallback only) | `src/loop_engine/model.rs` | `primary_runner_match` |
+| Cross-provider promotion primitive (overflow rung-4) | `src/loop_engine/recovery.rs` | `promote_once`, `PendingPromotion`, `apply_pending_promotion` |
 | Auto-review launch boundary | `src/loop_engine/auto_review.rs` | `maybe_fire`, `maybe_fire_inner`, `ProcessLauncher` |
 | Shared post-Claude pipeline | `src/loop_engine/iteration_pipeline.rs` | `process_iteration_output` |
 | Merge resolver | `src/loop_engine/merge_resolver.rs` | `ClaudeMergeResolver`, `MergeResolver` trait |

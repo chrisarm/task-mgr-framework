@@ -34,8 +34,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::loop_engine::project_config::{
-    ModelsConfig, PrimaryRunnerConfig, RouteSpec, RoutingConfig, RunnerSpec, SpilloverConfig,
-    TaskClassRoute,
+    ModelsConfig, RouteSpec, RoutingConfig, SpilloverConfig, TaskClassRoute,
 };
 
 /// Well-known model identifiers.
@@ -264,62 +263,18 @@ pub fn difficulty_rank(difficulty: Option<&str>) -> Option<usize> {
     EFFORT_FOR_DIFFICULTY.iter().position(|(k, _)| *k == d)
 }
 
-/// Return the first matching [`RunnerSpec`] from a [`PrimaryRunnerConfig`] for
-/// a given task identity pair `(task_id, task_type)`.
-///
-/// **Match priority** (highest → lowest):
-/// 1. `byTaskType` — exact, case-sensitive match on `task_type`
-/// 2. `byIdPrefix` — the map key matches a dash-delimited segment at the
-///    start of the task ID body (after stripping the 8-hex project prefix).
-///    The key is normalized by trimming a trailing `-`, so `"REVIEW"` and
-///    `"REVIEW-"` behave identically, and a `-` boundary is required after
-///    the prefix — so `"REVIEW-"` matches `REVIEW-001` but NOT `REVIEWER-001`.
-///    Same dash-boundary semantics as `id_body_matches_prefix` in
-///    `commands::next::selection` (kept as a local matcher rather than reused,
-///    to avoid a `loop_engine` → `commands` layer dependency).
-///
-/// When both maps produce a match, `byTaskType` wins even if the specs differ.
-/// `None` is returned only when neither map matches.
-///
-/// This is a pure function with no I/O. The `cfg` reference lifetime bounds
-/// the returned `RunnerSpec` to the config it was drawn from.
-pub fn primary_runner_match<'a>(
-    cfg: &'a PrimaryRunnerConfig,
-    task_id: Option<&str>,
-    task_type: Option<&str>,
-) -> Option<&'a RunnerSpec> {
-    // byTaskType wins when it matches — checked first.
-    if let Some(spec) = task_type.and_then(|tt| cfg.by_task_type.get(tt)) {
-        return Some(spec);
-    }
-    // byIdPrefix: check if any registered prefix matches the task ID.
-    if let Some(id) = task_id {
-        let body = strip_prd_prefix(id);
-        for (prefix, spec) in &cfg.by_id_prefix {
-            if id_body_matches_prefix(body, prefix) {
-                return Some(spec);
-            }
-        }
-    }
-    None
-}
-
-pub(crate) fn normalize_route_prefix(prefix: &str) -> String {
+/// Normalize a route prefix for matching: trim whitespace + a trailing `-`
+/// (so `"REVIEW"` and `"REVIEW-"` behave identically).
+fn normalize_route_prefix(prefix: &str) -> String {
     prefix.trim().trim_end_matches('-').to_string()
 }
 
-pub(crate) fn route_prefixes_overlap(left: &str, right: &str) -> bool {
-    let left = normalize_route_prefix(left);
-    let right = normalize_route_prefix(right);
-    if left.is_empty() || right.is_empty() {
-        return false;
-    }
-    let left_segments: Vec<&str> = left.split('-').collect();
-    let right_segments: Vec<&str> = right.split('-').collect();
-    segments_contain(&left_segments, &right_segments)
-        || segments_contain(&right_segments, &left_segments)
-}
-
+/// Dash-boundary prefix match against a task ID body (after the 8-hex project
+/// prefix is stripped): the prefix must match a contiguous run of dash-delimited
+/// segments at the start, so `"REVIEW-"` matches `REVIEW-001` but not
+/// `REVIEWER-001`. Kept local to `model` (rather than reusing
+/// `commands::next::selection::id_body_matches_prefix`) to avoid a
+/// `loop_engine` → `commands` layer dependency.
 fn id_body_matches_prefix(body: &str, prefix: &str) -> bool {
     let prefix = normalize_route_prefix(prefix);
     if prefix.is_empty() {
@@ -1102,120 +1057,12 @@ fn finalize_plan(
 mod tests {
     use super::*;
 
-    // ============ primary_runner_match tests ============
-
-    /// Build a minimal PrimaryRunnerConfig for tests: "review" and "milestone"
-    /// task types route to "grok-build" via byTaskType; "REVIEW-" id prefix also
-    /// routes to "grok-build" via byIdPrefix.
-    fn make_primary_runner_cfg() -> PrimaryRunnerConfig {
-        use std::collections::HashMap;
-        let grok_spec = RunnerSpec {
-            provider: "grok".to_string(),
-            model: "grok-build".to_string(),
-            ..Default::default()
-        };
-        let mut by_task_type = HashMap::new();
-        by_task_type.insert("review".to_string(), grok_spec.clone());
-        by_task_type.insert("milestone".to_string(), grok_spec.clone());
-        let mut by_id_prefix = HashMap::new();
-        by_id_prefix.insert("REVIEW-".to_string(), grok_spec);
-        PrimaryRunnerConfig {
-            claude_fallback_model: None,
-            runtime_error_threshold: 2,
-            by_task_type,
-            by_id_prefix,
-        }
-    }
-
-    // ============ primary_runner_match unit tests ============
-
-    #[test]
-    fn test_primary_runner_match_task_type_wins_over_id_prefix() {
-        use std::collections::HashMap;
-        // Two specs with different models to verify which one wins.
-        let mut by_task_type = HashMap::new();
-        by_task_type.insert(
-            "review".to_string(),
-            RunnerSpec {
-                provider: "grok".to_string(),
-                model: "grok-type-winner".to_string(),
-                ..Default::default()
-            },
-        );
-        let mut by_id_prefix = HashMap::new();
-        by_id_prefix.insert(
-            "REVIEW-".to_string(),
-            RunnerSpec {
-                provider: "grok".to_string(),
-                model: "grok-prefix-loser".to_string(),
-                ..Default::default()
-            },
-        );
-        let cfg = PrimaryRunnerConfig {
-            claude_fallback_model: None,
-            runtime_error_threshold: 2,
-            by_task_type,
-            by_id_prefix,
-        };
-        let spec = primary_runner_match(&cfg, Some("REVIEW-001"), Some("review"));
-        assert_eq!(
-            spec.map(|s| s.model.as_str()),
-            Some("grok-type-winner"),
-            "byTaskType must win over byIdPrefix when both match"
-        );
-    }
-
-    #[test]
-    fn test_primary_runner_match_falls_back_to_id_prefix_when_no_type_match() {
-        let cfg = make_primary_runner_cfg();
-        // task_type is not in byTaskType; id prefix IS in byIdPrefix.
-        let spec = primary_runner_match(&cfg, Some("REVIEW-001"), Some("implementation"));
-        assert_eq!(spec.map(|s| s.model.as_str()), Some("grok-build"));
-    }
-
-    #[test]
-    fn test_primary_runner_match_exact_final_id_prefix() {
-        use std::collections::HashMap;
-        let mut by_id_prefix = HashMap::new();
-        by_id_prefix.insert(
-            "MILESTONE-FINAL".to_string(),
-            RunnerSpec {
-                provider: "codex".to_string(),
-                model: String::new(),
-                ..Default::default()
-            },
-        );
-        let cfg = PrimaryRunnerConfig {
-            by_id_prefix,
-            ..Default::default()
-        };
-
-        let bare = primary_runner_match(&cfg, Some("MILESTONE-FINAL"), None);
-        assert_eq!(bare.map(|s| s.provider.as_str()), Some("codex"));
-
-        let prefixed = primary_runner_match(&cfg, Some("8d71d1f7-MILESTONE-FINAL"), None);
-        assert_eq!(prefixed.map(|s| s.provider.as_str()), Some("codex"));
-    }
-
     #[test]
     fn test_route_prefix_matching_keeps_dash_segment_boundary() {
         assert!(route_prefixes_overlap("MILESTONE", "MILESTONE-FINAL"));
         assert!(route_prefixes_overlap("FIX", "CODE-FIX"));
         assert!(id_body_matches_prefix("REVIEW-001", "REVIEW"));
         assert!(!id_body_matches_prefix("REVIEWER-001", "REVIEW"));
-    }
-
-    #[test]
-    fn test_primary_runner_match_returns_none_when_no_match() {
-        let cfg = make_primary_runner_cfg();
-        let spec = primary_runner_match(&cfg, Some("FEAT-001"), Some("feature"));
-        assert!(spec.is_none());
-    }
-
-    #[test]
-    fn test_primary_runner_match_none_task_id_and_type() {
-        let cfg = make_primary_runner_cfg();
-        assert!(primary_runner_match(&cfg, None, None).is_none());
     }
 
     // ============ escalate_tier tests ============
