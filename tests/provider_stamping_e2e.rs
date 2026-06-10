@@ -63,6 +63,12 @@ fn seed_run_task(conn: &Connection, run_id: &str, task_id: &str, iteration: i64)
         [run_id],
     )
     .expect("insert run");
+    seed_task_attempt(conn, run_id, task_id, iteration);
+}
+
+/// Seed one task + its `run_tasks` attempt row under an existing run — used by
+/// the heterogeneous-wave test, where several tasks share a single run.
+fn seed_task_attempt(conn: &Connection, run_id: &str, task_id: &str, iteration: i64) {
     conn.execute(
         "INSERT INTO tasks (id, title, status, priority) VALUES (?1, 'stamp fixture', 'in_progress', 50)",
         [task_id],
@@ -128,6 +134,7 @@ fn run_task_provider_model(
 /// Drive the real pipeline for `task_id` with an explicit runner+model and an
 /// output that marks the claimed task done. Returns nothing — assertions read
 /// the DB afterwards.
+#[allow(clippy::too_many_arguments)] // test helper mirroring ProcessingParams' shape
 fn run_completion(
     conn: &mut Connection,
     fx: &mut PipelineFixture,
@@ -136,6 +143,7 @@ fn run_completion(
     iteration: u32,
     effective_runner: RunnerKind,
     effective_model: Option<&str>,
+    slot_index: Option<usize>,
 ) {
     let mut outcome = IterationOutcome::Completed;
     let output = format!("<task-status>{task_id}:done</task-status>\n");
@@ -161,7 +169,7 @@ fn run_completion(
         effective_model,
         effective_effort: None,
         effective_runner: Some(effective_runner),
-        slot_index: None,
+        slot_index,
     });
 }
 
@@ -186,6 +194,7 @@ fn claude_completion_stamps_provider_and_model() {
         iter as u32,
         RunnerKind::Claude,
         Some(OPUS_MODEL),
+        None,
     );
 
     assert_eq!(
@@ -216,6 +225,7 @@ fn grok_completion_stamps_provider_and_model() {
         iter as u32,
         RunnerKind::Grok,
         Some(GROK_MODEL),
+        None,
     );
 
     assert_eq!(
@@ -247,6 +257,7 @@ fn codex_completion_stamps_provider_with_null_model() {
         iter as u32,
         RunnerKind::Codex,
         None,
+        None,
     );
 
     assert_eq!(
@@ -258,6 +269,75 @@ fn codex_completion_stamps_provider_with_null_model() {
         run_task_provider_model(&conn, run_id, task_id, iter),
         (Some("codex".to_string()), None),
         "run_tasks.provider is 'codex' with a NULL model for a provider-only codex route",
+    );
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// PRD success metric (2): a heterogeneous-provider WAVE — three slots in the
+// SAME run + iteration complete via three different providers through the
+// shared stamping home (the exact shape of the wave call site in
+// `slot.rs::process_slot_result`, which passes `slot_index: Some(N)`).
+// Each task must carry ITS OWN provider stamp — no cross-slot bleed.
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn heterogeneous_wave_stamps_each_slot_with_its_own_provider() {
+    disable_llm_extraction();
+    let (db_temp, mut conn) = setup_migrated_db();
+    let mut fx = PipelineFixture::new(db_temp.path());
+    let (run_id, iter) = ("run-hetero-wave", 1_i64);
+    conn.execute(
+        "INSERT INTO runs (run_id, status) VALUES (?1, 'active')",
+        [run_id],
+    )
+    .expect("insert run");
+
+    let slots: [(&str, RunnerKind, Option<&str>); 3] = [
+        ("WAVE-CLAUDE-001", RunnerKind::Claude, Some(OPUS_MODEL)),
+        ("WAVE-GROK-001", RunnerKind::Grok, Some(GROK_MODEL)),
+        ("WAVE-CODEX-001", RunnerKind::Codex, None),
+    ];
+    for (task_id, _, _) in &slots {
+        seed_task_attempt(&conn, run_id, task_id, iter);
+    }
+    for (slot_idx, (task_id, runner, model)) in slots.iter().enumerate() {
+        run_completion(
+            &mut conn,
+            &mut fx,
+            run_id,
+            task_id,
+            iter as u32,
+            *runner,
+            *model,
+            Some(slot_idx),
+        );
+    }
+
+    assert_eq!(
+        completed_by_provider(&conn, "WAVE-CLAUDE-001").as_deref(),
+        Some("claude"),
+    );
+    assert_eq!(
+        completed_by_provider(&conn, "WAVE-GROK-001").as_deref(),
+        Some("grok"),
+    );
+    assert_eq!(
+        completed_by_provider(&conn, "WAVE-CODEX-001").as_deref(),
+        Some("codex"),
+        "codex slot stamps provider identity even with no model string",
+    );
+    assert_eq!(
+        run_task_provider_model(&conn, run_id, "WAVE-CLAUDE-001", iter),
+        (Some("claude".to_string()), Some(OPUS_MODEL.to_string())),
+    );
+    assert_eq!(
+        run_task_provider_model(&conn, run_id, "WAVE-GROK-001", iter),
+        (Some("grok".to_string()), Some(GROK_MODEL.to_string())),
+    );
+    assert_eq!(
+        run_task_provider_model(&conn, run_id, "WAVE-CODEX-001", iter),
+        (Some("codex".to_string()), None),
+        "run_tasks rows must not bleed providers across wave slots",
     );
 }
 

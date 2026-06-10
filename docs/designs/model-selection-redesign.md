@@ -49,15 +49,14 @@ Grok/Codex default: single standard rung (grok-build; codex = no model flag). Ef
 Highest to lowest (see `ExecutionPlan`, `PlanContext`, `finalize_plan`):
 
 1. Explicit per-task model (from DB row or prd-level).
-2. Review class (`is_frontier_class` — built-in, strips 8-hex prefix, excludes REFACTOR-REVIEW-*). Forces Frontier; immune to blackout.
-3. `routing.byIdPrefix` (dash-boundary after prefix strip; optional `forceTier`).
-4. `routing.taskClasses` (implementation/planning + built-in review). May supply `providerPreference` + `byDifficulty` + `forceTier`.
-5. QUOTA_BLACKOUT reroute (only for default-path tasks; tier preserved; only if spillover-eligible).
-6. ANCHOR_WINDOW (primaryProvider + anchored_tier).
+2. `routing.byIdPrefix` (dash-boundary after prefix strip; optional `tier` pin). Beats the built-in review-class force — pinned by `precedence_matrix::byidprefix_route_beats_review_class_force`.
+3. `routing.taskClasses` (implementation/planning/review). The review class (`is_frontier_class` — built-in, strips 8-hex prefix, excludes REFACTOR-REVIEW-*) forces Frontier at this rung — not redefinable via config, never spillover-eligible. May supply `providerPreference` + `byDifficulty` + `forceTier`.
+4. QUOTA_BLACKOUT reroute (only for default-path tasks; tier preserved; only if spillover-eligible).
+5. ANCHOR_WINDOW (primaryProvider + anchored_tier).
 
 After selection: model = `model_for(p, tier)`, effort = `effort_for(final_p, difficulty)` (final provider's table wins).
 
-`primary_runner_match` (legacy byIdPrefix/byTaskType) survives **only** for the opt-in Codex→Claude RuntimeError fallback path.
+`primary_runner_match` (legacy byIdPrefix/byTaskType) survives only in the `recovery.rs` RuntimeError-promotion path, which is unreachable in production since the hard break rejects `primaryRunner` config at preflight (migrate-or-delete tracked as REFACTOR-006).
 
 ## Blackout Channel (separate from promotions)
 

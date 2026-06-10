@@ -22,16 +22,6 @@ pub struct ModelChoice {
 /// `None`. Keeps the prompt from blocking forever on bad pipes.
 const MAX_RETRIES: u32 = 3;
 
-/// Render the list and read a choice under the "Available Claude models:"
-/// header. Thin wrapper over [`select_choice_interactive`].
-pub fn select_model_interactive<R: BufRead, W: Write>(
-    reader: R,
-    writer: W,
-    choices: &[ModelChoice],
-) -> io::Result<Option<String>> {
-    select_choice_interactive(reader, writer, "Available Claude models:", choices)
-}
-
 /// Render `choices` under `header` and read a numbered choice. Returns:
 /// - `Ok(Some(id))` when the user picks a valid number.
 /// - `Ok(None)` when the user submits a blank line, hits EOF, or exhausts retries.
@@ -135,7 +125,9 @@ mod tests {
     fn run(input: &str) -> (Option<String>, String) {
         let reader = Cursor::new(input.as_bytes());
         let mut output = Vec::new();
-        let picked = select_model_interactive(reader, &mut output, &choices()).unwrap();
+        let picked =
+            select_choice_interactive(reader, &mut output, "Available models:", &choices())
+                .unwrap();
         (picked, String::from_utf8(output).unwrap())
     }
 
@@ -194,7 +186,8 @@ mod tests {
     fn empty_choices_returns_none() {
         let reader = Cursor::new(b"1\n".to_vec());
         let mut output = Vec::new();
-        let picked = select_model_interactive(reader, &mut output, &[]).unwrap();
+        let picked =
+            select_choice_interactive(reader, &mut output, "Available models:", &[]).unwrap();
         assert_eq!(picked, None);
         let out = String::from_utf8(output).unwrap();
         assert!(out.contains("no choices available"));
