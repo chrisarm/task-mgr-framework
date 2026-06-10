@@ -215,7 +215,7 @@ pub fn handle_overflow(params: HandleOverflowParams<'_>) -> RecoveryAction {
         // Codex, whose model already sits at the ceiling) so the ladder advances.
         ctx.model_overrides
             .insert(task_id.to_string(), next_model.clone());
-        RecoveryAction::EscalateModel {
+        RecoveryAction::EscalateTier {
             new_model: next_model,
         }
     } else if source_provider == Provider::Claude
@@ -295,7 +295,7 @@ pub fn handle_overflow(params: HandleOverflowParams<'_>) -> RecoveryAction {
     //   - FallbackToProvider → status='todo' + clear started_at + set tasks.model
     //                          to the cross-provider target (Grok model for
     //                          Claude→Grok, Claude model for Grok→Claude) so
-    //                          `resolve_task_model` picks it up next iteration.
+    //                          model resolution picks it up next iteration.
     //                          The DB UPDATE and the rung-1 ctx override inserts
     //                          (above) run together — never split across a
     //                          deferred-commit boundary — so the in-memory

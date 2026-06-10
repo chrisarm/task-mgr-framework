@@ -96,78 +96,42 @@ only in v1; it is not part of the Claude↔Grok fallback pair.
     "byIdPrefix": {
       "REVIEW-":    { "provider": "grok", "model": "grok-build" },
       "MILESTONE-": { "provider": "grok", "model": "grok-build" }
-    },
-    "baselineTierRoutes": {
-      "FEAT": {
-        "high":     { "provider": "codex", "runtimeErrorFallback": true },
-        "standard": { "provider": "grok", "model": "grok-build" }
-      }
     }
   }
 }
 ```
 
 Field defaults: `claudeFallbackModel=null`, `runtimeErrorThreshold=2`,
-`byTaskType={}`, `byIdPrefix={}`, `baselineTierRoutes={}`. `RunnerSpec.model`
+`byTaskType={}`, `byIdPrefix={}`. `RunnerSpec.model`
 defaults to `""` and is valid only for `provider: "codex"`; Grok and Claude
-routes must provide a nonblank model. `baselineTierRoutes` is keyed by task prefix,
-then by provider-neutral baseline tier (`low`, `standard`, `high`; legacy
-aliases `haiku`, `sonnet`, `opus` still deserialize). Absent or `null` →
-`primary_runner = None` in `ProjectConfig`; loop behavior is byte-identical to
-a pure-Claude run.
+routes must provide a nonblank model. Absent or `null` →
+`primary_runner = None` in `ProjectConfig`.
 
-### Routing precedence (`resolve_task_execution_target`)
+> **REFACTOR-005 (FR-002 hard break)**: `primaryRunner` is a legacy,
+> deserialize-only surface. A config that actually SETS it hard-errors at the
+> loop/batch preflight (`detect_legacy_model_keys`); spawn-side model/provider
+> routing is owned entirely by the provider-first `models` + `routing` block via
+> `model::resolve_execution_plan`. The `baselineTierRoutes` sub-map and the whole
+> legacy resolution chain (the pre-FR-001 task-model resolution functions and
+> the substring-tier classifier) were deleted. The
+> ONLY surviving consumer of a `primaryRunner` block is the opt-in Codex→Claude
+> RuntimeError fallback in `recovery::maybe_provider_runtime_fallback`, which
+> matches direct `byTaskType` / `byIdPrefix` routes via
+> `model::primary_runner_match`.
 
-```
-explicit task model   (tasks.model DB column / model_overrides override; provider hint cleared)
-  → direct primaryRunner match  (byTaskType wins over byIdPrefix; may carry provider hint)
-    → compute baseline Claude model  (`model::compute_baseline_model`)
-      → difficulty=high   (forces OPUS_MODEL)
-        → prd default     (prd_metadata.default_model)
-          → project default (.task-mgr/config.json defaultModel)
-            → user default  ($XDG_CONFIG_HOME/task-mgr/config.json defaultModel)
-    → primaryRunner.baselineTierRoutes remap for the task prefix + baseline tier
-      → baseline Claude model
-        → None
-```
-
-Rung 2 (`primaryRunner`) is skipped entirely when `primary_runner = None` —
-making the resolution chain byte-identical to the pre-primary-runner build.
-Callers that need the runner must use `resolve_task_execution_target`, not
-`resolve_task_model`, so explicit provider intent from `primaryRunner` survives
-to `resolve_effective_runner`. If a later pre-spawn rewrite changes the model
-(reviewModel, crash escalation, or an operator/model override), clear
-`provider_hint`; do not carry stale Codex intent across that rewrite.
-
-**Match priority** inside `byTaskType` / `byIdPrefix` (both must be checked
-for EVERY task):
+**Match priority** inside `byTaskType` / `byIdPrefix` (both must be checked):
 
 1. `byTaskType` — exact, case-sensitive match on the semantic task type
    (e.g. `"review"`, `"milestone"`).
 2. `byIdPrefix` — the task ID body (after stripping the 8-hex project prefix)
    starts with the map key, OR the body contains `"-<key>"`.
-3. `baselineTierRoutes` — checked after the normal baseline is computed;
-   uses the same task-ID prefix matching, then selects the route matching the
-   provider-neutral baseline tier.
 
-When both produce a match, `byTaskType` wins.
-Overlapping `byIdPrefix` / `baselineTierRoutes` prefixes are allowed only when
-the overlapping routes have identical `RunnerSpec`s; conflicting overlaps are
-config errors caught before loop startup.
+When both produce a match, `byTaskType` wins. Overlapping `byIdPrefix`
+prefixes are allowed only when the overlapping routes have identical
+`RunnerSpec`s; conflicting overlaps are config errors caught before loop startup.
 
 **SSoT**: `model::primary_runner_match` is the single prefix-matching impl —
 do NOT re-implement the prefix-matching logic anywhere else.
-`model::compute_baseline_model` is the single home for the baseline subtree
-(`difficulty=high → OPUS_MODEL`, else the first non-blank of prd → project →
-user default through `normalize`). Both the primary resolution site
-(`resolve_task_execution_target`) **and** the recovery path
-(`recovery::maybe_provider_runtime_fallback`) call `compute_baseline_model` with
-the SAME four inputs (difficulty, prd/project/user defaults), so a recovering
-Codex task derives the exact baseline tier it was originally routed by. This
-closed the FIX-001 divergence where recovery re-derived the baseline from
-`claude_fallback_model` and omitted `user_default`, letting it match a different
-`baselineTierRoutes` route than the spawn site. Never re-derive either formula
-inline.
 
 ### Symmetric Claude↔Grok fallback contract
 
@@ -434,7 +398,7 @@ AND inserts matching entries into `ctx.runner_overrides` / `ctx.model_overrides`
 atomically. Idempotency guard: a task already carrying a promotion override
 (in either direction) skips this rung and falls through to rung 5. The DB
 UPDATE AND the override-map inserts MUST run together — otherwise
-`resolve_task_model` on the next iteration silently shadows the override.
+model resolution on the next iteration silently shadows the override.
 
 Rungs 1–4 reset the task status to `todo` (and clear `started_at`) so the next
 iteration retries with the override applied; rung 5 sets `blocked`. Behavior
@@ -455,12 +419,12 @@ the operator sees the escape valve fired. Short-circuits for any task that
 never triggered the ladder (the dominant case is free).
 
 **Provider routing — `model::provider_for_model` +
-`ResolvedExecutionTarget.provider_hint`**: `provider_for_model` classifies a
+`EffectiveRunnerInput.provider_hint`**: `provider_for_model` classifies a
 model id as `Provider::Claude` or `Provider::Grok` via **token equality on `-`
 splits of the lowercased id**, returning `Provider::Grok` iff *some token is
 exactly* `"grok"`. It never returns `Provider::Codex`; Codex is routed only by
-explicit `primaryRunner` provider intent carried on
-`ResolvedExecutionTarget.provider_hint`. Substring matching
+explicit provider intent from the resolved `ExecutionPlan.provider`, carried to
+the spawn site via `EffectiveRunnerInput.provider_hint`. Substring matching
 (`.contains("grok")`) is explicitly prohibited because it would mis-route Groq
 Inc. models (`groq-llama-3`, etc.) to the xAI Grok runner. Every other input —
 `None`, the empty string, unknown model ids, Codex-looking model ids, the
@@ -485,7 +449,7 @@ propagate)**:
   `prompt_bytes`, `sections`, `dropped_sections`, `recovery`, `dump_path`).
   `sections` is an ordered JSON array of `[name, size]` pairs (NOT a map).
   `recovery` is a tagged object with discriminator field `action` and
-  variant-specific siblings (e.g. `{"action": "escalate_model", "new_model": "..."}`).
+  variant-specific siblings (e.g. `{"action": "escalate_tier", "new_model": "..."}`).
 - **Rotation**: keeps newest 3 dumps per task ID via
   `overflow::rotate_dumps_keep_n`. Each entry (unreadable dir entry, missing
   metadata, failed deletion) is logged and skipped independently so a single
@@ -1201,12 +1165,13 @@ For the full site→verb audit table and source-allowance matrix see
 | Overflow recovery ladder | `src/loop_engine/reactions/post_output.rs` + `src/loop_engine/overflow.rs` | `handle_overflow` (coordinator, owns the ladder), `handle_prompt_too_long` (`#[deprecated]` shim), `sanitize_id_for_filename`, `rotate_dumps_keep_n`, `RecoveryAction::FallbackToProvider` |
 | LLM runner dispatch | `src/loop_engine/runner.rs` + `src/loop_engine/engine.rs` | `RunnerKind`, `dispatch`, `ClaudeRunner`, `GrokRunner`, `CodexRunner`, `resolve_effective_runner` |
 | Capability surface | `src/loop_engine/runner.rs` | `RunnerCapability`, `LlmRunner::supports`, `enforce_capabilities`, `CHECKS` |
-| Provider routing | `src/loop_engine/model.rs` | `Provider`, `ResolvedExecutionTarget`, `provider_for_model`, `resolve_task_execution_target` |
+| Provider routing | `src/loop_engine/model.rs` | `Provider`, `ExecutionPlan`, `provider_for_model`, `resolve_execution_plan` |
 | Operator escape valve | `src/loop_engine/recovery.rs` | `check_override_invalidation` |
 | Overflow original model snapshot | `src/loop_engine/engine.rs` | `IterationContext::overflow_original_task_model` |
 | Fallback runner config | `src/loop_engine/project_config.rs` | `FallbackRunnerConfig`, `check_fallback_runner_binary` |
 | Primary runner config + routing | `src/loop_engine/project_config.rs` | `PrimaryRunnerConfig`, `RunnerSpec` |
-| Primary runner model/provider routing | `src/loop_engine/model.rs` | `primary_runner_match`, `resolve_task_execution_target`, `resolve_task_model`, `ModelResolutionContext` |
+| Spawn-side model/provider routing | `src/loop_engine/model.rs` | `resolve_execution_plan`, `ExecutionPlan`, `PlanContext`, `ResolvedModelsConfig` |
+| Primary runner match (recovery fallback only) | `src/loop_engine/model.rs` | `primary_runner_match` |
 | Auto-review launch boundary | `src/loop_engine/auto_review.rs` | `maybe_fire`, `maybe_fire_inner`, `ProcessLauncher` |
 | Shared post-Claude pipeline | `src/loop_engine/iteration_pipeline.rs` | `process_iteration_output` |
 | Merge resolver | `src/loop_engine/merge_resolver.rs` | `ClaudeMergeResolver`, `MergeResolver` trait |

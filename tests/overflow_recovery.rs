@@ -25,9 +25,7 @@ use tempfile::TempDir;
 
 use task_mgr::loop_engine::config::{CrashType, IterationOutcome};
 use task_mgr::loop_engine::engine::IterationContext;
-use task_mgr::loop_engine::model::{
-    FABLE_MODEL, ONE_M_SUFFIX, OPUS_MODEL, OPUS_MODEL_1M, SONNET_MODEL,
-};
+use task_mgr::loop_engine::model::{FABLE_MODEL, ONE_M_SUFFIX, OPUS_MODEL, SONNET_MODEL};
 use task_mgr::loop_engine::overflow::{OverflowEvent, RecoveryAction, sanitize_id_for_filename};
 use task_mgr::loop_engine::project_config::ProjectConfig;
 use task_mgr::loop_engine::prompt::PromptResult;
@@ -117,7 +115,7 @@ fn list_dump_files(base_dir: &Path, sanitized_task: &str) -> Vec<std::path::Path
 fn rung_label(a: &RecoveryAction) -> &'static str {
     match a {
         RecoveryAction::DowngradeEffort { .. } => "downgrade_effort",
-        RecoveryAction::EscalateModel { .. } => "escalate_model",
+        RecoveryAction::EscalateTier { .. } => "escalate_tier",
         RecoveryAction::To1mModel { .. } => "to_1m_model",
         RecoveryAction::FallbackToProvider { .. } => "fallback_to_provider",
         RecoveryAction::Blocked => "blocked",
@@ -128,7 +126,7 @@ fn rung_label(a: &RecoveryAction) -> &'static str {
 
 /// Sonnet+xhigh starting state: four synthetic `PromptTooLong` events should
 /// produce exactly the rung sequence
-/// [downgrade_effort → escalate_model → to_1m_model → blocked].
+/// [downgrade_effort → escalate_tier → to_1m_model → blocked].
 ///
 /// Iteration-by-iteration the next-iteration model/effort are derived by the
 /// engine from `ctx.effort_overrides` / `ctx.model_overrides`; the test
@@ -183,7 +181,7 @@ fn ladder_walk_sonnet_xhigh_to_blocked() {
     )
     .unwrap();
 
-    // Iter 2: Sonnet + high → escalate_below_opus to Opus.
+    // Iter 2: Sonnet + high → escalate one tier to Opus.
     let a2 = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
         conn: &mut conn,
@@ -198,9 +196,9 @@ fn ladder_walk_sonnet_xhigh_to_blocked() {
         effective_runner: RunnerKind::Claude,
         project_config: &ProjectConfig::default(),
     });
-    assert_eq!(rung_label(&a2), "escalate_model");
+    assert_eq!(rung_label(&a2), "escalate_tier");
     assert!(
-        matches!(a2, RecoveryAction::EscalateModel { ref new_model } if new_model == OPUS_MODEL)
+        matches!(a2, RecoveryAction::EscalateTier { ref new_model } if new_model == OPUS_MODEL)
     );
     assert_eq!(
         task_status(&conn, task_id),
@@ -229,9 +227,9 @@ fn ladder_walk_sonnet_xhigh_to_blocked() {
         effective_runner: RunnerKind::Claude,
         project_config: &ProjectConfig::default(),
     });
-    assert_eq!(rung_label(&a3), "escalate_model");
+    assert_eq!(rung_label(&a3), "escalate_tier");
     assert!(
-        matches!(a3, RecoveryAction::EscalateModel { ref new_model } if new_model == FABLE_MODEL),
+        matches!(a3, RecoveryAction::EscalateTier { ref new_model } if new_model == FABLE_MODEL),
         "opus must escalate one tier up to fable, got {a3:?}",
     );
     assert_eq!(
@@ -481,8 +479,8 @@ fn jsonl_appends_one_line_per_iteration_with_matching_action() {
     // escalates one tier up to fable (rung 2), not the 1M variant.
     let scenarios: [(Option<&str>, Option<&str>, &str); 3] = [
         (Some("xhigh"), Some(SONNET_MODEL), "downgrade_effort"),
-        (Some("high"), Some(SONNET_MODEL), "escalate_model"),
-        (Some("high"), Some(OPUS_MODEL), "escalate_model"),
+        (Some("high"), Some(SONNET_MODEL), "escalate_tier"),
+        (Some("high"), Some(OPUS_MODEL), "escalate_tier"),
     ];
     for (i, (effort, model, expected)) in scenarios.iter().enumerate() {
         // Re-claim between iterations (production: task selection re-picks the row).
@@ -513,7 +511,7 @@ fn jsonl_appends_one_line_per_iteration_with_matching_action() {
     let actions: Vec<&'static str> = events.iter().map(|e| rung_label(&e.recovery)).collect();
     assert_eq!(
         actions,
-        vec!["downgrade_effort", "escalate_model", "escalate_model"]
+        vec!["downgrade_effort", "escalate_tier", "escalate_tier"]
     );
 
     // Each line carries the iteration index it was emitted from.
@@ -672,10 +670,11 @@ fn original_model_captured_on_first_overflow_only() {
 
     // Iter 2/3/4: subsequent overflows arrive on escalated models, but the
     // original-model snapshot stays pinned at Sonnet.
+    let opus_1m = format!("{OPUS_MODEL}{ONE_M_SUFFIX}");
     let later: [(Option<&str>, Option<&str>); 3] = [
         (Some("high"), Some(SONNET_MODEL)),
         (Some("high"), Some(OPUS_MODEL)),
-        (Some("high"), Some(OPUS_MODEL_1M)),
+        (Some("high"), Some(opus_1m.as_str())),
     ];
     for (i, (effort, model)) in later.iter().enumerate() {
         // Reset so the SQL UPDATE has a row to flip.
@@ -811,7 +810,7 @@ fn no_pollution_outside_tempdir() {
 
 // ---------- AC TEST-002-1: override persistence across iterations -----------
 
-/// After rung 2 (escalate_model) fires, `ctx.model_overrides[task_id]` must
+/// After rung 2 (escalate_tier) fires, `ctx.model_overrides[task_id]` must
 /// still hold Opus even when subsequent iterations complete without any further
 /// overflow — the override is sticky for the lifetime of the loop slot.
 ///
@@ -842,7 +841,7 @@ fn override_persists_across_iterations() {
         effective_runner: RunnerKind::Claude,
         project_config: &ProjectConfig::default(),
     });
-    assert_eq!(rung_label(&action), "escalate_model");
+    assert_eq!(rung_label(&action), "escalate_tier");
     assert_eq!(
         ctx.model_overrides.get(task_id).map(String::as_str),
         Some(OPUS_MODEL),
@@ -904,7 +903,7 @@ fn original_model_captured_first_overflow_only() {
     )
     .unwrap();
 
-    // Observation 2: Sonnet+high → rung 2 (escalate_model).
+    // Observation 2: Sonnet+high → rung 2 (escalate_tier).
     let a2 = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
         conn: &mut conn,
@@ -919,7 +918,7 @@ fn original_model_captured_first_overflow_only() {
         effective_runner: RunnerKind::Claude,
         project_config: &ProjectConfig::default(),
     });
-    assert_eq!(rung_label(&a2), "escalate_model");
+    assert_eq!(rung_label(&a2), "escalate_tier");
     assert_eq!(
         ctx.overflow_original_model.get(task_id).map(String::as_str),
         Some(SONNET_MODEL),
@@ -932,7 +931,7 @@ fn original_model_captured_first_overflow_only() {
     )
     .unwrap();
 
-    // Observation 3: Opus+high → rung 2 (escalate_model, opus→fable). Even
+    // Observation 3: Opus+high → rung 2 (escalate_tier, opus→fable). Even
     // though the *current* effective_model is Opus, the snapshot must remain
     // Sonnet.
     let a3 = handle_overflow(HandleOverflowParams {
@@ -949,7 +948,7 @@ fn original_model_captured_first_overflow_only() {
         effective_runner: RunnerKind::Claude,
         project_config: &ProjectConfig::default(),
     });
-    assert_eq!(rung_label(&a3), "escalate_model");
+    assert_eq!(rung_label(&a3), "escalate_tier");
     assert_eq!(
         ctx.overflow_original_model.get(task_id).map(String::as_str),
         Some(SONNET_MODEL),

@@ -1319,7 +1319,7 @@ fn handle_overflow_rung_ladder_matches_pre_relocation() {
         );
         assert_eq!(
             action,
-            RecoveryAction::EscalateModel {
+            RecoveryAction::EscalateTier {
                 new_model: expected.to_string()
             },
             "rung 2: at the high effort floor, {model} must escalate to {expected}",
@@ -1702,7 +1702,7 @@ fn handle_overflow_emits_jsonl_event_with_core_fields() {
 // ---------------------------------------------------------------------------
 // AC5 (RUNS LIVE): known-bad discriminator. A stub overflow ladder that SKIPS
 // rung 1 (effort downgrade) jumps straight to model escalation, so on the
-// (xhigh, sonnet) input it yields EscalateModel{opus} instead of
+// (xhigh, sonnet) input it yields EscalateTier{opus} instead of
 // DowngradeEffort{high}. This proves the rung-1 assertion in
 // `handle_overflow_rung_ladder_matches_pre_relocation` actually discriminates:
 // a regression that drops the effort-downgrade rung is rejected.
@@ -1716,7 +1716,7 @@ fn naive_overflow_skipping_rung1(_effort: Option<&str>, model: Option<&str>) -> 
         task_mgr::loop_engine::model::Provider::Claude,
         model,
     ) {
-        RecoveryAction::EscalateModel { new_model: next }
+        RecoveryAction::EscalateTier { new_model: next }
     } else if let Some(m1m) = to_1m_model(model) {
         RecoveryAction::To1mModel { new_model: m1m }
     } else {
@@ -1730,10 +1730,10 @@ fn known_bad_overflow_skipping_rung1_fails_the_downgrade_assertion() {
     let action = naive_overflow_skipping_rung1(Some("xhigh"), Some(SONNET_MODEL));
 
     // The real coordinator returns DowngradeEffort{high}; the rung-1-skipping
-    // stub returns EscalateModel{opus}, so it WOULD fail that assertion.
+    // stub returns EscalateTier{opus}, so it WOULD fail that assertion.
     assert_eq!(
         action,
-        RecoveryAction::EscalateModel {
+        RecoveryAction::EscalateTier {
             new_model: OPUS_MODEL.to_string()
         },
         "rung-1-skipping stub jumps to model escalation on xhigh effort",

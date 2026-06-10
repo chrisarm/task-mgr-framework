@@ -777,53 +777,51 @@ fn build_prompt_critical_only_oversize_returns_sentinel_bundle() {
 // ---------------------------------------------------------------------------
 // FEAT-004 — the wave slot spawn-site (build_prompt) resolves through the
 // single FR-003 path (resolve_execution_plan), identical to the sequential
-// builder. The legacy `primaryRunner.baselineTierRoutes` map and the
-// prd/project/user `default_model` are NO LONGER consulted by the spawn-side
-// resolver — routing now flows from the `models` + `routing` config blocks.
+// builder. The legacy `primaryRunner` map and the prd/project/user
+// `default_model` are NO LONGER consulted by the spawn-side resolver — routing
+// now flows from the `models` + `routing` config blocks.
 //
 // These tests pin that behavior change: a medium-difficulty FEAT task lands on
-// the anchor window's standard tier (OPUS) regardless of a legacy
-// baselineTierRoutes config or a threaded default. (TEST-010 adds the positive
-// routing.byIdPrefix slot-path coverage; here we prove the legacy surfaces are
-// inert.)
+// the anchor window's standard tier (OPUS) regardless of a legacy primaryRunner
+// config or a threaded default. (TEST-010 adds the positive routing.byIdPrefix
+// slot-path coverage; here we prove the legacy surfaces are inert.)
 // ---------------------------------------------------------------------------
 
 const GROK_MODEL: &str = "grok-build";
 
-/// A legacy `baselineTierRoutes` config (`FEAT` prefix → Grok on the `standard`
-/// tier). Passed to the slot builder ONLY to prove the new resolver ignores it.
-fn baseline_tier_cfg() -> PrimaryRunnerConfig {
-    let mut tiers = std::collections::HashMap::new();
-    tiers.insert(
-        "standard".to_string(),
+/// A legacy `primaryRunner` config (`FEAT` id-prefix → Grok). Passed to the slot
+/// builder ONLY to prove the new resolver ignores the legacy primaryRunner
+/// surface.
+fn legacy_primary_runner_cfg() -> PrimaryRunnerConfig {
+    let mut by_id_prefix = std::collections::HashMap::new();
+    by_id_prefix.insert(
+        "FEAT".to_string(),
         RunnerSpec {
             provider: "grok".to_string(),
             model: GROK_MODEL.to_string(),
             ..Default::default()
         },
     );
-    let mut baseline_tier_routes = std::collections::HashMap::new();
-    baseline_tier_routes.insert("FEAT".to_string(), tiers);
     PrimaryRunnerConfig {
-        baseline_tier_routes,
+        by_id_prefix,
         ..Default::default()
     }
 }
 
 #[test]
-fn wave_slot_ignores_legacy_baseline_tier_routes_resolves_via_anchor_window() {
+fn wave_slot_ignores_legacy_primary_runner_resolves_via_anchor_window() {
     let (_tmp, conn) = setup_migrated_db();
     let project = project_with_files(&[]);
     let base_prompt = project.path().join("prompt.md");
     fs::write(&base_prompt, "# base\n").unwrap();
 
-    // Medium-difficulty FEAT task. Even with a legacy baselineTierRoutes config
+    // Medium-difficulty FEAT task. Even with a legacy primaryRunner config
     // AND a threaded SONNET prd_default, the FR-003 spawn-side resolver consults
     // neither — it uses the anchor window: medium → standard tier → OPUS.
     let mut task = Task::new("8d71d1f7-FEAT-001", "wave anchor-window resolution");
     task.difficulty = Some("medium".into());
 
-    let cfg = baseline_tier_cfg();
+    let cfg = legacy_primary_runner_cfg();
     let params = SlotPromptParams {
         project_root: project.path().to_path_buf(),
         base_prompt_path: base_prompt,
@@ -844,7 +842,7 @@ fn wave_slot_ignores_legacy_baseline_tier_routes_resolves_via_anchor_window() {
         bundle.resolved_model.as_deref(),
         Some(OPUS_MODEL),
         "the slot builder resolves via the FR-003 anchor window (medium→standard→OPUS); \
-         the legacy baselineTierRoutes grok route and the SONNET prd_default are NOT \
+         the legacy primaryRunner grok route and the SONNET prd_default are NOT \
          consulted by the spawn-side resolver (FEAT-004)",
     );
     assert_eq!(
@@ -870,7 +868,7 @@ fn wave_slot_anchor_window_resolves_without_any_default() {
     );
     task.difficulty = Some("medium".into());
 
-    let cfg = baseline_tier_cfg();
+    let cfg = legacy_primary_runner_cfg();
     let params = SlotPromptParams {
         project_root: project.path().to_path_buf(),
         base_prompt_path: base_prompt,

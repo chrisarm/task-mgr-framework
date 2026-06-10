@@ -292,7 +292,7 @@ pub(crate) fn escalate_task_model_if_needed_inner(
             // to (at least) the Opus rung — sub-Opus escalations get a fresh
             // chance at a higher Claude tier before any cross-provider pivot.
             // Config exact-match via `tier_of` (the 1M variant strips its suffix
-            // first), NOT substring `model_tier`: a model at the Standard tier
+            // first), NOT substring tier matching: a model at the Standard tier
             // (Opus) OR above (Frontier/Fable) is pivot-eligible. This preserves
             // the prior OPUS / OPUS[1M] behavior and correctly extends it to the
             // new frontier tier without resurrecting dead substring matching.
@@ -404,27 +404,24 @@ pub(crate) fn escalate_task_model_if_needed_inner(
 /// callers exclude `Crash(CodexAuthFailure)` before invoking
 /// `handle_task_failure`. Treat any reached call as a runtime fault.
 ///
-/// FIX-001: `project_default` / `user_default` are the engine-cached config
-/// defaults threaded from the failure-handler chain. The baseline tier (used to
-/// match a `baselineTierRoutes` route) is derived via
-/// [`model::compute_baseline_model`] from the SAME four inputs the primary
-/// spawn-site (`resolve_task_execution_target`) uses — `difficulty`,
-/// `prd_default`, `project_default`, `user_default` — so a recovering task
-/// matches the route it was originally routed by. Earlier this site substituted
-/// `primary.claude_fallback_model` for `project_default` and omitted
-/// `user_default`, causing a confirmed recovery↔primary divergence.
+/// `_project_default` / `_user_default` are the engine-cached config defaults
+/// threaded from the failure-handler chain. They were the inputs to the old
+/// `baselineTierRoutes` tier derivation (superseded baseline-tier machinery
+/// deleted in REFACTOR-005) — the route is now matched solely by direct
+/// `primaryRunner` `byTaskType` / `byIdPrefix` entries via
+/// [`model::primary_runner_match`]. The params are retained (still threaded by
+/// the failure-handler chain) rather than ripped out of six function signatures
+/// in a deletion-only diff; a follow-up may prune them.
 fn maybe_provider_runtime_fallback(
     conn: &Connection,
     task_id: &str,
     new_count: i32,
     ctx: &IterationContext,
     primary_cfg: Option<&project_config::PrimaryRunnerConfig>,
-    project_default: Option<&str>,
-    user_default: Option<&str>,
+    _project_default: Option<&str>,
+    _user_default: Option<&str>,
 ) -> TaskMgrResult<(Option<String>, Option<PendingPromotion>)> {
-    use crate::loop_engine::model::{
-        Provider, parse_config_provider, primary_runner_baseline_tier_match, primary_runner_match,
-    };
+    use crate::loop_engine::model::{Provider, parse_config_provider, primary_runner_match};
 
     // Idempotency is enforced by `promote_once` below (the single
     // `runner_overrides.contains_key` guard); it is no longer inlined here.
@@ -446,25 +443,9 @@ fn maybe_provider_runtime_fallback(
         )
         .ok()
         .flatten();
-    let prd_default: Option<String> = conn
-        .query_row(
-            "SELECT default_model FROM prd_metadata WHERE id = 1",
-            [],
-            |r| r.get(0),
-        )
-        .ok()
-        .flatten();
-    let baseline_model = model::compute_baseline_model(
-        difficulty.as_deref(),
-        prd_default.as_deref(),
-        project_default,
-        user_default,
-    );
     // `task_type` is not threaded into recovery; production Codex routing is
-    // dominated by `byIdPrefix` and `baselineTierRoutes`.
-    let Some(spec) = primary_runner_match(primary, Some(task_id), None).or_else(|| {
-        primary_runner_baseline_tier_match(primary, Some(task_id), baseline_model.as_deref())
-    }) else {
+    // matched by the direct `byIdPrefix` / `byTaskType` routes only.
+    let Some(spec) = primary_runner_match(primary, Some(task_id), None) else {
         return Ok((None, None));
     };
     if !spec.runtime_error_fallback {
@@ -479,7 +460,7 @@ fn maybe_provider_runtime_fallback(
 
     // Resolve the target Claude model. The AC says "OPUS for difficulty high,
     // else default" — we read the task's difficulty from the DB and pick:
-    //   - high → OPUS_MODEL (matches `resolve_task_model` rung 3 semantics)
+    //   - high → OPUS_MODEL (matches the difficulty=high baseline semantics)
     //   - else → `primary.claude_fallback_model` if set (mirrors the
     //     symmetric Grok→Claude branch's source of truth), else OPUS_MODEL
     //     as the safe baseline. Opting in via `runtimeErrorFallback:true` makes
@@ -544,7 +525,7 @@ fn maybe_provider_runtime_fallback(
 /// task is promoted to the Grok runner. The promotion writes BOTH the
 /// `tasks.model` column AND the in-memory override maps on `ctx`
 /// (`runner_overrides`, `model_overrides`) so the next iteration's
-/// `resolve_task_model` + `resolve_effective_runner` agree. The pre-promotion
+/// model resolution + `resolve_effective_runner` agree. The pre-promotion
 /// `tasks.model` value is captured into `ctx.overflow_original_task_model`
 /// via `entry().or_insert_with(...)` so the FEAT-008 override-invalidation
 /// detector can spot operator edits later.
@@ -725,11 +706,12 @@ pub fn auto_block_task(
 /// configuration so the embedded escalation call can fire the inverse
 /// Grok→Claude promotion. Pass `None` to suppress the inverse branch.
 ///
-/// **FIX-001**: `project_default` / `user_default` are the engine-cached config
-/// defaults (`engine.rs` run-config fields), threaded through to the embedded
+/// `project_default` / `user_default` are the engine-cached config defaults
+/// (`engine.rs` run-config fields), threaded through to the embedded
 /// `escalate_task_model_if_needed_inner` → `maybe_provider_runtime_fallback`
-/// baseline derivation so a recovering provider-routed task matches the same
-/// `baselineTierRoutes` route the primary spawn-site routed it by.
+/// chain. They fed the old baseline-tier route derivation that REFACTOR-005
+/// removed; the params remain threaded (a follow-up may prune them) but no
+/// longer influence routing.
 #[allow(clippy::too_many_arguments)]
 pub fn handle_task_failure(
     conn: &mut Connection,
@@ -1911,7 +1893,6 @@ mod tests {
             runtime_error_threshold: 2,
             by_task_type: std::collections::HashMap::new(),
             by_id_prefix,
-            ..Default::default()
         }
     }
 
@@ -2153,7 +2134,6 @@ mod tests {
             runtime_error_threshold: 2,
             by_task_type: std::collections::HashMap::new(),
             by_id_prefix,
-            ..Default::default()
         };
         let mut ctx = IterationContext::new(8);
         // Force-mark this task as Codex-executing so we exercise the new branch.
