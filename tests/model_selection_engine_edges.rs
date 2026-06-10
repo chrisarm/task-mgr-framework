@@ -626,6 +626,131 @@ fn blackout_reroute_leaves_runner_overrides_untouched() {
     );
 }
 
+/// TEST-010 — the PRD success metric, end-to-end in ONE scenario: under a
+/// simulated Claude rate limit (an active Claude quota blackout), a medium FEAT
+/// implementation task REROUTES to Grok while a frontier REVIEW task DEFERS
+/// (stays on Claude/frontier — review is never spillover-eligible), and the
+/// deferral-first path increments the stale counter ZERO times.
+///
+/// This composes the two halves the prior tests pinned separately
+/// (`blackout_reroute_leaves_runner_overrides_untouched` = medium reroutes;
+/// `edge_case_1_*` = stale untouched) and adds the load-bearing asymmetry: the
+/// frontier task must NOT reroute. Resolution runs through the real
+/// `resolve_execution_plan`; the deferral through the real
+/// `handle_quota_deferral_inner` both no-eligible handlers share.
+#[test]
+fn blackout_medium_reroutes_while_frontier_review_defers_zero_stale() {
+    // Production-shaped FR-001 config: Claude primary (full ladder) + Grok
+    // enabled, anchor=standard, spillover up to `high`.
+    let models: ModelsConfig = serde_json::from_value(serde_json::json!({
+        "primaryProvider": "claude",
+        "anchor": "standard",
+        "providers": {
+            "claude": {
+                "enabled": true,
+                "tiers": {
+                    "cheapest": HAIKU_MODEL,
+                    "cost-efficient": SONNET_MODEL,
+                    "standard": OPUS_MODEL,
+                    "frontier": FABLE_MODEL
+                }
+            },
+            "grok": {
+                "enabled": true,
+                "tiers": { "standard": "grok-build" }
+            }
+        }
+    }))
+    .unwrap();
+    let routing: RoutingConfig =
+        serde_json::from_value(serde_json::json!({ "spillover": { "maxDifficulty": "high" } }))
+            .unwrap();
+    let resolved = resolve_models_config(&models, &routing);
+
+    let (_dir, conn) = setup_db();
+    // A non-empty todo queue so the deferral-first branch has work to defer.
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, max_retries, consecutive_failures) \
+         VALUES ('FEAT-MED-001', 'medium impl', 'todo', 5, 0)",
+        [],
+    )
+    .unwrap();
+
+    let mut ctx = IterationContext::new(5);
+    assert_eq!(
+        ctx.stale_tracker.count(),
+        0,
+        "baseline: nothing counted yet"
+    );
+
+    // Simulated Claude rate limit → record the blackout on the ephemeral channel.
+    let now = 1_000_000u64;
+    ctx.provider_blackouts.record(Provider::Claude, now, 3600);
+    let active = ctx.provider_blackouts.active(now);
+
+    // Medium FEAT (default-path, spillover-eligible) → REROUTES to Grok.
+    let medium = resolve_execution_plan(&PlanContext {
+        task_id: "FEAT-MED-001",
+        task_model: None,
+        difficulty: Some("medium"),
+        models: &resolved,
+        provider_blackouts: &active,
+    });
+    assert_eq!(
+        medium.provider,
+        Provider::Grok,
+        "a medium FEAT task spills over to Grok under the Claude blackout",
+    );
+    assert_eq!(
+        medium.model.as_deref(),
+        Some("grok-build"),
+        "the rerouted medium task resolves the Grok ladder's standard rung",
+    );
+
+    // Frontier REVIEW (built-in frontier force, NOT spillover-eligible) → DEFERS:
+    // it stays on Claude/frontier and never reroutes off the blacked-out provider.
+    let review = resolve_execution_plan(&PlanContext {
+        task_id: "REVIEW-FRONTIER-001",
+        task_model: None,
+        difficulty: Some("high"),
+        models: &resolved,
+        provider_blackouts: &active,
+    });
+    assert_eq!(
+        review.provider,
+        Provider::Claude,
+        "a frontier review task is NOT spillover-eligible — it stays on the blacked-out Claude \
+         provider (it defers for quota rather than dropping providers)",
+    );
+    assert_eq!(
+        review.tier,
+        CapabilityTier::Frontier,
+        "review forces the frontier tier (built-in, not redefinable)",
+    );
+    assert_eq!(
+        review.model.as_deref(),
+        Some(FABLE_MODEL),
+        "frontier on the Claude ladder resolves FABLE",
+    );
+
+    // Deferral-first: the blacked-out provider + remaining todo work defers
+    // WITHOUT ever touching the stale tracker (the metric the PRD pins).
+    let wait = |_secs: u64| true;
+    let verdict = handle_quota_deferral_inner(&conn, None, &mut ctx.provider_blackouts, now, &wait);
+    assert_eq!(verdict, QuotaDeferral::Deferred { stopped: false });
+    assert_eq!(
+        ctx.stale_tracker.count(),
+        0,
+        "the deferral-first path must increment the stale counter ZERO times (PRD success metric)",
+    );
+    // The reroute went through the ephemeral channel only — runner_overrides
+    // (the permanent promotion channel) is untouched.
+    assert!(
+        ctx.runner_overrides.is_empty(),
+        "the blackout reroute must never write the permanent-promotion channel",
+    );
+}
+
 // ── Compile marker ────────────────────────────────────────────────────────────
 
 /// If the file stops building, this test disappears and the gap is visible in
