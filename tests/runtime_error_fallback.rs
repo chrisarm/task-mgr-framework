@@ -24,7 +24,7 @@ use task_mgr::db::{create_schema, open_connection, run_migrations};
 use task_mgr::loop_engine::engine::{
     IterationContext, escalate_task_model_if_needed, handle_task_failure,
 };
-use task_mgr::loop_engine::model::{OPUS_MODEL, OPUS_MODEL_1M, SONNET_MODEL};
+use task_mgr::loop_engine::model::{FABLE_MODEL, OPUS_MODEL, OPUS_MODEL_1M, SONNET_MODEL};
 use task_mgr::loop_engine::project_config::FallbackRunnerConfig;
 use task_mgr::loop_engine::runner::RunnerKind;
 
@@ -215,25 +215,24 @@ fn sonnet_at_threshold_escalates_to_opus_first_not_grok() {
 // ── AC #4 — Fallback disabled: existing Opus no-op preserved byte-for-byte ────
 
 /// With `fallbackRunner.enabled = false` (today's default and only state),
-/// a task at Opus with `consecutive_failures = 2` hits the existing
-/// Opus → Opus self-loop in `escalate_model`: the function returns
-/// `Some(OPUS_MODEL)` and the DB `UPDATE` rewrites the column to the same
-/// value it already held. FEAT-007 must preserve this exit path EXACTLY
-/// when `enabled = false` — same return value, same DB write shape, same
-/// stderr line. Runs unconditionally; this is the regression guard that
-/// proves the disabled path is byte-identical to today's behavior.
+/// a task at the FRONTIER ceiling (fable) with `consecutive_failures = 2` hits
+/// the tier self-loop in `escalate_tier`: the function returns
+/// `Some(FABLE_MODEL)` and the DB `UPDATE` rewrites the column to the same value
+/// it already held. With `enabled = false` the Grok branch must not fire — same
+/// return value, same DB write shape. This is the regression guard that proves
+/// the disabled path stays a pure tier self-loop at the ceiling.
 #[test]
 fn fallback_disabled_keeps_existing_opus_ceiling_byte_for_byte() {
     let (_dir, conn) = setup_db();
-    insert_task(&conn, "OPUS-CEIL-001", Some(OPUS_MODEL), 0);
+    insert_task(&conn, "FABLE-CEIL-001", Some(FABLE_MODEL), 0);
 
     let mut ctx = IterationContext::new(8);
-    // Disabled config: Grok branch MUST NOT fire — return must match today exactly.
+    // Disabled config: Grok branch MUST NOT fire — return must be the self-loop.
     let cfg = FallbackRunnerConfig::default();
     assert!(!cfg.enabled, "default config must keep fallback disabled");
     let result = escalate_task_model_if_needed(
         &conn,
-        "OPUS-CEIL-001",
+        "FABLE-CEIL-001",
         FALLBACK_THRESHOLD,
         &mut ctx,
         Some(&cfg),
@@ -242,26 +241,26 @@ fn fallback_disabled_keeps_existing_opus_ceiling_byte_for_byte() {
         None,
     )
     .unwrap();
-    // Pin today's exact return: Some(OPUS_MODEL) — the Opus self-loop in
-    // `escalate_model`. FEAT-007 with `enabled = false` must preserve this.
-    // With `enabled = true` and the Grok branch taken, the return would be
+    // Pin the self-loop return: Some(FABLE_MODEL) — the Frontier ceiling in
+    // `escalate_tier`. With `enabled = false` no Grok pivot happens. With
+    // `enabled = true` and the Grok branch taken, it would be
     // `Some(GROK_DEFAULT_MODEL)` instead.
     assert_eq!(
         result,
-        Some(OPUS_MODEL.to_string()),
-        "with fallback disabled, escalate_model loops Opus→Opus; return must match today exactly",
+        Some(FABLE_MODEL.to_string()),
+        "with fallback disabled, escalate_tier self-loops fable→fable at the ceiling",
     );
     assert!(
-        !ctx.runner_overrides.contains_key("OPUS-CEIL-001"),
+        !ctx.runner_overrides.contains_key("FABLE-CEIL-001"),
         "disabled fallback must NOT write runner_overrides",
     );
     assert_eq!(
-        read_model(&conn, "OPUS-CEIL-001").as_deref(),
-        Some(OPUS_MODEL),
-        "DB model column must remain at Opus when fallback is disabled (no Grok pivot)",
+        read_model(&conn, "FABLE-CEIL-001").as_deref(),
+        Some(FABLE_MODEL),
+        "DB model column must remain at fable when fallback is disabled (no Grok pivot)",
     );
     assert_ne!(
-        read_model(&conn, "OPUS-CEIL-001").as_deref(),
+        read_model(&conn, "FABLE-CEIL-001").as_deref(),
         Some(GROK_DEFAULT_MODEL),
         "fallback disabled MUST NOT write the Grok model to the DB",
     );

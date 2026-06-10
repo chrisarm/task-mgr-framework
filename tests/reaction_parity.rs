@@ -750,7 +750,9 @@ fn harness_fixtures_are_production_shaped_and_setup_works() {
 // ===========================================================================
 
 use task_mgr::loop_engine::engine::IterationContext;
-use task_mgr::loop_engine::model::{HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL};
+use task_mgr::loop_engine::model::{
+    FABLE_MODEL, HAIKU_MODEL, ONE_M_SUFFIX, OPUS_MODEL, SONNET_MODEL,
+};
 use task_mgr::loop_engine::reactions::account::{
     AccountUsageGateParams, UsageGateFn, account_usage_gate_inner,
 };
@@ -1173,9 +1175,9 @@ fn pre_spawn_and_gate_harness_compiles_and_setup_works() {
 //   AC5  → known_bad_overflow_skipping_rung1_fails_the_downgrade_assertion (LIVE)
 // ===========================================================================
 
-use task_mgr::loop_engine::model::{OPUS_MODEL_1M, escalate_below_opus, to_1m_model};
+use task_mgr::loop_engine::model::{builtin_resolved_models, escalate_below_ceiling, to_1m_model};
 use task_mgr::loop_engine::overflow::{OverflowEvent, RecoveryAction, sanitize_id_for_filename};
-use task_mgr::loop_engine::project_config::{FallbackRunnerConfig, ProjectConfig};
+use task_mgr::loop_engine::project_config::{ModelsConfig, ProjectConfig};
 use task_mgr::loop_engine::prompt::PromptResult;
 use task_mgr::loop_engine::reactions::post_output::{HandleOverflowParams, handle_overflow};
 
@@ -1208,14 +1210,20 @@ fn read_overflow_events(base_dir: &Path) -> Vec<OverflowEvent> {
         .collect()
 }
 
-/// A `ProjectConfig` with the Grok fallback runner ENABLED — the precondition
-/// for rung 4 (`FallbackToProvider`) on the Claude → Grok direction.
+/// A `ProjectConfig` wiring the Claude → Grok cross-provider fallback via the
+/// provider-first surface (`providers.claude.fallback = "grok"`, grok enabled) —
+/// the precondition for rung 4 (`FallbackToProvider`) on the Claude → Grok
+/// direction.
 fn config_with_fallback_enabled() -> ProjectConfig {
+    let mut models = ModelsConfig::builtin_default();
+    if let Some(p) = models.providers.get_mut("grok") {
+        p.enabled = true;
+    }
+    if let Some(p) = models.providers.get_mut("claude") {
+        p.fallback = Some("grok".to_string());
+    }
     ProjectConfig {
-        fallback_runner: Some(FallbackRunnerConfig {
-            enabled: true,
-            ..FallbackRunnerConfig::default()
-        }),
+        models,
         ..ProjectConfig::default()
     }
 }
@@ -1323,7 +1331,7 @@ fn handle_overflow_rung_ladder_matches_pre_relocation() {
         );
     }
 
-    // Rung 3 — 1M-context escalation once at the Opus ceiling.
+    // Rung 3 — 1M-context escalation once at the Frontier (fable) ceiling.
     {
         let (tmp, mut conn) = setup_migrated_db();
         insert_run(&conn);
@@ -1334,7 +1342,7 @@ fn handle_overflow_rung_ladder_matches_pre_relocation() {
             &mut ctx,
             "OF-R3",
             Some("high"),
-            Some(OPUS_MODEL),
+            Some(FABLE_MODEL),
             1,
             tmp.path(),
             None,
@@ -1344,26 +1352,27 @@ fn handle_overflow_rung_ladder_matches_pre_relocation() {
         assert_eq!(
             action,
             RecoveryAction::To1mModel {
-                new_model: OPUS_MODEL_1M.to_string()
+                new_model: format!("{FABLE_MODEL}{ONE_M_SUFFIX}")
             },
-            "rung 3: opus must escalate to the 1M-context variant",
+            "rung 3: fable at the ceiling must escalate to the 1M-context variant",
         );
         assert_eq!(task_status(&conn, "OF-R3").as_deref(), Some("todo"));
     }
 
-    // Rung 5 — no recovery available (Opus[1M] at high effort, no fallback). The
+    // Rung 5 — no recovery available (Fable[1M] at high effort, no fallback). The
     // task is blocked, NOT reset to todo.
     {
         let (tmp, mut conn) = setup_migrated_db();
         insert_run(&conn);
         insert_task_with_model(&conn, "OF-R5", None);
         let mut ctx = IterationContext::new(10);
+        let fable_1m = format!("{FABLE_MODEL}{ONE_M_SUFFIX}");
         let action = run_handle_overflow(
             &mut conn,
             &mut ctx,
             "OF-R5",
             Some("high"),
-            Some(OPUS_MODEL_1M),
+            Some(&fable_1m),
             1,
             tmp.path(),
             None,
@@ -1373,7 +1382,7 @@ fn handle_overflow_rung_ladder_matches_pre_relocation() {
         assert_eq!(
             action,
             RecoveryAction::Blocked,
-            "rung 5: Opus[1M] at high effort with no fallback config has no recovery",
+            "rung 5: Fable[1M] at high effort with no fallback config has no recovery",
         );
         assert_eq!(
             task_status(&conn, "OF-R5").as_deref(),
@@ -1395,7 +1404,8 @@ fn handle_overflow_rung4_fallback_to_provider_when_enabled() {
     disable_llm_extraction();
     let (tmp, mut conn) = setup_migrated_db();
     insert_run(&conn);
-    insert_task_with_model(&conn, "OF-R4", Some(OPUS_MODEL_1M));
+    let fable_1m = format!("{FABLE_MODEL}{ONE_M_SUFFIX}");
+    insert_task_with_model(&conn, "OF-R4", Some(&fable_1m));
     let mut ctx = IterationContext::new(10);
 
     let action = run_handle_overflow(
@@ -1403,7 +1413,7 @@ fn handle_overflow_rung4_fallback_to_provider_when_enabled() {
         &mut ctx,
         "OF-R4",
         Some("high"),
-        Some(OPUS_MODEL_1M),
+        Some(&fable_1m),
         1,
         tmp.path(),
         None,
@@ -1700,14 +1710,15 @@ fn handle_overflow_emits_jsonl_event_with_core_fields() {
 
 /// A deliberately-wrong ladder: ignores `effort` and never tries rung 1.
 fn naive_overflow_skipping_rung1(_effort: Option<&str>, model: Option<&str>) -> RecoveryAction {
-    if let Some(next) = escalate_below_opus(model) {
-        RecoveryAction::EscalateModel {
-            new_model: next.to_string(),
-        }
+    let resolved = builtin_resolved_models();
+    if let Some(next) = escalate_below_ceiling(
+        resolved,
+        task_mgr::loop_engine::model::Provider::Claude,
+        model,
+    ) {
+        RecoveryAction::EscalateModel { new_model: next }
     } else if let Some(m1m) = to_1m_model(model) {
-        RecoveryAction::To1mModel {
-            new_model: m1m.to_string(),
-        }
+        RecoveryAction::To1mModel { new_model: m1m }
     } else {
         RecoveryAction::Blocked
     }

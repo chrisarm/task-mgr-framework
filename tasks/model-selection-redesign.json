@@ -518,7 +518,7 @@
       "id": "FEAT-006",
       "modifiesBehavior": false,
       "notes": "PRD Open Question RESOLVED 2026-06-09 (pre-loop spike, codex-cli 0.136.0): verification method was --strict-config with an invalid value (errors pre-API enumerating the accepted set) + unknown-key tripwire (proves valid values parse). Do not re-run. Learning 4552/4983: protected-state guard sites (iteration.rs, slot.rs, wave_scheduler.rs) must remain wrapped.",
-      "passes": false,
+      "passes": true,
       "priority": 25,
       "qualityDimensions": [
         "Spike-verified (resolved 2026-06-09): key name, levels, position confirmed against pinned codex-cli 0.136.0; cap-at-high is policy, surfaced in the validation message",
@@ -653,7 +653,7 @@
       "model": "claude-opus-4-8",
       "modifiesBehavior": true,
       "notes": "Learning 3927 is the bug class this prevents: wave-mode empty-group path went straight to the stale tracker, causing false stale-abort. Learning 4171: wave-mode rate-limit reaction fires once per wave (post-wave aggregation), not per slot — hook the blackout recording there. Learning 4921/4672: promote_once is the only permanent-promotion guard; the blackout channel is derived per pass, never stored in overrides. Reactions single-home contract applies (account.rs coordinators, learning 4865/4186).",
-      "passes": false,
+      "passes": true,
       "priority": 27,
       "qualityDimensions": [
         "Channel discipline type-enforced: BlackoutState newtype, three rules in the doc comment, consistency pinned by tests",

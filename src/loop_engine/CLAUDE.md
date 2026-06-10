@@ -161,7 +161,7 @@ do NOT re-implement the prefix-matching logic anywhere else.
 (`difficulty=high → OPUS_MODEL`, else the first non-blank of prd → project →
 user default through `normalize`). Both the primary resolution site
 (`resolve_task_execution_target`) **and** the recovery path
-(`recovery::maybe_codex_fallback_to_claude`) call `compute_baseline_model` with
+(`recovery::maybe_provider_runtime_fallback`) call `compute_baseline_model` with
 the SAME four inputs (difficulty, prd/project/user defaults), so a recovering
 Codex task derives the exact baseline tier it was originally routed by. This
 closed the FIX-001 divergence where recovery re-derived the baseline from
@@ -188,7 +188,7 @@ per site: `recovery::promote_once` (CONTRACT-PROMO-001) owns the single
 `contains_key` guard and constructs the `PendingPromotion`. All four
 cross-provider branches call it — Claude→Grok and Grok→Claude (RuntimeError
 escalation, `recovery::escalate_task_model_if_needed_inner`), Codex→Claude
-(`recovery::maybe_codex_fallback_to_claude`), and the overflow rung-4 pivot
+(`recovery::maybe_provider_runtime_fallback`), and the overflow rung-4 pivot
 (`reactions::post_output::handle_overflow`). The recovery sites defer the apply
 to `apply_pending_promotion` after `tx.commit()?`; the overflow site applies
 immediately (its own `runner_overrides`/`model_overrides` inserts + the rung-4
@@ -396,27 +396,38 @@ overflowed-but-to-be-retried task as a terminal failure.
 | Rung | Action | Claude runner | Grok runner | Codex runner |
 |---|---|---|---|---|
 | 1 | Downgrade effort (`xhigh → high`) | ✓ | ✓ | — |
-| 2 | Escalate model below Opus (`haiku → sonnet`, `sonnet → opus`) | ✓ | — | — |
-| 3 | Escalate to 1M-context Opus (`opus → opus[1m]`) | ✓ | — | — |
-| 4 | **FallbackToProvider** — cross-provider pivot | → Grok via `fallbackRunner` | → Claude via `primaryRunner.claudeFallbackModel` | — |
+| 2 | `escalate_below_ceiling` — up one DEFINED tier on the SOURCE provider's ladder (`haiku → sonnet → opus → fable`); `None` at the ceiling | ✓ | — | — |
+| 3 | `to_1m_model` — append `ONE_M_SUFFIX` at the ceiling (`fable → fable[1m]`, suffix-append, Claude-only) | ✓ | — | — |
+| 4 | **FallbackToProvider** — tier-preserving cross-provider pivot to `providers.<source>.fallback` | → fallback provider | → fallback provider | → fallback provider |
 | 5 | Block (no further recovery) | ✓ | ✓ | ✓ |
 
-Rung 2 and 3 are Claude-only: Grok and Codex do not support the 1M-context
-variant in the same way. Codex v1 also has no effort flag and no cross-provider
-rung-4 fallback target, so Codex prompt overflow falls through to block after
-recording the overflow event.
+Rung 2 walks the SOURCE provider's capability ladder (config exact-match via
+`model::escalate_below_ceiling`, no substring matching). A single-rung provider
+(Grok, Codex) already sits at its ceiling, so rung 2 is a no-op for it and the
+ladder advances. Rung 3 (`to_1m_model`) is Claude-only — 1M context is a
+Claude-only capability; it suffix-appends `ONE_M_SUFFIX` to ANY Claude tier
+(opus[1m], fable[1m]), gated on the source provider being Claude. Codex v1 has
+no effort flag; with no `providers.codex.fallback` set it falls through to block.
 
-**Rung 4 detail — `FallbackToProvider`**: fires only when:
-- The effective runner is `RunnerKind::Claude` AND `fallback_runner` is
-  `Some(cfg)` with `cfg.enabled = true` (Claude → Grok), **OR**
-- The effective runner is `RunnerKind::Grok` AND `primary_runner` is
-  `Some(pr)` with `pr.claude_fallback_model.is_some()` (Grok → Claude).
+**Rung 4 detail — `FallbackToProvider`** (FEAT-007, config-derived): the pivot
+target is `providers.<source>.fallback` from the provider-first `models` config
+(`ResolvedModelsConfig::fallback_provider`), and the target model is
+**tier-preserving** — `model_for(target_provider, tier_of(source, model))`. A
+provider gains a rung-4 pivot iff its `fallback` key is set (Codex included);
+`validate_models_config` guarantees the fallback is a different, enabled
+provider, so a self-pivot or disabled target can never reach the rung. The
+legacy `fallbackRunner` / `primaryRunner.claudeFallbackModel` surfaces no longer
+drive this rung.
 
-`RunnerKind::Codex` is deliberately closed in v1: no Claude/Grok fallback is
-derived from model strings or from `primaryRunner`. RuntimeError retry tracking
-receives the executed runner explicitly via `IterationResult.effective_runner`
-or `SlotResult.effective_runner` and must short-circuit Codex before model
-escalation/promotion.
+`RunnerKind::Codex` derives NO fallback from model strings or from
+`primaryRunner`. Its only overflow rung-4 pivot is the explicit, config-derived
+`providers.codex.fallback` (FEAT-007) — set it and Codex pivots tier-preservingly
+like any other provider; leave it unset and Codex overflow falls through to
+block. The RuntimeError retry path (separate from overflow) receives the
+executed runner explicitly via `IterationResult.effective_runner` or
+`SlotResult.effective_runner` and short-circuits Codex into the opt-in
+`maybe_provider_runtime_fallback` path rather than the Claude model
+escalation/Grok promotion.
 
 In both cases, the rung writes the target model to the `tasks.model` DB column
 AND inserts matching entries into `ctx.runner_overrides` / `ctx.model_overrides`
@@ -1067,7 +1078,7 @@ promotion via `primaryRunner.<route>.runtimeErrorFallback: true`:
 
 When `runtimeErrorFallback` is `true` on a Codex route AND the matching task
 accumulates RuntimeError crashes past `runtimeErrorThreshold`,
-`maybe_codex_fallback_to_claude` (in `recovery.rs`) writes a
+`maybe_provider_runtime_fallback` (in `recovery.rs`) writes a
 `PendingPromotion { source_runner: Codex, target_runner: Claude }` to
 `tasks.model` and threads it into `ctx.runner_overrides` AFTER `tx.commit()`
 returns Ok (same deferred-apply pattern as the Claude↔Grok promotions). The

@@ -19,19 +19,46 @@ use rusqlite::Connection;
 use tempfile::TempDir;
 
 use task_mgr::loop_engine::engine::IterationContext;
-use task_mgr::loop_engine::model::{OPUS_MODEL_1M, SONNET_MODEL};
+use task_mgr::loop_engine::model::{FABLE_MODEL, ONE_M_SUFFIX, OPUS_MODEL, OPUS_MODEL_1M};
 use task_mgr::loop_engine::overflow::{OverflowEvent, RecoveryAction};
-use task_mgr::loop_engine::project_config::{
-    FallbackRunnerConfig, PrimaryRunnerConfig, ProjectConfig,
-};
+use task_mgr::loop_engine::project_config::{ModelsConfig, ProjectConfig};
 use task_mgr::loop_engine::prompt::PromptResult;
 use task_mgr::loop_engine::reactions::post_output::{HandleOverflowParams, handle_overflow};
 use task_mgr::loop_engine::runner::RunnerKind;
 
-/// PRD-mandated default Grok model id for the fallback rung. Pinned to the
-/// literal because `model.rs` does not yet expose a `GROK_DEFAULT_MODEL`
-/// constant — FEAT-002 will add it.
+/// PRD-mandated default Grok model id for the fallback rung — the model the
+/// builtin Grok provider ladder maps its single (Standard) rung to.
 const GROK_DEFAULT_MODEL: &str = "grok-build";
+
+/// The new Claude overflow ceiling: the 1M-context variant of the frontier
+/// (fable) model. The legacy ceiling was `OPUS_MODEL_1M`; the provider-first
+/// ladder now climbs haiku → sonnet → opus → fable → fable[1m] before rung 4.
+fn fable_1m() -> String {
+    format!("{FABLE_MODEL}{ONE_M_SUFFIX}")
+}
+
+/// Build a `ProjectConfig` whose provider-first `models` block wires the
+/// cross-provider fallbacks the overflow rung-4 pivot reads
+/// (`providers.<source>.fallback`). Grok is enabled so a `claude → grok` pivot
+/// target resolves; Claude is enabled by the builtin default. A `None` fallback
+/// means that provider has no rung-4 pivot.
+fn models_with_fallbacks(
+    claude_fallback: Option<&str>,
+    grok_fallback: Option<&str>,
+) -> ProjectConfig {
+    let mut models = ModelsConfig::builtin_default();
+    if let Some(p) = models.providers.get_mut("grok") {
+        p.enabled = true;
+        p.fallback = grok_fallback.map(str::to_string);
+    }
+    if let Some(p) = models.providers.get_mut("claude") {
+        p.fallback = claude_fallback.map(str::to_string);
+    }
+    ProjectConfig {
+        models,
+        ..ProjectConfig::default()
+    }
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -101,17 +128,10 @@ fn read_events(base_dir: &Path) -> Vec<OverflowEvent> {
         .collect()
 }
 
+/// Claude → Grok fallback configured (`providers.claude.fallback = "grok"`),
+/// no inverse. Replaces the legacy `fallbackRunner` surface.
 fn enabled_fallback_cfg() -> ProjectConfig {
-    ProjectConfig {
-        fallback_runner: Some(FallbackRunnerConfig {
-            enabled: true,
-            provider: "grok".to_string(),
-            model: GROK_DEFAULT_MODEL.to_string(),
-            cli_binary: None,
-            runtime_error_threshold: 2,
-        }),
-        ..ProjectConfig::default()
-    }
+    models_with_fallbacks(Some("grok"), None)
 }
 
 // ── AC #3 — Fallback disabled: 4-rung ladder ends in Blocked, byte-identical ──
@@ -120,13 +140,14 @@ fn enabled_fallback_cfg() -> ProjectConfig {
 fn fallback_disabled_walks_existing_four_rung_to_blocked() {
     let tmp = TempDir::new().expect("tempdir");
     let task_id = "DIS-FEAT-001";
-    let mut conn = make_conn_with_task(task_id, Some(OPUS_MODEL_1M));
+    let ceiling = fable_1m();
+    let mut conn = make_conn_with_task(task_id, Some(&ceiling));
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_id);
 
-    // Default ProjectConfig has fallback_runner: None — byte-identical to
-    // pre-FEAT-006 behavior. Snapshot the model column before the call so we
-    // can assert it is untouched on the Blocked exit.
+    // Default ProjectConfig has no `providers.claude.fallback` — byte-identical
+    // to the no-cross-provider-pivot behavior. Snapshot the model column before
+    // the call so we can assert it is untouched on the Blocked exit.
     let project_cfg = ProjectConfig::default();
     let model_before = task_model(&conn, task_id);
 
@@ -135,7 +156,7 @@ fn fallback_disabled_walks_existing_four_rung_to_blocked() {
         conn: &mut conn,
         task_id,
         effort: Some("high"),
-        effective_model: Some(OPUS_MODEL_1M),
+        effective_model: Some(&ceiling),
         prompt_result: &pr,
         iteration: 1,
         run_id: Some("run-disabled"),
@@ -147,7 +168,7 @@ fn fallback_disabled_walks_existing_four_rung_to_blocked() {
 
     assert!(
         matches!(action, RecoveryAction::Blocked),
-        "fallback disabled at Opus[1M]+high MUST land on Blocked (4-rung ladder), got {action:?}",
+        "fallback absent at fable[1M]+high MUST land on Blocked (ladder exhausted), got {action:?}",
     );
     assert_eq!(
         task_status(&conn, task_id),
@@ -189,7 +210,8 @@ fn fallback_disabled_walks_existing_four_rung_to_blocked() {
 fn fallback_absent_matches_disabled_byte_for_byte() {
     let tmp = TempDir::new().expect("tempdir");
     let task_id = "ABS-FEAT-001";
-    let mut conn = make_conn_with_task(task_id, Some(OPUS_MODEL_1M));
+    let ceiling = fable_1m();
+    let mut conn = make_conn_with_task(task_id, Some(&ceiling));
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_id);
     let project_cfg = ProjectConfig::default();
@@ -199,7 +221,7 @@ fn fallback_absent_matches_disabled_byte_for_byte() {
         conn: &mut conn,
         task_id,
         effort: Some("high"),
-        effective_model: Some(OPUS_MODEL_1M),
+        effective_model: Some(&ceiling),
         prompt_result: &pr,
         iteration: 1,
         run_id: None,
@@ -225,7 +247,8 @@ fn fallback_absent_matches_disabled_byte_for_byte() {
 fn fallback_enabled_claude_at_ceiling_promotes_to_grok() {
     let tmp = TempDir::new().expect("tempdir");
     let task_id = "PROMO-FEAT-001";
-    let mut conn = make_conn_with_task(task_id, Some(OPUS_MODEL_1M));
+    let ceiling = fable_1m();
+    let mut conn = make_conn_with_task(task_id, Some(&ceiling));
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_id);
     let project_cfg = enabled_fallback_cfg();
@@ -235,7 +258,7 @@ fn fallback_enabled_claude_at_ceiling_promotes_to_grok() {
         conn: &mut conn,
         task_id,
         effort: Some("high"),
-        effective_model: Some(OPUS_MODEL_1M),
+        effective_model: Some(&ceiling),
         prompt_result: &pr,
         iteration: 1,
         run_id: Some("run-promote"),
@@ -251,7 +274,7 @@ fn fallback_enabled_claude_at_ceiling_promotes_to_grok() {
             RecoveryAction::FallbackToProvider { ref provider, ref model }
                 if provider == "grok" && model == GROK_DEFAULT_MODEL
         ),
-        "rung 4 must fire when fallback enabled AND effective_runner==Claude, got {action:?}",
+        "rung 4 must fire when providers.claude.fallback=grok AND runner==Claude, got {action:?}",
     );
     assert_eq!(
         ctx.runner_overrides.get(task_id),
@@ -277,7 +300,7 @@ fn fallback_enabled_claude_at_ceiling_promotes_to_grok() {
     // overflow_original_task_model captures the pre-fallback model column.
     assert_eq!(
         ctx.overflow_original_task_model.get(task_id),
-        Some(&Some(OPUS_MODEL_1M.to_string())),
+        Some(&Some(ceiling.clone())),
         "Step 2 capture must snapshot the pre-UPDATE tasks.model value for FR-008 invalidation",
     );
 
@@ -299,7 +322,9 @@ fn fallback_enabled_task_already_on_grok_returns_blocked() {
     let mut conn = make_conn_with_task(task_id, Some(GROK_DEFAULT_MODEL));
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_id);
-    let project_cfg = enabled_fallback_cfg();
+    // Both directions wired so rung 4 WOULD fire for a Grok source — the only
+    // thing stopping a re-promote is the `promote_once` idempotency guard.
+    let project_cfg = models_with_fallbacks(Some("grok"), Some("claude"));
 
     // Simulate an earlier iteration that promoted this task to Grok.
     ctx.runner_overrides
@@ -337,44 +362,34 @@ fn fallback_enabled_task_already_on_grok_returns_blocked() {
     assert_eq!(task_status(&conn, task_id), "blocked");
 }
 
-// ── FEAT-PRIMARY-004 — Inverse Grok → Claude rung ─────────────────────────────
+// ── Inverse Grok → Claude rung (config-derived, tier-preserving) ──────────────
 
-/// A `ProjectConfig` whose `primary_runner` carries a Claude fallback model,
-/// optionally pairing it with an enabled Grok fallback (to prove the two
-/// directions don't interfere). `claude_fallback_model = None` exercises the
-/// "no inverse target → Blocked" path.
-fn primary_runner_cfg(
-    claude_fallback_model: Option<&str>,
-    with_grok_fallback: bool,
-) -> ProjectConfig {
-    ProjectConfig {
-        fallback_runner: with_grok_fallback.then(|| FallbackRunnerConfig {
-            enabled: true,
-            provider: "grok".to_string(),
-            model: GROK_DEFAULT_MODEL.to_string(),
-            cli_binary: None,
-            runtime_error_threshold: 2,
-        }),
-        primary_runner: Some(PrimaryRunnerConfig {
-            claude_fallback_model: claude_fallback_model.map(str::to_string),
-            ..PrimaryRunnerConfig::default()
-        }),
-        ..ProjectConfig::default()
-    }
+/// A `ProjectConfig` wiring the inverse Grok → Claude pivot via
+/// `providers.grok.fallback = "claude"`, optionally pairing it with the
+/// `providers.claude.fallback = "grok"` direction (to prove the two don't
+/// interfere). `grok_to_claude = false` exercises the "no inverse target →
+/// Blocked" path.
+fn grok_inverse_cfg(grok_to_claude: bool, with_claude_to_grok: bool) -> ProjectConfig {
+    models_with_fallbacks(
+        with_claude_to_grok.then_some("grok"),
+        grok_to_claude.then_some("claude"),
+    )
 }
 
-/// AC #6 — A Grok-primary task that overflows at the ceiling, with
-/// `claudeFallbackModel` set, fires rung 4 in the inverse direction: the
-/// target is the configured Claude model, runner flips to Claude.
+/// AC #6 — A Grok task that overflows at the ceiling, with
+/// `providers.grok.fallback = "claude"` set, fires rung 4 in the inverse
+/// direction. The pivot is TIER-PRESERVING: grok-build sits at the Standard
+/// tier, so the Claude target is the Standard-rung model (opus), and the runner
+/// flips to Claude.
 #[test]
 fn grok_primary_overflow_with_claude_fallback_promotes_to_claude() {
     let tmp = TempDir::new().expect("tempdir");
     let task_id = "GROKP-FEAT-001";
-    // Native Grok-primary task: tasks.model is a Grok model, NO prior override.
+    // Native Grok task: tasks.model is a Grok model, NO prior override.
     let mut conn = make_conn_with_task(task_id, Some(GROK_DEFAULT_MODEL));
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_id);
-    let project_cfg = primary_runner_cfg(Some(SONNET_MODEL), false);
+    let project_cfg = grok_inverse_cfg(true, false);
 
     let action = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
@@ -395,9 +410,9 @@ fn grok_primary_overflow_with_claude_fallback_promotes_to_claude() {
         matches!(
             action,
             RecoveryAction::FallbackToProvider { ref provider, ref model }
-                if provider == "claude" && model == SONNET_MODEL
+                if provider == "claude" && model == OPUS_MODEL
         ),
-        "Grok-primary overflow with claudeFallbackModel set MUST promote to Claude, got {action:?}",
+        "Grok overflow with grok.fallback=claude MUST pivot to Claude (tier-preserving → opus), got {action:?}",
     );
     assert_eq!(
         ctx.runner_overrides.get(task_id),
@@ -406,12 +421,12 @@ fn grok_primary_overflow_with_claude_fallback_promotes_to_claude() {
     );
     assert_eq!(
         ctx.model_overrides.get(task_id).map(String::as_str),
-        Some(SONNET_MODEL),
-        "model_overrides MUST be set to the claude fallback model",
+        Some(OPUS_MODEL),
+        "model_overrides MUST be set to the tier-preserving Claude model (opus)",
     );
     assert_eq!(
         task_model(&conn, task_id).as_deref(),
-        Some(SONNET_MODEL),
+        Some(OPUS_MODEL),
         "tasks.model UPDATE must run so resolve_task_model picks Claude next iter",
     );
     assert_eq!(
@@ -430,14 +445,14 @@ fn grok_primary_overflow_with_claude_fallback_promotes_to_claude() {
     assert!(matches!(
         events[0].recovery,
         RecoveryAction::FallbackToProvider { ref provider, ref model }
-            if provider == "claude" && model == SONNET_MODEL
+            if provider == "claude" && model == OPUS_MODEL
     ));
     // The runner field reports the runner active when the overflow fired (Grok).
     assert_eq!(events[0].runner.as_deref(), Some("grok"));
 }
 
-/// AC #7 — A Grok-primary task that overflows with `claudeFallbackModel`
-/// ABSENT skips rung 4 and lands on Blocked — no inverse target, no mutation.
+/// AC #7 — A Grok task that overflows with `providers.grok.fallback` ABSENT
+/// skips rung 4 and lands on Blocked — no inverse target, no mutation.
 #[test]
 fn grok_primary_overflow_without_claude_fallback_blocks() {
     let tmp = TempDir::new().expect("tempdir");
@@ -445,7 +460,7 @@ fn grok_primary_overflow_without_claude_fallback_blocks() {
     let mut conn = make_conn_with_task(task_id, Some(GROK_DEFAULT_MODEL));
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_id);
-    let project_cfg = primary_runner_cfg(None, false);
+    let project_cfg = grok_inverse_cfg(false, false);
 
     let action = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
@@ -476,26 +491,27 @@ fn grok_primary_overflow_without_claude_fallback_blocks() {
     );
 }
 
-/// AC #8 (regression) — With `primary_runner = None`, an enabled Grok fallback
-/// promotes a Claude task to Grok exactly as before; the inverse branch is
-/// unreachable and the path is byte-identical to the FEAT-006 behavior.
+/// AC #8 (regression) — With NO inverse (`providers.grok.fallback` unset), the
+/// `providers.claude.fallback = "grok"` direction promotes a Claude task to Grok
+/// exactly as before; the inverse branch is unreachable.
 #[test]
 fn claude_to_grok_byte_identical_when_primary_runner_none() {
     let tmp = TempDir::new().expect("tempdir");
     let task_id = "REGRESS-FEAT-001";
-    let mut conn = make_conn_with_task(task_id, Some(OPUS_MODEL_1M));
+    let ceiling = fable_1m();
+    let mut conn = make_conn_with_task(task_id, Some(&ceiling));
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_id);
-    // fallback enabled, primary_runner explicitly None.
+    // claude→grok wired, no inverse grok→claude.
     let project_cfg = enabled_fallback_cfg();
-    assert!(project_cfg.primary_runner.is_none());
+    assert!(project_cfg.models.providers["grok"].fallback.is_none());
 
     let action = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
         conn: &mut conn,
         task_id,
         effort: Some("high"),
-        effective_model: Some(OPUS_MODEL_1M),
+        effective_model: Some(&ceiling),
         prompt_result: &pr,
         iteration: 1,
         run_id: Some("run-regress"),
@@ -511,7 +527,7 @@ fn claude_to_grok_byte_identical_when_primary_runner_none() {
             RecoveryAction::FallbackToProvider { ref provider, ref model }
                 if provider == "grok" && model == GROK_DEFAULT_MODEL
         ),
-        "Claude→Grok promotion must be unchanged when primary_runner is None, got {action:?}",
+        "Claude→Grok promotion must be unchanged when no inverse is wired, got {action:?}",
     );
     assert_eq!(ctx.runner_overrides.get(task_id), Some(&RunnerKind::Grok));
     assert_eq!(
@@ -530,25 +546,26 @@ fn grok_to_claude_promoted_task_overflows_again_blocks() {
     let tmp = TempDir::new().expect("tempdir");
     let task_id = "BOUNCE-FEAT-001";
     // Post-promotion state: the task climbed the Claude ladder to the
-    // Opus[1M]+high ceiling, so rungs 1-3 are exhausted and rung 4 is reached.
-    let mut conn = make_conn_with_task(task_id, Some(OPUS_MODEL_1M));
+    // fable[1M]+high ceiling, so rungs 1-3 are exhausted and rung 4 is reached.
+    let ceiling = fable_1m();
+    let mut conn = make_conn_with_task(task_id, Some(&ceiling));
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_id);
     // Both directions configured to prove neither re-fires.
-    let project_cfg = primary_runner_cfg(Some(SONNET_MODEL), true);
+    let project_cfg = grok_inverse_cfg(true, true);
 
-    // Simulate the prior Grok→Claude promotion (now at the Opus[1M] ceiling).
+    // Simulate the prior Grok→Claude promotion (now at the fable[1M] ceiling).
     ctx.runner_overrides
         .insert(task_id.to_string(), RunnerKind::Claude);
     ctx.model_overrides
-        .insert(task_id.to_string(), OPUS_MODEL_1M.to_string());
+        .insert(task_id.to_string(), ceiling.clone());
 
     let action = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
         conn: &mut conn,
         task_id,
         effort: Some("high"),
-        effective_model: Some(OPUS_MODEL_1M),
+        effective_model: Some(&ceiling),
         prompt_result: &pr,
         iteration: 1,
         run_id: None,
@@ -581,7 +598,7 @@ fn claude_to_grok_promoted_task_with_primary_runner_blocks() {
     let mut conn = make_conn_with_task(task_id, Some(GROK_DEFAULT_MODEL));
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_id);
-    let project_cfg = primary_runner_cfg(Some(SONNET_MODEL), true);
+    let project_cfg = grok_inverse_cfg(true, true);
 
     // Simulate the prior Claude→Grok promotion.
     ctx.runner_overrides

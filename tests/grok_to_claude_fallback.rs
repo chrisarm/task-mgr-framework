@@ -24,11 +24,9 @@ use tempfile::TempDir;
 use task_mgr::loop_engine::engine::{
     EffectiveRunnerInput, IterationContext, resolve_effective_runner,
 };
-use task_mgr::loop_engine::model::{OPUS_MODEL_1M, SONNET_MODEL};
+use task_mgr::loop_engine::model::{OPUS_MODEL, OPUS_MODEL_1M, SONNET_MODEL};
 use task_mgr::loop_engine::overflow::RecoveryAction;
-use task_mgr::loop_engine::project_config::{
-    FallbackRunnerConfig, PrimaryRunnerConfig, ProjectConfig,
-};
+use task_mgr::loop_engine::project_config::{ModelsConfig, ProjectConfig};
 use task_mgr::loop_engine::prompt::PromptResult;
 use task_mgr::loop_engine::reactions::post_output::{HandleOverflowParams, handle_overflow};
 use task_mgr::loop_engine::runner::RunnerKind;
@@ -93,17 +91,19 @@ fn make_prompt_result(task_id: &str) -> PromptResult {
     }
 }
 
-/// A `ProjectConfig` with only `primaryRunner.claudeFallbackModel` set —
-/// no `fallbackRunner`. This represents the operator configuration for a
-/// project that routes review tasks to Grok as primary and wants Claude as
-/// the PromptTooLong fallback.
-fn project_cfg_with_primary_fallback(claude_model: &str) -> ProjectConfig {
+/// A `ProjectConfig` wiring the inverse Grok → Claude overflow pivot via the
+/// provider-first `providers.grok.fallback = "claude"` surface. The pivot is
+/// tier-preserving, so a Grok-build task (Standard tier) lands on the Claude
+/// Standard-rung model (opus) — the target is config-derived, not a literal
+/// `claudeFallbackModel`. Grok is enabled so the source provider resolves.
+fn project_cfg_with_grok_to_claude_fallback() -> ProjectConfig {
+    let mut models = ModelsConfig::builtin_default();
+    if let Some(p) = models.providers.get_mut("grok") {
+        p.enabled = true;
+        p.fallback = Some("claude".to_string());
+    }
     ProjectConfig {
-        primary_runner: Some(PrimaryRunnerConfig {
-            claude_fallback_model: Some(claude_model.to_string()),
-            ..Default::default()
-        }),
-        fallback_runner: None,
+        models,
         ..ProjectConfig::default()
     }
 }
@@ -127,11 +127,11 @@ fn grok_task_prompt_too_long_at_ceiling_falls_back_to_claude() {
     let mut conn = make_conn_with_task(task_id, Some(GROK_MODEL));
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_id);
-    let project_cfg = project_cfg_with_primary_fallback(SONNET_MODEL);
+    let project_cfg = project_cfg_with_grok_to_claude_fallback();
 
     // Use the Grok model at effort="high" to bypass rungs 1-3 (effort already
-    // at floor, Grok has no "below-Opus" escalation path, no 1M Grok variant
-    // in the ladder). The ladder falls straight to rung 4.
+    // at floor, Grok's single-rung ladder has no model escalation, no 1M Grok
+    // variant). The ladder falls straight to rung 4.
     let action = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
         conn: &mut conn,
@@ -153,10 +153,10 @@ fn grok_task_prompt_too_long_at_ceiling_falls_back_to_claude() {
         matches!(
             action,
             RecoveryAction::FallbackToProvider { ref provider, ref model }
-                if provider == "claude" && model == SONNET_MODEL
+                if provider == "claude" && model == OPUS_MODEL
         ),
-        "rung 4 inverse MUST fire for RunnerKind::Grok + claudeFallbackModel configured; \
-         got {action:?}",
+        "rung 4 inverse MUST fire for RunnerKind::Grok + providers.grok.fallback=claude \
+         (tier-preserving → opus); got {action:?}",
     );
     assert_eq!(
         ctx.runner_overrides.get(task_id),
@@ -165,13 +165,13 @@ fn grok_task_prompt_too_long_at_ceiling_falls_back_to_claude() {
     );
     assert_eq!(
         ctx.model_overrides.get(task_id).map(String::as_str),
-        Some(SONNET_MODEL),
-        "inverse fallback MUST write model_overrides[task_id] = claudeFallbackModel",
+        Some(OPUS_MODEL),
+        "inverse fallback MUST write model_overrides[task_id] = the tier-preserving Claude model",
     );
     assert_eq!(
         task_model(&conn, task_id).as_deref(),
-        Some(SONNET_MODEL),
-        "inverse fallback MUST UPDATE tasks.model to claudeFallbackModel so \
+        Some(OPUS_MODEL),
+        "inverse fallback MUST UPDATE tasks.model to the Claude target so \
          resolve_task_model picks Claude on the next iteration",
     );
     assert_eq!(
@@ -202,14 +202,16 @@ fn grok_task_prompt_too_long_without_claude_fallback_model_returns_blocked() {
     let mut conn = make_conn_with_task(task_id, Some(GROK_MODEL));
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_id);
-    // primary_runner present but claudeFallbackModel is None.
-    let project_cfg = ProjectConfig {
-        primary_runner: Some(PrimaryRunnerConfig {
-            claude_fallback_model: None,
-            ..Default::default()
-        }),
-        fallback_runner: None,
-        ..ProjectConfig::default()
+    // Grok enabled but `providers.grok.fallback` is absent → no inverse target.
+    let project_cfg = {
+        let mut models = ModelsConfig::builtin_default();
+        if let Some(p) = models.providers.get_mut("grok") {
+            p.enabled = true;
+        }
+        ProjectConfig {
+            models,
+            ..ProjectConfig::default()
+        }
     };
     let model_before = task_model(&conn, task_id);
 
@@ -267,7 +269,7 @@ fn grok_task_already_promoted_to_claude_returns_blocked_not_promoted_again() {
     let tmp = TempDir::new().expect("tempdir");
     let task_id = "8d71d1f7-REVIEW-003";
     let mut conn = make_conn_with_task(task_id, Some(GROK_MODEL));
-    let project_cfg = project_cfg_with_primary_fallback(SONNET_MODEL);
+    let project_cfg = project_cfg_with_grok_to_claude_fallback();
     let pr = make_prompt_result(task_id);
 
     let mut ctx = IterationContext::new(10);
@@ -332,7 +334,7 @@ fn after_inverse_overflow_fallback_next_iteration_resolves_claude_runner() {
     let mut conn = make_conn_with_task(task_id, Some(GROK_MODEL));
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_id);
-    let project_cfg = project_cfg_with_primary_fallback(SONNET_MODEL);
+    let project_cfg = project_cfg_with_grok_to_claude_fallback();
 
     // Fire rung 4 — writes runner_overrides + model_overrides + DB UPDATE.
     let action = handle_overflow(HandleOverflowParams {
@@ -355,11 +357,11 @@ fn after_inverse_overflow_fallback_next_iteration_resolves_claude_runner() {
     );
 
     // Simulate the start of the next iteration: the DB model has been updated
-    // to SONNET_MODEL by the rung-4 DB write.
+    // to the tier-preserving Claude target (opus) by the rung-4 DB write.
     let db_model = task_model(&conn, task_id);
     assert_eq!(
         db_model.as_deref(),
-        Some(SONNET_MODEL),
+        Some(OPUS_MODEL),
         "pre-condition: tasks.model must hold the Claude fallback model post-rung-4",
     );
 
@@ -413,17 +415,14 @@ fn after_inverse_overflow_fallback_next_iteration_resolves_claude_runner() {
     );
 }
 
-// ── Negative: Claude→Grok fallbackRunner does NOT trigger on RunnerKind::Grok ──
+// ── Negative: Claude→Grok fallback does NOT trigger on RunnerKind::Grok ────────
 
-/// When the effective runner is already Grok and `fallbackRunner` (Claude→Grok
-/// direction) is ALSO configured, the idempotency guard prevents a Grok task
-/// from being promoted to Grok (no-op loop). The `select_fallback_target`
-/// match arms are direction-specific: `RunnerKind::Grok` only consults
-/// `primary_runner`, never `fallback_runner`.
-///
-/// This is NOT a rung-4 issue per se — `select_fallback_target` already handles
-/// the directional split — but we pin it explicitly so a future refactor can't
-/// accidentally make a Grok task promote itself to Grok.
+/// When the effective runner is already Grok and the `providers.claude.fallback
+/// = "grok"` (Claude→Grok direction) is configured but `providers.grok.fallback`
+/// (Grok→Claude) is NOT, a Grok-source overflow consults ONLY its own provider's
+/// fallback (absent) → Blocked. `select_fallback_target` keys on the SOURCE
+/// provider, so the claude→grok direction is irrelevant to a Grok task and a
+/// task can never promote itself to its own provider.
 #[test]
 fn grok_runner_with_fallback_runner_configured_does_not_self_promote_to_grok() {
     let tmp = TempDir::new().expect("tempdir");
@@ -432,21 +431,20 @@ fn grok_runner_with_fallback_runner_configured_does_not_self_promote_to_grok() {
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_id);
 
-    // Both directions configured: fallbackRunner points to Grok (Claude→Grok),
-    // primaryRunner has no claudeFallbackModel (Grok→Claude disabled).
-    let project_cfg = ProjectConfig {
-        fallback_runner: Some(FallbackRunnerConfig {
-            enabled: true,
-            provider: "grok".to_string(),
-            model: GROK_MODEL.to_string(),
-            cli_binary: None,
-            runtime_error_threshold: 2,
-        }),
-        primary_runner: Some(PrimaryRunnerConfig {
-            claude_fallback_model: None, // Grok→Claude direction NOT configured
-            ..Default::default()
-        }),
-        ..ProjectConfig::default()
+    // Claude→Grok wired (providers.claude.fallback="grok"); the Grok→Claude
+    // inverse (providers.grok.fallback) is NOT set.
+    let project_cfg = {
+        let mut models = ModelsConfig::builtin_default();
+        if let Some(p) = models.providers.get_mut("grok") {
+            p.enabled = true;
+        }
+        if let Some(p) = models.providers.get_mut("claude") {
+            p.fallback = Some("grok".to_string());
+        }
+        ProjectConfig {
+            models,
+            ..ProjectConfig::default()
+        }
     };
 
     let action = handle_overflow(HandleOverflowParams {
@@ -467,8 +465,8 @@ fn grok_runner_with_fallback_runner_configured_does_not_self_promote_to_grok() {
 
     assert!(
         matches!(action, RecoveryAction::Blocked),
-        "RunnerKind::Grok with only fallbackRunner (Claude→Grok) configured MUST \
-         land on Blocked — fallbackRunner is irrelevant for the Grok runner; \
+        "RunnerKind::Grok with only the claude→grok direction wired MUST land on \
+         Blocked — a Grok source consults providers.grok.fallback (absent); \
          got {action:?}",
     );
     assert!(

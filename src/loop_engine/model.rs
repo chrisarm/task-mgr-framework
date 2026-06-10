@@ -17,18 +17,18 @@
 //! # Escalation vs. downgrade asymmetry
 //!
 //! Model escalation and effort downgrade are deliberately asymmetric.
-//! `escalate_model` moves the model up one tier on repeat crash / consecutive
-//! failure (called from `engine::check_crash_escalation` and
-//! `engine::escalate_task_model_if_needed`). `downgrade_effort` moves effort
-//! down one tier on `PromptTooLong` (called from the `PromptTooLong` branch
-//! in `engine.rs`). A task that starts at (Sonnet, `xhigh`) and keeps crashing
+//! [`escalate_tier`] moves the model up one DEFINED capability tier on the
+//! provider's ladder (config exact-match, never substring) on repeat crash /
+//! consecutive failure. [`downgrade_effort`] moves effort down one tier on
+//! `PromptTooLong`. A task that starts at (Sonnet, `xhigh`) and keeps crashing
 //! can therefore land at (Opus, `high`); this is intentional — `max` effort
 //! was retired for overflowing context and the `xhigh → high` step is the
 //! same safety valve for `xhigh`.
 //!
-//! When effort downgrade is exhausted (already at `high`), `to_1m_model`
-//! provides a second escape hatch: escalate to the 1M-context variant of
-//! the current model (currently Opus only). This gives the task a larger
+//! When effort downgrade is exhausted (already at `high`), the overflow ladder
+//! walks [`escalate_below_ceiling`] one tier at a time until the provider's
+//! ladder is exhausted, then [`to_1m_model`] provides a final escape hatch:
+//! append the 1M-context suffix to the (Claude-only) ceiling model for a larger
 //! context window without changing effort.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -58,7 +58,7 @@ pub const ONE_M_SUFFIX: &str = "[1m]";
 /// Computed from a model id by [`provider_for_model`] (token-equality on the
 /// lowercased, hyphen-split model string). Used to pick the right
 /// `RunnerKind` and to short-circuit Claude-only helpers like
-/// [`escalate_model`] when the active model belongs to a different provider.
+/// [`escalate_tier`] when the active model belongs to a different provider.
 ///
 /// New provider variants are added here when a new runner is plumbed
 /// through `dispatch`; today the only two are Claude (default) and Grok
@@ -615,77 +615,104 @@ pub fn downgrade_effort(effort: Option<&str>) -> Option<&'static str> {
     }
 }
 
-/// Escalate a model to the next higher tier.
-///
-/// - haiku → sonnet
-/// - sonnet → opus
-/// - opus → opus (already at ceiling)
-/// - None → None
-/// - unknown/Default tier → None (cannot escalate unrecognized model)
-pub fn escalate_model(model: Option<&str>) -> Option<String> {
-    if provider_for_model(model) != Provider::Claude {
-        return None;
-    }
-    match model {
-        None => None,
-        Some(m) => match model_tier(Some(m)) {
-            ModelTier::Default => None,
-            ModelTier::Haiku => Some(SONNET_MODEL.to_string()),
-            ModelTier::Sonnet => Some(OPUS_MODEL.to_string()),
-            ModelTier::Opus => Some(OPUS_MODEL.to_string()),
-        },
-    }
-}
-
-/// Escalate a sub-Opus model to the next tier below Opus's 1M ceiling.
-///
-/// This is the second rung of `PromptTooLong` recovery: once effort downgrade
-/// is exhausted (the `high` floor is preserved — effort never drops below `high`),
-/// escalate the model itself before reaching for `to_1m_model`. Mirrors
-/// `escalate_model` but stops at Opus instead of looping at it, so the caller
-/// can distinguish "moved up a tier" from "already at ceiling".
-///
-/// **High effort floor invariant**: `downgrade_effort` stops at `high`; when it
-/// returns `None` the loop calls this function instead of dropping effort further.
-/// The effort level is never lowered past `high` — model escalation is the next
-/// escape hatch, not a lower effort tier.
-///
-/// - haiku → sonnet
-/// - sonnet → opus
-/// - opus (incl. 1M variant) → None (already at ceiling)
-/// - None / unknown tier → None
-pub fn escalate_below_opus(model: Option<&str>) -> Option<&'static str> {
-    if provider_for_model(model) != Provider::Claude {
-        return None;
-    }
-    match model {
-        None => None,
-        Some(m) => match model_tier(Some(m)) {
-            ModelTier::Haiku => Some(SONNET_MODEL),
-            ModelTier::Sonnet => Some(OPUS_MODEL),
-            ModelTier::Opus | ModelTier::Default => None,
-        },
-    }
-}
-
 /// Check whether a model string is already a 1M-context variant (contains `[1m]`).
 pub fn is_1m_model(model: Option<&str>) -> bool {
     model.is_some_and(|m| m.to_lowercase().contains("[1m]"))
 }
 
-/// Return the 1M-context variant for a model, if one exists.
+/// Return the 1M-context variant for a Claude model.
 ///
-/// Currently only Opus has a 1M variant. Returns `None` if the model is
-/// already 1M, not Opus-tier, or `None`.
-pub fn to_1m_model(model: Option<&str>) -> Option<&'static str> {
-    if provider_for_model(model) != Provider::Claude {
+/// Suffix-append (NOT a constant lookup): appends [`ONE_M_SUFFIX`] to ANY
+/// Claude model so the 1M rung covers every Claude tier without a per-model
+/// constant — `claude-opus-4-8 → claude-opus-4-8[1m]`,
+/// `claude-fable-5 → claude-fable-5[1m]`. Returns `None` when the model is
+/// already a 1M variant, is not a Claude model (provider guard), or is `None`.
+/// 1M context is a Claude-only capability; Grok/Codex have no equivalent.
+pub fn to_1m_model(model: Option<&str>) -> Option<String> {
+    let m = model.map(str::trim).filter(|s| !s.is_empty())?;
+    if provider_for_model(Some(m)) != Provider::Claude {
         return None;
     }
-    match model {
-        Some(m) if is_1m_model(Some(m)) => None,
-        Some(m) if model_tier(Some(m)) == ModelTier::Opus => Some(OPUS_MODEL_1M),
-        _ => None,
+    if is_1m_model(Some(m)) {
+        return None;
     }
+    Some(format!("{m}{ONE_M_SUFFIX}"))
+}
+
+/// The next DEFINED capability tier strictly above `from` on `provider`'s
+/// sparse ladder in `resolved`, or `None` when `from` is already the highest
+/// defined rung. Undefined rungs are skipped — escalation always lands on a
+/// rung the provider actually maps to a model.
+fn next_defined_tier_above(
+    resolved: &ResolvedModelsConfig,
+    provider: Provider,
+    from: CapabilityTier,
+) -> Option<CapabilityTier> {
+    let p = resolved.providers.get(&provider)?;
+    CapabilityTier::ALL
+        .iter()
+        .copied()
+        .filter(|t| *t > from)
+        .find(|t| p.tiers.contains_key(t))
+}
+
+/// Escalate `model` up exactly one DEFINED tier on `provider`'s ladder.
+///
+/// The replacement for the legacy Claude-only `escalate_model`: tier membership
+/// is config exact-match (via [`ResolvedModelsConfig::tier_of`]), never
+/// substring matching, and the ladder is whatever the provider's `tiers` map
+/// defines. At the highest defined tier it **self-loops** (returns the model
+/// for the current tier — no wrap to the bottom, no hop to another provider).
+/// Returns `None` only when `model`'s tier cannot be resolved for `provider`
+/// (off-ladder model, or the provider is absent / has no defined rung).
+pub fn escalate_tier(
+    resolved: &ResolvedModelsConfig,
+    provider: Provider,
+    model: Option<&str>,
+) -> Option<String> {
+    let current = resolved.tier_of(provider, model?)?;
+    let target = next_defined_tier_above(resolved, provider, current).unwrap_or(current);
+    resolved.model_for(provider, target).map(str::to_string)
+}
+
+/// Escalate `model` up one DEFINED tier on `provider`'s ladder, returning
+/// `None` AT THE CEILING instead of self-looping.
+///
+/// This is the overflow ladder's model-escalation rung (the tier-based
+/// replacement for the legacy `escalate_below_opus`): the caller must be able
+/// to distinguish "moved up a tier" (`Some`) from "ladder exhausted" (`None`)
+/// to fall through to the 1M-context rung. For a single-rung provider (Grok,
+/// Codex) the model already sits at the ceiling, so this returns `None` and the
+/// overflow ladder advances to the cross-provider fallback rung — no model
+/// escalation, no provider hop within the rung.
+pub fn escalate_below_ceiling(
+    resolved: &ResolvedModelsConfig,
+    provider: Provider,
+    model: Option<&str>,
+) -> Option<String> {
+    let current = resolved.tier_of(provider, model?)?;
+    let target = next_defined_tier_above(resolved, provider, current)?;
+    resolved.model_for(provider, target).map(str::to_string)
+}
+
+/// The built-in default resolved config (Claude full ladder enabled, grok/codex
+/// present-but-disabled, `anchor=standard`), built once and cached.
+///
+/// Recovery paths that lack a threaded `ProjectConfig` (the consecutive-failure
+/// escalation in `recovery.rs`, whose call sites predate the provider-first
+/// config) resolve the Claude ladder through this so they stay config-driven
+/// (no hardcoded Claude-constant ladder) without changing their signatures.
+/// The overflow ladder, which DOES carry `project_config`, resolves the real
+/// user config instead — never this builtin.
+pub fn builtin_resolved_models() -> &'static ResolvedModelsConfig {
+    use std::sync::OnceLock;
+    static C: OnceLock<ResolvedModelsConfig> = OnceLock::new();
+    C.get_or_init(|| {
+        resolve_models_config(
+            crate::loop_engine::project_config::default_models_config(),
+            crate::loop_engine::project_config::default_routing_config(),
+        )
+    })
 }
 
 // ============================================================================
@@ -2426,87 +2453,97 @@ mod tests {
         );
     }
 
-    // ============ escalate_model tests ============
+    // ============ escalate_tier tests ============
+    //
+    // The builtin Claude ladder is config exact-match (NO substring matching):
+    // Cheapest=haiku, CostEfficient=sonnet, Standard=opus, Frontier=fable.
+    // `escalate_tier` self-loops at the Frontier ceiling; off-ladder ids → None.
 
     #[test]
-    fn test_escalate_model_haiku_to_sonnet() {
-        let result = escalate_model(Some(HAIKU_MODEL));
-        assert_eq!(result, Some(SONNET_MODEL.to_string()));
+    fn test_escalate_tier_haiku_to_sonnet() {
+        let r = escalate_tier(
+            builtin_resolved_models(),
+            Provider::Claude,
+            Some(HAIKU_MODEL),
+        );
+        assert_eq!(r, Some(SONNET_MODEL.to_string()));
     }
 
     #[test]
-    fn test_escalate_model_sonnet_to_opus() {
-        let result = escalate_model(Some(SONNET_MODEL));
-        assert_eq!(result, Some(OPUS_MODEL.to_string()));
+    fn test_escalate_tier_sonnet_to_opus() {
+        let r = escalate_tier(
+            builtin_resolved_models(),
+            Provider::Claude,
+            Some(SONNET_MODEL),
+        );
+        assert_eq!(r, Some(OPUS_MODEL.to_string()));
     }
 
     #[test]
-    fn test_escalate_model_opus_stays_opus() {
-        let result = escalate_model(Some(OPUS_MODEL));
-        assert_eq!(result, Some(OPUS_MODEL.to_string()));
+    fn test_escalate_tier_opus_to_fable() {
+        // opus is now the Standard rung; Frontier (fable) sits above it.
+        let r = escalate_tier(
+            builtin_resolved_models(),
+            Provider::Claude,
+            Some(OPUS_MODEL),
+        );
+        assert_eq!(r, Some(FABLE_MODEL.to_string()));
     }
 
     #[test]
-    fn test_escalate_model_none_stays_none() {
-        let result = escalate_model(None);
-        assert_eq!(result, None);
+    fn test_escalate_tier_fable_self_loops_at_ceiling() {
+        // Frontier is the ceiling: self-loop, NO wrap, NO provider hop.
+        let r = escalate_tier(
+            builtin_resolved_models(),
+            Provider::Claude,
+            Some(FABLE_MODEL),
+        );
+        assert_eq!(r, Some(FABLE_MODEL.to_string()));
     }
 
     #[test]
-    fn test_escalate_model_unknown_returns_none() {
-        let result = escalate_model(Some("gpt-4"));
-        assert_eq!(result, None, "unknown model tier cannot be escalated");
-    }
-
-    /// AC: unknown model string doesn't crash—returns None, not panic.
-    #[test]
-    fn test_escalate_model_various_unknown_strings_no_crash() {
-        assert_eq!(escalate_model(Some("")), None);
-        assert_eq!(escalate_model(Some("  ")), None);
-        assert_eq!(escalate_model(Some("llama-3-70b")), None);
-        assert_eq!(escalate_model(Some("gemini-pro")), None);
+    fn test_escalate_tier_none_stays_none() {
         assert_eq!(
-            escalate_model(Some("totally-unknown-model-xyz")),
-            None,
-            "arbitrary unknown string should safely return None"
+            escalate_tier(builtin_resolved_models(), Provider::Claude, None),
+            None
         );
     }
 
-    /// Escalate with case-variant model strings.
     #[test]
-    fn test_escalate_model_case_variants() {
-        assert_eq!(
-            escalate_model(Some("HAIKU")),
-            Some(SONNET_MODEL.to_string()),
-            "uppercase HAIKU should escalate to sonnet"
-        );
-        assert_eq!(
-            escalate_model(Some("Sonnet")),
-            Some(OPUS_MODEL.to_string()),
-            "mixed-case Sonnet should escalate to opus"
-        );
-        assert_eq!(
-            escalate_model(Some("OPUS")),
-            Some(OPUS_MODEL.to_string()),
-            "uppercase OPUS should stay at opus ceiling"
-        );
+    fn test_escalate_tier_off_ladder_returns_none() {
+        // Exact-match only: an id not on the provider's ladder can't escalate.
+        for m in ["gpt-4", "", "  ", "llama-3-70b", "totally-unknown-xyz"] {
+            assert_eq!(
+                escalate_tier(builtin_resolved_models(), Provider::Claude, Some(m)),
+                None,
+                "off-ladder id {m:?} must return None (no substring fallback)",
+            );
+        }
     }
 
-    /// Double escalation chain: haiku → sonnet → opus.
     #[test]
-    fn test_escalate_model_double_escalation_chain() {
-        let first = escalate_model(Some(HAIKU_MODEL));
-        assert_eq!(first, Some(SONNET_MODEL.to_string()));
-
-        let second = escalate_model(first.as_deref());
-        assert_eq!(second, Some(OPUS_MODEL.to_string()));
-
-        let third = escalate_model(second.as_deref());
-        assert_eq!(
-            third,
-            Some(OPUS_MODEL.to_string()),
-            "opus is the ceiling; further escalation stays at opus"
+    fn test_escalate_tier_grok_single_rung_self_loops() {
+        // Grok has one defined rung (Standard=grok-build); escalation self-loops.
+        let r = escalate_tier(
+            builtin_resolved_models(),
+            Provider::Grok,
+            Some("grok-build"),
         );
+        assert_eq!(r, Some("grok-build".to_string()));
+    }
+
+    /// Full chain haiku → sonnet → opus → fable → fable (ceiling self-loop).
+    #[test]
+    fn test_escalate_tier_full_chain() {
+        let resolved = builtin_resolved_models();
+        let a = escalate_tier(resolved, Provider::Claude, Some(HAIKU_MODEL));
+        assert_eq!(a, Some(SONNET_MODEL.to_string()));
+        let b = escalate_tier(resolved, Provider::Claude, a.as_deref());
+        assert_eq!(b, Some(OPUS_MODEL.to_string()));
+        let c = escalate_tier(resolved, Provider::Claude, b.as_deref());
+        assert_eq!(c, Some(FABLE_MODEL.to_string()));
+        let d = escalate_tier(resolved, Provider::Claude, c.as_deref());
+        assert_eq!(d, Some(FABLE_MODEL.to_string()), "fable is the ceiling");
     }
 
     // ============ downgrade_effort tests ============
@@ -2666,50 +2703,61 @@ mod tests {
     }
 
     // ============ to_1m_model tests ============
+    //
+    // Suffix-append, Claude-only (per `provider_for_model`). Covers EVERY Claude
+    // tier including the new frontier (fable) — not just Opus.
 
     #[test]
     fn test_to_1m_model_opus_returns_1m() {
-        assert_eq!(to_1m_model(Some(OPUS_MODEL)), Some(OPUS_MODEL_1M));
+        assert_eq!(
+            to_1m_model(Some(OPUS_MODEL)),
+            Some(OPUS_MODEL_1M.to_string())
+        );
+    }
+
+    #[test]
+    fn test_to_1m_model_fable_returns_1m() {
+        // The AC-mandated case: claude-fable-5 → claude-fable-5[1m].
+        assert_eq!(
+            to_1m_model(Some(FABLE_MODEL)),
+            Some(format!("{FABLE_MODEL}{ONE_M_SUFFIX}")),
+        );
+    }
+
+    #[test]
+    fn test_to_1m_model_any_claude_tier_gets_suffix() {
+        // No Opus gate: suffix-append fires on any Claude-classified model.
+        assert_eq!(
+            to_1m_model(Some(SONNET_MODEL)),
+            Some(format!("{SONNET_MODEL}{ONE_M_SUFFIX}")),
+        );
+        assert_eq!(
+            to_1m_model(Some(HAIKU_MODEL)),
+            Some(format!("{HAIKU_MODEL}{ONE_M_SUFFIX}")),
+        );
     }
 
     #[test]
     fn test_to_1m_model_already_1m_returns_none() {
         assert_eq!(to_1m_model(Some(OPUS_MODEL_1M)), None);
+        assert_eq!(
+            to_1m_model(Some(&format!("{FABLE_MODEL}{ONE_M_SUFFIX}"))),
+            None
+        );
     }
 
     #[test]
-    fn test_to_1m_model_non_opus_returns_none() {
-        assert_eq!(to_1m_model(Some(SONNET_MODEL)), None);
-        assert_eq!(to_1m_model(Some(HAIKU_MODEL)), None);
+    fn test_to_1m_model_grok_returns_none() {
+        // 1M context is a Claude-only capability — Grok has no variant.
+        assert_eq!(to_1m_model(Some("grok-build")), None);
+        assert_eq!(to_1m_model(Some("grok-code-fast-1")), None);
     }
 
     #[test]
-    fn test_to_1m_model_none_returns_none() {
+    fn test_to_1m_model_none_and_blank_return_none() {
         assert_eq!(to_1m_model(None), None);
-    }
-
-    #[test]
-    fn test_to_1m_model_unknown_returns_none() {
-        assert_eq!(to_1m_model(Some("gpt-4")), None);
         assert_eq!(to_1m_model(Some("")), None);
-    }
-
-    #[test]
-    fn test_to_1m_model_case_variant_opus() {
-        assert_eq!(
-            to_1m_model(Some("OPUS")),
-            Some(OPUS_MODEL_1M),
-            "case-insensitive opus detection should return 1M variant"
-        );
-    }
-
-    #[test]
-    fn test_1m_model_tier_is_opus() {
-        assert_eq!(
-            model_tier(Some(OPUS_MODEL_1M)),
-            ModelTier::Opus,
-            "1M model should still be classified as Opus tier"
-        );
+        assert_eq!(to_1m_model(Some("   ")), None);
     }
 
     // ============ is_review_class tests ============
@@ -2771,45 +2819,98 @@ mod tests {
         assert!(!is_review_class("ABCDEF01-CODE-REVIEW-1"));
     }
 
-    // ============ escalate_below_opus tests ============
+    // ============ escalate_below_ceiling tests ============
+    //
+    // Same one-tier-up walk as escalate_tier but returns None at the ceiling
+    // (Frontier) so the overflow ladder can fall through to the 1M rung.
 
     #[test]
-    fn test_escalate_below_opus_haiku_to_sonnet() {
-        assert_eq!(escalate_below_opus(Some(HAIKU_MODEL)), Some(SONNET_MODEL));
-    }
-
-    #[test]
-    fn test_escalate_below_opus_sonnet_to_opus() {
-        assert_eq!(escalate_below_opus(Some(SONNET_MODEL)), Some(OPUS_MODEL));
-    }
-
-    #[test]
-    fn test_escalate_below_opus_opus_is_ceiling() {
+    fn test_escalate_below_ceiling_haiku_to_sonnet() {
         assert_eq!(
-            escalate_below_opus(Some(OPUS_MODEL)),
-            None,
-            "opus is the ceiling for this rung; further escalation handled by to_1m_model"
+            escalate_below_ceiling(
+                builtin_resolved_models(),
+                Provider::Claude,
+                Some(HAIKU_MODEL)
+            ),
+            Some(SONNET_MODEL.to_string()),
         );
     }
 
     #[test]
-    fn test_escalate_below_opus_opus_1m_is_ceiling() {
+    fn test_escalate_below_ceiling_sonnet_to_opus() {
         assert_eq!(
-            escalate_below_opus(Some(OPUS_MODEL_1M)),
-            None,
-            "1M variant counts as Opus tier — no further escalation"
+            escalate_below_ceiling(
+                builtin_resolved_models(),
+                Provider::Claude,
+                Some(SONNET_MODEL)
+            ),
+            Some(OPUS_MODEL.to_string()),
         );
     }
 
     #[test]
-    fn test_escalate_below_opus_unknown_returns_none() {
-        assert_eq!(escalate_below_opus(Some("gpt-4")), None);
-        assert_eq!(escalate_below_opus(Some("")), None);
+    fn test_escalate_below_ceiling_opus_to_fable() {
+        // opus (Standard) still has Frontier (fable) above it — not the ceiling.
+        assert_eq!(
+            escalate_below_ceiling(
+                builtin_resolved_models(),
+                Provider::Claude,
+                Some(OPUS_MODEL)
+            ),
+            Some(FABLE_MODEL.to_string()),
+        );
     }
 
     #[test]
-    fn test_escalate_below_opus_none_returns_none() {
-        assert_eq!(escalate_below_opus(None), None);
+    fn test_escalate_below_ceiling_fable_is_ceiling() {
+        assert_eq!(
+            escalate_below_ceiling(
+                builtin_resolved_models(),
+                Provider::Claude,
+                Some(FABLE_MODEL)
+            ),
+            None,
+            "fable is the Frontier ceiling; the 1M rung handles the rest",
+        );
+    }
+
+    #[test]
+    fn test_escalate_below_ceiling_fable_1m_is_ceiling() {
+        // tier_of strips [1m] → fable → Frontier → no higher tier.
+        let fable_1m = format!("{FABLE_MODEL}{ONE_M_SUFFIX}");
+        assert_eq!(
+            escalate_below_ceiling(builtin_resolved_models(), Provider::Claude, Some(&fable_1m)),
+            None,
+        );
+    }
+
+    #[test]
+    fn test_escalate_below_ceiling_grok_single_rung_is_ceiling() {
+        // Grok's single rung IS its ceiling — no model escalation, no provider hop.
+        assert_eq!(
+            escalate_below_ceiling(
+                builtin_resolved_models(),
+                Provider::Grok,
+                Some("grok-build")
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn test_escalate_below_ceiling_off_ladder_returns_none() {
+        assert_eq!(
+            escalate_below_ceiling(builtin_resolved_models(), Provider::Claude, Some("gpt-4")),
+            None,
+        );
+        assert_eq!(
+            escalate_below_ceiling(builtin_resolved_models(), Provider::Claude, Some("")),
+            None,
+        );
+        assert_eq!(
+            escalate_below_ceiling(builtin_resolved_models(), Provider::Claude, None),
+            None,
+        );
     }
 
     // ============ parse_config_provider tests (FEAT-006) ============

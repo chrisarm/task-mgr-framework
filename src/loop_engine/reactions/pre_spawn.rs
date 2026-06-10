@@ -170,7 +170,11 @@ pub fn crash_escalated_model(
     }
     match normalize_baseline(resolved_model) {
         None => Some(model::OPUS_MODEL.to_string()),
-        Some(m) => model::escalate_model(Some(m)),
+        Some(m) => model::escalate_tier(
+            model::builtin_resolved_models(),
+            model::Provider::Claude,
+            Some(m),
+        ),
     }
 }
 

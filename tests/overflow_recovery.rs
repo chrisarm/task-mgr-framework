@@ -4,11 +4,12 @@
 //! `IterationContext` / `PromptResult` inputs — there is no Claude subprocess
 //! involved, just the recovery state machine and its diagnostics side effects.
 //!
-//! The full ladder under test (per PRD section 4):
+//! The full ladder under test (per PRD section 4, provider-first tier ladder):
 //! 1. `downgrade_effort` — `xhigh` → `high` (effort floor; preserves model)
-//! 2. `escalate_below_opus` — Sonnet → Opus (at floor effort; preserves effort)
-//! 3. `to_1m_model` — Opus → Opus[1M] (already at Opus; expands context window)
-//! 4. `Blocked` — Opus[1M] at `high` effort has no further escape hatch
+//! 2. `escalate_below_ceiling` — one DEFINED tier up the Claude ladder at the
+//!    `high` effort floor (Sonnet → Opus → Fable), preserving effort
+//! 3. `to_1m_model` — suffix-append at the Frontier ceiling (Fable → Fable[1M])
+//! 4. `Blocked` — Fable[1M] at `high` effort has no further escape hatch
 //!
 //! AC #11: every test uses the production types
 //! (`config::CrashType::PromptTooLong`, `engine::IterationContext`,
@@ -24,7 +25,9 @@ use tempfile::TempDir;
 
 use task_mgr::loop_engine::config::{CrashType, IterationOutcome};
 use task_mgr::loop_engine::engine::IterationContext;
-use task_mgr::loop_engine::model::{OPUS_MODEL, OPUS_MODEL_1M, SONNET_MODEL};
+use task_mgr::loop_engine::model::{
+    FABLE_MODEL, ONE_M_SUFFIX, OPUS_MODEL, OPUS_MODEL_1M, SONNET_MODEL,
+};
 use task_mgr::loop_engine::overflow::{OverflowEvent, RecoveryAction, sanitize_id_for_filename};
 use task_mgr::loop_engine::project_config::ProjectConfig;
 use task_mgr::loop_engine::prompt::PromptResult;
@@ -211,7 +214,7 @@ fn ladder_walk_sonnet_xhigh_to_blocked() {
     )
     .unwrap();
 
-    // Iter 3: Opus + high → to_1m_model.
+    // Iter 3: Opus + high → escalate one tier up to the frontier (fable).
     let a3 = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
         conn: &mut conn,
@@ -226,9 +229,43 @@ fn ladder_walk_sonnet_xhigh_to_blocked() {
         effective_runner: RunnerKind::Claude,
         project_config: &ProjectConfig::default(),
     });
-    assert_eq!(rung_label(&a3), "to_1m_model");
+    assert_eq!(rung_label(&a3), "escalate_model");
     assert!(
-        matches!(a3, RecoveryAction::To1mModel { ref new_model } if new_model == OPUS_MODEL_1M)
+        matches!(a3, RecoveryAction::EscalateModel { ref new_model } if new_model == FABLE_MODEL),
+        "opus must escalate one tier up to fable, got {a3:?}",
+    );
+    assert_eq!(
+        task_status(&conn, task_id),
+        "todo",
+        "rung 2 (opus→fable) must reset to todo"
+    );
+
+    conn.execute(
+        "UPDATE tasks SET status = 'in_progress' WHERE id = ?1",
+        [task_id],
+    )
+    .unwrap();
+
+    // Iter 4: Fable (frontier ceiling) + high → to_1m_model.
+    let fable_1m = format!("{FABLE_MODEL}{ONE_M_SUFFIX}");
+    let a4 = handle_overflow(HandleOverflowParams {
+        ctx: &mut ctx,
+        conn: &mut conn,
+        task_id,
+        effort: Some("high"),
+        effective_model: Some(FABLE_MODEL),
+        prompt_result: &pr,
+        iteration: 4,
+        run_id: Some("run-test"),
+        base_dir: base,
+        slot_index: None,
+        effective_runner: RunnerKind::Claude,
+        project_config: &ProjectConfig::default(),
+    });
+    assert_eq!(rung_label(&a4), "to_1m_model");
+    assert!(
+        matches!(a4, RecoveryAction::To1mModel { ref new_model } if *new_model == fable_1m),
+        "fable at the ceiling must append the 1M suffix, got {a4:?}",
     );
     assert_eq!(
         task_status(&conn, task_id),
@@ -242,37 +279,37 @@ fn ladder_walk_sonnet_xhigh_to_blocked() {
     )
     .unwrap();
 
-    // Iter 4: Opus[1M] + high → blocked (no further escape).
-    let a4 = handle_overflow(HandleOverflowParams {
+    // Iter 5: Fable[1M] + high → blocked (no further escape).
+    let a5 = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
         conn: &mut conn,
         task_id,
         effort: Some("high"),
-        effective_model: Some(OPUS_MODEL_1M),
+        effective_model: Some(&fable_1m),
         prompt_result: &pr,
-        iteration: 4,
+        iteration: 5,
         run_id: Some("run-test"),
         base_dir: base,
         slot_index: None,
         effective_runner: RunnerKind::Claude,
         project_config: &ProjectConfig::default(),
     });
-    assert_eq!(rung_label(&a4), "blocked");
-    assert!(matches!(a4, RecoveryAction::Blocked));
+    assert_eq!(rung_label(&a5), "blocked");
+    assert!(matches!(a5, RecoveryAction::Blocked));
     assert_eq!(
         task_status(&conn, task_id),
         "blocked",
-        "rung 4 must mark blocked"
+        "rung 5 must mark blocked"
     );
 }
 
 // ---------- AC #2: explicit-Opus skip ---------------------------------------
 
-/// A task whose model is already Opus on the very first overflow at the
-/// `high` effort floor must skip rung 2 (escalate_below_opus returns None
-/// at the Opus tier) and land on rung 3 (`to_1m_model`).
+/// A task whose model is already at the frontier (Fable) on the very first
+/// overflow at the `high` effort floor must skip rung 2 (`escalate_below_ceiling`
+/// returns None at the Frontier tier) and land on rung 3 (`to_1m_model`).
 #[test]
-fn explicit_opus_at_floor_skips_to_1m_rung() {
+fn explicit_fable_at_floor_skips_to_1m_rung() {
     let tmp = TempDir::new().expect("tempdir");
     let task_id = "BAR-FEAT-099";
     let mut conn = make_conn_with_task(task_id);
@@ -284,7 +321,7 @@ fn explicit_opus_at_floor_skips_to_1m_rung() {
         conn: &mut conn,
         task_id,
         effort: Some("high"),
-        effective_model: Some(OPUS_MODEL),
+        effective_model: Some(FABLE_MODEL),
         prompt_result: &pr,
         iteration: 1,
         run_id: None,
@@ -296,10 +333,11 @@ fn explicit_opus_at_floor_skips_to_1m_rung() {
     assert_eq!(
         rung_label(&action),
         "to_1m_model",
-        "Opus at high effort must skip directly to 1M variant",
+        "Fable at high effort must skip directly to the 1M variant",
     );
+    let fable_1m = format!("{FABLE_MODEL}{ONE_M_SUFFIX}");
     assert!(
-        matches!(action, RecoveryAction::To1mModel { ref new_model } if new_model == OPUS_MODEL_1M)
+        matches!(action, RecoveryAction::To1mModel { ref new_model } if *new_model == fable_1m)
     );
     assert_eq!(task_status(&conn, task_id), "todo");
 }
@@ -439,11 +477,12 @@ fn jsonl_appends_one_line_per_iteration_with_matching_action() {
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_id);
 
-    // Walk three rungs; pre-blocked so the loop ends in 3 lines.
+    // Walk three rungs; pre-blocked so the loop ends in 3 lines. opus+high now
+    // escalates one tier up to fable (rung 2), not the 1M variant.
     let scenarios: [(Option<&str>, Option<&str>, &str); 3] = [
         (Some("xhigh"), Some(SONNET_MODEL), "downgrade_effort"),
         (Some("high"), Some(SONNET_MODEL), "escalate_model"),
-        (Some("high"), Some(OPUS_MODEL), "to_1m_model"),
+        (Some("high"), Some(OPUS_MODEL), "escalate_model"),
     ];
     for (i, (effort, model, expected)) in scenarios.iter().enumerate() {
         // Re-claim between iterations (production: task selection re-picks the row).
@@ -474,7 +513,7 @@ fn jsonl_appends_one_line_per_iteration_with_matching_action() {
     let actions: Vec<&'static str> = events.iter().map(|e| rung_label(&e.recovery)).collect();
     assert_eq!(
         actions,
-        vec!["downgrade_effort", "escalate_model", "to_1m_model"]
+        vec!["downgrade_effort", "escalate_model", "escalate_model"]
     );
 
     // Each line carries the iteration index it was emitted from.
@@ -681,12 +720,13 @@ fn blocked_rung_writes_both_dump_and_jsonl() {
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_id);
 
+    let fable_1m = format!("{FABLE_MODEL}{ONE_M_SUFFIX}");
     let action = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
         conn: &mut conn,
         task_id,
         effort: Some("high"),
-        effective_model: Some(OPUS_MODEL_1M),
+        effective_model: Some(&fable_1m),
         prompt_result: &pr,
         iteration: 1,
         run_id: Some("run-blk"),
@@ -892,8 +932,9 @@ fn original_model_captured_first_overflow_only() {
     )
     .unwrap();
 
-    // Observation 3: Opus+high → rung 3 (to_1m_model). Even though the
-    // *current* effective_model is Opus, the snapshot must remain Sonnet.
+    // Observation 3: Opus+high → rung 2 (escalate_model, opus→fable). Even
+    // though the *current* effective_model is Opus, the snapshot must remain
+    // Sonnet.
     let a3 = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
         conn: &mut conn,
@@ -908,7 +949,7 @@ fn original_model_captured_first_overflow_only() {
         effective_runner: RunnerKind::Claude,
         project_config: &ProjectConfig::default(),
     });
-    assert_eq!(rung_label(&a3), "to_1m_model");
+    assert_eq!(rung_label(&a3), "escalate_model");
     assert_eq!(
         ctx.overflow_original_model.get(task_id).map(String::as_str),
         Some(SONNET_MODEL),
@@ -1021,12 +1062,13 @@ fn rung_4_writes_observability() {
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_id);
 
+    let fable_1m = format!("{FABLE_MODEL}{ONE_M_SUFFIX}");
     let action = handle_overflow(HandleOverflowParams {
         ctx: &mut ctx,
         conn: &mut conn,
         task_id,
         effort: Some("high"),
-        effective_model: Some(OPUS_MODEL_1M),
+        effective_model: Some(&fable_1m),
         prompt_result: &pr,
         iteration: 1,
         run_id: Some("run-r4obs"),
@@ -1037,7 +1079,7 @@ fn rung_4_writes_observability() {
     });
     assert!(
         matches!(action, RecoveryAction::Blocked),
-        "Opus[1M]+high must produce Blocked action",
+        "fable[1M]+high must produce Blocked action",
     );
     assert_eq!(task_status(&conn, task_id), "blocked");
 

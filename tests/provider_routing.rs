@@ -40,8 +40,8 @@
 //! a Provider-aware variant of the dispatch helper.
 
 use task_mgr::loop_engine::model::{
-    HAIKU_MODEL, OPUS_MODEL, OPUS_MODEL_1M, Provider, SONNET_MODEL, escalate_below_opus,
-    escalate_model, provider_for_model, to_1m_model,
+    HAIKU_MODEL, OPUS_MODEL, OPUS_MODEL_1M, Provider, SONNET_MODEL, builtin_resolved_models,
+    escalate_below_ceiling, escalate_tier, provider_for_model, to_1m_model,
 };
 
 // ── provider_for_model: positive (Grok) cases ─────────────────────────────────
@@ -198,14 +198,15 @@ fn provider_for_model_grok_with_hyphen_artifacts_is_grok() {
 
 // ── escalation guards: Grok inputs are a no-op ────────────────────────────────
 
-/// AC 5: escalate_model on a Grok model returns None (provider guard).
-///
-/// If a future refactor of [`model_tier`] starts recognizing grok-* as
-/// non-Default tier (or someone adds an explicit Grok escalation rung),
-/// FEAT-002's explicit guard ensures the contract still holds. Today the
-/// behavior is implicit via `ModelTier::Default` → `None`.
+/// AC 5/6: escalating a Grok id on the CLAUDE ladder returns None — the
+/// provider guard. A Grok id is off the Claude tier ladder (config exact-match
+/// via `tier_of`, no substring fallback), so both tier-escalation primitives
+/// find no tier and return None: a Grok task can never be bumped onto a Claude
+/// model. (In production the source provider is Grok, whose single-rung ladder
+/// likewise yields None — see `escalate_below_ceiling` ceiling semantics.)
 #[test]
-fn escalate_model_on_grok_returns_none() {
+fn escalate_grok_on_claude_ladder_returns_none() {
+    let resolved = builtin_resolved_models();
     for m in [
         "grok-build",
         "grok-code-fast-1",
@@ -213,65 +214,58 @@ fn escalate_model_on_grok_returns_none() {
         "Grok-Code-Fast-1",
     ] {
         assert_eq!(
-            escalate_model(Some(m)),
+            escalate_tier(resolved, Provider::Claude, Some(m)),
             None,
-            "escalate_model({m:?}) must return None (Grok cannot escalate via Claude ladder)",
+            "escalate_tier(Claude, {m:?}) must be None — Grok is off the Claude ladder",
         );
-    }
-}
-
-/// AC 6: escalate_below_opus on a Grok model returns None.
-#[test]
-fn escalate_below_opus_on_grok_returns_none() {
-    for m in ["grok-build", "grok-code-fast-1", "GROK-BUILD"] {
         assert_eq!(
-            escalate_below_opus(Some(m)),
+            escalate_below_ceiling(resolved, Provider::Claude, Some(m)),
             None,
-            "escalate_below_opus({m:?}) must return None — Grok is not on the Claude tier ladder",
+            "escalate_below_ceiling(Claude, {m:?}) must be None — Grok is off the Claude ladder",
         );
     }
 }
 
 /// AC 7: to_1m_model on a Grok model returns None.
 ///
-/// The 1M-context variant is an Opus-only Claude tier; Grok has no
-/// equivalent and the helper must not pretend otherwise.
+/// 1M context is a Claude-only capability; Grok has no equivalent and the
+/// suffix-append helper must not pretend otherwise (it gates on
+/// `provider_for_model == Claude`).
 #[test]
 fn to_1m_model_on_grok_returns_none() {
     for m in ["grok-build", "grok-code-fast-1", "Grok-Code-Fast-1"] {
         assert_eq!(
             to_1m_model(Some(m)),
             None,
-            "to_1m_model({m:?}) must return None — Grok has no 1M variant on the Claude ladder",
+            "to_1m_model({m:?}) must return None — Grok has no 1M variant",
         );
     }
 }
 
-/// AC 8: claude-side escalation continues to work — confirms the guard
-/// doesn't over-fire and break the existing Sonnet → Opus rung. This is the
-/// "known-bad discriminator" for an over-zealous guard implementation: if a
-/// future FEAT-002 patch accidentally writes `if provider_for_model(model) ==
-/// Provider::Claude { return None; }` (inverted), this assertion catches it.
+/// AC 8: claude-side escalation continues to work — confirms the provider
+/// guard doesn't over-fire and break the Claude ladder rungs. The ladder is
+/// haiku → sonnet → opus → fable (config exact-match).
 #[test]
-fn escalate_model_claude_side_unaffected_by_guard() {
+fn escalate_claude_side_unaffected_by_guard() {
+    let resolved = builtin_resolved_models();
     assert_eq!(
-        escalate_model(Some(SONNET_MODEL)),
+        escalate_tier(resolved, Provider::Claude, Some(SONNET_MODEL)),
         Some(OPUS_MODEL.to_string()),
         "Sonnet must still escalate to Opus — the provider guard must not over-fire",
     );
     assert_eq!(
-        escalate_model(Some(HAIKU_MODEL)),
+        escalate_tier(resolved, Provider::Claude, Some(HAIKU_MODEL)),
         Some(SONNET_MODEL.to_string()),
         "Haiku must still escalate to Sonnet — the provider guard must not over-fire",
     );
     assert_eq!(
-        escalate_below_opus(Some(SONNET_MODEL)),
-        Some(OPUS_MODEL),
-        "Sonnet must still escalate-below-opus to Opus — guard must not over-fire",
+        escalate_below_ceiling(resolved, Provider::Claude, Some(SONNET_MODEL)),
+        Some(OPUS_MODEL.to_string()),
+        "Sonnet must still escalate-below-ceiling to Opus — guard must not over-fire",
     );
     assert_eq!(
         to_1m_model(Some(OPUS_MODEL)),
-        Some(OPUS_MODEL_1M),
+        Some(OPUS_MODEL_1M.to_string()),
         "Opus must still produce its 1M variant — guard must not over-fire",
     );
 }

@@ -396,13 +396,20 @@ fn already_promoted_grok_task_does_not_ping_pong_back_to_grok() {
         models.push(read_model(&conn, "GROK-PP-001"));
     }
 
-    // The single legitimate promotion is grok→opus; after that tasks.model must
-    // stay on the Claude model. Any later grok reappearance is a ping-pong.
+    // The single legitimate cross-provider promotion is grok→opus. After that
+    // the task stays on the Claude side; subsequent consecutive failures climb
+    // the Claude tier ladder (opus → fable → fable ceiling), but the task MUST
+    // NEVER flip back to Grok — that would be a ping-pong.
+    assert_eq!(
+        models[1].as_deref(),
+        Some(OPUS_MODEL),
+        "first promotion must be the tier-preserving grok→opus pivot",
+    );
     assert!(
         models
             .iter()
             .skip(1)
-            .all(|m| m.as_deref() == Some(OPUS_MODEL)),
+            .all(|m| m.as_deref() != Some(GROK_MODEL)),
         "after the first inverse promotion the model must stay on Claude, \
          never flip back to Grok; got {models:?}",
     );

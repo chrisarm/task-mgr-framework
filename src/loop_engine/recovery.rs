@@ -189,8 +189,9 @@ pub(crate) fn promote_once(
 ///
 /// `project_default` / `user_default` are the engine-cached config defaults
 /// (`engine.rs` run-config fields), threaded straight through to
-/// `maybe_codex_fallback_to_claude` so a recovering Codex task derives its
-/// baseline tier from the SAME four inputs the primary spawn-site uses (FIX-001).
+/// `maybe_provider_runtime_fallback` so a recovering provider-routed task
+/// derives its baseline tier from the SAME four inputs the primary spawn-site
+/// uses (FIX-001).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn escalate_task_model_if_needed_inner(
     conn: &Connection,
@@ -223,7 +224,7 @@ pub(crate) fn escalate_task_model_if_needed_inner(
         //      `runtimeErrorFallback: true`.
         // Otherwise return `(None, None)` so the legacy auto-block ladder runs
         // (existing Codex projects without the opt-in see unchanged behavior).
-        return maybe_codex_fallback_to_claude(
+        return maybe_provider_runtime_fallback(
             conn,
             task_id,
             new_count,
@@ -234,9 +235,20 @@ pub(crate) fn escalate_task_model_if_needed_inner(
         );
     }
     // None / empty / whitespace model: assume sonnet baseline → escalate to opus.
+    // Otherwise step up one DEFINED tier on the Claude ladder (config exact-match
+    // via `escalate_tier`, no substring matching). Recovery's call sites predate
+    // the provider-first config and supply no `ResolvedModelsConfig`, so the
+    // Claude ladder is resolved from the builtin defaults — see
+    // `model::builtin_resolved_models`. A non-Claude (Grok/Codex) `current_model`
+    // is off the Claude ladder, so `escalate_tier` returns `None` and the
+    // provider-promotion branches below handle it, exactly as before.
     let escalated = match normalize_baseline(current_model.as_deref()) {
         None => Some(model::OPUS_MODEL.to_string()),
-        Some(m) => model::escalate_model(Some(m)),
+        Some(m) => model::escalate_tier(
+            model::builtin_resolved_models(),
+            model::Provider::Claude,
+            Some(m),
+        ),
     };
     if let Some(ref new_model) = escalated {
         conn.execute(
@@ -276,16 +288,21 @@ pub(crate) fn escalate_task_model_if_needed_inner(
                 Some(c) if c.enabled => c,
                 _ => return Ok((escalated, None)),
             };
-            // H2: use ModelTier-based inclusive check so both OPUS_MODEL and
-            // OPUS_MODEL_1M qualify as "at Opus" — string-eq on OPUS_MODEL
-            // excluded the 1M variant.
-            let was_at_opus = matches!(
-                model::model_tier(current_model.as_deref()),
-                model::ModelTier::Opus
-            );
+            // The Grok pivot fires only once the Claude ladder has been climbed
+            // to (at least) the Opus rung — sub-Opus escalations get a fresh
+            // chance at a higher Claude tier before any cross-provider pivot.
+            // Config exact-match via `tier_of` (the 1M variant strips its suffix
+            // first), NOT substring `model_tier`: a model at the Standard tier
+            // (Opus) OR above (Frontier/Fable) is pivot-eligible. This preserves
+            // the prior OPUS / OPUS[1M] behavior and correctly extends it to the
+            // new frontier tier without resurrecting dead substring matching.
+            let was_at_opus_or_above = current_model
+                .as_deref()
+                .and_then(|m| model::builtin_resolved_models().tier_of(model::Provider::Claude, m))
+                .is_some_and(|t| t >= model::CapabilityTier::Standard);
             // M1: compare in u32 space; new_count is a DB counter (always >= 0 in
             // practice) but guard the negative case to keep the cast sound.
-            if !was_at_opus
+            if !was_at_opus_or_above
                 || new_count < 0
                 || (new_count as u32) < fallback.runtime_error_threshold
             {
@@ -370,12 +387,18 @@ pub(crate) fn escalate_task_model_if_needed_inner(
     }
 }
 
-/// FEAT-005: Codex→Claude opt-in promotion helper. Returns `(None, None)`
-/// (auto-block) unless the matching `primaryRunner` Codex route opted in via
-/// `runtimeErrorFallback: true`, in which case the task is promoted onto a Claude
-/// model. Bound to one promotion per task via [`promote_once`], which returns
-/// `None` (→ auto-block) when `ctx.runner_overrides` already holds the task —
-/// the single cross-provider idempotency guard, no longer inlined here.
+/// Opt-in **provider→Claude** runtime-fallback promotion helper (FEAT-005,
+/// generalized in FEAT-007 from the Codex-only `maybe_codex_fallback_to_claude`).
+///
+/// Fires for a provider-routed task (today: Codex) whose matching
+/// `primaryRunner` route opted in via `runtimeErrorFallback: true` AND whose
+/// consecutive RuntimeError count has reached the route's **per-provider**
+/// `runtimeErrorThreshold`. On both gates passing it promotes the task onto a
+/// Claude model. Returns `(None, None)` (→ the legacy auto-block ladder) on any
+/// gate miss, so projects without the opt-in see unchanged behavior. Bound to
+/// one promotion per task via [`promote_once`], which returns `None` when
+/// `ctx.runner_overrides` already holds the task — the single cross-provider
+/// idempotency guard, never inlined here.
 ///
 /// Auth failures must never reach this function — the sequential and wave
 /// callers exclude `Crash(CodexAuthFailure)` before invoking
@@ -386,11 +409,11 @@ pub(crate) fn escalate_task_model_if_needed_inner(
 /// match a `baselineTierRoutes` route) is derived via
 /// [`model::compute_baseline_model`] from the SAME four inputs the primary
 /// spawn-site (`resolve_task_execution_target`) uses — `difficulty`,
-/// `prd_default`, `project_default`, `user_default` — so a recovering Codex task
+/// `prd_default`, `project_default`, `user_default` — so a recovering task
 /// matches the route it was originally routed by. Earlier this site substituted
 /// `primary.claude_fallback_model` for `project_default` and omitted
 /// `user_default`, causing a confirmed recovery↔primary divergence.
-fn maybe_codex_fallback_to_claude(
+fn maybe_provider_runtime_fallback(
     conn: &Connection,
     task_id: &str,
     new_count: i32,
@@ -408,6 +431,13 @@ fn maybe_codex_fallback_to_claude(
     let Some(primary) = primary_cfg else {
         return Ok((None, None));
     };
+    // Per-provider RuntimeError threshold gate: the route's runner stays in
+    // control until its own `runtimeErrorThreshold` is reached, mirroring the
+    // symmetric Grok→Claude branch. `new_count` is a DB counter (>= 0 in
+    // practice); guard the negative cast for soundness.
+    if new_count < 0 || (new_count as u32) < primary.runtime_error_threshold {
+        return Ok((None, None));
+    }
     let difficulty: Option<String> = conn
         .query_row(
             "SELECT difficulty FROM tasks WHERE id = ?",
@@ -697,8 +727,8 @@ pub fn auto_block_task(
 ///
 /// **FIX-001**: `project_default` / `user_default` are the engine-cached config
 /// defaults (`engine.rs` run-config fields), threaded through to the embedded
-/// `escalate_task_model_if_needed_inner` → `maybe_codex_fallback_to_claude`
-/// baseline derivation so a recovering Codex task matches the same
+/// `escalate_task_model_if_needed_inner` → `maybe_provider_runtime_fallback`
+/// baseline derivation so a recovering provider-routed task matches the same
 /// `baselineTierRoutes` route the primary spawn-site routed it by.
 #[allow(clippy::too_many_arguments)]
 pub fn handle_task_failure(
@@ -988,7 +1018,7 @@ mod tests {
     // CLEANUP-001: shims removed; tests now call the relocated functions directly.
 
     use super::*;
-    use crate::loop_engine::model::{HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL};
+    use crate::loop_engine::model::{FABLE_MODEL, HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL};
     use crate::loop_engine::reactions::pre_spawn::crash_escalated_model;
     use crate::loop_engine::test_utils::setup_test_db;
 
@@ -1150,10 +1180,11 @@ mod tests {
         );
     }
 
-    /// AC: same task + crash + already opus → stays opus (ceiling, no panic).
+    /// AC: same task + crash + opus → escalate one DEFINED tier up the Claude
+    /// ladder to the Frontier rung (fable). opus is the Standard rung now; the
+    /// ceiling self-loop happens at fable, not opus.
     #[test]
-
-    fn test_crash_escalation_opus_ceiling() {
+    fn test_crash_escalation_opus_to_fable() {
         let result = crash_escalated_model(
             &crash_map(&[("FEAT-001", true)]),
             "FEAT-001",
@@ -1161,8 +1192,24 @@ mod tests {
         );
         assert_eq!(
             result,
-            Some(OPUS_MODEL.to_string()),
-            "opus crash on same task must stay at opus ceiling"
+            Some(FABLE_MODEL.to_string()),
+            "opus crash must escalate up one tier to the frontier (fable)"
+        );
+    }
+
+    /// AC: same task + crash + already at the frontier (fable) → stays fable
+    /// (ceiling self-loop, no panic, no wrap).
+    #[test]
+    fn test_crash_escalation_fable_ceiling() {
+        let result = crash_escalated_model(
+            &crash_map(&[("FEAT-001", true)]),
+            "FEAT-001",
+            Some(FABLE_MODEL),
+        );
+        assert_eq!(
+            result,
+            Some(FABLE_MODEL.to_string()),
+            "fable crash on same task must stay at the frontier ceiling"
         );
     }
 
@@ -1315,9 +1362,8 @@ mod tests {
     }
 
     /// Edge case: multiple consecutive crashes on same task follow the ladder:
-    /// haiku → sonnet → opus → opus (ceiling).
+    /// haiku → sonnet → opus → fable → fable (ceiling self-loop).
     #[test]
-
     fn test_crash_escalation_consecutive_ladder() {
         let crashed = crash_map(&[("FEAT-001", true)]);
         // First crash: haiku → sonnet
@@ -1336,12 +1382,20 @@ mod tests {
             "second crash: sonnet → opus"
         );
 
-        // Third crash: opus → opus (ceiling)
+        // Third crash: opus → fable (Standard → Frontier)
         let third = crash_escalated_model(&crashed, "FEAT-001", second.as_deref());
         assert_eq!(
             third,
-            Some(OPUS_MODEL.to_string()),
-            "third crash: opus stays at ceiling"
+            Some(FABLE_MODEL.to_string()),
+            "third crash: opus → fable (one tier up)"
+        );
+
+        // Fourth crash: fable → fable (Frontier ceiling, self-loop)
+        let fourth = crash_escalated_model(&crashed, "FEAT-001", third.as_deref());
+        assert_eq!(
+            fourth,
+            Some(FABLE_MODEL.to_string()),
+            "fourth crash: fable stays at the frontier ceiling"
         );
     }
 
@@ -1717,9 +1771,10 @@ mod tests {
         );
     }
 
-    /// Opus task at 2 consecutive failures → model stays at opus (ceiling, no-op).
+    /// Opus task at 2 consecutive failures → escalate one tier to the frontier
+    /// (fable). opus is the Standard rung; Frontier sits above it.
     #[test]
-    fn test_model_escalation_opus_stays_at_ceiling() {
+    fn test_model_escalation_opus_to_fable() {
         let (_dir, conn) = setup_test_db();
         conn.execute(
             &format!("INSERT INTO tasks (id, title, status, model, consecutive_failures) VALUES ('T-001', 'Test', 'in_progress', '{OPUS_MODEL}', 0)"),
@@ -1733,8 +1788,8 @@ mod tests {
                 .unwrap();
         assert_eq!(
             result,
-            Some(OPUS_MODEL.to_string()),
-            "opus at ceiling must return opus (no-op value)"
+            Some(FABLE_MODEL.to_string()),
+            "opus at 2 failures must escalate up one tier to fable"
         );
         let model: Option<String> = conn
             .query_row("SELECT model FROM tasks WHERE id = 'T-001'", [], |r| {
@@ -1743,8 +1798,39 @@ mod tests {
             .unwrap();
         assert_eq!(
             model,
-            Some(OPUS_MODEL.to_string()),
-            "opus model in DB must remain opus"
+            Some(FABLE_MODEL.to_string()),
+            "model column in DB must be updated to fable"
+        );
+    }
+
+    /// Fable task at 2 consecutive failures → stays at fable (Frontier ceiling).
+    #[test]
+    fn test_model_escalation_fable_stays_at_ceiling() {
+        let (_dir, conn) = setup_test_db();
+        conn.execute(
+            &format!("INSERT INTO tasks (id, title, status, model, consecutive_failures) VALUES ('T-001', 'Test', 'in_progress', '{FABLE_MODEL}', 0)"),
+            [],
+        )
+        .unwrap();
+
+        let mut ctx = IterationContext::new(8);
+        let result =
+            escalate_task_model_if_needed(&conn, "T-001", 2, &mut ctx, None, None, None, None)
+                .unwrap();
+        assert_eq!(
+            result,
+            Some(FABLE_MODEL.to_string()),
+            "fable at the frontier ceiling must return fable (self-loop value)"
+        );
+        let model: Option<String> = conn
+            .query_row("SELECT model FROM tasks WHERE id = 'T-001'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            model,
+            Some(FABLE_MODEL.to_string()),
+            "fable model in DB must remain fable"
         );
     }
 

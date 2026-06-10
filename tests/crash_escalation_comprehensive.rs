@@ -37,7 +37,7 @@ use task_mgr::db::{create_schema, open_connection};
 use task_mgr::loop_engine::config::{CrashType, IterationOutcome};
 use task_mgr::loop_engine::engine::{IterationContext, auto_block_task, check_crash_escalation};
 use task_mgr::loop_engine::iteration_pipeline::{ProcessingParams, process_iteration_output};
-use task_mgr::loop_engine::model::{HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL};
+use task_mgr::loop_engine::model::{FABLE_MODEL, HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL};
 use task_mgr::loop_engine::signals::SignalFlag;
 
 // ---------------------------------------------------------------------------
@@ -624,9 +624,10 @@ fn stale_map_entry_for_removed_task_does_not_affect_new_task() {
     );
 }
 
-/// Repeated crashes on the same task follow the full model ladder.
-/// Between crashes the pipeline writes `true` (crash) each time, but
-/// the calling code feeds the escalated model back into the next check.
+/// Repeated crashes on the same task follow the full model ladder
+/// (haiku → sonnet → opus → fable → fable ceiling). Between crashes the
+/// pipeline writes `true` (crash) each time, but the calling code feeds the
+/// escalated model back into the next check.
 #[test]
 fn repeated_crashes_traverse_full_ladder_haiku_sonnet_opus() {
     let crashed = crash_map(&[("TASK-REPEAT", true)]);
@@ -642,10 +643,13 @@ fn repeated_crashes_traverse_full_ladder_haiku_sonnet_opus() {
     assert_eq!(step2.as_deref(), Some(OPUS_MODEL), "step 2: sonnet → opus");
 
     let step3 = check_crash_escalation(&crashed, "TASK-REPEAT", step2.as_deref());
+    assert_eq!(step3.as_deref(), Some(FABLE_MODEL), "step 3: opus → fable");
+
+    let step4 = check_crash_escalation(&crashed, "TASK-REPEAT", step3.as_deref());
     assert_eq!(
-        step3.as_deref(),
-        Some(OPUS_MODEL),
-        "step 3: opus → opus (ceiling)"
+        step4.as_deref(),
+        Some(FABLE_MODEL),
+        "step 4: fable → fable (frontier ceiling)"
     );
 }
 
