@@ -393,6 +393,7 @@ pub fn build_prompt(
         reorder_hint: None,
         batch_sibling_prds: None,
         resolved_model: None,
+        resolved_models: &resolved_models,
         next_task_output: None,
         recalled_learnings: None,
     };

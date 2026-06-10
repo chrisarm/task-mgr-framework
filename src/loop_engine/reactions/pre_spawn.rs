@@ -115,8 +115,16 @@ pub fn resolve_task_execution(params: ResolveTaskExecutionParams<'_>) -> TaskExe
     invalidate_stale_overrides(ctx, conn, task_id);
 
     // 2. Crash escalation (None when the last iteration on this task did not
-    //    crash — the caller keeps its already-resolved model).
-    let model = crash_escalated_model(&ctx.crashed_last_iteration, task_id, resolved_model);
+    //    crash — the caller keeps its already-resolved model). Resolves the
+    //    Claude ladder from the OPERATOR's config carried on the context, so a
+    //    remapped Claude ladder escalates onto models that config defines, not
+    //    the builtin defaults (REFACTOR-007).
+    let model = crash_escalated_model_with_config(
+        &ctx.crashed_last_iteration,
+        task_id,
+        resolved_model,
+        &ctx.resolved_models,
+    );
 
     // 3. Prior-overflow effort override, read AFTER invalidation.
     let effort = ctx.effort_overrides.get(task_id).copied();
@@ -155,10 +163,41 @@ pub fn resolve_task_execution(params: ResolveTaskExecutionParams<'_>) -> TaskExe
 /// not a crash. A `None`/empty/whitespace `resolved_model` is treated as the
 /// sonnet baseline and escalates to opus. Escalation is independent of
 /// `CrashTracker` backoff.
+///
+/// This is the **builtin-ladder convenience variant** — it resolves the Claude
+/// tier ladder from [`model::builtin_resolved_models`]. The production
+/// coordinator [`resolve_task_execution`] calls
+/// [`crash_escalated_model_with_config`] with the operator-resolved config from
+/// the context instead (REFACTOR-007); this 3-arg form is retained for the
+/// equivalence tests (and the `engine::check_crash_escalation` re-export) that
+/// exercise the default ladder.
 pub fn crash_escalated_model(
     crashed_last_iteration: &HashMap<String, bool>,
     current_task_id: &str,
     resolved_model: Option<&str>,
+) -> Option<String> {
+    crash_escalated_model_with_config(
+        crashed_last_iteration,
+        current_task_id,
+        resolved_model,
+        model::builtin_resolved_models(),
+    )
+}
+
+/// Operator-config-aware crash-recovery model escalation: identical to
+/// [`crash_escalated_model`] but resolves the Claude tier ladder from the
+/// supplied `models` config rather than the builtin defaults.
+///
+/// This is the production path (REFACTOR-007): [`resolve_task_execution`] passes
+/// `&ctx.resolved_models` so an operator who remapped Claude tiers (custom
+/// ladder, null rungs) gets a crash escalation onto a model THEIR config defines
+/// — closing the FIX-001 config-input divergence where the recovery paths walked
+/// the builtin ladder regardless of operator config.
+pub fn crash_escalated_model_with_config(
+    crashed_last_iteration: &HashMap<String, bool>,
+    current_task_id: &str,
+    resolved_model: Option<&str>,
+    models: &ResolvedModelsConfig,
 ) -> Option<String> {
     if !crashed_last_iteration
         .get(current_task_id)
@@ -169,11 +208,7 @@ pub fn crash_escalated_model(
     }
     match normalize_baseline(resolved_model) {
         None => Some(model::OPUS_MODEL.to_string()),
-        Some(m) => model::escalate_tier(
-            model::builtin_resolved_models(),
-            model::Provider::Claude,
-            Some(m),
-        ),
+        Some(m) => model::escalate_tier(models, model::Provider::Claude, Some(m)),
     }
 }
 

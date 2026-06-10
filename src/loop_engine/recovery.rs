@@ -205,6 +205,7 @@ pub(crate) fn escalate_task_model_if_needed_inner(
     task_id: &str,
     new_count: i32,
     executed_runner: RunnerKind,
+    models: &model::ResolvedModelsConfig,
 ) -> TaskMgrResult<(Option<String>, Option<PendingPromotion>)> {
     if !should_escalate_for_consecutive_failures(new_count) {
         return Ok((None, None));
@@ -219,19 +220,17 @@ pub(crate) fn escalate_task_model_if_needed_inner(
         })?;
     // None / empty / whitespace model: assume sonnet baseline → escalate to opus.
     // Otherwise step up one DEFINED tier on the Claude ladder (config exact-match
-    // via `escalate_tier`, no substring matching). Recovery's call sites supply
-    // no `ResolvedModelsConfig`, so the Claude ladder is resolved from the
-    // builtin defaults — see `model::builtin_resolved_models`. A non-Claude
-    // (Grok) `current_model` is off the Claude ladder, so `escalate_tier`
-    // returns `None` and no escalation fires; the task then proceeds to normal
-    // failure accounting (→ `auto_block_task`).
+    // via `escalate_tier`, no substring matching). The Claude ladder is resolved
+    // from the OPERATOR's config (`models`, threaded down from the orchestrator's
+    // `IterationContext::resolved_models`) so an operator who remapped Claude
+    // tiers (custom ladder, null rungs) gets escalations onto models THEIR config
+    // defines — not the builtin defaults (REFACTOR-007, the FIX-001 divergence).
+    // A non-Claude (Grok) `current_model` is off the Claude ladder, so
+    // `escalate_tier` returns `None` and no escalation fires; the task then
+    // proceeds to normal failure accounting (→ `auto_block_task`).
     let escalated = match normalize_baseline(current_model.as_deref()) {
         None => Some(model::OPUS_MODEL.to_string()),
-        Some(m) => model::escalate_tier(
-            model::builtin_resolved_models(),
-            model::Provider::Claude,
-            Some(m),
-        ),
+        Some(m) => model::escalate_tier(models, model::Provider::Claude, Some(m)),
     };
     if let Some(ref new_model) = escalated {
         conn.execute(
@@ -292,7 +291,13 @@ pub fn escalate_task_model_if_needed(
             provider_hint: None,
         },
     );
-    let (model, pending) = escalate_task_model_if_needed_inner(conn, task_id, new_count, runner)?;
+    let (model, pending) = escalate_task_model_if_needed_inner(
+        conn,
+        task_id,
+        new_count,
+        runner,
+        &ctx.resolved_models,
+    )?;
     if let Some(p) = pending {
         apply_pending_promotion(ctx, &p);
     }
@@ -314,8 +319,13 @@ pub fn escalate_task_model_if_needed_for_runner(
     executed_runner: RunnerKind,
     ctx: &mut IterationContext,
 ) -> TaskMgrResult<Option<String>> {
-    let (model, pending) =
-        escalate_task_model_if_needed_inner(conn, task_id, new_count, executed_runner)?;
+    let (model, pending) = escalate_task_model_if_needed_inner(
+        conn,
+        task_id,
+        new_count,
+        executed_runner,
+        &ctx.resolved_models,
+    )?;
     if let Some(p) = pending {
         apply_pending_promotion(ctx, &p);
     }
@@ -470,7 +480,13 @@ pub fn handle_task_failure_with_runner(
         // model would never be used.
         let mut pending_promotion: Option<PendingPromotion> = None;
         if !should_auto_block(new_count, max_retries) {
-            match escalate_task_model_if_needed_inner(&tx, task_id, new_count, runner) {
+            match escalate_task_model_if_needed_inner(
+                &tx,
+                task_id,
+                new_count,
+                runner,
+                &ctx.resolved_models,
+            ) {
                 Ok((_model, promotion)) => {
                     pending_promotion = promotion;
                 }
@@ -1508,6 +1524,139 @@ mod tests {
             model,
             Some(SONNET_MODEL.to_string()),
             "model in DB must be unchanged at 1 failure"
+        );
+    }
+
+    // --- REFACTOR-007: operator-resolved config threading ---
+    //
+    // Both escalation paths must resolve the Claude tier ladder from the
+    // OPERATOR's config (carried on `IterationContext::resolved_models`), not the
+    // builtin defaults. These use a production-shaped FR-001 JSON config with a
+    // custom Claude ladder that omits the `standard` rung — so a `sonnet`
+    // (cost-efficient) baseline escalates PAST the (undefined) standard rung
+    // straight to the frontier (`fable`). The builtin ladder would give `opus`,
+    // so the two outputs are unambiguously distinguishable.
+
+    /// Build a production-shaped (FR-001 JSON, real serde field names) Claude
+    /// ladder with NO `standard` rung. Model ids come from the exported
+    /// constants — never literals — so `no_hardcoded_models` stays green.
+    fn operator_models_no_standard_rung() -> model::ResolvedModelsConfig {
+        let json = serde_json::json!({
+            "primaryProvider": "claude",
+            "anchor": "standard",
+            "providers": {
+                "claude": {
+                    "enabled": true,
+                    "tiers": {
+                        "cheapest": HAIKU_MODEL,
+                        "cost-efficient": SONNET_MODEL,
+                        "frontier": FABLE_MODEL
+                    }
+                }
+            }
+        });
+        let models: crate::loop_engine::project_config::ModelsConfig =
+            serde_json::from_value(json).expect("production-shaped models JSON deserializes");
+        model::resolve_models_config(
+            &models,
+            &crate::loop_engine::project_config::RoutingConfig::default(),
+        )
+    }
+
+    /// Consecutive-failure escalation writes a model from the OPERATOR ladder.
+    /// With the standard rung dropped, sonnet escalates to fable — the builtin
+    /// ladder would write opus, so this falsifies a `builtin_resolved_models()`
+    /// regression at `escalate_task_model_if_needed_inner`.
+    #[test]
+    fn test_consecutive_escalation_uses_operator_ladder_not_builtin() {
+        let (_dir, conn) = setup_test_db();
+        conn.execute(
+            &format!("INSERT INTO tasks (id, title, status, model, consecutive_failures) VALUES ('T-001', 'Test', 'in_progress', '{SONNET_MODEL}', 0)"),
+            [],
+        )
+        .unwrap();
+
+        let mut ctx = IterationContext::new(8);
+        ctx.resolved_models = operator_models_no_standard_rung();
+
+        let result = escalate_task_model_if_needed(&conn, "T-001", 2, &mut ctx).unwrap();
+        assert_eq!(
+            result,
+            Some(FABLE_MODEL.to_string()),
+            "operator ladder (no standard rung): sonnet must escalate past the \
+             undefined standard rung to the frontier (fable)"
+        );
+        assert_ne!(
+            result,
+            Some(OPUS_MODEL.to_string()),
+            "must NOT fall back to the builtin ladder (which would write opus)"
+        );
+        let model: Option<String> = conn
+            .query_row("SELECT model FROM tasks WHERE id = 'T-001'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            model,
+            Some(FABLE_MODEL.to_string()),
+            "the DB model column must be written from the operator ladder"
+        );
+    }
+
+    /// Crash escalation resolves the same operator ladder via
+    /// `crash_escalated_model_with_config` (the production path
+    /// `resolve_task_execution` uses): sonnet → fable, not opus.
+    #[test]
+    fn test_crash_escalation_uses_operator_ladder_not_builtin() {
+        use crate::loop_engine::reactions::pre_spawn::crash_escalated_model_with_config;
+
+        let operator = operator_models_no_standard_rung();
+        let result = crash_escalated_model_with_config(
+            &crash_map(&[("FEAT-001", true)]),
+            "FEAT-001",
+            Some(SONNET_MODEL),
+            &operator,
+        );
+        assert_eq!(
+            result,
+            Some(FABLE_MODEL.to_string()),
+            "operator ladder: sonnet crash must escalate to the frontier (fable)"
+        );
+        assert_ne!(
+            result,
+            Some(OPUS_MODEL.to_string()),
+            "must NOT use the builtin ladder (which would give opus)"
+        );
+
+        // Same inputs against the builtin ladder still give opus — proving the
+        // divergence is the config input, not the model/task arguments.
+        let builtin = crash_escalated_model_with_config(
+            &crash_map(&[("FEAT-001", true)]),
+            "FEAT-001",
+            Some(SONNET_MODEL),
+            model::builtin_resolved_models(),
+        );
+        assert_eq!(builtin, Some(OPUS_MODEL.to_string()));
+    }
+
+    /// Default-config behavior is byte-identical: with the builtin ladder on
+    /// the context (the `IterationContext::new` default), consecutive-failure
+    /// escalation still walks sonnet → opus exactly as before the threading.
+    #[test]
+    fn test_consecutive_escalation_default_config_byte_identical() {
+        let (_dir, conn) = setup_test_db();
+        conn.execute(
+            &format!("INSERT INTO tasks (id, title, status, model, consecutive_failures) VALUES ('T-001', 'Test', 'in_progress', '{SONNET_MODEL}', 0)"),
+            [],
+        )
+        .unwrap();
+
+        let mut ctx = IterationContext::new(8);
+        let result = escalate_task_model_if_needed(&conn, "T-001", 2, &mut ctx).unwrap();
+        assert_eq!(
+            result,
+            Some(OPUS_MODEL.to_string()),
+            "default (builtin) ladder must still escalate sonnet → opus"
         );
     }
 

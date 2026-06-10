@@ -118,6 +118,15 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
     let start_time = Instant::now();
     let inter_iteration_delay = Duration::from_secs(run_config.config.iteration_delay_secs);
     let mut ctx = IterationContext::new(run_config.config.max_crashes as u32);
+    // Thread the operator-resolved provider-first config into the recovery
+    // paths (consecutive-failure + crash escalation). Without this they walk
+    // `builtin_resolved_models()` and an operator who remapped Claude tiers gets
+    // escalations onto models their config never defined (FIX-001 divergence).
+    // `resolve_models_config` is a pure projection of already-validated input.
+    ctx.resolved_models = crate::loop_engine::model::resolve_models_config(
+        &project_config.models,
+        &project_config.routing,
+    );
     let mut iterations_completed: u32 = 0;
     let mut tasks_completed: u32 = 0;
     let mut last_claimed_task: Option<String> = None;

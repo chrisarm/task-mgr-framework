@@ -495,6 +495,7 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
         // The escalation render reads this — the policy section is omitted for
         // the Opus tier. Must be set before the critical assemble below.
         resolved_model: resolved_model.as_deref(),
+        resolved_models: &resolved_models,
         next_task_output: Some(task_output),
         recalled_learnings: Some(&next_result.learnings),
     };

@@ -48,8 +48,29 @@ pub(crate) fn load_escalation_template(base_prompt_path: &Path) -> Option<String
 /// (`tier_of == None`, e.g. an unknown id) is not at the ceiling and still
 /// receives the policy.
 pub fn build_escalation_section(base_prompt_path: &Path, resolved_model: Option<&str>) -> String {
+    build_escalation_section_with_config(
+        base_prompt_path,
+        resolved_model,
+        model::builtin_resolved_models(),
+    )
+}
+
+/// Operator-config-aware variant of [`build_escalation_section`]: the ceiling
+/// check resolves the Claude tier ladder from the supplied `models` config
+/// instead of the builtin defaults.
+///
+/// This is the production path (REFACTOR-007): [`render_escalation_section`]
+/// passes the operator-resolved config carried on [`PromptContext`], so an
+/// operator who remapped the Claude frontier rung sees the policy omitted at
+/// THEIR ceiling — not the builtin one. The 2-arg [`build_escalation_section`]
+/// is retained for the equivalence tests that exercise the default ladder.
+pub fn build_escalation_section_with_config(
+    base_prompt_path: &Path,
+    resolved_model: Option<&str>,
+    models: &model::ResolvedModelsConfig,
+) -> String {
     let at_ceiling = resolved_model
-        .and_then(|m| model::builtin_resolved_models().tier_of(model::Provider::Claude, m))
+        .and_then(|m| models.tier_of(model::Provider::Claude, m))
         .is_some_and(|t| t == model::CapabilityTier::Frontier);
     if at_ceiling {
         return String::new();
@@ -70,7 +91,11 @@ pub fn build_escalation_section(base_prompt_path: &Path, resolved_model: Option<
 /// budget, never trimmed. The [`SectionKind`] argument is therefore ignored.
 pub fn render_escalation_section(ctx: &PromptContext<'_>, _kind: SectionKind) -> Rendered {
     Rendered {
-        text: build_escalation_section(ctx.base_prompt_path, ctx.resolved_model),
+        text: build_escalation_section_with_config(
+            ctx.base_prompt_path,
+            ctx.resolved_model,
+            ctx.resolved_models,
+        ),
         ..Default::default()
     }
 }
@@ -245,6 +270,60 @@ mod tests {
             result,
             Some("Nested template content".to_string()),
             "Template should resolve relative to base_prompt_path's parent, not cwd"
+        );
+    }
+
+    /// REFACTOR-007: the at-ceiling check resolves the Claude ladder from the
+    /// OPERATOR config, not the builtin defaults. With a custom config where
+    /// opus is the frontier rung, an opus-tier task is at the ceiling → the
+    /// policy section is omitted; the builtin ladder (opus = standard, fable =
+    /// frontier) would still emit it. Proves
+    /// `build_escalation_section_with_config` honors the threaded config.
+    #[test]
+    fn test_escalation_ceiling_uses_operator_ladder_not_builtin() {
+        use crate::loop_engine::model::{OPUS_MODEL, SONNET_MODEL};
+
+        let temp_dir = TempDir::new().unwrap();
+        let base_prompt_path = temp_dir.path().join("prompt.md");
+        fs::write(&base_prompt_path, "base prompt").unwrap();
+        create_escalation_template(temp_dir.path(), "escalate when stuck");
+
+        // Operator config: opus is the frontier rung (no fable defined).
+        let json = serde_json::json!({
+            "primaryProvider": "claude",
+            "anchor": "standard",
+            "providers": {
+                "claude": {
+                    "enabled": true,
+                    "tiers": { "cost-efficient": SONNET_MODEL, "frontier": OPUS_MODEL }
+                }
+            }
+        });
+        let models: crate::loop_engine::project_config::ModelsConfig =
+            serde_json::from_value(json).expect("production-shaped models JSON deserializes");
+        let operator = model::resolve_models_config(
+            &models,
+            &crate::loop_engine::project_config::RoutingConfig::default(),
+        );
+
+        // Operator ladder: opus IS the frontier → at ceiling → section omitted.
+        let operator_section =
+            build_escalation_section_with_config(&base_prompt_path, Some(OPUS_MODEL), &operator);
+        assert_eq!(
+            operator_section, "",
+            "opus is the operator frontier rung → escalation policy must be omitted"
+        );
+
+        // Builtin ladder: opus is `standard` (fable is frontier) → NOT at the
+        // ceiling → the policy section renders from the template.
+        let builtin_section = build_escalation_section_with_config(
+            &base_prompt_path,
+            Some(OPUS_MODEL),
+            model::builtin_resolved_models(),
+        );
+        assert!(
+            builtin_section.contains("Model Escalation Policy"),
+            "builtin ladder: opus is below the frontier → policy must still render"
         );
     }
 }

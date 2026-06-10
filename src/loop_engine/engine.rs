@@ -429,6 +429,18 @@ pub struct IterationContext {
     /// [`BlackoutState::active`]), the quota-deferral wait, and the
     /// excluded-id computation. See [`BlackoutState`] for the three rules.
     pub provider_blackouts: BlackoutState,
+    /// The operator-resolved provider-first config (`models` + `routing`),
+    /// built ONCE per run in `run_loop` from `ProjectConfig` and threaded to the
+    /// per-task recovery paths that resolve Claude tier ladders — consecutive-
+    /// failure escalation (`recovery::escalate_task_model_if_needed*`) and crash
+    /// escalation (`pre_spawn::crash_escalated_model_with_config`). These call
+    /// sites historically walked `model::builtin_resolved_models()`, so an
+    /// operator who remapped Claude tiers (custom ladder, null rungs) got
+    /// recovery escalations onto models their config never defined (the FIX-001
+    /// config-input divergence). Defaults to `builtin_resolved_models()` so every
+    /// test/`IterationContext::new` construction stays byte-identical to the
+    /// pre-threading builtin behavior.
+    pub resolved_models: model::ResolvedModelsConfig,
 }
 
 impl IterationContext {
@@ -454,6 +466,7 @@ impl IterationContext {
             overflow_original_task_model: std::collections::HashMap::new(),
             transient_backend_attempts: 0,
             provider_blackouts: BlackoutState::default(),
+            resolved_models: model::builtin_resolved_models().clone(),
         }
     }
 }
