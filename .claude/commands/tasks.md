@@ -71,20 +71,15 @@ Default tier matrix (from the `_DEFAULT_TIER_MODELS` tables; empty = route with 
 Codex routes are always explicit (`byIdPrefix` or `taskClasses` in `routing`); Codex is never inferred from a model string.
 <!-- MODELS:END -->
 
-**Model selection is config-driven at runtime (see `src/loop_engine/model.rs:resolve_task_execution_target` + `apply_review_model_override`).** Do **not** put a `model` field on *any* task entry in the generated JSON (FEAT, ANALYSIS, CODE-REVIEW-*, MILESTONE-*, VERIFY, CONTRACT, REFACTOR-*, spawned FIX-*/CODE-FIX-* etc.). 
+**Model selection is config-driven at runtime (see `src/loop_engine/model.rs:resolve_execution_plan`).** Do **not** put a `model` field on *any* task entry in the generated JSON (FEAT, ANALYSIS, CODE-REVIEW-*, MILESTONE-*, VERIFY, CONTRACT, REFACTOR-*, spawned FIX-*/CODE-FIX-* etc.), and do **not** set a top-level PRD `"model"` field — it is ignored under the models config and prints a warning on every import and loop start.
 
-- The top-level PRD `"model": "<sonnet>"` supplies the `prd_default`.
-- Task `estimatedEffort` (aka `difficulty`; canonical key `estimatedEffort`, alias `difficulty` accepted) set to `"high"` selects the `OPUS_MODEL` baseline rung (before any baselineTier remap).
-- Config surfaces that now drive selection:
-  - `reviewModel` (project or user) — forces the value on every review-class task id (`CODE-REVIEW-*`, `MILESTONE-FINAL`, `REVIEW-*` after prefix strip) at spawn time; highest late override.
-  - `primaryRunner.byTaskType` / `byIdPrefix` — rung 2 (before difficulty high).
-  - `primaryRunner.baselineTierRoutes` — for a given prefix + the baseline tier that would have been used (sonnet from default, or opus from high difficulty), pick a RunnerSpec (e.g. codex for high-tier FEAT work).
-  - `default_model` at project/user level.
-- Explicit per-task `model` wins rung 1 and bypasses the above routing for that task — the whole point of the recent config-driving changes is to stop baking model strings into task lists so operators can control routing via `task-mgr models set-*` without regenerating JSONs.
+- Task `estimatedEffort` (aka `difficulty`; canonical key `estimatedEffort`, alias `difficulty` accepted) drives the **anchor window**: `models.anchor` (default `standard`) + difficulty offset picks the capability tier (`low` → anchor−1, `medium` → anchor, `high` → anchor+1, clamped to the ladder), then the provider's tier ladder maps tier → model. With the default config, `high` resolves to the frontier model and `medium` to the standard model.
+- Operator `routing` config (`task-mgr models route <prefix>`, `routing.taskClasses`) provides forced routes at rungs 2–3, ahead of the anchor window. Review-class IDs (`CODE-REVIEW-*`, `MILESTONE-FINAL`, `REVIEW-*` after prefix strip) carry a built-in, non-redefinable force to the **frontier tier**.
+- Explicit per-task `model` wins rung 1 and bypasses the above routing for that task — the whole point of config-driven selection is to stop baking model strings into task lists so operators can control routing via `task-mgr models set-*` without regenerating JSONs.
 
-**Guidance for strong-model tasks:** Set `"estimatedEffort": "high"` on CONTRACT-xxx (when complex), all review gates (`CODE-REVIEW-*`, `REFACTOR-REVIEW-FINAL`, `MILESTONE-*`, `REVIEW-001`), VERIFY-xxx, and any spawned repair tasks that should start with a capable baseline. Combined with `reviewModel` this gives the intended behavior while letting configs be the source of truth.
+**Guidance for strong-model tasks:** Set `"estimatedEffort": "high"` on CONTRACT-xxx (when complex), VERIFY-xxx, MILESTONE-*, REFACTOR-REVIEW-FINAL, and any spawned repair tasks that should start with a capable baseline. Review-class IDs are frontier-forced regardless of difficulty.
 
-The old "stamp reviewModel snapshot into the task JSON" pattern is retired; the generator no longer reads `.task-mgr/config.json` for per-task model values.
+The old "stamp model snapshots into the task JSON" pattern is retired; the generator no longer reads `.task-mgr/config.json` for per-task model values.
 
 **`timeoutSecs` assignment** (set on tasks that run the full test suite):
 
@@ -94,24 +89,13 @@ The old "stamp reviewModel snapshot into the task JSON" pattern is retired; the 
 | `VERIFY-xxx`    | 1800          | Same — runs complete test suite                       |
 | All others      | _(omit)_      | Uses loop default (12 min)                            |
 
-Set the resolved **sonnet** model as the PRD-level `"model"` field:
-
-```json
-{
-  "version": "1.0",
-  "model": "<resolved-sonnet-id>",
-  ...
-}
-```
-
-(The only `model` key in the generated task list; every `userStories[]` entry omits `model`.)
-
-This makes sonnet the baseline for ordinary FEAT work. Do **not** stamp
-`model` on FEAT tasks (or any tasks): use `estimatedEffort: "high"` and/or
-`modifiesBehavior: true` to express the desire for a strong baseline tier.
-`.task-mgr/config.json` `primaryRunner.baselineTierRoutes` (and `byTaskType`/`byIdPrefix`)
-plus `reviewModel` then select the actual runner/model at runtime.
-Explicit per-task `model` fields (highest precedence) bypass all of that policy.
+The generated task list contains **no `model` keys at all** — not on tasks, not
+at the PRD top level. Use `estimatedEffort: "high"` and/or
+`modifiesBehavior: true` to express the desire for a strong tier; the
+`models` + `routing` config (`task-mgr models show`) selects the actual
+runner/model at runtime via the anchor window and any forced routes.
+Explicit per-task `model` fields (rung 1, highest precedence) bypass all of
+that policy; a top-level PRD `model` is ignored and warns.
 
 ---
 
@@ -337,7 +321,6 @@ The agent checks these before starting any task. If the required task in the oth
 {
   "version": "1.0",
   "project": "{{PROJECT_NAME}}",
-  "model": "<resolved-sonnet-id>",
   "branchName": "feat/{feature-name}",
   "externalGitRepo": "{{EXTERNAL_GIT_REPO_OR_OMIT}}",
   "mergeStrategy": "Merge to main after MILESTONE-FINAL passes. Squash commits optional.",
@@ -915,13 +898,13 @@ Every task list follows a lean phased structure. The table below is the spine fo
 
 | # | Priority | ID pattern                      | Type            | Spawned by       | Depends on                          | Model / timeout (config-driven) |
 | - | -------- | ------------------------------- | --------------- | ---------------- | ----------------------------------- | ------------------------------- |
-| 0 | 0-1      | `CONTRACT-xxx` (optional)       | contract        | — / `/spike`     | —                                   | `estimatedEffort: high` (if complex); reviewModel/primary apply at runtime |
+| 0 | 0-1      | `CONTRACT-xxx` (optional)       | contract        | — / `/spike`     | —                                   | `estimatedEffort: high` (if complex); routing config applies at runtime |
 | 1 | 2-12     | `FEAT-xxx` / `FIX-xxx`          | implementation  | —                | relevant CONTRACT (if any)          | omit `model`; use high effort for baseline tier intent |
-| 2 | 13       | `CODE-REVIEW-1` (large PRDs only) | review        | —                | all early FEAT/FIX + CONTRACT       | `estimatedEffort: high`; `reviewModel` override if set in config |
-| 2a| 14-20    | `CODE-FIX-xxx` / `WIRE-FIX-xxx` | implementation  | CODE-REVIEW-1    | —                                   | `estimatedEffort: high` for repair strength (or let primaryRunner byIdPrefix drive) |
+| 2 | 13       | `CODE-REVIEW-1` (large PRDs only) | review        | —                | all early FEAT/FIX + CONTRACT       | `estimatedEffort: high`; review-class → frontier-forced |
+| 2a| 14-20    | `CODE-FIX-xxx` / `WIRE-FIX-xxx` | implementation  | CODE-REVIEW-1    | —                                   | `estimatedEffort: high` for repair strength (or let `routing.byIdPrefix` drive) |
 | 3 | 70       | `REFACTOR-REVIEW-FINAL` (optional) | review       | —                | all implementation                  | `estimatedEffort: high`; no per-task model |
 | 3a| 71-85    | `REFACTOR-xxx`                  | implementation  | REFACTOR-REVIEW-FINAL | —                                | `estimatedEffort: high` |
-| 4 | 99       | `REVIEW-001` (the final gate)   | review          | —                | all prior work + REFACTOR (if any)  | `estimatedEffort: high`, 1800s; reviewModel drives when present |
+| 4 | 99       | `REVIEW-001` (the final gate)   | review          | —                | all prior work + REFACTOR (if any)  | `estimatedEffort: high`, 1800s; review-class → frontier-forced |
 
 **REVIEW-001 is the milestone.** It runs the full, unscoped quality gate and must leave the repo green (including pre-existing failures). There are no separate MILESTONE-1 / MILESTONE-2 tasks in the lean skeleton.
 
@@ -931,7 +914,7 @@ Every task list follows a lean phased structure. The table below is the spine fo
 
 - **ANALYSIS-xxx** (opt-in) — Only for behavior-modifying changes that span >2 top-level directories *or* when the PRD/spike author explicitly requests it (set `requiresConsumerAnalysis: true` or create the task manually). For small localized changes, document the callers directly in the FEAT task description instead.
 
-- **FEAT-xxx** — Tests for the new behavior live *inside* the same coherent change (see the lean skeleton in `plan-tasks.md`). `edgeCases`, `invariants`, and known-bad discriminators are still required on the task. Do not set `model` on the task; mark `estimatedEffort: "high"` and/or `modifiesBehavior: true` when you want the Opus baseline rung (or to enable `baselineTierRoutes` remap of an opus-tier FEAT). Runtime (primaryRunner, reviewModel, etc.) selects the actual model/runner.
+- **FEAT-xxx** — Tests for the new behavior live *inside* the same coherent change (see the lean skeleton in `plan-tasks.md`). `edgeCases`, `invariants`, and known-bad discriminators are still required on the task. Do not set `model` on the task; mark `estimatedEffort: "high"` and/or `modifiesBehavior: true` when you want a stronger tier (anchor+1 via the anchor window). The runtime `models` + `routing` config selects the actual model/runner.
 
 - **Middle milestones, separate TEST-INIT, INT-xxx, and VERIFY-001 removed** — These were identified as low-ROI ceremony (see anti-pattern table in `plan-tasks.md`). The single `REVIEW-001` at the end runs the full gate and serves as the milestone. `INT-xxx` concerns are now handled inside the final review's acceptance criteria and the PRD's Boundary Contracts section. A `CONTRACT-xxx` (when present) does the deep edge-case/invariant work before any implementation begins.
 
@@ -1055,7 +1038,7 @@ After generation, verify:
 - [ ] **Edge case coverage**: Every PRD Known Edge Case appears as an `edgeCases` entry on at least one TEST-INIT task
 - [ ] **Prompt instructs scoped per-iteration testing and full-suite-at-milestones** (Quality Checks section is present and splits the two gates)
 - [ ] **No task has `synergyWith` / `batchWith` / `conflictsWith` populated** (dropped — `touchesFiles` drives synergy at selection time; conflicts expressed via `dependsOn`)
-- [ ] **No `model` fields on any user story / task** (only top-level PRD `model` for the sonnet baseline is present; reviewModel / primaryRunner / baselineTierRoutes / difficulty-high now drive selection)
+- [ ] **No `model` fields anywhere** (no per-task models AND no top-level PRD model; the anchor window, `routing` config, and the built-in review-class frontier force drive selection)
 - [ ] Review gates, MILESTONE-*, REFACTOR-REVIEW-FINAL, complex CONTRACTs and repair FIXes carry `estimatedEffort: "high"` (so difficulty triggers opus baseline rung when no stronger config route applies)
 - [ ] **`qualityDimensions` is a flat array**, NOT `{correctness, performance, style}` sub-objects
 - [ ] **Only CODE-REVIEW-1 and REFACTOR-REVIEW-FINAL exist** — no REFACTOR-REVIEW-1 or -2 tasks in the JSON
