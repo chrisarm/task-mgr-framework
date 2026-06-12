@@ -293,8 +293,6 @@ fn audit_setup_with_claude_dir(
         db_dir: project_dir.join(".task-mgr"),
         project_dir: project_dir.to_path_buf(),
     };
-    let local_skills_dir = project_dir.join(".claude").join("commands");
-
     let registry = default_registry();
     let checks = registry.run_all(&ctx);
 
@@ -306,18 +304,17 @@ fn audit_setup_with_claude_dir(
 
     let mut applied_fixes = Vec::new();
 
-    // Fix missing skills (copy from local .claude/commands/ to ~/.claude/commands/).
-    let missing_skills: Vec<&str> = EXPECTED_SKILLS
-        .iter()
-        .filter(|&&skill| !ctx.commands_dir.join(format!("{skill}.md")).exists())
-        .copied()
-        .collect();
-    if !missing_skills.is_empty() {
-        applied_fixes.extend(fix_install_skills(
-            &local_skills_dir,
-            &ctx.commands_dir,
-            &missing_skills,
-        ));
+    // Fix missing or stale-but-owned skills (stage the binary's embedded
+    // copies into ~/.claude/commands/; content no longer comes from the local
+    // project). Locally modified skills are auto_fixable: false and only the
+    // explicit `task-mgr init --force-skills` replaces them.
+    let skills_need_fix = checks.iter().any(|c| {
+        c.category == setup_output::SetupCategory::Skills
+            && c.auto_fixable
+            && c.severity != SetupSeverity::Pass
+    });
+    if skills_need_fix {
+        applied_fixes.extend(fix_install_skills(&ctx.commands_dir));
     }
 
     // Fix missing project config.
@@ -399,7 +396,7 @@ mod audit_setup_tests {
 
         // No settings.json → defaultMode check is Pass (safe default).
         // No hook file → hook_bypass is Pass (nothing to bypass).
-        // All 6 expected skills are missing → 6 Warnings.
+        // Every expected skill is missing → one Warning each.
         // No config.json → 1 Warning.
         // No CLAUDE.md → 1 Info.
 
@@ -439,10 +436,15 @@ mod audit_setup_tests {
         let claude_dir = make_claude_dir(home.path());
         write_clean_settings(&claude_dir);
 
-        // Install all expected skills.
+        // Install all expected skills with the real embedded content — the
+        // freshness check warns on anything that differs from the bundle.
         let commands_dir = claude_dir.join("commands");
-        for skill in EXPECTED_SKILLS {
-            std::fs::write(commands_dir.join(format!("{skill}.md")), "# skill").unwrap();
+        for skill in EXPECTED_SKILLS.iter() {
+            std::fs::write(
+                commands_dir.join(format!("{skill}.md")),
+                crate::skills::embedded_content(skill).unwrap(),
+            )
+            .unwrap();
         }
 
         // Install a hook with the bypass.
@@ -494,12 +496,8 @@ mod audit_setup_tests {
         let claude_dir = make_claude_dir(home.path());
         write_clean_settings(&claude_dir);
 
-        // Provide source skills in local .claude/commands/ so auto-fix can copy.
-        let local_commands = project.path().join(".claude").join("commands");
-        std::fs::create_dir_all(&local_commands).unwrap();
-        for skill in EXPECTED_SKILLS {
-            std::fs::write(local_commands.join(format!("{skill}.md")), "# skill").unwrap();
-        }
+        // Skills are missing entirely — auto-fix stages the binary's embedded
+        // copies (no project-local source directory is involved anymore).
 
         // Provide a hook that needs patching.
         let hook_path = claude_dir.join("hooks").join("guard-destructive.sh");
@@ -543,12 +541,8 @@ mod audit_setup_tests {
         let claude_dir = make_claude_dir(home.path());
         write_clean_settings(&claude_dir);
 
-        // Provide source skills so auto-fix can copy them.
-        let local_commands = project.path().join(".claude").join("commands");
-        std::fs::create_dir_all(&local_commands).unwrap();
-        for skill in EXPECTED_SKILLS {
-            std::fs::write(local_commands.join(format!("{skill}.md")), "# skill").unwrap();
-        }
+        // Skills are staged from the binary's embedded copies — no local
+        // source directory needed.
 
         // Provide a hook that needs patching.
         let hook_path = claude_dir.join("hooks").join("guard-destructive.sh");

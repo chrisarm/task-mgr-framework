@@ -92,6 +92,13 @@ TASK ID PREFIXING:
         #[arg(long, default_value_t = false)]
         force: bool,
 
+        /// Overwrite locally modified skill files in ~/.claude/commands/ with
+        /// the versions bundled in this binary. Without this flag, files that
+        /// differ from what task-mgr last installed are kept and listed.
+        /// Symlinks are never touched.
+        #[arg(long = "force-skills", default_value_t = false)]
+        force_skills: bool,
+
         /// Append to existing database (preserves existing tasks, learnings, runs)
         #[arg(long, default_value_t = false)]
         append: bool,

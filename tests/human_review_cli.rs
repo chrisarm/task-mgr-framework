@@ -29,6 +29,7 @@ fn init_from_fixture(fixture_name: &str) -> TempDir {
     let prd_path = fixture_path(fixture_name);
 
     Command::new(cargo_bin("task-mgr"))
+        .env("HOME", temp_dir.path())
         .args(["--dir", temp_dir.path().to_str().unwrap()])
         .args([
             "init",
@@ -52,6 +53,7 @@ fn test_init_with_requires_human_succeeds() {
     let prd_path = fixture_path("prd_with_requires_human.json");
 
     Command::new(cargo_bin("task-mgr"))
+        .env("HOME", temp_dir.path())
         .args(["--dir", temp_dir.path().to_str().unwrap()])
         .args([
             "init",
@@ -291,6 +293,7 @@ fn test_full_round_trip_requires_human() {
     // Phase 3: Import the exported JSON into a fresh DB
     let temp_dir2 = TempDir::new().unwrap();
     Command::new(cargo_bin("task-mgr"))
+        .env("HOME", temp_dir2.path())
         .args(["--dir", temp_dir2.path().to_str().unwrap()])
         .args([
             "init",

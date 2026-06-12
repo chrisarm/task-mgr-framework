@@ -85,11 +85,85 @@ struct DispatchInitArgs {
     from_json: Vec<PathBuf>,
     enhance: bool,
     force: bool,
+    force_skills: bool,
     append: bool,
     update_existing: bool,
     dry_run: bool,
     prefix: Option<String>,
     no_prefix: bool,
+}
+
+/// Best-effort refresh of `~/.claude/commands/` from the embedded skill
+/// registry ([`task_mgr::skills`]). Warns and returns on any problem —
+/// staging never fails the surrounding command. Callers must skip this on
+/// `--dry-run` paths (a dry run must not write to `$HOME`).
+fn stage_global_skills(force_skills: bool) {
+    let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) else {
+        ui::emit_err(&ui::yellow(
+            "warning: skills: $HOME not set; skipped staging ~/.claude/commands/",
+        ));
+        return;
+    };
+    let dir = PathBuf::from(home).join(".claude").join("commands");
+    let outcome = task_mgr::skills::stage_skills(&dir, force_skills);
+
+    for err in &outcome.errors {
+        ui::emit_err(&ui::yellow(&format!("warning: skills: {err}")));
+    }
+    for name in &outcome.overwrote_modified {
+        ui::emit_err(&format!("overwrote {name}.md (local copy differed)"));
+    }
+    for name in &outcome.skipped_symlink {
+        ui::emit_err(&ui::yellow(&format!(
+            "warning: ~/.claude/commands/{name}.md is a symlink — refusing to overwrite"
+        )));
+    }
+    if !outcome.skipped_modified.is_empty() {
+        let n = outcome.skipped_modified.len();
+        let mut block = String::new();
+        if outcome.manifest_missing {
+            block.push_str(
+                "warning: no skills manifest found (first run after upgrading task-mgr), so \
+                 pre-existing files can't be told apart from local edits.\n",
+            );
+        }
+        block.push_str(&format!(
+            "warning: {n} skill file{} in ~/.claude/commands/ differ{} from the versions \
+             bundled with this task-mgr:",
+            if n == 1 { "" } else { "s" },
+            if n == 1 { "s" } else { "" },
+        ));
+        for name in &outcome.skipped_modified {
+            block.push_str(&format!("\n  • {name}.md"));
+        }
+        block.push_str(
+            "\n  Kept your copies. To replace all with the bundled versions: \
+             task-mgr init --force-skills",
+        );
+        ui::emit_err(&ui::yellow(&block));
+    }
+
+    // Summary only when something changed; a fully up-to-date pass is silent.
+    let refreshed = outcome.refreshed.len() + outcome.overwrote_modified.len();
+    let mut parts = Vec::new();
+    if !outcome.installed.is_empty() {
+        parts.push(format!("{} installed", outcome.installed.len()));
+    }
+    if refreshed > 0 {
+        parts.push(format!("{refreshed} refreshed"));
+    }
+    if !outcome.skipped_modified.is_empty() {
+        parts.push(format!("{} skipped (local edits)", outcome.skipped_modified.len()));
+    }
+    if !outcome.skipped_symlink.is_empty() {
+        parts.push(format!("{} skipped (symlink)", outcome.skipped_symlink.len()));
+    }
+    if !parts.is_empty() {
+        ui::emit(&format!(
+            "Staged skills to ~/.claude/commands/: {}",
+            parts.join(", ")
+        ));
+    }
 }
 
 /// Resolve the project root for `init_project`.
@@ -133,13 +207,14 @@ fn dispatch_init(
     if args.from_json.is_empty() && args.force {
         ui::emit_err(
             "error: `task-mgr init --force` is not supported. Project-level init has no \
-             destructive form. To reset, `rm -rf .task-mgr/` and re-run `task-mgr init`.",
+             destructive form. To reset, `rm -rf .task-mgr/` and re-run `task-mgr init`. \
+             (To overwrite locally modified skill files, use `--force-skills`.)",
         );
         process::exit(2);
     }
 
     if args.from_json.is_empty() {
-        dispatch_init_project(db_dir, format, args.enhance)
+        dispatch_init_project(db_dir, format, args.enhance, args.force_skills)
     } else {
         dispatch_init_shim(db_dir, verbose, format, args)
     }
@@ -151,12 +226,14 @@ fn dispatch_init_project(
     db_dir: &Path,
     format: OutputFormat,
     enhance: bool,
+    force_skills: bool,
 ) -> Result<(), TaskMgrError> {
     use task_mgr::commands::init::init_project;
 
     let project_root = project_root_for_init(db_dir);
     let _lock = LockGuard::acquire(db_dir)?;
     let result = init_project(&project_root)?;
+    stage_global_skills(force_skills);
 
     if enhance {
         use task_mgr::commands::enhance::templates::EnhanceProfile;
@@ -212,6 +289,9 @@ fn dispatch_init_shim(
     {
         let _lock = LockGuard::acquire(db_dir)?;
         init_project(&project_root)?;
+    }
+    if !args.dry_run {
+        stage_global_skills(args.force_skills);
     }
 
     let prefix_mode =
@@ -323,6 +403,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
             from_json,
             enhance,
             force,
+            force_skills,
             append,
             update_existing,
             dry_run,
@@ -336,6 +417,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                 from_json,
                 enhance,
                 force,
+                force_skills,
                 append,
                 update_existing,
                 dry_run,
@@ -1083,6 +1165,9 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                         dry_run,
                         prefix_mode,
                     )?;
+                    if !dry_run {
+                        stage_global_skills(false);
+                    }
                     if cli.verbose {
                         ui::prompt(&format_init_verbose(&result));
                     }
@@ -1260,6 +1345,9 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                         dry_run,
                         prefix_mode,
                     )?;
+                    if !dry_run {
+                        stage_global_skills(false);
+                    }
                     if cli.verbose {
                         ui::prompt(&format_init_verbose(&result));
                     }

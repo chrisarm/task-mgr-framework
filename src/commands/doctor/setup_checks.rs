@@ -37,15 +37,11 @@ fn read_settings_json(settings_path: &Path) -> Result<Option<serde_json::Value>,
     Ok(Some(json))
 }
 
-/// Expected task-mgr skill names (`.md` files in `~/.claude/commands/`).
-pub const EXPECTED_SKILLS: &[&str] = &[
-    "tm-apply",
-    "tm-learn",
-    "tm-recall",
-    "tm-invalidate",
-    "tm-status",
-    "tm-next",
-];
+/// Expected task-mgr skill names (`.md` files in `~/.claude/commands/`),
+/// derived from the embedded registry in [`crate::skills`] (aliases excluded)
+/// so doctor and the `init` staging path share one source of truth.
+pub static EXPECTED_SKILLS: std::sync::LazyLock<Vec<&'static str>> =
+    std::sync::LazyLock::new(crate::skills::expected_skill_names);
 
 /// Check that `permissions.defaultMode` is not set to `"default"`.
 ///
@@ -287,34 +283,74 @@ pub fn check_hook_bypass(ctx: &CheckContext) -> SetupCheck {
 }
 
 /// Check that each expected skill is installed in `ctx.commands_dir` (typically
-/// `~/.claude/commands/`).
+/// `~/.claude/commands/`) AND current with the binary's embedded copy.
 ///
-/// # Returns
-/// One `SetupCheck` per skill: `Pass` when present, `Warning` with a
-/// copy-pasteable install command when absent.
+/// Read-only freshness triage (same hash as the staging writer):
+/// - file bytes == embedded → `Pass`
+/// - manifest hash == file hash (stale but task-mgr-owned) → `Warning`,
+///   auto-fixable, fix = `task-mgr init`
+/// - otherwise (locally modified) → `Warning`, NOT auto-fixable, fix =
+///   `task-mgr init --force-skills`
+/// - names without an embedded counterpart (custom lists in tests) fall back
+///   to the existence-only check.
 pub fn check_skills_installed(ctx: &CheckContext, expected: &[&str]) -> Vec<SetupCheck> {
     let global_dir = &ctx.commands_dir;
+    let manifest = crate::skills::manifest_hashes(global_dir);
     expected
         .iter()
         .map(|name| {
+            let check_name = format!("skill_{}", name.replace('-', "_"));
             let skill_path = global_dir.join(format!("{name}.md"));
-            if skill_path.exists() {
-                SetupCheck {
+            let Ok(on_disk) = std::fs::read(&skill_path) else {
+                return SetupCheck {
                     category: SetupCategory::Skills,
-                    name: format!("skill_{}", name.replace('-', "_")),
+                    name: check_name,
+                    message: format!("Skill {name} not found in {}", global_dir.display()),
+                    severity: SetupSeverity::Warning,
+                    fix_command: Some("task-mgr init".to_string()),
+                    auto_fixable: true,
+                };
+            };
+            let Some(embedded) = crate::skills::embedded_content(name) else {
+                return SetupCheck {
+                    category: SetupCategory::Skills,
+                    name: check_name,
                     message: format!("Skill {name} is installed"),
                     severity: SetupSeverity::Pass,
                     fix_command: None,
                     auto_fixable: false,
+                };
+            };
+            if on_disk == embedded.as_bytes() {
+                SetupCheck {
+                    category: SetupCategory::Skills,
+                    name: check_name,
+                    message: format!("Skill {name} is installed and current"),
+                    severity: SetupSeverity::Pass,
+                    fix_command: None,
+                    auto_fixable: false,
+                }
+            } else if manifest.get(*name) == Some(&crate::skills::content_hash(&on_disk)) {
+                SetupCheck {
+                    category: SetupCategory::Skills,
+                    name: check_name,
+                    message: format!(
+                        "Skill {name} is stale (older task-mgr install; safe to refresh)"
+                    ),
+                    severity: SetupSeverity::Warning,
+                    fix_command: Some("task-mgr init".to_string()),
+                    auto_fixable: true,
                 }
             } else {
                 SetupCheck {
                     category: SetupCategory::Skills,
-                    name: format!("skill_{}", name.replace('-', "_")),
-                    message: format!("Skill {name} not found in {}", global_dir.display()),
+                    name: check_name,
+                    message: format!(
+                        "Skill {name} differs from the bundled version (local edits?)"
+                    ),
                     severity: SetupSeverity::Warning,
-                    fix_command: Some(format!("cp .claude/commands/{name}.md ~/.claude/commands/")),
-                    auto_fixable: true,
+                    fix_command: Some("task-mgr init --force-skills".to_string()),
+                    auto_fixable: false,
                 }
             }
         })
@@ -425,7 +461,7 @@ fn check_claude_md_vec(ctx: &CheckContext) -> Vec<SetupCheck> {
 }
 
 fn check_skills_installed_default(ctx: &CheckContext) -> Vec<SetupCheck> {
-    check_skills_installed(ctx, EXPECTED_SKILLS)
+    check_skills_installed(ctx, &EXPECTED_SKILLS)
 }
 
 /// Build the default registry containing all 6 setup checks.
@@ -866,11 +902,15 @@ mod tests {
         }
     }
 
-    /// Present skill must produce Pass.
+    /// Present-and-current skill must produce Pass.
     #[test]
     fn test_check_skills_installed_pass_present_skill_is_pass() {
         let dir = TempDir::new().unwrap();
-        write_fixture(dir.path(), "tm-apply.md", "# tm-apply");
+        write_fixture(
+            dir.path(),
+            "tm-apply.md",
+            crate::skills::embedded_content("tm-apply").unwrap(),
+        );
 
         let checks = check_skills_installed(&ctx_commands(dir.path().to_path_buf()), &["tm-apply"]);
 
@@ -882,7 +922,11 @@ mod tests {
     #[test]
     fn test_check_skills_installed_mixed_some_pass_some_warning() {
         let dir = TempDir::new().unwrap();
-        write_fixture(dir.path(), "tm-apply.md", "# tm-apply");
+        write_fixture(
+            dir.path(),
+            "tm-apply.md",
+            crate::skills::embedded_content("tm-apply").unwrap(),
+        );
         // tm-learn is absent
 
         let checks = check_skills_installed(
@@ -901,6 +945,52 @@ mod tests {
             .count();
         assert_eq!(pass_count, 1, "tm-apply should pass");
         assert_eq!(warn_count, 1, "tm-learn should warn");
+    }
+
+    /// Stale but task-mgr-owned (manifest hash matches file): auto-fixable
+    /// Warning pointing at plain `task-mgr init`.
+    #[test]
+    fn test_check_skills_installed_stale_owned_is_auto_fixable_warning() {
+        let dir = TempDir::new().unwrap();
+        // Stage everything, then simulate an older install of tm-apply by
+        // rewriting the file AND its manifest hash to the old content.
+        crate::skills::stage_skills(dir.path(), false);
+        write_fixture(dir.path(), "tm-apply.md", "old bundled content");
+        let manifest_path = dir.path().join(crate::skills::MANIFEST_FILE);
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["skills"]["tm-apply"] =
+            crate::skills::content_hash(b"old bundled content").into();
+        std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+        let checks = check_skills_installed(&ctx_commands(dir.path().to_path_buf()), &["tm-apply"]);
+
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].severity, SetupSeverity::Warning);
+        assert!(checks[0].auto_fixable, "stale-owned skill is auto-fixable");
+        assert_eq!(checks[0].fix_command.as_deref(), Some("task-mgr init"));
+    }
+
+    /// Locally modified (no matching manifest hash): non-auto-fixable Warning
+    /// pointing at `task-mgr init --force-skills`.
+    #[test]
+    fn test_check_skills_installed_modified_is_not_auto_fixable() {
+        let dir = TempDir::new().unwrap();
+        crate::skills::stage_skills(dir.path(), false);
+        write_fixture(dir.path(), "tm-apply.md", "# my customized version");
+
+        let checks = check_skills_installed(&ctx_commands(dir.path().to_path_buf()), &["tm-apply"]);
+
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].severity, SetupSeverity::Warning);
+        assert!(
+            !checks[0].auto_fixable,
+            "modified skill must not be auto-fixed"
+        );
+        assert_eq!(
+            checks[0].fix_command.as_deref(),
+            Some("task-mgr init --force-skills")
+        );
     }
 
     /// Empty expected list must return empty Vec.
@@ -1012,11 +1102,16 @@ mod tests {
             "#!/bin/bash\n[ -n \"$LOOP_ALLOW_DESTRUCTIVE\" ] && exit 0\n",
         );
 
-        // All skills installed
+        // All skills installed with the real embedded content (the freshness
+        // check warns when a file differs from the bundle).
         let commands_dir = claude_dir.join("commands");
         std::fs::create_dir_all(&commands_dir).unwrap();
-        for skill in EXPECTED_SKILLS {
-            write_fixture(&commands_dir, &format!("{skill}.md"), "# skill");
+        for skill in EXPECTED_SKILLS.iter() {
+            write_fixture(
+                &commands_dir,
+                &format!("{skill}.md"),
+                crate::skills::embedded_content(skill).unwrap(),
+            );
         }
 
         // Project config and CLAUDE.md
@@ -1057,7 +1152,7 @@ mod tests {
             hook_check.message
         );
 
-        let skill_checks = check_skills_installed(&ctx, EXPECTED_SKILLS);
+        let skill_checks = check_skills_installed(&ctx, &EXPECTED_SKILLS);
         for check in &skill_checks {
             assert_eq!(
                 check.severity,

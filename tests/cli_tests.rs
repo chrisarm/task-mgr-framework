@@ -43,6 +43,7 @@ fn setup_initialized_tempdir() -> TempDir {
     let mut last_stderr = String::new();
     for attempt in 0..5 {
         let output = Command::new(cargo_bin("task-mgr"))
+        .env("HOME", &dir_str)
             .args(["--dir", &dir_str])
             .args(["init", "--no-prefix", "--from-json", &prd_str])
             .output()
@@ -111,6 +112,7 @@ fn test_init_from_json() {
     let prd_path = sample_prd_path();
 
     Command::new(cargo_bin("task-mgr"))
+        .env("HOME", temp_dir.path())
         .args(["--dir", temp_dir.path().to_str().unwrap()])
         .args([
             "init",
@@ -135,6 +137,7 @@ fn test_init_creates_database() {
     assert!(!db_path.exists());
 
     Command::new(cargo_bin("task-mgr"))
+        .env("HOME", temp_dir.path())
         .args(["--dir", temp_dir.path().to_str().unwrap()])
         .args([
             "init",
@@ -156,6 +159,7 @@ fn test_init_dry_run_shows_preview() {
 
     // Run with dry-run flag
     let output = Command::new(cargo_bin("task-mgr"))
+        .env("HOME", temp_dir.path())
         .args(["--dir", temp_dir.path().to_str().unwrap()])
         .args([
             "init",
@@ -363,6 +367,7 @@ fn test_init_nonexistent_file_returns_error() {
     let temp_dir = TempDir::new().unwrap();
 
     Command::new(cargo_bin("task-mgr"))
+        .env("HOME", temp_dir.path())
         .args(["--dir", temp_dir.path().to_str().unwrap()])
         .args([
             "init",
@@ -390,6 +395,7 @@ fn test_init_without_from_json_runs_project_level_scaffold() {
     let temp_dir = TempDir::new().unwrap();
 
     Command::new(cargo_bin("task-mgr"))
+        .env("HOME", temp_dir.path())
         .args(["--dir", temp_dir.path().to_str().unwrap()])
         .arg("init")
         .assert()
@@ -481,6 +487,7 @@ fn test_database_isolation() {
     // Initialize both with the same PRD
     for temp_dir in [&temp_dir1, &temp_dir2] {
         Command::new(cargo_bin("task-mgr"))
+        .env("HOME", temp_dir.path())
             .args(["--dir", temp_dir.path().to_str().unwrap()])
             .args([
                 "init",
@@ -569,6 +576,7 @@ fn test_export_roundtrip() {
     // Re-import into new directory
     let temp_dir2 = TempDir::new().unwrap();
     Command::new(cargo_bin("task-mgr"))
+        .env("HOME", temp_dir2.path())
         .args(["--dir", temp_dir2.path().to_str().unwrap()])
         .args([
             "init",
@@ -1462,6 +1470,7 @@ fn setup_archive_test_dir() -> (TempDir, String) {
 
     // Init P1 (alpha-project) from the local copy with explicit prefix
     Command::new(cargo_bin("task-mgr"))
+        .env("HOME", &dir)
         .args(["--dir", &dir])
         .args([
             "init",
@@ -1475,6 +1484,7 @@ fn setup_archive_test_dir() -> (TempDir, String) {
 
     // Init P2 (beta-project) with --append from the local copy with explicit prefix
     Command::new(cargo_bin("task-mgr"))
+        .env("HOME", &dir)
         .args(["--dir", &dir])
         .args([
             "init",
@@ -1785,6 +1795,7 @@ fn setup_list_with_archived() -> (TempDir, String) {
 
     // Init with sample PRD (7 tasks)
     Command::new(cargo_bin("task-mgr"))
+        .env("HOME", &dir)
         .args(["--dir", &dir])
         .args([
             "init",
@@ -1819,6 +1830,7 @@ fn setup_history_with_archived() -> (TempDir, String) {
 
     // Init with sample PRD so the DB and schema are created
     Command::new(cargo_bin("task-mgr"))
+        .env("HOME", &dir)
         .args(["--dir", &dir])
         .args([
             "init",
@@ -1942,6 +1954,7 @@ fn test_list_include_archived_with_limit_caps_archived() {
     let prd_path = sample_prd_path();
 
     Command::new(cargo_bin("task-mgr"))
+        .env("HOME", &dir)
         .args(["--dir", &dir])
         .args([
             "init",
@@ -2113,6 +2126,7 @@ fn setup_init_force_dir() -> (TempDir, String) {
 
     // Init P1
     Command::new(cargo_bin("task-mgr"))
+        .env("HOME", &dir)
         .args(["--dir", &dir])
         .args([
             "init",
@@ -2185,6 +2199,7 @@ fn test_init_force_archives_runs_and_key_decisions_hard_deletes_tasks() {
 
     // Run init --force for P1
     Command::new(cargo_bin("task-mgr"))
+        .env("HOME", &dir)
         .args(["--dir", &dir])
         .args([
             "init",
@@ -2267,6 +2282,7 @@ fn test_init_force_preserves_previously_archived_data() {
 
     // Run init --force — must not touch the already-archived run
     Command::new(cargo_bin("task-mgr"))
+        .env("HOME", &dir)
         .args(["--dir", &dir])
         .args([
             "init",
@@ -2321,6 +2337,7 @@ fn test_init_force_global_wipe_hard_deletes_everything() {
 
     // Run init --force without --prefix (no-prefix = global wipe)
     Command::new(cargo_bin("task-mgr"))
+        .env("HOME", &dir)
         .args(["--dir", &dir])
         .args([
             "init",
@@ -2422,6 +2439,7 @@ fn test_init_no_args_creates_task_mgr_dir_and_emits_hint() {
     let db_dir = temp_dir.path().join(".task-mgr");
 
     let assert = Command::new(cargo_bin("task-mgr"))
+        .env("HOME", &db_dir)
         .args(["--dir", db_dir.to_str().unwrap()])
         .arg("init")
         .assert()
@@ -2449,6 +2467,7 @@ fn test_init_with_enhance_creates_claude_and_agents_md() {
     let db_dir = temp_dir.path().join(".task-mgr");
 
     Command::new(cargo_bin("task-mgr"))
+        .env("HOME", temp_dir.path())
         .args(["--dir", db_dir.to_str().unwrap()])
         .args(["init", "--enhance"])
         .current_dir(temp_dir.path())
@@ -2490,6 +2509,7 @@ fn test_init_force_without_from_json_rejected() {
     );
 
     let assert = Command::new(cargo_bin("task-mgr"))
+        .env("HOME", &db_dir)
         .args(["--dir", db_dir.to_str().unwrap()])
         .args(["init", "--force"])
         // Prevent ambient TASK_MGR_DIR / TASK_MGR_ACTIVE_PREFIX (set by the
@@ -2521,6 +2541,7 @@ fn test_init_from_json_shim_emits_deprecation_notice_and_imports() {
     let db_dir = temp_dir.path().join(".task-mgr");
 
     let assert = Command::new(cargo_bin("task-mgr"))
+        .env("HOME", &db_dir)
         .args(["--dir", db_dir.to_str().unwrap()])
         .args([
             "init",
@@ -2546,6 +2567,7 @@ fn test_init_from_json_with_enhance_imports_prd_and_skips_enhance() {
     let db_dir = temp_dir.path().join(".task-mgr");
 
     let assert = Command::new(cargo_bin("task-mgr"))
+        .env("HOME", temp_dir.path())
         .args(["--dir", db_dir.to_str().unwrap()])
         .args([
             "init",
@@ -2586,6 +2608,7 @@ fn test_current_empty_db_exits_zero_with_no_active_prd_message() {
     // Initialize project schema without importing any PRD (no from-json).
     let temp_dir = TempDir::new().unwrap();
     Command::new(cargo_bin("task-mgr"))
+        .env("HOME", temp_dir.path())
         .args(["--dir", temp_dir.path().to_str().unwrap()])
         .arg("init")
         .env_remove("TASK_MGR_ACTIVE_PREFIX")
@@ -2666,6 +2689,7 @@ fn test_add_emits_arrow_context_line_as_first_stderr() {
     fs::copy(&prd_path, &local_prd).unwrap();
 
     Command::new(cargo_bin("task-mgr"))
+        .env("HOME", temp_dir.path())
         .args(["--dir", temp_dir.path().to_str().unwrap()])
         .args([
             "init",
@@ -2936,4 +2960,124 @@ fn test_typo_close_to_real_command_produces_no_hint() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("hint:").not());
+}
+
+// ============================================================================
+// Embedded skills staging (src/skills.rs) — end-to-end behavior of the
+// init-family hooks in main.rs. Every command here pins HOME to a tempdir;
+// staging into the developer's real ~/.claude/commands would otherwise occur.
+// ============================================================================
+
+#[test]
+fn test_init_stages_embedded_skills_into_home() {
+    let temp_dir = TempDir::new().unwrap();
+    let home = temp_dir.path().join("home");
+    let db_dir = temp_dir.path().join(".task-mgr");
+
+    Command::new(cargo_bin("task-mgr"))
+        .env("HOME", &home)
+        .args(["--dir", db_dir.to_str().unwrap()])
+        .arg("init")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Staged skills"));
+
+    let commands = home.join(".claude").join("commands");
+    assert!(commands.join("plan-tasks.md").exists());
+    assert!(commands.join("tasks.md").exists());
+    assert!(
+        commands.join("prd-tasks.md").exists(),
+        "deprecated alias must be staged"
+    );
+    assert!(
+        commands.join(".task-mgr-skills.json").exists(),
+        "manifest must be written"
+    );
+    let alias = fs::read_to_string(commands.join("prd-tasks.md")).unwrap();
+    assert!(
+        alias.starts_with("> **Deprecated**"),
+        "alias must carry the deprecation banner"
+    );
+}
+
+#[test]
+fn test_init_skills_second_run_silent_modified_kept_force_overwrites() {
+    let temp_dir = TempDir::new().unwrap();
+    let home = temp_dir.path().join("home");
+    let db_dir = temp_dir.path().join(".task-mgr");
+    let dir_arg = db_dir.to_str().unwrap().to_string();
+
+    Command::new(cargo_bin("task-mgr"))
+        .env("HOME", &home)
+        .args(["--dir", &dir_arg])
+        .arg("init")
+        .assert()
+        .success();
+
+    // Second run: everything up to date — no skills summary at all.
+    Command::new(cargo_bin("task-mgr"))
+        .env("HOME", &home)
+        .args(["--dir", &dir_arg])
+        .arg("init")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Staged skills").not());
+
+    // Locally modify one skill: kept, consolidated warning names the file and
+    // the exact escape hatch.
+    let target = home.join(".claude").join("commands").join("tm-apply.md");
+    fs::write(&target, "# my customized version").unwrap();
+    Command::new(cargo_bin("task-mgr"))
+        .env("HOME", &home)
+        .args(["--dir", &dir_arg])
+        .arg("init")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("tm-apply.md"))
+        .stderr(predicate::str::contains("task-mgr init --force-skills"));
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        "# my customized version",
+        "modified skill must be kept without --force-skills"
+    );
+
+    // --force-skills replaces it and itemizes the overwrite.
+    Command::new(cargo_bin("task-mgr"))
+        .env("HOME", &home)
+        .args(["--dir", &dir_arg])
+        .args(["init", "--force-skills"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("overwrote tm-apply.md"));
+    assert_ne!(
+        fs::read_to_string(&target).unwrap(),
+        "# my customized version",
+        "--force-skills must replace the modified skill"
+    );
+}
+
+#[test]
+fn test_init_shim_dry_run_does_not_stage_skills() {
+    let temp_dir = TempDir::new().unwrap();
+    let home = temp_dir.path().join("home");
+    let db_dir = temp_dir.path().join(".task-mgr");
+    let prd = sample_prd_path();
+
+    Command::new(cargo_bin("task-mgr"))
+        .env("HOME", &home)
+        .args(["--dir", db_dir.to_str().unwrap()])
+        .args([
+            "init",
+            "--no-prefix",
+            "--from-json",
+            prd.to_str().unwrap(),
+            "--dry-run",
+        ])
+        .assert()
+        .success();
+
+    assert!(
+        !home.join(".claude").exists(),
+        "--dry-run must not write skills into $HOME"
+    );
 }
