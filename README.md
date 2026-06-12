@@ -51,7 +51,6 @@ task-mgr works with JSON-formatted Product Requirement Documents (PRDs). Each PR
       ],
       "touchesFiles": ["src/auth.rs", "src/routes.rs"],
       "dependsOn": [],
-      "synergyWith": ["US-002"],
       "notes": "Use argon2 for password hashing"
     }
   ]
@@ -61,7 +60,8 @@ task-mgr works with JSON-formatted Product Requirement Documents (PRDs). Each PR
 ### 2. Initialize the database
 
 ```bash
-# Scaffold the project (creates .task-mgr/, runs migrations, optionally picks a model)
+# Scaffold the project (creates .task-mgr/, runs migrations, optionally picks a
+# model anchor, and stages the agent skills into ~/.claude/commands/)
 task-mgr init
 
 # Import a PRD (canonical form)
@@ -233,7 +233,7 @@ The learnings system provides institutional memory across agent iterations. See 
 
 ## Project-level init vs PRD-level init
 
-`task-mgr init` (no arguments) handles project scaffolding only — it creates `.task-mgr/`, runs migrations, writes a default config, and optionally fires the interactive model picker. It is idempotent and does not touch any PRD JSON files.
+`task-mgr init` (no arguments) handles project scaffolding only — it creates `.task-mgr/`, runs migrations, writes a default config, optionally fires the interactive model picker, and refreshes the agent skills staged in `~/.claude/commands/` from the binary's embedded copies (see [Setting Up the Skills](#setting-up-the-skills)). It is idempotent and does not touch any PRD JSON files.
 
 PRD import is a separate concern handled by the loop/batch subcommands:
 
@@ -315,7 +315,7 @@ Use `--no-worktree` to revert to the old behavior of checking out branches direc
 
 ### Project Configuration
 
-Create `.task-mgr/config.json` to add project-specific tool permissions and pin a default Claude model:
+Create `.task-mgr/config.json` to add project-specific tool permissions:
 
 ```json
 {
@@ -325,8 +325,7 @@ Create `.task-mgr/config.json` to add project-specific tool permissions and pin 
     "Bash(docker-compose:*)",
     "Bash(curl:*)",
     "Bash(./scripts/*:*)"
-  ],
-  "defaultModel": "claude-sonnet-4-6"
+  ]
 }
 ```
 
@@ -345,59 +344,33 @@ Note: The `LOOP_ALLOWED_TOOLS` env var fully overrides — when set, project con
 
 ### Model Selection
 
-Pin a preferred Claude model for all tasks with `task-mgr models`:
+Model selection is config-driven via the provider-first `models` + `routing` config, managed entirely with `task-mgr models` (writes to project `.task-mgr/config.json` or user config; unrelated keys are preserved):
 
 ```sh
-task-mgr models list                       # print built-in model IDs + difficulty→effort mapping
+task-mgr models list                       # built-in model IDs + per-provider tier/effort tables + anchor
 task-mgr models list --remote              # live list from Anthropic (requires opt-in, below)
-task-mgr models set-default                # interactive picker (user-level)
-task-mgr models set-default claude-opus-4-7 --project   # pin at project level
-task-mgr models show                       # resolved default + source label
-task-mgr models unset-default [--project]
+task-mgr models show                       # resolved routing table, anchor-derived difficulty→model matrix
+task-mgr models init                       # write the default models+routing block
+task-mgr models set-anchor <tier>          # cheapest | cost-efficient | standard | frontier
+task-mgr models enable|disable <provider>  # claude | grok | codex
+task-mgr models set-tier <provider> <tier> [model]      # pin a model to a capability tier rung
+task-mgr models set-effort <provider> <difficulty> [level]
+task-mgr models set-fallback <provider> [target]        # tier-preserving cross-provider pivot for stuck tasks
+task-mgr models route <prefix> [--provider <p>] [--tier <t>]   # force a route by task-ID prefix
 ```
 
-**Resolution precedence** (highest to lowest):
+**Resolution** (see `resolve_execution_plan` in `src/loop_engine/model.rs`):
 
-1. `task.model` — explicit override on the task
-2. `.task-mgr/config.json` direct `primaryRunner` match (`byTaskType` / `byIdPrefix`)
-3. Baseline Claude model (`difficulty == "high"` → Opus, else PRD/project/user default)
-4. `.task-mgr/config.json` `primaryRunner.baselineTierRoutes` remap, if configured
-5. The baseline Claude model from step 3
-6. None (CLI default)
+1. `task.model` — explicit per-task override (bypasses all routing; task generators never emit it)
+2. `routing.byIdPrefix` — operator-forced route by task-ID prefix
+3. `routing.taskClasses` — class routing (`planning` / `implementation`); review-class IDs (`REVIEW-*`, `CODE-REVIEW-*`, `MILESTONE-FINAL`) have a built-in, non-redefinable force to the **frontier** tier
+4. Quota-blackout reroute, when a provider is in an ephemeral blackout window
+5. **Anchor window** — `models.anchor` (default `standard`) + difficulty offset picks the capability tier (`low` → anchor−1, `medium` → anchor, `high` → anchor+1, clamped to the ladder)
+6. The provider's tier ladder maps the tier to a concrete model (or no `-m` flag for provider-only rungs)
 
-Route selected task classes to Codex with `primaryRunner`. Codex routing is explicit only; model names such as `gpt-*`, `o*`, or `codex-*` do not auto-select Codex.
-Overlapping `byIdPrefix` or `baselineTierRoutes` prefixes must route to the same spec; conflicting overlaps fail config validation before the loop starts.
+PRD task lists carry **no model strings at all** — a task's `estimatedEffort` / `difficulty` plus its ID drive selection, so operators control routing entirely from config without regenerating JSONs. (Top-level PRD `model`, user-config `defaultModel`, and the legacy `reviewModel` / `primaryRunner` / `fallbackRunner` blocks are ignored or hard-rejected at preflight; migrate with `task-mgr models init --force-replace-legacy`.)
 
-```json
-{
-  "primaryRunner": {
-    "byTaskType": {
-      "spike": { "provider": "codex" }
-    },
-    "byIdPrefix": {
-      "CODEX-": { "provider": "codex" }
-    }
-  }
-}
-```
-
-Route by task prefix plus the provider-neutral baseline tier with `baselineTierRoutes`. This lets a project keep Sonnet as its PRD default while routing ordinary FEAT work to Grok and high-tier FEAT work to Codex:
-
-```json
-{
-  "primaryRunner": {
-    "claudeFallbackModel": "claude-opus-4-8",
-    "baselineTierRoutes": {
-      "FEAT": {
-        "high": { "provider": "codex", "runtimeErrorFallback": true },
-        "standard": { "provider": "grok", "model": "grok-build" }
-      }
-    }
-  }
-}
-```
-
-Codex uses the `codex` binary on `PATH`, or `CODEX_BINARY` when set to a non-empty executable path. `reviewModel` is still a string model override; do not combine it with a Codex review route in v1.
+Codex routing is config-explicit only (`routing` entries with `provider: "codex"`); model names such as `gpt-*`, `o*`, or `codex-*` never auto-select Codex. Codex uses the `codex` binary on `PATH`, or `CODEX_BINARY` when set to a non-empty executable path.
 
 **Remote opt-in** (prevents surprise HTTP calls on a globally-exported SDK key):
 
@@ -408,7 +381,7 @@ Codex uses the `codex` binary on `PATH`, or `CODEX_BINARY` when set to a non-emp
 
 Without both, `--remote` silently falls back to the built-in list. Live responses are cached at `$XDG_CACHE_HOME/task-mgr/models-cache.json` with a 24h TTL; stale cache is treated as a miss rather than served (no stale-on-error).
 
-The interactive picker fires automatically from `task-mgr init` (project-level) and from the deprecated `task-mgr init --from-json X` shim path when nothing resolves and stdin+stderr are both TTYs. Non-TTY / auto-mode runs print a one-line stderr hint and skip — loops never hang waiting for input. The picker does NOT fire from `task-mgr loop init` or `task-mgr batch init` directly (model selection is a project-level concern).
+The interactive anchor-tier picker fires automatically from `task-mgr init` (project-level) and from the deprecated `task-mgr init --from-json X` shim path when no `models` block is configured and stdin+stderr are both TTYs. Non-TTY / auto-mode runs print a one-line stderr hint and skip — loops never hang waiting for input. Configs with legacy keys are not auto-migrated; the hint points at `task-mgr models init --force-replace-legacy`. The picker does NOT fire from `task-mgr loop init` or `task-mgr batch init` directly (model selection is a project-level concern).
 
 ## Iterative Build Workflow
 
@@ -518,26 +491,17 @@ All skills are included in this repo at `.claude/commands/`. There are two categ
 
 **Task-mgr skills** (`/tm-apply`, `/tm-learn`, `/tm-recall`, `/tm-invalidate`, `/tm-status`, `/tm-next`) — used during build/learn phases.
 
-**Option A: Use the repo copies directly** — Claude Code automatically loads skills from `.claude/commands/` in the project root. Just clone the repo and they're available.
+**Installation is automatic.** All skills are embedded in the task-mgr binary at build time and staged into `~/.claude/commands/` whenever you run `task-mgr init`, `task-mgr loop init`, or `task-mgr batch init` (skipped on `--dry-run`). Upgrading the binary (`cargo install --path .`) and running any init refreshes them — no manual copying, no drift.
 
-**Option B: Copy to global commands** — To make skills available across all projects:
+Staging is guarded by a manifest (`~/.claude/commands/.task-mgr-skills.json`) that records what task-mgr last installed:
 
-```bash
-# Workflow skills
-cp .claude/commands/prd.md ~/.claude/commands/
-cp .claude/commands/tasks.md ~/.claude/commands/
-cp .claude/commands/plan-tasks.md ~/.claude/commands/
+- **Missing** skills are installed; **unmodified stale** copies are refreshed.
+- **Locally edited** skills are kept and listed, with `task-mgr init --force-skills` as the explicit overwrite.
+- **Symlinks** are never touched (even with `--force-skills`), and files task-mgr doesn't own (your own custom skills) are never iterated.
 
-# Task-mgr skills (recommended for all projects using task-mgr)
-cp .claude/commands/tm-apply.md ~/.claude/commands/
-cp .claude/commands/tm-learn.md ~/.claude/commands/
-cp .claude/commands/tm-recall.md ~/.claude/commands/
-cp .claude/commands/tm-invalidate.md ~/.claude/commands/
-cp .claude/commands/tm-status.md ~/.claude/commands/
-cp .claude/commands/tm-next.md ~/.claude/commands/
-```
+`task-mgr doctor --setup` reports skill freshness (missing / stale / locally modified) and `--auto-fix` stages anything safely refreshable.
 
-The loop engine warns at startup if task-mgr skills are missing from `~/.claude/commands/` and shows the exact copy commands needed.
+> **Note:** Don't hand-edit the staged copies in `~/.claude/commands/` unless you mean to fork them — edits are detected and skipped on refresh, leaving you on a stale fork. To change a skill for everyone, edit it in this repo's `.claude/commands/`, reinstall the binary, and re-run any init. `prd-tasks.md` is staged as a deprecated alias of `tasks.md`.
 
 ## Shell Integration
 
