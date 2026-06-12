@@ -9,7 +9,7 @@
 //!
 //! | Function                      | Action                                        |
 //! |-------------------------------|-----------------------------------------------|
-//! | `fix_install_skills`          | Copy `.md` files to `~/.claude/commands/`     |
+//! | `fix_install_skills`          | Stage embedded skills to `~/.claude/commands/` |
 //! | `fix_generate_project_config` | Write `.task-mgr/config.json`                 |
 //! | `fix_patch_hook`              | Insert `LOOP_ALLOW_DESTRUCTIVE` bypass        |
 //! | `fix_generate_claude_md`      | Generate template `CLAUDE.md`                 |
@@ -18,80 +18,69 @@
 use std::path::{Path, PathBuf};
 
 use crate::commands::doctor::setup_output::SetupFix;
+// Symlink policy lives in one place: the skills staging module.
+use crate::skills::is_symlink;
 
-/// Returns `true` if `path` is a symlink, **without following it**.
+/// Install/refresh skill `.md` files in `global_dir` from the embedded
+/// registry.
 ///
-/// Uses `symlink_metadata` so a dangling symlink is still detected.
-/// Returns `false` when the path does not exist or metadata is unavailable.
-fn is_symlink(path: &Path) -> bool {
-    std::fs::symlink_metadata(path)
-        .map(|m| m.file_type().is_symlink())
-        .unwrap_or(false)
-}
-
-/// Copy missing skill `.md` files from `source_dir` to `global_dir`.
-///
-/// For each name in `missing_skills`, copies `<source_dir>/<name>.md` to
-/// `<global_dir>/<name>.md`. Creates `global_dir` if it does not exist.
+/// Delegates to [`crate::skills::stage_skills`] — the single writer for skill
+/// staging — and maps its outcome to `SetupFix` entries. The skill content
+/// comes from the binary (compiled in via `include_str!`), so this works from
+/// any project directory. Locally modified files are kept (success: false,
+/// pointing at `task-mgr init --force-skills`); symlinks are never touched;
+/// up-to-date files produce no entry.
 ///
 /// # Idempotency
-/// Overwrites the destination when it already exists — repeated runs produce
-/// the same file content.
-///
-/// # Arguments
-/// * `source_dir` — local skill directory (e.g., `<project>/.claude/commands/`)
-/// * `global_dir` — installation target (e.g., `~/.claude/commands/`)
-/// * `missing_skills` — skill names without the `.md` suffix
-pub fn fix_install_skills(
-    source_dir: &Path,
-    global_dir: &Path,
-    missing_skills: &[&str],
-) -> Vec<SetupFix> {
-    if missing_skills.is_empty() {
-        return Vec::new();
+/// A second run after a successful first run returns an empty vec (everything
+/// up to date).
+pub fn fix_install_skills(global_dir: &Path) -> Vec<SetupFix> {
+    let outcome = crate::skills::stage_skills(global_dir, false);
+    let fix_name = |name: &str| format!("install_skill_{}", name.replace('-', "_"));
+
+    let mut fixes = Vec::new();
+    for name in &outcome.installed {
+        fixes.push(SetupFix {
+            name: fix_name(name),
+            action: format!("Installed {name}.md to {}", global_dir.display()),
+            success: true,
+        });
     }
-
-    // Ensure target directory exists before attempting any copies.
-    if let Err(e) = std::fs::create_dir_all(global_dir) {
-        return missing_skills
-            .iter()
-            .map(|name| SetupFix {
-                name: format!("install_skill_{}", name.replace('-', "_")),
-                action: format!("Failed to create {}: {e}", global_dir.display()),
-                success: false,
-            })
-            .collect();
+    for name in &outcome.refreshed {
+        fixes.push(SetupFix {
+            name: fix_name(name),
+            action: format!("Refreshed stale {name}.md in {}", global_dir.display()),
+            success: true,
+        });
     }
-
-    missing_skills
-        .iter()
-        .map(|name| {
-            let fix_name = format!("install_skill_{}", name.replace('-', "_"));
-            let src = source_dir.join(format!("{name}.md"));
-            let dst = global_dir.join(format!("{name}.md"));
-
-            if is_symlink(&dst) {
-                return SetupFix {
-                    name: fix_name,
-                    action: format!("{} is a symlink — refusing to overwrite", dst.display()),
-                    success: false,
-                };
-            }
-
-            match std::fs::copy(&src, &dst) {
-                Ok(_) => SetupFix {
-                    name: fix_name,
-                    action: format!("Copied {name}.md to {}", global_dir.display()),
-                    success: true,
-                },
-                Err(e) => SetupFix {
-                    name: fix_name,
-                    action: format!("Failed to copy {} to {}: {e}", src.display(), dst.display()),
-                    success: false,
-                },
-            }
-        })
-        .collect()
+    for name in &outcome.skipped_modified {
+        fixes.push(SetupFix {
+            name: fix_name(name),
+            action: format!(
+                "{name}.md is locally modified — kept (use `task-mgr init --force-skills` \
+                 to replace)"
+            ),
+            success: false,
+        });
+    }
+    for name in &outcome.skipped_symlink {
+        fixes.push(SetupFix {
+            name: fix_name(name),
+            action: format!(
+                "{} is a symlink — refusing to overwrite",
+                global_dir.join(format!("{name}.md")).display()
+            ),
+            success: false,
+        });
+    }
+    for err in &outcome.errors {
+        fixes.push(SetupFix {
+            name: "install_skills".to_string(),
+            action: err.clone(),
+            success: false,
+        });
+    }
+    fixes
 }
 
 /// Generate `.task-mgr/config.json` with the given additional tool allowlist.
@@ -399,81 +388,58 @@ mod tests {
     // ─── fix_install_skills ───────────────────────────────────────────────────
 
     #[test]
-    fn test_fix_install_skills_copies_file() {
-        let src = TempDir::new().unwrap();
+    fn test_fix_install_skills_installs_embedded_registry() {
         let dst = TempDir::new().unwrap();
-        std::fs::write(src.path().join("tm-apply.md"), "# tm-apply").unwrap();
 
-        let fixes = fix_install_skills(src.path(), dst.path(), &["tm-apply"]);
+        let fixes = fix_install_skills(dst.path());
 
-        assert_eq!(fixes.len(), 1);
-        assert!(fixes[0].success, "expected success: {}", fixes[0].action);
+        assert_eq!(fixes.len(), crate::skills::EMBEDDED_SKILLS.len());
+        assert!(fixes.iter().all(|f| f.success), "{fixes:#?}");
         assert!(dst.path().join("tm-apply.md").exists());
+        assert!(dst.path().join("plan-tasks.md").exists());
     }
 
-    #[test]
-    fn test_fix_install_skills_empty_list_returns_empty() {
-        let src = TempDir::new().unwrap();
-        let dst = TempDir::new().unwrap();
-
-        let fixes = fix_install_skills(src.path(), dst.path(), &[]);
-
-        assert!(fixes.is_empty());
-    }
-
-    #[test]
-    fn test_fix_install_skills_missing_source_returns_failure() {
-        let src = TempDir::new().unwrap();
-        let dst = TempDir::new().unwrap();
-        // tm-apply.md does NOT exist in src
-
-        let fixes = fix_install_skills(src.path(), dst.path(), &["tm-apply"]);
-
-        assert_eq!(fixes.len(), 1);
-        assert!(!fixes[0].success, "must fail when source file is missing");
-    }
-
-    /// Running twice should overwrite and report success both times.
+    /// A second run after a successful first run is a no-op (empty vec).
     #[test]
     fn test_fix_install_skills_idempotent() {
-        let src = TempDir::new().unwrap();
         let dst = TempDir::new().unwrap();
-        std::fs::write(src.path().join("tm-apply.md"), "# tm-apply").unwrap();
 
-        let fixes1 = fix_install_skills(src.path(), dst.path(), &["tm-apply"]);
-        let fixes2 = fix_install_skills(src.path(), dst.path(), &["tm-apply"]);
+        let fixes1 = fix_install_skills(dst.path());
+        let fixes2 = fix_install_skills(dst.path());
 
-        assert!(fixes1[0].success);
-        assert!(fixes2[0].success);
-        assert!(dst.path().join("tm-apply.md").exists());
+        assert!(!fixes1.is_empty());
+        assert!(fixes2.is_empty(), "second run must be a no-op: {fixes2:#?}");
     }
 
     /// `global_dir` is created automatically when it does not exist.
     #[test]
     fn test_fix_install_skills_creates_global_dir() {
-        let src = TempDir::new().unwrap();
         let parent = TempDir::new().unwrap();
         let dst = parent.path().join("commands"); // does not exist yet
-        std::fs::write(src.path().join("tm-learn.md"), "# tm-learn").unwrap();
 
-        let fixes = fix_install_skills(src.path(), &dst, &["tm-learn"]);
+        let fixes = fix_install_skills(&dst);
 
-        assert!(fixes[0].success, "must create dst dir: {}", fixes[0].action);
+        assert!(fixes.iter().all(|f| f.success), "{fixes:#?}");
         assert!(dst.join("tm-learn.md").exists());
     }
 
-    /// Multiple skills — each produces its own `SetupFix`.
+    /// Locally modified files are kept and reported as non-success with the
+    /// `--force-skills` hint.
     #[test]
-    fn test_fix_install_skills_multiple_skills() {
-        let src = TempDir::new().unwrap();
+    fn test_fix_install_skills_keeps_locally_modified() {
         let dst = TempDir::new().unwrap();
-        std::fs::write(src.path().join("tm-apply.md"), "# apply").unwrap();
-        std::fs::write(src.path().join("tm-learn.md"), "# learn").unwrap();
+        fix_install_skills(dst.path());
+        std::fs::write(dst.path().join("tm-apply.md"), "# my custom version").unwrap();
 
-        let fixes = fix_install_skills(src.path(), dst.path(), &["tm-apply", "tm-learn"]);
+        let fixes = fix_install_skills(dst.path());
 
-        assert_eq!(fixes.len(), 2);
-        assert!(fixes.iter().all(|f| f.success));
+        assert_eq!(fixes.len(), 1);
+        assert!(!fixes[0].success);
+        assert!(fixes[0].action.contains("--force-skills"));
+        assert_eq!(
+            std::fs::read_to_string(dst.path().join("tm-apply.md")).unwrap(),
+            "# my custom version"
+        );
     }
 
     // ─── fix_generate_project_config ─────────────────────────────────────────
@@ -754,28 +720,35 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn test_fix_install_skills_symlink_dst_returns_failure() {
-        let src = TempDir::new().unwrap();
+        let aux = TempDir::new().unwrap();
         let dst_dir = TempDir::new().unwrap();
-        std::fs::write(src.path().join("tm-apply.md"), "# tm-apply").unwrap();
 
-        // Plant a symlink at the expected destination path.
-        let real_target = src.path().join("real-tm-apply.md");
+        // Plant a symlink at one expected destination path.
+        let real_target = aux.path().join("real-tm-apply.md");
         std::fs::write(&real_target, "# real").unwrap();
         let link = dst_dir.path().join("tm-apply.md");
         std::os::unix::fs::symlink(&real_target, &link).unwrap();
 
-        let fixes = fix_install_skills(src.path(), dst_dir.path(), &["tm-apply"]);
+        let fixes = fix_install_skills(dst_dir.path());
 
-        assert_eq!(fixes.len(), 1);
+        let symlink_fix = fixes
+            .iter()
+            .find(|f| f.name == "install_skill_tm_apply")
+            .expect("tm-apply must produce a fix entry");
         assert!(
-            !fixes[0].success,
+            !symlink_fix.success,
             "symlink dst must be rejected: {}",
-            fixes[0].action
+            symlink_fix.action
         );
         assert!(
-            fixes[0].action.contains("symlink"),
+            symlink_fix.action.contains("symlink"),
             "message must mention symlink: {}",
-            fixes[0].action
+            symlink_fix.action
+        );
+        assert_eq!(
+            std::fs::read_to_string(&real_target).unwrap(),
+            "# real",
+            "symlink target must be untouched"
         );
     }
 

@@ -222,20 +222,17 @@ Default tier matrix (from the `_DEFAULT_TIER_MODELS` tables; empty = route with 
 Codex routes are always explicit (`byIdPrefix` or `taskClasses` in `routing`); Codex is never inferred from a model string.
 <!-- MODELS:END -->
 
-Set the resolved **sonnet** model as the PRD-level `"model"` field. Sonnet is the iteration baseline for ordinary FEAT work.
+**Model selection is config-driven at runtime (the `models` + `routing` config).** Do **not** put a `model` field anywhere in the generated JSON — not on any task (REVIEW-001, REFACTOR-001, spawned FIX-*/REFACTOR-FIX-* included) and **not as a top-level PRD field**. A top-level PRD `"model"` is ignored under the models config and prints a warning on every import and loop start; omit it entirely.
 
-**Model selection is config-driven at runtime.** Do **not** stamp a `model` field on any task in the generated JSON (including REVIEW-001, REFACTOR-001, or spawned FIX-*/REFACTOR-FIX-*). 
+How the loop resolves each task's model (`resolve_execution_plan` in `src/loop_engine/model.rs`):
 
-- Top-level `"model": "<sonnet>"` sets the PRD default (prd_default rung).
-- `difficulty` / `estimatedEffort: "high"` on a task triggers the `OPUS_MODEL` baseline (before baseline-tier remapping).
-- `.task-mgr/config.json` keys drive the rest at runtime:
-  - `reviewModel` — late override applied to all review-class IDs (`REVIEW-*`, `CODE-REVIEW-*`, `MILESTONE-FINAL`) via `apply_review_model_override`; takes precedence.
-  - `primaryRunner.byTaskType` / `byIdPrefix` — rung 2, before difficulty high.
-  - `primaryRunner.baselineTierRoutes` — remaps a resolved baseline tier (sonnet/opus/haiku) for matching ID prefixes (e.g. route FEAT opus-baseline work to codex, or review opus-baseline to grok).
-  - `default_model` (project or user) — fallback defaults.
-- Explicit per-task `model` in JSON is highest precedence and **bypasses** primaryRunner / baselineTier routing for that task. Omit it to let configs drive.
+- Explicit per-task `model` is rung 1 and bypasses ALL config routing — never emit it; it exists only for human one-offs.
+- `routing.byIdPrefix` / `routing.taskClasses` (rungs 2–3) — operator-configured forced routes (`task-mgr models route <prefix>`). Review-class IDs (`REVIEW-*`, `CODE-REVIEW-*`, `MILESTONE-FINAL`) carry a built-in, non-redefinable force to the **frontier tier**.
+- Anchor window (rung 5) — the default path: `models.anchor` (default `standard`) + difficulty offset picks the capability tier (`low` → anchor−1, `medium` → anchor, `high` → anchor+1, clamped to the ladder), then the provider's tier ladder maps tier → model.
 
-Use `estimatedEffort: "high"` (which populates task `difficulty`) on REFACTOR-001, REVIEW-001, and any other gate/spawned repair task that should receive a strong baseline when no reviewModel/primary route matches. This guarantees opus (or a baselineTier remap of opus) unless reviewModel forces otherwise.
+So the ONLY model-relevant knobs a generated task list sets are `difficulty` / `estimatedEffort` (plus task IDs, which drive class/prefix routing). With the default config, `estimatedEffort: "high"` resolves to the frontier model, `medium` to the standard model.
+
+Use `estimatedEffort: "high"` (which populates task `difficulty`) on REFACTOR-001 and any other gate/spawned repair task that should receive a strong baseline via the anchor window. Review-class IDs are frontier-forced regardless of difficulty.
 
 **`timeoutSecs` assignment** (set on tasks that run the full test suite):
 
@@ -289,7 +286,7 @@ FEAT-001: [First coherent change] (priority 1)
   — Edge cases to handle (edgeCases field)
   — Known-bad patterns to avoid
   — Failure modes and expected behavior
-  — Do not set model; use estimatedEffort: "high" (or `modifiesBehavior: true`) when you want the strong baseline rung (or to trigger baselineTier remap); configs (primaryRunner, reviewModel) drive actual selection. Omit `model` on FEATs to preserve runtime provider routing.
+  — Do not set model; use estimatedEffort: "high" (or `modifiesBehavior: true`) when you want a stronger tier (anchor+1 via the anchor window); the models+routing config drives actual selection. Omit `model` on FEATs to preserve runtime provider routing.
 
 FEAT-002: [Second coherent change] (priority 2)
   — Depends on FEAT-001 if sequential
@@ -301,12 +298,12 @@ FEAT-002: [Second coherent change] (priority 2)
 ... (2-10 FEAT tasks, grouped by coherent change)
 
 REFACTOR-001: Full review for opportunities to improve code (priority 98)
-  — `estimatedEffort: "high"`, `timeoutSecs: 1800` (strong baseline via difficulty rung or reviewModel/primaryRunner/baselineTier config; no per-task `model`)
+  — `estimatedEffort: "high"`, `timeoutSecs: 1800` (strong tier via the anchor window; no per-task `model`)
   — DRY, testable, separation of concerns, function length/complexity
   — Spawns REFACTOR-FIX-xxx via task-mgr add --stdin --depended-on-by REVIEW-001
 
 REVIEW-001: Code review + final verification (priority 99)
-  — `estimatedEffort: "high"`, `timeoutSecs: 1800` (review-class gets `reviewModel` if set in config, else strong baseline from high difficulty; no per-task `model` field)
+  — `estimatedEffort: "high"`, `timeoutSecs: 1800` (review-class IDs are frontier-forced built-in; no per-task `model` field)
   — Quality, security, integration wiring, documentation
   — RUNS THE FULL QUALITY GATE (unscoped test suite)
   — Updates remaining task descriptions based on learnings
@@ -411,7 +408,6 @@ The agent checks these before starting any task. If the required task hasn't pas
 {
   "version": "1.0",
   "project": "{{PROJECT_NAME}}",
-  "model": "<resolved-sonnet-id>",
   "branchName": "feat/{feature-name}",
   "externalGitRepo": "{{EXTERNAL_GIT_REPO_OR_OMIT}}",
   "description": "Brief description of the change",
@@ -546,7 +542,7 @@ The agent checks these before starting any task. If the required task hasn't pas
 - `taskType`: Required on every task. Use `"implementation"`, `"review"`, `"verification"`, `"milestone"`, `"test"`, or `"analysis"`.
 - `priority`: Sequential integers. REFACTOR-001 at 98, REVIEW-001 at 99.
 - `passes`: Always `false` (loop marks true).
-- `model`: **Omit on all tasks.** The top-level PRD `"model"` (sonnet) is the only model string in the generated task list. Runtime resolution (`resolve_task_execution_target` + `apply_review_model_override`) uses difficulty/estimatedEffort for the high→opus rung, plus `reviewModel`, `primaryRunner.*`, and `default_model` from config. Explicit per-task models would bypass those policies.
+- `model`: **Omit everywhere — on every task AND at the PRD top level.** The generated task list contains no model strings at all. Runtime resolution (`resolve_execution_plan`) uses difficulty/estimatedEffort through the anchor window, plus operator `routing` config (`byIdPrefix` / `taskClasses`); review-class IDs are frontier-forced. An explicit per-task model is rung 1 and would bypass all of that; a top-level PRD model is ignored and warns.
 - `timeoutSecs`: Set `1800` on REFACTOR-001 and REVIEW-001. Omit elsewhere.
 - `estimatedEffort`: `low` (1 file, 1-3 criteria), `medium` (2-3 files, new function), `high` (3+ files, new module).
 - `touchesFiles`: Actual file paths the agent will modify. Drives scoped per-iteration tests and synergy-based selection at runtime.
@@ -987,9 +983,9 @@ Verify:
 - [ ] Each implementation task has `qualityDimensions` populated as a **flat array** (NOT `{correctness, performance, style}` sub-objects)
 - [ ] Each task's known edge cases appear in `edgeCases` field
 - [ ] Tasks with `modifiesBehavior: true` have caller impact documented in description
-- [ ] **No per-task `model` fields at all** (top-level PRD `model` only; explicit task models bypass primaryRunner/baselineTier/reviewModel routing)
-- [ ] REFACTOR-001 and REVIEW-001 have `estimatedEffort: "high"` (for strong baseline rung when no reviewModel route) and `timeoutSecs: 1800`
-- [ ] REVIEW-001 (and any CODE-REVIEW etc. in full PRDs) rely on `reviewModel` config or high difficulty for model; instructions do not hardcode a review model value into task entries
+- [ ] **No `model` fields anywhere** (no per-task models AND no top-level PRD model; explicit models bypass the models+routing config, a top-level model is ignored and warns)
+- [ ] REFACTOR-001 and REVIEW-001 have `estimatedEffort: "high"` (strong tier via the anchor window) and `timeoutSecs: 1800`
+- [ ] REVIEW-001 (and any CODE-REVIEW etc. in full PRDs) rely on the built-in frontier force for review-class IDs; instructions do not hardcode a review model value into task entries
 - [ ] **No task has `synergyWith` / `batchWith` / `conflictsWith` populated** (dropped — `touchesFiles` drives synergy at runtime)
 - [ ] **Context-economy placeholders populated in the generated prompt** (the agent can't read the JSON, so these MUST be in the prompt):
   - [ ] `{{PROHIBITED_OUTCOMES}}` — rendered from JSON `prohibitedOutcomes[]` as a bullet list
@@ -1049,7 +1045,7 @@ To run: task-mgr loop -y tasks/{feature}.json
 | Missing edgeCases                              | Agent discovers edge cases in production                      | Every identified edge case has an edgeCases entry               |
 | Populating `synergyWith` / `batchWith`         | Ignored — `task-mgr next` derives synergy from `touchesFiles` | Just populate `touchesFiles` accurately; drop synergyWith       |
 | `qualityDimensions` as sub-objects             | Old schema; agent reads flat arrays now                       | One flat list of strings, not `{correctness, performance, style}` |
-| Setting any per-task `model` (FEAT, REVIEW, etc.) | Explicit task `model` is highest precedence and bypasses reviewModel / primaryRunner / baselineTierRoutes | Omit `model` on every task entry; use `estimatedEffort: "high"` for gates that need strong baseline; let configs drive |
+| Setting any `model` (per-task or top-level PRD)   | Explicit task `model` is rung 1 and bypasses the models+routing config; a top-level PRD `model` is ignored and warns | Omit `model` everywhere; use `estimatedEffort: "high"` for gates that need a strong tier; let `task-mgr models` config drive |
 | Prompt that tells agent to Read `tasks/*.json` | Wastes context; agent can't edit JSON anyway                  | Use `task-mgr next --claim`; embed global fields in prompt      |
 | Prompt without `{{PROHIBITED_OUTCOMES}}` etc.  | Agent can't see those JSON fields                             | Render all global fields as bullet lists in the prompt          |
 | No data flow contracts for cross-module data   | Silent wrong-key-type bugs                                    | Trace key types, document in prompt                             |

@@ -44,6 +44,16 @@ cargo run --bin gen-docs   # regenerates the MODELS block (with tier matrix + an
 ```
 
 CI runs `cargo run --bin gen-docs -- --check` which fails if the doc is stale.
+
+The `.claude/commands/*.md` skill files are also **embedded in the binary**
+(`src/skills.rs`, `include_str!`) and staged into `~/.claude/commands/` on
+`task-mgr init` / `loop init` / `batch init` (manifest-guarded so local edits
+are never clobbered; `task-mgr init --force-skills` overwrites them; the
+last-installed binary wins on refresh). To ship a skill edit: change it here,
+`cargo install --path .`, then run any init. Tests that spawn the real binary
+with an init-family command MUST set `HOME` to a tempdir or they'll stage into
+the developer's real `~/.claude/commands/`.
+
 Tests import the constants; JSON fixtures use tier placeholders
 (`{{FRONTIER_MODEL}}` / `{{STANDARD_MODEL}}` / `{{COST_EFFICIENT_MODEL}}` /
 `{{CHEAPEST_MODEL}}` and legacy const-style) in `tests/fixtures/*.json.tmpl`

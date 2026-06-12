@@ -67,6 +67,7 @@ fn test_init_no_args_parses_with_empty_from_json() {
             from_json,
             enhance,
             force,
+            force_skills,
             append,
             update_existing,
             dry_run,
@@ -76,11 +77,30 @@ fn test_init_no_args_parses_with_empty_from_json() {
             assert!(from_json.is_empty(), "from_json must default to empty");
             assert!(!enhance, "--enhance defaults to false");
             assert!(!force);
+            assert!(!force_skills, "--force-skills defaults to false");
             assert!(!append);
             assert!(!update_existing);
             assert!(!dry_run);
             assert!(prefix.is_none());
             assert!(!no_prefix);
+        }
+        _ => panic!("Expected Init command"),
+    }
+}
+
+#[test]
+fn test_init_with_force_skills_flag() {
+    let cli = Cli::parse_from(["task-mgr", "init", "--force-skills"]);
+    match cli.command {
+        Commands::Init {
+            from_json,
+            force,
+            force_skills,
+            ..
+        } => {
+            assert!(from_json.is_empty());
+            assert!(!force, "--force-skills must not imply --force");
+            assert!(force_skills);
         }
         _ => panic!("Expected Init command"),
     }

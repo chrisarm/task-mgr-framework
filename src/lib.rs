@@ -11,6 +11,7 @@ pub mod models;
 pub mod observability;
 pub mod output;
 pub mod paths;
+pub mod skills;
 pub mod util;
 
 // Re-export commonly used error types

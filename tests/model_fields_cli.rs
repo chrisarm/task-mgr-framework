@@ -27,6 +27,7 @@ fn init_from_fixture(fixture_name: &str) -> TempDir {
     let prd_path = render_fixture_tmpl(fixture_name, temp_dir.path());
 
     Command::new(cargo_bin("task-mgr"))
+        .env("HOME", temp_dir.path())
         .args(["--dir", temp_dir.path().to_str().unwrap()])
         .args([
             "init",
@@ -50,6 +51,7 @@ fn test_init_with_model_fields_succeeds() {
     let prd_path = render_fixture_tmpl("prd_with_all_model_fields.json", temp_dir.path());
 
     Command::new(cargo_bin("task-mgr"))
+        .env("HOME", temp_dir.path())
         .args(["--dir", temp_dir.path().to_str().unwrap()])
         .args([
             "init",
@@ -69,6 +71,7 @@ fn test_init_with_partial_model_fields_succeeds() {
     let prd_path = render_fixture_tmpl("prd_with_partial_model_fields.json", temp_dir.path());
 
     Command::new(cargo_bin("task-mgr"))
+        .env("HOME", temp_dir.path())
         .args(["--dir", temp_dir.path().to_str().unwrap()])
         .args([
             "init",
@@ -292,6 +295,7 @@ fn test_reimport_preserves_model_fields() {
 
     // Re-import with --append --update-existing
     Command::new(cargo_bin("task-mgr"))
+        .env("HOME", temp_dir.path())
         .args(["--dir", temp_dir.path().to_str().unwrap()])
         .args([
             "init",
@@ -362,6 +366,7 @@ fn test_full_cli_round_trip() {
     // Phase 3: Import the exported JSON into a fresh DB
     let temp_dir2 = TempDir::new().unwrap();
     Command::new(cargo_bin("task-mgr"))
+        .env("HOME", temp_dir2.path())
         .args(["--dir", temp_dir2.path().to_str().unwrap()])
         .args([
             "init",

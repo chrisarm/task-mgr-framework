@@ -37,6 +37,7 @@ fn setup_initialized_tempdir() -> TempDir {
     let prd_path = sample_prd_path();
 
     let status = Command::new(cargo_bin("task-mgr"))
+        .env("HOME", temp_dir.path())
         .args(["--dir", temp_dir.path().to_str().unwrap()])
         .args([
             "init",
