@@ -1,0 +1,274 @@
+{
+  "branchName": "feat/batch-chain-incomplete-stop",
+  "description": "Fix batch --chain advancing to downstream PRDs when a loop exhausts its iteration budget (or hits a deadline) with todo/in_progress work remaining. Two-layer defense: (1) reconcile_ambiguous_exit in orchestrator post-loop sets exit_code=1 when budget/deadline ends with active tasks; (2) LoopResult.prd_complete + batch chain gate stops chain on !prd_complete even if exit code drifts. Design: docs/designs/batch-chain-incomplete-stop.md (approved 2026-06-12).",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "Rust: No warnings in cargo check output",
+      "Rust: No warnings in cargo clippy --all-targets -- -D warnings output",
+      "Rust: cargo fmt --check passes",
+      "Scoped tests for touched modules pass (cargo test reconcile_ambiguous_exit, batch::tests, engine::tests as applicable)",
+      "chain=false batch behavior unchanged — no validation, tracking, or stop-on-incomplete paths touched"
+    ],
+    "description": "These criteria apply to ALL implementation tasks"
+  },
+  "priorityPhilosophy": {
+    "description": "Hierarchy of what matters most when implementing tasks",
+    "hierarchy": [
+      "1. PLAN — Anticipate edge cases before coding",
+      "2. PHASE 2 FOUNDATION — Reuse count_remaining_active_tasks / classify_drained_queue predicate; do not invent a second incompleteness check",
+      "3. FUNCTIONING CODE — reconcile runs ONLY on outer post-while path, BEFORE step 17.5 task resets",
+      "4. CORRECTNESS — Compiles, type-checks, scoped tests pass deterministically",
+      "5. CODE QUALITY — chain=false and was_stopped paths byte-identical except where design requires",
+      "6. POLISH — --chain help text mentions iteration-budget exhaustion"
+    ],
+    "principles": [
+      "Quality dimensions explicit — qualityDimensions on every task tells you what 'good' looks like",
+      "Edge cases = test cases — every known edge case must have a corresponding unit test",
+      "Scoped per-iteration tests, full suite at REVIEW-001",
+      "Reuse wave_scheduler::count_remaining_active_tasks — same predicate as classify_drained_queue",
+      "chain=false must remain a complete no-op — zero new code paths when chain is off"
+    ]
+  },
+  "prohibitedOutcomes": [
+    "Calling reconcile_ambiguous_exit inside per-wave terminals, drained short-circuits, merge-halts, or signal paths — only the outer post-while fallthrough",
+    "Calling reconcile AFTER step 17.5/17.6 task resets — would erase todo/in_progress evidence of incompleteness",
+    "Downgrading exit_code when already nonzero (crashes, blocked=2, stale abort, merge-halt)",
+    "Changing was_stopped exit 0 semantics — intentional .stop stays clean exit even with remaining work",
+    "Surfacing prd_complete in batch summary or PrdRunResult in this change — out of scope",
+    "Full e2e batch run spawning real agent loops — unit/structure tests only",
+    "Populating synergyWith / batchWith / conflictsWith — ignored by task-mgr next",
+    "Per-task or top-level model fields — config-driven routing only",
+    "Tests that only assert 'no crash' without verifying exit_code / prd_complete / chain skip structure"
+  ],
+  "project": "task-mgr",
+  "requires": [],
+  "taskPrefix": "b2db855c",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "Function `reconcile_ambiguous_exit` exists in wave_scheduler.rs as pub(crate) with signature taking conn, task_prefix, was_stopped, and &mut exit_code / exit_reason / final_run_status",
+        "Function calls count_remaining_active_tasks exactly once per invocation",
+        "Unit test reconcile_ambiguous_exit_max_iter_with_todo_sets_exit_1: seed todo task under prefix, pass exit_code=0 and reason max iterations reached, was_stopped=false → exit_code becomes 1 and reason contains task(s) remaining",
+        "Unit test reconcile_ambiguous_exit_max_iter_drained_sets_complete: all tasks done/irrelevant/skipped/blocked, reason max iterations reached → exit_code stays 0, reason becomes all tasks complete, final_run_status Completed",
+        "Unit test reconcile_ambiguous_exit_was_stopped_unchanged: todo task present, was_stopped=true → exit_code and reason unchanged",
+        "Unit test reconcile_ambiguous_exit_deadline_with_remaining: reason deadline reached, todo present → exit_code 1",
+        "orchestrator.rs calls reconcile_ambiguous_exit once on the outer post-while path before last_claimed_task reset (grep-verified ordering)",
+        "Negative: reconcile is NOT called inside the should_stop / terminal match block or inside run_wave_iteration handling",
+        "Known-bad: if reconcile runs after reset_task_to_todo, the max_iter_with_todo test would fail to set exit 1 — placement before step 17.5 is mandatory",
+        "Failure mode: count_remaining_active_tasks query failure returns 0 per existing helper — reconcile treats as drained (documented existing behavior, do not change helper)"
+      ],
+      "dependsOn": [],
+      "description": "Implement Layer 1: honest loop exit code when iteration ceiling or deadline is hit with active work remaining.\n\nDO:\n- Add `pub(crate) fn reconcile_ambiguous_exit(conn: &Connection, task_prefix: Option<&str>, was_stopped: bool, exit_code: &mut i32, exit_reason: &mut String, final_run_status: &mut RunStatus)` in `src/loop_engine/wave_scheduler.rs` immediately after `classify_drained_queue` (same module as `count_remaining_active_tasks`).\n- Read `count_remaining_active_tasks(conn, task_prefix)` ONCE; branch on the count.\n- Decision table:\n  - `was_stopped == true` → return immediately (no mutation)\n  - `*exit_code != 0` → return immediately (do not downgrade)\n  - `exit_reason` is exactly `\"max iterations reached\"` or `\"deadline reached\"` AND count > 0 → `*exit_code = 1`, `*exit_reason = format!(\"{} with {} task(s) remaining\", ...)` , `*final_run_status = RunStatus::Aborted`\n  - `exit_reason == \"max iterations reached\"` AND count == 0 → `*exit_reason = \"all tasks complete\".to_string()`, `*final_run_status = RunStatus::Completed` (exit stays 0)\n  - Deadline + count == 0: leave `exit_reason = \"deadline reached\"` (exit 0) — add one-line comment that symmetric upgrade is optional polish\n- Call reconcile ONLY in `src/loop_engine/orchestrator.rs` immediately after the `while iteration < max_iterations` loop ends (line ~672), BEFORE step 17.5 `reset_task_to_todo` for `last_claimed_task`.\n- Import and call from orchestrator; pass `&conn`, `task_prefix.as_deref()`, `was_stopped`, `&mut exit_code`, `&mut exit_reason`, `&mut final_run_status`.\n\nDO NOT:\n- Call reconcile from wave terminal paths, `classify_drained_queue` short-circuits, merge-halt, stale abort, or `should_stop` match arms\n- Call reconcile after step 17.5/17.6 resets\n- Add a second SQL incompleteness predicate — reuse `count_remaining_active_tasks`\n\nEdge cases:\n- was_stopped with remaining todo tasks → exit 0 unchanged\n- exit_code already 2 (blocked) → unchanged\n- max iterations + all tasks terminal → upgrade to all tasks complete\n- deadline + todo remaining → exit 1\n\nKnown-bad:\n- Reconcile after reset_task_to_todo would see only terminal rows and falsely report complete\n- Calling reconcile inside wave `outcome.terminal` would double-classify or downgrade authoritative codes",
+      "edgeCases": [
+        "was_stopped=true with todo tasks remaining: exit 0 unchanged",
+        "exit_code already 1/2/130 from crash/blocked/signal: no downgrade",
+        "max iterations reached + count==0: upgrade to all tasks complete / Completed",
+        "deadline reached + count>0: exit 1 Aborted",
+        "deadline reached + count==0: exit 0, reason stays deadline reached"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Reconcile called after step 17.5 resets in_progress to todo",
+          "expectedBehavior": "Must not happen — code review / grep gate; would mask incompleteness"
+        },
+        {
+          "cause": "count_remaining_active_tasks returns 0 on SQL error (existing unwrap_or 0)",
+          "expectedBehavior": "Reconcile treats as drained; existing helper behavior unchanged in this task"
+        }
+      ],
+      "id": "FEAT-001",
+      "modifiesBehavior": true,
+      "notes": "Design doc: docs/designs/batch-chain-incomplete-stop.md. Predicate: wave_scheduler.rs count_remaining_active_tasks (excludes done/irrelevant/skipped/blocked). Orchestrator default init at lines 133-134. Documented exit codes at orchestrator.rs:72-77. Learning [4324]: count_remaining_tasks is the consolidated SQL helper — do not duplicate. Learning [3927]: drained-queue vs stale-abort distinction lives in classify_drained_queue — reconcile is for budget/deadline fallthrough only. Learning [2695]: exit code consistency matters across paths — do not downgrade existing nonzero codes.",
+      "passes": true,
+      "priority": 1,
+      "qualityDimensions": [
+        "Single count_remaining_active_tasks read per reconcile call",
+        "Outer post-while placement only — no reconcile inside inner terminal paths",
+        "was_stopped and already-nonzero exit_code are early returns with zero mutation",
+        "Enriched exit reason includes N task(s) remaining for operator triage",
+        "Deadline+drained leaves deadline reached reason (one-line comment documents intentional asymmetry)"
+      ],
+      "taskType": "implementation",
+      "title": "Add reconcile_ambiguous_exit + orchestrator post-loop wiring",
+      "touchesFiles": [
+        "src/loop_engine/wave_scheduler.rs",
+        "src/loop_engine/orchestrator.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "LoopResult has pub prd_complete: bool field with doc comment; #[derive(Default)] yields false",
+        "orchestrator.rs normal return sets prd_complete from count_remaining_active_tasks == 0 after reconcile",
+        "batch.rs chain gate uses exit_code != 0 || !loop_result.prd_complete when chain=true",
+        "batch.rs emits Chain stopped: PRD did not complete, skipping remaining PRDs on chain break",
+        "batch.rs:740 synthetic LoopResult sets prd_complete: true",
+        "auto_review.rs passing_result sets prd_complete: true",
+        "engine.rs Default test asserts prd_complete == false",
+        "test_chain_stops_on_incomplete_prd exists: chain=true, exit_code=0, prd_complete=false → remaining PRDs have skipped=true",
+        "test_chain_false_incomplete_does_not_skip exists: chain=false, same incomplete signals (exit_code=1 or prd_complete=false) → downstream PRD skipped=false (batch continues)",
+        "test_stop_on_failure_results_structure covers exit_code=1 chain failure case (existing) plus documents chain=true incomplete skip invariants",
+        "Negative: chain=false path has no new behavior — grep confirms chain gate still wrapped in chain &&",
+        "Known-bad: chain gate checking only exit_code would let iteration-ceiling exit 0 advance chain before Layer 1 ships — prd_complete gate catches drift",
+        "CONTRACT + grep audit: batch reads loop_result.prd_complete on LoopResult from engine::run_loop; `rg 'LoopResult \\{' --type rust` shows every literal sets prd_complete explicitly (batch.rs:740, auto_review.rs:454, orchestrator.rs:786) or uses Default/..Default::default() (startup.rs early returns); cargo check passes with zero missing-field errors"
+      ],
+      "dependsOn": [
+        "FEAT-001"
+      ],
+      "description": "Implement Layer 2: observable PRD completion flag and batch --chain stop when PRD did not complete.\n\nDO (engine.rs):\n- Add field to LoopResult (engine.rs ~893):\n  `/// True when every task for this PRD prefix is in a terminal state (done/irrelevant/skipped/blocked) at loop end.`\n  `pub prd_complete: bool,`\n- Update engine.rs Default tests (~1214-1234) to assert prd_complete is false under LoopResult::default().\n\nDO (orchestrator.rs normal return ~786):\n- Set `prd_complete: count_remaining_active_tasks(&conn, task_prefix.as_deref()) == 0` AFTER reconcile_ambiguous_exit runs (same DB state reconcile used).\n\nDO (batch.rs chain gate ~707):\n- Replace `if chain && exit_code != 0` with chain break on `chain && (exit_code != 0 || !loop_result.prd_complete)`.\n- Update message to: `Chain stopped: PRD did not complete, skipping remaining PRDs`.\n- Do NOT advance chain_base when chain breaks (existing break before advancement already correct).\n\nDO (call sites — grep LoopResult { and set explicitly where literals are constructed):\n- batch.rs:740 synthetic LoopResult for auto-review → `prd_complete: true`\n- auto_review.rs:454 passing_result helper → `prd_complete: true`\n- startup.rs early-return LoopResult paths: rely on Default (false) — verify compile; add field only if struct literals need it\n- Any test files constructing LoopResult { ... } without ..Default::default() — set prd_complete appropriately\n\nDO (batch.rs tests):\n- Add test_chain_stops_on_incomplete_prd: chain=true, exit_code=0, prd_complete=false → remaining PRDs skipped=true.\n- Add test_chain_false_incomplete_does_not_skip: chain=false with exit_code=1 or prd_complete=false → downstream PRD skipped=false (regression guard for if chain && only).\n- Keep test_stop_on_failure_results_structure for exit_code=1 chain failure; extend comments if needed for incomplete invariants.\n\nDO NOT:\n- Add prd_complete to PrdRunResult or batch summary output\n- Change was_stopped early-break path in batch (lines 680-691)\n- Touch chain=false code paths beyond the guarded `if chain &&` condition\n\nData contract (orchestrator → batch):\n- Source: LoopResult { prd_complete: bool, exit_code: i32, ... } from engine::run_loop\n- Consumer: batch.rs run_batch reads loop_result.prd_complete after await engine::run_loop\n- Access: `let chain_break = chain && (exit_code != 0 || !loop_result.prd_complete);`",
+      "edgeCases": [
+        "exit_code=0, prd_complete=false after iteration ceiling: chain stops",
+        "exit_code=1, prd_complete=true (hypothetical drift): chain still stops on exit_code",
+        "was_stopped=true: early batch break before chain gate — no behavior change",
+        "chain=false with incomplete PRD: batch continues to next PRD (unchanged)"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Forgot to update a LoopResult struct literal after adding field",
+          "expectedBehavior": "Compiler error until all literals updated or use ..Default::default()"
+        },
+        {
+          "cause": "prd_complete computed before reconcile",
+          "expectedBehavior": "Would disagree with exit_code after reconcile — must compute after reconcile on same conn snapshot"
+        }
+      ],
+      "id": "FEAT-002",
+      "modifiesBehavior": true,
+      "notes": "Depends on FEAT-001 reconcile running before prd_complete is computed (same post-reconcile DB snapshot). Validated: no `LoopResult` literals under tests/ — integration tests use run_loop return values only; compile gate is sufficient (do not add tests/e2e_loop.rs to touchesFiles). Grep: `rg 'LoopResult \\{' --type rust` for literal updates in src/loop_engine/. Learning [4933]: batch --chain uses chain_base stacking — stopping chain on incomplete prevents downstream PRDs building on broken tips. Learning [3824]: auto-review must not change exit code — prd_complete on synthetic result is for truthfulness only. Learning [2716]: avoid duplicate exit_code checks — chain_break is one compound condition.",
+      "passes": true,
+      "priority": 2,
+      "qualityDimensions": [
+        "prd_complete computed from same count_remaining_active_tasks predicate as reconcile",
+        "Default false on early-return LoopResult paths (conservative)",
+        "Synthetic auto-review LoopResult prd_complete true reflects last successful complete PRD intent",
+        "chain=false complete no-op",
+        "Structure-only batch tests match batch-chain-worktrees.json style (no real run_loop spawn)"
+      ],
+      "taskType": "implementation",
+      "title": "Add LoopResult.prd_complete + batch chain defensive gate",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/orchestrator.rs",
+        "src/loop_engine/batch.rs",
+        "src/loop_engine/auto_review.rs",
+        "src/loop_engine/startup.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "commands.rs --chain long_help mentions incomplete work and iteration budget / deadline exhaustion, not only first failure",
+        "cli/tests.rs compiles and passes if help-text snapshot tests exist for batch --chain",
+        "Negative: no behavior change to run_batch or CLI parsing — doc comment only",
+        "cargo test cli::tests passes (scoped)"
+      ],
+      "dependsOn": [
+        "FEAT-002"
+      ],
+      "description": "Update operator-facing documentation for batch --chain to mention iteration-budget exhaustion and incomplete PRDs, not only hard failures.\n\nDO:\n- Edit `src/cli/commands.rs` --chain flag doc comment (~997-1006): state that batch stops when a PRD fails OR does not complete (iteration budget exhausted, deadline with remaining tasks, blocked/crash paths). Downstream chained PRDs would build on incomplete work.\n- If `src/cli/tests.rs` has assertions on --chain help text, update expected strings to match.\n\nDO NOT:\n- Change clap defaults or flag behavior\n- Edit docs/designs/batch-chain-incomplete-stop.md (already the design artifact)\n- Add new CLI flags",
+      "edgeCases": [
+        "No cli/tests help assertion for --chain: skip test updates, doc only"
+      ],
+      "estimatedEffort": "low",
+      "failureModes": [
+        {
+          "cause": "Stale cli test expected help string",
+          "expectedBehavior": "Update test expectation to match new doc comment"
+        }
+      ],
+      "id": "FEAT-003",
+      "modifiesBehavior": false,
+      "notes": "Current help at commands.rs:1001-1002 says 'Batch stops on the first failure'. Align with new message 'PRD did not complete'.",
+      "passes": true,
+      "priority": 3,
+      "qualityDimensions": [
+        "Help text accurate for both Layer 1 exit_code and Layer 2 prd_complete gate",
+        "Minimal diff — doc comment (+ test strings if any) only"
+      ],
+      "taskType": "implementation",
+      "title": "Update --chain CLI help text",
+      "touchesFiles": [
+        "src/cli/commands.rs",
+        "src/cli/tests.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No duplicate SQL incompleteness checks beyond count_remaining_active_tasks",
+        "reconcile_ambiguous_exit under ~40 lines; early returns for was_stopped and nonzero exit_code",
+        "All LoopResult literals grep-clean for prd_complete",
+        "Any issues spawn REFACTOR-FIX-xxx via task-mgr add --stdin --depended-on-by REVIEW-001"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003"
+      ],
+      "description": "Review FEAT-001..003 for DRY violations, coupling, and clarity.\n\nDO: Check reconcile_ambiguous_exit isn't duplicating classify_drained_queue logic; verify chain_break is a single clear predicate; verify no stray LoopResult literals missing prd_complete.\nDO NOT: Skip — gate before final review.",
+      "estimatedEffort": "high",
+      "id": "REFACTOR-001",
+      "notes": "If no issues: invoke /simplify on any ugly touchpoint, emit REFACTOR-001:done. Spawn fixes with --depended-on-by REVIEW-001.",
+      "passes": true,
+      "priority": 98,
+      "qualityDimensions": [
+        "DRY with classify_drained_queue predicate",
+        "Single chain_break expression in batch.rs",
+        "No dead code from LoopResult field addition"
+      ],
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Review for refactoring opportunities",
+      "touchesFiles": [
+        "src/loop_engine/wave_scheduler.rs",
+        "src/loop_engine/orchestrator.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/batch.rs",
+        "src/loop_engine/auto_review.rs",
+        "src/loop_engine/startup.rs",
+        "src/cli/commands.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "grep reconcile_ambiguous_exit shows exactly one call site in orchestrator post-while path",
+        "cargo test (full workspace) passes",
+        "cargo clippy --all-targets -- -D warnings clean",
+        "cargo fmt --check passes",
+        "Negative: no unwrap() added in production paths touched",
+        "Integration: batch chain stop message and push_remaining_skipped fire on incomplete PRD",
+        "Regression: chain=false with incomplete PRD (exit_code=1 or prd_complete=false) still advances to next PRD — grep confirms chain gate is `if chain &&` only; test_stop_on_failure_results_structure incomplete case documents chain=false is not in the skip path",
+        "If issues found: FIX-xxx spawned via task-mgr add --stdin --depended-on-by REVIEW-001"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "REFACTOR-001"
+      ],
+      "description": "Backward-looking review: integration wiring, exit-code contract, batch chain behavior, docs. RUN FULL QUALITY GATE.\n\nDO:\n- Verify reconcile placement: after while, before step 17.5 only\n- Verify iteration-ceiling-with-todo → exit 1 → batch chain stops → remaining PRDs skipped\n- Verify was_stopped and chain=false unchanged\n- Run full cargo test, clippy -D warnings, fmt --check\n- Confirm docs/designs/batch-chain-incomplete-stop.md still accurate (no edit required unless implementation diverged)\n\nDO NOT: Scope the test suite — full gate only here.",
+      "estimatedEffort": "high",
+      "id": "REVIEW-001",
+      "notes": "Learning [4753]: if parallel-slot fixture test failures appear with dead -slot-N paths, touch tests/*.rs and rebuild before concluding regression. Spawn fixes atomically via add --stdin. chain=false regression: batch.rs run_batch loop must not call push_remaining_skipped for incomplete unless chain=true.",
+      "passes": true,
+      "priority": 99,
+      "qualityDimensions": [
+        "Documented exit codes match implementation for max iterations and deadline",
+        "chain=false byte-identical behavior verified by test review",
+        "Full suite green including any pre-existing failures fixed inline"
+      ],
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Code review + full verification",
+      "touchesFiles": [
+        "src/loop_engine/wave_scheduler.rs",
+        "src/loop_engine/orchestrator.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/batch.rs",
+        "src/loop_engine/auto_review.rs",
+        "src/loop_engine/startup.rs",
+        "src/cli/commands.rs"
+      ]
+    }
+  ],
+  "version": "1.0"
+}

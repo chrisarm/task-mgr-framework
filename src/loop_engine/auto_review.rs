@@ -458,6 +458,7 @@ mod tests {
             branch_name: None,
             was_stopped: false,
             tasks_completed: 5,
+            prd_complete: true,
         }
     }
 

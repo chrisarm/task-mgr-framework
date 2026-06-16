@@ -6,17 +6,14 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use chrono::Utc;
 
-use crate::loop_engine::config::{IterationOutcome, PermissionMode};
-use crate::loop_engine::model::HAIKU_MODEL;
-use crate::loop_engine::watchdog::TimeoutConfig;
+use crate::loop_engine::config::IterationOutcome;
+use crate::loop_engine::model::{ResolvedModelsConfig, cost_efficient_auxiliary_plan};
 
-/// Hard timeout for the milestone-summary Haiku spawn. Summaries are a
+/// Hard timeout for the milestone-summary LLM spawn. Summaries are a
 /// ~1KB text prompt; anything over 5 min means the child is stuck. We
 /// fall back to the heuristic summary on timeout, so the loop never
 /// hangs on milestone rollups.
@@ -289,9 +286,9 @@ fn crash_recommendation(task_id: &str, outcomes: &[String]) -> Option<String> {
     None
 }
 
-/// Build the Haiku prompt asking for a short narrative summary + crash
+/// Build the LLM prompt asking for a short narrative summary + crash
 /// recommendations. Kept private so the format is owned by this module.
-fn build_haiku_summary_prompt(milestone_task_id: &str, raw_entries: &str) -> String {
+fn build_summary_prompt(milestone_task_id: &str, raw_entries: &str) -> String {
     format!(
         "You are summarizing the progress log of an autonomous coding loop at a \
          milestone boundary. The milestone that just completed is `{}`.\n\n\
@@ -313,44 +310,33 @@ fn build_haiku_summary_prompt(milestone_task_id: &str, raw_entries: &str) -> Str
     )
 }
 
-/// Try to generate the narrative + recommendations section via Haiku.
+/// Try to generate the narrative + recommendations section via auxiliary LLM.
 ///
 /// Returns `None` on any failure (binary missing, non-zero exit, empty output) —
 /// callers fall back to the deterministic heuristic in that case.
 ///
-/// Designed to be cheap: text-only permission mode (no tools), no timeout
-/// override (Haiku is fast — short prompts, ~5–15s typical), `db_dir` threaded
-/// through so any nested `task-mgr` invocation hits the canonical DB.
-fn try_haiku_summary(
+/// Designed to be cheap: text-only permission mode (no tools), fixed timeout
+/// with no activity extension, `db_dir` threaded through so any nested
+/// `task-mgr` invocation hits the canonical DB.
+fn try_llm_summary(
     milestone_task_id: &str,
     raw_entries: &str,
     db_dir: Option<&Path>,
+    resolved: &ResolvedModelsConfig,
 ) -> Option<String> {
-    let prompt = build_haiku_summary_prompt(milestone_task_id, raw_entries);
-    // No activity extensions — this is a fixed-size summary pass, not an
-    // open-ended coding iteration.
-    let no_activity = Arc::new(AtomicU64::new(0));
-    let timeout = TimeoutConfig {
-        base_timeout: MILESTONE_SUMMARY_TIMEOUT,
-        initial_extension: Duration::from_secs(0),
-        last_activity_epoch: no_activity,
-    };
-    let result = match crate::loop_engine::claude::spawn_claude(
+    let prompt = build_summary_prompt(milestone_task_id, raw_entries);
+    let plan = cost_efficient_auxiliary_plan(resolved);
+    let result = match crate::loop_engine::runner::dispatch_auxiliary(
+        plan,
         &prompt,
-        &PermissionMode::text_only(),
-        crate::loop_engine::claude::SpawnOpts {
-            model: Some(HAIKU_MODEL),
-            db_dir,
-            // Bounded so a rate-limited or stalled summary can't hang the
-            // loop. On timeout we fall through to the heuristic fallback.
-            timeout: Some(timeout),
-            ..Default::default()
-        },
+        MILESTONE_SUMMARY_TIMEOUT,
+        db_dir,
+        None,
     ) {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(
-                "milestone summary Haiku spawn failed: {} — falling back to heuristic",
+                "milestone summary LLM spawn failed: {} — falling back to heuristic",
                 e
             );
             return None;
@@ -358,14 +344,14 @@ fn try_haiku_summary(
     };
     if result.timed_out {
         tracing::warn!(
-            "milestone summary Haiku timed out after {}s — falling back to heuristic",
+            "milestone summary LLM timed out after {}s — falling back to heuristic",
             MILESTONE_SUMMARY_TIMEOUT.as_secs()
         );
         return None;
     }
     if result.exit_code != 0 {
         tracing::warn!(
-            "milestone summary Haiku exited with code {} — falling back to heuristic",
+            "milestone summary LLM exited with code {} — falling back to heuristic",
             result.exit_code
         );
         return None;
@@ -393,8 +379,8 @@ fn try_haiku_summary(
 /// long-running narrative survives.
 ///
 /// The summary records iterations covered, distinct tasks, completed tasks,
-/// files touched, and (when `db_dir` is `Some`) a Haiku-generated narrative +
-/// crash-avoidance recommendations. When `db_dir` is `None` or the Haiku call
+/// files touched, and (when `db_dir` is `Some`) an LLM-generated narrative +
+/// crash-avoidance recommendations. When `db_dir` is `None` or the LLM call
 /// fails, falls back to the deterministic `crash_recommendation` heuristic.
 ///
 /// **Note on "Iterations covered":** the count reflects raw entries currently
@@ -403,7 +389,12 @@ fn try_haiku_summary(
 /// entries before the milestone fired, so the count is a lower bound.
 ///
 /// Best-effort: file I/O and LLM failures log via `tracing` and do not propagate.
-pub fn summarize_milestone(progress_path: &Path, milestone_task_id: &str, db_dir: Option<&Path>) {
+pub fn summarize_milestone(
+    progress_path: &Path,
+    milestone_task_id: &str,
+    db_dir: Option<&Path>,
+    resolved: &ResolvedModelsConfig,
+) {
     let content = match fs::read_to_string(progress_path) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
@@ -483,18 +474,18 @@ pub fn summarize_milestone(progress_path: &Path, milestone_task_id: &str, db_dir
         },
     );
 
-    // Optional Haiku-generated narrative + recommendations. Skipped when
+    // Optional LLM-generated narrative + recommendations. Skipped when
     // db_dir is None (test path) or when the spawn fails for any reason —
     // either way the deterministic heuristic block always provides a baseline.
     let llm_section = if db_dir.is_some() {
         let raw_entries = entries[scope_start..].join("\n---\n");
-        try_haiku_summary(milestone_task_id, &raw_entries, db_dir)
+        try_llm_summary(milestone_task_id, &raw_entries, db_dir, resolved)
     } else {
         None
     };
 
     if let Some(narrative) = llm_section {
-        summary.push_str("- Narrative + recommendations (haiku):\n");
+        summary.push_str("- Narrative + recommendations (LLM summary):\n");
         for line in narrative.lines() {
             summary.push_str("    ");
             summary.push_str(line);
@@ -1038,7 +1029,12 @@ mod tests {
         write_iteration_entry(&mut content, 3, "MILESTONE-1", "Completed");
         fs::write(&progress_path, &content).unwrap();
 
-        summarize_milestone(&progress_path, "MILESTONE-1", None);
+        summarize_milestone(
+            &progress_path,
+            "MILESTONE-1",
+            None,
+            crate::loop_engine::model::builtin_resolved_models(),
+        );
 
         let after = fs::read_to_string(&progress_path).unwrap();
         // Raw FEAT-001 / FEAT-002 entries should be GONE — replaced by summary.
@@ -1074,7 +1070,12 @@ mod tests {
         write_iteration_entry(&mut content, 3, "FEAT-003", "Completed");
         fs::write(&progress_path, &content).unwrap();
 
-        summarize_milestone(&progress_path, "MILESTONE-2", None);
+        summarize_milestone(
+            &progress_path,
+            "MILESTONE-2",
+            None,
+            crate::loop_engine::model::builtin_resolved_models(),
+        );
 
         let after = fs::read_to_string(&progress_path).unwrap();
         assert!(
@@ -1108,7 +1109,12 @@ mod tests {
         write_iteration_entry(&mut content, 3, "REFACTOR-REVIEW-2", "PromptOverflow");
         fs::write(&progress_path, &content).unwrap();
 
-        summarize_milestone(&progress_path, "MILESTONE-2", None);
+        summarize_milestone(
+            &progress_path,
+            "MILESTONE-2",
+            None,
+            crate::loop_engine::model::builtin_resolved_models(),
+        );
 
         let after = fs::read_to_string(&progress_path).unwrap();
         assert!(
@@ -1140,7 +1146,12 @@ mod tests {
             "\n## 2026-01-01 - Milestone Summary: MILESTONE-1\n- Iterations covered: 0\n---\n";
         fs::write(&progress_path, content).unwrap();
 
-        summarize_milestone(&progress_path, "MILESTONE-2", None);
+        summarize_milestone(
+            &progress_path,
+            "MILESTONE-2",
+            None,
+            crate::loop_engine::model::builtin_resolved_models(),
+        );
 
         let after = fs::read_to_string(&progress_path).unwrap();
         assert_eq!(after, content, "no-op when nothing to summarize");
@@ -1150,7 +1161,12 @@ mod tests {
     fn test_summarize_milestone_missing_file_is_noop() {
         let temp_dir = TempDir::new().unwrap();
         let progress_path = temp_dir.path().join("missing.txt");
-        summarize_milestone(&progress_path, "MILESTONE-1", None);
+        summarize_milestone(
+            &progress_path,
+            "MILESTONE-1",
+            None,
+            crate::loop_engine::model::builtin_resolved_models(),
+        );
         assert!(
             !progress_path.exists(),
             "must not create a progress file from nothing"

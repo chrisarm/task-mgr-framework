@@ -455,6 +455,30 @@ pub fn escalate_below_ceiling(
     resolved.model_for(provider, target).map(str::to_string)
 }
 
+/// Provider/model pair for best-effort auxiliary LLM passes.
+///
+/// The model is a borrowed tier-table entry from [`ResolvedModelsConfig`], so a
+/// `None` value means "dispatch without a model flag" rather than "fall back to
+/// a hardcoded default".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuxiliaryLlmPlan<'a> {
+    pub provider: Provider,
+    pub model: Option<&'a str>,
+}
+
+/// Resolve the fixed cost-efficient auxiliary target for the primary provider.
+///
+/// This intentionally ignores the config anchor and task difficulty window:
+/// auxiliary extraction/summarization should use the primary provider's
+/// cost-efficient rung, not the cheapest rung and not an anchor-relative tier.
+pub fn cost_efficient_auxiliary_plan(resolved: &ResolvedModelsConfig) -> AuxiliaryLlmPlan<'_> {
+    let provider = resolved.primary_provider;
+    AuxiliaryLlmPlan {
+        provider,
+        model: resolved.model_for(provider, CapabilityTier::CostEfficient),
+    }
+}
+
 /// The built-in default resolved config (Claude full ladder enabled, grok/codex
 /// present-but-disabled, `anchor=standard`), built once and cached.
 ///
@@ -1722,6 +1746,14 @@ mod tests {
         provider: Provider,
         tiers: &[(CapabilityTier, Option<&str>)],
     ) -> ResolvedModelsConfig {
+        resolved_single_with_anchor(provider, CapabilityTier::Standard, tiers)
+    }
+
+    fn resolved_single_with_anchor(
+        provider: Provider,
+        anchor: CapabilityTier,
+        tiers: &[(CapabilityTier, Option<&str>)],
+    ) -> ResolvedModelsConfig {
         let mut providers = HashMap::new();
         providers.insert(
             provider.as_str().to_string(),
@@ -1738,7 +1770,7 @@ mod tests {
         );
         let models = ModelsConfig {
             primary_provider: provider.as_str().to_string(),
-            anchor: CapabilityTier::Standard.as_str().to_string(),
+            anchor: anchor.as_str().to_string(),
             providers,
         };
         resolve_models_config(&models, &RoutingConfig::default())
@@ -2019,6 +2051,76 @@ mod tests {
                 "anchor=cost-efficient, difficulty={difficulty}"
             );
         }
+    }
+
+    #[test]
+    fn cost_efficient_auxiliary_plan_builtin_claude_uses_sonnet() {
+        let plan = cost_efficient_auxiliary_plan(builtin_resolved_models());
+        assert_eq!(plan.provider, Provider::Claude);
+        assert_eq!(plan.model, Some(SONNET_MODEL));
+        assert_ne!(plan.model, Some(HAIKU_MODEL));
+    }
+
+    #[test]
+    fn cost_efficient_auxiliary_plan_honors_custom_cost_efficient_tier() {
+        let r = resolved_single(
+            Provider::Claude,
+            &[
+                (CapabilityTier::Cheapest, Some(SONNET_MODEL)),
+                (CapabilityTier::CostEfficient, Some(HAIKU_MODEL)),
+                (CapabilityTier::Standard, Some(OPUS_MODEL)),
+            ],
+        );
+
+        let plan = cost_efficient_auxiliary_plan(&r);
+        assert_eq!(plan.provider, Provider::Claude);
+        assert_eq!(plan.model, Some(HAIKU_MODEL));
+    }
+
+    #[test]
+    fn cost_efficient_auxiliary_plan_grok_sparse_ladder_clamps_to_standard() {
+        let r = resolved_single(
+            Provider::Grok,
+            &[(
+                CapabilityTier::Standard,
+                Some(GROK_DEFAULT_TIER_MODELS[0].1),
+            )],
+        );
+
+        let plan = cost_efficient_auxiliary_plan(&r);
+        assert_eq!(plan.provider, Provider::Grok);
+        assert_eq!(plan.model, Some(GROK_DEFAULT_TIER_MODELS[0].1));
+    }
+
+    #[test]
+    fn cost_efficient_auxiliary_plan_ignores_anchor_window() {
+        let standard_anchor = resolved_single_with_anchor(
+            Provider::Claude,
+            CapabilityTier::Standard,
+            &[
+                (CapabilityTier::Cheapest, Some(HAIKU_MODEL)),
+                (CapabilityTier::CostEfficient, Some(SONNET_MODEL)),
+                (CapabilityTier::Standard, Some(OPUS_MODEL)),
+            ],
+        );
+        let cost_efficient_anchor = resolved_single_with_anchor(
+            Provider::Claude,
+            CapabilityTier::CostEfficient,
+            &[
+                (CapabilityTier::Cheapest, Some(HAIKU_MODEL)),
+                (CapabilityTier::CostEfficient, Some(SONNET_MODEL)),
+                (CapabilityTier::Standard, Some(OPUS_MODEL)),
+            ],
+        );
+
+        assert_eq!(
+            cost_efficient_auxiliary_plan(&standard_anchor),
+            cost_efficient_auxiliary_plan(&cost_efficient_anchor)
+        );
+        assert_eq!(
+            cost_efficient_auxiliary_plan(&cost_efficient_anchor).model,
+            Some(SONNET_MODEL)
+        );
     }
 
     #[test]

@@ -94,6 +94,7 @@ at the PRD top level. Use `estimatedEffort: "high"` and/or
 `modifiesBehavior: true` to express the desire for a strong tier; the
 `models` + `routing` config (`task-mgr models show`) selects the actual
 runner/model at runtime via the anchor window and any forced routes.
+Do not set model; use estimatedEffort to preserve runtime provider routing.
 Explicit per-task `model` fields (rung 1, highest precedence) bypass all of
 that policy; a top-level PRD `model` is ignored and warns.
 

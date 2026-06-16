@@ -249,6 +249,7 @@ yourself.
 | `task-mgr run end` | End a run session |
 | `task-mgr export` | Export database state to JSON |
 | `task-mgr doctor` | Check database health and fix stale state |
+| `task-mgr doctor` orphan branch PRD | Remediate with `task-mgr archive --branch <branch>` after verifying the PRD is stale |
 | `task-mgr skip` | Skip one or more tasks intentionally (defer for later without marking as failed) |
 | `task-mgr irrelevant` | Mark one or more tasks as irrelevant (no longer needed due to changed requireme… |
 | `task-mgr learn` | Record a learning from a task outcome |

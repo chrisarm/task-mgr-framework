@@ -303,8 +303,7 @@ pub fn stage_skills(commands_dir: &Path, force: bool) -> StageOutcome {
                     record(&mut manifest, &mut manifest_dirty);
                     continue;
                 }
-                let installed_by_us =
-                    manifest.skills.get(skill.name) == Some(&md5_hex(&existing));
+                let installed_by_us = manifest.skills.get(skill.name) == Some(&md5_hex(&existing));
                 if installed_by_us || force {
                     match write_atomic(&path, embedded) {
                         Ok(()) => {
@@ -335,7 +334,9 @@ pub fn stage_skills(commands_dir: &Path, force: bool) -> StageOutcome {
                         .push(format!("failed to write {}: {e}", manifest_path.display()));
                 }
             }
-            Err(e) => outcome.errors.push(format!("failed to serialize manifest: {e}")),
+            Err(e) => outcome
+                .errors
+                .push(format!("failed to serialize manifest: {e}")),
         }
     }
 

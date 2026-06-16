@@ -21,6 +21,20 @@ fn insert_test_task(conn: &rusqlite::Connection, id: &str, status: &str) {
     .unwrap();
 }
 
+fn insert_test_prd_metadata(
+    conn: &rusqlite::Connection,
+    id: i64,
+    task_prefix: &str,
+    project: &str,
+    branch_name: Option<&str>,
+) {
+    conn.execute(
+        "INSERT INTO prd_metadata (id, project, task_prefix, branch_name) VALUES (?, ?, ?, ?)",
+        rusqlite::params![id, project, task_prefix, branch_name],
+    )
+    .unwrap();
+}
+
 // ============ find_stale_in_progress_tasks tests ============
 
 #[test]
@@ -360,6 +374,7 @@ fn test_format_text_healthy() {
             stale_tasks: 0,
             active_runs: 0,
             orphaned_relationships: 0,
+            orphan_branch_prds: 0,
             decay_warnings: 0,
             reconciled: 0,
             total_issues: 0,
@@ -388,6 +403,7 @@ fn test_format_text_with_issues() {
             stale_tasks: 1,
             active_runs: 0,
             orphaned_relationships: 0,
+            orphan_branch_prds: 0,
             decay_warnings: 0,
             reconciled: 0,
             total_issues: 1,
@@ -421,6 +437,7 @@ fn test_format_text_with_fixes() {
             stale_tasks: 1,
             active_runs: 0,
             orphaned_relationships: 0,
+            orphan_branch_prds: 0,
             decay_warnings: 0,
             reconciled: 0,
             total_issues: 1,
@@ -451,6 +468,7 @@ fn test_doctor_result_serialization() {
             stale_tasks: 1,
             active_runs: 0,
             orphaned_relationships: 0,
+            orphan_branch_prds: 0,
             decay_warnings: 0,
             reconciled: 0,
             total_issues: 1,
@@ -643,6 +661,7 @@ fn test_format_text_dry_run() {
             stale_tasks: 1,
             active_runs: 0,
             orphaned_relationships: 0,
+            orphan_branch_prds: 0,
             decay_warnings: 0,
             reconciled: 0,
             total_issues: 1,
@@ -759,7 +778,7 @@ fn test_invalid_task_ids() {
 fn setup_git_repo_with_commits(dir: &std::path::Path, commits: &[&str]) {
     // Initialize git repo
     std::process::Command::new("git")
-        .args(["init", "-b", "main"])
+        .args(["-c", "init.defaultBranch=main", "init"])
         .current_dir(dir)
         .output()
         .unwrap();
@@ -791,6 +810,164 @@ fn setup_git_repo_with_commits(dir: &std::path::Path, commits: &[&str]) {
             .output()
             .unwrap();
     }
+}
+
+#[test]
+fn doctor_flags_prd_with_nonexistent_branch() {
+    let (tmp_dir, conn) = setup_test_db();
+    setup_git_repo_with_commits(tmp_dir.path(), &["feat: initial commit"]);
+    insert_test_prd_metadata(&conn, 1, "P1", "orphan-prd", Some("feat/missing"));
+    insert_test_task(&conn, "P1-001", "todo");
+
+    let result = checks::find_orphan_branch_prds(&conn, tmp_dir.path()).unwrap();
+
+    assert_eq!(
+        result,
+        vec![(
+            "P1".to_string(),
+            "orphan-prd".to_string(),
+            "feat/missing".to_string()
+        )]
+    );
+}
+
+#[test]
+fn doctor_ignores_prd_with_extant_local_branch() {
+    let (tmp_dir, conn) = setup_test_db();
+    setup_git_repo_with_commits(tmp_dir.path(), &["feat: initial commit"]);
+    insert_test_prd_metadata(&conn, 1, "P1", "local-prd", Some("feat/local"));
+    insert_test_task(&conn, "P1-001", "todo");
+
+    std::process::Command::new("git")
+        .args(["branch", "feat/local"])
+        .current_dir(tmp_dir.path())
+        .output()
+        .unwrap();
+
+    let result = checks::find_orphan_branch_prds(&conn, tmp_dir.path()).unwrap();
+
+    assert!(result.is_empty());
+}
+
+#[test]
+fn doctor_ignores_prd_with_remote_only_branch() {
+    let (tmp_dir, conn) = setup_test_db();
+    setup_git_repo_with_commits(tmp_dir.path(), &["feat: initial commit"]);
+    insert_test_prd_metadata(&conn, 1, "P1", "remote-prd", Some("feat/foo"));
+    insert_test_task(&conn, "P1-001", "todo");
+
+    std::process::Command::new("git")
+        .args(["update-ref", "refs/remotes/origin/feat/foo", "HEAD"])
+        .current_dir(tmp_dir.path())
+        .output()
+        .unwrap();
+
+    let result = checks::find_orphan_branch_prds(&conn, tmp_dir.path()).unwrap();
+
+    assert!(result.is_empty());
+}
+
+#[test]
+fn doctor_ignores_prd_with_null_branch_name() {
+    let (tmp_dir, conn) = setup_test_db();
+    setup_git_repo_with_commits(tmp_dir.path(), &["feat: initial commit"]);
+    insert_test_prd_metadata(&conn, 1, "P1", "null-branch-prd", None);
+    insert_test_task(&conn, "P1-001", "todo");
+
+    let result = checks::find_orphan_branch_prds(&conn, tmp_dir.path()).unwrap();
+
+    assert!(result.is_empty());
+}
+
+#[test]
+fn doctor_ignores_prd_with_empty_branch_name() {
+    let (tmp_dir, conn) = setup_test_db();
+    setup_git_repo_with_commits(tmp_dir.path(), &["feat: initial commit"]);
+    insert_test_prd_metadata(&conn, 1, "P1", "empty-branch-prd", Some(""));
+    insert_test_task(&conn, "P1-001", "todo");
+
+    let result = checks::find_orphan_branch_prds(&conn, tmp_dir.path()).unwrap();
+
+    assert!(result.is_empty());
+}
+
+#[test]
+fn doctor_ignores_prd_with_all_archived_rows() {
+    let (tmp_dir, conn) = setup_test_db();
+    setup_git_repo_with_commits(tmp_dir.path(), &["feat: initial commit"]);
+    insert_test_prd_metadata(&conn, 1, "P1", "archived-prd", Some("feat/missing"));
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, priority, archived_at) VALUES ('P1-001', 'Archived Task', 'todo', 10, datetime('now'))",
+        [],
+    )
+    .unwrap();
+
+    let result = checks::find_orphan_branch_prds(&conn, tmp_dir.path()).unwrap();
+
+    assert!(result.is_empty());
+}
+
+#[test]
+fn doctor_returns_empty_in_non_git_directory() {
+    let (tmp_dir, conn) = setup_test_db();
+    insert_test_prd_metadata(&conn, 1, "P1", "non-git-prd", Some("feat/missing"));
+    insert_test_task(&conn, "P1-001", "todo");
+
+    let result = checks::find_orphan_branch_prds(&conn, tmp_dir.path()).unwrap();
+
+    assert!(result.is_empty());
+}
+
+#[test]
+fn doctor_reports_orphan_branch_prd_as_issue() {
+    let (tmp_dir, mut conn) = setup_test_db();
+    setup_git_repo_with_commits(tmp_dir.path(), &["feat: initial commit"]);
+    insert_test_prd_metadata(&conn, 1, "P1", "orphan-prd", Some("feat/missing"));
+    insert_test_task(&conn, "P1-001", "todo");
+
+    let result = doctor(&mut conn, false, false, 0, false, tmp_dir.path()).unwrap();
+
+    assert_eq!(result.summary.orphan_branch_prds, 1);
+    assert!(
+        result
+            .issues
+            .iter()
+            .any(|i| i.issue_type == IssueType::OrphanBranchPrd && i.entity_id == "P1")
+    );
+}
+
+#[test]
+fn doctor_fix_orphan_branch_prd_is_print_only() {
+    let (tmp_dir, mut conn) = setup_test_db();
+    setup_git_repo_with_commits(tmp_dir.path(), &["feat: initial commit"]);
+    insert_test_prd_metadata(&conn, 1, "P1", "orphan-prd", Some("feat/missing"));
+    insert_test_task(&conn, "P1-001", "todo");
+
+    let result = doctor(&mut conn, true, false, 0, false, tmp_dir.path()).unwrap();
+
+    assert_eq!(result.would_fix.len(), 1);
+    assert!(
+        result.would_fix[0]
+            .action
+            .contains("task-mgr archive --branch feat/")
+    );
+    assert_eq!(
+        result
+            .fixed
+            .iter()
+            .filter(|f| f.issue_type == IssueType::OrphanBranchPrd)
+            .count(),
+        0
+    );
+
+    let archived_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tasks WHERE archived_at IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(archived_count, 0);
 }
 
 #[test]
@@ -978,6 +1155,7 @@ fn test_format_text_git_reconciliation() {
             stale_tasks: 0,
             active_runs: 0,
             orphaned_relationships: 0,
+            orphan_branch_prds: 0,
             decay_warnings: 0,
             reconciled: 1,
             total_issues: 1,
@@ -1006,6 +1184,7 @@ fn test_format_text_git_reconciliation_verbose() {
             stale_tasks: 0,
             active_runs: 0,
             orphaned_relationships: 0,
+            orphan_branch_prds: 0,
             decay_warnings: 0,
             reconciled: 1,
             total_issues: 1,
@@ -1016,6 +1195,91 @@ fn test_format_text_git_reconciliation_verbose() {
     let verbose = format_doctor_verbose(&result);
     assert!(verbose.contains("Git reconciliation"));
     assert!(verbose.contains("FEAT-001"));
+}
+
+#[test]
+fn doctor_dry_run_orphan_branch_prd_uses_manual_remediation_label() {
+    let (tmp_dir, mut conn) = setup_test_db();
+    setup_git_repo_with_commits(tmp_dir.path(), &["feat: initial commit"]);
+    insert_test_prd_metadata(&conn, 1, "P1", "orphan-prd", Some("feat/missing"));
+    insert_test_task(&conn, "P1-001", "todo");
+
+    let result = doctor(&mut conn, true, true, 0, false, tmp_dir.path()).unwrap();
+
+    let text = format_text(&result);
+    assert!(
+        text.contains("Manual remediation required"),
+        "print-only orphan fixes must not appear under [DRY RUN] Would fix"
+    );
+    assert!(
+        !text.contains("[DRY RUN] Would fix"),
+        "orphan-only dry-run must not use the auto-fix preview header"
+    );
+}
+
+#[test]
+fn test_format_doctor_verbose_orphan_branch_prd() {
+    let result = DoctorResult {
+        issues: vec![Issue {
+            issue_type: IssueType::OrphanBranchPrd,
+            entity_id: "P1".to_string(),
+            description: "PRD 'orphan-prd' (prefix: P1, branch: feat/missing)".to_string(),
+        }],
+        fixed: vec![],
+        would_fix: vec![],
+        auto_fix: false,
+        dry_run: false,
+        summary: DoctorSummary {
+            stale_tasks: 0,
+            active_runs: 0,
+            orphaned_relationships: 0,
+            orphan_branch_prds: 1,
+            decay_warnings: 0,
+            reconciled: 0,
+            total_issues: 1,
+            total_fixed: 0,
+        },
+    };
+
+    let verbose = format_doctor_verbose(&result);
+    assert!(verbose.contains("Check 5"));
+    assert!(verbose.contains("Orphan branch PRDs"));
+    assert!(verbose.contains("P1"));
+}
+
+#[test]
+fn test_format_text_orphan_branch_prd() {
+    let result = DoctorResult {
+        issues: vec![Issue {
+            issue_type: IssueType::OrphanBranchPrd,
+            entity_id: "P1".to_string(),
+            description: "PRD 'orphan-prd' (prefix: P1, branch: feat/missing) references a branch that doesn't exist locally or on any remote — likely test pollution or a stale PRD\n    Fix: task-mgr archive --branch feat/missing".to_string(),
+        }],
+        fixed: vec![],
+        would_fix: vec![Fix {
+            issue_type: IssueType::OrphanBranchPrd,
+            entity_id: "P1".to_string(),
+            action: fixes::fix_orphan_branch_prd_remediation("feat/missing"),
+        }],
+        auto_fix: true,
+        dry_run: false,
+        summary: DoctorSummary {
+            stale_tasks: 0,
+            active_runs: 0,
+            orphaned_relationships: 0,
+            orphan_branch_prds: 1,
+            decay_warnings: 0,
+            reconciled: 0,
+            total_issues: 1,
+            total_fixed: 0,
+        },
+    };
+
+    let text = format_text(&result);
+    assert!(text.contains("Orphan branch PRDs (1)"));
+    assert!(text.contains("PRD 'orphan-prd' (prefix: P1, branch: feat/missing)"));
+    assert!(text.contains("Fix: task-mgr archive --branch feat/missing"));
+    assert!(text.contains("Manual remediation required"));
 }
 
 #[test]
@@ -1038,6 +1302,7 @@ fn test_git_reconciliation_serialization() {
             stale_tasks: 0,
             active_runs: 0,
             orphaned_relationships: 0,
+            orphan_branch_prds: 0,
             decay_warnings: 0,
             reconciled: 1,
             total_issues: 1,

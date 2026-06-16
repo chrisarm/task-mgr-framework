@@ -1584,7 +1584,10 @@ mod tests {
             project_config: &project_cfg,
         });
         assert!(
-            matches!(action, crate::loop_engine::overflow::RecoveryAction::DowngradeEffort { .. }),
+            matches!(
+                action,
+                crate::loop_engine::overflow::RecoveryAction::DowngradeEffort { .. }
+            ),
             "xhigh effort must take the rung-1 downgrade branch, got {action:?}",
         );
         // Precondition state: effort override set, snapshot is Some(None), and

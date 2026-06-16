@@ -517,6 +517,7 @@ pub fn process_iteration_output(params: ProcessingParams<'_>) -> ProcessingOutco
             Some(run_id),
             Some(db_dir),
             Some(signal_flag),
+            &ctx.resolved_models,
         ) {
             Ok(extraction) => {
                 result.learnings_extracted = extraction.learnings_extracted;

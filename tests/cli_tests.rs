@@ -43,7 +43,7 @@ fn setup_initialized_tempdir() -> TempDir {
     let mut last_stderr = String::new();
     for attempt in 0..5 {
         let output = Command::new(cargo_bin("task-mgr"))
-        .env("HOME", &dir_str)
+            .env("HOME", &dir_str)
             .args(["--dir", &dir_str])
             .args(["init", "--no-prefix", "--from-json", &prd_str])
             .output()
@@ -487,7 +487,7 @@ fn test_database_isolation() {
     // Initialize both with the same PRD
     for temp_dir in [&temp_dir1, &temp_dir2] {
         Command::new(cargo_bin("task-mgr"))
-        .env("HOME", temp_dir.path())
+            .env("HOME", temp_dir.path())
             .args(["--dir", temp_dir.path().to_str().unwrap()])
             .args([
                 "init",

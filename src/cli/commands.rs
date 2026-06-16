@@ -998,8 +998,10 @@ your PRD file is literally called `init` or `run`.
         ///
         /// When enabled, each PRD's worktree branches from the previous PRD's
         /// branch instead of HEAD. This ensures later phases see earlier phases'
-        /// code changes. Batch stops on the first failure (downstream PRDs
-        /// would be based on incomplete work).
+        /// code changes. Batch stops when a PRD fails OR does not complete —
+        /// including when the iteration budget is exhausted or a deadline is
+        /// reached with tasks still remaining. Downstream chained PRDs would
+        /// otherwise build on incomplete work.
         ///
         /// Requires each PRD to have a `branchName` field.
         #[arg(long, default_value_t = false)]
@@ -1465,6 +1467,15 @@ pub enum BatchCommand {
         keep_worktrees: bool,
 
         /// Chain PRDs so each builds on the previous PRD's branch
+        ///
+        /// When enabled, each PRD's worktree branches from the previous PRD's
+        /// branch instead of HEAD. This ensures later phases see earlier phases'
+        /// code changes. Batch stops when a PRD fails OR does not complete —
+        /// including when the iteration budget is exhausted or a deadline is
+        /// reached with tasks still remaining. Downstream chained PRDs would
+        /// otherwise build on incomplete work.
+        ///
+        /// Requires each PRD to have a `branchName` field.
         #[arg(long, default_value_t = false)]
         chain: bool,
 

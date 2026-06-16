@@ -11,7 +11,7 @@ use crate::loop_engine::guidance::SessionGuidance;
 use crate::loop_engine::model;
 use crate::loop_engine::progress;
 use crate::loop_engine::project_config;
-use crate::loop_engine::runner::RunnerKind;
+use crate::loop_engine::runner::{RunnerKind, runner_kind_for};
 use crate::loop_engine::signals::SignalFlag;
 use crate::loop_engine::stale::StaleTracker;
 use crate::models::RunStatus;
@@ -543,13 +543,7 @@ pub fn resolve_effective_runner(
     let provider = input
         .provider_hint
         .unwrap_or_else(|| model::provider_for_model(input.model));
-    // kind-correct: identity translation — maps Provider enum to RunnerKind,
-    // two representations of the same provider concept.
-    match provider {
-        model::Provider::Grok => RunnerKind::Grok,
-        model::Provider::Codex => RunnerKind::Codex,
-        model::Provider::Claude => RunnerKind::Claude,
-    }
+    runner_kind_for(provider)
 }
 
 /// Per-slot execution context for parallel wave iterations.
@@ -917,6 +911,16 @@ pub struct LoopResult {
     /// reconciliation. Used by callers (e.g. batch auto-review gating) to decide
     /// whether this run met the minimum-tasks threshold.
     pub tasks_completed: u32,
+    /// True when every task for this PRD prefix is in a terminal state
+    /// (done/irrelevant/skipped/blocked) at loop end.
+    ///
+    /// Computed from `count_remaining_active_tasks == 0` AFTER
+    /// `reconcile_ambiguous_exit` runs but BEFORE step 17.5 task resets, so it
+    /// reflects the authoritative terminal classifications. Read by
+    /// `batch run --chain` to stop the chain when a PRD exhausted its iteration
+    /// budget or deadline with active work still queued (an ambiguous exit 0
+    /// that Layer 1 may not have caught). `#[derive(Default)]` yields `false`.
+    pub prd_complete: bool,
 }
 
 /// Configuration for running the loop, built from CLI args + env.
@@ -1059,7 +1063,11 @@ pub fn apply_status_updates(
                     || update.task_id == "MILESTONE"
                     || update.task_id.ends_with("-MILESTONE");
                 if is_milestone && let Some(pp) = progress_path {
-                    progress::summarize_milestone(pp, &update.task_id, db_dir);
+                    let resolved = ctx
+                        .as_ref()
+                        .map(|c| &c.resolved_models)
+                        .unwrap_or(model::builtin_resolved_models());
+                    progress::summarize_milestone(pp, &update.task_id, db_dir, resolved);
                 }
             }
             // Prune crashed_last_iteration on terminal transitions only —
@@ -1218,6 +1226,7 @@ mod tests {
         assert!(r.branch_name.is_none());
         assert!(!r.was_stopped);
         assert_eq!(r.tasks_completed, 0);
+        assert!(!r.prd_complete);
     }
 
     #[test]
@@ -1231,6 +1240,7 @@ mod tests {
         assert!(r.branch_name.is_none());
         assert!(!r.was_stopped);
         assert_eq!(r.tasks_completed, 0);
+        assert!(!r.prd_complete);
     }
 
     // --- IterationContext tests ---

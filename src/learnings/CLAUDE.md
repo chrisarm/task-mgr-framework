@@ -33,8 +33,10 @@ public for tests and `curate enrich`, but new production creation paths should u
 ### Write-time near-duplicate guard (ingestion auto-extraction ONLY)
 
 The loop-engine auto-extraction path mines a learning from each iteration's output
-via Haiku. When two iterations surface the *same* lesson with slightly reworded
-titles, the exact `(outcome, title)` guard (`learning_exists`) lets both rows in,
+via the primary provider's **cost-efficient tier** (Sonnet on the default Claude
+config; previously hardcoded to Haiku/cheapest — intentional upgrade). When two
+iterations surface the *same* lesson with slightly reworded titles, the exact
+`(outcome, title)` guard (`learning_exists`) lets both rows in,
 polluting `recall` until the post-hoc `curate dedup` LLM pass merges them. To stop
 the near-duplicate at write time, `extract_learnings_from_output()` layers a second,
 embedding-based tier on top of the exact-match guard:
@@ -52,6 +54,11 @@ stored under the **configured** embedding model at construction — **cross-mode
 comparison is intentionally skipped** (similarity across different embedding spaces is
 meaningless). The guard is wired ONLY into ingestion auto-extraction; the human
 `task-mgr learn` and `import_learnings` paths are deliberately untouched.
+
+**Follow-up inconsistency:** `curate dedup` and `curate enrich` still invoke Haiku
+directly via legacy `dedup_model` / `enrich_model` paths — they are not yet wired
+through the provider-first tier routing that extraction now uses. Migrating them is
+out of scope here but is a known inconsistency.
 
 **Asymmetric-risk bias — uncertainty RECORDS, never skips.** A false positive (dropping
 a real, distinct learning) is unrecoverable at write time (no LLM second opinion),

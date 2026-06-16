@@ -1,20 +1,19 @@
 //! LLM-powered learning extraction from agent iteration output.
 //!
-//! Uses Claude to automatically extract structured learnings from raw
-//! iteration output. Integrates with the existing CRUD system to persist
-//! extracted learnings.
+//! Uses an auxiliary LLM pass to automatically extract structured learnings
+//! from raw iteration output. Integrates with the existing CRUD system to
+//! persist extracted learnings.
 //!
 //! ## Design
 //!
 //! - Best-effort: parse/spawn failures log warnings and return 0 learnings
-//! - Same model as loop: uses `spawn_claude()` from loop_engine
+//! - Primary-provider cost-efficient tier via `runner::dispatch`; on the
+//!   built-in Claude config this intentionally uses Sonnet rather than Haiku
 //! - Opt-out via `TASK_MGR_NO_EXTRACT_LEARNINGS=1`
 
 pub mod extraction;
 
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use rusqlite::Connection;
@@ -23,16 +22,14 @@ use crate::TaskMgrResult;
 use crate::learnings::crud::{LearningWriter, RecordLearningParams};
 use crate::learnings::embeddings::{NEAR_DUP_THRESHOLD, NearDupOutcome, NearDuplicateChecker};
 use crate::learnings::retrieval::patterns::{resolve_task_context, type_prefix_from};
-use crate::loop_engine::claude;
-use crate::loop_engine::config::PermissionMode;
-use crate::loop_engine::model::HAIKU_MODEL;
+use crate::loop_engine::model::{ResolvedModelsConfig, cost_efficient_auxiliary_plan};
+use crate::loop_engine::runner::dispatch_auxiliary;
 use crate::loop_engine::signals::SignalFlag;
-use crate::loop_engine::watchdog::TimeoutConfig;
 use crate::models::LearningOutcome;
 
 /// Hard timeout for the extraction subprocess. Extraction is a one-shot
 /// classification pass on ≤50KB of text; anything over ~5 min means the
-/// spawned Claude is stuck (rate limit, network stall, runaway internal
+/// spawned auxiliary LLM is stuck (rate limit, network stall, runaway internal
 /// retry). Better to bail and move on than hang the whole loop.
 const EXTRACTION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
@@ -63,9 +60,9 @@ pub fn is_extraction_disabled() -> bool {
         .unwrap_or(false)
 }
 
-/// Extracts learnings from Claude's iteration output using LLM analysis.
+/// Extracts learnings from agent iteration output using LLM analysis.
 ///
-/// Spawns a Claude subprocess with an extraction prompt, parses the JSON
+/// Dispatches an auxiliary LLM with an extraction prompt, parses the JSON
 /// response, and records each extracted learning via the CRUD system.
 ///
 /// Best-effort: never crashes the loop. Returns 0 learnings on any error.
@@ -79,6 +76,8 @@ pub fn is_extraction_disabled() -> bool {
 /// * `db_dir` - Optional database directory for scheduling embeddings after recording.
 ///   Pass `Some(path)` in production paths to auto-embed learnings. Pass `None` in
 ///   tests or callers that don't need embeddings (writer no-ops, behavior matches pre-refactor).
+/// * `resolved` - Resolved project model/routing config used to choose the
+///   primary provider's cost-efficient auxiliary model.
 pub fn extract_learnings_from_output(
     conn: &Connection,
     output: &str,
@@ -86,6 +85,7 @@ pub fn extract_learnings_from_output(
     run_id: Option<&str>,
     db_dir: Option<&Path>,
     signal_flag: Option<&SignalFlag>,
+    resolved: &ResolvedModelsConfig,
 ) -> TaskMgrResult<ExtractionResult> {
     if output.trim().is_empty() {
         return Ok(ExtractionResult::empty());
@@ -94,58 +94,41 @@ pub fn extract_learnings_from_output(
     // Build extraction prompt
     let prompt = build_extraction_prompt(output, task_id);
 
-    // Extraction runs with a fixed hard timeout — no monitor thread, no
-    // activity-based extensions. A 0-valued activity epoch means the
-    // watchdog's activity branch is inert (no extension can trigger),
-    // so only the base deadline and the signal flag can terminate it.
-    let no_activity = Arc::new(AtomicU64::new(0));
-    let timeout = TimeoutConfig {
-        base_timeout: EXTRACTION_TIMEOUT,
-        initial_extension: Duration::from_secs(0),
-        last_activity_epoch: no_activity,
-    };
+    let plan = cost_efficient_auxiliary_plan(resolved);
+    tracing::debug!(
+        provider = ?plan.provider,
+        model = plan.model.unwrap_or("<provider default>"),
+        "spawning learning extraction auxiliary LLM"
+    );
 
-    // Spawn Claude for extraction
-    let claude_result = match claude::spawn_claude(
-        &prompt,
-        &PermissionMode::text_only(),
-        claude::SpawnOpts {
-            db_dir,
-            // Cheap, fast classification — Haiku is the right tool here.
-            model: Some(HAIKU_MODEL),
-            // Bounded so a rate-limited or stalled extraction can't hang the
-            // whole loop. 5 min is generous for ≤50KB of input to Haiku.
-            timeout: Some(timeout),
-            // Honor Ctrl-C during extraction so the user isn't stuck waiting
-            // on the full hard timeout after hitting the signal.
-            signal_flag,
-            ..Default::default()
-        },
-    ) {
-        Ok(result) => result,
-        Err(e) => {
-            eprintln!("Warning: learning extraction spawn failed: {}", e);
-            return Ok(ExtractionResult::empty());
-        }
-    };
+    // Bounded so a rate-limited or stalled extraction can't hang the whole
+    // loop. The dispatcher keeps this text-only and omits effort flags.
+    let auxiliary_result =
+        match dispatch_auxiliary(plan, &prompt, EXTRACTION_TIMEOUT, db_dir, signal_flag) {
+            Ok(result) => result,
+            Err(e) => {
+                eprintln!("Warning: learning extraction spawn failed: {}", e);
+                return Ok(ExtractionResult::empty());
+            }
+        };
 
-    if claude_result.timed_out {
+    if auxiliary_result.timed_out {
         eprintln!(
             "Warning: learning extraction timed out after {}s — skipping",
             EXTRACTION_TIMEOUT.as_secs()
         );
         return Ok(ExtractionResult::empty());
     }
-    if claude_result.exit_code != 0 {
+    if auxiliary_result.exit_code != 0 {
         eprintln!(
-            "Warning: learning extraction Claude exited with code {}",
-            claude_result.exit_code
+            "Warning: learning extraction auxiliary LLM exited with code {}",
+            auxiliary_result.exit_code
         );
         return Ok(ExtractionResult::empty());
     }
 
     // Parse the extraction response
-    let params_list = match parse_extraction_response(&claude_result.output, task_id, run_id) {
+    let params_list = match parse_extraction_response(&auxiliary_result.output, task_id, run_id) {
         Ok(list) => list,
         Err(e) => {
             eprintln!("Warning: learning extraction parse failed: {}", e);
@@ -197,9 +180,9 @@ pub fn extract_learnings_from_output(
 
 /// Test seam for the Tier-2 semantic-dedup arms of [`record_extracted_learnings`].
 ///
-/// `extract_learnings_from_output` spawns a Claude subprocess before the recording
-/// loop, so the loop is unreachable from a unit test without a subprocess + live
-/// Ollama. Injecting the guard behind this trait lets a scripted fake exercise every
+/// `extract_learnings_from_output` dispatches the primary-provider auxiliary LLM
+/// before the recording loop, so the loop is unreachable from a unit test without
+/// a subprocess + live Ollama. Injecting the guard behind this trait lets a scripted fake exercise every
 /// arm offline. The fake is the second impl that earns the abstraction, so this is
 /// DI-for-testability (CLAUDE.md §5), not premature generalization.
 trait NearDupGuard {

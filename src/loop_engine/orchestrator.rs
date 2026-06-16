@@ -50,7 +50,9 @@ use crate::loop_engine::progress;
 use crate::loop_engine::reactions;
 use crate::loop_engine::signals;
 use crate::loop_engine::startup::{self, LoopInitContext};
-use crate::loop_engine::wave_scheduler::classify_drained_queue;
+use crate::loop_engine::wave_scheduler::{
+    classify_drained_queue, count_remaining_active_tasks, reconcile_ambiguous_exit,
+};
 use crate::loop_engine::worktree;
 use crate::models::RunStatus;
 use crate::output::ui;
@@ -671,6 +673,31 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
         }
     }
 
+    // Layer 1 (batch-chain honesty): when the loop fell out of the outer
+    // `while` because it hit the iteration ceiling or the deadline with active
+    // work still in the queue, upgrade the ambiguous exit 0 to a non-zero code
+    // so `batch run --chain` stops instead of stacking the next PRD on an
+    // incomplete branch tip. MUST run BEFORE step 17.5's `reset_task_to_todo` —
+    // after the reset, a stranded task is still counted, but reading here keeps
+    // the count tied to the authoritative terminal classifications above.
+    reconcile_ambiguous_exit(
+        &conn,
+        task_prefix.as_deref(),
+        was_stopped,
+        &mut exit_code,
+        &mut exit_reason,
+        &mut final_run_status,
+    );
+
+    // Layer 2 (observable PRD completion): snapshot whether every task for this
+    // prefix is terminal, reading the SAME post-reconcile DB state. MUST be read
+    // BEFORE step 17.5's `reset_task_to_todo` — after the reset a stranded task
+    // is flipped back to `todo` and would still count, but capturing here ties
+    // the flag to the authoritative terminal classifications. `batch run --chain`
+    // consumes this via `LoopResult.prd_complete` to stop the chain on an
+    // incomplete PRD even when the exit code is an ambiguous 0.
+    let prd_complete = count_remaining_active_tasks(&conn, task_prefix.as_deref()) == 0;
+
     // Step 17.5: Reset uncompleted claimed task so it's not stuck in_progress for next run
     if let Some(ref task_id) = last_claimed_task {
         reset_task_to_todo(&mut conn, task_id, "uncompleted task");
@@ -789,6 +816,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
         branch_name: branch_name.clone(),
         was_stopped,
         tasks_completed,
+        prd_complete,
     }
 }
 

@@ -141,6 +141,87 @@ pub fn find_orphaned_relationships(
     Ok(results)
 }
 
+/// Collect local and remote branch ref short names via a single `git for-each-ref`.
+///
+/// Returns `None` when git is unavailable or `dir` is not a repo.
+fn list_local_and_remote_branches(dir: &Path) -> Option<HashSet<String>> {
+    let output = Command::new("git")
+        .args([
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "refs/heads",
+            "refs/remotes",
+        ])
+        .current_dir(dir)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    Some(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| !line.contains(" -> "))
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToOwned::to_owned)
+            .collect(),
+    )
+}
+
+/// Find active PRDs whose recorded branch does not exist locally or on any remote.
+///
+/// Returns `(task_prefix, project, branch_name)` for PRDs that still have at least
+/// one unarchived task and whose `branch_name` is absent from `refs/heads` and
+/// `refs/remotes`.
+pub fn find_orphan_branch_prds(
+    conn: &Connection,
+    dir: &Path,
+) -> TaskMgrResult<Vec<(String, String, String)>> {
+    let branch_refs = match list_local_and_remote_branches(dir) {
+        Some(refs) => refs,
+        None => return Ok(Vec::new()),
+    };
+
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT task_prefix, project, branch_name
+        FROM prd_metadata
+        WHERE branch_name IS NOT NULL
+        AND branch_name != ''
+        AND task_prefix IS NOT NULL
+        AND EXISTS (
+            SELECT 1
+            FROM tasks
+            WHERE id LIKE prd_metadata.task_prefix || '-%' ESCAPE '\'
+            AND archived_at IS NULL
+        )
+        ORDER BY task_prefix
+        "#,
+    )?;
+
+    let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        let (task_prefix, project, branch_name): (String, String, String) = row?;
+        let branch_exists = branch_refs.contains(&branch_name)
+            || branch_refs.iter().any(|entry| {
+                entry
+                    .split_once('/')
+                    .is_some_and(|(_, stripped)| stripped == branch_name)
+            });
+
+        if !branch_exists {
+            results.push((task_prefix, project, branch_name));
+        }
+    }
+
+    Ok(results)
+}
+
 /// Parse task IDs from git log commit messages.
 ///
 /// Looks for patterns like `[FEAT-001]`, `[US-001]`, `[FIX-001]` in commit messages.

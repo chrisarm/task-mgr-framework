@@ -424,6 +424,78 @@ pub(crate) fn classify_drained_queue(
     })
 }
 
+/// Reconcile an *ambiguous* loop exit — the iteration ceiling or the deadline
+/// was reached — against the actual state of the queue, so the loop's exit code
+/// is honest about unfinished work.
+///
+/// Background: hitting `max_iterations` or the deadline drops out of the outer
+/// `while` with `exit_code = 0` and a reason of `"max iterations reached"` /
+/// `"deadline reached"`, regardless of whether `todo`/`in_progress` work is
+/// still outstanding. `batch run --chain` only stops on `exit_code != 0`, so a
+/// budget-exhausted-but-incomplete PRD would silently let the next PRD stack on
+/// its incomplete branch tip. This upgrades that ambiguous `0` to a `1` (with a
+/// reason naming the count) so the chain gate can stop.
+///
+/// Reads `count_remaining_active_tasks` exactly ONCE. The decision table:
+///
+/// - `was_stopped` → return unchanged (a `.stop` halt is a clean operator exit,
+///   exit 0 even with work remaining).
+/// - `*exit_code != 0` → return unchanged (never downgrade an authoritative
+///   nonzero code, e.g. `2` blocked / `3` overflow / `130` signal).
+/// - reason is exactly `"max iterations reached"` or `"deadline reached"` AND
+///   count > 0 → `exit_code = 1`, reason names the remaining count,
+///   `final_run_status = Aborted`.
+/// - reason is exactly `"max iterations reached"` AND count == 0 → relabel to
+///   `"all tasks complete"`, `final_run_status = Completed` (exit stays 0).
+/// - reason is `"deadline reached"` AND count == 0 → left unchanged (exit 0);
+///   the symmetric "all tasks complete" relabel is optional polish.
+///
+/// MUST be called ONLY on the outer post-`while` path, BEFORE step 17.5
+/// `reset_task_to_todo` — after that reset the only-terminal rows would make a
+/// budget-exhausted PRD falsely report complete. Never call it from wave
+/// terminal paths, `classify_drained_queue` short-circuits, or `should_stop`
+/// match arms.
+///
+/// Failure mode: a `count_remaining_active_tasks` query failure returns 0 (per
+/// the existing helper), which this treats as drained — documented existing
+/// behavior; the helper is not changed here.
+pub(crate) fn reconcile_ambiguous_exit(
+    conn: &Connection,
+    task_prefix: Option<&str>,
+    was_stopped: bool,
+    exit_code: &mut i32,
+    exit_reason: &mut String,
+    final_run_status: &mut RunStatus,
+) {
+    // Operator `.stop` halt is a clean exit even with work left.
+    if was_stopped {
+        return;
+    }
+    // Never downgrade an authoritative nonzero code (blocked / overflow / signal).
+    if *exit_code != 0 {
+        return;
+    }
+
+    let is_max_iter = exit_reason == "max iterations reached";
+    let is_deadline = exit_reason == "deadline reached";
+    if !is_max_iter && !is_deadline {
+        return;
+    }
+
+    let remaining = count_remaining_active_tasks(conn, task_prefix);
+    if remaining > 0 {
+        *exit_code = 1;
+        *exit_reason = format!("{exit_reason} with {remaining} task(s) remaining");
+        *final_run_status = RunStatus::Aborted;
+    } else if is_max_iter {
+        // Drained on the ceiling: the loop did finish; report it honestly.
+        *exit_reason = "all tasks complete".to_string();
+        *final_run_status = RunStatus::Completed;
+    }
+    // Deadline + drained: leave "deadline reached" / exit 0 — symmetric upgrade
+    // to "all tasks complete" is optional polish, intentionally not done here.
+}
+
 /// Sleep between waves so the loop respects `--iteration-delay` the same
 /// way it does between sequential iterations. Polls the signal flag every
 /// 200ms so SIGINT/SIGTERM short-circuits the delay; returns true if the
@@ -1972,6 +2044,129 @@ mod tests {
         assert_eq!(ctx.stale_tracker.count(), 0);
     }
 
+    // ---------------------------------------------------------------
+    // reconcile_ambiguous_exit (Layer 1: honest budget/deadline exit)
+    // ---------------------------------------------------------------
+
+    /// Iteration ceiling hit with a `todo` task still in flight → the ambiguous
+    /// exit 0 must upgrade to exit 1 with a reason naming the remaining count,
+    /// so `batch run --chain` stops instead of advancing.
+    #[test]
+    fn reconcile_ambiguous_exit_max_iter_with_todo_sets_exit_1() {
+        let (_temp, conn) = setup_test_db();
+        insert_task(&conn, "FEAT-A", "Still pending", "todo", 10);
+        let mut exit_code = 0;
+        let mut exit_reason = "max iterations reached".to_string();
+        let mut run_status = RunStatus::Aborted;
+        reconcile_ambiguous_exit(
+            &conn,
+            None,
+            false,
+            &mut exit_code,
+            &mut exit_reason,
+            &mut run_status,
+        );
+        assert_eq!(exit_code, 1);
+        assert!(
+            exit_reason.contains("task(s) remaining"),
+            "got: {exit_reason}"
+        );
+        assert!(matches!(run_status, RunStatus::Aborted));
+    }
+
+    /// Iteration ceiling hit but every task is terminal (done/irrelevant/
+    /// skipped/blocked) → exit stays 0 and the reason is relabeled to a clean
+    /// "all tasks complete" with `RunStatus::Completed`.
+    #[test]
+    fn reconcile_ambiguous_exit_max_iter_drained_sets_complete() {
+        let (_temp, conn) = setup_test_db();
+        insert_task(&conn, "FEAT-A", "Done", "done", 10);
+        insert_task(&conn, "FEAT-B", "Irrelevant", "irrelevant", 20);
+        insert_task(&conn, "FEAT-C", "Skipped", "skipped", 30);
+        insert_task(&conn, "FEAT-D", "Blocked", "blocked", 40);
+        let mut exit_code = 0;
+        let mut exit_reason = "max iterations reached".to_string();
+        let mut run_status = RunStatus::Aborted;
+        reconcile_ambiguous_exit(
+            &conn,
+            None,
+            false,
+            &mut exit_code,
+            &mut exit_reason,
+            &mut run_status,
+        );
+        assert_eq!(exit_code, 0);
+        assert_eq!(exit_reason, "all tasks complete");
+        assert!(matches!(run_status, RunStatus::Completed));
+    }
+
+    /// An operator `.stop` halt (`was_stopped = true`) is a clean exit even with
+    /// `todo` work remaining — exit code and reason must be left untouched.
+    #[test]
+    fn reconcile_ambiguous_exit_was_stopped_unchanged() {
+        let (_temp, conn) = setup_test_db();
+        insert_task(&conn, "FEAT-A", "Still pending", "todo", 10);
+        let mut exit_code = 0;
+        let mut exit_reason = "max iterations reached".to_string();
+        let mut run_status = RunStatus::Aborted;
+        reconcile_ambiguous_exit(
+            &conn,
+            None,
+            true,
+            &mut exit_code,
+            &mut exit_reason,
+            &mut run_status,
+        );
+        assert_eq!(exit_code, 0);
+        assert_eq!(exit_reason, "max iterations reached");
+    }
+
+    /// Deadline reached with a `todo` task remaining → exit upgrades to 1,
+    /// symmetric with the max-iterations case.
+    #[test]
+    fn reconcile_ambiguous_exit_deadline_with_remaining() {
+        let (_temp, conn) = setup_test_db();
+        insert_task(&conn, "FEAT-A", "Still pending", "todo", 10);
+        let mut exit_code = 0;
+        let mut exit_reason = "deadline reached".to_string();
+        let mut run_status = RunStatus::Aborted;
+        reconcile_ambiguous_exit(
+            &conn,
+            None,
+            false,
+            &mut exit_code,
+            &mut exit_reason,
+            &mut run_status,
+        );
+        assert_eq!(exit_code, 1);
+        assert!(
+            exit_reason.contains("task(s) remaining"),
+            "got: {exit_reason}"
+        );
+        assert!(matches!(run_status, RunStatus::Aborted));
+    }
+
+    /// Defensive: an already-nonzero exit (e.g. 2 = blocked) must never be
+    /// downgraded, even with a recognized reason and remaining work.
+    #[test]
+    fn reconcile_ambiguous_exit_does_not_downgrade_nonzero() {
+        let (_temp, conn) = setup_test_db();
+        insert_task(&conn, "FEAT-A", "Still pending", "todo", 10);
+        let mut exit_code = 2;
+        let mut exit_reason = "blocked".to_string();
+        let mut run_status = RunStatus::Aborted;
+        reconcile_ambiguous_exit(
+            &conn,
+            None,
+            false,
+            &mut exit_code,
+            &mut exit_reason,
+            &mut run_status,
+        );
+        assert_eq!(exit_code, 2);
+        assert_eq!(exit_reason, "blocked");
+    }
+
     /// Regression: a wave that selects nothing because a prior wave left a
     /// task stranded in `in_progress` (merge-back / completion-detection
     /// gap) must auto-recover it to `todo` and retry next wave WITHOUT
@@ -2256,9 +2451,17 @@ mod tests {
                 let mut f = std::fs::File::create(&path).unwrap();
                 writeln!(f, "#!/bin/sh").unwrap();
                 writeln!(f, r#"PROMPT=$(cat)"#).unwrap();
+                // Prefer the `## Current Task` JSON block (slot prompts emit
+                // this section first, but learnings / extraction prompts may
+                // carry other quoted `"id"` fields earlier in the byte stream).
                 writeln!(
                     f,
-                    r#"TASK_ID=$(printf '%s' "$PROMPT" | sed -n 's/.*"id": *"\([^"]*\)".*/\1/p' | head -n 1)"#
+                    r#"TASK_ID=$(printf '%s' "$PROMPT" | sed -n '/^## Current Task$/,/^```$/p' | sed -n 's/^[[:space:]]*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"#
+                )
+                .unwrap();
+                writeln!(
+                    f,
+                    r#"[ -z "$TASK_ID" ] && TASK_ID=$(printf '%s' "$PROMPT" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"#
                 )
                 .unwrap();
                 writeln!(
@@ -2274,6 +2477,34 @@ mod tests {
             }
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
             path
+        }
+
+        /// Hermetic env guards shared by every comprehensive wave test.
+        ///
+        /// - `TASK_MGR_NO_EXTRACT_LEARNINGS=1` keeps post-slot auxiliary LLM
+        ///   spawns from competing for `CLAUDE_BINARY` (post-FEAT-002).
+        /// - `MOCK_CRASH_TASKS` is restored on drop so mixed-crash tests cannot
+        ///   leak into siblings in the same binary.
+        struct ComprehensiveWaveEnv {
+            _no_extract: EnvGuard,
+            _bin: EnvGuard,
+            _crash: EnvGuard,
+        }
+
+        impl ComprehensiveWaveEnv {
+            fn new(script: &std::path::Path, mock_crash_tasks: Option<&str>) -> Self {
+                let _no_extract = EnvGuard::set("TASK_MGR_NO_EXTRACT_LEARNINGS", "1");
+                let _bin = EnvGuard::set("CLAUDE_BINARY", script.to_str().unwrap());
+                let _crash = match mock_crash_tasks {
+                    Some(tasks) => EnvGuard::set("MOCK_CRASH_TASKS", tasks),
+                    None => EnvGuard::remove("MOCK_CRASH_TASKS"),
+                };
+                Self {
+                    _no_extract,
+                    _bin,
+                    _crash,
+                }
+            }
         }
 
         /// Fetch a task's status, panicking if the row is missing.
@@ -2358,8 +2589,7 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             let script = make_mock_script("two_complete");
-            let _guard = EnvGuard::set("CLAUDE_BINARY", script.to_str().unwrap());
-            let _crash_guard = EnvGuard::remove("MOCK_CRASH_TASKS");
+            let _env = ComprehensiveWaveEnv::new(&script, None);
 
             let (temp, mut conn) = setup_test_db();
             let run_id = "run-wave-complete";
@@ -2435,8 +2665,7 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             let script = make_mock_script("monitor_per_slot");
-            let _guard = EnvGuard::set("CLAUDE_BINARY", script.to_str().unwrap());
-            let _crash_guard = EnvGuard::remove("MOCK_CRASH_TASKS");
+            let _env = ComprehensiveWaveEnv::new(&script, None);
 
             let (temp, mut conn) = setup_test_db();
             let run_id = "run-wave-monitor-per-slot";
@@ -2508,6 +2737,7 @@ mod tests {
             // Point the binary at a path that would crash if spawned, so a
             // regression that skips the signal check would surface as a
             // non-Empty outcome instead of a silent pass.
+            let _no_extract = EnvGuard::set("TASK_MGR_NO_EXTRACT_LEARNINGS", "1");
             let _guard = EnvGuard::set("CLAUDE_BINARY", "/nonexistent_binary_for_signal_test");
 
             let (temp, mut conn) = setup_test_db();
@@ -2554,8 +2784,7 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             let script = make_mock_script("mixed_crash");
-            let _bin_guard = EnvGuard::set("CLAUDE_BINARY", script.to_str().unwrap());
-            let _crash_guard = EnvGuard::set("MOCK_CRASH_TASKS", "FEAT-CRASH");
+            let _env = ComprehensiveWaveEnv::new(&script, Some("FEAT-CRASH"));
 
             let (temp, mut conn) = setup_test_db();
             let run_id = "run-wave-mixed";
@@ -2599,11 +2828,21 @@ mod tests {
 
             let _ = std::fs::remove_file(&script);
 
+            // DB status is the primary contract; `tasks_completed` mirrors the
+            // aggregator and can drift if a sibling env race clobbers the mock
+            // binary mid-wave — assert row state first for a actionable message.
             assert_eq!(
-                outcome.tasks_completed, 1,
-                "the non-crashing slot must still mark its task done"
+                task_status(&conn, "FEAT-OK"),
+                "done",
+                "the non-crashing slot must mark FEAT-OK done (tasks_completed={})",
+                outcome.tasks_completed
             );
-            assert_eq!(task_status(&conn, "FEAT-OK"), "done");
+            assert_eq!(
+                outcome.tasks_completed,
+                1,
+                "the non-crashing slot must still bump tasks_completed (FEAT-OK status={})",
+                task_status(&conn, "FEAT-OK")
+            );
             assert_ne!(
                 task_status(&conn, "FEAT-CRASH"),
                 "done",
@@ -2623,8 +2862,7 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             let script = make_mock_script("parallel_one");
-            let _guard = EnvGuard::set("CLAUDE_BINARY", script.to_str().unwrap());
-            let _crash_guard = EnvGuard::remove("MOCK_CRASH_TASKS");
+            let _env = ComprehensiveWaveEnv::new(&script, None);
 
             let (temp, mut conn) = setup_test_db();
             let run_id = "run-wave-parallel-one";
@@ -2701,8 +2939,7 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             let script = make_mock_script("all_overlap");
-            let _guard = EnvGuard::set("CLAUDE_BINARY", script.to_str().unwrap());
-            let _crash_guard = EnvGuard::remove("MOCK_CRASH_TASKS");
+            let _env = ComprehensiveWaveEnv::new(&script, None);
 
             let (temp, mut conn) = setup_test_db();
             let run_id = "run-wave-overlap";
@@ -2771,9 +3008,8 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             let script = make_mock_script("all_crash");
-            let _bin_guard = EnvGuard::set("CLAUDE_BINARY", script.to_str().unwrap());
             // Both tasks crash.
-            let _crash_guard = EnvGuard::set("MOCK_CRASH_TASKS", "FEAT-X,FEAT-Y");
+            let _env = ComprehensiveWaveEnv::new(&script, Some("FEAT-X,FEAT-Y"));
 
             let (temp, mut conn) = setup_test_db();
             let run_id = "run-wave-all-crash";
@@ -2827,16 +3063,16 @@ mod tests {
         }
 
         /// AC7 — mirror: at least one slot completes, so the crash tracker
-        /// resets even if a sibling crashed. Seeds `count = 2` first so the
-        /// reset-to-zero assertion is meaningful.
+        /// resets even if a sibling crashed. Seeds `count = 1` first so the
+        /// reset-to-zero assertion is meaningful without paying the 60s
+        /// backoff that `count = 2` would trigger in `wave_preflight_check`.
         #[test]
         fn test_wave_crash_tracker_any_completed_resets() {
             let _env_lock = CLAUDE_BINARY_MUTEX
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             let script = make_mock_script("mixed_reset");
-            let _bin_guard = EnvGuard::set("CLAUDE_BINARY", script.to_str().unwrap());
-            let _crash_guard = EnvGuard::set("MOCK_CRASH_TASKS", "FEAT-CRASH");
+            let _env = ComprehensiveWaveEnv::new(&script, Some("FEAT-CRASH"));
 
             let (temp, mut conn) = setup_test_db();
             let run_id = "run-wave-mixed-reset";
@@ -2860,8 +3096,7 @@ mod tests {
 
             let mut ctx = IterationContext::new(10);
             ctx.crash_tracker.record_crash();
-            ctx.crash_tracker.record_crash();
-            assert_eq!(ctx.crash_tracker.count(), 2);
+            assert_eq!(ctx.crash_tracker.count(), 1);
 
             run_wave_iteration(
                 build_wave_params(
@@ -2902,8 +3137,7 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             let script = make_mock_script("progress_slots");
-            let _bin_guard = EnvGuard::set("CLAUDE_BINARY", script.to_str().unwrap());
-            let _crash_guard = EnvGuard::remove("MOCK_CRASH_TASKS");
+            let _env = ComprehensiveWaveEnv::new(&script, None);
 
             let (temp, mut conn) = setup_test_db();
             let run_id = "run-wave-progress";

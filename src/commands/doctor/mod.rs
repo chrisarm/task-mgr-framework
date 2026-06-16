@@ -16,6 +16,7 @@ pub mod setup_output;
 #[cfg(test)]
 mod tests;
 
+pub use checks::find_orphan_branch_prds;
 pub use output::{
     DoctorResult, DoctorSummary, Fix, Issue, IssueType, format_doctor_verbose, format_text,
 };
@@ -39,7 +40,10 @@ use checks::{
     find_active_runs_without_end, find_git_reconciliation_tasks, find_orphaned_relationships,
     find_stale_in_progress_tasks, has_active_loop_lock,
 };
-use fixes::{fix_active_run, fix_git_reconciliation, fix_orphaned_relationship, fix_stale_task};
+use fixes::{
+    fix_active_run, fix_git_reconciliation, fix_orphan_branch_prd_remediation,
+    fix_orphaned_relationship, fix_stale_task,
+};
 
 /// Check database health and optionally fix issues.
 ///
@@ -112,6 +116,22 @@ pub fn doctor(
             description: format!(
                 "Relationship from '{}' references non-existent task '{}'",
                 task_id, related_id
+            ),
+        });
+    }
+
+    // Check for active PRDs whose branch is absent from local and remote refs.
+    let orphan_branch_prds = checks::find_orphan_branch_prds(conn, dir)?;
+    for (prefix, project, branch) in &orphan_branch_prds {
+        issues.push(Issue {
+            issue_type: IssueType::OrphanBranchPrd,
+            entity_id: prefix.clone(),
+            description: format!(
+                "PRD '{}' (prefix: {}, branch: {}) references a branch that doesn't exist locally or on any remote — likely test pollution or a stale PRD\n    Fix: {}",
+                project,
+                prefix,
+                branch,
+                fix_orphan_branch_prd_remediation(branch)
             ),
         });
     }
@@ -209,6 +229,15 @@ pub fn doctor(
             }
         }
 
+        // Orphan branch PRDs are print-only: never archive from doctor --fix.
+        for (prefix, _project, branch) in &orphan_branch_prds {
+            would_fix.push(Fix {
+                issue_type: IssueType::OrphanBranchPrd,
+                entity_id: prefix.clone(),
+                action: fix_orphan_branch_prd_remediation(branch),
+            });
+        }
+
         // Fix git reconciliation tasks -> mark as done
         for (task_id, _title, commit_msg) in &reconciliation_tasks {
             let fix = Fix {
@@ -229,6 +258,7 @@ pub fn doctor(
         stale_tasks: stale_tasks.len(),
         active_runs: active_runs.len(),
         orphaned_relationships: orphaned.len(),
+        orphan_branch_prds: orphan_branch_prds.len(),
         decay_warnings: decay_warnings_list.len(),
         reconciled: reconciliation_tasks.len(),
         total_issues: issues.len(),
@@ -279,7 +309,7 @@ fn audit_setup_with_claude_dir(
     claude_dir: &Path,
     auto_fix: bool,
 ) -> SetupAuditResult {
-    use setup_checks::{EXPECTED_SKILLS, default_registry};
+    use setup_checks::default_registry;
     use setup_fixes::{
         detect_additional_tools, fix_generate_claude_md, fix_generate_project_config,
         fix_install_skills, fix_patch_hook,

@@ -78,6 +78,11 @@ pub fn fix_git_reconciliation(
     Ok(())
 }
 
+/// Return the explicit command an operator can run to archive an orphan branch PRD.
+pub fn fix_orphan_branch_prd_remediation(branch: &str) -> String {
+    format!("task-mgr archive --branch {branch}")
+}
+
 /// Fix an orphaned relationship by deleting it.
 pub fn fix_orphaned_relationship(
     conn: &Connection,

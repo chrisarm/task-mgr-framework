@@ -153,10 +153,16 @@ fn stage_global_skills(force_skills: bool) {
         parts.push(format!("{refreshed} refreshed"));
     }
     if !outcome.skipped_modified.is_empty() {
-        parts.push(format!("{} skipped (local edits)", outcome.skipped_modified.len()));
+        parts.push(format!(
+            "{} skipped (local edits)",
+            outcome.skipped_modified.len()
+        ));
     }
     if !outcome.skipped_symlink.is_empty() {
-        parts.push(format!("{} skipped (symlink)", outcome.skipped_symlink.len()));
+        parts.push(format!(
+            "{} skipped (symlink)",
+            outcome.skipped_symlink.len()
+        ));
     }
     if !parts.is_empty() {
         ui::emit(&format!(
@@ -1664,8 +1670,13 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
             task_id,
             run_id,
         } => {
+            use task_mgr::loop_engine::model::resolve_models_config;
+            use task_mgr::loop_engine::project_config::read_project_config;
+
             let _lock = LockGuard::acquire(&cli.dir)?;
             let conn = open_connection(&cli.dir)?;
+            let proj_config = read_project_config(&cli.dir);
+            let resolved_models = resolve_models_config(&proj_config.models, &proj_config.routing);
 
             let output = std::fs::read_to_string(&from_output).map_err(|e| {
                 TaskMgrError::io_error(from_output.display().to_string(), "reading output file", e)
@@ -1678,6 +1689,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                 run_id.as_deref(),
                 Some(&cli.dir),
                 None, // CLI invocation — no shared signal flag; Ctrl-C kills this process directly
+                &resolved_models,
             )?;
 
             if result.learnings_extracted > 0 {

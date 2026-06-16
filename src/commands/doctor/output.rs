@@ -19,6 +19,8 @@ pub enum IssueType {
     ActiveRunWithoutEnd,
     /// Relationship references a non-existent task
     OrphanedRelationship,
+    /// PRD references a branch that no longer exists locally or on a remote
+    OrphanBranchPrd,
     /// Task approaching automatic decay (warning, not an error)
     DecayWarning,
     /// Task completed in git history but not marked done in DB
@@ -31,6 +33,7 @@ impl std::fmt::Display for IssueType {
             IssueType::StaleInProgressTask => write!(f, "stale_in_progress_task"),
             IssueType::ActiveRunWithoutEnd => write!(f, "active_run_without_end"),
             IssueType::OrphanedRelationship => write!(f, "orphaned_relationship"),
+            IssueType::OrphanBranchPrd => write!(f, "orphan_branch_prd"),
             IssueType::DecayWarning => write!(f, "decay_warning"),
             IssueType::GitReconciliation => write!(f, "git_reconciliation"),
         }
@@ -86,6 +89,8 @@ pub struct DoctorSummary {
     pub active_runs: usize,
     /// Number of orphaned relationships found
     pub orphaned_relationships: usize,
+    /// Number of active PRDs whose branch no longer exists
+    pub orphan_branch_prds: usize,
     /// Number of tasks approaching decay (warnings only, not errors)
     pub decay_warnings: usize,
     /// Number of tasks reconciled from git history
@@ -169,6 +174,24 @@ pub fn format_doctor_verbose(result: &DoctorResult) -> String {
             .issues
             .iter()
             .filter(|i| i.issue_type == IssueType::GitReconciliation)
+        {
+            output.push_str(&format!("    - {}\n", issue.entity_id));
+        }
+    }
+
+    // Check 5: Orphan branch PRDs
+    output.push_str("\n[verbose] Check 5: Orphan branch PRDs\n");
+    output
+        .push_str("  Query: Active PRDs whose branch_name is absent from local and remote refs\n");
+    output.push_str(&format!(
+        "  Found: {} issue(s)\n",
+        result.summary.orphan_branch_prds
+    ));
+    if result.summary.orphan_branch_prds > 0 {
+        for issue in result
+            .issues
+            .iter()
+            .filter(|i| i.issue_type == IssueType::OrphanBranchPrd)
         {
             output.push_str(&format!("    - {}\n", issue.entity_id));
         }
@@ -260,6 +283,21 @@ pub fn format_text(result: &DoctorResult) -> String {
         output.push('\n');
     }
 
+    if result.summary.orphan_branch_prds > 0 {
+        output.push_str(&format!(
+            "Orphan branch PRDs ({})\n",
+            result.summary.orphan_branch_prds
+        ));
+        for issue in result
+            .issues
+            .iter()
+            .filter(|i| i.issue_type == IssueType::OrphanBranchPrd)
+        {
+            output.push_str(&format!("  - {}\n", issue.description));
+        }
+        output.push('\n');
+    }
+
     if result.summary.decay_warnings > 0 {
         output.push_str(&format!(
             "⚠ Tasks approaching decay ({}) [warning only]\n",
@@ -290,28 +328,64 @@ pub fn format_text(result: &DoctorResult) -> String {
         output.push('\n');
     }
 
-    // List would-be fixes in dry-run mode
-    if result.dry_run && !result.would_fix.is_empty() {
-        output.push_str(&format!(
-            "[DRY RUN] Would fix {} issue(s):\n",
-            result.would_fix.len()
-        ));
-        for fix in &result.would_fix {
-            output.push_str(&format!("  → {}: {}\n", fix.entity_id, fix.action));
+    // Dry-run: auto-fixable issues preview separately from print-only remediations.
+    let (dry_run_auto_fixes, dry_run_manual_fixes): (Vec<_>, Vec<_>) = if result.dry_run {
+        result
+            .would_fix
+            .iter()
+            .partition(|fix| fix.issue_type != IssueType::OrphanBranchPrd)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
+    if result.dry_run {
+        if !dry_run_auto_fixes.is_empty() {
+            output.push_str(&format!(
+                "[DRY RUN] Would fix {} issue(s):\n",
+                dry_run_auto_fixes.len()
+            ));
+            for fix in &dry_run_auto_fixes {
+                output.push_str(&format!("  → {}: {}\n", fix.entity_id, fix.action));
+            }
+            output.push('\n');
+            output.push_str("No changes were made. Run without --dry-run to apply fixes.\n");
         }
-        output.push('\n');
-        output.push_str("No changes were made. Run without --dry-run to apply fixes.\n");
-    } else if !result.fixed.is_empty() {
+        if !dry_run_manual_fixes.is_empty() {
+            output.push_str(&format!(
+                "Manual remediation required for {} issue(s):\n",
+                dry_run_manual_fixes.len()
+            ));
+            for fix in &dry_run_manual_fixes {
+                output.push_str(&format!("  → {}: {}\n", fix.entity_id, fix.action));
+            }
+            output.push('\n');
+        }
+    } else {
         // List actual fixes
-        output.push_str(&format!("Fixed {} issue(s):\n", result.summary.total_fixed));
-        for fix in &result.fixed {
-            output.push_str(&format!("  ✓ {}: {}\n", fix.entity_id, fix.action));
+        if !result.fixed.is_empty() {
+            output.push_str(&format!("Fixed {} issue(s):\n", result.summary.total_fixed));
+            for fix in &result.fixed {
+                output.push_str(&format!("  ✓ {}: {}\n", fix.entity_id, fix.action));
+            }
+            output.push('\n');
         }
-        output.push('\n');
-    } else if result.auto_fix && !result.dry_run {
-        output.push_str("No issues required fixing.\n");
-    } else if !result.dry_run {
-        output.push_str("Run with --auto-fix to automatically repair these issues.\n");
+        if !result.would_fix.is_empty() {
+            output.push_str(&format!(
+                "Manual remediation required for {} issue(s):\n",
+                result.would_fix.len()
+            ));
+            for fix in &result.would_fix {
+                output.push_str(&format!("  → {}: {}\n", fix.entity_id, fix.action));
+            }
+            output.push('\n');
+        }
+        if result.fixed.is_empty() && result.would_fix.is_empty() {
+            if result.auto_fix && !result.dry_run {
+                output.push_str("No issues required fixing.\n");
+            } else if !result.dry_run {
+                output.push_str("Run with --auto-fix to automatically repair these issues.\n");
+            }
+        }
     }
 
     output

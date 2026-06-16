@@ -28,6 +28,7 @@ use crate::error::{TaskMgrError, TaskMgrResult};
 use crate::loop_engine::claude::open_pty_for_child_output;
 use crate::loop_engine::claude::{ACTIVE_PREFIX_ENV, ClaudeStreamFormat, is_pty_read_eof};
 use crate::loop_engine::config::PermissionMode;
+use crate::loop_engine::model::{AuxiliaryLlmPlan, Provider};
 use crate::loop_engine::signals::SignalFlag;
 use crate::loop_engine::stream::{CodexStreamFormat, GrokStreamFormat, drive_stream};
 use crate::loop_engine::watchdog::{TimeoutConfig, exit_code_from_status, watchdog_loop};
@@ -247,6 +248,15 @@ pub enum RunnerKind {
     Claude,
     Grok,
     Codex,
+}
+
+/// The runner that executes `provider`.
+pub fn runner_kind_for(provider: Provider) -> RunnerKind {
+    match provider {
+        Provider::Claude => RunnerKind::Claude,
+        Provider::Grok => RunnerKind::Grok,
+        Provider::Codex => RunnerKind::Codex,
+    }
 }
 
 impl RunnerKind {
@@ -1866,6 +1876,34 @@ pub fn dispatch(
     result
 }
 
+pub(crate) fn dispatch_auxiliary(
+    plan: AuxiliaryLlmPlan<'_>,
+    prompt: &str,
+    timeout: Duration,
+    db_dir: Option<&Path>,
+    signal_flag: Option<&SignalFlag>,
+) -> TaskMgrResult<RunnerResult> {
+    // Fixed hard timeout: no monitor thread, no activity extension.
+    let no_activity = Arc::new(AtomicU64::new(0));
+    let timeout = TimeoutConfig {
+        base_timeout: timeout,
+        initial_extension: Duration::from_secs(0),
+        last_activity_epoch: no_activity,
+    };
+    dispatch(
+        runner_kind_for(plan.provider),
+        prompt,
+        &PermissionMode::text_only(),
+        RunnerOpts {
+            model: plan.model,
+            timeout: Some(timeout),
+            signal_flag,
+            db_dir,
+            ..RunnerOpts::default()
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1921,6 +1959,13 @@ mod tests {
                 "{name}.supports({cap:?}) expected {expected}",
             );
         }
+    }
+
+    #[test]
+    fn runner_kind_for_maps_each_provider() {
+        assert_eq!(runner_kind_for(Provider::Claude), RunnerKind::Claude);
+        assert_eq!(runner_kind_for(Provider::Grok), RunnerKind::Grok);
+        assert_eq!(runner_kind_for(Provider::Codex), RunnerKind::Codex);
     }
 
     /// AC#4: enforcement completeness guard. Every `RunnerCapability` variant
@@ -2146,6 +2191,29 @@ mod tests {
         path
     }
 
+    fn make_claude_argv_recorder(name: &str, marker: &str) -> std::path::PathBuf {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let path = std::env::temp_dir().join(format!("task_mgr_test_{name}_argv.sh"));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "#!/bin/sh").unwrap();
+            writeln!(f, r#": > "$TASK_MGR_CLAUDE_ARGV_OUT""#).unwrap();
+            writeln!(f, r#"for arg in "$@"; do"#).unwrap();
+            writeln!(
+                f,
+                r#"  printf '%s\n' "$arg" >> "$TASK_MGR_CLAUDE_ARGV_OUT""#
+            )
+            .unwrap();
+            writeln!(f, "done").unwrap();
+            writeln!(f, r#"PROMPT=$(cat)"#).unwrap();
+            writeln!(f, r#"echo "{marker} $PROMPT""#).unwrap();
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
     /// AC: dispatch(RunnerKind::Claude, ...) routes through to the Claude
     /// binary, and the returned RunnerResult contains the echoed marker
     /// string. Mirrors `claude::tests::spawn_claude_echo` shape.
@@ -2185,6 +2253,73 @@ mod tests {
             r.output.contains("hello-from-dispatch"),
             "expected output to contain the piped prompt, got {:?}",
             r.output,
+        );
+    }
+
+    #[test]
+    fn dispatch_auxiliary_uses_text_only_no_effort_and_plan_model() {
+        let _guard = CLAUDE_BINARY_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let marker = "AUXILIARY_DISPATCH_MARKER_2B7B285A";
+        let script = make_claude_argv_recorder("dispatch_auxiliary", marker);
+        let argv_out = std::env::temp_dir().join("task_mgr_dispatch_auxiliary_argv_out.txt");
+        unsafe {
+            std::env::set_var("CLAUDE_BINARY", script.to_str().unwrap());
+            std::env::set_var("TASK_MGR_CLAUDE_ARGV_OUT", argv_out.to_str().unwrap());
+        }
+
+        let plan = AuxiliaryLlmPlan {
+            provider: Provider::Claude,
+            model: Some(crate::loop_engine::model::SONNET_MODEL),
+        };
+        let result = dispatch_auxiliary(
+            plan,
+            "hello-from-auxiliary",
+            Duration::from_secs(300),
+            None,
+            None,
+        );
+
+        unsafe {
+            std::env::remove_var("CLAUDE_BINARY");
+            std::env::remove_var("TASK_MGR_CLAUDE_ARGV_OUT");
+        }
+        let argv = std::fs::read_to_string(&argv_out).unwrap_or_default();
+        let _ = std::fs::remove_file(&script);
+        let _ = std::fs::remove_file(&argv_out);
+
+        let r = result.expect("dispatch_auxiliary returned Err");
+        assert_eq!(r.exit_code, 0, "expected clean exit, got {r:?}");
+        assert!(
+            r.output.contains(marker),
+            "expected output to contain {marker:?}, got {:?}",
+            r.output,
+        );
+        assert!(
+            r.output.contains("hello-from-auxiliary"),
+            "expected output to contain the piped prompt, got {:?}",
+            r.output,
+        );
+
+        let argv: Vec<&str> = argv.lines().collect();
+        assert!(
+            argv.windows(2)
+                .any(|w| w == ["--permission-mode", "dontAsk"]),
+            "text_only must dispatch as scoped no-tool mode, got {argv:?}",
+        );
+        assert!(
+            argv.windows(2)
+                .any(|w| { w == ["--model", crate::loop_engine::model::SONNET_MODEL,] }),
+            "plan model must be forwarded, got {argv:?}",
+        );
+        assert!(
+            !argv.contains(&"--effort"),
+            "auxiliary dispatch must omit effort, got {argv:?}",
+        );
+        assert!(
+            !argv.contains(&"--allowedTools"),
+            "text_only auxiliary dispatch must not allow tools, got {argv:?}",
         );
     }
 

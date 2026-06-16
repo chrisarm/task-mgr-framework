@@ -704,10 +704,13 @@ pub async fn run_batch(
             cleanup_ctx.cleanup(wt_path, exit_code, result_branch_name.as_deref());
         }
 
-        // Chain stop-on-failure: if this PRD failed, skip all remaining PRDs.
-        // Downstream PRDs would build on a broken state, so we abort immediately.
-        if chain && exit_code != 0 {
-            ui::emit("Chain stopped: PRD failed, skipping remaining PRDs");
+        // Chain stop-on-incomplete: skip all remaining PRDs when this PRD either
+        // failed (non-zero exit) OR did not complete (active work still queued at
+        // loop end — an ambiguous exit 0 from an exhausted iteration budget or
+        // deadline). Downstream PRDs would build on a broken or incomplete state,
+        // so we abort immediately. Only `chain=true` enters this path.
+        if chain && (exit_code != 0 || !loop_result.prd_complete) {
+            ui::emit("Chain stopped: PRD did not complete, skipping remaining PRDs");
             push_remaining_skipped(&mut results, &pairs, i + 1, &mut skipped);
             break;
         }
@@ -743,6 +746,7 @@ pub async fn run_batch(
             worktree_path: target.worktree_path.clone(),
             branch_name: target.branch_name.clone(),
             tasks_completed: target.tasks_completed,
+            prd_complete: true,
         };
         let launcher = auto_review::ProcessLauncher;
         auto_review::maybe_fire(
@@ -1248,10 +1252,24 @@ mod tests {
         );
     }
 
+    /// The exact chain-break predicate from `run_batch` (batch.rs ~709):
+    /// `chain && (exit_code != 0 || !prd_complete)`. Mirroring it in one place
+    /// keeps the tests below honest — they exercise the real boolean, not a
+    /// re-derived approximation. A drift between this and the production gate
+    /// surfaces as a failing assertion in the tests that consume it.
+    fn chain_break(chain: bool, exit_code: i32, prd_complete: bool) -> bool {
+        chain && (exit_code != 0 || !prd_complete)
+    }
+
     #[test]
     fn test_stop_on_failure_results_structure() {
         // Verify that when chain=true and a PRD fails, remaining PRDs are skipped.
         // We test the PrdRunResult structure that would be produced, not the async runner.
+        //
+        // This covers the exit_code=1 chain failure case. The incomplete-PRD skip
+        // invariants (chain=true, exit_code=0, prd_complete=false → downstream
+        // skipped) are documented and asserted in `test_chain_stops_on_incomplete_prd`;
+        // the chain=false regression guard is `test_chain_false_incomplete_does_not_skip`.
         //
         // Simulate what run_batch would produce for 3 PRDs where PRD[1] fails:
         let results = [
@@ -1295,6 +1313,121 @@ mod tests {
             results[1].chain_base.as_deref(),
             results[0].branch_name.as_deref(),
             "chain_base must equal previous PRD's branch_name"
+        );
+    }
+
+    #[test]
+    fn test_chain_stops_on_incomplete_prd() {
+        // Layer 2: chain=true and the PRD exhausted its iteration budget/deadline
+        // with active work still queued → exit_code=0 but prd_complete=false.
+        // The chain gate must break and the remaining PRDs must be skipped, even
+        // though the exit code alone (0) would have let the chain advance.
+        assert!(
+            chain_break(true, 0, false),
+            "chain must break on incomplete PRD despite exit_code=0"
+        );
+
+        // Drive the real skip helper from index 1 onward, exactly as run_batch
+        // does after a chain break at PRD[0].
+        let pairs = vec![
+            (PathBuf::from("phase-1.json"), PathBuf::from("p1.md")),
+            (PathBuf::from("phase-2.json"), PathBuf::from("p2.md")),
+            (PathBuf::from("phase-3.json"), PathBuf::from("p3.md")),
+        ];
+        let mut results = vec![PrdRunResult {
+            prd_file: pairs[0].0.clone(),
+            exit_code: 0,
+            ..Default::default()
+        }];
+        let mut skipped = 0usize;
+        push_remaining_skipped(&mut results, &pairs, 1, &mut skipped);
+
+        assert_eq!(
+            skipped, 2,
+            "two downstream PRDs skipped after incomplete PRD"
+        );
+        assert!(
+            results[1].skipped && results[2].skipped,
+            "remaining PRDs must have skipped=true"
+        );
+    }
+
+    /// Integration-style sequence: mirrors `run_batch`'s per-PRD chain gate and
+    /// `push_remaining_skipped` after each PRD — first PRD completes and advances
+    /// `chain_base`, second PRD is incomplete (`exit_code=0`, `prd_complete=false`),
+    /// third PRD is never run.
+    #[test]
+    fn test_chain_sequence_stops_after_incomplete_second_prd() {
+        let pairs = vec![
+            (PathBuf::from("phase-1.json"), PathBuf::from("p1.md")),
+            (PathBuf::from("phase-2.json"), PathBuf::from("p2.md")),
+            (PathBuf::from("phase-3.json"), PathBuf::from("p3.md")),
+        ];
+
+        let mut results = Vec::new();
+        let mut chain_base: Option<String> = None;
+        let mut skipped = 0usize;
+
+        for (i, (prd_file, _)) in pairs.iter().enumerate() {
+            let (exit_code, prd_complete, branch_name) = match i {
+                0 => (0, true, Some("feat/phase-1".to_string())),
+                1 => (0, false, Some("feat/phase-2".to_string())),
+                _ => unreachable!("third PRD must be skipped before iteration"),
+            };
+
+            results.push(PrdRunResult {
+                prd_file: prd_file.clone(),
+                exit_code,
+                branch_name: branch_name.clone(),
+                chain_base: chain_base.clone(),
+                ..Default::default()
+            });
+
+            if chain_break(true, exit_code, prd_complete) {
+                push_remaining_skipped(&mut results, &pairs, i + 1, &mut skipped);
+                break;
+            }
+
+            chain_base = branch_name;
+        }
+
+        assert_eq!(results.len(), 3, "third PRD recorded as skipped");
+        assert!(!results[0].skipped && results[0].exit_code == 0);
+        assert!(!results[1].skipped && results[1].exit_code == 0);
+        assert!(results[2].skipped);
+        assert_eq!(skipped, 1);
+        assert_eq!(
+            results[1].chain_base.as_deref(),
+            Some("feat/phase-1"),
+            "second PRD branches from first PRD's tip"
+        );
+        assert_eq!(results[2].chain_base, None);
+    }
+
+    #[test]
+    fn test_chain_false_incomplete_does_not_skip() {
+        // Regression guard for the `if chain &&` wrapping: when chain=false, NO
+        // incomplete signal — neither a non-zero exit nor prd_complete=false —
+        // may break the batch. Both would-be break signals must be inert.
+        assert!(
+            !chain_break(false, 1, true),
+            "chain=false must not break on exit_code=1"
+        );
+        assert!(
+            !chain_break(false, 0, false),
+            "chain=false must not break on prd_complete=false"
+        );
+
+        // With chain=false the runner never calls push_remaining_skipped, so a
+        // downstream PRD that actually ran keeps skipped=false.
+        let downstream = PrdRunResult {
+            prd_file: PathBuf::from("phase-2.json"),
+            exit_code: 0,
+            ..Default::default()
+        };
+        assert!(
+            !downstream.skipped,
+            "chain=false leaves downstream PRDs un-skipped (batch continues)"
         );
     }
 

@@ -1,0 +1,307 @@
+{
+  "branchName": "feat/cost-efficient-auxiliary-llm",
+  "description": "Replace hardcoded Haiku + Claude-only spawns in loop learning extraction and milestone progress summarization with the operator's primary-provider cost-efficient tier from ResolvedModelsConfig, dispatched via runner::dispatch.",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "Rust: No warnings in `cargo check` output",
+      "Rust: No warnings in `cargo clippy -- -D warnings` output",
+      "Rust: Scoped tests pass for touched modules",
+      "Rust: `cargo fmt --check` passes",
+      "No literal Claude model strings introduced outside model.rs",
+      "No per-task or top-level PRD `model` fields in this JSON"
+    ],
+    "description": "These criteria apply to ALL implementation tasks"
+  },
+  "priorityPhilosophy": {
+    "description": "Hierarchy of what matters most when implementing tasks",
+    "hierarchy": [
+      "1. PLAN — Anticipate edge cases before coding",
+      "2. PHASE 2 FOUNDATION — Shared resolution + dispatch helpers before wiring call sites",
+      "3. FUNCTIONING CODE — Both auxiliary paths use config; CLI and loop agree",
+      "4. CORRECTNESS — Compiles, type-checks, scoped tests pass deterministically",
+      "5. CODE QUALITY — Clean code, qualityDimensions satisfied, no warnings",
+      "6. POLISH — Docs, formatting, neutral naming"
+    ],
+    "principles": [
+      "Cost-efficient tier is intentional (Sonnet on default Claude), not cheapest-tier parity",
+      "Primary provider only — not per-iteration effective_runner",
+      "Effort omitted on auxiliary spawns (parity with today)",
+      "Best-effort auxiliary: spawn/parse failures log warnings and return empty — never crash the loop",
+      "Scoped per-iteration tests, full suite at REVIEW-001"
+    ]
+  },
+  "prohibitedOutcomes": [
+    "Hardcoding HAIKU_MODEL or any literal model string outside model.rs (tests/no_hardcoded_models.rs)",
+    "Using spawn_claude directly in auxiliary paths after this change — must go through runner::dispatch",
+    "Passing effort_for(provider, Some(\"low\")) on auxiliary spawns — effort must stay None",
+    "Using effective_runner or per-iteration model for auxiliary resolution — primary_provider only",
+    "Breaking ExtractionResult shape or best-effort empty-return contract on extraction failures",
+    "Tests that spawn a real LLM subprocess during unit tests — use pure plan-resolution tests instead"
+  ],
+  "project": "task-mgr",
+  "requires": [],
+  "taskPrefix": "d11f4aa9",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "Positive: cost_efficient_auxiliary_plan(builtin_resolved_models()) returns provider Claude and model Some(SONNET_MODEL)",
+        "Positive: runner_kind_for(Provider::Grok) == RunnerKind::Grok (and Claude/Codex likewise)",
+        "Positive: dispatch_auxiliary uses runner::dispatch with effort: None and PermissionMode::text_only()",
+        "Negative: no HAIKU_MODEL usage in cost_efficient_auxiliary_plan (cost-efficient tier, not cheapest)",
+        "Negative: no literal model strings outside model.rs in new code",
+        "Unit test: custom config with cost-efficient tier pinned to HAIKU_MODEL returns that model",
+        "Unit test: Grok-primary config with only standard rung defined clamps cost-efficient lookup to grok-build",
+        "Unit test: anchor=cost-efficient does not change cost_efficient_auxiliary_plan output (fixed tier, not anchor window)",
+        "Known-bad: using anchored_tier for auxiliary resolution fails the anchor-independence unit test",
+        "CONTRACT: AuxiliaryLlmPlan.model type is Option<&str> referencing ResolvedModelsConfig tier table — grep model_for return type in model.rs"
+      ],
+      "dependsOn": [],
+      "description": "Introduce the shared resolution and spawn machinery used by learning extraction and milestone summary.\n\nDO:\n- Add `AuxiliaryLlmPlan<'a> { provider: Provider, model: Option<&'a str> }` and `pub fn cost_efficient_auxiliary_plan(resolved: &ResolvedModelsConfig) -> AuxiliaryLlmPlan<'_>` in src/loop_engine/model.rs. Resolution: `provider = resolved.primary_provider`; `model = resolved.model_for(provider, CapabilityTier::CostEfficient)`.\n- Add `pub fn runner_kind_for(provider: Provider) -> RunnerKind` in src/loop_engine/runner.rs (Claude/Grok/Codex mapping). Optionally refactor private `runner_of_provider` in src/loop_engine/reactions/post_output.rs to call it.\n- Add `pub(crate) fn dispatch_auxiliary(plan: AuxiliaryLlmPlan<'_>, prompt: &str, timeout: Duration, db_dir: Option<&Path>, signal_flag: Option<&SignalFlag>) -> TaskMgrResult<RunnerResult>` in runner.rs: `PermissionMode::text_only()`, `effort: None`, existing 5-minute hard-timeout pattern.\n- Unit tests in model.rs: default builtin Claude → SONNET_MODEL; custom cost-efficient tier override; Grok-primary sparse ladder clamp; anchor tier changes do NOT affect fixed CostEfficient lookup.\n\nDO NOT:\n- Do NOT use CapabilityTier::Cheapest — intentional upgrade from today's Haiku.\n- Do NOT add effort to RunnerOpts for auxiliary dispatch.\n- Do NOT hardcode model literals in tests — use SONNET_MODEL / HAIKU_MODEL constants from model.rs.\n\nEdge cases:\n- Sparse ladder (Grok-only standard rung): cost-efficient clamps to nearest defined rung.\n- Null tier model (Codex): model is None → dispatch without -m flag.\n- Disabled/missing provider entry: model_for returns None per existing sparse-ladder rules.\n\nKnown-bad:\n- Resolving via anchored_tier(anchor, Some(\"low\")) would vary with anchor — wrong; must use fixed CostEfficient tier lookup.",
+      "edgeCases": [
+        "Sparse provider ladder: model_for clamps to nearest defined rung",
+        "Null Codex standard model: plan.model is None",
+        "Custom cost-efficient tier override via models config"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "dispatch_auxiliary spawn fails",
+          "expectedBehavior": "Returns Err to caller; callers (wired in FEAT-002/003) treat as best-effort empty"
+        }
+      ],
+      "id": "FEAT-001",
+      "modifiesBehavior": false,
+      "notes": "Reuse: ResolvedModelsConfig::model_for, CapabilityTier::CostEfficient, runner::dispatch, TimeoutConfig pattern from ingestion/mod.rs. Learning #2975: spawn_claude is already dispatch(Claude); type aliases in claude.rs stay valid. Learning #5081: resolve_models_config is pure — callers pass already-built ResolvedModelsConfig. Learning #5120: tier lookup is config exact-match via model_for, not substring. Learning #5134: thread ResolvedModelsConfig from context objects, don't re-walk builtin in production paths.",
+      "passes": true,
+      "priority": 1,
+      "qualityDimensions": [
+        "Pure plan resolution — no I/O in cost_efficient_auxiliary_plan",
+        "Single SSoT for Provider→RunnerKind mapping",
+        "dispatch_auxiliary mirrors existing extraction timeout/signal_flag semantics",
+        "Table-driven unit tests cover default, override, sparse ladder, anchor independence"
+      ],
+      "taskType": "implementation",
+      "title": "Add cost-efficient auxiliary plan + shared dispatch helper",
+      "touchesFiles": [
+        "src/loop_engine/model.rs",
+        "src/loop_engine/runner.rs",
+        "src/loop_engine/reactions/post_output.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: iteration_pipeline passes &params.ctx.resolved_models into extract_learnings_from_output",
+        "Positive: main.rs extract-learnings loads project config and passes resolved models",
+        "Positive: ingestion/mod.rs contains no HAIKU_MODEL import or spawn_claude call",
+        "Negative: extract_learnings_from_output signature change must update ALL callers (grep-verified: iteration_pipeline.rs, main.rs only)",
+        "Negative: spawn failure still returns Ok(ExtractionResult::empty()) — loop must not abort",
+        "Negative: is_extraction_disabled() opt-out still skips spawn entirely",
+        "Known-bad: only wiring iteration_pipeline but not main.rs leaves CLI on old behavior — grep main.rs for resolved_models / resolve_models_config",
+        "Failure mode: dispatch_auxiliary times out → eprintln warning + empty ExtractionResult (existing pattern)",
+        "CONTRACT: extract_learnings_from_output takes &ResolvedModelsConfig — grep all call sites compile"
+      ],
+      "dependsOn": [
+        "FEAT-001"
+      ],
+      "description": "Route loop and CLI learning extraction through config-driven auxiliary dispatch.\n\nDO:\n- Add `resolved: &ResolvedModelsConfig` parameter to `extract_learnings_from_output` in src/learnings/ingestion/mod.rs.\n- Replace `claude::spawn_claude` + `HAIKU_MODEL` with `cost_efficient_auxiliary_plan(resolved)` + `dispatch_auxiliary`.\n- Update module docs: remove \"Same model as loop\" / Haiku comments; document primary-provider cost-efficient tier and intentional Sonnet default.\n- Add `tracing::debug!` for resolved provider + model at spawn time.\n- Thread `&params.ctx.resolved_models` from process_iteration_output in src/loop_engine/iteration_pipeline.rs (~L513).\n- In src/main.rs ExtractLearnings command: `read_project_config(&cli.dir)` → `resolve_models_config(&cfg.models, &cfg.routing)` → pass to extraction (mirror curate dedup pattern).\n- Preserve best-effort contract: spawn/timeout/parse failures → warn + ExtractionResult::empty(); TASK_MGR_NO_EXTRACT_LEARNINGS opt-out unchanged.\n\nDO NOT:\n- Do NOT change ExtractionResult shape or record_extracted_learnings behavior.\n- Do NOT use effective_runner from the iteration — primary_provider only.\n- Do NOT add effort flags.\n\nEdge cases:\n- CLI extract-learnings with no models block: builtin_resolved_models() via resolve_models_config on merged defaults.\n- Empty output: early return unchanged.\n- signal_flag None on CLI path: unchanged.\n\nKnown-bad:\n- Forgetting main.rs caller leaves CLI on hardcoded Haiku while loop uses config.",
+      "edgeCases": [
+        "CLI path: signal_flag is None",
+        "TASK_MGR_NO_EXTRACT_LEARNINGS=1 skips spawn",
+        "Empty learning_source skips before spawn"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Learning extraction spawn/parse failure",
+          "expectedBehavior": "Warn to stderr/eprintln; return Ok with zero learnings — never propagate to loop abort"
+        }
+      ],
+      "id": "FEAT-002",
+      "modifiesBehavior": true,
+      "notes": "Callers: iteration_pipeline.rs (production loop), main.rs (CLI). Learning #2111: wave + sequential both use iteration_pipeline — single wiring point. Learning #2174: LearningWriter::flush stays after recording loop. Learning #656: keep PermissionMode::text_only() (current behavior). Data contract: IterationContext.resolved_models: ResolvedModelsConfig (engine.rs) → ProcessingParams.ctx → extract_learnings_from_output(resolved: &ResolvedModelsConfig).",
+      "passes": true,
+      "priority": 2,
+      "qualityDimensions": [
+        "All production callers updated — no stale spawn_claude path",
+        "Best-effort extraction contract preserved",
+        "CLI and loop share same resolution path",
+        "Debug logging aids operator visibility without stderr contract pollution"
+      ],
+      "taskType": "implementation",
+      "title": "Wire learning extraction to cost-efficient auxiliary plan",
+      "touchesFiles": [
+        "src/learnings/ingestion/mod.rs",
+        "src/loop_engine/iteration_pipeline.rs",
+        "src/main.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: summarize_milestone accepts resolved: &ResolvedModelsConfig and passes it to try_llm_summary",
+        "Positive: engine.rs milestone hook passes ctx.resolved_models with builtin fallback",
+        "Positive: progress.rs has no HAIKU_MODEL import or spawn_claude in summary path",
+        "Negative: db_dir None still skips LLM spawn (existing test behavior)",
+        "Negative: summarize_milestone file compaction behavior unchanged — only LLM spawn path changes",
+        "Unit test: all summarize_milestone tests compile and pass with builtin_resolved_models() argument",
+        "Known-bad: hardcoding builtin in production caller only (no ctx fallback) breaks tests that pass ctx=None",
+        "Failure mode: try_llm_summary spawn failure returns None → deterministic heuristic block still written",
+        "CONTRACT: summarize_milestone signature change updates engine.rs and all progress.rs test call sites"
+      ],
+      "dependsOn": [
+        "FEAT-001"
+      ],
+      "description": "Route milestone progress summarization through the same config-driven auxiliary dispatch.\n\nDO:\n- Rename `try_haiku_summary` → `try_llm_summary`, `build_haiku_summary_prompt` → `build_summary_prompt` in src/loop_engine/progress.rs.\n- Add `resolved: &ResolvedModelsConfig` to `try_llm_summary` and `summarize_milestone`.\n- Replace Haiku spawn with cost_efficient_auxiliary_plan + dispatch_auxiliary.\n- Update summary header from `(haiku)` to neutral text (e.g. `(LLM summary)` or include resolved model id when present).\n- In src/loop_engine/engine.rs apply_status_updates milestone hook (~L1062): pass `ctx.as_ref().map(|c| &c.resolved_models).unwrap_or(model::builtin_resolved_models())` to summarize_milestone.\n- Update progress.rs unit tests to pass `builtin_resolved_models()`; db_dir: None paths unchanged (no subprocess).\n- Preserve best-effort: spawn failure → None → heuristic crash_recommendation fallback.\n\nDO NOT:\n- Do NOT change milestone compaction logic (scope_start, file rewrite) beyond the LLM section label.\n- Do NOT require subprocess in tests — db_dir None still skips LLM.\n\nEdge cases:\n- ctx is None in apply_status_updates: fallback builtin_resolved_models().\n- db_dir is None: skip LLM section (test path).\n- LLM timeout: fall back to heuristic recommendations.\n\nKnown-bad:\n- Renaming summarize_milestone without updating engine.rs caller breaks compile.",
+      "edgeCases": [
+        "ctx None in apply_status_updates",
+        "db_dir None skips LLM",
+        "LLM spawn timeout falls back to heuristic"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Milestone summary LLM spawn/timeout/nonzero exit",
+          "expectedBehavior": "tracing::warn + return None; summarize_milestone uses heuristic crash recommendations"
+        }
+      ],
+      "id": "FEAT-003",
+      "modifiesBehavior": true,
+      "notes": "Caller: engine.rs apply_status_updates only (grep summarize_milestone). Tests in progress.rs mod tests. Data contract: IterationContext.resolved_models → apply_status_updates(ctx) → summarize_milestone(resolved) → try_llm_summary → dispatch_auxiliary. Learning #5134: use ctx.resolved_models in production, builtin only as fallback.",
+      "passes": true,
+      "priority": 3,
+      "qualityDimensions": [
+        "Haiku-specific naming removed from milestone summary path",
+        "Milestone hook threads operator config from IterationContext",
+        "Best-effort LLM fallback to heuristic unchanged",
+        "Unit tests remain hermetic (db_dir None)"
+      ],
+      "taskType": "implementation",
+      "title": "Wire milestone summary to cost-efficient auxiliary plan",
+      "touchesFiles": [
+        "src/loop_engine/progress.rs",
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: src/learnings/CLAUDE.md no longer says auto-extraction uses Haiku without the cost-efficient tier context",
+        "Positive: doc mentions intentional upgrade from cheapest (Haiku) to cost-efficient tier on default config",
+        "Positive: doc notes curate paths as follow-up inconsistency",
+        "Negative: no functional code changes in this task"
+      ],
+      "dependsOn": [
+        "FEAT-002",
+        "FEAT-003"
+      ],
+      "description": "Document the intentional tier change in the learnings subsystem design notes.\n\nDO:\n- Update src/learnings/CLAUDE.md L35–36 (and any other Haiku references in that file for auto-extraction): state that loop auto-extraction uses primary-provider cost-efficient tier (Sonnet on default Claude config), previously Haiku/cheapest.\n- Note that curate dedup/enrich still use legacy haiku/dedup_model paths (follow-up).\n\nDO NOT:\n- Do NOT edit root CLAUDE.md or gen-docs output unless REVIEW-001 finds a gap.\n- Do NOT change extraction prompt wording (out of scope).\n\nEdge cases:\n- None — documentation only.",
+      "edgeCases": [],
+      "estimatedEffort": "low",
+      "failureModes": [],
+      "id": "FEAT-004",
+      "modifiesBehavior": false,
+      "notes": "Depends on FEAT-002 landing so docs match code. Out of scope: curate dedup/enrich migration, extraction.rs prompt neutral wording.",
+      "passes": true,
+      "priority": 4,
+      "qualityDimensions": [
+        "Accurate tier semantics — cost-efficient not cheapest",
+        "Follow-up scope clearly bounded"
+      ],
+      "taskType": "implementation",
+      "title": "Update learnings subsystem docs for cost-efficient extraction",
+      "touchesFiles": [
+        "src/learnings/CLAUDE.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No duplicate runner_of_provider / runner_kind_for logic left divergent",
+        "dispatch_auxiliary is shared by both auxiliary call sites",
+        "Functions under 30 lines where practical",
+        "Any issues spawn REFACTOR-FIX-xxx via task-mgr add --stdin --depended-on-by REVIEW-001"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004"
+      ],
+      "description": "Review all implementation for DRY violations, duplicate Provider→RunnerKind mapping, and auxiliary spawn consistency.\n\nDO: Check FEAT-001 helpers are the only auxiliary resolution path for extraction + milestone summary.\nDO NOT: Skip — catches drift before final review.",
+      "estimatedEffort": "high",
+      "id": "REFACTOR-001",
+      "notes": "If no issues: emit REFACTOR-001:done with one-line note.",
+      "passes": true,
+      "priority": 98,
+      "qualityDimensions": [
+        "DRY across extraction and milestone paths",
+        "Single Provider→RunnerKind SSoT"
+      ],
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Review for refactoring opportunities",
+      "touchesFiles": [
+        "src/loop_engine/model.rs",
+        "src/loop_engine/runner.rs",
+        "src/learnings/ingestion/mod.rs",
+        "src/loop_engine/progress.rs",
+        "src/loop_engine/iteration_pipeline.rs",
+        "src/loop_engine/engine.rs",
+        "src/main.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: grep shows no spawn_claude/HAIKU_MODEL in auxiliary paths (ingestion extraction, progress summary)",
+        "Positive: extract_learnings_from_output and summarize_milestone callers complete (iteration_pipeline, main, engine, progress tests)",
+        "Positive: FULL cargo fmt --check && cargo check && cargo clippy -- -D warnings && cargo test clean",
+        "Negative: No unwrap() in new production paths",
+        "Negative: No literal model strings outside model.rs",
+        "Documentation: src/learnings/CLAUDE.md reflects cost-efficient tier",
+        "Pre-existing failures fixed or spawned as FIX-xxx",
+        "If issues found: FIX-xxx via task-mgr add --stdin --depended-on-by REVIEW-001"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "REFACTOR-001",
+        "FIX-001"
+      ],
+      "description": "Review implementation for quality, wiring, and documentation. RUN THE FULL QUALITY GATE (unscoped test suite).\n\nDO: Grep-verify no HAIKU_MODEL in ingestion/mod.rs or progress.rs summary path; verify all extract_learnings_from_output and summarize_milestone callers updated; run full cargo test.\nDO NOT: Scope the test suite — trunk must be green.",
+      "estimatedEffort": "high",
+      "id": "REVIEW-001",
+      "notes": "Frontier-forced via REVIEW-001 ID. Spawn fixes atomically via task-mgr add --stdin --depended-on-by REVIEW-001.",
+      "passes": true,
+      "priority": 99,
+      "qualityDimensions": [
+        "All auxiliary paths config-driven",
+        "Full suite green including pre-existing",
+        "CLI and loop parity verified"
+      ],
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Code review + final verification",
+      "touchesFiles": [
+        "src/loop_engine/model.rs",
+        "src/loop_engine/runner.rs",
+        "src/learnings/ingestion/mod.rs",
+        "src/loop_engine/progress.rs",
+        "src/loop_engine/iteration_pipeline.rs",
+        "src/loop_engine/engine.rs",
+        "src/main.rs",
+        "src/learnings/CLAUDE.md"
+      ]
+    },
+    {
+      "estimatedEffort": "medium",
+      "id": "FIX-001",
+      "notes": "Discovered during d11f4aa9-REVIEW-001 full cargo test gate. 3989/3997 passed; failure in long-running parallel slot harness test. File untouched on feat branch (git diff BASE HEAD shows none). Spawned per AC7/8 and learning 5174/5178. Do not block REVIEW completion.",
+      "passes": true,
+      "priority": 0,
+      "title": "Investigate and stabilize pre-existing wave_scheduler comprehensive slot crash isolation test failure (test_wave_crash_in_one_slot_does_not_affect_others assertion on done count; inherited, not touched by cost-efficient-aux changes)",
+      "touchesFiles": [
+        "src/loop_engine/wave_scheduler.rs"
+      ]
+    }
+  ],
+  "version": "1.0"
+}

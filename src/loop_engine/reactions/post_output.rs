@@ -42,7 +42,7 @@ use crate::loop_engine::overflow::{
 use crate::loop_engine::project_config::ProjectConfig;
 use crate::loop_engine::prompt::PromptResult;
 use crate::loop_engine::recovery::promote_once;
-use crate::loop_engine::runner::RunnerKind;
+use crate::loop_engine::runner::{RunnerKind, runner_kind_for};
 
 /// The provider that owns `runner` (the inverse of [`provider_of_runner`]).
 /// Total: every `RunnerKind` maps to exactly one provider and back.
@@ -51,15 +51,6 @@ fn provider_of_runner(runner: RunnerKind) -> Provider {
         RunnerKind::Claude => Provider::Claude,
         RunnerKind::Grok => Provider::Grok,
         RunnerKind::Codex => Provider::Codex,
-    }
-}
-
-/// The runner that executes `provider`. Inverse of [`provider_of_runner`].
-fn runner_of_provider(provider: Provider) -> RunnerKind {
-    match provider {
-        Provider::Claude => RunnerKind::Claude,
-        Provider::Grok => RunnerKind::Grok,
-        Provider::Codex => RunnerKind::Codex,
     }
 }
 
@@ -101,7 +92,7 @@ fn select_fallback_target(
     Some((
         target_provider.as_str().to_string(),
         target_model,
-        runner_of_provider(target_provider),
+        runner_kind_for(target_provider),
     ))
 }
 

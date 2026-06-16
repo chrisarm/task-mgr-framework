@@ -959,8 +959,7 @@ mod tests {
         let manifest_path = dir.path().join(crate::skills::MANIFEST_FILE);
         let mut manifest: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
-        manifest["skills"]["tm-apply"] =
-            crate::skills::content_hash(b"old bundled content").into();
+        manifest["skills"]["tm-apply"] = crate::skills::content_hash(b"old bundled content").into();
         std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
 
         let checks = check_skills_installed(&ctx_commands(dir.path().to_path_buf()), &["tm-apply"]);
