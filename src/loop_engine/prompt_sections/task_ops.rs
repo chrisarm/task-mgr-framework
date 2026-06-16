@@ -44,6 +44,10 @@ pub(crate) fn task_ops_section() -> &'static str {
      pulling one into context can push you past the model window mid-iteration and\n\
      force a retry. Use the `task-mgr` CLI for every task operation instead:\n\
      \n\
+     - **Work selection**: the loop engine already claimed `## Current Task`.\n\
+       Work ONLY that task. NEVER run `task-mgr next --claim` or `task-mgr next`\n\
+       to pick work during loop iterations; use `task-mgr show <task-id>` for\n\
+       re-reads.\n\
      - **Mark a task's status**: emit `<task-status>TASK-ID:done</task-status>`\n\
        (statuses: `done`, `failed`, `skipped`, `irrelevant`, `blocked`). The loop\n\
        engine parses these and applies them via `task-mgr`.\n\
@@ -130,6 +134,18 @@ mod tests {
         assert!(
             section.contains("task-mgr show"),
             "section must offer the CLI alternative for looking up other tasks"
+        );
+        assert!(
+            section.contains("NEVER"),
+            "section must hard-prohibit claiming another task"
+        );
+        assert!(
+            section.contains("next --claim"),
+            "section must explicitly prohibit next --claim"
+        );
+        assert!(
+            section.contains("## Current Task"),
+            "section must point at the pinned current task"
         );
         assert!(
             section.contains("jq"),

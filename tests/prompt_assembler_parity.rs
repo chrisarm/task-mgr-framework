@@ -40,6 +40,9 @@ use task_mgr::loop_engine::prompt_sections::escalation::{
     ESCALATION_SECTION, build_escalation_section, escalation_spec,
 };
 use task_mgr::loop_engine::prompt_sections::learnings::build_learnings_section;
+use task_mgr::loop_engine::prompt_sections::pin_authority::{
+    PIN_AUTHORITY_SECTION, pin_authority_spec,
+};
 use task_mgr::loop_engine::prompt_sections::siblings::{
     SIBLINGS_SECTION, build_sibling_prd_section, siblings_spec,
 };
@@ -316,7 +319,8 @@ fn criticals_present_in_both_rosters_at_legacy_positions() {
     // siblings / escalation / reorder_instr):
     //   steering → session_guidance → reorder_hint → tool_awareness → source →
     //   dependencies → synergy → siblings → task → task_ops → learnings →
-    //   completion → escalation → reorder_instr → key_decision → base_prompt
+    //   completion → escalation → reorder_instr → key_decision → base_prompt →
+    //   pin_authority
     let seq_order = [
         "steering",
         "session_guidance",
@@ -334,6 +338,7 @@ fn criticals_present_in_both_rosters_at_legacy_positions() {
         "reorder_instr",
         "key_decision",
         "base_prompt",
+        "pin_authority",
     ];
     let seq_names: Vec<&str> = seq.iter().map(|s| s.name).collect();
     assert_eq!(seq_names, seq_order, "sequential roster display order");
@@ -341,7 +346,8 @@ fn criticals_present_in_both_rosters_at_legacy_positions() {
     // Slot display order (FEAT-005 — the slot path has no sequential-only
     // sections, so this is the complete slot prompt layout):
     //   task → task_ops → learnings → source → dependencies → steering →
-    //   session_guidance → tool_awareness → key_decision → completion → base_prompt
+    //   session_guidance → tool_awareness → key_decision → completion → base_prompt →
+    //   pin_authority
     let slot_order = [
         "task",
         "task_ops",
@@ -354,12 +360,19 @@ fn criticals_present_in_both_rosters_at_legacy_positions() {
         "key_decision",
         "completion",
         "base_prompt",
+        "pin_authority",
     ];
     let slot_names: Vec<&str> = slot.iter().map(|s| s.name).collect();
     assert_eq!(slot_names, slot_order, "slot roster display order");
 
-    // Each of the four envelope sections is a Critical spec in both rosters.
-    for name in ["task", "task_ops", "completion", "base_prompt"] {
+    // Each envelope / authority section is a Critical spec in both rosters.
+    for name in [
+        "task",
+        "task_ops",
+        "completion",
+        "base_prompt",
+        "pin_authority",
+    ] {
         assert!(
             matches!(spec_named(&seq, name).kind, SectionKind::Critical),
             "{name} must be Critical in the sequential roster"
@@ -420,6 +433,17 @@ fn sequential_critical_sections_match_legacy() {
         "guard: sequential base prompt must end with a newline, got {legacy_base:?}"
     );
     assert_eq!(render_named(&roster, "base_prompt", &ctx), legacy_base);
+
+    let legacy_pin_authority = (pin_authority_spec().render)(&ctx, pin_authority_spec().kind).text;
+    assert!(
+        legacy_pin_authority.contains("## Task selection authority")
+            && legacy_pin_authority.contains("next --claim"),
+        "guard: pin authority must render the late task-selection guard, got {legacy_pin_authority:?}"
+    );
+    assert_eq!(
+        render_named(&roster, PIN_AUTHORITY_SECTION, &ctx),
+        legacy_pin_authority
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -497,6 +521,12 @@ fn slot_critical_sections_match_legacy() {
         "guard: slot base prompt preserves the file verbatim (no newline fixup), got {legacy_base:?}"
     );
     assert_eq!(render_named(&roster, "base_prompt", &ctx), legacy_base);
+
+    assert_eq!(
+        render_named(&roster, PIN_AUTHORITY_SECTION, &ctx),
+        render_named(&sequential_roster(), PIN_AUTHORITY_SECTION, &ctx),
+        "pin_authority is shared verbatim between the two paths"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1379,6 +1409,7 @@ const SEQUENTIAL_KNOWN_SECTIONS: &[&str] = &[
     "reorder_instr",
     "key_decision",
     "base_prompt",
+    "pin_authority",
 ];
 
 /// Roster-completeness test: every name in [`SEQUENTIAL_KNOWN_SECTIONS`] must

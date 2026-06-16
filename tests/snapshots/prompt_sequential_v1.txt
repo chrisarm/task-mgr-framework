@@ -25,6 +25,10 @@ You MUST NOT read or edit `tasks/*.json` directly. The PRD task JSON is large;
 pulling one into context can push you past the model window mid-iteration and
 force a retry. Use the `task-mgr` CLI for every task operation instead:
 
+- **Work selection**: the loop engine already claimed `## Current Task`.
+Work ONLY that task. NEVER run `task-mgr next --claim` or `task-mgr next`
+to pick work during loop iterations; use `task-mgr show <task-id>` for
+re-reads.
 - **Mark a task's status**: emit `<task-status>TASK-ID:done</task-status>`
 (statuses: `done`, `failed`, `skipped`, `irrelevant`, `blocked`). The loop
 engine parses these and applies them via `task-mgr`.
@@ -101,3 +105,13 @@ Only emit this for genuine architectural forks. Skip trivial implementation deta
 # Agent Instructions
 
 Implement the task.
+## Task selection authority
+
+The loop engine has already selected and claimed the task in `## Current Task`.
+During loop iterations, NEVER run `task-mgr next --claim` and do not run
+`task-mgr next` to pick work. Work only the pinned current task.
+
+To influence the NEXT iteration, emit `<reorder>TASK-ID</reorder>`; the engine
+will claim that task on the next iteration. For re-reading task details, use
+`task-mgr show <task-id>`.
+

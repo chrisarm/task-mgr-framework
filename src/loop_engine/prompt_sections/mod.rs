@@ -7,6 +7,7 @@
 pub mod dependencies;
 pub mod escalation;
 pub mod learnings;
+pub mod pin_authority;
 pub mod siblings;
 pub mod synergy;
 pub mod task_ops;

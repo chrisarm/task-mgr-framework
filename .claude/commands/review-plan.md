@@ -1,5 +1,7 @@
 # /review-plan
 
+> **Canonical reference:** `~/.claude/docs/task-mgr-best-practices.md` — what to run after the plan is approved (`/spike`, `/plan-tasks` or `/tasks`, then `task-mgr loop init` + `loop run`).
+
 When this command is invoked with a task description:
 
 1. Enter plan mode and draft an implementation plan

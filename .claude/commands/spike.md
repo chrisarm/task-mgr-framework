@@ -21,6 +21,8 @@ user_invocable: true
 
 ## Core Philosophy (Read This Every Time)
 
+> **Canonical reference:** `~/.claude/docs/task-mgr-best-practices.md` — where this spike fits in the planning flow and how to wire `CONTRACT-xxx` / spawn-fixup tasks afterward.
+
 > **CRITICAL — Spike output must be actionable and cheap to produce.**
 >
 > 1. **One hypothesis, one cheapest falsifier** — Name the riskiest assumption and the smallest experiment that could kill it (ideally < 2 hours of wall time).

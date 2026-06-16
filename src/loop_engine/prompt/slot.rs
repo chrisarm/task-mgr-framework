@@ -30,6 +30,7 @@ use crate::loop_engine::prompt::assembler::{
 };
 use crate::loop_engine::prompt::core;
 use crate::loop_engine::prompt_sections::dependencies::dependencies_spec;
+use crate::loop_engine::prompt_sections::pin_authority::pin_authority_spec;
 use crate::loop_engine::prompt_sections::task_ops::task_ops_spec;
 use crate::loop_engine::prompt_sections::truncate_to_budget;
 use crate::models::Task;
@@ -79,6 +80,7 @@ pub fn slot_roster() -> Vec<SectionSpec> {
             kind: SectionKind::Critical,
             render: render_base_prompt_section,
         },
+        pin_authority_spec(),
     ]
 }
 
@@ -444,6 +446,7 @@ pub fn build_prompt(
     let task_ops = critical_assembled.section_text("task_ops");
     let completion_section = critical_assembled.section_text("completion");
     let base_prompt = critical_assembled.section_text("base_prompt");
+    let pin_authority = critical_assembled.section_text("pin_authority");
 
     // ============================================================
     // Phase 2: trimmable sections — fit into the remaining budget.
@@ -538,7 +541,7 @@ pub fn build_prompt(
     // Display order matches sequential.rs: steering → guidance precede
     // tool_awareness so project-wide guidance lands before per-task content.
     let prompt = format!(
-        "{task_section}{task_ops}{learnings_section}{source_section}{dep_section}{steering_section}{guidance_section}{tool_section}{key_decisions_section}{completion_section}{base_prompt}"
+        "{task_section}{task_ops}{learnings_section}{source_section}{dep_section}{steering_section}{guidance_section}{tool_section}{key_decisions_section}{completion_section}{base_prompt}{pin_authority}"
     );
 
     let section_sizes: Vec<(&'static str, usize)> = vec![
@@ -553,6 +556,7 @@ pub fn build_prompt(
         ("key_decision", key_decisions_section.len()),
         ("completion", completion_section.len()),
         ("base_prompt", base_prompt.len()),
+        ("pin_authority", pin_authority.len()),
     ];
 
     SlotPromptBundle {
@@ -566,5 +570,26 @@ pub fn build_prompt(
         cluster_effort,
         section_sizes,
         dropped_sections,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_slot_roster_places_pin_authority_after_base_prompt() {
+        let roster = slot_roster();
+        let base_idx = roster
+            .iter()
+            .position(|spec| spec.name == "base_prompt")
+            .expect("base_prompt in roster");
+        let pin_idx = roster
+            .iter()
+            .position(|spec| spec.name == "pin_authority")
+            .expect("pin_authority in roster");
+
+        assert_eq!(pin_idx, base_idx + 1);
+        assert!(matches!(roster[pin_idx].kind, SectionKind::Critical));
     }
 }

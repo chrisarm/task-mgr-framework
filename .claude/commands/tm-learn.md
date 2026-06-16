@@ -11,6 +11,8 @@ Record a learning to task-mgr's institutional memory so future iterations benefi
 
 ## Instructions
 
+> **See also:** `~/.claude/docs/task-mgr-best-practices.md` § Learnings & recall.
+
 Help the user record a learning via `task-mgr learn`. Determine the right parameters by analyzing context.
 
 ### Step 1: Determine Outcome Type

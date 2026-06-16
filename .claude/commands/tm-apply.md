@@ -11,6 +11,8 @@ Mark a learning as applied (useful) so the UCB bandit ranking algorithm promotes
 
 ## Instructions
 
+> **See also:** `~/.claude/docs/task-mgr-best-practices.md` § Learnings & recall.
+
 ### If ID Provided
 
 Run the apply command directly:

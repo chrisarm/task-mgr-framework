@@ -11,6 +11,8 @@ Generate a task list and prompt directly from a plan or description, skipping th
 
 ## Instructions
 
+> **Canonical reference:** `~/.claude/docs/task-mgr-best-practices.md` — planning flow, CLI, mid-loop JSON sync, spawn-fixup targeting, model routing (`task-mgr models route`), and gotchas. This skill adds lean task-generation steps on top of that base.
+
 You are generating a lean, executable task list for the Claude Loop agent system. This skill combines planning and task generation into one step — no intermediate PRD artifact.
 
 > **CRITICAL — These principles must be embedded in every task and the prompt file:**
@@ -222,7 +224,7 @@ Default tier matrix (from the `_DEFAULT_TIER_MODELS` tables; empty = route with 
 Codex routes are always explicit (`byIdPrefix` or `taskClasses` in `routing`); Codex is never inferred from a model string.
 <!-- MODELS:END -->
 
-**Model selection is config-driven at runtime (the `models` + `routing` config).** Do **not** put a `model` field anywhere in the generated JSON — not on any task (REVIEW-001, REFACTOR-001, spawned FIX-*/REFACTOR-FIX-* included) and **not as a top-level PRD field**. A top-level PRD `"model"` is ignored under the models config and prints a warning on every import and loop start; omit it entirely.
+**Model selection is config-driven at runtime (the `models` + `routing` config).** Do **not** put a `model` field anywhere in the generated JSON — not on any task (REVIEW-001, REFACTOR-001, spawned FIX-*/REFACTOR-FIX-* included) and **not as a top-level PRD field**. A top-level PRD `"model"` is ignored under the models config and prints a warning on every import and loop start; omit it entirely. **Do not document routing in task JSON** — operators configure prefixes with `task-mgr models route` (see **Model routing** in `~/.claude/docs/task-mgr-best-practices.md`).
 
 How the loop resolves each task's model (`resolve_execution_plan` in `src/loop_engine/model.rs`):
 
@@ -614,7 +616,7 @@ Non-negotiables: tests drive implementation; satisfy every `qualityDimensions` e
 
 ## Global Acceptance Criteria
 
-These apply to **every** implementation task — the task-level `acceptanceCriteria` returned by `task-mgr next` are layered on top. If any of these fails, the task is not done.
+These apply to **every** implementation task — the task-level `acceptanceCriteria` embedded in `## Current Task` are layered on top. If any of these fails, the task is not done.
 
 {{GLOBAL_ACCEPTANCE_CRITERIA}}
 
@@ -624,7 +626,7 @@ These apply to **every** implementation task — the task-level `acceptanceCrite
 
 ## Cross-PRD Dependencies (check before every task)
 
-This task list blocks on work in other PRD files. Before claiming any task, verify each entry below shows `passes: true` in its referenced PRD JSON (use `jq '.userStories[] | select(.id=="<id>") | .passes' tasks/<other-prd>.json`). If any is still `false`, output `<promise>BLOCKED</promise>` with the reason and stop.
+This task list blocks on work in other PRD files. Before working `## Current Task`, verify each entry below shows `passes: true` in its referenced PRD JSON (use `jq '.userStories[] | select(.id=="<id>") | .passes' tasks/<other-prd>.json`). If any is still `false`, output `<promise>BLOCKED</promise>` with the reason and stop.
 
 {{CROSS_PRD_REQUIRES}}
 
@@ -634,7 +636,7 @@ This task list blocks on work in other PRD files. Before claiming any task, veri
 
 ## Task Files + CLI (IMPORTANT — context economy)
 
-**Never read or edit `tasks/*.json` directly.** Loading the JSON wastes context and editing corrupts loop-engine state. Everything the agent needs about a task is returned by `task-mgr next`; everything global (Priority Philosophy, Prohibited Outcomes, Global Acceptance Criteria, Cross-PRD Requires, Key Learnings, CLAUDE.md Excerpts, Data Flow Contracts, Key Context) is already embedded in **this prompt file** — that is the authoritative copy. If something here looks inconsistent with the JSON, trust this file and surface the discrepancy.
+**Never read or edit `tasks/*.json` directly.** Loading the JSON wastes context and editing corrupts loop-engine state. Everything the agent needs about this iteration's task is embedded in `## Current Task`; everything global (Priority Philosophy, Prohibited Outcomes, Global Acceptance Criteria, Cross-PRD Requires, Key Learnings, CLAUDE.md Excerpts, Data Flow Contracts, Key Context) is already embedded in **this prompt file** — that is the authoritative copy. If something here looks inconsistent with the JSON, trust this file and surface the discrepancy.
 
 ### Getting your task prefix
 
@@ -650,8 +652,7 @@ Use `$PREFIX` in every CLI call below so you stay scoped to this task list.
 
 | Need                                    | Command                                                                                                                                                                           |
 | --------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Pick + claim the next eligible task     | `task-mgr next --prefix $PREFIX --claim`                                                                                                                                          |
-| Inspect one task (full acceptance etc.) | `task-mgr show $PREFIX-TASK-ID`                                                                                                                                                   |
+| Inspect this iteration's task           | `task-mgr show <TASK-ID>` using the task ID from `## Current Task`                                                                                                                 |
 | List remaining tasks (debug only)       | `task-mgr list --prefix $PREFIX --status todo`                                                                                                                                    |
 | Recall learnings relevant to a task     | `task-mgr recall --for-task $PREFIX-TASK-ID` (also: `--query <text>`, `--tag <tag>`)                                                                                              |
 | Add a follow-up task (review spawns)    | `echo '{...}' \| task-mgr add --stdin --depended-on-by REVIEW-001` — priority auto-computed; DB + PRD JSON updated atomically                                                    |
@@ -689,14 +690,9 @@ Skip the read entirely on the first iteration (file won't exist). Before appendi
 
 Optimize for context economy: pull only what's needed, don't dump whole files.
 
-1. **Resolve prefix and claim the next task**:
-   ```bash
-   PREFIX=$(jq -r '.taskPrefix' tasks/{{FEATURE_NAME}}.json)
-   task-mgr next --prefix $PREFIX --claim
-   ```
-   The output includes `id`, `title`, `description`, `acceptanceCriteria`, `qualityDimensions`, `edgeCases`, `touchesFiles`, `dependsOn`, `branchName`, and `notes` — everything you need. If it reports no eligible task or unmet cross-PRD `requires`, output `<promise>BLOCKED</promise>` with the printed reason and stop.
+1. **Work the task in `## Current Task`** — the loop engine already selected and claimed it at iteration start. Use `task-mgr show <TASK-ID>` only if you need to inspect the pinned task details again. If `## Current Task` says there is no eligible task or unmet cross-PRD `requires`, output `<promise>BLOCKED</promise>` with the printed reason and stop.
 
-2. **Pull only the progress context you need** — most iterations want just the most recent section (the `tac | awk | tac` command above). If `task-mgr next` listed a `dependsOn` task whose rationale you need, grep that specific task's block instead of reading the whole log. Skip entirely on the first iteration.
+2. **Pull only the progress context you need** — most iterations want just the most recent section (the `tac | awk | tac` command above). If `## Current Task` lists a `dependsOn` task whose rationale you need, grep that specific task's block instead of reading the whole log. Skip entirely on the first iteration.
 
 3. **Recall focused learnings** — `task-mgr recall --for-task <TASK-ID>` returns the learnings scored highest for this specific task. That's the ONLY way to reach `tasks/long-term-learnings.md` / `tasks/learnings.md` content — **do not** Read those files directly; they grow unboundedly.
 
@@ -728,7 +724,9 @@ Optimize for context economy: pull only what's needed, don't dump whole files.
 
 ## Task Selection (reference)
 
-`task-mgr next --prefix $PREFIX --claim` already picks: eligible tasks (`passes: false`, deps complete), preferring file-overlap with the previous task's `touchesFiles`, then lowest priority. You don't pick — you claim what it returns.
+The loop engine owns selection and claim at iteration start. It injects the claimed task into `## Current Task`; work only that pinned task during this iteration.
+
+To request a different pick on the **next** iteration, emit `<reorder>TASK-ID</reorder>`. The engine will claim that task on the next iteration. Never combine reorder with `next --claim`.
 
 ---
 
@@ -1046,7 +1044,8 @@ To run: task-mgr loop -y tasks/{feature}.json
 | Populating `synergyWith` / `batchWith`         | Ignored — `task-mgr next` derives synergy from `touchesFiles` | Just populate `touchesFiles` accurately; drop synergyWith       |
 | `qualityDimensions` as sub-objects             | Old schema; agent reads flat arrays now                       | One flat list of strings, not `{correctness, performance, style}` |
 | Setting any `model` (per-task or top-level PRD)   | Explicit task `model` is rung 1 and bypasses the models+routing config; a top-level PRD `model` is ignored and warns | Omit `model` everywhere; use `estimatedEffort: "high"` for gates that need a strong tier; let `task-mgr models` config drive |
-| Prompt that tells agent to Read `tasks/*.json` | Wastes context; agent can't edit JSON anyway                  | Use `task-mgr next --claim`; embed global fields in prompt      |
+| Prompt that tells agent to Read `tasks/*.json` | Wastes context; agent can't edit JSON anyway                  | Trust `## Current Task`; use `task-mgr show <TASK-ID>` only for inspection |
+| Prompt that tells loop agents to claim work    | Creates competing task selectors and double `in_progress` tasks | Trust `## Current Task`; never use `next --claim` in loop iterations; `<reorder>` affects the next iteration only |
 | Prompt without `{{PROHIBITED_OUTCOMES}}` etc.  | Agent can't see those JSON fields                             | Render all global fields as bullet lists in the prompt          |
 | No data flow contracts for cross-module data   | Silent wrong-key-type bugs                                    | Trace key types, document in prompt                             |
 | No documentation check in REVIEW               | Future sessions can't understand the system                   | REVIEW-001 checks if docs need updating                         |

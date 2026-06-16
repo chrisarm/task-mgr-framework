@@ -11,6 +11,8 @@ Convert a markdown PRD into JSON task list and prompt file for task-mgr loop exe
 
 ## Instructions
 
+> **Canonical reference:** `~/.claude/docs/task-mgr-best-practices.md` — planning flow, CLI, mid-loop JSON sync, spawn-fixup targeting, model routing (`task-mgr models route`), and gotchas. This skill adds PRD→JSON conversion steps on top of that base.
+
 You are converting a human-readable PRD into machine-executable task artifacts for the Claude Loop autonomous agent system.
 
 > **CRITICAL — Three principles must be embedded in every task and the prompt file:**
@@ -71,7 +73,7 @@ Default tier matrix (from the `_DEFAULT_TIER_MODELS` tables; empty = route with 
 Codex routes are always explicit (`byIdPrefix` or `taskClasses` in `routing`); Codex is never inferred from a model string.
 <!-- MODELS:END -->
 
-**Model selection is config-driven at runtime (see `src/loop_engine/model.rs:resolve_execution_plan`).** Do **not** put a `model` field on *any* task entry in the generated JSON (FEAT, ANALYSIS, CODE-REVIEW-*, MILESTONE-*, VERIFY, CONTRACT, REFACTOR-*, spawned FIX-*/CODE-FIX-* etc.), and do **not** set a top-level PRD `"model"` field — it is ignored under the models config and prints a warning on every import and loop start.
+**Model selection is config-driven at runtime (see `src/loop_engine/model.rs:resolve_execution_plan`).** Do **not** put a `model` field on *any* task entry in the generated JSON (FEAT, ANALYSIS, CODE-REVIEW-*, MILESTONE-*, VERIFY, CONTRACT, REFACTOR-*, spawned FIX-*/CODE-FIX-* etc.), and do **not** set a top-level PRD `"model"` field — it is ignored under the models config and prints a warning on every import and loop start. **Do not document routing in task JSON** — operators configure prefixes with `task-mgr models route` (see **Model routing** in `~/.claude/docs/task-mgr-best-practices.md`).
 
 - Task `estimatedEffort` (aka `difficulty`; canonical key `estimatedEffort`, alias `difficulty` accepted) drives the **anchor window**: `models.anchor` (default `standard`) + difficulty offset picks the capability tier (`low` → anchor−1, `medium` → anchor, `high` → anchor+1, clamped to the ladder), then the provider's tier ladder maps tier → model. With the default config, `high` resolves to the frontier model and `medium` to the standard model.
 - Operator `routing` config (`task-mgr models route <prefix>`, `routing.taskClasses`) provides forced routes at rungs 2–3, ahead of the anchor window. Review-class IDs (`CODE-REVIEW-*`, `MILESTONE-FINAL`, `REVIEW-*` after prefix strip) carry a built-in, non-redefinable force to the **frontier tier**.
@@ -490,7 +492,7 @@ Non-negotiables: tests drive implementation; satisfy every `qualityDimensions` e
 
 ## Global Acceptance Criteria
 
-These apply to **every** implementation task in this PRD — the task-level `acceptanceCriteria` returned by `task-mgr next` are layered on top. If any of these fails, the task is not done.
+These apply to **every** implementation task in this PRD — the task-level `acceptanceCriteria` embedded in `## Current Task` are layered on top. If any of these fails, the task is not done.
 
 {{GLOBAL_ACCEPTANCE_CRITERIA}}
 
@@ -500,7 +502,7 @@ These apply to **every** implementation task in this PRD — the task-level `acc
 
 ## Cross-PRD Dependencies (check before every task)
 
-This PRD blocks on work in other PRD files. Before claiming any task, verify each entry below shows `passes: true` in its referenced PRD JSON (use `jq '.userStories[] | select(.id=="<id>") | .passes' tasks/<other-prd>.json`). If any is still `false`, output `<promise>BLOCKED</promise>` with the reason and stop.
+This PRD blocks on work in other PRD files. Before working `## Current Task`, verify each entry below shows `passes: true` in its referenced PRD JSON (use `jq '.userStories[] | select(.id=="<id>") | .passes' tasks/<other-prd>.json`). If any is still `false`, output `<promise>BLOCKED</promise>` with the reason and stop.
 
 {{CROSS_PRD_REQUIRES}}
 
@@ -510,7 +512,7 @@ This PRD blocks on work in other PRD files. Before claiming any task, verify eac
 
 ## Task Files + CLI (IMPORTANT — context economy)
 
-**Never read or edit `tasks/*.json` directly.** PRDs are thousands of lines; loading one wastes a huge amount of context and editing corrupts loop-engine state. Everything the agent needs about a task is returned by `task-mgr next`; everything PRD-wide that matters for implementation (Priority Philosophy, Prohibited Outcomes, Global Acceptance Criteria, Cross-PRD Requires, Key Learnings, CLAUDE.md Excerpts, Data Flow Contracts, Key Context) is already embedded in **this prompt file** — that is the authoritative copy. If something here looks inconsistent with the JSON, trust this file and surface the discrepancy.
+**Never read or edit `tasks/*.json` directly.** PRDs are thousands of lines; loading one wastes a huge amount of context and editing corrupts loop-engine state. Everything the agent needs about this iteration's task is embedded in `## Current Task`; everything PRD-wide that matters for implementation (Priority Philosophy, Prohibited Outcomes, Global Acceptance Criteria, Cross-PRD Requires, Key Learnings, CLAUDE.md Excerpts, Data Flow Contracts, Key Context) is already embedded in **this prompt file** — that is the authoritative copy. If something here looks inconsistent with the JSON, trust this file and surface the discrepancy.
 
 ### Getting your PRD's task prefix
 
@@ -526,8 +528,7 @@ Use `$PREFIX` in every CLI call below so you stay scoped to this PRD. If a later
 
 | Need                                   | Command                                                                                                                                                                           |
 | -------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Pick + claim the next eligible task    | `task-mgr next --prefix $PREFIX --claim`                                                                                                                                          |
-| Inspect one task (full acceptance etc.) | `task-mgr show $PREFIX-TASK-ID`                                                                                                                                                   |
+| Inspect this iteration's task          | `task-mgr show <TASK-ID>` using the task ID from `## Current Task`                                                                                                                 |
 | List remaining tasks (debug only)      | `task-mgr list --prefix $PREFIX --status todo`                                                                                                                                    |
 | Recall learnings relevant to a task    | `task-mgr recall --for-task $PREFIX-TASK-ID` (also: `--query <text>`, `--tag <tag>`)                                                                                              |
 | Add a follow-up task (review spawns)   | `echo '{...}' \| task-mgr add --stdin --depended-on-by MILESTONE-N` — priority auto-computed; DB + PRD JSON updated atomically                                                   |
@@ -565,14 +566,9 @@ Skip the read entirely on the first iteration (file won't exist). Before appendi
 
 Optimize for context economy: pull only what's needed, don't dump whole files.
 
-1. **Resolve prefix and claim the next task**:
-   ```bash
-   PREFIX=$(jq -r '.taskPrefix' tasks/{{FEATURE_NAME}}.json)
-   task-mgr next --prefix $PREFIX --claim
-   ```
-   The output includes `id`, `title`, `description`, `acceptanceCriteria`, `qualityDimensions`, `edgeCases`, `touchesFiles`, `dependsOn`, `branchName`, and `notes` — everything you need for the task. If it reports no eligible task or unmet cross-PRD `requires`, output `<promise>BLOCKED</promise>` with the printed reason and stop.
+1. **Work the task in `## Current Task`** — the loop engine already selected and claimed it at iteration start. Use `task-mgr show <TASK-ID>` only if you need to inspect the pinned task details again. If `## Current Task` says there is no eligible task or unmet cross-PRD `requires`, output `<promise>BLOCKED</promise>` with the printed reason and stop.
 
-2. **Pull only the progress context you need** — most iterations want just the most recent section (the `tac | awk | tac` command above). If `task-mgr next` listed a `dependsOn` task whose rationale you need, grep that specific task's block instead of reading the whole log (`grep -n -A 40 '## .* - <THAT-TASK-ID>' tasks/progress-$PREFIX.txt`). Skip entirely on the first iteration (file won't exist).
+2. **Pull only the progress context you need** — most iterations want just the most recent section (the `tac | awk | tac` command above). If `## Current Task` lists a `dependsOn` task whose rationale you need, grep that specific task's block instead of reading the whole log (`grep -n -A 40 '## .* - <THAT-TASK-ID>' tasks/progress-$PREFIX.txt`). Skip entirely on the first iteration (file won't exist).
 
 3. **Recall focused learnings** — `task-mgr recall --for-task <TASK-ID>` returns the learnings scored highest for this specific task. That's the ONLY way to reach `tasks/long-term-learnings.md` / `tasks/learnings.md` content — **do not** Read those files directly; they grow unboundedly.
 
@@ -606,11 +602,13 @@ Optimize for context economy: pull only what's needed, don't dump whole files.
 
 ## Task Selection (reference)
 
-`task-mgr next --prefix $PREFIX --claim` already picks: eligible tasks (`passes: false`, deps complete, not `requiresHuman`), preferring file-overlap with the previous task's `touchesFiles`, then lowest priority. You don't pick — you claim what it returns.
+The loop engine owns selection and claim at iteration start. It injects the claimed task into `## Current Task`; work only that pinned task during this iteration.
+
+To request a different pick on the **next** iteration, emit `<reorder>TASK-ID</reorder>`. The engine will claim that task on the next iteration. Never combine reorder with `next --claim`.
 
 Two runtime checks you DO own:
 
-- If the returned task has `preflightChecks`, run them. If any fails: `task-mgr skip <TASK-ID> --reason "<preflight failure>"` and re-run `task-mgr next`.
+- If `## Current Task` has `preflightChecks`, run them. If any fails: emit `<task-status><TASK-ID>:skipped</task-status>` with the preflight reason and stop this iteration; the engine will pick the next task on the next iteration.
 - If the previous task had a `completionCheck`, run it before starting the new one. If it fails: `task-mgr fail <prev-task> --error "completionCheck failed"` and fix it first.
 
 ---
@@ -915,7 +913,7 @@ Every task list follows a lean phased structure. The table below is the spine fo
 
 - **ANALYSIS-xxx** (opt-in) — Only for behavior-modifying changes that span >2 top-level directories *or* when the PRD/spike author explicitly requests it (set `requiresConsumerAnalysis: true` or create the task manually). For small localized changes, document the callers directly in the FEAT task description instead.
 
-- **FEAT-xxx** — Tests for the new behavior live *inside* the same coherent change (see the lean skeleton in `plan-tasks.md`). `edgeCases`, `invariants`, and known-bad discriminators are still required on the task. Do not set `model` on the task; mark `estimatedEffort: "high"` and/or `modifiesBehavior: true` when you want a stronger tier (anchor+1 via the anchor window). The runtime `models` + `routing` config selects the actual model/runner.
+- **FEAT-xxx** — Tests for the new behavior live *inside* the same coherent change (see the lean skeleton in `plan-tasks.md`). `edgeCases`, `invariants`, and known-bad discriminators are still required on the task. Do not stamp `model` on FEAT tasks; mark `estimatedEffort: "high"` and/or `modifiesBehavior: true` when you want a stronger tier (anchor+1 via the anchor window). The runtime `models` + `routing` config selects the actual model/runner.
 
 - **Middle milestones, separate TEST-INIT, INT-xxx, and VERIFY-001 removed** — These were identified as low-ROI ceremony (see anti-pattern table in `plan-tasks.md`). The single `REVIEW-001` at the end runs the full gate and serves as the milestone. `INT-xxx` concerns are now handled inside the final review's acceptance criteria and the PRD's Boundary Contracts section. A `CONTRACT-xxx` (when present) does the deep edge-case/invariant work before any implementation begins.
 

@@ -12,6 +12,8 @@ Search task-mgr's institutional memory for learnings relevant to your current wo
 
 ## Instructions
 
+> **See also:** `~/.claude/docs/task-mgr-best-practices.md` § Learnings & recall.
+
 Help the user find relevant learnings from the task-mgr database.
 
 ### Step 1: Determine Search Strategy

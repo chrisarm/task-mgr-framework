@@ -116,6 +116,7 @@ fn snapshot_preserves_documented_section_order() {
         "## Completing This Task",
         "## Key Decision Points",
         "# Agent Instructions",
+        "## Task selection authority",
     ];
 
     let mut cursor: usize = 0;

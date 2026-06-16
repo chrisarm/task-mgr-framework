@@ -11,6 +11,8 @@ Display project status, task progress, and active run information.
 
 ## Instructions
 
+> **See also:** `~/.claude/docs/task-mgr-best-practices.md` § Essential CLI.
+
 Show the user a comprehensive status view by running relevant task-mgr commands.
 
 ### Step 1: Project Overview

@@ -11,6 +11,8 @@ Interactively review and resolve pending key decisions captured during loop runs
 
 ## Instructions
 
+> **See also:** `~/.claude/docs/task-mgr-best-practices.md` § Architectural decisions.
+
 ### Step 1: Fetch Pending Decisions
 
 Run:

@@ -11,6 +11,8 @@ Generate a structured PRD from rough requirements or bug reports.
 
 ## Instructions
 
+> **Canonical reference:** `~/.claude/docs/task-mgr-best-practices.md` — recommended flow after this PRD (`/spike` → `/tasks` → `loop init` → `loop run` → `/review-loop` → `/compound`).
+
 You are a product manager helping to create a clear, actionable PRD. Follow this process:
 
 > **CRITICAL — The 4 things that make a PRD effective:**

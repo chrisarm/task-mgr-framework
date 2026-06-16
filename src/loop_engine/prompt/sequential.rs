@@ -34,6 +34,7 @@ use crate::loop_engine::prompt_sections::escalation::escalation_spec;
 use crate::loop_engine::prompt_sections::learnings::{
     build_learnings_section, record_shown_learnings,
 };
+use crate::loop_engine::prompt_sections::pin_authority::pin_authority_spec;
 use crate::loop_engine::prompt_sections::siblings::siblings_spec;
 #[cfg(test)]
 use crate::loop_engine::prompt_sections::synergy::build_synergy_section;
@@ -100,6 +101,7 @@ pub fn sequential_roster() -> Vec<SectionSpec> {
             kind: SectionKind::Critical,
             render: render_base_prompt_section,
         },
+        pin_authority_spec(),
     ]
 }
 
@@ -531,6 +533,7 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
     let escalation_section = critical_assembled.section_text("escalation");
     let reorder_instr_section = critical_assembled.section_text("reorder_instr");
     let base_prompt_section = critical_assembled.section_text("base_prompt");
+    let pin_authority_section = critical_assembled.section_text("pin_authority");
 
     let critical_total = critical_assembled.prompt.len();
 
@@ -663,12 +666,13 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
     // ============================================================
     // Display order: steering → guidance → hint → tools → source → deps → synergy →
     //                siblings → task → task_ops → learnings → completion → escalation →
-    //                reorder instr → key_decision → base prompt
+    //                reorder instr → key_decision → base prompt → pin_authority
     let prompt = format!(
         "{steering_section}{guidance_section}{hint_section}{tool_awareness_section}\
          {source_section}{dep_section}{synergy_section}{sibling_section}\
          {task_section}{task_ops}{learnings_section}{completion_section}\
-         {escalation_section}{reorder_instr_section}{key_decision_section}{base_prompt_section}"
+         {escalation_section}{reorder_instr_section}{key_decision_section}\
+         {base_prompt_section}{pin_authority_section}"
     );
     let section_sizes: Vec<(&'static str, usize)> = vec![
         ("steering", steering_section.len()),
@@ -687,6 +691,7 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
         ("reorder_instr", reorder_instr_section.len()),
         ("key_decision", key_decision_section.len()),
         ("base_prompt", base_prompt_section.len()),
+        ("pin_authority", pin_authority_section.len()),
     ];
 
     Ok(Some(PromptResult {
@@ -3642,6 +3647,7 @@ pub enum ApiError {
             "escalation",
             "reorder_instr",
             "base_prompt",
+            "pin_authority",
         ] {
             assert!(
                 names.contains(expected),
@@ -3649,5 +3655,21 @@ pub enum ApiError {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn test_sequential_roster_places_pin_authority_after_base_prompt() {
+        let roster = sequential_roster();
+        let base_idx = roster
+            .iter()
+            .position(|spec| spec.name == "base_prompt")
+            .expect("base_prompt in roster");
+        let pin_idx = roster
+            .iter()
+            .position(|spec| spec.name == "pin_authority")
+            .expect("pin_authority in roster");
+
+        assert_eq!(pin_idx, base_idx + 1);
+        assert!(matches!(roster[pin_idx].kind, SectionKind::Critical));
     }
 }

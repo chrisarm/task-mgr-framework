@@ -17,6 +17,8 @@ The first three phases — plan, work, review — produce a feature. The compoun
 /compound tasks/prd-<feature>.md "also propose an agent for X"
 ```
 
+> **Canonical reference:** `~/.claude/docs/task-mgr-best-practices.md` — learnings/recall CLI, mid-loop JSON sync, and when **not** to edit `tasks/*.json` by hand.
+
 ## Prerequisites
 
 - The loop has finished (`MILESTONE-FINAL` passed)

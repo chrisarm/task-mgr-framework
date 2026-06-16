@@ -12,6 +12,8 @@ Show the next recommended task based on task-mgr's scoring algorithm (priority, 
 
 ## Instructions
 
+> **See also:** `~/.claude/docs/task-mgr-best-practices.md` § Essential CLI.
+
 ### Step 1: Get Recommendation
 
 ```bash

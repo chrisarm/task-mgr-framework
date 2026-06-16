@@ -11,6 +11,8 @@ Degrade a learning that turned out to be wrong or harmful via two-step degradati
 
 ## Instructions
 
+> **See also:** `~/.claude/docs/task-mgr-best-practices.md` § Learnings & recall.
+
 ### If ID Provided
 
 Run the invalidation directly:

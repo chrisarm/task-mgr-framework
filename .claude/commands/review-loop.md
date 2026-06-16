@@ -18,6 +18,8 @@ Backward-looking review of code produced by a completed autonomous loop run. Che
 /review-loop tasks/prd-<feature>.md
 ```
 
+> **Canonical reference:** `~/.claude/docs/task-mgr-best-practices.md` — worktree discipline, spawn-fixup targeting (`task-mgr add --stdin`), and post-loop `/compound` flow.
+
 ## What This Does
 
 1. Finds the loop's worktree.
