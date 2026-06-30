@@ -1,0 +1,228 @@
+{
+  "branchName": "feat/wrapper-commit-baseline-diff",
+  "description": "Fix the sequential-mode wrapper-commit so it commits only the changes an iteration produced, instead of sweeping pre-existing dirty/untracked working-tree files in with `git add -A`. Capture a pre-iteration `git status` baseline and stage only the set difference.",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "Rust: No warnings in `cargo check` output",
+      "Rust: No warnings in `cargo clippy -- -D warnings` output",
+      "Rust: Scoped tests pass with `cargo test -p task-mgr <module>` (full suite at REVIEW-001)",
+      "Rust: `cargo fmt --check` passes",
+      "No breaking changes to existing public APIs unless explicitly required (wrapper_commit is pub(crate) — its signature change is in-scope)",
+      "Status mutations (if any) go through TaskLifecycle, never raw UPDATE SQL — N/A for this change (no status writes)"
+    ],
+    "description": "These criteria apply to ALL implementation tasks"
+  },
+  "priorityPhilosophy": {
+    "description": "Hierarchy of what matters most when implementing tasks",
+    "hierarchy": [
+      "1. PLAN — Anticipate edge cases before coding",
+      "2. PHASE 2 FOUNDATION — ~1 day now to save ~2+ weeks later (1:10+ ratio); we are pre-launch, foundations compound",
+      "3. FUNCTIONING CODE — Pragmatic, reliable, wired in per plan",
+      "4. CORRECTNESS — Compiles, type-checks, scoped tests pass deterministically",
+      "5. CODE QUALITY — Clean code, qualityDimensions satisfied, no warnings",
+      "6. POLISH — Docs, formatting, minor improvements"
+    ],
+    "principles": [
+      "Quality dimensions explicit — qualityDimensions on every task tells you what 'good' looks like",
+      "Safety over convenience — when the baseline is unknown, SKIP the commit rather than risk sweeping; never fall back to `git add -A`",
+      "Edge cases = test cases — every known edge case must have a corresponding test",
+      "Scoped per-iteration tests, full suite at REVIEW-001 — REVIEW must leave the trunk green including pre-existing failures",
+      "Ship working code with tests to prove it; handle Option/Result explicitly; avoid unwrap() in production"
+    ]
+  },
+  "prohibitedOutcomes": [
+    "Any `git add -A` (or `git add .`) WITHOUT a `-- <pathspec>` scope in the wrapper-commit path — that is the exact bug being fixed",
+    "Falling back to staging everything when the baseline is None — must skip+warn instead",
+    "Tests that only assert 'no crash' or check the return type without verifying which paths were committed vs left dirty",
+    "A `-z` parser that mis-handles rename entries (off-by-one consuming the FROM field) or treats the Y status slot as a rename indicator",
+    "Committing gitignored or pre-existing-dirty files (the regression this fix exists to prevent)",
+    "Error messages that don't identify what went wrong"
+  ],
+  "project": "task-mgr",
+  "requires": [],
+  "taskPrefix": "5ea5a433",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "Positive: capture_status_paths runs `git status --porcelain -z --untracked-files=all` and returns a HashSet<String> of paths; renames contribute both TO and FROM paths.",
+        "Positive: wrapper_commit with a baseline stages exactly `current - baseline` via `git add -A -- <paths>`, then commits.",
+        "Negative: wrapper_commit must NOT invoke `git add -A` without a `-- <pathspec>` anywhere in the function.",
+        "Negative: a None baseline returns None and emits a `ui::emit` warning — must NOT stage anything.",
+        "Unit test (parser): a renamed tracked file yields BOTH old and new paths in the returned set.",
+        "Unit test (parser): an entry whose Y slot is R/C but X is not (e.g. ` R`) is NOT treated as a rename (no phantom FROM consumption); trailing empty split field is dropped.",
+        "Unit test (happy parity): clean tree at baseline, agent creates foo.rs → only foo.rs committed (matches what `git add -A` would have produced on a clean tree).",
+        "Unit test (exclusion): baseline has untracked stray.md; agent creates foo.rs → only foo.rs committed; stray.md remains on disk, untracked, after the commit.",
+        "Unit test (untracked-dir granularity): baseline has untracked data/old.md; agent creates data/new.md → data/new.md committed, data/old.md not.",
+        "Unit test (tracked exclusion): baseline has modified tracked a.txt; agent modifies b.txt → only b.txt committed; a.txt change still uncommitted.",
+        "Unit test (deletion): agent deletes a tracked file → the commit contains its removal.",
+        "Unit test (nothing-new): agent touches only a baseline-dirty path → wrapper_commit returns None, no commit created.",
+        "Unit test (None baseline): wrapper_commit(.., None) returns None, creates no commit, sweeps nothing.",
+        "CONTRACT: the call site in src/loop_engine/reactions/post_completion.rs (the `for id in completed_ids` loop) compiles against the new 4-arg signature (updated in FEAT-002)."
+      ],
+      "dependsOn": [],
+      "description": "Rewrite the sequential wrapper-commit staging in src/loop_engine/git_reconcile.rs so it commits only paths the iteration produced.\n\nDO:\n- Add `pub(crate) fn capture_status_paths(working_root: &Path) -> Option<HashSet<String>>` that runs `git status --porcelain -z --untracked-files=all` and parses the NUL-separated entries into a set of paths. Each entry is `XY<sp><path>`; for a rename/copy entry the form is `XY<sp>TO\\0FROM\\0` — insert BOTH the new (TO) and old (FROM) paths. Return None ONLY if the git invocation itself fails.\n- Change `wrapper_commit` signature to `wrapper_commit(working_root: &Path, task_id: &str, message_suffix: &str, baseline: Option<&HashSet<String>>) -> Option<String>`.\n- New body: `let baseline = baseline?;` (None → emit ONE `ui::emit` line saying the agent didn't commit and the wrapper can't safely stage so the work was left dirty, then return None — NEVER `git add -A`). Then `let current = capture_status_paths(working_root)?;` compute `current.difference(baseline)`; if empty return None; else stage with `git add -A -- <paths...>`; commit + rev-parse logic unchanged.\n- Add a rustdoc note on wrapper_commit documenting the deliberate footgun: a path dirty at baseline that the agent ALSO edits is excluded (its change stays uncommitted in the tree — visible, not lost; correct for a loop worktree expected clean at start).\n\nDO NOT:\n- Use `git add -A` without a `-- <pathspec>` scope.\n- Key the rename/copy detection on the Y slot — renames are index-side (X slot only: `entry.as_bytes()[0] == b'R' || == b'C'`).\n- Forget to drop the trailing empty field produced by splitting `-z` output on NUL.\n- Use porcelain v2 — v1 `-z` is sufficient and simpler.\n\nEdge cases:\n- Untracked file inside a PRE-EXISTING untracked directory: `--untracked-files=all` gives file granularity so the agent's new file is committed while the sibling stray is not.\n- Agent deletes a tracked file: `git add -A -- <path>` stages the deletion.\n- gitignored files (e.g. tasks/progress-*.txt) never appear in `git status --porcelain`, so they are naturally excluded — no special-casing.\n\nKnown-bad to guard against:\n- A naive `git add -- <paths>` (no `-A`) stages deletions only on git >=2.0 — use `-A -- <paths>`.\n- Splitting `-z` on NUL and treating every token as a separate path double-counts the FROM field of a rename as a phantom path.",
+      "edgeCases": [
+        "None baseline (git status failed upstream): return None + ui::emit warning, leave tree dirty",
+        "Empty diff (agent touched only baseline-dirty paths): return None, no commit",
+        "New file inside a pre-existing untracked directory: committed at file granularity",
+        "Agent-deleted tracked file: deletion staged via `git add -A -- <path>`",
+        "Rename/copy entry: both old and new paths captured",
+        "gitignored progress file dirty during iteration: absent from porcelain, naturally excluded"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "git status invocation fails (not a repo / git missing)",
+          "expectedBehavior": "capture_status_paths returns None → wrapper_commit returns None with a ui::emit warning; no partial staging"
+        },
+        {
+          "cause": "Pathological iteration with thousands of changed paths exceeding ARG_MAX on `git add -A -- <paths>`",
+          "expectedBehavior": "Acceptable for v1 (far worse cases pre-date this); note in rustdoc as a known limit. Do NOT silently truncate."
+        }
+      ],
+      "id": "FEAT-001",
+      "modifiesBehavior": true,
+      "notes": "Reuse: rename-handling intent from worktree.rs:2401-2413 (`dirty_tracked_paths`, column-based) adapted for `-z`; selective-add pattern from worktree.rs:2444-2446 (`git add -- <vec>`). Test harness: `test_utils::init_test_repo()` returns (TempDir, PathBuf) with an initial commit; `setup_git_repo_with_file()` writes file.txt. Tests shell out to git via std::process::Command (fine in cargo test). Existing tests start at git_reconcile.rs:456 (`#[cfg(test)] mod tests`) — add new tests there; there is currently NO direct wrapper_commit test. Learning 5270: feature branches accumulate unrelated dirty files (task JSON, progress, command files) — staging discipline must scope to the iteration's own changes. Learning 1808/2966/3302: tasks/progress-*.txt are gitignored, never appear in porcelain output. Learning 2445: untracked entries need explicit flags (parallels `--untracked-files=all`). Learning 4747: when these tests run under the loop, git mutations need sandbox disabled.",
+      "passes": true,
+      "priority": 1,
+      "qualityDimensions": [
+        "Set-difference semantics: stage exactly current-minus-baseline by path; never widen to `-A` unscoped",
+        "`-z` parser correctness: rename keyed on X slot only, both TO+FROM inserted, trailing empty field dropped, no phantom paths",
+        "Fail-safe on None baseline: skip + visible `ui::emit` warning, never sweep",
+        "Tests verify WHICH paths landed in the commit and which stayed dirty — not just a non-None return",
+        "Idiomatic: reuse existing git-command + porcelain patterns from worktree.rs; no new abstractions"
+      ],
+      "taskType": "implementation",
+      "title": "git_reconcile: capture_status_paths helper + baseline-diff wrapper_commit",
+      "touchesFiles": [
+        "src/loop_engine/git_reconcile.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: PostCompletionParams has `git_status_baseline: Option<&'a HashSet<String>>`; the exhaustive destructure (no `..`) names it; the wrapper_commit call forwards it.",
+        "Positive: orchestrator.rs captures the baseline via `git_reconcile::capture_status_paths(&working_root)` immediately before the run_iteration call and passes `.as_ref()` into the sequential params.",
+        "Negative: the baseline must NOT be captured after run_iteration returns, and must NOT be threaded through IterationResult.",
+        "Positive: wave (wave_scheduler.rs), compat shim (orchestrator.rs ~912), and tests/reaction_parity.rs all pass `git_status_baseline: None` and compile.",
+        "Positive (compile contract): the CONTRACT-001 exhaustive destructure forces every construction site to be updated — `cargo build` is green only when all four sites + destructure account for the new field.",
+        "Documentation: post_completion.rs rustdoc (~189-193) and src/loop_engine/CLAUDE.md:558 describe the baseline-diff behavior, not `git add -A`.",
+        "CONTRACT: field type `Option<&'a HashSet<String>>` matches what FEAT-001's wrapper_commit expects (`Option<&HashSet<String>>`) — grep both to verify.",
+        "Reaction parity: `cargo test -p task-mgr --test reaction_parity` passes with the added field."
+      ],
+      "dependsOn": [
+        "FEAT-001"
+      ],
+      "description": "Wire the pre-iteration baseline from run_loop into wrapper_commit, and update the call site to the new 4-arg signature.\n\nDO:\n- Add field `git_status_baseline: Option<&'a HashSet<String>>` to `PostCompletionParams<'a>` (src/loop_engine/reactions/post_completion.rs ~71-94).\n- Add it to the EXHAUSTIVE destructure in `react_to_completions_inner` (~218-229) and pass it to the `wrapper_commit(working_root, id, \"loop wrapper commit\", git_status_baseline)` call (~237).\n- In orchestrator.rs run_loop: immediately BEFORE the `run_iteration(&mut ctx, &mut iteration_params)` call (~329) capture `let git_baseline = git_reconcile::capture_status_paths(&working_root);` and pass `git_status_baseline: git_baseline.as_ref()` in the sequential PostCompletionParams construction (~422).\n- Pass `git_status_baseline: None` at the wave construction (wave_scheduler.rs ~1381, wrapper_commit=false), the human-review compat shim (orchestrator.rs ~912), and the parity-test helper (tests/reaction_parity.rs ~2282).\n- Docs (same commit): update the post_completion.rs ~189-193 rustdoc that describes the old `git status --porcelain` no-op, and the wrapper-commit row context in src/loop_engine/CLAUDE.md:558, to the baseline-diff contract (the 'at most one commit per iteration' invariant still holds; the reason changes from 'tree clean' to 'no NEW paths remain').\n\nDO NOT:\n- Capture the baseline INSIDE run_iteration or thread it through IterationResult (14 construction sites) — capture in run_loop's scope where PostCompletionParams is built.\n- Capture the baseline AFTER run_iteration returns — it must be snapshotted before the agent runs.\n- Set `git_status_baseline` to anything but None on the wave / shim / parity-test paths (wrapper_commit is false there; a real value would be unused but misleading).\n\nEdge cases:\n- run_iteration only mutates DB/signals before the agent spawn (the sequential claim is DB-only — no `with_prd_sync`), so the run_loop-captured baseline accurately reflects pre-task tree state. Verify this still holds (grep the claim path) and keep it true.",
+      "edgeCases": [
+        "Wave path (wrapper_commit=false): field is None and unused — correct",
+        "Compat human-review shim (wrapper_commit=false): None",
+        "First iteration with a clean tree: baseline is an empty set, diff == all agent changes (parity with old behavior)"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "A construction site forgets the new field",
+          "expectedBehavior": "Compile error (CONTRACT-001 exhaustive destructure) — caught at build, not runtime"
+        },
+        {
+          "cause": "Baseline lifetime doesn't outlive PostCompletionParams borrow",
+          "expectedBehavior": "Keep `git_baseline` as a local in the loop body so it lives across run_iteration and the params construction; borrow with `.as_ref()`"
+        }
+      ],
+      "id": "FEAT-002",
+      "modifiesBehavior": true,
+      "notes": "Construction sites (all four): orchestrator.rs:422 (sequential, real baseline), wave_scheduler.rs:1381 (None), orchestrator.rs:912 (compat shim, None), tests/reaction_parity.rs:2282 (None). Destructure at post_completion.rs:218-229. wrapper_commit call at post_completion.rs:234-242. `working_root` is in scope at orchestrator.rs:425 (`working_root.as_path()`). Architect verified run_iteration touches DB/signals only before agent spawn (claim path is `next_excluding -> TaskLifecycle::try_claim`, DB-only, no with_prd_sync; PRD-JSON sync happens post-spawn). HashSet import: add `use std::collections::HashSet;` where the field type is referenced. Learning 5270: this is the threading that makes the FEAT-001 fix actually fire on the sequential path.",
+      "passes": true,
+      "priority": 2,
+      "qualityDimensions": [
+        "Capture timing correct: baseline snapshotted in run_loop before run_iteration, never after",
+        "Single-home discipline: rely on the exhaustive destructure to force all sites; no `..` shortcut",
+        "Wave/shim/parity sites pass None (wrapper_commit=false) — no misleading real baseline",
+        "Docs match new behavior in the same commit"
+      ],
+      "taskType": "implementation",
+      "title": "Thread git_status_baseline through PostCompletionParams + capture point",
+      "touchesFiles": [
+        "src/loop_engine/reactions/post_completion.rs",
+        "src/loop_engine/orchestrator.rs",
+        "src/loop_engine/wave_scheduler.rs",
+        "tests/reaction_parity.rs",
+        "src/loop_engine/CLAUDE.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No accidental code duplication; if the `-z` parser and `dirty_tracked_paths` share enough, factor a helper — otherwise document why they stay separate",
+        "wrapper_commit and capture_status_paths each do one thing; flag any function >40 lines",
+        "Clear separation: capture/parse vs diff vs stage/commit",
+        "Code follows existing git-command patterns in worktree.rs / git_reconcile.rs",
+        "Any issues found spawn REFACTOR-FIX-xxx tasks via `task-mgr add --stdin --depended-on-by REVIEW-001`"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002"
+      ],
+      "description": "Review the wrapper-commit baseline-diff implementation for DRY violations, complexity, coupling, and clarity.\n\nDO: Check the `-z` parser for duplicated logic vs worktree.rs's `dirty_tracked_paths` (consider whether a shared porcelain parser is warranted or whether duplication is acceptable for `-z` vs column form); verify wrapper_commit stays a single-responsibility function under ~40 lines; confirm the threading adds no needless indirection.\nDO NOT: Skip — this gate catches issues before final review. Do NOT force a premature abstraction if the `-z` and column parsers genuinely differ.",
+      "estimatedEffort": "high",
+      "id": "REFACTOR-001",
+      "notes": "If issues found: `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001` for each (priority 50-97) — atomic DB+JSON sync. If no issues, invoke /simplify on any ugly touchpoint, then emit `<task-status>REFACTOR-001:done</task-status>` with a one-line note. Use the rust-python-code-reviewer agent.",
+      "passes": false,
+      "priority": 98,
+      "qualityDimensions": [
+        "DRY across the two porcelain parsers (only if genuinely shared)",
+        "Single-responsibility functions",
+        "Pattern consistency with worktree.rs git-command helpers"
+      ],
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Review for refactoring opportunities",
+      "touchesFiles": [
+        "src/loop_engine/git_reconcile.rs",
+        "src/loop_engine/reactions/post_completion.rs",
+        "src/loop_engine/orchestrator.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: the only `git add -A` in src/loop_engine is now scoped with `-- <pathspec>` (grep `git add -A` and `add\", \"-A` to verify no unscoped sweep remains).",
+        "Positive: capture_status_paths is the single source of porcelain capture for both baseline and commit-time current state.",
+        "Positive: FULL `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check` all clean (no scope filter).",
+        "Negative: no unwrap()/expect() introduced in the production wrapper-commit path (tests may use expect()).",
+        "Negative: no dead code / unused-import warnings for the new field or helper.",
+        "Wiring: baseline flows run_loop -> PostCompletionParams -> react_to_completions_inner -> wrapper_commit on the sequential path; None on wave/shim/parity (grep-verified).",
+        "Documentation: post_completion.rs rustdoc, wrapper_commit rustdoc, and src/loop_engine/CLAUDE.md:558 all describe the baseline-diff contract.",
+        "Pre-existing test failures fixed (or, if >~12 and clearly unrelated, spawned as a single FIX-xxx with the failing test names).",
+        "If issues found: FIX-xxx / WIRE-FIX-xxx spawned via `task-mgr add --stdin --depended-on-by REVIEW-001`."
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "REFACTOR-001"
+      ],
+      "description": "Review the whole change for correctness, security, wiring, and docs. RUN THE FULL QUALITY GATE (unscoped suite).\n\nDO: Confirm no `git add -A` without `-- <pathspec>` remains in the loop engine; confirm the None-baseline path skips (never sweeps); grep that capture_status_paths is the single porcelain-capture used for both baseline and commit-time; confirm the baseline is captured before run_iteration on the sequential path and None on wave/shim/parity; run the FULL `cargo test` (no scope filter), `cargo clippy -- -D warnings`, `cargo fmt --check`.\nDO NOT: Skip the wiring check — an un-threaded baseline silently reverts to the bug. Do NOT scope the suite — this is THE place the full suite runs.",
+      "estimatedEffort": "high",
+      "id": "REVIEW-001",
+      "notes": "Spawn fixes via `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001`. If clean: emit `<task-status>REVIEW-001:done</task-status>` with 'Clean review'. Beware the stale slot-worktree test-binary gotcha (CLAUDE.md): mass cargo-test failures naming a removed `-slot-N` path are stale shared-target binaries, not a regression — `touch tests/<binary>.rs` and rebuild before concluding. The wave path is unaffected by this change (wrapper_commit=false) — verify no wave-path behavior shifted.",
+      "passes": false,
+      "priority": 99,
+      "qualityDimensions": [
+        "No unscoped `git add -A` anywhere in the loop engine",
+        "Baseline fully wired on sequential, None on wave/shim/parity",
+        "Full suite green including any pre-existing failures",
+        "Docs updated to the new contract"
+      ],
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Code review + final verification",
+      "touchesFiles": [
+        "src/loop_engine/git_reconcile.rs",
+        "src/loop_engine/reactions/post_completion.rs",
+        "src/loop_engine/orchestrator.rs",
+        "src/loop_engine/wave_scheduler.rs",
+        "tests/reaction_parity.rs",
+        "src/loop_engine/CLAUDE.md"
+      ]
+    }
+  ],
+  "version": "1.0"
+}
