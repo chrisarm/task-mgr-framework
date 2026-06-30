@@ -432,6 +432,93 @@ pub(crate) fn capture_status_paths(working_root: &Path) -> Option<HashSet<String
     Some(parse_status_paths(&output.stdout))
 }
 
+fn wrapper_commit_paths(
+    working_root: &Path,
+    task_id: &str,
+    baseline: Option<&HashSet<String>>,
+) -> Option<Vec<String>> {
+    let baseline = match baseline {
+        Some(baseline) => baseline,
+        None => {
+            ui::emit(&format!(
+                "Wrapper did not commit task {}: no git status baseline was captured, so changes cannot be safely staged and were left dirty",
+                task_id
+            ));
+            return None;
+        }
+    };
+
+    let current = capture_status_paths(working_root)?;
+    let mut paths: Vec<String> = current.difference(baseline).cloned().collect();
+    if paths.is_empty() {
+        return None;
+    }
+    paths.sort();
+    Some(paths)
+}
+
+fn stage_wrapper_commit_paths(working_root: &Path, paths: &[String]) -> Option<()> {
+    use std::process::Command;
+
+    let add = Command::new("git")
+        .args(["add", "-A", "--"])
+        .args(paths)
+        .current_dir(working_root)
+        .output()
+        .ok()?;
+
+    if !add.status.success() {
+        tracing::warn!(
+            "wrapper git add failed: {}",
+            String::from_utf8_lossy(&add.stderr).trim()
+        );
+        return None;
+    }
+
+    Some(())
+}
+
+fn commit_staged_wrapper_changes(
+    working_root: &Path,
+    task_id: &str,
+    message_suffix: &str,
+) -> Option<String> {
+    use std::process::Command;
+
+    let commit_msg = format!("feat: {}-completed - {}", task_id, message_suffix);
+    let commit = Command::new("git")
+        .args(["commit", "-m", &commit_msg])
+        .current_dir(working_root)
+        .output()
+        .ok()?;
+
+    if !commit.status.success() {
+        tracing::warn!(
+            "wrapper git commit failed: {}",
+            String::from_utf8_lossy(&commit.stderr).trim()
+        );
+        return None;
+    }
+
+    let hash = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(working_root)
+        .output()
+        .ok()?;
+
+    if !hash.status.success() {
+        return None;
+    }
+
+    let h = String::from_utf8_lossy(&hash.stdout).trim().to_string();
+    ui::emit(&format!(
+        "Wrapper committed changes for task {} ({})",
+        task_id,
+        &h[..7.min(h.len())]
+    ));
+    Some(h)
+}
+
 /// Commit uncommitted changes on behalf of the subprocess when it couldn't.
 ///
 /// In scoped permission mode (`--permission-mode dontAsk`), the Claude subprocess
@@ -452,76 +539,9 @@ pub(crate) fn wrapper_commit(
     message_suffix: &str,
     baseline: Option<&HashSet<String>>,
 ) -> Option<String> {
-    use std::process::Command;
-
-    let baseline = match baseline {
-        Some(baseline) => baseline,
-        None => {
-            ui::emit(&format!(
-                "Wrapper did not commit task {}: no git status baseline was captured, so changes cannot be safely staged and were left dirty",
-                task_id
-            ));
-            return None;
-        }
-    };
-
-    let current = capture_status_paths(working_root)?;
-    let mut paths: Vec<String> = current.difference(baseline).cloned().collect();
-    if paths.is_empty() {
-        return None;
-    }
-    paths.sort();
-
-    // Stage only paths that became dirty after the pre-agent baseline.
-    let add = Command::new("git")
-        .args(["add", "-A", "--"])
-        .args(&paths)
-        .current_dir(working_root)
-        .output()
-        .ok()?;
-
-    if !add.status.success() {
-        tracing::warn!(
-            "wrapper git add failed: {}",
-            String::from_utf8_lossy(&add.stderr).trim()
-        );
-        return None;
-    }
-
-    // Commit with task ID in the message
-    let commit_msg = format!("feat: {}-completed - {}", task_id, message_suffix);
-    let commit = Command::new("git")
-        .args(["commit", "-m", &commit_msg])
-        .current_dir(working_root)
-        .output()
-        .ok()?;
-
-    if !commit.status.success() {
-        tracing::warn!(
-            "wrapper git commit failed: {}",
-            String::from_utf8_lossy(&commit.stderr).trim()
-        );
-        return None;
-    }
-
-    // Get the commit hash
-    let hash = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(working_root)
-        .output()
-        .ok()?;
-
-    if hash.status.success() {
-        let h = String::from_utf8_lossy(&hash.stdout).trim().to_string();
-        ui::emit(&format!(
-            "Wrapper committed changes for task {} ({})",
-            task_id,
-            &h[..7.min(h.len())]
-        ));
-        Some(h)
-    } else {
-        None
-    }
+    let paths = wrapper_commit_paths(working_root, task_id, baseline)?;
+    stage_wrapper_commit_paths(working_root, &paths)?;
+    commit_staged_wrapper_changes(working_root, task_id, message_suffix)
 }
 
 #[cfg(test)]
