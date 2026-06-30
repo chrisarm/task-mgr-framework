@@ -460,16 +460,20 @@ fn wrapper_commit_paths(
 fn stage_wrapper_commit_paths(working_root: &Path, paths: &[String]) -> Option<()> {
     use std::process::Command;
 
-    let add = Command::new("git")
-        .args(["add", "-A", "--"])
-        .args(paths)
-        .current_dir(working_root)
-        .output()
-        .ok()?;
+    for path in paths {
+        let add = Command::new("git")
+            .args(["add", "-A", "--", path])
+            .current_dir(working_root)
+            .output()
+            .ok()?;
 
-    if !add.status.success() {
+        if add.status.success() || path_has_staged_change(working_root, path) {
+            continue;
+        }
+
         tracing::warn!(
-            "wrapper git add failed: {}",
+            "wrapper git add failed for {}: {}",
+            path,
             String::from_utf8_lossy(&add.stderr).trim()
         );
         return None;
@@ -478,16 +482,29 @@ fn stage_wrapper_commit_paths(working_root: &Path, paths: &[String]) -> Option<(
     Some(())
 }
 
+fn path_has_staged_change(working_root: &Path, path: &str) -> bool {
+    use std::process::Command;
+
+    let diff = Command::new("git")
+        .args(["diff", "--cached", "--quiet", "--", path])
+        .current_dir(working_root)
+        .status();
+
+    matches!(diff, Ok(status) if status.code() == Some(1))
+}
+
 fn commit_staged_wrapper_changes(
     working_root: &Path,
     task_id: &str,
     message_suffix: &str,
+    paths: &[String],
 ) -> Option<String> {
     use std::process::Command;
 
     let commit_msg = format!("feat: {}-completed - {}", task_id, message_suffix);
     let commit = Command::new("git")
-        .args(["commit", "-m", &commit_msg])
+        .args(["commit", "-m", &commit_msg, "--"])
+        .args(paths)
         .current_dir(working_root)
         .output()
         .ok()?;
@@ -541,7 +558,7 @@ pub(crate) fn wrapper_commit(
 ) -> Option<String> {
     let paths = wrapper_commit_paths(working_root, task_id, baseline)?;
     stage_wrapper_commit_paths(working_root, &paths)?;
-    commit_staged_wrapper_changes(working_root, task_id, message_suffix)
+    commit_staged_wrapper_changes(working_root, task_id, message_suffix, &paths)
 }
 
 #[cfg(test)]
@@ -608,6 +625,20 @@ mod tests {
         .collect();
         paths.sort();
         paths
+    }
+
+    fn head_changed_name_status(dir: &std::path::Path) -> String {
+        git_stdout(
+            dir,
+            &[
+                "diff-tree",
+                "-M",
+                "--no-commit-id",
+                "--name-status",
+                "-r",
+                "HEAD",
+            ],
+        )
     }
 
     fn status_porcelain(dir: &std::path::Path) -> String {
@@ -759,6 +790,37 @@ mod tests {
     }
 
     #[test]
+    fn test_wrapper_commit_excludes_preexisting_staged_change() {
+        let (_tmp, repo) = crate::loop_engine::test_utils::init_test_repo();
+        write_file(&repo.join("staged.txt"), "base staged\n");
+        commit_paths(&repo, "add staged baseline file", &["staged.txt"]);
+
+        write_file(
+            &repo.join("staged.txt"),
+            "operator staged before baseline\n",
+        );
+        git_output(&repo, &["add", "--", "staged.txt"]);
+        let baseline = capture_status_paths(&repo).expect("capture baseline");
+        assert!(baseline.contains("staged.txt"));
+
+        write_file(&repo.join("agent.txt"), "agent work\n");
+
+        let hash = wrapper_commit(&repo, "FEAT-001", "loop wrapper commit", Some(&baseline));
+
+        assert!(hash.is_some(), "new agent path should be committed");
+        assert_eq!(head_changed_paths(&repo), vec!["agent.txt"]);
+        assert_eq!(
+            git_stdout(&repo, &["diff", "--cached", "--name-only"]).trim(),
+            "staged.txt",
+            "baseline staged path should remain staged after wrapper commit"
+        );
+        assert!(
+            status_porcelain(&repo).contains("M  staged.txt"),
+            "baseline staged path should remain outside the wrapper commit"
+        );
+    }
+
+    #[test]
     fn test_wrapper_commit_stages_deletion() {
         let (_tmp, repo) = crate::loop_engine::test_utils::init_test_repo();
         write_file(&repo.join("a.txt"), "tracked\n");
@@ -773,12 +835,32 @@ mod tests {
         assert!(hash.is_some(), "tracked deletion should be committed");
         assert_eq!(head_changed_paths(&repo), vec!["a.txt"]);
         assert!(
-            git_stdout(
-                &repo,
-                &["diff-tree", "--no-commit-id", "--name-status", "-r", "HEAD"],
-            )
-            .contains("D\ta.txt"),
+            head_changed_name_status(&repo).contains("D\ta.txt"),
             "HEAD commit should contain the deletion"
+        );
+    }
+
+    #[test]
+    fn test_wrapper_commit_stages_rename() {
+        let (_tmp, repo) = crate::loop_engine::test_utils::init_test_repo();
+        write_file(&repo.join("old.rs"), "tracked\n");
+        commit_paths(&repo, "add tracked file", &["old.rs"]);
+        let baseline = capture_status_paths(&repo).expect("capture baseline");
+        assert!(baseline.is_empty());
+
+        git_output(&repo, &["mv", "old.rs", "new.rs"]);
+
+        let hash = wrapper_commit(&repo, "FEAT-001", "loop wrapper commit", Some(&baseline));
+
+        assert!(hash.is_some(), "tracked rename should be committed");
+        assert_eq!(head_changed_paths(&repo), vec!["new.rs", "old.rs"]);
+        assert!(
+            head_changed_name_status(&repo).contains("R100\told.rs\tnew.rs"),
+            "HEAD commit should contain the rename"
+        );
+        assert!(
+            status_porcelain(&repo).trim().is_empty(),
+            "clean-baseline rename wrapper commit should leave the tree clean"
         );
     }
 
