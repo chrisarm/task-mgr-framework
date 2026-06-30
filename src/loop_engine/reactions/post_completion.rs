@@ -234,7 +234,7 @@ pub fn react_to_completions_inner(
     if wrapper_commit {
         for id in completed_ids {
             if let Some(hash) =
-                git_reconcile::wrapper_commit(working_root, id, "loop wrapper commit")
+                git_reconcile::wrapper_commit(working_root, id, "loop wrapper commit", None)
             {
                 wrapper_commit_hash = Some(hash);
             }
