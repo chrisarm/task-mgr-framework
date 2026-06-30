@@ -2273,6 +2273,7 @@ fn post_completion_params<'a>(
         run_id: RUN_ID,
         iteration: 1,
         working_root,
+        git_status_baseline: None,
         prd_file,
         task_prefix: Some(PREFIX),
         default_model: None,

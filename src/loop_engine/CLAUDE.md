@@ -555,7 +555,7 @@ flipped this iteration/wave's tasks to `done`:
 
 | # | Reaction | Sequential | Wave |
 |---|---|---|---|
-| #8 | Wrapper-commit (commit on a task's behalf when Claude couldn't) | `wrapper_commit = true` | `wrapper_commit = false` (slot merge-back already carries the commit) |
+| #8 | Wrapper-commit (commit only paths that became dirty after the pre-agent baseline; no-op once no NEW paths remain) | `wrapper_commit = true` | `wrapper_commit = false` (slot merge-back already carries the commit) |
 | #9 | External-git completion shadow (`git_reconcile::reconcile_external_git_completions`) | ✓ | ✓ |
 | #10 | Human-review trigger for `requires_human` completions | ✓ | ✓ **(behavior addition)** |
 

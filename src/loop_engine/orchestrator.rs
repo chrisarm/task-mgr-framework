@@ -42,6 +42,7 @@ use crate::loop_engine::calibrate;
 use crate::loop_engine::config::{self, IterationOutcome, PermissionMode};
 use crate::loop_engine::deadline;
 use crate::loop_engine::display;
+use crate::loop_engine::git_reconcile;
 use crate::loop_engine::guidance::SessionGuidance;
 use crate::loop_engine::iteration_pipeline;
 use crate::loop_engine::oauth;
@@ -326,6 +327,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
             project_config: &project_config,
         };
 
+        let git_baseline = git_reconcile::capture_status_paths(&working_root);
         let mut result = match run_iteration(&mut ctx, &mut iteration_params) {
             Ok(r) => r,
             Err(e) => {
@@ -423,6 +425,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                 run_id: &run_id,
                 iteration,
                 working_root: working_root.as_path(),
+                git_status_baseline: git_baseline.as_ref(),
                 prd_file: &paths.prd_file,
                 task_prefix: task_prefix.as_deref(),
                 default_model: default_model.as_deref(),
@@ -913,6 +916,7 @@ fn trigger_human_reviews(conn: &mut Connection, params: HumanReviewParams<'_>) {
         run_id: "",
         iteration,
         working_root: Path::new("."),
+        git_status_baseline: None,
         prd_file,
         task_prefix,
         default_model,

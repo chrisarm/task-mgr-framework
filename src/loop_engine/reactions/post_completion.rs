@@ -75,6 +75,10 @@ pub struct PostCompletionParams<'a> {
     pub iteration: u32,
     /// Worktree root — wrapper-commit target + the external-git completion scan.
     pub working_root: &'a Path,
+    /// Pre-agent dirty-path snapshot for safe wrapper commits. Sequential
+    /// callers pass the set captured immediately before `run_iteration`; paths
+    /// already dirty in this baseline are never staged by the wrapper.
+    pub git_status_baseline: Option<&'a HashSet<String>>,
     /// PRD JSON path — `mutate_prd_from_feedback` target on review feedback.
     pub prd_file: &'a Path,
     /// Active task prefix (scopes the external-git reconcile + PRD mutation).
@@ -188,9 +192,9 @@ pub fn react_to_completions(
 ///
 /// 1. **Wrapper-commit (#8)** — when `wrapper_commit` is set, commit on each
 ///    completed task's behalf (the slot merge-back covers this on the wave path,
-///    so it passes `false`). `wrapper_commit`'s own `git status --porcelain`
-///    check makes the call a no-op once the tree is clean, so at most one commit
-///    lands per iteration.
+///    so it passes `false`). `wrapper_commit` stages only paths that became
+///    dirty after the pre-agent baseline; once no NEW paths remain, the call is
+///    a no-op, so at most one commit lands per iteration.
 /// 2. **External-git completion shadow (#9)** — scan the configured external repo
 ///    for `<id>-completed` markers and mark matches done. Runs AFTER the caller
 ///    fed `completed_ids` from the post-merge reconcile (AC5); its reconciled ids
@@ -219,6 +223,7 @@ pub fn react_to_completions_inner(
         run_id,
         iteration: _,
         working_root,
+        git_status_baseline,
         prd_file,
         task_prefix,
         default_model: _,
@@ -233,9 +238,12 @@ pub fn react_to_completions_inner(
     let mut wrapper_commit_hash = None;
     if wrapper_commit {
         for id in completed_ids {
-            if let Some(hash) =
-                git_reconcile::wrapper_commit(working_root, id, "loop wrapper commit", None)
-            {
+            if let Some(hash) = git_reconcile::wrapper_commit(
+                working_root,
+                id,
+                "loop wrapper commit",
+                git_status_baseline,
+            ) {
                 wrapper_commit_hash = Some(hash);
             }
         }
