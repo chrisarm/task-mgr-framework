@@ -426,6 +426,11 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                 iteration,
                 working_root: working_root.as_path(),
                 git_status_baseline: git_baseline.as_ref(),
+                wrapper_commit_task_id: if claimed_was_completed {
+                    result.task_id.as_deref()
+                } else {
+                    None
+                },
                 prd_file: &paths.prd_file,
                 task_prefix: task_prefix.as_deref(),
                 default_model: default_model.as_deref(),
@@ -917,6 +922,7 @@ fn trigger_human_reviews(conn: &mut Connection, params: HumanReviewParams<'_>) {
         iteration,
         working_root: Path::new("."),
         git_status_baseline: None,
+        wrapper_commit_task_id: None,
         prd_file,
         task_prefix,
         default_model,
