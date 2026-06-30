@@ -1128,4 +1128,5 @@ For the full site→verb audit table and source-allowance matrix see
 | Merge resolver | `src/loop_engine/merge_resolver.rs` | `ClaudeMergeResolver`, `MergeResolver` trait |
 | Stash preflight | `src/loop_engine/worktree.rs` | `prepare_slot0_for_merge`, `cleanup_preparation`, `run_slot_merge_attempt` |
 | Post-merge slot reconcile | `src/loop_engine/git_reconcile.rs` | `reconcile_merged_slot_completions` |
-| Post-completion reactions (#8/#9/#10) | `src/loop_engine/reactions/post_completion.rs` | `react_to_completions` (coordinator, both paths), `react_to_completions_inner` (hermetic core), `PostCompletionParams`, `ReviewFn`; relocated leaf `orchestrator::trigger_human_reviews` (`#[deprecated]` shim) |
+| Wrapper-commit baseline-diff (#8) | `src/loop_engine/git_reconcile.rs` | `capture_status_paths` (single porcelain source), `wrapper_commit`, `wrapper_commit_paths`, `stage_wrapper_commit_paths` (scoped `git add -A -- <path>` only; baseline diff vs pre-iteration dirty set) |
+| Post-completion reactions (#8/#9/#10) | `src/loop_engine/reactions/post_completion.rs` | `react_to_completions` (coordinator, both paths), `react_to_completions_inner` (hermetic core), `PostCompletionParams` (incl. `git_status_baseline`), `ReviewFn`; relocated leaf `orchestrator::trigger_human_reviews` (`#[deprecated]` shim) |
