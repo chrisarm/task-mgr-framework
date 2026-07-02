@@ -203,7 +203,7 @@
       "estimatedEffort": "high",
       "id": "REVIEW-001",
       "notes": "Spawn fixes via `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001`. If clean: emit `<task-status>REVIEW-001:done</task-status>` with 'Clean review'. Beware the stale slot-worktree test-binary gotcha (CLAUDE.md): mass cargo-test failures naming a removed `-slot-N` path are stale shared-target binaries, not a regression — `touch tests/<binary>.rs` and rebuild before concluding. The wave path is unaffected by this change (wrapper_commit=false) — verify no wave-path behavior shifted.",
-      "passes": false,
+      "passes": true,
       "priority": 99,
       "qualityDimensions": [
         "No unscoped `git add -A` anywhere in the loop engine",
