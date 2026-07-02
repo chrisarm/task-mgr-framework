@@ -448,7 +448,20 @@ fn wrapper_commit_paths(
         }
     };
 
-    let current = capture_status_paths(working_root)?;
+    let current = match capture_status_paths(working_root) {
+        Some(current) => current,
+        None => {
+            // Distinct from the empty-diff `None` below: the baseline existed but
+            // re-reading the working tree at commit time failed, so we cannot
+            // compute the new-path set. Surface it (the inner `tracing::warn` is
+            // file-only) rather than letting the task look silently uncommitted.
+            ui::emit(&format!(
+                "Wrapper did not commit task {}: capturing the post-iteration git status failed, so changes cannot be safely staged and were left dirty",
+                task_id
+            ));
+            return None;
+        }
+    };
     let mut paths: Vec<String> = current.difference(baseline).cloned().collect();
     if paths.is_empty() {
         return None;
@@ -467,6 +480,10 @@ fn stage_wrapper_commit_paths(working_root: &Path, paths: &[String]) -> Option<(
             .output()
             .ok()?;
 
+        // A path already staged at baseline (operator-staged before the agent
+        // ran) can make `git add` exit non-zero even though the index already
+        // holds the intended state — treat an existing staged diff as success so
+        // such a path does not abort the whole wrapper commit.
         if add.status.success() || path_has_staged_change(working_root, path) {
             continue;
         }
@@ -548,6 +565,18 @@ fn commit_staged_wrapper_changes(
 /// uncommitted but visible in the working tree. Sequential loop worktrees are
 /// expected to be clean at iteration start; this conservative behavior prevents
 /// wrapper-commit from sweeping unrelated operator changes into the task commit.
+///
+/// Known limitations (acceptable for v1 — the worktree is expected near-clean):
+/// - **Partial-staging on failure is not rolled back.** If `git add` fails for a
+///   path mid-batch, the commit is aborted (returns `None`) but paths staged
+///   earlier in the batch stay in the index. The conservative skip is still
+///   safer than the old `git add -A` sweep; the operator's next `git status` /
+///   `/review-loop` surfaces the partially-staged state.
+/// - **Path-count / `ARG_MAX`.** Staging is one `git add` per path (so the add
+///   side does not hit `ARG_MAX`), but the final commit passes the full path
+///   list in a single `git commit -- <paths...>`; a pathological iteration that
+///   produces tens of thousands of new paths could exceed the OS argument
+///   limit. Not chunked in v1.
 ///
 /// Returns `Some(commit_hash)` on success, `None` if nothing to commit or on error.
 pub(crate) fn wrapper_commit(
