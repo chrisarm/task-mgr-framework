@@ -415,6 +415,64 @@ fn build_tool_awareness_block_scoped_none_returns_empty_string() {
 }
 
 // ---------------------------------------------------------------------------
+// GIT_SAFETY_GUARDRAIL — binary-shipped destructive-op guardrail. Must appear in
+// every tool-bearing mode (so the loop agent in ANY repo is told never to
+// physically delete files it did not author) and stay absent from the tool-less
+// Scoped(None) mode.
+// ---------------------------------------------------------------------------
+
+/// Assert the destructive-op guardrail is present: it must steer toward the
+/// index-only `git rm --cached` and explicitly forbid a bare `git rm`.
+fn assert_has_git_safety_guardrail(block: &str) {
+    assert!(
+        block.contains("git rm --cached"),
+        "tool-awareness block must steer to the index-only `git rm --cached`; got:\n{block}"
+    );
+    assert!(
+        block.contains("git rm <path>"),
+        "tool-awareness block must explicitly forbid a bare `git rm`; got:\n{block}"
+    );
+    assert!(
+        block.to_ascii_lowercase().contains("did not author"),
+        "guardrail must scope the prohibition to files the agent did not author; got:\n{block}"
+    );
+}
+
+#[test]
+fn git_safety_guardrail_present_in_dangerous_mode() {
+    assert_has_git_safety_guardrail(&build_tool_awareness_block(&PermissionMode::Dangerous));
+}
+
+#[test]
+fn git_safety_guardrail_present_in_auto_mode() {
+    // Auto is the loop's default permission mode, so this is the real-world path.
+    assert_has_git_safety_guardrail(&build_tool_awareness_block(&PermissionMode::Auto {
+        allowed_tools: None,
+    }));
+    assert_has_git_safety_guardrail(&build_tool_awareness_block(&PermissionMode::Auto {
+        allowed_tools: Some("Read,Write,Bash(git:*)".to_string()),
+    }));
+}
+
+#[test]
+fn git_safety_guardrail_present_in_scoped_with_tools() {
+    assert_has_git_safety_guardrail(&build_tool_awareness_block(&PermissionMode::Scoped {
+        allowed_tools: Some("Read,Write,Bash(git:*)".to_string()),
+    }));
+}
+
+#[test]
+fn git_safety_guardrail_absent_in_scoped_none() {
+    let block = build_tool_awareness_block(&PermissionMode::Scoped {
+        allowed_tools: None,
+    });
+    assert!(
+        !block.contains("git rm"),
+        "tool-less Scoped(None) mode advertises no tools and must stay empty (no guardrail); got:\n{block}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // build_key_decisions_block — normal vs. review/verify task IDs
 // ---------------------------------------------------------------------------
 

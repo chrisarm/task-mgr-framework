@@ -205,12 +205,38 @@ pub fn build_source_context_block(
     scan_source_context(touches_files, budget, project_root).format_for_prompt()
 }
 
+/// Hard guardrail against destructive git/file operations, injected into the
+/// tool-awareness block for every mode in which the agent can touch the working
+/// tree. Ships in the BINARY (not a per-repo `task-mgr learn` entry) so it
+/// applies in every repo the loop drives — a learning would only protect this
+/// repo's own development.
+///
+/// Rationale: the loop agent runs in a working tree it does not fully own (the
+/// operator's pre-existing uncommitted files, artifacts from earlier waves). A
+/// remediation step that physically `git rm`/`rm`/`git clean`s a file it did not
+/// author turns a diff-hygiene problem into real on-disk data loss — the failure
+/// that escalated the wrapper-commit incident. Untracking is index-only
+/// (`git rm --cached`, file stays on disk); deletion of unattributed files is
+/// forbidden. Staging-side counterpart: the wrapper-commit baseline-diff fix.
+const GIT_SAFETY_GUARDRAIL: &str = "\
+**Never delete or revert files you did not author.** You are operating in a \
+working tree that may already contain the operator's uncommitted files and \
+artifacts from earlier work. To stop tracking a file, use `git rm --cached \
+<path>` — index-only, the file stays on disk. NEVER run a bare `git rm <path>`, \
+`rm <path>`, `git clean`, `git reset --hard`, or `git checkout -- <path>` \
+against any file your task did not create or modify; those physically delete or \
+revert work and have caused real data loss. If a stray or untracked file seems \
+to be in your way, leave it on disk and report it — do not remove it.\n\n";
+
 /// Build the tool-awareness block describing the tools the agent has
 /// access to under `permission_mode`.
 ///
 /// Prevents the "I need Bash access" behavioral pattern by explicitly
 /// informing the agent about its available tools based on the resolved
-/// permission mode.
+/// permission mode. Every mode that grants tool access also appends
+/// [`GIT_SAFETY_GUARDRAIL`]; the tool-less `Scoped { allowed_tools: None }` mode
+/// stays an empty string (no file-mutating surface to guard, and a downstream
+/// contract relies on it rendering empty).
 pub fn build_tool_awareness_block(permission_mode: &PermissionMode) -> String {
     match permission_mode {
         PermissionMode::Scoped {
@@ -244,15 +270,20 @@ pub fn build_tool_awareness_block(permission_mode: &PermissionMode) -> String {
                  because the shell sees `VAR=val` as the first token, not `command`. \
                  Use `env VAR=val command` instead — `env` is an allowed prefix.\n\n",
             );
+            section.push_str(GIT_SAFETY_GUARDRAIL);
 
             section
         }
-        PermissionMode::Dangerous => "## Available Tools\n\n\
-             You have unrestricted tool access. Just use any tool you need.\n\n"
-            .to_string(),
-        PermissionMode::Auto { .. } => "## Available Tools\n\n\
-             You have auto-approved tool access. Just use any tool you need.\n\n"
-            .to_string(),
+        PermissionMode::Dangerous => format!(
+            "## Available Tools\n\n\
+             You have unrestricted tool access. Just use any tool you need.\n\n\
+             {GIT_SAFETY_GUARDRAIL}"
+        ),
+        PermissionMode::Auto { .. } => format!(
+            "## Available Tools\n\n\
+             You have auto-approved tool access. Just use any tool you need.\n\n\
+             {GIT_SAFETY_GUARDRAIL}"
+        ),
         PermissionMode::Scoped {
             allowed_tools: None,
         } => String::new(),
