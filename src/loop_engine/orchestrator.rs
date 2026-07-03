@@ -327,7 +327,26 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
             project_config: &project_config,
         };
 
+        // Baseline for the wrapper-commit set difference (see
+        // git_reconcile::wrapper_commit). Captured here — before run_iteration —
+        // so only paths that become dirty *during* the agent's run are eligible
+        // for the wrapper commit. This window is slightly wider than
+        // "immediately before spawn": operator edits made during a usage-gate
+        // wait / crash backoff / task selection inside run_iteration fall between
+        // baseline and commit and could be attributed to the agent. Acceptable
+        // for a loop worktree expected clean at iteration start; tightening it
+        // would require threading the capture into run_iteration's pre-spawn
+        // point (14 IterationResult construction sites).
         let git_baseline = git_reconcile::capture_status_paths(&working_root);
+        if git_baseline.is_none() {
+            // Surface at capture time, not only at the end-of-iteration skip:
+            // with no baseline the wrapper commit is disabled for this iteration.
+            ui::emit(
+                "Wrapper-commit baseline capture failed at iteration start; a task \
+                 that completes without self-committing will be left dirty rather \
+                 than risk staging unrelated files",
+            );
+        }
         let mut result = match run_iteration(&mut ctx, &mut iteration_params) {
             Ok(r) => r,
             Err(e) => {
@@ -426,6 +445,12 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                 iteration,
                 working_root: working_root.as_path(),
                 git_status_baseline: git_baseline.as_ref(),
+                // Only the claimed task that actually completed is attributed a
+                // wrapper commit (REFACTOR-FIX-002 — one commit per iteration, not
+                // one per completed id). An iteration whose only completion is a
+                // cross-task `<task-status>` (not the claimed task) intentionally
+                // gets no wrapper commit even with dirty agent work: the wrapper
+                // commit belongs to a single owning task or to none.
                 wrapper_commit_task_id: if claimed_was_completed {
                     result.task_id.as_deref()
                 } else {

@@ -567,6 +567,11 @@ fn commit_staged_wrapper_changes(
 /// wrapper-commit from sweeping unrelated operator changes into the task commit.
 ///
 /// Known limitations (acceptable for v1 — the worktree is expected near-clean):
+/// - **Exclusion is path-set membership, not content.** A baseline-dirty file
+///   the agent *renames* to a new path lands in `current − baseline` under the
+///   new path, so its full content — including edits made before the baseline —
+///   is committed. Only paths whose string is unchanged since baseline are
+///   excluded; a near-clean worktree makes this rare.
 /// - **Partial-staging on failure is not rolled back.** If `git add` fails for a
 ///   path mid-batch, the commit is aborted (returns `None`) but paths staged
 ///   earlier in the batch stay in the index. The conservative skip is still
