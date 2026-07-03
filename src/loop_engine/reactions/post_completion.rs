@@ -75,6 +75,14 @@ pub struct PostCompletionParams<'a> {
     pub iteration: u32,
     /// Worktree root — wrapper-commit target + the external-git completion scan.
     pub working_root: &'a Path,
+    /// Pre-agent dirty-path snapshot for safe wrapper commits. Sequential
+    /// callers pass the set captured immediately before `run_iteration`; paths
+    /// already dirty in this baseline are never staged by the wrapper.
+    pub git_status_baseline: Option<&'a HashSet<String>>,
+    /// Claimed task id that completed this sequential iteration and owns any
+    /// wrapper commit. Cross-task completions in `completed_ids` never receive
+    /// the wrapper commit.
+    pub wrapper_commit_task_id: Option<&'a str>,
     /// PRD JSON path — `mutate_prd_from_feedback` target on review feedback.
     pub prd_file: &'a Path,
     /// Active task prefix (scopes the external-git reconcile + PRD mutation).
@@ -104,10 +112,11 @@ pub struct PostCompletionOutcome {
     /// ids resolved — the same accounting the pre-convergence inline external-git
     /// block did at each call site.
     pub external_reconciled: Vec<String>,
-    /// The hash of the last wrapper-commit (#8) made on a completed task's
-    /// behalf, or `None` when `wrapper_commit` was `false`, nothing was dirty, or
-    /// the commit failed. The sequential caller stores it in `ctx.last_commit`;
-    /// the wave caller ignores it (`wrapper_commit = false`).
+    /// The hash of the wrapper-commit (#8) made on the claimed completed task's
+    /// behalf, or `None` when `wrapper_commit` was `false`, the claimed task did
+    /// not complete, nothing was dirty, or the commit failed. The sequential
+    /// caller stores it in `ctx.last_commit`; the wave caller ignores it
+    /// (`wrapper_commit = false`).
     pub wrapper_commit_hash: Option<String>,
 }
 
@@ -186,11 +195,11 @@ pub fn react_to_completions(
 /// Hermetic core of the post-completion coordinator. Destructures the params
 /// exhaustively; folds the three completion-driven reactions in order:
 ///
-/// 1. **Wrapper-commit (#8)** — when `wrapper_commit` is set, commit on each
-///    completed task's behalf (the slot merge-back covers this on the wave path,
-///    so it passes `false`). `wrapper_commit`'s own `git status --porcelain`
-///    check makes the call a no-op once the tree is clean, so at most one commit
-///    lands per iteration.
+/// 1. **Wrapper-commit (#8)** — when `wrapper_commit` is set and the claimed
+///    task completed, commit once on that claimed task's behalf (the slot
+///    merge-back covers this on the wave path, so it passes `false`).
+///    `wrapper_commit` stages only paths that became dirty after the pre-agent
+///    baseline.
 /// 2. **External-git completion shadow (#9)** — scan the configured external repo
 ///    for `<id>-completed` markers and mark matches done. Runs AFTER the caller
 ///    fed `completed_ids` from the post-merge reconcile (AC5); its reconciled ids
@@ -219,6 +228,8 @@ pub fn react_to_completions_inner(
         run_id,
         iteration: _,
         working_root,
+        git_status_baseline,
+        wrapper_commit_task_id,
         prd_file,
         task_prefix,
         default_model: _,
@@ -231,14 +242,13 @@ pub fn react_to_completions_inner(
     // (1) Wrapper-commit (#8). Sequential only; the slot merge-back already
     //     carries the commit on the wave path.
     let mut wrapper_commit_hash = None;
-    if wrapper_commit {
-        for id in completed_ids {
-            if let Some(hash) =
-                git_reconcile::wrapper_commit(working_root, id, "loop wrapper commit")
-            {
-                wrapper_commit_hash = Some(hash);
-            }
-        }
+    if wrapper_commit && let Some(id) = wrapper_commit_task_id {
+        wrapper_commit_hash = git_reconcile::wrapper_commit(
+            working_root,
+            id,
+            "loop wrapper commit",
+            git_status_baseline,
+        );
     }
 
     // (2) External-git completion shadow (#9). Empty when no external repo is

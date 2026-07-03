@@ -1384,6 +1384,8 @@ pub fn run_wave_iteration(
             // Unused on the wave path (`wrapper_commit = false`); `source_root` is
             // the loop's main worktree, a valid placeholder.
             working_root: params.source_root,
+            git_status_baseline: None,
+            wrapper_commit_task_id: None,
             prd_file: params.prd_path,
             task_prefix: params.task_prefix,
             default_model: params.default_model,

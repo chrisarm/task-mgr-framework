@@ -2208,6 +2208,9 @@ fn no_transient_returns_none_resets_counter_and_writes_nothing() {
 // ===========================================================================
 
 use std::cell::RefCell;
+use std::collections::HashSet;
+use std::fs;
+use std::process::Command;
 
 use task_mgr::loop_engine::reactions::post_completion::{
     HumanReviewTask, PostCompletionParams, ReviewFn, react_to_completions_inner,
@@ -2273,6 +2276,8 @@ fn post_completion_params<'a>(
         run_id: RUN_ID,
         iteration: 1,
         working_root,
+        git_status_baseline: None,
+        wrapper_commit_task_id: None,
         prd_file,
         task_prefix: Some(PREFIX),
         default_model: None,
@@ -2281,6 +2286,138 @@ fn post_completion_params<'a>(
         external_git_scan_depth: 50,
         wrapper_commit: true,
     }
+}
+
+fn git_command(repo: &Path, args: &[&str]) -> std::process::Output {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .output()
+        .unwrap_or_else(|e| panic!("git {:?} spawn failed: {}", args, e));
+    assert!(
+        output.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    output
+}
+
+fn git_stdout(repo: &Path, args: &[&str]) -> String {
+    String::from_utf8_lossy(&git_command(repo, args).stdout).to_string()
+}
+
+fn init_git_repo() -> TempDir {
+    let repo = TempDir::new().expect("tempdir");
+    git_command(repo.path(), &["init"]);
+    git_command(repo.path(), &["config", "user.email", "test@example.com"]);
+    git_command(repo.path(), &["config", "user.name", "Test User"]);
+    fs::write(repo.path().join("README.md"), "initial\n").expect("write seed file");
+    git_command(repo.path(), &["add", "README.md"]);
+    git_command(repo.path(), &["commit", "-m", "initial"]);
+    repo
+}
+
+fn commit_count(repo: &Path) -> usize {
+    git_stdout(repo, &["rev-list", "--count", "HEAD"])
+        .trim()
+        .parse()
+        .expect("commit count")
+}
+
+// ---------------------------------------------------------------------------
+// Wrapper commit attribution: sequential batches can include multiple completed
+// ids, but the wrapper commit belongs only to the claimed task. The unrelated
+// cross-task completion appears first to pin the regression ordering.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn react_to_completions_wrapper_commit_uses_claimed_id_once_for_multi_id_batch() {
+    disable_llm_extraction();
+    let (_db, mut conn) = setup_migrated_db();
+    insert_run(&conn);
+    let repo = init_git_repo();
+    let prd = repo.path().join("prd.json");
+    let baseline = HashSet::new();
+    fs::write(repo.path().join("agent-output.txt"), "new work\n").expect("write agent output");
+
+    let completed_ids = vec!["RP-CROSS-DONE".to_string(), "RP-CLAIMED-DONE".to_string()];
+    let spy = ReviewSpy::no_feedback();
+    let review = spy.closure();
+    let params = PostCompletionParams {
+        run_id: RUN_ID,
+        iteration: 1,
+        working_root: repo.path(),
+        git_status_baseline: Some(&baseline),
+        wrapper_commit_task_id: Some("RP-CLAIMED-DONE"),
+        prd_file: &prd,
+        task_prefix: Some(PREFIX),
+        default_model: None,
+        permission_mode: &PERMISSION_MODE,
+        external_repo_path: None,
+        external_git_scan_depth: 50,
+        wrapper_commit: true,
+    };
+
+    let outcome =
+        react_to_completions_inner(&mut conn, &completed_ids, &params, &review as ReviewFn);
+
+    assert!(
+        outcome.wrapper_commit_hash.is_some(),
+        "dirty worktree should produce exactly one wrapper commit",
+    );
+    assert_eq!(
+        commit_count(repo.path()),
+        2,
+        "wrapper commit is attempted at most once for a multi-id completion batch",
+    );
+    assert_eq!(
+        git_stdout(repo.path(), &["log", "-1", "--pretty=%s"]).trim(),
+        "feat: RP-CLAIMED-DONE-completed - loop wrapper commit",
+        "wrapper commit message must use the claimed completed task id, not the first completed id",
+    );
+}
+
+#[test]
+fn react_to_completions_wave_shape_does_not_wrapper_commit() {
+    disable_llm_extraction();
+    let (_db, mut conn) = setup_migrated_db();
+    insert_run(&conn);
+    let repo = init_git_repo();
+    let prd = repo.path().join("prd.json");
+    let baseline = HashSet::new();
+    fs::write(repo.path().join("wave-output.txt"), "wave work\n").expect("write wave output");
+
+    let completed_ids = vec!["RP-WAVE-DONE".to_string(), "RP-OTHER-DONE".to_string()];
+    let spy = ReviewSpy::no_feedback();
+    let review = spy.closure();
+    let params = PostCompletionParams {
+        run_id: RUN_ID,
+        iteration: 1,
+        working_root: repo.path(),
+        git_status_baseline: Some(&baseline),
+        wrapper_commit_task_id: Some("RP-WAVE-DONE"),
+        prd_file: &prd,
+        task_prefix: Some(PREFIX),
+        default_model: None,
+        permission_mode: &PERMISSION_MODE,
+        external_repo_path: None,
+        external_git_scan_depth: 50,
+        wrapper_commit: false,
+    };
+
+    let outcome =
+        react_to_completions_inner(&mut conn, &completed_ids, &params, &review as ReviewFn);
+
+    assert_eq!(
+        outcome.wrapper_commit_hash, None,
+        "wave path keeps wrapper_commit=false and must not commit",
+    );
+    assert_eq!(
+        commit_count(repo.path()),
+        1,
+        "wave-shaped post-completion reaction must leave git history untouched",
+    );
 }
 
 // ---------------------------------------------------------------------------
