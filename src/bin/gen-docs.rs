@@ -15,8 +15,13 @@ use task_mgr::util::marker_splice;
 
 const MODELS_BEGIN: &str = "<!-- MODELS:BEGIN -->";
 const MODELS_END: &str = "<!-- MODELS:END -->";
-const EXPECTED_MODEL_CONSTS: &[&str] =
-    &["FABLE_MODEL", "OPUS_MODEL", "SONNET_MODEL", "HAIKU_MODEL"];
+const EXPECTED_MODEL_CONSTS: &[&str] = &[
+    "FABLE_MODEL",
+    "OPUS_MODEL",
+    "SONNET_MODEL",
+    "HAIKU_MODEL",
+    "GROK_MODEL",
+];
 
 fn main() -> ExitCode {
     let check_mode = std::env::args().any(|a| a == "--check");
@@ -253,6 +258,7 @@ fn render_block(model_rs: &Path) -> Result<String, String> {
             "OPUS_MODEL" => "Opus (standard)",
             "SONNET_MODEL" => "Sonnet (cost-efficient)",
             "HAIKU_MODEL" => "Haiku (cheapest)",
+            "GROK_MODEL" => "Grok (standard)",
             _ => name.as_str(),
         };
         out.push_str(&format!("- **{tier}** → `{name}` = `{value}`\n"));

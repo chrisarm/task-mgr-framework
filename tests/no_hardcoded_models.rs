@@ -8,10 +8,11 @@
 //!   `HAIKU_MODEL` / `FABLE_MODEL` constants, so this scope stays strict.
 //! - Grok ids (`grok-build`, `grok-code-fast-1`, `grok-4*`, …) are banned in
 //!   PRODUCTION code only. Unit-test modules (`#[cfg(test)]`) and integration
-//!   tests under `tests/` legitimately use the literal `"grok-build"` (there is
-//!   no exported Grok constant to import), so the grok check skips test code.
-//!   The point is to catch a `grok-build` literal sneaking into a runtime path
-//!   (e.g. `default_grok_provider`), which the Claude-only regex used to miss.
+//!   tests under `tests/` may still use concrete grok ids (e.g. `"grok-build"`
+//!   as a sample id); production must route through `GROK_MODEL` /
+//!   `GROK_DEFAULT_TIER_MODELS`. The point is to catch a grok id sneaking into
+//!   a runtime path (e.g. `default_grok_provider`), which the Claude-only
+//!   regex used to miss.
 //!
 //! See `src/loop_engine/model.rs` for why; see `.claude/commands/tasks.md`
 //! and `tests/fixtures/*.json.tmpl` for how other call sites derive from it.
@@ -67,8 +68,8 @@ fn no_hardcoded_model_strings_outside_model_rs() {
          (`src/loop_engine/model.rs`).\n\
          Claude: use `OPUS_MODEL` / `SONNET_MODEL` / `HAIKU_MODEL` / `FABLE_MODEL` constants \
          (or `{{{{OPUS_MODEL}}}}` placeholders in `.json.tmpl` fixtures).\n\
-         Grok: production code must route model ids through `model.rs` (e.g. the \
-         `GROK_DEFAULT_TIER_MODELS` table), never a `\"grok-build\"` literal.\n\n\
+         Grok: production code must route model ids through `model.rs` (`GROK_MODEL` \
+         / `GROK_DEFAULT_TIER_MODELS`), never a bare grok model-id literal.\n\n\
          Offenders:\n{}\n",
         offenders.join("\n")
     );

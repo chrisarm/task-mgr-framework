@@ -38,15 +38,17 @@ use crate::loop_engine::project_config::{
 };
 
 /// Well-known model identifiers.
-pub const OPUS_MODEL: &str = "claude-opus-4-8";
-pub const SONNET_MODEL: &str = "claude-sonnet-4-6";
+pub const OPUS_MODEL: &str = "claude-opus-5";
+pub const SONNET_MODEL: &str = "claude-sonnet-5";
 pub const HAIKU_MODEL: &str = "claude-haiku-4-5-20251001";
 /// Claude Fable 5 — the frontier-tier Claude model, above Opus. Added by the
 /// model-selection redesign (FR-001); `claude-fable-5` contains no legacy tier
 /// token, which is why substring tier classification is structurally dead and
 /// `CapabilityTier`/`tier_of` use config exact-match instead.
 pub const FABLE_MODEL: &str = "claude-fable-5";
-/// Suffix marking a 1M-context model variant (`claude-opus-4-8[1m]`).
+/// Default Grok model on the single `standard` rung of the built-in ladder.
+pub const GROK_MODEL: &str = "grok-4.5";
+/// Suffix marking a 1M-context model variant (`claude-opus-5[1m]`).
 /// Stripped by `tier_of` before the exact config match and appended by the
 /// Claude-only 1M escalation rung. Single source of truth for the literal.
 pub const ONE_M_SUFFIX: &str = "[1m]";
@@ -65,7 +67,7 @@ pub const ONE_M_SUFFIX: &str = "[1m]";
 pub enum Provider {
     /// Anthropic Claude models (default for unknown / unset inputs).
     Claude,
-    /// xAI Grok models (`grok-build`, `grok-code-fast-1`, …).
+    /// xAI Grok models (`grok-4.5`, `grok-build`, `grok-code-fast-1`, …).
     Grok,
     /// OpenAI Codex CLI models. In v1 this is selected only by explicit
     /// `primaryRunner.provider = "codex"`; model-name inference is forbidden.
@@ -298,7 +300,7 @@ pub const CLAUDE_DEFAULT_TIER_MODELS: &[(&str, &str)] = &[
     ("standard", OPUS_MODEL),
     ("frontier", FABLE_MODEL),
 ];
-pub const GROK_DEFAULT_TIER_MODELS: &[(&str, &str)] = &[("standard", "grok-build")];
+pub const GROK_DEFAULT_TIER_MODELS: &[(&str, &str)] = &[("standard", GROK_MODEL)];
 pub const CODEX_DEFAULT_TIER_MODELS: &[(&str, &str)] = &[("standard", "")];
 
 /// Trim + lowercase a difficulty string for table lookup. Returns `None` when
@@ -391,7 +393,7 @@ pub fn is_1m_model(model: Option<&str>) -> bool {
 ///
 /// Suffix-append (NOT a constant lookup): appends [`ONE_M_SUFFIX`] to ANY
 /// Claude model so the 1M rung covers every Claude tier without a per-model
-/// constant — `claude-opus-4-8 → claude-opus-4-8[1m]`,
+/// constant — `claude-opus-5 → claude-opus-5[1m]`,
 /// `claude-fable-5 → claude-fable-5[1m]`. Returns `None` when the model is
 /// already a 1M variant, is not a Claude model (provider guard), or is `None`.
 /// 1M context is a Claude-only capability; Grok/Codex have no equivalent.
@@ -1287,13 +1289,13 @@ mod tests {
 
     #[test]
     fn test_escalate_tier_grok_single_rung_self_loops() {
-        // Grok has one defined rung (Standard=grok-build); escalation self-loops.
+        // Grok has one defined rung (Standard=GROK_MODEL); escalation self-loops.
         let r = escalate_tier(
             builtin_resolved_models(),
             Provider::Grok,
-            Some("grok-build"),
+            Some(GROK_MODEL),
         );
-        assert_eq!(r, Some("grok-build".to_string()));
+        assert_eq!(r, Some(GROK_MODEL.to_string()));
     }
 
     /// Full chain haiku → sonnet → opus → fable → fable (ceiling self-loop).
@@ -2152,7 +2154,7 @@ mod tests {
         assert!(grok.enabled, "user override flips enabled");
         assert_eq!(
             grok.tiers.get("standard"),
-            Some(&Some("grok-build".to_string())),
+            Some(&Some(GROK_MODEL.to_string())),
             "grok inherits its default tier ladder"
         );
         assert!(

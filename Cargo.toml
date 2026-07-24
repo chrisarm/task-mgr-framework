@@ -1,6 +1,6 @@
 [package]
 name = "task-mgr"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 rust-version = "1.95"
 description = "A standalone CLI tool for managing AI agent loop tasks with SQLite as working state"
@@ -74,7 +74,7 @@ tracing-appender = "0.2"
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
-rstest = "0.24"
+rstest = "0.26"
 # Used by reranker HTTP tests.
 mockito = "1"
 static_assertions = "1"

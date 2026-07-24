@@ -195,9 +195,10 @@ Do **not** hardcode model IDs — they change with each Claude release and must 
 **Current model IDs** (bumped in `src/loop_engine/model.rs`):
 
 - **Fable (frontier)** → `FABLE_MODEL` = `claude-fable-5`
-- **Opus (standard)** → `OPUS_MODEL` = `claude-opus-4-8`
-- **Sonnet (cost-efficient)** → `SONNET_MODEL` = `claude-sonnet-4-6`
+- **Opus (standard)** → `OPUS_MODEL` = `claude-opus-5`
+- **Sonnet (cost-efficient)** → `SONNET_MODEL` = `claude-sonnet-5`
 - **Haiku (cheapest)** → `HAIKU_MODEL` = `claude-haiku-4-5-20251001`
+- **Grok (standard)** → `GROK_MODEL` = `grok-4.5`
 
 **Difficulty → `--effort` mapping**:
 
@@ -217,8 +218,8 @@ Default tier matrix (from the `_DEFAULT_TIER_MODELS` tables; empty = route with 
 | Tier | Claude | Grok | Codex |
 |------|--------|------|-------|
 | frontier | claude-fable-5 | (n/a) | (n/a) |
-| standard | claude-opus-4-8 | grok-build | (no -m flag) |
-| cost-efficient | claude-sonnet-4-6 | (n/a) | (n/a) |
+| standard | claude-opus-5 | grok-4.5 | (no -m flag) |
+| cost-efficient | claude-sonnet-5 | (n/a) | (n/a) |
 | cheapest | claude-haiku-4-5-20251001 | (n/a) | (n/a) |
 
 Codex routes are always explicit (`byIdPrefix` or `taskClasses` in `routing`); Codex is never inferred from a model string.

@@ -1673,7 +1673,7 @@ mod tests {
         assert!(merged.providers["grok"].enabled);
         assert_eq!(
             merged.providers["grok"].tiers.get("standard"),
-            Some(&Some("grok-build".to_string())),
+            Some(&Some(crate::loop_engine::model::GROK_MODEL.to_string())),
             "grok keeps its default ladder under field-wise merge"
         );
         assert!(merged.providers["claude"].enabled, "claude untouched");
