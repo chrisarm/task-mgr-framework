@@ -46,16 +46,13 @@ use task_mgr::loop_engine::config::PermissionMode;
 use task_mgr::loop_engine::engine::{
     EffectiveRunnerInput, IterationContext, resolve_effective_runner,
 };
-use task_mgr::loop_engine::model::{FABLE_MODEL, HAIKU_MODEL, OPUS_MODEL, Provider, SONNET_MODEL};
+use task_mgr::loop_engine::model::{
+    FABLE_MODEL, GROK_MODEL, HAIKU_MODEL, OPUS_MODEL, Provider, SONNET_MODEL,
+};
 use task_mgr::loop_engine::project_config::{ModelsConfig, RoutingConfig};
 use task_mgr::loop_engine::prompt::slot::{SlotPromptBundle, SlotPromptParams, build_prompt};
 use task_mgr::loop_engine::runner::RunnerKind;
 use task_mgr::models::Task;
-
-/// The grok CLI's only model id (the builtin Grok ladder's single rung). Not a
-/// Claude id, so the no_hardcoded_models guard (which matches `claude-*` only)
-/// does not flag this literal — mirrors `overflow_fallback_rung.rs`.
-const GROK_MODEL: &str = "grok-build";
 
 // ── Fixtures ────────────────────────────────────────────────────────────────
 
@@ -76,7 +73,7 @@ fn project_root() -> TempDir {
 
 /// The shared provider-first `models` block for the matrix: all three providers
 /// enabled, `anchor = standard`. Claude carries the full ladder; Grok carries
-/// its single `grok-build` rung; Codex carries a provider-only `standard` rung
+/// its single `GROK_MODEL` rung; Codex carries a provider-only `standard` rung
 /// (null model → spawn with no `-m` flag). Routing is supplied per-test.
 fn full_models() -> ModelsConfig {
     serde_json::from_value(json!({
@@ -203,7 +200,7 @@ fn review_class_forces_frontier_when_no_route_overrides() {
 /// A `routing.byIdPrefix` route on a REVIEW id beats the built-in
 /// review→frontier force: the route runs at rung BY_ID_PREFIX, BEFORE the class
 /// rung. The REVIEW task lands on the route's grok provider at the anchor window
-/// (medium → standard → grok-build), NOT frontier FABLE.
+/// (medium → standard → GROK_MODEL), NOT frontier FABLE.
 #[test]
 fn byidprefix_route_beats_review_class_force() {
     let (_tmp, conn) = setup_migrated_db();
@@ -217,7 +214,7 @@ fn byidprefix_route_beats_review_class_force() {
         model.as_deref(),
         Some(GROK_MODEL),
         "the byIdPrefix grok route (rung BY_ID_PREFIX) beats the built-in review→frontier force \
-         (rung TASK_CLASS); the route's anchor-window tier (standard) resolves grok-build",
+         (rung TASK_CLASS); the route's anchor-window tier (standard) resolves GROK_MODEL",
     );
     assert_eq!(
         hint,

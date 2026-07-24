@@ -2,6 +2,8 @@
 
 You have unrestricted tool access. Just use any tool you need.
 
+**Never delete or revert files you did not author.** You are operating in a working tree that may already contain the operator's uncommitted files and artifacts from earlier work. To stop tracking a file, use `git rm --cached <path>` — index-only, the file stays on disk. NEVER run a bare `git rm <path>`, `rm <path>`, `git clean`, `git reset --hard`, or `git checkout -- <path>` against any file your task did not create or modify; those physically delete or revert work and have caused real data loss. If a stray or untracked file seems to be in your way, leave it on disk and report it — do not remove it.
+
 ## Current Task
 
 ```json

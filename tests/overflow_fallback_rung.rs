@@ -11,7 +11,7 @@
 //!     rung 4 and lands on `Blocked` (no re-promote, no second tasks.model
 //!     UPDATE).
 //!   * `RecoveryAction::FallbackToProvider` serde shape:
-//!     `{"action":"fallback_to_provider","provider":"grok","model":"grok-build"}`.
+//!     `{"action":"fallback_to_provider","provider":"grok","model":"<GROK_MODEL>"}`.
 
 use std::path::Path;
 
@@ -19,16 +19,16 @@ use rusqlite::Connection;
 use tempfile::TempDir;
 
 use task_mgr::loop_engine::engine::IterationContext;
-use task_mgr::loop_engine::model::{FABLE_MODEL, ONE_M_SUFFIX, OPUS_MODEL};
+use task_mgr::loop_engine::model::{FABLE_MODEL, GROK_MODEL, ONE_M_SUFFIX, OPUS_MODEL};
 use task_mgr::loop_engine::overflow::{OverflowEvent, RecoveryAction};
 use task_mgr::loop_engine::project_config::{ModelsConfig, ProjectConfig};
 use task_mgr::loop_engine::prompt::PromptResult;
 use task_mgr::loop_engine::reactions::post_output::{HandleOverflowParams, handle_overflow};
 use task_mgr::loop_engine::runner::RunnerKind;
 
-/// PRD-mandated default Grok model id for the fallback rung — the model the
-/// builtin Grok provider ladder maps its single (Standard) rung to.
-const GROK_DEFAULT_MODEL: &str = "grok-build";
+/// Default Grok model id for the fallback rung — the model the builtin Grok
+/// provider ladder maps its single (Standard) rung to.
+const GROK_DEFAULT_MODEL: &str = GROK_MODEL;
 
 /// The new Claude overflow ceiling: the 1M-context variant of the frontier
 /// (fable) model. The legacy ceiling was the 1M Opus variant; the provider-first
@@ -681,5 +681,5 @@ fn user_message_fallback_to_provider_exact_string() {
 #[test]
 fn test_file_compiles_marker() {
     let _ = format!("{OPUS_MODEL}{ONE_M_SUFFIX}");
-    assert_eq!(GROK_DEFAULT_MODEL, "grok-build");
+    assert_eq!(GROK_DEFAULT_MODEL, GROK_MODEL);
 }

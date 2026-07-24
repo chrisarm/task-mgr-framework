@@ -751,7 +751,7 @@ fn harness_fixtures_are_production_shaped_and_setup_works() {
 
 use task_mgr::loop_engine::engine::IterationContext;
 use task_mgr::loop_engine::model::{
-    FABLE_MODEL, HAIKU_MODEL, ONE_M_SUFFIX, OPUS_MODEL, SONNET_MODEL,
+    FABLE_MODEL, GROK_MODEL, HAIKU_MODEL, ONE_M_SUFFIX, OPUS_MODEL, SONNET_MODEL,
 };
 use task_mgr::loop_engine::reactions::account::{
     AccountUsageGateParams, UsageGateFn, account_usage_gate_inner,
@@ -1425,7 +1425,7 @@ fn handle_overflow_rung4_fallback_to_provider_when_enabled() {
         action,
         RecoveryAction::FallbackToProvider {
             provider: "grok".to_string(),
-            model: "grok-build".to_string(),
+            model: GROK_MODEL.to_string(),
         },
         "rung 4: Claude ladder exhausted + fallback enabled ⇒ pivot to the Grok runner",
     );
@@ -1433,7 +1433,7 @@ fn handle_overflow_rung4_fallback_to_provider_when_enabled() {
     assert_eq!(task_status(&conn, "OF-R4").as_deref(), Some("todo"));
     assert_eq!(
         ctx.model_overrides.get("OF-R4").map(String::as_str),
-        Some("grok-build"),
+        Some(GROK_MODEL),
         "rung 4 must record the cross-provider model override on ctx",
     );
     assert_eq!(

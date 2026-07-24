@@ -31,17 +31,13 @@ use tempfile::TempDir;
 use task_mgr::loop_engine::engine::{
     EffectiveRunnerInput, IterationContext, resolve_effective_runner,
 };
-use task_mgr::loop_engine::model::{FABLE_MODEL, ONE_M_SUFFIX, SONNET_MODEL};
+use task_mgr::loop_engine::model::{FABLE_MODEL, GROK_MODEL, ONE_M_SUFFIX, SONNET_MODEL};
 use task_mgr::loop_engine::overflow::RecoveryAction;
 use task_mgr::loop_engine::project_config::{ModelsConfig, ProjectConfig};
 use task_mgr::loop_engine::prompt::PromptResult;
 use task_mgr::loop_engine::reactions::post_output::{HandleOverflowParams, handle_overflow};
 use task_mgr::loop_engine::reactions::pre_spawn::invalidate_stale_overrides;
 use task_mgr::loop_engine::runner::RunnerKind;
-
-/// The grok CLI's only model id (the builtin Grok ladder's single rung). Not a
-/// Claude id, so no_hardcoded_models (matches `claude-*` only) does not flag it.
-const GROK_MODEL: &str = "grok-build";
 
 /// The Claude overflow ceiling: the 1M-context variant of the frontier (fable)
 /// model. At `(fable[1m], effort=high)` rungs 1–3 are exhausted, so the ladder
