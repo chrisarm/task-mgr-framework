@@ -258,16 +258,21 @@ pub fn is_frontier_class(id: &str) -> bool {
 pub const CLAUDE_EFFORT_FOR_DIFFICULTY: &[(&str, &str)] =
     &[("low", "low"), ("medium", "medium"), ("high", "high")];
 
-/// Grok difficulty → `--effort` level.
+/// Grok difficulty → `--effort` / `--reasoning-effort` level.
 ///
-/// Scaling: low → medium, medium → high, high → xhigh.
+/// Scaling: low → medium, medium → high, high → high.
+///
+/// Capped at `high` by CLI constraint: grok 0.2.x accepts only
+/// `high|medium|low` and rejects `xhigh` with a hard error before the
+/// session starts. `validate_models_config` rejects an `xhigh` grok effort
+/// entry for the same reason.
 pub const GROK_EFFORT_FOR_DIFFICULTY: &[(&str, &str)] =
-    &[("low", "medium"), ("medium", "high"), ("high", "xhigh")];
+    &[("low", "medium"), ("medium", "high"), ("high", "high")];
 
 /// Static fallback used by prompt builders when no per-provider effort entry is
 /// found. Identical to `GROK_EFFORT_FOR_DIFFICULTY`.
 pub const EFFORT_FOR_DIFFICULTY: &[(&str, &str)] =
-    &[("low", "medium"), ("medium", "high"), ("high", "xhigh")];
+    &[("low", "medium"), ("medium", "high"), ("high", "high")];
 
 /// Codex difficulty → `-c model_reasoning_effort=` level.
 ///
@@ -275,8 +280,8 @@ pub const EFFORT_FOR_DIFFICULTY: &[(&str, &str)] =
 /// `none|minimal|low|medium|high|xhigh` (spike-confirmed against codex-cli
 /// 0.136.0, 2026-06-09), but the loop forbids `xhigh` so a runaway reasoning
 /// budget can never be configured. `validate_models_config` rejects an `xhigh`
-/// codex effort entry naming the policy. Unlike `EFFORT_FOR_DIFFICULTY` (Claude
-/// /Grok), codex maps each difficulty to the same-named effort level.
+/// codex effort entry naming the policy. Unlike `EFFORT_FOR_DIFFICULTY` (Grok
+/// static fallback), codex maps each difficulty to the same-named effort level.
 /// The flag is emitted by build_codex_argv (BEFORE the exec subcommand) when
 /// the selected runner supports Effort (now true for CodexRunner).
 pub const CODEX_EFFORT_FOR_DIFFICULTY: &[(&str, &str)] =
@@ -1346,18 +1351,29 @@ mod tests {
     fn test_effort_for_difficulty_new_mapping() {
         assert_eq!(
             EFFORT_FOR_DIFFICULTY,
-            &[("low", "medium"), ("medium", "high"), ("high", "xhigh"),],
-            "difficulty→effort ladder must be medium/high/xhigh (max retired)"
+            &[("low", "medium"), ("medium", "high"), ("high", "high"),],
+            "difficulty→effort ladder must be medium/high/high (xhigh rejected by grok CLI)"
+        );
+        assert_eq!(
+            GROK_EFFORT_FOR_DIFFICULTY, EFFORT_FOR_DIFFICULTY,
+            "static fallback must stay identical to the grok table"
         );
     }
 
     #[test]
-    fn test_effort_for_difficulty_never_produces_max() {
+    fn test_effort_for_difficulty_never_produces_max_or_xhigh() {
         for (_, effort) in EFFORT_FOR_DIFFICULTY {
             assert_ne!(
                 *effort, "max",
                 "max effort is retired — no difficulty should map to it"
             );
+            assert_ne!(
+                *effort, "xhigh",
+                "xhigh is not a grok CLI effort level — no difficulty should map to it"
+            );
+        }
+        for (_, effort) in GROK_EFFORT_FOR_DIFFICULTY {
+            assert_ne!(*effort, "xhigh", "grok table must not emit xhigh");
         }
     }
 

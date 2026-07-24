@@ -956,8 +956,12 @@
       "touchesFiles": [
         "src/loop_engine/",
         "tests/"
-      ]
+      ],
+      "notes": "[IRRELEVANT 2026-07-24] Effort complete on main; remaining open task is stale bookkeeping, not unfinished work.",
+      "status": "irrelevant"
     }
   ],
-  "version": "1.0"
+  "version": "1.0",
+  "archivedAt": "2026-07-24",
+  "archivedReason": "Stale effort archived 2026-07-24: Shipped as PR #22; open MILESTONE-FINAL was stale."
 }

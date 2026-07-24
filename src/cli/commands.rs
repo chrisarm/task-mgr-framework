@@ -1707,7 +1707,8 @@ EXAMPLES:
         provider: String,
         /// Difficulty: low | medium | high
         difficulty: String,
-        /// Effort level; omit for a `null` entry (no effort flag). Codex rejects "xhigh".
+        /// Effort level; omit for a `null` entry (no effort flag).
+        /// Codex rejects "xhigh" by policy; grok rejects "xhigh" (CLI only accepts low|medium|high).
         effort: Option<String>,
     },
 

@@ -217,7 +217,7 @@
       "estimatedEffort": "low",
       "id": "REVIEW-001",
       "model": "claude-opus-4-7",
-      "notes": "If issues found: add FIX-xxx tasks to JSON (priority 50-97), commit. Empirical test command: `CLAUDE_BINARY=/tmp/claude-log-argv.sh target/release/task-mgr curate dedup --dry-run --concurrency 1`. Argv-log wrapper already exists at /tmp/claude-log-argv.sh from earlier investigation.",
+      "notes": "If issues found: add FIX-xxx tasks to JSON (priority 50-97), commit. Empirical test command: `CLAUDE_BINARY=/tmp/claude-log-argv.sh target/release/task-mgr curate dedup --dry-run --concurrency 1`. Argv-log wrapper already exists at /tmp/claude-log-argv.sh from earlier investigation.\n[IRRELEVANT 2026-07-24] Effort complete on main; remaining open task is stale bookkeeping, not unfinished work.",
       "passes": false,
       "priority": 99,
       "title": "Code review + empirical verification",
@@ -226,8 +226,11 @@
         "src/commands/curate/mod.rs",
         "src/commands/curate/enrich.rs",
         "CLAUDE.md"
-      ]
+      ],
+      "status": "irrelevant"
     }
   ],
-  "version": "1.0"
+  "version": "1.0",
+  "archivedAt": "2026-07-24",
+  "archivedReason": "Stale effort archived 2026-07-24: Feature merged (feat/curate-session-cleanup); open REVIEW was stale bookkeeping."
 }

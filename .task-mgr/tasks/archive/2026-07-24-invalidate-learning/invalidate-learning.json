@@ -537,14 +537,17 @@
       "id": "MILESTONE-FINAL",
       "model": "claude-opus-4-6",
       "modifiesBehavior": false,
-      "notes": "Merge gate. All quality checks green.",
+      "notes": "Merge gate. All quality checks green.\n[IRRELEVANT 2026-07-24] Effort complete on main; remaining open task is stale bookkeeping, not unfinished work.",
       "passes": false,
       "priority": 99,
       "synergyWith": [],
       "timeoutSecs": 1800,
       "title": "Ready for merge",
-      "touchesFiles": []
+      "touchesFiles": [],
+      "status": "irrelevant"
     }
   ],
-  "version": "1.0"
+  "version": "1.0",
+  "archivedAt": "2026-07-24",
+  "archivedReason": "Stale effort archived 2026-07-24: CLI + two-step degradation shipped; open MILESTONE-FINAL was stale."
 }

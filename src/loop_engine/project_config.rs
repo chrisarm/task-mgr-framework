@@ -55,6 +55,7 @@ pub struct ProviderConfig {
     pub tiers: HashMap<String, Option<String>>,
     /// Difficulty (`"low"`/`"medium"`/`"high"`) → effort level. `null` value =
     /// no effort flag. Codex must not map to `"xhigh"` (policy cap; validated).
+    /// Grok must not map to `"xhigh"` (CLI accepts only low|medium|high).
     #[serde(default)]
     pub effort: HashMap<String, Option<String>>,
     /// Tier-preserving cross-provider fallback target. Must be a DIFFERENT,
@@ -392,6 +393,7 @@ pub fn legacy_model_keys_message(keys: &[&str]) -> String {
 /// - a malformed or disabled `primaryProvider`, a malformed `anchor`,
 /// - ambiguous reverse model lookups (two tiers → one model),
 /// - codex effort `xhigh` (by policy),
+/// - grok effort `xhigh` (CLI accepts only high|medium|low),
 /// - a `fallback` to self or to a disabled / unknown provider,
 /// - routes referencing disabled / unknown providers or malformed forced tiers,
 /// - the premature `routing.reviewCascade` key (deferred — not yet supported).
@@ -462,6 +464,23 @@ pub fn validate_models_config(
                     errors.push(format!(
                         "models.providers.{name}.effort.{difficulty}: codex effort \"xhigh\" is \
                          rejected by policy (allowed: low, medium, high)"
+                    ));
+                }
+            }
+        }
+
+        // Grok CLI constraint (not policy): `--effort` / `--reasoning-effort`
+        // accepts only high|medium|low. Passing xhigh fails before spawn with
+        // "unknown effort level 'xhigh'".
+        if provider == Some(Provider::Grok) {
+            for (difficulty, level) in &pcfg.effort {
+                if level
+                    .as_deref()
+                    .is_some_and(|l| l.trim().eq_ignore_ascii_case("xhigh"))
+                {
+                    errors.push(format!(
+                        "models.providers.{name}.effort.{difficulty}: grok effort \"xhigh\" is \
+                         rejected by the grok CLI (allowed: low, medium, high)"
                     ));
                 }
             }
@@ -1747,6 +1766,39 @@ mod tests {
             errs.iter()
                 .any(|e| e.contains("xhigh") && e.contains("policy")),
             "codex xhigh must be rejected by policy: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_grok_effort_xhigh_by_cli_constraint() {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "claude".to_string(),
+            ProviderConfig {
+                enabled: true,
+                tiers: HashMap::from([("standard".to_string(), Some(OPUS_MODEL.to_string()))]),
+                ..Default::default()
+            },
+        );
+        providers.insert(
+            "grok".to_string(),
+            ProviderConfig {
+                enabled: true,
+                tiers: HashMap::from([("standard".to_string(), Some("grok-build".to_string()))]),
+                effort: HashMap::from([("high".to_string(), Some("xhigh".to_string()))]),
+                ..Default::default()
+            },
+        );
+        let models = ModelsConfig {
+            primary_provider: "claude".to_string(),
+            anchor: "standard".to_string(),
+            providers,
+        };
+        let errs = validate_models_config(&models, &RoutingConfig::default()).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("xhigh") && e.contains("grok") && e.contains("CLI")),
+            "grok xhigh must be rejected as a CLI constraint: {errs:?}"
         );
     }
 

@@ -280,42 +280,43 @@ pub fn init(
 
         let prd: PrdFile = serde_json::from_str(&content)?;
 
-        // Resolve prefix from first PRD file (CLI override > auto-generate).
-        // In Auto mode, always generate deterministically from branchName + filename.
-        // The JSON's taskPrefix field is ignored — it was previously used as a cache
-        // but caused mismatch bugs when agents or worktree copies modified it.
-        if file_idx == 0 {
-            resolved_prefix = match &prefix_mode {
-                PrefixMode::Disabled => None,
-                PrefixMode::Explicit(p) => Some(p.clone()),
-                PrefixMode::Auto => {
-                    let filename = json_path
-                        .file_name()
-                        .and_then(|f| f.to_str())
-                        .unwrap_or("unknown.json");
-                    let generated = generate_prefix(prd.branch_name.as_deref(), filename);
-                    if prd.task_prefix.as_deref() != Some(&generated) {
-                        if prd.task_prefix.is_some() {
-                            ui::emit(&format!(
-                                "Note: ignoring JSON taskPrefix '{}', using deterministic prefix '{}'",
-                                prd.task_prefix.as_deref().unwrap_or(""),
-                                generated,
-                            ));
-                        }
-                        if !dry_run {
-                            let _ = write_prefix_to_json(json_path, &generated);
-                        }
+        // Resolve prefix per PRD file (CLI override > auto-generate).
+        // In Auto mode, generate deterministically from each file's branchName + filename
+        // so batch init can import multiple PRDs that share raw task IDs (REFACTOR-001, etc.).
+        // Explicit mode still applies one CLI prefix to every file in the batch.
+        let file_prefix = match &prefix_mode {
+            PrefixMode::Disabled => None,
+            PrefixMode::Explicit(p) => Some(p.clone()),
+            PrefixMode::Auto => {
+                let filename = json_path
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .unwrap_or("unknown.json");
+                let generated = generate_prefix(prd.branch_name.as_deref(), filename);
+                if prd.task_prefix.as_deref() != Some(&generated) {
+                    if prd.task_prefix.is_some() {
+                        ui::emit(&format!(
+                            "Note: ignoring JSON taskPrefix '{}', using deterministic prefix '{}'",
+                            prd.task_prefix.as_deref().unwrap_or(""),
+                            generated,
+                        ));
                     }
-                    Some(generated)
+                    if !dry_run {
+                        let _ = write_prefix_to_json(json_path, &generated);
+                    }
                 }
-            };
+                Some(generated)
+            }
+        };
+        if file_idx == 0 {
+            resolved_prefix = file_prefix.clone();
         }
 
         // Process stories — collect raw IDs first for duplicate checking,
         // then apply prefix after all validation
         for story in &prd.user_stories {
             // Track all IDs for dependency validation (with prefix applied)
-            let effective_id = if let Some(ref pfx) = resolved_prefix {
+            let effective_id = if let Some(ref pfx) = file_prefix {
                 prefix_id(pfx, &story.id)
             } else {
                 story.id.clone()
@@ -325,7 +326,7 @@ pub fn init(
             if append && existing_ids.contains(&effective_id) {
                 if update_existing {
                     let mut s = story.clone();
-                    if let Some(ref pfx) = resolved_prefix {
+                    if let Some(ref pfx) = file_prefix {
                         prefix_story(pfx, &mut s);
                     }
                     stories_to_update.push(s);
@@ -360,7 +361,7 @@ pub fn init(
                 review_guidelines: prd.review_guidelines.clone(),
                 user_stories: Vec::new(), // We'll collect stories separately
                 external_git_repo: prd.external_git_repo.clone(),
-                task_prefix: resolved_prefix.clone().or(prd.task_prefix.clone()),
+                task_prefix: file_prefix.clone().or(prd.task_prefix.clone()),
                 prd_file: prd.prd_file.clone(),
                 model: prd.model.clone(),
                 default_max_retries: prd.default_max_retries,
@@ -380,7 +381,7 @@ pub fn init(
                 review_guidelines: None,
                 user_stories: Vec::new(),
                 external_git_repo: None,
-                task_prefix: None,
+                task_prefix: file_prefix.clone(),
                 prd_file: prd.prd_file.clone(),
                 model: None,
                 default_max_retries: None,
@@ -390,7 +391,7 @@ pub fn init(
 
         // Collect new stories (with prefix applied)
         for story in prd.user_stories {
-            let effective_id = if let Some(ref pfx) = resolved_prefix {
+            let effective_id = if let Some(ref pfx) = file_prefix {
                 prefix_id(pfx, &story.id)
             } else {
                 story.id.clone()
@@ -401,7 +402,7 @@ pub fn init(
             }
 
             let mut s = story;
-            if let Some(ref pfx) = resolved_prefix {
+            if let Some(ref pfx) = file_prefix {
                 prefix_story(pfx, &mut s);
             }
             all_stories.push(s);

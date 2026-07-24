@@ -425,7 +425,8 @@ pub fn handle_set_effort(
         &["models", "providers", p.as_str(), "effort", &key],
         Some(leaf),
     )?;
-    // build_and_validate enforces the codex `xhigh` policy cap.
+    // build_and_validate enforces the codex `xhigh` policy cap and the grok
+    // CLI constraint (high|medium|low only).
     validate_and_write(db_dir, &value)?;
     ui::emit_data(&format!("Set {}.effort.{key} -> {display}", p.as_str()));
     Ok(())
@@ -1166,6 +1167,24 @@ mod tests {
         assert!(
             msg.contains("policy"),
             "codex xhigh must be rejected by policy: {msg}"
+        );
+    }
+
+    #[test]
+    fn set_effort_grok_xhigh_rejected_by_cli_constraint() {
+        let dir = tempfile::tempdir().unwrap();
+        // Pre-enable grok so the write path reaches effort validation.
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{"version":1,"models":{"providers":{"grok":{"enabled":true}}}}"#,
+        )
+        .unwrap();
+        let err = handle_set_effort(dir.path(), "grok", "high", Some("xhigh")).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("CONFIG ERROR"), "{msg}");
+        assert!(
+            msg.contains("CLI") || msg.contains("grok"),
+            "grok xhigh must be rejected as a CLI constraint: {msg}"
         );
     }
 

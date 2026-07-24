@@ -1,0 +1,65 @@
+STALE curate-session-cleanup -> .task-mgr/tasks/archive/2026-07-24-curate-session-cleanup
+  wrote .task-mgr/tasks/archive/2026-07-24-curate-session-cleanup/curate-session-cleanup.json (annotated)
+  removed tasks/curate-session-cleanup.json
+  moved tasks/curate-session-cleanup-prompt.md -> .task-mgr/tasks/archive/2026-07-24-curate-session-cleanup/curate-session-cleanup-prompt.md
+
+STALE data-driven-prompt-construction -> .task-mgr/tasks/archive/2026-07-24-data-driven-prompt-construction
+  wrote .task-mgr/tasks/archive/2026-07-24-data-driven-prompt-construction/data-driven-prompt-construction.json (annotated)
+  removed tasks/data-driven-prompt-construction.json
+  moved tasks/data-driven-prompt-construction-prompt.md -> .task-mgr/tasks/archive/2026-07-24-data-driven-prompt-construction/data-driven-prompt-construction-prompt.md
+
+STALE invalidate-learning -> .task-mgr/tasks/archive/2026-07-24-invalidate-learning
+  wrote .task-mgr/tasks/archive/2026-07-24-invalidate-learning/invalidate-learning.json (annotated)
+  removed tasks/invalidate-learning.json
+  moved tasks/prd-invalidate-learning.md -> .task-mgr/tasks/archive/2026-07-24-invalidate-learning/prd-invalidate-learning.md
+
+STALE learning-dedup-embedding-guard -> .task-mgr/tasks/archive/2026-07-24-learning-dedup-embedding-guard
+  wrote .task-mgr/tasks/archive/2026-07-24-learning-dedup-embedding-guard/learning-dedup-embedding-guard.json (annotated)
+  removed tasks/learning-dedup-embedding-guard.json
+  moved tasks/learning-dedup-embedding-guard-prompt.md -> .task-mgr/tasks/archive/2026-07-24-learning-dedup-embedding-guard/learning-dedup-embedding-guard-prompt.md
+
+STALE model-selection-redesign -> .task-mgr/tasks/archive/2026-07-24-model-selection-redesign
+  wrote .task-mgr/tasks/archive/2026-07-24-model-selection-redesign/model-selection-redesign.json (annotated)
+  removed tasks/model-selection-redesign.json
+  moved tasks/model-selection-redesign-prompt.md -> .task-mgr/tasks/archive/2026-07-24-model-selection-redesign/model-selection-redesign-prompt.md
+  moved tasks/prd-model-selection-redesign.md -> .task-mgr/tasks/archive/2026-07-24-model-selection-redesign/prd-model-selection-redesign.md
+
+STALE overflow-harden -> .task-mgr/tasks/archive/2026-07-24-overflow-recovery-and-diagnostics
+  wrote .task-mgr/tasks/archive/2026-07-24-overflow-recovery-and-diagnostics/overflow-harden.json (annotated)
+  removed tasks/overflow-harden.json
+  moved tasks/overflow-harden-prompt.md -> .task-mgr/tasks/archive/2026-07-24-overflow-recovery-and-diagnostics/overflow-harden-prompt.md
+  moved tasks/prd-overflow-recovery-and-diagnostics.md -> .task-mgr/tasks/archive/2026-07-24-overflow-recovery-and-diagnostics/prd-overflow-recovery-and-diagnostics.md
+
+STALE parallel-task-execution -> .task-mgr/tasks/archive/2026-07-24-parallel-task-execution
+  wrote .task-mgr/tasks/archive/2026-07-24-parallel-task-execution/parallel-task-execution.json (annotated)
+  removed tasks/parallel-task-execution.json
+  moved tasks/parallel-task-execution-prompt.md -> .task-mgr/tasks/archive/2026-07-24-parallel-task-execution/parallel-task-execution-prompt.md
+  moved tasks/prd-parallel-task-execution.md -> .task-mgr/tasks/archive/2026-07-24-parallel-task-execution/prd-parallel-task-execution.md
+
+STALE reactions-framework-convergence -> .task-mgr/tasks/archive/2026-07-24-reactions-framework-convergence
+  wrote .task-mgr/tasks/archive/2026-07-24-reactions-framework-convergence/reactions-framework-convergence.json (annotated)
+  removed tasks/reactions-framework-convergence.json
+  moved tasks/reactions-framework-convergence-prompt.md -> .task-mgr/tasks/archive/2026-07-24-reactions-framework-convergence/reactions-framework-convergence-prompt.md
+  moved tasks/prd-reactions-framework-convergence.md -> .task-mgr/tasks/archive/2026-07-24-reactions-framework-convergence/prd-reactions-framework-convergence.md
+
+COMPLETE harden-baseline-tier-routing -> .task-mgr/tasks/archive/2026-07-24-harden-baseline-tier-routing
+  wrote .task-mgr/tasks/archive/2026-07-24-harden-baseline-tier-routing/harden-baseline-tier-routing.json (annotated)
+  removed tasks/harden-baseline-tier-routing.json
+  moved tasks/harden-baseline-tier-routing-prompt.md -> .task-mgr/tasks/archive/2026-07-24-harden-baseline-tier-routing/harden-baseline-tier-routing-prompt.md
+  moved tasks/prd-harden-baseline-tier-routing.md -> .task-mgr/tasks/archive/2026-07-24-harden-baseline-tier-routing/prd-harden-baseline-tier-routing.md
+
+COMPLETE logging-standardization -> .task-mgr/tasks/archive/2026-07-24-logging-standardization
+  wrote .task-mgr/tasks/archive/2026-07-24-logging-standardization/logging-standardization.json (annotated)
+  removed tasks/logging-standardization.json
+  moved tasks/logging-standardization-prompt.md -> .task-mgr/tasks/archive/2026-07-24-logging-standardization/logging-standardization-prompt.md
+  moved tasks/logging-standardization-spike.md -> .task-mgr/tasks/archive/2026-07-24-logging-standardization/logging-standardization-spike.md
+
+COMPLETE scoped-permissions -> .task-mgr/tasks/archive/2026-07-24-scoped-permissions
+  wrote .task-mgr/tasks/archive/2026-07-24-scoped-permissions/scoped-permissions.json (annotated)
+  removed tasks/scoped-permissions.json
+  moved tasks/scoped-permissions-prompt.md -> .task-mgr/tasks/archive/2026-07-24-scoped-permissions/scoped-permissions-prompt.md
+
+NOTE already deleted from disk (will git rm if tracked): tasks/batch-chain-incomplete-stop.json
+NOTE already deleted from disk (will git rm if tracked): tasks/cost-efficient-auxiliary-llm.json
+NOTE already deleted from disk (will git rm if tracked): tasks/doctor-orphan-prd-check.json
+NOTE already deleted from disk (will git rm if tracked): tasks/wrapper-commit-baseline-diff.json

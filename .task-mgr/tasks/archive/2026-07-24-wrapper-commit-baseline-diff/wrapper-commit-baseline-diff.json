@@ -165,7 +165,7 @@
       "description": "Review the wrapper-commit baseline-diff implementation for DRY violations, complexity, coupling, and clarity.\n\nDO: Check the `-z` parser for duplicated logic vs worktree.rs's `dirty_tracked_paths` (consider whether a shared porcelain parser is warranted or whether duplication is acceptable for `-z` vs column form); verify wrapper_commit stays a single-responsibility function under ~40 lines; confirm the threading adds no needless indirection.\nDO NOT: Skip — this gate catches issues before final review. Do NOT force a premature abstraction if the `-z` and column parsers genuinely differ.",
       "estimatedEffort": "high",
       "id": "REFACTOR-001",
-      "notes": "If issues found: `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001` for each (priority 50-97) — atomic DB+JSON sync. If no issues, invoke /simplify on any ugly touchpoint, then emit `<task-status>REFACTOR-001:done</task-status>` with a one-line note. Use the rust-python-code-reviewer agent.",
+      "notes": "If issues found: `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001` for each (priority 50-97) — atomic DB+JSON sync. If no issues, invoke /simplify on any ugly touchpoint, then emit `<task-status>REFACTOR-001:done</task-status>` with a one-line note. Use the rust-python-code-reviewer agent.\n[IRRELEVANT 2026-07-24] Effort complete on main (PR #34 squash-merged); remaining open task is stale bookkeeping.",
       "passes": false,
       "priority": 98,
       "qualityDimensions": [
@@ -180,7 +180,8 @@
         "src/loop_engine/git_reconcile.rs",
         "src/loop_engine/reactions/post_completion.rs",
         "src/loop_engine/orchestrator.rs"
-      ]
+      ],
+      "status": "irrelevant"
     },
     {
       "acceptanceCriteria": [
@@ -224,5 +225,7 @@
       ]
     }
   ],
-  "version": "1.0"
+  "version": "1.0",
+  "archivedAt": "2026-07-24",
+  "archivedReason": "Completed effort archived 2026-07-24: wrapper-commit baseline diff (PR #34)."
 }

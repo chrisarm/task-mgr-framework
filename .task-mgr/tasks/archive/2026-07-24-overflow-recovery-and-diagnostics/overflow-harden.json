@@ -253,7 +253,7 @@
       "estimatedEffort": "medium",
       "id": "REVIEW-001",
       "model": "claude-opus-4-7",
-      "notes": "Spawn fixes via `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001`. If no issues: emit `<task-status>REVIEW-001:done</task-status>` with 'Clean review' note. The 4 KB JSONL warning is the most likely source of subtle issues — verify the boundary (4096 == no warning, 4097 == warning) with a focused test if not already covered. Tests run via `cargo test 2>&1 | tee /tmp/test-results.txt | tail -5 && grep 'FAILED\\|test result: FAILED' /tmp/test-results.txt | head -10` per CLAUDE.md test protocol.",
+      "notes": "Spawn fixes via `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001`. If no issues: emit `<task-status>REVIEW-001:done</task-status>` with 'Clean review' note. The 4 KB JSONL warning is the most likely source of subtle issues — verify the boundary (4096 == no warning, 4097 == warning) with a focused test if not already covered. Tests run via `cargo test 2>&1 | tee /tmp/test-results.txt | tail -5 && grep 'FAILED\\|test result: FAILED' /tmp/test-results.txt | head -10` per CLAUDE.md test protocol.\n[IRRELEVANT 2026-07-24] Effort complete on main; remaining open task is stale bookkeeping, not unfinished work.",
       "passes": false,
       "priority": 99,
       "qualityDimensions": [
@@ -269,7 +269,8 @@
         "src/loop_engine/overflow.rs",
         "tests/overflow_filesystem.rs",
         "CLAUDE.md"
-      ]
+      ],
+      "status": "irrelevant"
     },
     {
       "acceptanceCriteria": [
@@ -290,5 +291,7 @@
       ]
     }
   ],
-  "version": "1.0"
+  "version": "1.0",
+  "archivedAt": "2026-07-24",
+  "archivedReason": "Stale effort archived 2026-07-24: Overflow recovery + diagnostics on main; open REVIEW was stale."
 }

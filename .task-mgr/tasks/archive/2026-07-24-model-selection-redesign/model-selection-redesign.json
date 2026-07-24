@@ -275,7 +275,7 @@
       "id": "FEAT-002",
       "model": "claude-opus-4-8",
       "modifiesBehavior": true,
-      "notes": "DELIBERATE deviation from learnings #4670/#4633 (read-time normalizers) per operator decision — hard break, no soft migration. Per-command coverage table in PRD FR-002 is the spec. The interim mutating-verb guard keeps old verbs safe until FEAT-009 deletes them. Grep for every read site of the four legacy fields before deleting (learning 4915: systematic construction/usage-site discovery — production, test helpers, fixtures).",
+      "notes": "DELIBERATE deviation from learnings #4670/#4633 (read-time normalizers) per operator decision — hard break, no soft migration. Per-command coverage table in PRD FR-002 is the spec. The interim mutating-verb guard keeps old verbs safe until FEAT-009 deletes them. Grep for every read site of the four legacy fields before deleting (learning 4915: systematic construction/usage-site discovery — production, test helpers, fixtures).\n[IRRELEVANT 2026-07-24] Effort complete on main; remaining open task is stale bookkeeping, not unfinished work.",
       "passes": false,
       "priority": 6,
       "qualityDimensions": [
@@ -293,7 +293,8 @@
         "src/loop_engine/batch.rs",
         "src/commands/models/handlers.rs",
         "src/loop_engine/config.rs"
-      ]
+      ],
+      "status": "irrelevant"
     },
     {
       "acceptanceCriteria": [
@@ -583,7 +584,7 @@
       "id": "FEAT-007",
       "model": "claude-opus-4-8",
       "modifiesBehavior": true,
-      "notes": "Learning 4921: promote_once owns the single ctx.runner_overrides idempotency guard across all four promotion sites — this task must not add a fifth site or a second guard. Learning 4672/4689: test idempotency explicitly (already-promoted → None). Old escalate_model/escalate_below_opus stay deleted-or-delegating per REFACTOR-005's sweep — this task rewrites their internals to CapabilityTier; final deletion of any remaining shims happens in REFACTOR-005. Ladder behaviors are reactions: honor the single-home contract (exhaustive param-struct destructure, hermetic _inner + injected seams).",
+      "notes": "Learning 4921: promote_once owns the single ctx.runner_overrides idempotency guard across all four promotion sites — this task must not add a fifth site or a second guard. Learning 4672/4689: test idempotency explicitly (already-promoted → None). Old escalate_model/escalate_below_opus stay deleted-or-delegating per REFACTOR-005's sweep — this task rewrites their internals to CapabilityTier; final deletion of any remaining shims happens in REFACTOR-005. Ladder behaviors are reactions: honor the single-home contract (exhaustive param-struct destructure, hermetic _inner + injected seams).\n[IRRELEVANT 2026-07-24] Effort complete on main; remaining open task is stale bookkeeping, not unfinished work.",
       "passes": false,
       "priority": 26,
       "qualityDimensions": [
@@ -599,7 +600,8 @@
         "src/loop_engine/recovery.rs",
         "src/loop_engine/reactions/post_output.rs",
         "src/loop_engine/model.rs"
-      ]
+      ],
+      "status": "irrelevant"
     },
     {
       "acceptanceCriteria": [
@@ -763,7 +765,7 @@
       "id": "FEAT-009",
       "model": "claude-opus-4-8",
       "modifiesBehavior": true,
-      "notes": "Existing handlers.rs already round-trips via serde_json::Value and probes before writing — preserve those patterns under the new verb set. The clap surface changes are operator-facing: keep man-pages/completions generation working (cargo test cli_tests if touched). gen-docs MODELS-block regeneration is FEAT-011's scope; here only ensure constants stay in model.rs.",
+      "notes": "Existing handlers.rs already round-trips via serde_json::Value and probes before writing — preserve those patterns under the new verb set. The clap surface changes are operator-facing: keep man-pages/completions generation working (cargo test cli_tests if touched). gen-docs MODELS-block regeneration is FEAT-011's scope; here only ensure constants stay in model.rs.\n[IRRELEVANT 2026-07-24] Effort complete on main; remaining open task is stale bookkeeping, not unfinished work.",
       "passes": false,
       "priority": 29,
       "qualityDimensions": [
@@ -781,7 +783,8 @@
         "src/commands/models/picker.rs",
         "src/commands/models/ensure_default.rs",
         "src/main.rs"
-      ]
+      ],
+      "status": "irrelevant"
     },
     {
       "acceptanceCriteria": [
@@ -801,7 +804,7 @@
       "estimatedEffort": "high",
       "id": "TEST-010",
       "modifiesBehavior": false,
-      "notes": "Use production-shaped fixtures: tests/fixtures/*.json.tmpl with placeholders rendered by tests/common/mod.rs::render_fixture_tmpl (FEAT-011 adds {{FRONTIER_MODEL}} etc. — coordinate: if this task needs the new placeholders first, add them here and note it for FEAT-011). assert_eq! on exact model-id strings, never contains().",
+      "notes": "Use production-shaped fixtures: tests/fixtures/*.json.tmpl with placeholders rendered by tests/common/mod.rs::render_fixture_tmpl (FEAT-011 adds {{FRONTIER_MODEL}} etc. — coordinate: if this task needs the new placeholders first, add them here and note it for FEAT-011). assert_eq! on exact model-id strings, never contains().\n[IRRELEVANT 2026-07-24] Effort complete on main; remaining open task is stale bookkeeping, not unfinished work.",
       "passes": false,
       "priority": 30,
       "qualityDimensions": [
@@ -822,7 +825,8 @@
         "tests/codex_runner_overrides_invariant.rs",
         "tests/prompt_slot.rs",
         "tests/model_selection_engine_edges.rs"
-      ]
+      ],
+      "status": "irrelevant"
     },
     {
       "acceptanceCriteria": [
@@ -1021,7 +1025,9 @@
       "taskType": "verification",
       "timeoutSecs": 1800,
       "title": "Final verification: success metrics, docs, reachability, no-unwrap audit",
-      "touchesFiles": []
+      "touchesFiles": [],
+      "notes": "[IRRELEVANT 2026-07-24] Effort complete on main; remaining open task is stale bookkeeping, not unfinished work.",
+      "status": "irrelevant"
     },
     {
       "acceptanceCriteria": [
@@ -1052,7 +1058,9 @@
       "taskType": "milestone",
       "timeoutSecs": 1800,
       "title": "Final milestone: trunk green, all tasks passed, merge-ready",
-      "touchesFiles": []
+      "touchesFiles": [],
+      "notes": "[IRRELEVANT 2026-07-24] Effort complete on main; remaining open task is stale bookkeeping, not unfinished work.",
+      "status": "irrelevant"
     },
     {
       "dependsOn": [
@@ -1112,7 +1120,7 @@
       "description": "The spawn site (resolve_execution_plan via both prompt builders) and the overflow ladder (post_output.rs:193) resolve the OPERATOR's config via resolve_models_config(&project_config.models, &project_config.routing) — but three live paths walk builtin_resolved_models() instead: (1) consecutive-failure escalation escalate_task_model_if_needed_inner (recovery.rs:248, writes tasks.model), (2) crash-escalation suggestion crash_escalated_model (reactions/pre_spawn.rs:173), (3) the at-ceiling check in build_escalation_section (prompt_sections/escalation.rs:52, prompt-text only). The derivation FUNCTION is single-homed (escalate_tier/tier_of in model.rs) but the config INPUT diverges — the exact FIX-001 divergence class the section-2.6 modularity rule guards: an operator who remaps Claude tiers (custom ladder, null rungs) gets recovery escalations onto models their config never defined. The acknowledged-tech-debt comment at recovery.rs:241 (call sites predate the provider-first config) marks the seam. Callers (orchestrator/wave_scheduler/iteration) already hold project_config; thread the resolved config through.",
       "estimatedEffort": "medium",
       "id": "REFACTOR-007",
-      "notes": "Found by REFACTOR-REVIEW-FINAL. Sequenced after REFACTOR-006 because both rework recovery.rs signatures — if 006 chooses delete, fewer signatures need the new parameter. anchored_tier/normalize_difficulty single-homing is confirmed intact; this task only fixes the config-input divergence.",
+      "notes": "Found by REFACTOR-REVIEW-FINAL. Sequenced after REFACTOR-006 because both rework recovery.rs signatures — if 006 chooses delete, fewer signatures need the new parameter. anchored_tier/normalize_difficulty single-homing is confirmed intact; this task only fixes the config-input divergence.\n[IRRELEVANT 2026-07-24] Effort complete on main; remaining open task is stale bookkeeping, not unfinished work.",
       "passes": false,
       "priority": 74,
       "title": "Thread operator-resolved ModelsConfig into recovery/pre_spawn crash escalation (replace builtin_resolved_models at live sites)",
@@ -1120,7 +1128,8 @@
         "src/loop_engine/recovery.rs",
         "src/loop_engine/reactions/pre_spawn.rs",
         "src/loop_engine/prompt_sections/escalation.rs"
-      ]
+      ],
+      "status": "irrelevant"
     },
     {
       "acceptanceCriteria": [
@@ -1132,7 +1141,7 @@
       "description": "CLAUDE/GROK/CODEX_DEFAULT_TIER_MODELS (model.rs:228-235, consumed by gen-docs) restate the tier->model assignments that default_claude_provider/default_grok_provider/default_codex_provider build at runtime in project_config.rs:290-328 — two homes with no drift guard, so a rung added to one silently desyncs models-list/gen-docs documentation from actual routing. Additionally the \"grok-build\" literal at project_config.rs:310 (and the dead default_fallback_model at :974) escapes tests/no_hardcoded_models.rs, whose regex only matches claude-(opus|sonnet|haiku|fable) ids. Make the runtime builders consume the *_DEFAULT_TIER_MODELS tables (preferred) or pin table<->builder equality in a test, and extend the no_hardcoded_models guard to grok model ids.",
       "estimatedEffort": "low",
       "id": "REFACTOR-008",
-      "notes": "Found by REFACTOR-REVIEW-FINAL (reviewer agent Warnings #2+#3, merged — same SSoT concern). overflow.rs grok-build hits are #[cfg(test)] code, out of scope.",
+      "notes": "Found by REFACTOR-REVIEW-FINAL (reviewer agent Warnings #2+#3, merged — same SSoT concern). overflow.rs grok-build hits are #[cfg(test)] code, out of scope.\n[IRRELEVANT 2026-07-24] Effort complete on main; remaining open task is stale bookkeeping, not unfinished work.",
       "passes": false,
       "priority": 76,
       "title": "Single-source default tier tables: derive default_*_provider from *_DEFAULT_TIER_MODELS and widen no_hardcoded_models to grok ids",
@@ -1140,7 +1149,8 @@
         "src/loop_engine/model.rs",
         "src/loop_engine/project_config.rs",
         "tests/no_hardcoded_models.rs"
-      ]
+      ],
+      "status": "irrelevant"
     },
     {
       "acceptanceCriteria": [
@@ -1151,7 +1161,7 @@
       "description": "Sequential (iteration.rs:478) drops the spawn provider_hint whenever effective_model != prompt_result.resolved_model; wave (wave_scheduler.rs:836-848) deliberately KEEPS it when effective_model widens to default_model (the Codex provider:codex/model-empty case) and drops only on the crash-escalation/review-routing rewrites. The asymmetry is reasoned and commented, but it lives OUTSIDE the reaction_parity harness (which pins resolve_task_execution, not the post-plan hint handling), so a future edit to either site can silently diverge the paths — the parity-divergence bug class the reactions framework exists to prevent. Extract a shared helper (e.g. final_provider_hint(plan_provider, effective_model, resolved_model, default_model) in reactions or model.rs) used by both dispatch sites, or add an explicit parity test covering the widening case so divergence fails at test time.",
       "estimatedEffort": "low",
       "id": "REFACTOR-009",
-      "notes": "Found by REFACTOR-REVIEW-FINAL (reviewer agent Warning #1). Investigate whether the sequential blanket-drop is actually wrong for the widening case (a latent bug) before choosing helper shape — if sequential drops a hint wave keeps, a Codex task could dispatch to Claude in sequential mode only.",
+      "notes": "Found by REFACTOR-REVIEW-FINAL (reviewer agent Warning #1). Investigate whether the sequential blanket-drop is actually wrong for the widening case (a latent bug) before choosing helper shape — if sequential drops a hint wave keeps, a Codex task could dispatch to Claude in sequential mode only.\n[IRRELEVANT 2026-07-24] Effort complete on main; remaining open task is stale bookkeeping, not unfinished work.",
       "passes": false,
       "priority": 78,
       "title": "Share the post-plan provider_hint drop rule between sequential and wave paths (or pin the widening case in reaction_parity)",
@@ -1159,8 +1169,11 @@
         "src/loop_engine/iteration.rs",
         "src/loop_engine/wave_scheduler.rs",
         "tests/reaction_parity.rs"
-      ]
+      ],
+      "status": "irrelevant"
     }
   ],
-  "version": "1.0"
+  "version": "1.0",
+  "archivedAt": "2026-07-24",
+  "archivedReason": "Stale effort archived 2026-07-24: Shipped as PR #31; remaining FEAT/TEST/VERIFY/REFACTOR checkboxes never flipped."
 }

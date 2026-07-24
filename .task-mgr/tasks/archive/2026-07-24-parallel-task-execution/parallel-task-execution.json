@@ -634,7 +634,7 @@
       "id": "CODE-REVIEW-2",
       "model": "claude-opus-4-7",
       "modifiesBehavior": false,
-      "notes": "Critical checks: (1) IterationContext never crosses thread boundaries, (2) each slot opens its own Connection, (3) git merge uses ephemeral branches not same-branch, (4) JoinHandle panics handled, (5) progress logged sequentially post-wave.",
+      "notes": "Critical checks: (1) IterationContext never crosses thread boundaries, (2) each slot opens its own Connection, (3) git merge uses ephemeral branches not same-branch, (4) JoinHandle panics handled, (5) progress logged sequentially post-wave.\n[IRRELEVANT 2026-07-24] Effort complete on main; remaining open task is stale bookkeeping, not unfinished work.",
       "passes": false,
       "priority": 30,
       "qualityDimensions": [
@@ -651,7 +651,8 @@
         "src/loop_engine/progress.rs",
         "src/loop_engine/config.rs",
         "src/cli/commands.rs"
-      ]
+      ],
+      "status": "irrelevant"
     },
     {
       "acceptanceCriteria": [
@@ -670,7 +671,7 @@
       "id": "MILESTONE-2",
       "model": "claude-opus-4-7",
       "modifiesBehavior": false,
-      "notes": "Run full workspace tests. Phase 2 is the critical parallel infrastructure.",
+      "notes": "Run full workspace tests. Phase 2 is the critical parallel infrastructure.\n[IRRELEVANT 2026-07-24] Effort complete on main; remaining open task is stale bookkeeping, not unfinished work.",
       "passes": false,
       "priority": 35,
       "qualityDimensions": [
@@ -681,7 +682,8 @@
       "taskType": "milestone",
       "timeoutSecs": 1800,
       "title": "Phase 2 gate: parallel execution engine complete",
-      "touchesFiles": []
+      "touchesFiles": [],
+      "status": "irrelevant"
     },
     {
       "acceptanceCriteria": [
@@ -703,7 +705,7 @@
       "id": "TEST-001",
       "model": "claude-opus-4-7",
       "modifiesBehavior": false,
-      "notes": "Build on TEST-INIT stubs. Remove #[ignore] attributes. Learning [135]: Use multi-iteration sequences to test state machine transitions. Learning [681]: Archive CLI tests fail in non-git temp dirs. Tests need real git repos (tempdir-based).",
+      "notes": "Build on TEST-INIT stubs. Remove #[ignore] attributes. Learning [135]: Use multi-iteration sequences to test state machine transitions. Learning [681]: Archive CLI tests fail in non-git temp dirs. Tests need real git repos (tempdir-based).\n[IRRELEVANT 2026-07-24] Effort complete on main; remaining open task is stale bookkeeping, not unfinished work.",
       "passes": false,
       "priority": 38,
       "qualityDimensions": [
@@ -718,7 +720,8 @@
         "src/commands/next/tests.rs",
         "src/loop_engine/engine.rs",
         "src/loop_engine/worktree.rs"
-      ]
+      ],
+      "status": "irrelevant"
     },
     {
       "acceptanceCriteria": [
@@ -945,7 +948,9 @@
       "title": "Remove stale #[allow(dead_code)] on slot worktree fns",
       "touchesFiles": [
         "src/loop_engine/worktree.rs"
-      ]
+      ],
+      "notes": "[IRRELEVANT 2026-07-24] Effort complete on main; remaining open task is stale bookkeeping, not unfinished work.",
+      "status": "irrelevant"
     },
     {
       "acceptanceCriteria": [
@@ -961,7 +966,9 @@
       "title": "Extract shared scoring helper from select_next_task / select_parallel_group",
       "touchesFiles": [
         "src/commands/next/selection.rs"
-      ]
+      ],
+      "notes": "[IRRELEVANT 2026-07-24] Effort complete on main; remaining open task is stale bookkeeping, not unfinished work.",
+      "status": "irrelevant"
     },
     {
       "acceptanceCriteria": [
@@ -979,7 +986,9 @@
         "src/commands/next/selection.rs",
         "src/commands/next/mod.rs",
         "src/loop_engine/engine.rs"
-      ]
+      ],
+      "notes": "[IRRELEVANT 2026-07-24] Effort complete on main; remaining open task is stale bookkeeping, not unfinished work.",
+      "status": "irrelevant"
     },
     {
       "acceptanceCriteria": [
@@ -995,7 +1004,9 @@
       "title": "Decompose run_wave_iteration into smaller helpers",
       "touchesFiles": [
         "src/loop_engine/engine.rs"
-      ]
+      ],
+      "notes": "[IRRELEVANT 2026-07-24] Effort complete on main; remaining open task is stale bookkeeping, not unfinished work.",
+      "status": "irrelevant"
     },
     {
       "acceptanceCriteria": [
@@ -1011,7 +1022,9 @@
       "title": "Replace WaveOutcome.terminal opaque tuple with named struct",
       "touchesFiles": [
         "src/loop_engine/engine.rs"
-      ]
+      ],
+      "notes": "[IRRELEVANT 2026-07-24] Effort complete on main; remaining open task is stale bookkeeping, not unfinished work.",
+      "status": "irrelevant"
     },
     {
       "acceptanceCriteria": [
@@ -1096,5 +1109,7 @@
       ]
     }
   ],
-  "version": "1.0"
+  "version": "1.0",
+  "archivedAt": "2026-07-24",
+  "archivedReason": "Stale effort archived 2026-07-24: Shipped as PR #25; open CODE-REVIEW/MILESTONE/TEST/REFACTOR checkboxes stale."
 }

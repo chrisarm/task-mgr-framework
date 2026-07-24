@@ -217,7 +217,7 @@
       "description": "Review all implementation for quality, security, integration wiring, and documentation needs. RUN THE FULL QUALITY GATE (unscoped test suite).\n\nDO: Verify the guard is reachable from the loop engine's iteration pipeline (extract_learnings_from_output is the only insertion point — grep callers). Verify no unwrap() in new paths. Verify graceful degradation (Ollama down) is preserved. Confirm src/learnings/CLAUDE.md is updated to document the new write-time near-dup guard in the 'Learning Creation Chokepoint' narrative. Run full cargo test / clippy / fmt (no scope filter).\nDO NOT: Skip the wiring check. Do NOT scope the test suite — this is THE place the full suite runs.",
       "estimatedEffort": "medium",
       "id": "REVIEW-001",
-      "notes": "Do NOT stamp `model` here — runtime reviewModel config (currently claude-opus-4-8) owns the reviewer. Spawn fixes via `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001` (no `model` on spawned FIX/WIRE-FIX — primaryRunner.byIdPrefix routes them). Watch for the stale slot-worktree test-binary gotcha (CLAUDE.md): mass fixture-read failures naming a removed -slot-N path are not regressions — `touch tests/<bin>.rs` and rebuild. If clean: emit `<task-status>REVIEW-001:done</task-status>` with 'Clean review'.",
+      "notes": "Do NOT stamp `model` here — runtime reviewModel config (currently claude-opus-4-8) owns the reviewer. Spawn fixes via `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001` (no `model` on spawned FIX/WIRE-FIX — primaryRunner.byIdPrefix routes them). Watch for the stale slot-worktree test-binary gotcha (CLAUDE.md): mass fixture-read failures naming a removed -slot-N path are not regressions — `touch tests/<bin>.rs` and rebuild. If clean: emit `<task-status>REVIEW-001:done</task-status>` with 'Clean review'.\n[IRRELEVANT 2026-07-24] Effort complete on main; remaining open task is stale bookkeeping, not unfinished work.",
       "passes": false,
       "priority": 99,
       "qualityDimensions": [
@@ -233,8 +233,11 @@
         "src/learnings/embeddings/mod.rs",
         "src/learnings/ingestion/mod.rs",
         "src/learnings/CLAUDE.md"
-      ]
+      ],
+      "status": "irrelevant"
     }
   ],
-  "version": "1.0"
+  "version": "1.0",
+  "archivedAt": "2026-07-24",
+  "archivedReason": "Stale effort archived 2026-07-24: Shipped as PR #30; open REVIEW was stale post-compound."
 }

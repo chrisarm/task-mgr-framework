@@ -37,7 +37,8 @@ use task_mgr::commands::models::handle_set_anchor;
 use task_mgr::db::{create_schema, open_connection, run_migrations};
 use task_mgr::loop_engine::engine::IterationContext;
 use task_mgr::loop_engine::model::{
-    CODEX_EFFORT_FOR_DIFFICULTY, CapabilityTier, FABLE_MODEL, HAIKU_MODEL, OPUS_MODEL, PlanContext,
+    CODEX_EFFORT_FOR_DIFFICULTY, GROK_EFFORT_FOR_DIFFICULTY, CapabilityTier, FABLE_MODEL,
+    HAIKU_MODEL, OPUS_MODEL, PlanContext,
     Provider, SONNET_MODEL, anchored_tier, provider_for_model, resolve_execution_plan,
     resolve_models_config,
 };
@@ -319,6 +320,70 @@ fn codex_effort_table_caps_at_high() {
     );
     assert_ne!(
         resolved.effort_for(Provider::Codex, Some("high")),
+        Some("xhigh")
+    );
+}
+
+/// `validate_models_config` rejects a grok `xhigh` effort entry — the grok CLI
+/// only accepts high|medium|low and hard-errors on xhigh before the session.
+#[test]
+fn validate_models_config_rejects_grok_xhigh_effort() {
+    let models_json = serde_json::json!({
+        "primaryProvider": "grok",
+        "anchor": "standard",
+        "providers": {
+            "grok": {
+                "enabled": true,
+                "tiers": { "standard": "grok-build" },
+                "effort": { "high": "xhigh" }
+            }
+        }
+    });
+    let models: ModelsConfig = serde_json::from_value(models_json).unwrap();
+    let errs = validate_models_config(&models, &RoutingConfig::default()).unwrap_err();
+    assert!(
+        errs.iter().any(|e| {
+            e.contains("grok")
+                && e.contains("xhigh")
+                && e.contains("CLI")
+                && e.contains("effort")
+        }),
+        "expected a grok xhigh CLI-constraint rejection naming the key: {errs:?}"
+    );
+}
+
+/// The grok effort table is capped at `high`: difficulty=high resolves effort
+/// `high`, never `xhigh` (CLI rejects xhigh before spawn).
+#[test]
+fn grok_effort_table_caps_at_high() {
+    assert!(
+        !GROK_EFFORT_FOR_DIFFICULTY
+            .iter()
+            .any(|(_, e)| *e == "xhigh"),
+        "GROK_EFFORT_FOR_DIFFICULTY must never map to xhigh"
+    );
+    let high = GROK_EFFORT_FOR_DIFFICULTY
+        .iter()
+        .find(|(d, _)| *d == "high")
+        .map(|(_, e)| *e);
+    assert_eq!(high, Some("high"));
+
+    let resolved =
+        resolve_models_config(&ModelsConfig::builtin_default(), &RoutingConfig::default());
+    assert_eq!(
+        resolved.effort_for(Provider::Grok, Some("high")),
+        Some("high")
+    );
+    assert_eq!(
+        resolved.effort_for(Provider::Grok, Some("medium")),
+        Some("high")
+    );
+    assert_eq!(
+        resolved.effort_for(Provider::Grok, Some("low")),
+        Some("medium")
+    );
+    assert_ne!(
+        resolved.effort_for(Provider::Grok, Some("high")),
         Some("xhigh")
     );
 }

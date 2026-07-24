@@ -316,6 +316,56 @@ fn test_init_duplicate_across_files_fails() {
 }
 
 #[test]
+fn test_init_auto_prefix_duplicate_ids_across_files_succeeds() {
+    let temp_dir = TempDir::new().unwrap();
+
+    let json1 = r#"{
+        "project": "test",
+        "branchName": "feat/phase-a",
+        "userStories": [
+            {"id": "REVIEW-001", "title": "Review A", "priority": 99, "passes": false}
+        ]
+    }"#;
+    let json2 = r#"{
+        "project": "test",
+        "branchName": "feat/phase-b",
+        "userStories": [
+            {"id": "REVIEW-001", "title": "Review B", "priority": 99, "passes": false}
+        ]
+    }"#;
+
+    let path1 = temp_dir.path().join("01-phase-a.json");
+    let path2 = temp_dir.path().join("02-phase-b.json");
+    fs::write(&path1, json1).unwrap();
+    fs::write(&path2, json2).unwrap();
+
+    let result = init(
+        temp_dir.path(),
+        &[&path1, &path2],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Auto,
+    )
+    .unwrap();
+
+    assert_eq!(result.tasks_imported, 2);
+
+    let conn = open_connection(temp_dir.path()).unwrap();
+    let ids: Vec<String> = conn
+        .prepare("SELECT id FROM tasks ORDER BY id")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(ids.len(), 2);
+    assert_ne!(ids[0], ids[1]);
+    assert!(ids.iter().all(|id| id.ends_with("-REVIEW-001")));
+}
+
+#[test]
 fn test_init_passes_maps_to_done() {
     let temp_dir = TempDir::new().unwrap();
     let json = r#"{

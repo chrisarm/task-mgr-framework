@@ -50,7 +50,7 @@ Do **not** hardcode model IDs — they change with each Claude release and must 
 
 **Difficulty → `--effort` mapping**:
 
-- Claude / Grok (`EFFORT_FOR_DIFFICULTY`): `low` → `medium`, `medium` → `high`, `high` → `xhigh`
+- Claude / Grok (`EFFORT_FOR_DIFFICULTY`): `low` → `medium`, `medium` → `high`, `high` → `high`
 - Codex (`CODEX_EFFORT_FOR_DIFFICULTY`, capped at `high` by policy): `low` → `low`, `medium` → `medium`, `high` → `high`
 
 **Capability tiers + anchor window (default `models` config)**:
