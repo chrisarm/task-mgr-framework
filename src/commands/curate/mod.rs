@@ -1176,7 +1176,9 @@ pub fn curate_dedup(conn: &Connection, params: DedupParams) -> TaskMgrResult<Ded
 /// a warning printed to stderr.  All other errors (Ollama call failures, store
 /// failures) are counted and reported in the result without aborting the run.
 pub fn curate_embed(conn: &Connection, params: EmbedParams) -> TaskMgrResult<EmbedResult> {
-    use crate::learnings::embeddings::{OllamaEmbedder, count_embedded, store_embedding};
+    use crate::learnings::embeddings::{
+        OllamaEmbedder, count_embedded, format_embed_input, store_embedding,
+    };
 
     // Status counts are always computed (needed for both modes).
     let total_active: i64 = conn.query_row(
@@ -1188,6 +1190,16 @@ pub fn curate_embed(conn: &Connection, params: EmbedParams) -> TaskMgrResult<Emb
     let already_embedded = count_embedded(conn, &params.model)?;
 
     if params.status {
+        if let Some(ref profile) = params.profile_id {
+            ui::emit(&format!(
+                "embedding profile: {profile}  model: {}  dims: {}",
+                params.model,
+                params
+                    .expected_dims
+                    .map(|d| d.to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            ));
+        }
         return Ok(EmbedResult {
             status_only: true,
             total_active,
@@ -1196,6 +1208,8 @@ pub fn curate_embed(conn: &Connection, params: EmbedParams) -> TaskMgrResult<Emb
             skipped_empty: 0,
             errors: 0,
             model: params.model,
+            profile_id: params.profile_id,
+            expected_dims: params.expected_dims,
         });
     }
 
@@ -1298,6 +1312,7 @@ pub fn curate_embed(conn: &Connection, params: EmbedParams) -> TaskMgrResult<Emb
             continue;
         }
 
+        let text = format_embed_input(&params.passage_prefix, &text);
         items.push(EmbedItem { id: row.id, text });
     }
 
@@ -1330,6 +1345,17 @@ pub fn curate_embed(conn: &Connection, params: EmbedParams) -> TaskMgrResult<Emb
                     ));
                 }
                 for (item, embedding) in chunk.iter().zip(embeddings.iter()) {
+                    if let Some(expected) = params.expected_dims {
+                        if embedding.len() != expected {
+                            ui::emit_err(&format!(
+                                "Warning: learning {} embedding has {} dims, expected {expected}",
+                                item.id,
+                                embedding.len()
+                            ));
+                            errors += 1;
+                            continue;
+                        }
+                    }
                     match store_embedding(conn, item.id, &params.model, embedding) {
                         Ok(()) => embedded_this_run += 1,
                         Err(e) => {
@@ -1361,6 +1387,8 @@ pub fn curate_embed(conn: &Connection, params: EmbedParams) -> TaskMgrResult<Emb
         skipped_empty,
         errors,
         model: params.model,
+        profile_id: params.profile_id,
+        expected_dims: params.expected_dims,
     })
 }
 

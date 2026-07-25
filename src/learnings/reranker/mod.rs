@@ -25,14 +25,15 @@
 //! is independently truncated to [`MAX_QUERY_CHARS`]. The truncations are
 //! char-safe so non-ASCII content never panics on a UTF-8 boundary.
 //!
-//! The caps target the jina-reranker-v2 training context of 1024 tokens.
-//! Cross-encoders evaluate `(query, document)` together, so the server rejects
-//! the *entire batch* with HTTP 400 if any single (query+doc) pair exceeds
-//! `n_ctx_train`. The companion docker image runs llama-box with
-//! `--parallel 1` so the full 1024 tokens go to a single sequence (default
-//! n_seq_max=8 would divide it into 128-token shards). Combined with these
-//! caps, typical English content (~0.25–0.4 tokens/char) clears with margin;
-//! adversarial content (~1 token/char) is what the caps defend against.
+//! Default caps target the jina-reranker-v2 training context of 1024 tokens.
+//! Profiles with larger contexts (e.g. Nemotron 8192) supply higher caps via
+//! [`LlamaBoxReranker::with_char_limits`]. Cross-encoders evaluate
+//! `(query, document)` together, so the server rejects the *entire batch* with
+//! HTTP 400 if any single (query+doc) pair exceeds `n_ctx_train`. The companion
+//! docker image runs llama-box with `--parallel 1` so the full context goes to
+//! a single sequence (default n_seq_max=8 would divide it into shards).
+
+pub mod profiles;
 
 use std::time::Duration;
 
@@ -41,14 +42,22 @@ use serde::Deserialize;
 use super::retrieval::ScoredLearning;
 use crate::{TaskMgrError, TaskMgrResult};
 
-/// Maximum number of Unicode characters per document sent to the reranker.
-const MAX_DOC_CHARS: usize = 1024;
+pub use profiles::{
+    DEFAULT_RERANKER_MODEL, DEFAULT_RERANKER_PROFILE_ID, JINA_MAX_DOC_CHARS, JINA_MAX_QUERY_CHARS,
+    RERANKER_PROFILES, RerankerProfile, ResolvedReranker, find_reranker_profile,
+    resolve_reranker_pair,
+};
 
-/// Maximum number of Unicode characters in the query sent to the reranker.
+/// Maximum number of Unicode characters per document sent to the reranker
+/// when using the default (Jina) profile. Prefer profile-driven caps via
+/// [`LlamaBoxReranker::with_char_limits`].
+pub const MAX_DOC_CHARS: usize = JINA_MAX_DOC_CHARS;
+
+/// Maximum number of Unicode characters in the query (Jina default).
 ///
 /// Long free-text queries (e.g. pasted log lines) would otherwise eat into the
-/// document's share of the 1024-token context window. See [`MAX_DOC_CHARS`].
-const MAX_QUERY_CHARS: usize = 256;
+/// document's share of the context window. See [`MAX_DOC_CHARS`].
+pub const MAX_QUERY_CHARS: usize = JINA_MAX_QUERY_CHARS;
 
 /// Snippet length (in chars) when echoing a malformed response into an error message.
 const ERROR_BODY_SNIPPET_CHARS: usize = 200;
@@ -77,16 +86,31 @@ pub struct LlamaBoxReranker {
     base_url: String,
     model: String,
     agent: ureq::Agent,
+    max_doc_chars: usize,
+    max_query_chars: usize,
 }
 
 impl LlamaBoxReranker {
     /// Construct a reranker pointing at the given llama-box server and model.
+    ///
+    /// Uses Jina default char caps. Prefer [`Self::from_resolved`] when a
+    /// profile supplies larger contexts.
     ///
     /// Timeouts: 3s connect, 60s read. The read timeout is longer than
     /// [`OllamaEmbedder`](crate::learnings::embeddings::OllamaEmbedder)'s 30s
     /// because the first rerank after a cold model load can take 20–30 s for
     /// GPU warmup; subsequent calls are typically sub-second.
     pub fn new(base_url: &str, model: &str) -> Self {
+        Self::with_char_limits(base_url, model, MAX_DOC_CHARS, MAX_QUERY_CHARS)
+    }
+
+    /// Construct with explicit document/query char caps (from a profile).
+    pub fn with_char_limits(
+        base_url: &str,
+        model: &str,
+        max_doc_chars: usize,
+        max_query_chars: usize,
+    ) -> Self {
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .http_status_as_error(false)
             .timeout_connect(Some(Duration::from_secs(3)))
@@ -98,18 +122,25 @@ impl LlamaBoxReranker {
             base_url: base_url.trim_end_matches('/').to_string(),
             model: model.to_string(),
             agent,
+            max_doc_chars: max_doc_chars.max(1),
+            max_query_chars: max_query_chars.max(1),
         }
+    }
+
+    /// Build from a fully resolved profile/config.
+    pub fn from_resolved(r: &ResolvedReranker) -> Self {
+        Self::with_char_limits(&r.url, &r.model, r.max_doc_chars, r.max_query_chars)
     }
 }
 
 /// Compose the document text sent over the wire for a single candidate.
 ///
-/// Format: `"{title}\n\n{content}"`, truncated to [`MAX_DOC_CHARS`] Unicode
+/// Format: `"{title}\n\n{content}"`, truncated to `max_doc_chars` Unicode
 /// characters. `chars().take(N)` never splits a codepoint, so non-ASCII
 /// content cannot panic.
-fn build_document(learning: &crate::models::Learning) -> String {
+fn build_document(learning: &crate::models::Learning, max_doc_chars: usize) -> String {
     let combined = format!("{}\n\n{}", learning.title, learning.content);
-    combined.chars().take(MAX_DOC_CHARS).collect()
+    combined.chars().take(max_doc_chars).collect()
 }
 
 #[derive(Deserialize)]
@@ -147,9 +178,9 @@ impl Reranker for LlamaBoxReranker {
         let url = format!("{}/v1/rerank", self.base_url);
         let documents: Vec<String> = candidates
             .iter()
-            .map(|c| build_document(&c.learning))
+            .map(|c| build_document(&c.learning, self.max_doc_chars))
             .collect();
-        let truncated_query: String = query.chars().take(MAX_QUERY_CHARS).collect();
+        let truncated_query: String = query.chars().take(self.max_query_chars).collect();
 
         let payload = serde_json::json!({
             "model": self.model,
@@ -546,7 +577,7 @@ mod tests {
 
         // Re-derive what the impl would have sent and assert == MAX_DOC_CHARS chars.
         let learning = make_candidate(1, title, &content).learning;
-        let doc = build_document(&learning);
+        let doc = build_document(&learning, MAX_DOC_CHARS);
         assert_eq!(
             doc.chars().count(),
             MAX_DOC_CHARS,
@@ -597,7 +628,7 @@ mod tests {
         content.push_str(&"x".repeat(500));
 
         let learning = make_candidate(1, title, &content).learning;
-        let doc = build_document(&learning);
+        let doc = build_document(&learning, MAX_DOC_CHARS);
 
         assert!(doc.chars().count() <= MAX_DOC_CHARS);
         // Round-trip through String to ensure we truncated on a char boundary.
@@ -638,7 +669,7 @@ mod tests {
         let result = reranker.rerank("q", candidates).unwrap();
         assert_eq!(result.len(), 1);
         // Empty title+content -> document is just "\n\n".
-        let doc = build_document(&result[0].learning);
+        let doc = build_document(&result[0].learning, MAX_DOC_CHARS);
         assert_eq!(doc, "\n\n");
     }
 }

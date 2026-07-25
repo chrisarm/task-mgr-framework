@@ -43,3 +43,6 @@ Thumbs.db
 tasks/progress-*.txt
 .task-mgr/logs/
 # task-mgr end: progress files (untracked)
+
+# Host-specific CA certs baked into recall-stack images (e.g. Cloudflare WARP gateway CA)
+docker/certs/*.crt

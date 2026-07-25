@@ -9,20 +9,29 @@ this directory.
 
 ## Embedding / Ollama Configuration
 
-`curate embed` generates local embeddings via Ollama for the dedup pre-filter. Configure in `.task-mgr/config.json`:
+`curate embed` generates local embeddings via Ollama for the dedup pre-filter and
+vector recall. Configure in `.task-mgr/config.json`:
 
 ```json
 {
   "ollamaUrl": "http://localhost:11435",
-  "embeddingModel": "hf.co/jinaai/jina-embeddings-v5-text-small-retrieval-GGUF:Q8_0"
+  "embeddingProfile": "jina-small-q8"
 }
 ```
 
-- **Default URL**: `http://localhost:11435` (the bundled docker-compose stack
-  remaps to 11435 to avoid clashing with a host-installed `ollama serve` on the
-  upstream-default 11434)
-- **Default model**: `hf.co/jinaai/jina-embeddings-v5-text-small-retrieval-GGUF:Q8_0` (1024 dimensions)
-- **Schema**: Migration v15 adds `learning_embeddings` table (BLOB storage, little-endian f32)
+Catalog (SSoT: `src/learnings/embeddings/profiles.rs`):
+
+| Profile | Model | Dims | Prefixes |
+|---------|-------|------|----------|
+| `jina-small-q8` (default) | Jina v5 text-small Q8_0 | 1024 | none |
+| `nemotron-3-embed-q8` | Aqua00 Nemotron-3-Embed-8B Q8_0 | 4096 | `query:` / `passage:` |
+
+- **Default URL**: `http://localhost:11435` (bundled stack; avoids host `ollama` on 11434)
+- **Raw escape hatch**: `embeddingModel` still accepted; if it matches a catalog
+  Ollama id, prefixes are applied automatically
+- **Switching profiles**: one embedding row per learning (PK); re-run
+  `task-mgr curate embed --force` after a profile change
+- **Schema**: Migration v15 `learning_embeddings` (BLOB, little-endian f32)
 
 ### Graceful Degradation
 
@@ -44,21 +53,22 @@ Configure in `.task-mgr/config.json`:
 ```json
 {
   "rerankerUrl": "http://localhost:8181",
-  "rerankerModel": "jina-reranker-v2-base-multilingual",
+  "rerankerProfile": "jina-v2",
   "rerankerOverFetch": 3
 }
 ```
 
+Catalog (SSoT: `src/learnings/reranker/profiles.rs`): `jina-v2` (default, 1024
+char doc caps) and `nemotron-rerank-1b` (8192-token model; larger char caps).
+
 - **`rerankerUrl`** — base URL of a [gpustack/llama-box](https://github.com/gpustack/llama-box)
   server exposing OpenAI-compatible `/v1/rerank`. Reranker is disabled when unset.
-  Project default is host port **8181** (one off from llama-box's internal 8080
-  to avoid clashing with other projects that commonly publish on 8080); the
-  bundled docker-compose stack remaps `8181:8080` for this reason.
-- **`rerankerModel`** — model name passed in the `model` field of the rerank
-  request. Required alongside `rerankerUrl`; either-or disables rerank.
+  Project default is host port **8181** (compose remaps `8181:8080`).
+- **`rerankerProfile`** — preferred; supplies model id + trunc caps.
+- **`rerankerModel`** — raw escape hatch when profile is unset. Required (with
+  URL) when not using a profile; either-or disables rerank.
 - **`rerankerOverFetch`** — per-backend over-fetch factor. Slate size is
-  `min(limit * over_fetch, 30)`. Default `3`. Higher = better recall headroom,
-  longer rerank latency.
+  `min(limit * over_fetch, 30)`. Default `3`.
 - **Example llama-box invocation** (CPU, host-native — bind to 8181 to match
   the project default; if you run the bundled docker-compose stack instead,
   the container's internal 8080 is remapped to host 8181 automatically):

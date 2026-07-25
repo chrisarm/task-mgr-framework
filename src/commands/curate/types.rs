@@ -297,6 +297,12 @@ pub struct EmbedParams {
     pub ollama_url: String,
     /// Embedding model name as known to Ollama.
     pub model: String,
+    /// Passage prefix from the active embedding profile (may be empty).
+    pub passage_prefix: String,
+    /// Expected dimensionality for known profiles (`None` = skip assert).
+    pub expected_dims: Option<usize>,
+    /// Catalog profile id when resolved from a profile.
+    pub profile_id: Option<String>,
 }
 
 impl Default for EmbedParams {
@@ -307,6 +313,9 @@ impl Default for EmbedParams {
             status: false,
             ollama_url: DEFAULT_OLLAMA_URL.to_string(),
             model: DEFAULT_EMBEDDING_MODEL.to_string(),
+            passage_prefix: String::new(),
+            expected_dims: Some(1024),
+            profile_id: Some("jina-small-q8".to_string()),
         }
     }
 }
@@ -328,6 +337,12 @@ pub struct EmbedResult {
     pub errors: usize,
     /// Embedding model used.
     pub model: String,
+    /// Catalog profile id when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    /// Expected dims when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_dims: Option<usize>,
 }
 
 /// Result of the `curate count` command.

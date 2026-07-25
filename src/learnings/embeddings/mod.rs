@@ -3,9 +3,16 @@
 //! Provides local embedding generation via Ollama, BLOB-based storage in SQLite,
 //! and cosine similarity computation for pre-filtering duplicate candidates.
 
+pub mod profiles;
+
 use rusqlite::Connection;
 
 use crate::TaskMgrResult;
+
+pub use profiles::{
+    DEFAULT_EMBEDDING_PROFILE_ID, EMBEDDING_PROFILES, EmbeddingProfile, ResolvedEmbedding,
+    find_embedding_profile, format_embed_input, resolve_embedding,
+};
 
 /// Default Ollama server URL.
 ///
@@ -13,7 +20,7 @@ use crate::TaskMgrResult;
 /// docker-compose stack doesn't clash with a host-installed `ollama serve`.
 pub const DEFAULT_OLLAMA_URL: &str = "http://localhost:11435";
 
-/// Default embedding model.
+/// Default embedding model (Jina small Q8_0 — same as profile `jina-small-q8`).
 pub const DEFAULT_EMBEDDING_MODEL: &str =
     "hf.co/jinaai/jina-embeddings-v5-text-small-retrieval-GGUF:Q8_0";
 
@@ -231,8 +238,17 @@ pub fn blob_to_embedding(blob: &[u8]) -> Vec<f32> {
 /// - `-1.0` for opposite direction
 ///
 /// Handles zero vectors gracefully (returns `0.0`, never `NaN`).
+///
+/// **Length mismatch:** when `a.len() != b.len()`, returns `0.0` rather than
+/// silently truncating to `min(len)`. Mixed-dimension comparisons (e.g. after
+/// switching embedding models without a full re-embed) must not produce a
+/// false high similarity. Callers that need strict failure should check lengths
+/// before calling.
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    let len = a.len().min(b.len());
+    if a.len() != b.len() {
+        return 0.0;
+    }
+    let len = a.len();
     let mut dot = 0.0_f64;
     let mut norm_a = 0.0_f64;
     let mut norm_b = 0.0_f64;
@@ -421,19 +437,18 @@ pub fn try_embed_learning(
     use crate::loop_engine::project_config::read_project_config;
 
     let proj = read_project_config(db_dir);
-    let ollama_url = proj
-        .ollama_url
-        .unwrap_or_else(|| DEFAULT_OLLAMA_URL.to_string());
-    let model = proj
-        .embedding_model
-        .unwrap_or_else(|| DEFAULT_EMBEDDING_MODEL.to_string());
+    let resolved = match proj.resolved_embedding() {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
 
     let text = compose_embed_text(title, content);
     if text.is_empty() {
         return false;
     }
+    let text = format_embed_input(&resolved.passage_prefix, &text);
 
-    let embedder = OllamaEmbedder::new(&ollama_url, &model);
+    let embedder = OllamaEmbedder::new(&resolved.ollama_url, &resolved.model);
 
     match embedder.is_available() {
         Ok(true) => {}
@@ -449,7 +464,18 @@ pub fn try_embed_learning(
         }
     };
 
-    if let Err(e) = store_embedding(conn, learning_id, &model, &embedding) {
+    if let Some(expected) = resolved.expected_dims {
+        if embedding.len() != expected {
+            eprintln!(
+                "Warning: embedding for learning {learning_id} has {} dims, expected {expected} for model {}",
+                embedding.len(),
+                resolved.model
+            );
+            return false;
+        }
+    }
+
+    if let Err(e) = store_embedding(conn, learning_id, &resolved.model, &embedding) {
         eprintln!("Warning: failed to store embedding for learning {learning_id}: {e}");
         return false;
     }
@@ -473,14 +499,12 @@ pub fn try_embed_learnings_batch(
     }
 
     let proj = read_project_config(db_dir);
-    let ollama_url = proj
-        .ollama_url
-        .unwrap_or_else(|| DEFAULT_OLLAMA_URL.to_string());
-    let model = proj
-        .embedding_model
-        .unwrap_or_else(|| DEFAULT_EMBEDDING_MODEL.to_string());
+    let resolved = match proj.resolved_embedding() {
+        Ok(r) => r,
+        Err(_) => return 0,
+    };
 
-    let embedder = OllamaEmbedder::new(&ollama_url, &model);
+    let embedder = OllamaEmbedder::new(&resolved.ollama_url, &resolved.model);
 
     match embedder.is_available() {
         Ok(true) => {}
@@ -488,7 +512,7 @@ pub fn try_embed_learnings_batch(
         Err(_) => return 0,
     }
 
-    // Build texts, skipping empty ones
+    // Build texts, skipping empty ones; apply passage prefix for the active profile.
     let items: Vec<(i64, String)> = learnings
         .iter()
         .filter_map(|(id, title, content)| {
@@ -496,7 +520,7 @@ pub fn try_embed_learnings_batch(
             if text.is_empty() {
                 None
             } else {
-                Some((*id, text))
+                Some((*id, format_embed_input(&resolved.passage_prefix, &text)))
             }
         })
         .collect();
@@ -513,7 +537,16 @@ pub fn try_embed_learnings_batch(
         match embedder.embed_batch(&texts) {
             Ok(embeddings) => {
                 for ((id, _), emb) in chunk.iter().zip(embeddings.iter()) {
-                    if store_embedding(conn, *id, &model, emb).is_ok() {
+                    if let Some(expected) = resolved.expected_dims {
+                        if emb.len() != expected {
+                            eprintln!(
+                                "Warning: embedding for learning {id} has {} dims, expected {expected}",
+                                emb.len()
+                            );
+                            continue;
+                        }
+                    }
+                    if store_embedding(conn, *id, &resolved.model, emb).is_ok() {
                         stored += 1;
                     }
                 }
@@ -560,6 +593,8 @@ pub struct NearDuplicateChecker {
     embedder: OllamaEmbedder,
     threshold: f32,
     known: Vec<(i64, Vec<f32>)>,
+    /// Passage prefix from the active embedding profile (may be empty).
+    passage_prefix: String,
 }
 
 impl NearDuplicateChecker {
@@ -578,14 +613,12 @@ impl NearDuplicateChecker {
         use crate::loop_engine::project_config::read_project_config;
 
         let proj = read_project_config(db_dir);
-        let url = proj
-            .ollama_url
-            .unwrap_or_else(|| DEFAULT_OLLAMA_URL.to_string());
-        let model = proj
-            .embedding_model
-            .unwrap_or_else(|| DEFAULT_EMBEDDING_MODEL.to_string());
+        let resolved = match proj.resolved_embedding() {
+            Ok(r) => r,
+            Err(_) => return None,
+        };
 
-        let embedder = OllamaEmbedder::new(&url, &model);
+        let embedder = OllamaEmbedder::new(&resolved.ollama_url, &resolved.model);
 
         if !matches!(embedder.is_available(), Ok(true)) {
             return None;
@@ -593,7 +626,7 @@ impl NearDuplicateChecker {
 
         // Only embeddings for the *configured* model are loaded; cross-model
         // comparison is intentionally skipped (see struct doc comment).
-        let known = match load_all_active_embeddings(conn, &model) {
+        let known = match load_all_active_embeddings(conn, &resolved.model) {
             Ok(v) => v
                 .into_iter()
                 .map(|le| (le.learning_id, le.embedding))
@@ -608,6 +641,7 @@ impl NearDuplicateChecker {
             embedder,
             threshold,
             known,
+            passage_prefix: resolved.passage_prefix,
         })
     }
 
@@ -629,6 +663,7 @@ impl NearDuplicateChecker {
         if text.is_empty() {
             return NearDupOutcome::Unavailable;
         }
+        let text = format_embed_input(&self.passage_prefix, &text);
 
         let emb = match self.embedder.embed(&text) {
             Ok(v) => v,
@@ -749,14 +784,11 @@ mod tests {
 
     #[test]
     fn test_cosine_mismatched_lengths() {
-        // Uses the shorter length
+        // Must not silently truncate: mixed dims → 0.0 (not a false 1.0).
         let a = vec![1.0, 0.0];
         let b = vec![1.0, 0.0, 999.0];
         let sim = cosine_similarity(&a, &b);
-        assert!(
-            (sim - 1.0).abs() < 1e-6,
-            "truncated to shorter -> 1.0, got {sim}"
-        );
+        assert_eq!(sim, 0.0, "mismatched lengths -> 0.0, got {sim}");
     }
 
     #[test]

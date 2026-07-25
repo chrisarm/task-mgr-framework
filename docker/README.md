@@ -4,11 +4,12 @@ Two services that back the optional recall features:
 
 | Service | Port | Purpose |
 |---------|------|---------|
-| `ollama` / `ollama-cpu` | 11435 | Hosts the jina-embeddings model for semantic recall |
-| `llama-box` / `llama-box-cpu` | 8181 | Hosts the jina-reranker cross-encoder for recall reranking (container internal: 8080) |
+| `ollama` / `ollama-cpu` | 11435 | Hosts the embedding model for semantic recall (default: Jina; optional Nemotron Q8) |
+| `llama-box` / `llama-box-cpu` | 8181 | Hosts the cross-encoder reranker (default: Jina v2; optional Nemotron 1B) |
 
-Both models are baked into the image at build time — container startup is instant
-with no network dependency at runtime.
+Default models are baked into the image at build time — container startup is instant
+with no network dependency at runtime. Alternate profiles are selected via
+`scripts/recall-stack-up.sh --embed-profile` / `--rerank-profile` (compose build-args).
 
 ## Prerequisites
 
@@ -46,17 +47,20 @@ docker compose -f docker/docker-compose.yml --profile cpu up -d --build
 
 ## task-mgr Configuration
 
-Add to `.task-mgr/config.json`:
+Prefer catalog **profiles** (see `scripts/recall-stack-up.sh --list-profiles`):
 
 ```json
 {
   "ollamaUrl": "http://localhost:11435",
-  "embeddingModel": "hf.co/jinaai/jina-embeddings-v5-text-small-retrieval-GGUF:Q8_0",
+  "embeddingProfile": "jina-small-q8",
   "rerankerUrl": "http://localhost:8181",
-  "rerankerModel": "jina-reranker-v2-base-multilingual",
+  "rerankerProfile": "jina-v2",
   "rerankerOverFetch": 3
 }
 ```
+
+Raw `embeddingModel` / `rerankerModel` strings remain supported as an escape hatch.
+After changing `embeddingProfile`, run `task-mgr curate embed --force`.
 
 ## Service Details
 

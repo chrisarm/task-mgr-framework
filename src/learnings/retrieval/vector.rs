@@ -10,8 +10,8 @@ use rusqlite::Connection;
 
 use crate::learnings::crud::get_learning;
 use crate::learnings::embeddings::{
-    DEFAULT_EMBEDDING_MODEL, DEFAULT_OLLAMA_URL, OllamaEmbedder, cosine_similarity,
-    load_all_active_embeddings,
+    DEFAULT_EMBEDDING_MODEL, DEFAULT_OLLAMA_URL, OllamaEmbedder, ResolvedEmbedding,
+    cosine_similarity, format_embed_input, load_all_active_embeddings,
 };
 use crate::{TaskMgrError, TaskMgrResult};
 
@@ -60,6 +60,8 @@ const SCORE_SCALE: f64 = 15.0;
 pub struct VectorBackend {
     embedder: OllamaEmbedder,
     model: String,
+    /// Query prefix from the active embedding profile (may be empty).
+    query_prefix: String,
     /// When `true`, propagate embed/load failures instead of returning
     /// `Ok(empty)`. See struct-level docs.
     strict: bool,
@@ -68,10 +70,22 @@ pub struct VectorBackend {
 impl VectorBackend {
     /// Create a VectorBackend pointing at the given Ollama server and model.
     /// `strict` defaults to `false` to preserve historical caller semantics.
+    /// No query prefix (raw model / tests).
     pub fn new(ollama_url: &str, model: &str) -> Self {
         Self {
             embedder: OllamaEmbedder::new(ollama_url, model),
             model: model.to_string(),
+            query_prefix: String::new(),
+            strict: false,
+        }
+    }
+
+    /// Create from a fully resolved embedding config (profile prefixes applied).
+    pub fn from_resolved(resolved: &ResolvedEmbedding) -> Self {
+        Self {
+            embedder: OllamaEmbedder::new(&resolved.ollama_url, &resolved.model),
+            model: resolved.model.clone(),
+            query_prefix: resolved.query_prefix.clone(),
             strict: false,
         }
     }
@@ -113,10 +127,12 @@ impl VectorBackend {
             _ => return Ok(Vec::new()),
         };
 
-        // Embed the query text. Strict mode surfaces the failure to the caller
-        // with actionable hints; non-strict preserves the historical
-        // graceful-degradation contract.
-        let query_embedding = match self.embedder.embed(text) {
+        // Embed the query text (with profile query prefix when configured).
+        // Strict mode surfaces the failure to the caller with actionable
+        // hints; non-strict preserves the historical graceful-degradation
+        // contract.
+        let text = format_embed_input(&self.query_prefix, text);
+        let query_embedding = match self.embedder.embed(&text) {
             Ok(emb) => emb,
             Err(e) => {
                 if self.strict {

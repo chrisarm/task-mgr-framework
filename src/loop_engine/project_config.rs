@@ -663,8 +663,15 @@ pub struct ProjectConfig {
     #[serde(default)]
     pub ollama_url: Option<String>,
 
-    /// Embedding model name for Ollama.
-    /// Defaults to `hf.co/jinaai/jina-embeddings-v5-text-small-retrieval-GGUF:Q8_0`.
+    /// Built-in embedding profile id (`jina-small-q8`, `nemotron-3-embed-q8`).
+    /// When set, takes precedence over [`Self::embedding_model`] and supplies
+    /// model id, expected dims, and query/passage prefixes from the catalog.
+    #[serde(default)]
+    pub embedding_profile: Option<String>,
+
+    /// Embedding model name for Ollama (raw escape hatch).
+    /// Defaults to `hf.co/jinaai/jina-embeddings-v5-text-small-retrieval-GGUF:Q8_0`
+    /// when neither this nor `embedding_profile` is set.
     #[serde(default)]
     pub embedding_model: Option<String>,
 
@@ -673,12 +680,20 @@ pub struct ProjectConfig {
     #[serde(default)]
     pub dedup_model: Option<String>,
 
-    /// llama-box reranker endpoint. Must be set together with `reranker_model`;
-    /// if only one is present the reranker is disabled with a warning.
+    /// llama-box reranker endpoint. Must be set together with `reranker_model`
+    /// or `reranker_profile`; if only one of URL/model-side is present the
+    /// reranker is disabled with a warning.
     #[serde(default)]
     pub reranker_url: Option<String>,
 
-    /// Cross-encoder model name served by the llama-box `/v1/rerank` endpoint.
+    /// Built-in reranker profile id (`jina-v2`, `nemotron-rerank-1b`).
+    /// When set, takes precedence over [`Self::reranker_model`] and supplies
+    /// model name plus document/query char caps from the catalog.
+    #[serde(default)]
+    pub reranker_profile: Option<String>,
+
+    /// Cross-encoder model name served by the llama-box `/v1/rerank` endpoint
+    /// (raw escape hatch when `reranker_profile` is unset).
     #[serde(default)]
     pub reranker_model: Option<String>,
 
@@ -766,9 +781,11 @@ impl Default for ProjectConfig {
             additional_allowed_tools: Vec::new(),
             permission_mode: None,
             ollama_url: None,
+            embedding_profile: None,
             embedding_model: None,
             dedup_model: None,
             reranker_url: None,
+            reranker_profile: None,
             reranker_model: None,
             reranker_over_fetch: None,
             merge_resolver_timeout_secs: None,
@@ -785,30 +802,76 @@ impl Default for ProjectConfig {
 }
 
 impl ProjectConfig {
-    /// Returns `Some((url, model, over_fetch))` only when both `reranker_url`
-    /// AND `reranker_model` are set. Returns `None` silently when neither is
-    /// set; warns and returns `None` when exactly one is present.
-    pub fn resolved_reranker_config(&self) -> Option<(String, String, u32)> {
-        match (&self.reranker_url, &self.reranker_model) {
-            (Some(url), Some(model)) => {
-                let over_fetch = match self.reranker_over_fetch {
-                    None => 3,
-                    Some(0) => {
-                        crate::output::warn("rerankerOverFetch=0 is invalid; clamping to 1");
-                        1
-                    }
-                    Some(n) => n,
-                };
-                Some((url.clone(), model.clone(), over_fetch))
-            }
-            (None, None) => None,
-            _ => {
+    /// Resolve Ollama embedding settings (profile catalog or raw model).
+    ///
+    /// See [`crate::learnings::embeddings::resolve_embedding`].
+    pub fn resolved_embedding(
+        &self,
+    ) -> Result<crate::learnings::embeddings::ResolvedEmbedding, String> {
+        crate::learnings::embeddings::resolve_embedding(
+            self.ollama_url.as_deref(),
+            self.embedding_profile.as_deref(),
+            self.embedding_model.as_deref(),
+        )
+    }
+
+    /// Returns resolved reranker settings when both URL and model-side are set.
+    ///
+    /// Model-side comes from `reranker_profile` (catalog) or `reranker_model`
+    /// (raw). Returns `None` silently when neither side is set; warns and
+    /// returns `None` when exactly one is present. Unknown profile ids warn
+    /// and disable the reranker (same soft-fail posture as incomplete pairs).
+    pub fn resolved_reranker_config(
+        &self,
+    ) -> Option<crate::learnings::reranker::ResolvedReranker> {
+        let has_url = self
+            .reranker_url
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty());
+        let has_model_side = self
+            .reranker_profile
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+            || self
+                .reranker_model
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty());
+
+        match (has_url, has_model_side) {
+            (false, false) => return None,
+            (true, false) | (false, true) => {
                 crate::output::warn(
-                    "rerankerUrl/rerankerModel: both must be set; reranker disabled",
+                    "rerankerUrl and rerankerProfile/rerankerModel: both must be set; reranker disabled",
                 );
+                return None;
+            }
+            (true, true) => {}
+        }
+
+        if self.reranker_over_fetch == Some(0) {
+            crate::output::warn("rerankerOverFetch=0 is invalid; clamping to 1");
+        }
+
+        match crate::learnings::reranker::resolve_reranker_pair(
+            self.reranker_url.as_deref(),
+            self.reranker_profile.as_deref(),
+            self.reranker_model.as_deref(),
+            self.reranker_over_fetch,
+        ) {
+            Ok(resolved) => resolved,
+            Err(e) => {
+                crate::output::warn(&format!("{e}; reranker disabled"));
                 None
             }
         }
+    }
+
+    /// Backward-compatible tuple form used by older call sites.
+    ///
+    /// Prefer [`Self::resolved_reranker_config`].
+    pub fn resolved_reranker_tuple(&self) -> Option<(String, String, u32)> {
+        self.resolved_reranker_config()
+            .map(|r| (r.url, r.model, r.over_fetch))
     }
 }
 
@@ -1193,10 +1256,10 @@ mod tests {
             reranker_over_fetch: Some(5),
             ..Default::default()
         };
-        assert_eq!(
-            config.resolved_reranker_config(),
-            Some(("http://x".to_string(), "m".to_string(), 5))
-        );
+        let r = config.resolved_reranker_config().unwrap();
+        assert_eq!(r.url, "http://x");
+        assert_eq!(r.model, "m");
+        assert_eq!(r.over_fetch, 5);
     }
 
     #[test]
@@ -1207,10 +1270,8 @@ mod tests {
             reranker_over_fetch: None,
             ..Default::default()
         };
-        assert_eq!(
-            config.resolved_reranker_config(),
-            Some(("http://x".to_string(), "m".to_string(), 3))
-        );
+        let r = config.resolved_reranker_config().unwrap();
+        assert_eq!((r.url.as_str(), r.model.as_str(), r.over_fetch), ("http://x", "m", 3));
     }
 
     #[test]
@@ -1221,10 +1282,8 @@ mod tests {
             reranker_over_fetch: Some(0),
             ..Default::default()
         };
-        assert_eq!(
-            config.resolved_reranker_config(),
-            Some(("http://x".to_string(), "m".to_string(), 1))
-        );
+        let r = config.resolved_reranker_config().unwrap();
+        assert_eq!(r.over_fetch, 1);
     }
 
     #[test]
@@ -1272,10 +1331,10 @@ mod tests {
         assert_eq!(config.reranker_url.as_deref(), Some("http://x"));
         assert_eq!(config.reranker_model.as_deref(), Some("m"));
         assert_eq!(config.reranker_over_fetch, Some(5));
-        assert_eq!(
-            config.resolved_reranker_config(),
-            Some(("http://x".to_string(), "m".to_string(), 5))
-        );
+        let r = config.resolved_reranker_config().unwrap();
+        assert_eq!(r.url, "http://x");
+        assert_eq!(r.model, "m");
+        assert_eq!(r.over_fetch, 5);
     }
 
     #[test]

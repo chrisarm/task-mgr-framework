@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use rusqlite::Connection;
 
 use crate::TaskMgrResult;
+use crate::learnings::embeddings::ResolvedEmbedding;
 use crate::models::Learning;
 
 use super::{RetrievalBackend, RetrievalQuery, ScoredLearning};
@@ -46,6 +47,18 @@ impl CompositeBackend {
                 Box::new(super::Fts5Backend),
                 Box::new(super::PatternsBackend),
                 Box::new(super::VectorBackend::new(ollama_url, model).with_strict_mode(strict)),
+            ],
+        }
+    }
+
+    /// Like [`Self::with_ollama_config`] but applies profile query prefixes via
+    /// [`super::VectorBackend::from_resolved`].
+    pub fn with_resolved_embedding(resolved: &ResolvedEmbedding, strict: bool) -> Self {
+        Self {
+            backends: vec![
+                Box::new(super::Fts5Backend),
+                Box::new(super::PatternsBackend),
+                Box::new(super::VectorBackend::from_resolved(resolved).with_strict_mode(strict)),
             ],
         }
     }

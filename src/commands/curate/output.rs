@@ -116,8 +116,17 @@ pub fn format_dedup_text(result: &DedupResult) -> String {
 /// Format `curate embed` output as human-readable text.
 pub fn format_embed_text(result: &EmbedResult) -> String {
     if result.status_only {
+        let profile = result
+            .profile_id
+            .as_deref()
+            .map(|p| format!(" profile: {p}"))
+            .unwrap_or_default();
+        let dims = result
+            .expected_dims
+            .map(|d| format!(" dims: {d}"))
+            .unwrap_or_default();
         return format!(
-            "Embeddings: {}/{} active learnings embedded (model: {})\n",
+            "Embeddings: {}/{} active learnings embedded (model: {}{profile}{dims})\n",
             result.already_embedded, result.total_active, result.model
         );
     }

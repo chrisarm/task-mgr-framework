@@ -747,6 +747,15 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
 
             let conn = open_connection(&cli.dir)?;
             let proj_config = read_project_config(&cli.dir);
+            let embedding = match proj_config.resolved_embedding() {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    return Err(TaskMgrError::InvalidConfig {
+                        field: "embeddingProfile".to_string(),
+                        message: e,
+                    });
+                }
+            };
             let reranker = proj_config.resolved_reranker_config();
 
             let params = RecallCmdParams {
@@ -755,12 +764,9 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                 tags,
                 outcome,
                 limit,
-                ollama_url: proj_config.ollama_url,
-                embedding_model: proj_config.embedding_model,
+                embedding,
                 include_superseded,
-                reranker_url: reranker.as_ref().map(|(u, _, _)| u.clone()),
-                reranker_model: reranker.as_ref().map(|(_, m, _)| m.clone()),
-                reranker_over_fetch: reranker.map(|(_, _, n)| n),
+                reranker,
                 allow_degraded,
             };
 
@@ -1561,7 +1567,6 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                 DedupParams, EmbedParams, EnrichParams, RetireParams, curate_count, curate_dedup,
                 curate_embed, curate_retire, curate_unretire,
             };
-            use task_mgr::learnings::embeddings::{DEFAULT_EMBEDDING_MODEL, DEFAULT_OLLAMA_URL};
             use task_mgr::loop_engine::project_config::read_project_config;
             let _lock = LockGuard::acquire(&cli.dir)?;
             let conn = open_connection(&cli.dir)?;
@@ -1620,9 +1625,13 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                     pair_mode,
                 } => {
                     let proj_config = read_project_config(&cli.dir);
-                    let embed_model = proj_config
-                        .embedding_model
-                        .unwrap_or_else(|| DEFAULT_EMBEDDING_MODEL.to_string());
+                    let resolved = proj_config.resolved_embedding().map_err(|e| {
+                        TaskMgrError::InvalidConfig {
+                            field: "embeddingProfile".to_string(),
+                            message: e,
+                        }
+                    })?;
+                    let embed_model = resolved.model;
                     let dedup_model = proj_config.dedup_model.unwrap_or_else(|| {
                         task_mgr::commands::curate::types::DEFAULT_DEDUP_MODEL.to_string()
                     });
@@ -1646,17 +1655,20 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                 }
                 CurateAction::Embed { force, status } => {
                     let proj_config = read_project_config(&cli.dir);
-                    let ollama_url = proj_config
-                        .ollama_url
-                        .unwrap_or_else(|| DEFAULT_OLLAMA_URL.to_string());
-                    let model = proj_config
-                        .embedding_model
-                        .unwrap_or_else(|| DEFAULT_EMBEDDING_MODEL.to_string());
+                    let resolved = proj_config.resolved_embedding().map_err(|e| {
+                        TaskMgrError::InvalidConfig {
+                            field: "embeddingProfile".to_string(),
+                            message: e,
+                        }
+                    })?;
                     let params = EmbedParams {
                         force,
                         status,
-                        ollama_url,
-                        model,
+                        ollama_url: resolved.ollama_url,
+                        model: resolved.model,
+                        passage_prefix: resolved.passage_prefix,
+                        expected_dims: resolved.expected_dims,
+                        profile_id: resolved.profile_id.map(|s| s.to_string()),
                     };
                     let result = curate_embed(&conn, params)?;
                     output_result(&result, cli.format);

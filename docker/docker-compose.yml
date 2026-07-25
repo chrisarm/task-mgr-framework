@@ -6,6 +6,14 @@ services:
   ollama:
     build:
       context: ./ollama
+      additional_contexts:
+        # Host-specific CA certs (e.g. Cloudflare WARP gateway) installed into
+        # the image trust store before build-time downloads. See certs/README.md.
+        certs: ./certs
+      args:
+        # Override via scripts/recall-stack-up.sh --embed-profile or:
+        #   docker compose build --build-arg OLLAMA_MODEL=...
+        OLLAMA_MODEL: ${OLLAMA_MODEL:-hf.co/jinaai/jina-embeddings-v5-text-small-retrieval-GGUF:Q8_0}
     ports:
       - "11435:11434"
     restart: unless-stopped
@@ -16,7 +24,9 @@ services:
       interval: 30s
       timeout: 5s
       retries: 5
-      start_period: 60s
+      # Nemotron 8B can take longer than Jina to become healthy on first boot;
+      # 120s covers both default and larger embed profiles.
+      start_period: 120s
     deploy:
       resources:
         reservations:
@@ -28,8 +38,14 @@ services:
   llama-box:
     build:
       context: ./llama-box
+      additional_contexts:
+        certs: ./certs
       args:
         LLAMA_BOX_VARIANT: cuda-12.8
+        HF_REPO: ${RERANK_HF_REPO:-gpustack/jina-reranker-v2-base-multilingual-GGUF}
+        HF_FILE: ${RERANK_HF_FILE:-jina-reranker-v2-base-multilingual-FP16.gguf}
+        HF_REVISION: ${RERANK_HF_REVISION:-09a0e5b9f3d193a4f1e771ba6ceccdf1153d3a9a}
+        MODEL_PATH: ${RERANK_MODEL_PATH:-/models/jina-reranker-v2.gguf}
     ports:
       # Host 8181 (project default — avoids clashing with other projects
       # that commonly publish on 8080); container internal stays at 8080.
@@ -58,21 +74,32 @@ services:
     profiles: [cpu]
     build:
       context: ./ollama
+      additional_contexts:
+        certs: ./certs
+      args:
+        OLLAMA_MODEL: ${OLLAMA_MODEL:-hf.co/jinaai/jina-embeddings-v5-text-small-retrieval-GGUF:Q8_0}
     ports:
       - "11435:11434"
     restart: unless-stopped
     healthcheck:
-      # Same probe as GPU variant; start_period 60s covers model load on CPU.
+      # Same probe as GPU variant; start_period covers model load on CPU.
       test: ["CMD-SHELL", "curl -sf http://localhost:11434/api/tags || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 5
-      start_period: 60s
+      start_period: 120s
 
   llama-box-cpu:
     profiles: [cpu]
     build:
       context: ./llama-box
+      additional_contexts:
+        certs: ./certs
+      args:
+        HF_REPO: ${RERANK_HF_REPO:-gpustack/jina-reranker-v2-base-multilingual-GGUF}
+        HF_FILE: ${RERANK_HF_FILE:-jina-reranker-v2-base-multilingual-FP16.gguf}
+        HF_REVISION: ${RERANK_HF_REVISION:-09a0e5b9f3d193a4f1e771ba6ceccdf1153d3a9a}
+        MODEL_PATH: ${RERANK_MODEL_PATH:-/models/jina-reranker-v2.gguf}
     ports:
       # Host 8181 (see GPU variant above for rationale).
       - "8181:8080"
