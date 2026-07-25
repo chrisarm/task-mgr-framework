@@ -298,6 +298,25 @@ mod tests {
     }
 
     #[test]
+    fn over_fetch_percent_at_max_boundary_not_clamped_further() {
+        let r = resolve_reranker_pair(
+            Some("http://localhost:8181"),
+            Some("jina-v2"),
+            None,
+            Some(300),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(r.over_fetch_percent, 300);
+    }
+
+    #[test]
+    fn default_over_fetch_is_two_hundred() {
+        assert_eq!(DEFAULT_RERANKER_OVER_FETCH_PERCENT, 200);
+        assert!(DEFAULT_RERANKER_OVER_FETCH_PERCENT <= MAX_RERANKER_OVER_FETCH_PERCENT);
+    }
+
+    #[test]
     fn unknown_profile_errors() {
         let err = resolve_reranker_pair(Some("http://x"), Some("nope"), None, None).unwrap_err();
         assert!(err.contains("unknown rerankerProfile"));

@@ -1800,6 +1800,59 @@ mod rerank {
         );
     }
 
+    #[test]
+    fn test_over_fetch_fifty_percent() {
+        let (_temp_dir, conn) = setup_db();
+        for i in 0..20 {
+            create_test_learning(
+                &conn,
+                &format!("Learning {i}"),
+                "common content keyword",
+                LearningOutcome::Pattern,
+            );
+        }
+
+        let (boxed, mock) = make_box_with(Ok);
+        let params = RecallParams {
+            query: Some("keyword".to_string()),
+            limit: 10,
+            reranker: Some(boxed),
+            reranker_over_fetch_percent: 50, // limit 10 → slate 15
+            ..Default::default()
+        };
+        let backend = fts5_and_patterns();
+        let _ = recall_learnings_with_backend(&conn, params, &backend).unwrap();
+        let n = mock.last_candidates_len().unwrap();
+        assert_eq!(n, 15, "50% overfetch with limit 10 must fetch 15, got {n}");
+    }
+
+    #[test]
+    fn test_over_fetch_three_hundred_percent_respects_slate_cap() {
+        let (_temp_dir, conn) = setup_db();
+        for i in 0..50 {
+            create_test_learning(
+                &conn,
+                &format!("Learning {i}"),
+                "common content keyword",
+                LearningOutcome::Pattern,
+            );
+        }
+
+        let (boxed, mock) = make_box_with(Ok);
+        let params = RecallParams {
+            query: Some("keyword".to_string()),
+            limit: 10,
+            reranker: Some(boxed),
+            // 300% → 40, but absolute MAX_RERANK_SLATE is 30
+            reranker_over_fetch_percent: 300,
+            ..Default::default()
+        };
+        let backend = fts5_and_patterns();
+        let _ = recall_learnings_with_backend(&conn, params, &backend).unwrap();
+        let n = mock.last_candidates_len().unwrap();
+        assert_eq!(n, 30, "300% with limit 10 still caps at 30, got {n}");
+    }
+
     // -- Truncation: result is capped at params.limit even though slate > limit --
 
     #[test]

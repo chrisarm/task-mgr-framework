@@ -1358,6 +1358,37 @@ mod tests {
     }
 
     #[test]
+    fn test_reranker_over_fetch_percent_clamped_at_300() {
+        let config = ProjectConfig {
+            reranker_url: Some("http://x".to_string()),
+            reranker_model: Some("m".to_string()),
+            reranker_over_fetch_percent: Some(999),
+            ..Default::default()
+        };
+        let r = config.resolved_reranker_config().unwrap();
+        assert_eq!(
+            r.over_fetch_percent,
+            crate::learnings::reranker::MAX_RERANKER_OVER_FETCH_PERCENT
+        );
+        assert_eq!(crate::learnings::reranker::MAX_RERANKER_OVER_FETCH_PERCENT, 300);
+    }
+
+    #[test]
+    fn test_legacy_reranker_over_fetch_key_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{"rerankerUrl":"http://x","rerankerModel":"m","rerankerOverFetch":3}"#,
+        )
+        .unwrap();
+        let config = read_project_config(dir.path());
+        // Old key is not deserialized; percent is unset → default 200.
+        assert!(config.reranker_over_fetch_percent.is_none());
+        let r = config.resolved_reranker_config().unwrap();
+        assert_eq!(r.over_fetch_percent, 200);
+    }
+
+    #[test]
     fn test_merge_fail_halt_threshold_default_is_two() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("config.json"), "{}").unwrap();
