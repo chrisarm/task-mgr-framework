@@ -43,8 +43,9 @@ use super::retrieval::ScoredLearning;
 use crate::{TaskMgrError, TaskMgrResult};
 
 pub use profiles::{
-    DEFAULT_RERANKER_MODEL, DEFAULT_RERANKER_PROFILE_ID, JINA_MAX_DOC_CHARS, JINA_MAX_QUERY_CHARS,
-    RERANKER_PROFILES, RerankerProfile, ResolvedReranker, find_reranker_profile,
+    DEFAULT_RERANKER_MODEL, DEFAULT_RERANKER_OVER_FETCH_PERCENT, DEFAULT_RERANKER_PROFILE_ID,
+    JINA_MAX_DOC_CHARS, JINA_MAX_QUERY_CHARS, MAX_RERANKER_OVER_FETCH_PERCENT, RERANKER_PROFILES,
+    RerankerProfile, ResolvedReranker, find_reranker_profile, rerank_slate_size,
     resolve_reranker_pair,
 };
 

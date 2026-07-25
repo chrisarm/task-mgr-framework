@@ -55,9 +55,13 @@ Prefer catalog **profiles** (see `scripts/recall-stack-up.sh --list-profiles`):
   "embeddingProfile": "jina-small-q8",
   "rerankerUrl": "http://localhost:8181",
   "rerankerProfile": "jina-v2",
-  "rerankerOverFetch": 3
+  "rerankerOverFetchPercent": 200
 }
 ```
+
+`rerankerOverFetchPercent` = extra % beyond `--limit` (default 200, max 300).
+Example: 50 with limit 10 → 15 candidates pre-rerank. Legacy `rerankerOverFetch`
+is ignored.
 
 Raw `embeddingModel` / `rerankerModel` strings remain supported as an escape hatch.
 After changing `embeddingProfile`, run `task-mgr curate embed --force`.

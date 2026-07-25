@@ -84,7 +84,7 @@ scripts/recall-stack-up.sh --list-profiles
   "embeddingProfile": "jina-small-q8",
   "rerankerUrl": "http://localhost:8181",
   "rerankerProfile": "jina-v2",
-  "rerankerOverFetch": 3
+  "rerankerOverFetchPercent": 200
 }
 ```
 
@@ -96,9 +96,14 @@ scripts/recall-stack-up.sh --list-profiles
   "embeddingProfile": "nemotron-3-embed-q8",
   "rerankerUrl": "http://localhost:8181",
   "rerankerProfile": "nemotron-rerank-1b",
-  "rerankerOverFetch": 3
+  "rerankerOverFetchPercent": 200
 }
 ```
+
+`rerankerOverFetchPercent` is **extra** percent beyond `--limit` (not a multiplier).
+Example: `50` with limit 10 fetches 15 candidates before rerank. Default **200**
+(old multiplier of 3). Max **300** (clamped). Absolute slate hard-cap remains 30.
+The legacy key `rerankerOverFetch` is ignored with a warning.
 
 Raw escape hatches still work: `embeddingModel` / `rerankerModel` strings without
 a profile. When `embeddingModel` matches a catalog Ollama id, prefixes are

@@ -35,15 +35,49 @@ pub struct RerankerProfile {
     pub notes: &'static str,
 }
 
+/// Default extra percent beyond `limit` when fetching the rerank slate.
+///
+/// 200 → fetch `ceil(limit * 3.0)` (same effective size as the old integer
+/// multiplier default of `3`). Example: limit 10 → slate 30.
+pub const DEFAULT_RERANKER_OVER_FETCH_PERCENT: u32 = 200;
+
+/// Maximum allowed `rerankerOverFetchPercent` (extra % beyond limit).
+///
+/// Values above this are clamped at resolve time. 300% → slate up to
+/// `ceil(limit * 4.0)` before the absolute `MAX_RERANK_SLATE` cap applies.
+pub const MAX_RERANKER_OVER_FETCH_PERCENT: u32 = 300;
+
 /// Fully resolved reranker settings when both URL and model are available.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedReranker {
     pub url: String,
     pub model: String,
-    pub over_fetch: u32,
+    /// Extra percent beyond the final result limit for the pre-rerank slate.
+    /// Slate size = `min(ceil(limit * (100 + p) / 100), MAX_RERANK_SLATE)`.
+    /// Example: 50 with limit 10 → 15 candidates.
+    pub over_fetch_percent: u32,
     pub max_doc_chars: usize,
     pub max_query_chars: usize,
     pub profile_id: Option<&'static str>,
+}
+
+/// Compute the candidate slate size for reranking.
+///
+/// `over_fetch_percent` is **extra** percent beyond `limit` (not a multiplier).
+/// - limit=10, percent=50 → 15
+/// - limit=10, percent=200 → 30
+/// - limit=10, percent=0 → 10
+///
+/// Result is always at least `limit` (when limit > 0) and at most `max_slate`.
+pub fn rerank_slate_size(limit: usize, over_fetch_percent: u32, max_slate: usize) -> usize {
+    if limit == 0 {
+        return 0;
+    }
+    let max_slate = max_slate.max(1);
+    let inflated = (limit as u64)
+        .saturating_mul(100u64.saturating_add(u64::from(over_fetch_percent)))
+        .div_ceil(100) as usize;
+    inflated.max(limit).min(max_slate)
 }
 
 /// Built-in catalog. First entry is the default when a profile is requested by default paths.
@@ -98,7 +132,7 @@ pub fn resolve_reranker_pair(
     reranker_url: Option<&str>,
     reranker_profile: Option<&str>,
     reranker_model: Option<&str>,
-    reranker_over_fetch: Option<u32>,
+    reranker_over_fetch_percent: Option<u32>,
 ) -> Result<Option<ResolvedReranker>, String> {
     let url = reranker_url
         .map(str::trim)
@@ -110,15 +144,15 @@ pub fn resolve_reranker_pair(
 
     match (url, model) {
         (Some(url), Some(model)) => {
-            let over_fetch = match reranker_over_fetch {
-                None => 3,
-                Some(0) => 1, // caller may warn; we clamp here for safety
-                Some(n) => n,
-            };
+            // 0% extra is valid (slate == limit). Unset → default 200%.
+            // Values above MAX_RERANKER_OVER_FETCH_PERCENT are clamped.
+            let raw =
+                reranker_over_fetch_percent.unwrap_or(DEFAULT_RERANKER_OVER_FETCH_PERCENT);
+            let over_fetch_percent = raw.min(MAX_RERANKER_OVER_FETCH_PERCENT);
             Ok(Some(ResolvedReranker {
                 url,
                 model,
-                over_fetch,
+                over_fetch_percent,
                 max_doc_chars: max_doc,
                 max_query_chars: max_query,
                 profile_id,
@@ -200,7 +234,7 @@ mod tests {
         assert_eq!(r.model, DEFAULT_RERANKER_MODEL);
         assert_eq!(r.max_doc_chars, 1024);
         assert_eq!(r.max_query_chars, 256);
-        assert_eq!(r.over_fetch, 3);
+        assert_eq!(r.over_fetch_percent, DEFAULT_RERANKER_OVER_FETCH_PERCENT);
         assert_eq!(r.profile_id, Some("jina-v2"));
     }
 
@@ -210,7 +244,7 @@ mod tests {
             Some("http://localhost:8181"),
             Some("nemotron-rerank-1b"),
             Some("ignored"),
-            Some(5),
+            Some(50),
         )
         .unwrap()
         .unwrap();
@@ -218,11 +252,11 @@ mod tests {
         assert!(r.model.contains("nemotron"));
         assert_eq!(r.max_doc_chars, 6000);
         assert_eq!(r.max_query_chars, 1024);
-        assert_eq!(r.over_fetch, 5);
+        assert_eq!(r.over_fetch_percent, 50);
     }
 
     #[test]
-    fn raw_model_jina_caps_default() {
+    fn raw_model_zero_percent_ok() {
         let r = resolve_reranker_pair(
             Some("http://localhost:8181"),
             None,
@@ -233,8 +267,34 @@ mod tests {
         .unwrap();
         assert_eq!(r.model, "custom-rerank");
         assert_eq!(r.max_doc_chars, JINA_MAX_DOC_CHARS);
-        assert_eq!(r.over_fetch, 1);
+        assert_eq!(r.over_fetch_percent, 0);
         assert!(r.profile_id.is_none());
+    }
+
+    #[test]
+    fn slate_size_extra_percent() {
+        assert_eq!(rerank_slate_size(10, 50, 30), 15);
+        assert_eq!(rerank_slate_size(10, 200, 30), 30);
+        assert_eq!(rerank_slate_size(10, 0, 30), 10);
+        assert_eq!(rerank_slate_size(20, 200, 30), 30); // capped by max_slate
+        assert_eq!(rerank_slate_size(0, 50, 30), 0);
+        // 300% extra → 4× limit before max_slate
+        assert_eq!(rerank_slate_size(5, 300, 30), 20);
+        assert_eq!(rerank_slate_size(10, 300, 30), 30);
+    }
+
+    #[test]
+    fn over_fetch_percent_clamped_at_max() {
+        let r = resolve_reranker_pair(
+            Some("http://localhost:8181"),
+            Some("jina-v2"),
+            None,
+            Some(999),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(r.over_fetch_percent, MAX_RERANKER_OVER_FETCH_PERCENT);
+        assert_eq!(MAX_RERANKER_OVER_FETCH_PERCENT, 300);
     }
 
     #[test]

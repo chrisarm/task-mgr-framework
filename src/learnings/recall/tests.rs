@@ -1420,7 +1420,7 @@ mod rerank {
             limit: 5,
             // PanicReranker — if called the test fails.
             reranker: Some(Box::new(PanicReranker)),
-            reranker_over_fetch: 3,
+            reranker_over_fetch_percent: 200,
             ..Default::default()
         };
         let backend = fts5_and_patterns();
@@ -1441,7 +1441,7 @@ mod rerank {
             query: Some(String::new()),
             limit: 5,
             reranker: Some(Box::new(PanicReranker)),
-            reranker_over_fetch: 3,
+            reranker_over_fetch_percent: 200,
             ..Default::default()
         };
         let backend = fts5_and_patterns();
@@ -1504,7 +1504,7 @@ mod rerank {
             query: Some("shared".to_string()),
             limit: 3,
             reranker: Some(boxed),
-            reranker_over_fetch: 3,
+            reranker_over_fetch_percent: 200,
             ..Default::default()
         };
         let backend = fts5_and_patterns();
@@ -1601,7 +1601,7 @@ mod rerank {
             for_task: Some("US-001".to_string()),
             limit: 5,
             reranker: Some(boxed),
-            reranker_over_fetch: 3,
+            reranker_over_fetch_percent: 200,
             ..Default::default()
         };
         let backend = fts5_and_patterns();
@@ -1666,7 +1666,7 @@ mod rerank {
             for_task: Some("US-001".to_string()),
             limit: 5,
             reranker: Some(boxed),
-            reranker_over_fetch: 3,
+            reranker_over_fetch_percent: 200,
             ..Default::default()
         };
         let backend = fts5_and_patterns();
@@ -1699,7 +1699,7 @@ mod rerank {
             query: Some("shared".to_string()),
             limit: 5,
             reranker: Some(boxed),
-            reranker_over_fetch: 3,
+            reranker_over_fetch_percent: 200,
             ..Default::default()
         };
         let backend = fts5_and_patterns();
@@ -1732,7 +1732,7 @@ mod rerank {
             query: Some("keyword".to_string()),
             limit: 20,
             reranker: Some(boxed),
-            reranker_over_fetch: 3,
+            reranker_over_fetch_percent: 200,
             ..Default::default()
         };
         let backend = fts5_and_patterns();
@@ -1760,16 +1760,16 @@ mod rerank {
             query: Some("keyword".to_string()),
             limit: 5,
             reranker: Some(boxed),
-            reranker_over_fetch: 3,
+            reranker_over_fetch_percent: 200,
             ..Default::default()
         };
         let backend = fts5_and_patterns();
         let _ = recall_learnings_with_backend(&conn, params, &backend).unwrap();
         let n = mock.last_candidates_len().unwrap();
-        assert_eq!(n, 15, "slate must be limit*over_fetch = 15, got {n}");
+        assert_eq!(n, 15, "slate must be limit + 200% = 15, got {n}");
     }
 
-    // -- Clamping: over_fetch == 0 clamps to 1 (NOT to 3) --
+    // -- Zero percent: no over-fetch (slate == limit) --
 
     #[test]
     fn test_over_fetch_zero_clamps_to_one() {
@@ -1788,7 +1788,7 @@ mod rerank {
             query: Some("keyword".to_string()),
             limit: 4,
             reranker: Some(boxed),
-            reranker_over_fetch: 0, // clamps to 1
+            reranker_over_fetch_percent: 0, // no extra (slate == limit)
             ..Default::default()
         };
         let backend = fts5_and_patterns();
@@ -1796,7 +1796,7 @@ mod rerank {
         let n = mock.last_candidates_len().unwrap();
         assert_eq!(
             n, 4,
-            "slate must be limit*1 = 4 when over_fetch=0 is clamped, got {n}"
+            "slate must be limit when over_fetch_percent=0, got {n}"
         );
     }
 
@@ -1819,7 +1819,7 @@ mod rerank {
             query: Some("keyword".to_string()),
             limit: 4,
             reranker: Some(boxed),
-            reranker_over_fetch: 3,
+            reranker_over_fetch_percent: 200,
             ..Default::default()
         };
         let backend = fts5_and_patterns();
@@ -1922,7 +1922,7 @@ mod rerank {
             query: Some("shared".to_string()),
             limit: 5,
             reranker: Some(boxed),
-            reranker_over_fetch: 3,
+            reranker_over_fetch_percent: 200,
             ..Default::default()
         };
         let _ = recall_learnings_with_backend(&conn, params, &backend).unwrap();

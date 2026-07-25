@@ -54,7 +54,7 @@ Configure in `.task-mgr/config.json`:
 {
   "rerankerUrl": "http://localhost:8181",
   "rerankerProfile": "jina-v2",
-  "rerankerOverFetch": 3
+  "rerankerOverFetchPercent": 200
 }
 ```
 
@@ -67,8 +67,11 @@ char doc caps) and `nemotron-rerank-1b` (8192-token model; larger char caps).
 - **`rerankerProfile`** — preferred; supplies model id + trunc caps.
 - **`rerankerModel`** — raw escape hatch when profile is unset. Required (with
   URL) when not using a profile; either-or disables rerank.
-- **`rerankerOverFetch`** — per-backend over-fetch factor. Slate size is
-  `min(limit * over_fetch, 30)`. Default `3`.
+- **`rerankerOverFetchPercent`** — extra percent beyond `--limit` for the
+  pre-rerank slate. Slate =
+  `min(ceil(limit * (100 + p) / 100), 30)`. Default **200** (limit×3); max
+  **300** (clamped). Example: `50` with limit 10 → 15 candidates. Legacy
+  `rerankerOverFetch` (integer multiplier) is ignored with a warning.
 - **Example llama-box invocation** (CPU, host-native — bind to 8181 to match
   the project default; if you run the bundled docker-compose stack instead,
   the container's internal 8080 is remapped to host 8181 automatically):

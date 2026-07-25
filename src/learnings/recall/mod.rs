@@ -33,9 +33,9 @@ use super::retrieval::{CompositeBackend, RetrievalBackend, RetrievalQuery, Score
 
 /// Hard cap on the candidate slate size sent to the reranker.
 ///
-/// Bounds rerank latency and request body size regardless of `limit *
-/// reranker_over_fetch`. Cross-encoder rerank is the dominant cost of recall
-/// when enabled; 30 docs keeps p99 latency reasonable on commodity GPUs.
+/// Bounds rerank latency and request body size regardless of over-fetch
+/// percent. Cross-encoder rerank is the dominant cost of recall when enabled;
+/// 30 docs keeps p99 latency reasonable on commodity GPUs.
 const MAX_RERANK_SLATE: usize = 30;
 
 /// Width of the rerank-score band inside which UCB breaks ties.
@@ -76,10 +76,11 @@ pub struct RecallParams {
     /// the recall pipeline switches to over-fetch + per-backend union +
     /// rerank + truncate. `Send + Sync` so `RecallParams` can cross threads.
     pub reranker: Option<Box<dyn Reranker + Send + Sync>>,
-    /// Per-backend over-fetch factor when reranking. Effective slate size is
-    /// `min(limit * reranker_over_fetch, MAX_RERANK_SLATE)`. Must be >= 1;
-    /// values of 0 are clamped to 1.
-    pub reranker_over_fetch: u32,
+    /// Extra percent beyond `limit` for the pre-rerank slate.
+    /// Slate = `min(ceil(limit * (100 + p) / 100), MAX_RERANK_SLATE)`.
+    /// Example: 50 with limit 10 → 15. Default when unset at the CLI layer is
+    /// [`crate::learnings::reranker::DEFAULT_RERANKER_OVER_FETCH_PERCENT`] (200).
+    pub reranker_over_fetch_percent: u32,
 }
 
 /// Result of recalling learnings.
@@ -244,10 +245,11 @@ fn rerank_pipeline(
     limit: usize,
     params: &RecallParams,
 ) -> TaskMgrResult<RankedWithUcb> {
-    let over_fetch = params.reranker_over_fetch.max(1);
-    let slate_limit = limit
-        .saturating_mul(over_fetch as usize)
-        .min(MAX_RERANK_SLATE);
+    let slate_limit = super::reranker::rerank_slate_size(
+        limit,
+        params.reranker_over_fetch_percent,
+        MAX_RERANK_SLATE,
+    );
     query.limit = slate_limit;
 
     let candidates = backend.retrieve_for_rerank(conn, query)?;

@@ -697,10 +697,15 @@ pub struct ProjectConfig {
     #[serde(default)]
     pub reranker_model: Option<String>,
 
-    /// How many candidates per backend to fetch before reranking.
-    /// Defaults to 3 when unset; values of 0 are clamped to 1 with a warning.
+    /// Extra percent beyond the result limit when building the pre-rerank slate.
+    /// Example: 50 with `--limit 10` fetches 15 candidates. Default when unset:
+    /// 200 (same effective size as the old integer multiplier of 3).
+    /// Hard max: 300 (clamped at resolve time).
+    ///
+    /// The legacy key `rerankerOverFetch` (integer multiplier) is **removed**;
+    /// if present in JSON it is ignored with a warning at config load.
     #[serde(default)]
-    pub reranker_over_fetch: Option<u32>,
+    pub reranker_over_fetch_percent: Option<u32>,
 
     /// Hard cap (seconds) on a single parallel-slot merge-conflict resolution
     /// Claude run. Defaults to 600 (10 min). Lift for projects with large
@@ -787,7 +792,7 @@ impl Default for ProjectConfig {
             reranker_url: None,
             reranker_profile: None,
             reranker_model: None,
-            reranker_over_fetch: None,
+            reranker_over_fetch_percent: None,
             merge_resolver_timeout_secs: None,
             merge_resolver_effort: None,
             merge_fail_halt_threshold: default_merge_fail_halt_threshold(),
@@ -848,15 +853,20 @@ impl ProjectConfig {
             (true, true) => {}
         }
 
-        if self.reranker_over_fetch == Some(0) {
-            crate::output::warn("rerankerOverFetch=0 is invalid; clamping to 1");
+        if let Some(p) = self.reranker_over_fetch_percent {
+            if p > crate::learnings::reranker::MAX_RERANKER_OVER_FETCH_PERCENT {
+                crate::output::warn(&format!(
+                    "rerankerOverFetchPercent={p} exceeds max {}; clamping",
+                    crate::learnings::reranker::MAX_RERANKER_OVER_FETCH_PERCENT
+                ));
+            }
         }
 
         match crate::learnings::reranker::resolve_reranker_pair(
             self.reranker_url.as_deref(),
             self.reranker_profile.as_deref(),
             self.reranker_model.as_deref(),
-            self.reranker_over_fetch,
+            self.reranker_over_fetch_percent,
         ) {
             Ok(resolved) => resolved,
             Err(e) => {
@@ -866,12 +876,12 @@ impl ProjectConfig {
         }
     }
 
-    /// Backward-compatible tuple form used by older call sites.
+    /// Backward-compatible tuple form: `(url, model, over_fetch_percent)`.
     ///
     /// Prefer [`Self::resolved_reranker_config`].
     pub fn resolved_reranker_tuple(&self) -> Option<(String, String, u32)> {
         self.resolved_reranker_config()
-            .map(|r| (r.url, r.model, r.over_fetch))
+            .map(|r| (r.url, r.model, r.over_fetch_percent))
     }
 }
 
@@ -1034,6 +1044,13 @@ pub fn read_project_config(db_dir: &Path) -> ProjectConfig {
              --force-replace-legacy` to migrate.",
             legacy.join(", ")
         ));
+    }
+    // Removed integer multiplier; use rerankerOverFetchPercent (extra % beyond limit).
+    if value.get("rerankerOverFetch").is_some() {
+        crate::output::warn(
+            "`rerankerOverFetch` is removed; use `rerankerOverFetchPercent` (extra percent \
+             beyond --limit). Old default 3 ≈ 200. Example: 50 with limit 10 fetches 15.",
+        );
     }
     // Deserialize the non-model surfaces. Legacy model keys are ignored by
     // serde (REFACTOR-006 removed their struct fields); the `models`/`routing`
@@ -1253,37 +1270,40 @@ mod tests {
         let config = ProjectConfig {
             reranker_url: Some("http://x".to_string()),
             reranker_model: Some("m".to_string()),
-            reranker_over_fetch: Some(5),
+            reranker_over_fetch_percent: Some(50),
             ..Default::default()
         };
         let r = config.resolved_reranker_config().unwrap();
         assert_eq!(r.url, "http://x");
         assert_eq!(r.model, "m");
-        assert_eq!(r.over_fetch, 5);
+        assert_eq!(r.over_fetch_percent, 50);
     }
 
     #[test]
-    fn test_resolved_reranker_config_default_over_fetch() {
+    fn test_resolved_reranker_config_default_over_fetch_percent() {
         let config = ProjectConfig {
             reranker_url: Some("http://x".to_string()),
             reranker_model: Some("m".to_string()),
-            reranker_over_fetch: None,
+            reranker_over_fetch_percent: None,
             ..Default::default()
         };
         let r = config.resolved_reranker_config().unwrap();
-        assert_eq!((r.url.as_str(), r.model.as_str(), r.over_fetch), ("http://x", "m", 3));
+        assert_eq!(
+            (r.url.as_str(), r.model.as_str(), r.over_fetch_percent),
+            ("http://x", "m", 200)
+        );
     }
 
     #[test]
-    fn test_resolved_reranker_config_over_fetch_zero_clamped_to_one() {
+    fn test_resolved_reranker_config_zero_percent_allowed() {
         let config = ProjectConfig {
             reranker_url: Some("http://x".to_string()),
             reranker_model: Some("m".to_string()),
-            reranker_over_fetch: Some(0),
+            reranker_over_fetch_percent: Some(0),
             ..Default::default()
         };
         let r = config.resolved_reranker_config().unwrap();
-        assert_eq!(r.over_fetch, 1);
+        assert_eq!(r.over_fetch_percent, 0);
     }
 
     #[test]
@@ -1324,17 +1344,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(
             dir.path().join("config.json"),
-            r#"{"rerankerUrl":"http://x","rerankerModel":"m","rerankerOverFetch":5}"#,
+            r#"{"rerankerUrl":"http://x","rerankerModel":"m","rerankerOverFetchPercent":50}"#,
         )
         .unwrap();
         let config = read_project_config(dir.path());
         assert_eq!(config.reranker_url.as_deref(), Some("http://x"));
         assert_eq!(config.reranker_model.as_deref(), Some("m"));
-        assert_eq!(config.reranker_over_fetch, Some(5));
+        assert_eq!(config.reranker_over_fetch_percent, Some(50));
         let r = config.resolved_reranker_config().unwrap();
         assert_eq!(r.url, "http://x");
         assert_eq!(r.model, "m");
-        assert_eq!(r.over_fetch, 5);
+        assert_eq!(r.over_fetch_percent, 50);
     }
 
     #[test]

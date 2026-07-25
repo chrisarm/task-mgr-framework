@@ -211,9 +211,10 @@ print_config_hint() {
     "embeddingProfile": "$EMBED_PROFILE",
     "rerankerUrl": "$RERANKER_URL",
     "rerankerProfile": "$RERANK_PROFILE",
-    "rerankerOverFetch": 3
+    "rerankerOverFetchPercent": 200
   }
 EOF
+  log "  (rerankerOverFetchPercent = extra % beyond --limit; default 200, max 300)"
   if [[ "$EMBED_PROFILE" != "jina-small-q8" ]]; then
     warn "after changing embeddingProfile, run: task-mgr curate embed --force"
   fi

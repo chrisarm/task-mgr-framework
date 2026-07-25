@@ -526,11 +526,12 @@ OLLAMA / VECTOR BACKEND:
     (no query) does not require Ollama.
 
 RERANKER:
-    Set rerankerUrl + rerankerModel in .task-mgr/config.json to enable
-    cross-encoder reranking via gpustack/llama-box. Optional rerankerOverFetch
-    (default 3) controls candidate over-retrieval before rerank. Reranker
-    soft-fails: if the server is unreachable, recall returns the un-reranked
-    candidates with a stderr warning (NOT a hard error).
+    Set rerankerUrl + rerankerProfile (or rerankerModel) in .task-mgr/config.json
+    to enable cross-encoder reranking via gpustack/llama-box. Optional
+    rerankerOverFetchPercent is extra % beyond --limit (default 200, max 300):
+    e.g. 50 with limit 10 fetches 15 candidates before rerank. Absolute slate
+    cap is 30. Reranker soft-fails: if the server is unreachable, recall returns
+    the un-reranked candidates with a stderr warning (NOT a hard error).
 ")]
     Recall {
         /// Text query to search for in title and content

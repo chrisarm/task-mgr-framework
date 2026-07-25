@@ -120,11 +120,12 @@ pub fn recall(conn: &Connection, params: RecallCmdParams) -> TaskMgrResult<Recal
     // Build the cross-encoder reranker from the resolved config (profile caps
     // included). Missing resolution disables rerank; runtime soft-fail still
     // applies when the server is unreachable.
-    let reranker_over_fetch = params
+    use crate::learnings::reranker::DEFAULT_RERANKER_OVER_FETCH_PERCENT;
+    let reranker_over_fetch_percent = params
         .reranker
         .as_ref()
-        .map(|r| r.over_fetch)
-        .unwrap_or(3);
+        .map(|r| r.over_fetch_percent)
+        .unwrap_or(DEFAULT_RERANKER_OVER_FETCH_PERCENT);
     let reranker: Option<Box<dyn Reranker + Send + Sync>> = params
         .reranker
         .as_ref()
@@ -140,7 +141,7 @@ pub fn recall(conn: &Connection, params: RecallCmdParams) -> TaskMgrResult<Recal
         include_superseded: params.include_superseded,
         allow_degraded: params.allow_degraded,
         reranker,
-        reranker_over_fetch,
+        reranker_over_fetch_percent,
     };
 
     // Build composite backend with config-aware VectorBackend.
