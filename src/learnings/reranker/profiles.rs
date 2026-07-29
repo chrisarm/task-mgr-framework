@@ -103,7 +103,7 @@ pub static RERANKER_PROFILES: &[RerankerProfile] = &[
         hf_repo: Some("kread/llama-nemotron-rerank-1b-v2-GGUF"),
         hf_file: Some("llama-nemotron-rerank-1b-v2-q8_0.gguf"),
         container_model_path: Some("/models/llama-nemotron-rerank-1b-v2-q8_0.gguf"),
-        notes: "Nemotron rerank 1B Q8_0 (~1.3 GB), 8192-token ctx. Opt-in docker bake; ~2 GB VRAM.",
+        notes: "Nemotron rerank 1B Q8_0 (~1.3 GB), 8192-token ctx. REQUIRES llama.cpp with llama-embed arch — NOT supported by llama-box v0.0.171 (fails: unknown model architecture 'llama-embed'). Keep jina-v2 for llama-box until a newer llama-box ships.",
     },
 ];
 

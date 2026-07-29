@@ -115,6 +115,12 @@ pub fn format_dedup_text(result: &DedupResult) -> String {
 
 /// Format `curate embed` output as human-readable text.
 pub fn format_embed_text(result: &EmbedResult) -> String {
+    let pruned = if result.pruned_stale > 0 {
+        format!("Pruned {} stale row(s) from other models.\n", result.pruned_stale)
+    } else {
+        String::new()
+    };
+
     if result.status_only {
         let profile = result
             .profile_id
@@ -125,13 +131,23 @@ pub fn format_embed_text(result: &EmbedResult) -> String {
             .expected_dims
             .map(|d| format!(" dims: {d}"))
             .unwrap_or_default();
-        return format!(
-            "Embeddings: {}/{} active learnings embedded (model: {}{profile}{dims})\n",
+        let mut out = format!(
+            "{pruned}Embeddings: {}/{} active learnings embedded (model: {}{profile}{dims})\n",
             result.already_embedded, result.total_active, result.model
         );
+        // Post-v21 multiple models coexist; show where the rows live so
+        // abandoned models' storage is visible (prune with --prune-stale).
+        if result.rows_by_model.len() > 1 {
+            out.push_str("Rows by model:\n");
+            for mc in &result.rows_by_model {
+                let marker = if mc.model == result.model { "" } else { " (stale?)" };
+                out.push_str(&format!("  {}: {} row(s){marker}\n", mc.model, mc.rows));
+            }
+        }
+        return out;
     }
 
-    let mut out = format!("Embedded {} learning(s)", result.embedded_this_run);
+    let mut out = format!("{pruned}Embedded {} learning(s)", result.embedded_this_run);
     if result.skipped_empty > 0 {
         out.push_str(&format!(
             ", {} skipped (empty content)",
@@ -147,10 +163,18 @@ pub fn format_embed_text(result: &EmbedResult) -> String {
 
 /// Format `curate count` output as human-readable text.
 pub fn format_count_text(result: &CountResult) -> String {
-    format!(
-        "Total: {}\nActive: {}\nRetired: {}\nEmbedded: {}\n",
-        result.total, result.active, result.retired, result.embedded
-    )
+    let mut out = format!(
+        "Total: {}\nActive: {}\nRetired: {}\nEmbedded: {} (model: {})\n",
+        result.total, result.active, result.retired, result.embedded, result.embedding_model
+    );
+    if result.rows_by_model.len() > 1 {
+        out.push_str("Rows by model:\n");
+        for mc in &result.rows_by_model {
+            let marker = if mc.model == result.embedding_model { "" } else { " (stale?)" };
+            out.push_str(&format!("  {}: {} row(s){marker}\n", mc.model, mc.rows));
+        }
+    }
+    out
 }
 
 /// Format `curate unretire` output as human-readable text.

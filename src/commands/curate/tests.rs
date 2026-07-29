@@ -19,10 +19,10 @@ use crate::models::{Confidence, LearningOutcome};
 
 use super::output::{format_retire_text, format_unretire_text};
 use super::{
-    DeduplicateLearningItem, MergeClusterParams, RetireParams, build_dedup_prompt,
+    DeduplicateLearningItem, EmbedParams, MergeClusterParams, RetireParams, build_dedup_prompt,
     build_pair_judgment_prompt, clear_dismissals, compute_dismissal_pairs, curate_count,
-    curate_retire, curate_unretire, is_fully_dismissed, load_dismissals, merge_cluster,
-    parse_dedup_response, record_dismissals,
+    curate_embed, curate_retire, curate_unretire, is_fully_dismissed, load_dismissals,
+    merge_cluster, parse_dedup_response, record_dismissals,
 };
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -4603,12 +4603,13 @@ fn test_count_learnings_stats_returns_correct_counts_with_mixed_data() {
     )
     .expect("insert embedding");
 
-    let result = curate_count(&conn).expect("curate_count");
+    let result = curate_count(&conn, "test-model").expect("curate_count");
 
     assert_eq!(result.total, 5, "total: 3 active + 2 retired");
     assert_eq!(result.active, 3);
     assert_eq!(result.retired, 2);
     assert_eq!(result.embedded, 1, "only id1 has an embedding");
+    assert_eq!(result.embedding_model, "test-model");
 
     // Suppress unused-variable warnings from borrow checker
     let _ = (id2, id3);
@@ -4617,11 +4618,49 @@ fn test_count_learnings_stats_returns_correct_counts_with_mixed_data() {
 #[test]
 fn test_count_returns_zeros_on_empty_db() {
     let (_tmp, conn) = setup_db();
-    let result = curate_count(&conn).expect("curate_count on empty db");
+    let result = curate_count(&conn, "test-model").expect("curate_count on empty db");
     assert_eq!(result.total, 0);
     assert_eq!(result.active, 0);
     assert_eq!(result.retired, 0);
     assert_eq!(result.embedded, 0);
+    assert!(result.rows_by_model.is_empty());
+}
+
+/// AC (v21): `embedded` is scoped to the ACTIVE model only, and the per-model
+/// breakdown surfaces rows lingering under previously configured models.
+#[test]
+fn test_count_embedded_scoped_to_active_model_with_breakdown() {
+    let (_tmp, conn) = setup_db();
+    let id1 = insert_learning(&conn, "L1", Confidence::Medium, LearningOutcome::Pattern);
+    let id2 = insert_learning(&conn, "L2", Confidence::Medium, LearningOutcome::Pattern);
+
+    // id1 embedded under old + new model, id2 only under the old model.
+    for (lid, model) in [(id1, "old-model"), (id1, "new-model"), (id2, "old-model")] {
+        conn.execute(
+            "INSERT INTO learning_embeddings (learning_id, model, dimensions, embedding) \
+             VALUES (?1, ?2, 2, X'0000803F00000040')",
+            rusqlite::params![lid, model],
+        )
+        .expect("insert embedding");
+    }
+
+    let result = curate_count(&conn, "new-model").expect("curate_count");
+    assert_eq!(
+        result.embedded, 1,
+        "only id1 has a vector under the active model"
+    );
+    assert_eq!(result.embedding_model, "new-model");
+    assert_eq!(
+        result.rows_by_model.len(),
+        2,
+        "both models appear in the breakdown"
+    );
+    let old = result
+        .rows_by_model
+        .iter()
+        .find(|m| m.model == "old-model")
+        .expect("old-model row");
+    assert_eq!(old.rows, 2, "stale rows under old-model are visible");
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -5245,5 +5284,179 @@ fn test_dedup_reset_dismissals_clears_table_before_run() {
         dismissal_row_count(&conn),
         0,
         "reset cleared the table; dry_run prevented re-populating it"
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// curate embed tests (v21 multi-model gap-fill, prune, dims guard) — mockito
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Mock Ollama: `/api/tags` lists `model`; `/api/embed` returns `embeddings`.
+fn mock_ollama(
+    server: &mut mockito::Server,
+    model: &str,
+    embeddings: &[&[f32]],
+) -> (mockito::Mock, mockito::Mock) {
+    let tags = server
+        .mock("GET", "/api/tags")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(serde_json::json!({ "models": [{ "name": model }] }).to_string())
+        .create();
+    let embs: Vec<Vec<f32>> = embeddings.iter().map(|e| e.to_vec()).collect();
+    let embed = server
+        .mock("POST", "/api/embed")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(serde_json::json!({ "embeddings": embs }).to_string())
+        .create();
+    (tags, embed)
+}
+
+fn insert_embedding_row(conn: &Connection, learning_id: i64, model: &str, dims: i64) {
+    conn.execute(
+        "INSERT INTO learning_embeddings (learning_id, model, dimensions, embedding) \
+         VALUES (?1, ?2, ?3, X'0000803F00000040')",
+        rusqlite::params![learning_id, model, dims],
+    )
+    .expect("insert embedding row");
+}
+
+fn embedding_models_for(conn: &Connection, learning_id: i64) -> Vec<String> {
+    let mut stmt = conn
+        .prepare("SELECT model FROM learning_embeddings WHERE learning_id = ?1 ORDER BY model")
+        .unwrap();
+    stmt.query_map([learning_id], |r| r.get(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect()
+}
+
+/// AC (v21 core): default embed gap-fills ONLY learnings missing a vector for
+/// the ACTIVE model — a row under a different model does not count as covered,
+/// and existing rows (any model) survive untouched.
+#[test]
+fn test_embed_gap_fill_targets_only_active_model_gaps() {
+    let (_tmp, conn) = setup_db();
+    let id_a = insert_learning(&conn, "A", Confidence::Medium, LearningOutcome::Pattern);
+    let id_b = insert_learning(&conn, "B", Confidence::Medium, LearningOutcome::Pattern);
+    insert_embedding_row(&conn, id_a, "other-model", 2); // gap for active model
+    insert_embedding_row(&conn, id_b, "gap-model", 2); // already covered
+
+    let mut server = mockito::Server::new();
+    let (_tags, _embed) = mock_ollama(&mut server, "gap-model", &[&[1.0, 2.0]]);
+
+    let params = EmbedParams {
+        ollama_url: server.url(),
+        model: "gap-model".to_string(),
+        expected_dims: Some(2),
+        profile_id: None,
+        ..Default::default()
+    };
+    let result = curate_embed(&conn, params).expect("curate_embed");
+
+    assert_eq!(
+        result.embedded_this_run, 1,
+        "only A (missing gap-model) is embedded; B's other-model row must not mask the gap"
+    );
+    assert_eq!(result.errors, 0);
+    assert_eq!(
+        embedding_models_for(&conn, id_a),
+        vec!["gap-model".to_string(), "other-model".to_string()],
+        "A gains gap-model and keeps other-model"
+    );
+    assert_eq!(embedding_models_for(&conn, id_b), vec!["gap-model".to_string()]);
+}
+
+/// AC: --force re-embeds every active learning for the ACTIVE model while
+/// leaving other models' rows untouched.
+#[test]
+fn test_embed_force_replaces_active_model_only() {
+    let (_tmp, conn) = setup_db();
+    let id_a = insert_learning(&conn, "A", Confidence::Medium, LearningOutcome::Pattern);
+    insert_embedding_row(&conn, id_a, "gap-model", 2);
+    insert_embedding_row(&conn, id_a, "other-model", 2);
+
+    let mut server = mockito::Server::new();
+    let (_tags, _embed) = mock_ollama(&mut server, "gap-model", &[&[3.0, 4.0]]);
+
+    let params = EmbedParams {
+        force: true,
+        ollama_url: server.url(),
+        model: "gap-model".to_string(),
+        expected_dims: Some(2),
+        profile_id: None,
+        ..Default::default()
+    };
+    let result = curate_embed(&conn, params).expect("curate_embed --force");
+
+    assert_eq!(result.embedded_this_run, 1);
+    assert_eq!(
+        embedding_models_for(&conn, id_a),
+        vec!["gap-model".to_string(), "other-model".to_string()],
+        "force must not delete the other model's row"
+    );
+}
+
+/// AC: --prune-stale deletes rows under non-active models (and only those);
+/// combined with --status it is DB-only (no Ollama server involved).
+#[test]
+fn test_embed_prune_stale_removes_other_models_db_only() {
+    let (_tmp, conn) = setup_db();
+    let id_a = insert_learning(&conn, "A", Confidence::Medium, LearningOutcome::Pattern);
+    insert_embedding_row(&conn, id_a, "gap-model", 2);
+    insert_embedding_row(&conn, id_a, "old-model-1", 2);
+    insert_embedding_row(&conn, id_a, "old-model-2", 3);
+
+    let params = EmbedParams {
+        status: true,
+        prune_stale: true,
+        // Unreachable URL proves the prune+status path never touches Ollama.
+        ollama_url: "http://127.0.0.1:1".to_string(),
+        model: "gap-model".to_string(),
+        expected_dims: Some(2),
+        profile_id: None,
+        ..Default::default()
+    };
+    let result = curate_embed(&conn, params).expect("prune+status must not need Ollama");
+
+    assert_eq!(result.pruned_stale, 2, "both stale models' rows deleted");
+    assert_eq!(result.already_embedded, 1);
+    assert_eq!(
+        embedding_models_for(&conn, id_a),
+        vec!["gap-model".to_string()],
+        "active model's row survives the prune"
+    );
+    assert_eq!(result.rows_by_model.len(), 1, "breakdown reflects post-prune state");
+}
+
+/// AC: raw models (no catalog dims) validate new vectors against the width
+/// already stored under the model key — a mismatched vector is rejected
+/// instead of silently mixing dimensions within one model.
+#[test]
+fn test_embed_raw_model_dims_guard_rejects_mismatch() {
+    let (_tmp, conn) = setup_db();
+    let id_a = insert_learning(&conn, "A", Confidence::Medium, LearningOutcome::Pattern);
+    let id_b = insert_learning(&conn, "B", Confidence::Medium, LearningOutcome::Pattern);
+    insert_embedding_row(&conn, id_b, "raw-model", 3); // establishes 3-dim space
+
+    let mut server = mockito::Server::new();
+    // Ollama now returns 2-dim vectors for the same model string.
+    let (_tags, _embed) = mock_ollama(&mut server, "raw-model", &[&[1.0, 2.0]]);
+
+    let params = EmbedParams {
+        ollama_url: server.url(),
+        model: "raw-model".to_string(),
+        expected_dims: None, // raw escape hatch: no catalog dims
+        profile_id: None,
+        ..Default::default()
+    };
+    let result = curate_embed(&conn, params).expect("curate_embed raw model");
+
+    assert_eq!(result.embedded_this_run, 0, "mismatched vector must not be stored");
+    assert_eq!(result.errors, 1);
+    assert!(
+        embedding_models_for(&conn, id_a).is_empty(),
+        "A must not receive a 2-dim vector into a 3-dim model space"
     );
 }

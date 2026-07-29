@@ -293,6 +293,9 @@ pub struct EmbedParams {
     pub force: bool,
     /// If true, only print status counts and model name; skip embedding.
     pub status: bool,
+    /// If true, delete embedding rows stored under models other than the
+    /// active one before anything else (combinable with `status`).
+    pub prune_stale: bool,
     /// Ollama server base URL (e.g. `http://localhost:11435`).
     pub ollama_url: String,
     /// Embedding model name as known to Ollama.
@@ -311,6 +314,7 @@ impl Default for EmbedParams {
         Self {
             force: false,
             status: false,
+            prune_stale: false,
             ollama_url: DEFAULT_OLLAMA_URL.to_string(),
             model: DEFAULT_EMBEDDING_MODEL.to_string(),
             passage_prefix: String::new(),
@@ -343,6 +347,22 @@ pub struct EmbedResult {
     /// Expected dims when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_dims: Option<usize>,
+    /// Rows deleted by `--prune-stale` (models other than the active one).
+    #[serde(default)]
+    pub pruned_stale: usize,
+    /// Per-model row counts across the whole table (post-v21 multi-model
+    /// retention visibility). Populated on `--status` only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rows_by_model: Vec<ModelRowCount>,
+}
+
+/// Row count for one embedding model in `learning_embeddings`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelRowCount {
+    /// Embedding model string the rows are keyed under.
+    pub model: String,
+    /// Total rows stored under that model (active + retired learnings).
+    pub rows: i64,
 }
 
 /// Result of the `curate count` command.
@@ -354,8 +374,15 @@ pub struct CountResult {
     pub active: i64,
     /// Retired learnings (retired_at IS NOT NULL)
     pub retired: i64,
-    /// Active learnings with embeddings
+    /// Active learnings with an embedding under the ACTIVE model only
+    /// (post-v21, other models' rows may coexist — see `rows_by_model`)
     pub embedded: i64,
+    /// The active embedding model the `embedded` count is scoped to.
+    #[serde(default)]
+    pub embedding_model: String,
+    /// Per-model row counts across the whole table.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rows_by_model: Vec<ModelRowCount>,
 }
 
 /// Result of the `curate dedup` command.

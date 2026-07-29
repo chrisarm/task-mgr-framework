@@ -2,7 +2,7 @@
 
 ## Project layout
 
-- Database: `.task-mgr/tasks.db` (per worktree; schema migrations under `src/db/migrations/v*.rs` — most recent: v19 adds `tasks.claims_shared_infra` for the parallel-slot shared-infra heuristic)
+- Database: `.task-mgr/tasks.db` (per worktree; schema migrations under `src/db/migrations/v*.rs` — most recent: v21 multi-model `learning_embeddings` PK `(learning_id, model)`; v19 added `tasks.claims_shared_infra` for the parallel-slot shared-infra heuristic)
 - Main worktree: `$HOME/projects/task-mgr`
 - Feature worktrees: `$HOME/projects/task-mgr-worktrees/<branch-name>/`
 - Parallel-slot worktrees: `$HOME/projects/task-mgr-worktrees/<branch-name>-slot-<N>/` for slots 1+ (slot 0 reuses the feature worktree directly; see `src/loop_engine/CLAUDE.md` "Parallel-slot scheduling")

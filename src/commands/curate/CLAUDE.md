@@ -29,9 +29,23 @@ Catalog (SSoT: `src/learnings/embeddings/profiles.rs`):
 - **Default URL**: `http://localhost:11435` (bundled stack; avoids host `ollama` on 11434)
 - **Raw escape hatch**: `embeddingModel` still accepted; if it matches a catalog
   Ollama id, prefixes are applied automatically
-- **Switching profiles**: one embedding row per learning (PK); re-run
-  `task-mgr curate embed --force` after a profile change
-- **Schema**: Migration v15 `learning_embeddings` (BLOB, little-endian f32)
+- **Switching profiles**: PK is `(learning_id, model)` (migration v21) — Jina,
+  Nemotron, and other models coexist per learning. Active recall/curate use only
+  the configured model. After a switch, run `task-mgr curate embed` (no
+  `--force`) to gap-fill missing vectors for the new model; prior models are not
+  erased. Use `--force` only to re-compute the *active* model for all active
+  learnings.
+- **Reclaiming stale rows**: `task-mgr curate embed --prune-stale` deletes rows
+  stored under models other than the active one (combinable with `--status` for
+  a DB-only prune). Nothing else ever removes a non-active model's rows.
+- **Visibility**: `curate embed --status` and `curate count` print a per-model
+  row breakdown when more than one model is present; `curate count`'s
+  `embedded` figure is scoped to the ACTIVE model. Dimension inconsistency
+  within one model key (re-quantized tag, raw-model collision) triggers a
+  stderr warning from `curate embed`; raw models without catalog dims are
+  validated against the width already stored under their key.
+- **Schema**: Migration v15 created `learning_embeddings` (BLOB, little-endian
+  f32); v21 composite PK for multi-model retention
 
 ### Graceful Degradation
 

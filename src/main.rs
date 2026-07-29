@@ -1650,10 +1650,21 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                     output_result(&result, cli.format);
                 }
                 CurateAction::Count => {
-                    let result = curate_count(&conn)?;
+                    let proj_config = read_project_config(&cli.dir);
+                    let resolved = proj_config.resolved_embedding().map_err(|e| {
+                        TaskMgrError::InvalidConfig {
+                            field: "embeddingProfile".to_string(),
+                            message: e,
+                        }
+                    })?;
+                    let result = curate_count(&conn, &resolved.model)?;
                     output_result(&result, cli.format);
                 }
-                CurateAction::Embed { force, status } => {
+                CurateAction::Embed {
+                    force,
+                    status,
+                    prune_stale,
+                } => {
                     let proj_config = read_project_config(&cli.dir);
                     let resolved = proj_config.resolved_embedding().map_err(|e| {
                         TaskMgrError::InvalidConfig {
@@ -1664,6 +1675,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                     let params = EmbedParams {
                         force,
                         status,
+                        prune_stale,
                         ollama_url: resolved.ollama_url,
                         model: resolved.model,
                         passage_prefix: resolved.passage_prefix,

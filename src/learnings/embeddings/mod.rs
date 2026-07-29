@@ -312,7 +312,11 @@ pub fn find_near_duplicate(
 // Storage functions
 // ---------------------------------------------------------------------------
 
-/// Store (or replace) an embedding for a learning.
+/// Store (or replace) an embedding for a learning under a specific model.
+///
+/// Primary key is `(learning_id, model)` (migration v21). Replacing model A's
+/// vector never deletes model B's row for the same learning — profile switches
+/// retain prior catalog embeddings so only gaps need re-embedding.
 pub fn store_embedding(
     conn: &Connection,
     learning_id: i64,
@@ -328,12 +332,17 @@ pub fn store_embedding(
     Ok(())
 }
 
-/// Load the embedding for a single learning. Returns `None` if not found.
-pub fn load_embedding(conn: &Connection, learning_id: i64) -> TaskMgrResult<Option<Vec<f32>>> {
-    let mut stmt =
-        conn.prepare("SELECT embedding FROM learning_embeddings WHERE learning_id = ?1")?;
+/// Load the embedding for a single learning under `model`. Returns `None` if not found.
+pub fn load_embedding(
+    conn: &Connection,
+    learning_id: i64,
+    model: &str,
+) -> TaskMgrResult<Option<Vec<f32>>> {
+    let mut stmt = conn.prepare(
+        "SELECT embedding FROM learning_embeddings WHERE learning_id = ?1 AND model = ?2",
+    )?;
 
-    let result = stmt.query_row([learning_id], |row| {
+    let result = stmt.query_row(rusqlite::params![learning_id, model], |row| {
         let blob: Vec<u8> = row.get(0)?;
         Ok(blob_to_embedding(&blob))
     });
@@ -395,6 +404,54 @@ pub fn count_embedded(conn: &Connection, model: &str) -> TaskMgrResult<i64> {
         |row| row.get(0),
     )?;
     Ok(count)
+}
+
+/// Per-model row counts over the whole `learning_embeddings` table (including
+/// rows for retired learnings), ordered by model name.
+///
+/// Post-v21 the table retains rows for every model ever embedded; this is the
+/// only surface that reveals rows lingering under non-active models.
+pub fn count_rows_by_model(conn: &Connection) -> TaskMgrResult<Vec<(String, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT model, COUNT(*) FROM learning_embeddings GROUP BY model ORDER BY model",
+    )?;
+    let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row?);
+    }
+    Ok(results)
+}
+
+/// Delete all embedding rows stored under models OTHER than `keep_model`.
+///
+/// Returns the number of rows deleted. This is the explicit reclaim path for
+/// the multi-model retention introduced by migration v21 — nothing else ever
+/// removes a non-active model's rows short of deleting the learning itself.
+pub fn delete_stale_model_embeddings(conn: &Connection, keep_model: &str) -> TaskMgrResult<usize> {
+    let deleted = conn.execute(
+        "DELETE FROM learning_embeddings WHERE model != ?1",
+        [keep_model],
+    )?;
+    Ok(deleted)
+}
+
+/// Distinct `dimensions` values stored under `model`, ascending.
+///
+/// More than one entry means the model key holds internally inconsistent
+/// vectors (e.g. an Ollama tag was re-quantized to a different width without
+/// changing the model string) — cross-comparisons silently score 0.0.
+pub fn stored_dims_for_model(conn: &Connection, model: &str) -> TaskMgrResult<Vec<i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT dimensions FROM learning_embeddings
+         WHERE model = ?1 ORDER BY dimensions ASC",
+    )?;
+    let rows = stmt.query_map([model], |row| row.get(0))?;
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row?);
+    }
+    Ok(results)
 }
 
 // ---------------------------------------------------------------------------
@@ -835,7 +892,7 @@ mod tests {
         let embedding = vec![1.0_f32, -2.5, 3.125, 0.0];
         store_embedding(&conn, 1, "test-model", &embedding).unwrap();
 
-        let loaded = load_embedding(&conn, 1).unwrap();
+        let loaded = load_embedding(&conn, 1, "test-model").unwrap();
         assert_eq!(
             loaded,
             Some(embedding),
@@ -846,23 +903,55 @@ mod tests {
     #[test]
     fn test_load_embedding_not_found() {
         let (_dir, conn) = setup_db();
-        let loaded = load_embedding(&conn, 999).unwrap();
+        let loaded = load_embedding(&conn, 999, "any-model").unwrap();
         assert_eq!(loaded, None, "missing embedding returns None");
     }
 
     #[test]
-    fn test_store_replaces_existing() {
+    fn test_store_same_model_replaces() {
+        let (_dir, conn) = setup_db();
+        insert_learning(&conn, 1, "Test");
+
+        store_embedding(&conn, 1, "model-a", &[1.0, 2.0]).unwrap();
+        store_embedding(&conn, 1, "model-a", &[3.0, 4.0, 5.0]).unwrap();
+
+        let loaded = load_embedding(&conn, 1, "model-a").unwrap().unwrap();
+        assert_eq!(
+            loaded,
+            vec![3.0, 4.0, 5.0],
+            "same-model store must replace prior vector"
+        );
+    }
+
+    #[test]
+    fn test_store_different_models_coexist() {
         let (_dir, conn) = setup_db();
         insert_learning(&conn, 1, "Test");
 
         store_embedding(&conn, 1, "model-a", &[1.0, 2.0]).unwrap();
         store_embedding(&conn, 1, "model-b", &[3.0, 4.0, 5.0]).unwrap();
 
-        let loaded = load_embedding(&conn, 1).unwrap().unwrap();
         assert_eq!(
-            loaded,
-            vec![3.0, 4.0, 5.0],
-            "second store must replace first"
+            load_embedding(&conn, 1, "model-a").unwrap().unwrap(),
+            vec![1.0, 2.0],
+            "model-a must be preserved when model-b is stored"
+        );
+        assert_eq!(
+            load_embedding(&conn, 1, "model-b").unwrap().unwrap(),
+            vec![3.0, 4.0, 5.0]
+        );
+        assert_eq!(count_embedded(&conn, "model-a").unwrap(), 1);
+        assert_eq!(count_embedded(&conn, "model-b").unwrap(), 1);
+
+        // Replacing model-a must not erase model-b.
+        store_embedding(&conn, 1, "model-a", &[9.0, 8.0]).unwrap();
+        assert_eq!(
+            load_embedding(&conn, 1, "model-b").unwrap().unwrap(),
+            vec![3.0, 4.0, 5.0]
+        );
+        assert_eq!(
+            load_embedding(&conn, 1, "model-a").unwrap().unwrap(),
+            vec![9.0, 8.0]
         );
     }
 

@@ -21,7 +21,7 @@ opt-in and download larger weights.
 | Embed | `jina-small-q8` **(default)** | ~0.6 GB | 1024-d, no text prefixes |
 | Embed | `nemotron-3-embed-q8` | ~8.5 GB | 4096-d; uses `query:` / `passage:` prefixes; re-embed after switch |
 | Rerank | `jina-v2` **(default)** | ~0.5 GB | 1024-token ctx |
-| Rerank | `nemotron-rerank-1b` | ~1.3 GB Q8_0 | 8192-token ctx; GGUF from `kread/llama-nemotron-rerank-1b-v2-GGUF` |
+| Rerank | `nemotron-rerank-1b` | ~1.3 GB Q8_0 | **Blocked on llama-box v0.0.171** (`llama-embed` arch unknown). Use `jina-v2` until llama-box upgrades. |
 
 List profiles: `scripts/recall-stack-up.sh --list-profiles`
 
@@ -111,12 +111,16 @@ applied automatically.
 
 ### After changing the embedding profile
 
-Vectors are keyed by model string; switching profiles requires a re-embed
-(overwrites the single embedding row per learning):
+Vectors are keyed by model string with a composite PK `(learning_id, model)`
+(migration v21). Switching profiles **keeps** other models' rows; only the
+active model is used for recall. Gap-fill embeddings for the newly active model
+(does not re-embed docs that already have that model):
 
 ```sh
-task-mgr curate embed --force
-task-mgr curate embed --status   # shows profile, model, dims, coverage
+task-mgr curate embed            # only learnings missing the active model
+# task-mgr curate embed --force  # re-embed ALL active learnings for active model only
+# task-mgr curate embed --prune-stale --status  # reclaim rows left by prior models (DB-only)
+task-mgr curate embed --status   # shows profile, model, dims, coverage, per-model rows
 task-mgr recall --query 'overflow recovery ladder' --limit 5
 ```
 
@@ -131,7 +135,7 @@ reranker is healthy, and `vector similarity` when it soft-fails.
 | Build fails downloading model from Hugging Face | Transient HF outage / TLS MITM without `docker/certs/`. Dockerfile retries 3×; re-run `--rebuild`. |
 | `task-mgr recall` errors "Ollama embedding service unreachable" | Ollama down. Run the script, or `--allow-degraded` for FTS5/pattern only. |
 | `task-mgr recall` warns "reranker: ... using un-reranked order" | Reranker down — results still return without cross-encoder order. |
-| Empty vector hits after profile switch | Run `task-mgr curate embed --force`. |
+| Empty vector hits after profile switch | Run `task-mgr curate embed` (gap-fill; only learnings missing the new model are embedded). |
 | Port 11435 or 8181 already in use | Stop the other service or remap compose ports + config URLs. |
 | GPU free but models on CPU | Host CDI/runtime issue; ensure nvidia-container-toolkit + CDI refresh. |
 

@@ -1926,27 +1926,45 @@ FIELD VALUES:
     /// Generate and store Ollama embeddings for active learnings
     #[command(after_help = "\
 EXAMPLES:
-    # Show embedding status (counts and model) without embedding
+    # Show embedding status (counts, model, per-model rows) without embedding
     task-mgr curate embed --status
 
-    # Embed all unembedded active learnings (default)
+    # Gap-fill: embed active learnings missing a vector for the ACTIVE model
+    # (the right command after switching embedding profiles — other models'
+    # rows are kept and skipped)
     task-mgr curate embed
 
-    # Re-embed ALL active learnings (force refresh)
+    # Re-embed ALL active learnings for the ACTIVE model (other models' rows
+    # are untouched)
     task-mgr curate embed --force
 
+    # Reclaim rows stored under previously configured models
+    task-mgr curate embed --prune-stale --status
+
 MODEL:
-    Configured via .task-mgr/config.json field 'embeddingModel'.
+    Configured via .task-mgr/config.json field 'embeddingProfile' (or the raw
+    'embeddingModel' escape hatch).
     Default: hf.co/jinaai/jina-embeddings-v5-text-small-retrieval-GGUF:Q8_0
+
+    Vectors are keyed by (learning, model) — see migration v21 — so switching
+    profiles keeps prior models' rows; only the active model is used by recall.
 ")]
     Embed {
-        /// Re-embed ALL active learnings, not just those without embeddings
+        /// Re-embed ALL active learnings for the active model, not just those
+        /// missing a vector (other models' rows are never touched)
         #[arg(long, default_value_t = false)]
         force: bool,
 
-        /// Show embedded/total counts and model name without performing any embedding
+        /// Show embedded/total counts, model name, and per-model row counts
+        /// without performing any embedding
         #[arg(long, default_value_t = false)]
         status: bool,
+
+        /// Delete embedding rows stored under models OTHER than the active one
+        /// (reclaims space left by previous embedding profiles; combinable
+        /// with --status for a DB-only prune)
+        #[arg(long = "prune-stale", default_value_t = false)]
+        prune_stale: bool,
     },
 
     /// Show learning statistics: total, active, retired, and embedded counts

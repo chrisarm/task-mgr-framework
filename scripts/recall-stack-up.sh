@@ -94,7 +94,7 @@ Embedding profiles (--embed-profile):
 
 Reranker profiles (--rerank-profile):
   jina-v2                Default. ~0.5 GB FP16, 1024-token ctx.
-  nemotron-rerank-1b     Nemotron rerank 1B Q8_0 (~1.3 GB), 8192-token ctx.
+  nemotron-rerank-1b     Nemotron 1B Q8_0 — NOT usable with llama-box v0.0.171 (llama-embed arch).
 
 After switching embed profile, set .task-mgr/config.json and re-embed:
   {
@@ -103,7 +103,7 @@ After switching embed profile, set .task-mgr/config.json and re-embed:
     "rerankerUrl": "http://localhost:8181",
     "rerankerProfile": "nemotron-rerank-1b"
   }
-  task-mgr curate embed --force
+  task-mgr curate embed   # gap-fill: embeds only learnings missing the new model
 EOF
 }
 
@@ -216,7 +216,7 @@ print_config_hint() {
 EOF
   log "  (rerankerOverFetchPercent = extra % beyond --limit; default 200, max 300)"
   if [[ "$EMBED_PROFILE" != "jina-small-q8" ]]; then
-    warn "after changing embeddingProfile, run: task-mgr curate embed --force"
+    warn "after changing embeddingProfile, run: task-mgr curate embed  (gap-fill; prior models' vectors are kept)"
   fi
   if command -v nvidia-smi >/dev/null 2>&1; then
     log "GPU memory snapshot:"

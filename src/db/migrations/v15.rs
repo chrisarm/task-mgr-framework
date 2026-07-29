@@ -9,9 +9,12 @@
 //!   - `created_at` TEXT NOT NULL DEFAULT (datetime('now'))
 //!
 //! ## Semantics
-//! - One embedding per learning (learning_id is PK, not just FK)
-//! - Re-embedding replaces via INSERT OR REPLACE
+//! - Originally one embedding per learning (`learning_id` was the sole PK)
+//! - Re-embedding replaced via INSERT OR REPLACE
 //! - Cascade delete removes embeddings when learning is deleted
+//!
+//! Superseded by migration v21: composite PK `(learning_id, model)` so multiple
+//! catalog/raw embedding models can coexist per learning.
 
 use super::Migration;
 
@@ -110,7 +113,11 @@ mod tests {
         );
     }
 
-    /// INSERT OR REPLACE must work for re-embedding.
+    /// INSERT OR REPLACE must re-embed under the same model key.
+    ///
+    /// Post-v21 the PK is `(learning_id, model)`, so a different model string
+    /// inserts a second row rather than overwriting (see v21 tests). This test
+    /// only asserts same-model replace still works after full migrations.
     #[test]
     fn test_v15_insert_or_replace_works() {
         let (_temp_dir, conn) = setup_migrated_db();
@@ -129,21 +136,23 @@ mod tests {
         )
         .unwrap();
 
-        // Replace the embedding
+        // Replace the embedding for the same model
         conn.execute(
-            "INSERT OR REPLACE INTO learning_embeddings (learning_id, model, dimensions, embedding) VALUES (1, 'new-model', 4, X'000000000000803F0000004000004040')",
+            "INSERT OR REPLACE INTO learning_embeddings (learning_id, model, dimensions, embedding) VALUES (1, 'test-model', 4, X'000000000000803F0000004000004040')",
             [],
         )
         .unwrap();
 
-        let model: String = conn
+        let (dims, count): (i64, i64) = conn
             .query_row(
-                "SELECT model FROM learning_embeddings WHERE learning_id = 1",
+                "SELECT dimensions, (SELECT COUNT(*) FROM learning_embeddings WHERE learning_id = 1)
+                 FROM learning_embeddings WHERE learning_id = 1 AND model = 'test-model'",
                 [],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(model, "new-model", "INSERT OR REPLACE must update the row");
+        assert_eq!(count, 1, "same-model replace must not create a second row");
+        assert_eq!(dims, 4, "INSERT OR REPLACE must update the row");
     }
 
     /// Cascade delete must remove embedding when learning is deleted.

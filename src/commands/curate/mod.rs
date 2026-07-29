@@ -19,7 +19,7 @@ pub use output::{
 };
 pub use types::{
     CountResult, DedupCluster, DedupParams, DedupResult, DeduplicateLearningItem, EmbedParams,
-    EmbedResult, EnrichCandidate, EnrichParams, EnrichResult, MergeClusterParams,
+    EmbedResult, EnrichCandidate, EnrichParams, EnrichResult, MergeClusterParams, ModelRowCount,
     MergeClusterResult, RawDedupCluster, RetireParams, RetireResult, RetirementCandidate,
     UnretireResult,
 };
@@ -47,7 +47,9 @@ use crate::models::{Confidence, LearningOutcome};
 use crate::output::ui;
 
 /// Returns learning statistics: total, active, retired, and embedded counts.
-pub fn curate_count(conn: &Connection) -> TaskMgrResult<CountResult> {
+pub fn curate_count(conn: &Connection, embedding_model: &str) -> TaskMgrResult<CountResult> {
+    use crate::learnings::embeddings::{count_embedded, count_rows_by_model};
+
     let total: i64 = conn.query_row("SELECT COUNT(*) FROM learnings", [], |r| r.get(0))?;
     let active: i64 = conn.query_row(
         "SELECT COUNT(*) FROM learnings WHERE retired_at IS NULL",
@@ -59,17 +61,21 @@ pub fn curate_count(conn: &Connection) -> TaskMgrResult<CountResult> {
         [],
         |r| r.get(0),
     )?;
-    let embedded: i64 = conn.query_row(
-        "SELECT COUNT(DISTINCT le.learning_id) FROM learning_embeddings le \
-         JOIN learnings l ON l.id = le.learning_id WHERE l.retired_at IS NULL",
-        [],
-        |r| r.get(0),
-    )?;
+    // Post-v21 multiple models coexist per learning; "embedded" is only
+    // meaningful scoped to the active model. The per-model breakdown reveals
+    // rows lingering under previously configured models.
+    let embedded = count_embedded(conn, embedding_model)?;
+    let rows_by_model = count_rows_by_model(conn)?
+        .into_iter()
+        .map(|(model, rows)| ModelRowCount { model, rows })
+        .collect();
     Ok(CountResult {
         total,
         active,
         retired,
         embedded,
+        embedding_model: embedding_model.to_string(),
+        rows_by_model,
     })
 }
 
@@ -1168,16 +1174,35 @@ pub fn curate_dedup(conn: &Connection, params: DedupParams) -> TaskMgrResult<Ded
 /// Embeds active learnings via Ollama and stores the vectors in `learning_embeddings`.
 ///
 /// Behaviour:
+/// - `params.prune_stale = true`: FIRST deletes all rows stored under models
+///   other than `params.model` (the explicit reclaim path for v21 multi-model
+///   retention). DB-only; combinable with `status`.
 /// - `params.status = true`: returns counts without embedding.
-/// - `params.force = true`: re-embeds ALL active learnings (replaces existing).
-/// - Default: embeds only active learnings that have no entry for `params.model`.
+/// - `params.force = true`: re-embeds ALL active learnings for `params.model`
+///   (replaces that model only; other models' rows for the same learning are kept).
+/// - Default: embeds only active learnings that have no entry for `params.model`
+///   (gap-fill after a profile switch — prior models stay in the table).
 ///
 /// Learnings whose embedding text (title + content) is empty are skipped with
 /// a warning printed to stderr.  All other errors (Ollama call failures, store
 /// failures) are counted and reported in the result without aborting the run.
 pub fn curate_embed(conn: &Connection, params: EmbedParams) -> TaskMgrResult<EmbedResult> {
     use crate::learnings::embeddings::{
-        OllamaEmbedder, count_embedded, format_embed_input, store_embedding,
+        OllamaEmbedder, count_embedded, count_rows_by_model, delete_stale_model_embeddings,
+        format_embed_input, store_embedding, stored_dims_for_model,
+    };
+
+    // Prune runs first (before any counting) so status/gap-fill see the
+    // post-prune table. DB-only: works without Ollama, including with --status.
+    let pruned_stale = if params.prune_stale {
+        let deleted = delete_stale_model_embeddings(conn, &params.model)?;
+        ui::emit(&format!(
+            "Pruned {deleted} embedding row(s) stored under models other than '{}'",
+            params.model
+        ));
+        deleted
+    } else {
+        0
     };
 
     // Status counts are always computed (needed for both modes).
@@ -1188,6 +1213,18 @@ pub fn curate_embed(conn: &Connection, params: EmbedParams) -> TaskMgrResult<Emb
     )?;
 
     let already_embedded = count_embedded(conn, &params.model)?;
+
+    // Post-v21 a single model key must hold same-width vectors; more than one
+    // distinct dims value means the model was re-shaped behind its string
+    // (re-quantized tag, raw-model collision) and cross-comparisons score 0.0.
+    let stored_dims = stored_dims_for_model(conn, &params.model)?;
+    if stored_dims.len() > 1 {
+        ui::emit_err(&format!(
+            "Warning: model '{}' holds vectors with inconsistent dimensions {stored_dims:?}; \
+             similarity across them is meaningless — run `curate embed --force` to re-embed",
+            params.model
+        ));
+    }
 
     if params.status {
         if let Some(ref profile) = params.profile_id {
@@ -1200,6 +1237,10 @@ pub fn curate_embed(conn: &Connection, params: EmbedParams) -> TaskMgrResult<Emb
                     .unwrap_or_else(|| "unknown".to_string())
             ));
         }
+        let rows_by_model = count_rows_by_model(conn)?
+            .into_iter()
+            .map(|(model, rows)| ModelRowCount { model, rows })
+            .collect();
         return Ok(EmbedResult {
             status_only: true,
             total_active,
@@ -1210,8 +1251,20 @@ pub fn curate_embed(conn: &Connection, params: EmbedParams) -> TaskMgrResult<Emb
             model: params.model,
             profile_id: params.profile_id,
             expected_dims: params.expected_dims,
+            pruned_stale,
+            rows_by_model,
         });
     }
+
+    // Raw-model escape hatch has no catalog dims; validate new vectors against
+    // the width already stored under this key so gap-fill can't silently mix
+    // dimensions within one model.
+    let effective_dims = params.expected_dims.or_else(|| {
+        match stored_dims.as_slice() {
+            [single] => usize::try_from(*single).ok(),
+            _ => None,
+        }
+    });
 
     // Verify Ollama is reachable and the model is available.
     let embedder = OllamaEmbedder::new(&params.ollama_url, &params.model);
@@ -1345,16 +1398,16 @@ pub fn curate_embed(conn: &Connection, params: EmbedParams) -> TaskMgrResult<Emb
                     ));
                 }
                 for (item, embedding) in chunk.iter().zip(embeddings.iter()) {
-                    if let Some(expected) = params.expected_dims {
-                        if embedding.len() != expected {
-                            ui::emit_err(&format!(
-                                "Warning: learning {} embedding has {} dims, expected {expected}",
-                                item.id,
-                                embedding.len()
-                            ));
-                            errors += 1;
-                            continue;
-                        }
+                    if let Some(expected) = effective_dims
+                        && embedding.len() != expected
+                    {
+                        ui::emit_err(&format!(
+                            "Warning: learning {} embedding has {} dims, expected {expected}",
+                            item.id,
+                            embedding.len()
+                        ));
+                        errors += 1;
+                        continue;
                     }
                     match store_embedding(conn, item.id, &params.model, embedding) {
                         Ok(()) => embedded_this_run += 1,
@@ -1389,6 +1442,8 @@ pub fn curate_embed(conn: &Connection, params: EmbedParams) -> TaskMgrResult<Emb
         model: params.model,
         profile_id: params.profile_id,
         expected_dims: params.expected_dims,
+        pruned_stale,
+        rows_by_model: Vec::new(),
     })
 }
 
