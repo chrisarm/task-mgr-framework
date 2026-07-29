@@ -83,7 +83,10 @@ pub struct PostCompletionParams<'a> {
     /// wrapper commit. Cross-task completions in `completed_ids` never receive
     /// the wrapper commit.
     pub wrapper_commit_task_id: Option<&'a str>,
-    /// PRD JSON path — `mutate_prd_from_feedback` target on review feedback.
+    /// PRD JSON path — `mutate_prd_from_feedback` target on review feedback,
+    /// and the orchestrator-owned path excluded from wrapper staging (the
+    /// post-agent `passes` flip must not become a second commit after a clean
+    /// agent self-commit).
     pub prd_file: &'a Path,
     /// Active task prefix (scopes the external-git reconcile + PRD mutation).
     pub task_prefix: Option<&'a str>,
@@ -198,8 +201,9 @@ pub fn react_to_completions(
 /// 1. **Wrapper-commit (#8)** — when `wrapper_commit` is set and the claimed
 ///    task completed, commit once on that claimed task's behalf (the slot
 ///    merge-back covers this on the wave path, so it passes `false`).
-///    `wrapper_commit` stages only paths that became dirty after the pre-agent
-///    baseline.
+///    Staging is `(post-agent dirty − baseline − orchestrator excludes)`; the
+///    PRD JSON path is always excluded so the pipeline's `passes` flip does
+///    not create a double commit after a correct agent self-commit.
 /// 2. **External-git completion shadow (#9)** — scan the configured external repo
 ///    for `<id>-completed` markers and mark matches done. Runs AFTER the caller
 ///    fed `completed_ids` from the post-merge reconcile (AC5); its reconciled ids
@@ -240,14 +244,19 @@ pub fn react_to_completions_inner(
     } = params;
 
     // (1) Wrapper-commit (#8). Sequential only; the slot merge-back already
-    //     carries the commit on the wave path.
+    //     carries the commit on the wave path. Exclude orchestrator-owned
+    //     paths (PRD `passes` sync) so a correct agent self-commit is not
+    //     followed by a second wrapper that only bookkeeping-dirtied the PRD.
     let mut wrapper_commit_hash = None;
     if wrapper_commit && let Some(id) = wrapper_commit_task_id {
+        let exclude =
+            git_reconcile::orchestrator_wrapper_exclude_paths(working_root, prd_file);
         wrapper_commit_hash = git_reconcile::wrapper_commit(
             working_root,
             id,
             "loop wrapper commit",
             git_status_baseline,
+            &exclude,
         );
     }
 

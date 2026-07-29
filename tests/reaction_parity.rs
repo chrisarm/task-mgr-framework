@@ -2421,6 +2421,142 @@ fn react_to_completions_wave_shape_does_not_wrapper_commit() {
 }
 
 // ---------------------------------------------------------------------------
+// Wrapper commit must not treat orchestrator PRD `passes` dirt as agent work.
+// After a clean agent self-commit the pipeline flips passes:true; that alone
+// must not produce a second "loop wrapper commit".
+// ---------------------------------------------------------------------------
+
+#[test]
+fn react_to_completions_prd_only_dirt_skips_wrapper_commit() {
+    disable_llm_extraction();
+    let (_db, mut conn) = setup_migrated_db();
+    insert_run(&conn);
+    let repo = init_git_repo();
+    let prd = repo.path().join("prd.json");
+    fs::write(
+        &prd,
+        r#"{"userStories":[{"id":"RP-CLAIMED-DONE","passes":false}]}"#,
+    )
+    .expect("write prd");
+    git_command(repo.path(), &["add", "prd.json"]);
+    git_command(repo.path(), &["commit", "-m", "add prd"]);
+    let baseline = HashSet::new();
+    // Simulate post-agent pipeline PRD passes flip (agent already committed work).
+    fs::write(
+        &prd,
+        r#"{"userStories":[{"id":"RP-CLAIMED-DONE","passes":true}]}"#,
+    )
+    .expect("flip prd passes");
+
+    let completed_ids = vec!["RP-CLAIMED-DONE".to_string()];
+    let spy = ReviewSpy::no_feedback();
+    let review = spy.closure();
+    let params = PostCompletionParams {
+        run_id: RUN_ID,
+        iteration: 1,
+        working_root: repo.path(),
+        git_status_baseline: Some(&baseline),
+        wrapper_commit_task_id: Some("RP-CLAIMED-DONE"),
+        prd_file: &prd,
+        task_prefix: Some(PREFIX),
+        default_model: None,
+        permission_mode: &PERMISSION_MODE,
+        external_repo_path: None,
+        external_git_scan_depth: 50,
+        wrapper_commit: true,
+    };
+
+    let before = commit_count(repo.path());
+    let outcome =
+        react_to_completions_inner(&mut conn, &completed_ids, &params, &review as ReviewFn);
+
+    assert!(
+        outcome.wrapper_commit_hash.is_none(),
+        "PRD-only dirt must not produce a wrapper commit after agent self-commit",
+    );
+    assert_eq!(
+        commit_count(repo.path()),
+        before,
+        "git history must stay unchanged when only the PRD was dirtied by the orchestrator",
+    );
+    let status = git_stdout(repo.path(), &["status", "--porcelain"]);
+    assert!(
+        status.contains("prd.json"),
+        "PRD passes flip should remain dirty for the operator; got: {status}"
+    );
+}
+
+#[test]
+fn react_to_completions_wraps_agent_residue_but_not_prd() {
+    disable_llm_extraction();
+    let (_db, mut conn) = setup_migrated_db();
+    insert_run(&conn);
+    let repo = init_git_repo();
+    let prd = repo.path().join("prd.json");
+    fs::write(
+        &prd,
+        r#"{"userStories":[{"id":"RP-CLAIMED-DONE","passes":false}]}"#,
+    )
+    .expect("write prd");
+    git_command(repo.path(), &["add", "prd.json"]);
+    git_command(repo.path(), &["commit", "-m", "add prd"]);
+    let baseline = HashSet::new();
+    fs::write(
+        &prd,
+        r#"{"userStories":[{"id":"RP-CLAIMED-DONE","passes":true}]}"#,
+    )
+    .expect("flip prd passes");
+    fs::write(repo.path().join("leftover.rs"), "fn leftover() {}\n").expect("agent residue");
+
+    let completed_ids = vec!["RP-CLAIMED-DONE".to_string()];
+    let spy = ReviewSpy::no_feedback();
+    let review = spy.closure();
+    let params = PostCompletionParams {
+        run_id: RUN_ID,
+        iteration: 1,
+        working_root: repo.path(),
+        git_status_baseline: Some(&baseline),
+        wrapper_commit_task_id: Some("RP-CLAIMED-DONE"),
+        prd_file: &prd,
+        task_prefix: Some(PREFIX),
+        default_model: None,
+        permission_mode: &PERMISSION_MODE,
+        external_repo_path: None,
+        external_git_scan_depth: 50,
+        wrapper_commit: true,
+    };
+
+    let outcome =
+        react_to_completions_inner(&mut conn, &completed_ids, &params, &review as ReviewFn);
+
+    assert!(
+        outcome.wrapper_commit_hash.is_some(),
+        "agent residue should still produce a residual wrapper commit",
+    );
+    assert_eq!(
+        git_stdout(repo.path(), &["log", "-1", "--pretty=%s"]).trim(),
+        "feat: RP-CLAIMED-DONE-completed - loop wrapper commit",
+    );
+    let head_files = git_stdout(
+        repo.path(),
+        &["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"],
+    );
+    assert!(
+        head_files.contains("leftover.rs"),
+        "wrapper must include agent residue; got: {head_files}"
+    );
+    assert!(
+        !head_files.contains("prd.json"),
+        "wrapper must not include orchestrator PRD dirt; got: {head_files}"
+    );
+    let status = git_stdout(repo.path(), &["status", "--porcelain"]);
+    assert!(
+        status.contains("prd.json"),
+        "PRD must remain dirty after residual wrap; got: {status}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // AC1: human-review fires for the SAME completed requires_human task on both
 // the sequential (1 completed id) and wave (N completed ids) shapes; an
 // ordinary completion in the wave set is NOT reviewed.

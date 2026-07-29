@@ -432,10 +432,72 @@ pub(crate) fn capture_status_paths(working_root: &Path) -> Option<HashSet<String
     Some(parse_status_paths(&output.stdout))
 }
 
+/// Convert `path` into the repo-relative form used by `git status --porcelain`
+/// (forward slashes, no leading `./`). Returns `None` when the path cannot be
+/// expressed relative to `working_root` (outside the repo, or empty).
+pub(crate) fn repo_relative_status_path(working_root: &Path, path: &Path) -> Option<String> {
+    let normalize = |rel: &Path| -> Option<String> {
+        let s = rel.to_string_lossy().replace('\\', "/");
+        let s = s.trim_start_matches("./");
+        if s.is_empty() || s == "." {
+            return None;
+        }
+        // Refuse path-escape forms; porcelain paths never walk up.
+        if s.split('/').any(|seg| seg == "..") {
+            return None;
+        }
+        Some(s.to_string())
+    };
+
+    if let Ok(rel) = path.strip_prefix(working_root) {
+        return normalize(rel);
+    }
+
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        working_root.join(path)
+    };
+
+    if let Ok(rel) = candidate.strip_prefix(working_root) {
+        return normalize(rel);
+    }
+
+    // Symlinks / non-canonical roots: best-effort canonicalize both sides.
+    if let (Ok(root), Ok(abs)) = (working_root.canonicalize(), candidate.canonicalize()) {
+        if let Ok(rel) = abs.strip_prefix(&root) {
+            return normalize(rel);
+        }
+    }
+
+    if !path.is_absolute() {
+        return normalize(path);
+    }
+
+    None
+}
+
+/// Paths the orchestrator itself dirties after the agent exits and that must
+/// never enter a wrapper commit. Today: the active PRD JSON (`passes` sync via
+/// `update_prd_task_passes` / lifecycle). Progress/logs are gitignored.
+///
+/// Best-effort: unresolvable paths are omitted (never panics).
+pub(crate) fn orchestrator_wrapper_exclude_paths(
+    working_root: &Path,
+    prd_file: &Path,
+) -> HashSet<String> {
+    let mut set = HashSet::new();
+    if let Some(rel) = repo_relative_status_path(working_root, prd_file) {
+        set.insert(rel);
+    }
+    set
+}
+
 fn wrapper_commit_paths(
     working_root: &Path,
     task_id: &str,
     baseline: Option<&HashSet<String>>,
+    exclude_paths: &HashSet<String>,
 ) -> Option<Vec<String>> {
     let baseline = match baseline {
         Some(baseline) => baseline,
@@ -462,7 +524,11 @@ fn wrapper_commit_paths(
             return None;
         }
     };
-    let mut paths: Vec<String> = current.difference(baseline).cloned().collect();
+    let mut paths: Vec<String> = current
+        .difference(baseline)
+        .filter(|p| !exclude_paths.contains(*p))
+        .cloned()
+        .collect();
     if paths.is_empty() {
         return None;
     }
@@ -553,18 +619,27 @@ fn commit_staged_wrapper_changes(
     Some(h)
 }
 
-/// Commit uncommitted changes on behalf of the subprocess when it couldn't.
+/// Commit uncommitted agent residue after a sequential task completion.
 ///
 /// In scoped permission mode (`--permission-mode dontAsk`), the Claude subprocess
 /// may be unable to run `git commit` even when `Bash(git:*)` is allowed (e.g. due
-/// to session learnings or format mismatches). This function is called by the loop
-/// engine after detecting task completion when no git commit was made.
+/// to session learnings or format mismatches). The sequential loop calls this
+/// after the shared completion pipeline when the claimed task completed.
 ///
-/// The baseline intentionally excludes any path that was already dirty before
-/// the agent ran. If the agent also edits such a path, that change remains
-/// uncommitted but visible in the working tree. Sequential loop worktrees are
-/// expected to be clean at iteration start; this conservative behavior prevents
-/// wrapper-commit from sweeping unrelated operator changes into the task commit.
+/// Staging set is a **set difference**, not a full `git add -A`:
+/// 1. **Baseline** — paths already dirty before the agent ran are never staged.
+///    If the agent also edits such a path, that change remains uncommitted but
+///    visible in the working tree.
+/// 2. **Orchestrator excludes** — paths the loop itself dirties after the agent
+///    exits (chiefly the PRD JSON `passes` flip via `update_prd_task_passes`)
+///    are never staged. Without this filter, a correct agent self-commit was
+///    always followed by a second `loop wrapper commit` that only (or mostly)
+///    contained the PRD `passes: true` bookkeeping.
+///
+/// When the agent self-committed cleanly and only orchestrator-owned paths
+/// remain dirty, this returns `None` and leaves the PRD dirty for the operator
+/// (or a later end-of-loop housekeeping commit). Subsequent iterations capture
+/// that PRD path in their baseline, so it is not mis-attributed to later tasks.
 ///
 /// Known limitations (acceptable for v1 — the worktree is expected near-clean):
 /// - **Exclusion is path-set membership, not content.** A baseline-dirty file
@@ -589,8 +664,9 @@ pub(crate) fn wrapper_commit(
     task_id: &str,
     message_suffix: &str,
     baseline: Option<&HashSet<String>>,
+    exclude_paths: &HashSet<String>,
 ) -> Option<String> {
-    let paths = wrapper_commit_paths(working_root, task_id, baseline)?;
+    let paths = wrapper_commit_paths(working_root, task_id, baseline, exclude_paths)?;
     stage_wrapper_commit_paths(working_root, &paths)?;
     commit_staged_wrapper_changes(working_root, task_id, message_suffix, &paths)
 }
@@ -739,6 +815,10 @@ mod tests {
         assert_eq!(paths.len(), 2);
     }
 
+    fn empty_exclude() -> HashSet<String> {
+        HashSet::new()
+    }
+
     #[test]
     fn test_wrapper_commit_clean_baseline_commits_only_new_file() {
         let (_tmp, repo) = crate::loop_engine::test_utils::init_test_repo();
@@ -747,7 +827,13 @@ mod tests {
 
         write_file(&repo.join("foo.rs"), "fn foo() {}\n");
 
-        let hash = wrapper_commit(&repo, "FEAT-001", "loop wrapper commit", Some(&baseline));
+        let hash = wrapper_commit(
+            &repo,
+            "FEAT-001",
+            "loop wrapper commit",
+            Some(&baseline),
+            &empty_exclude(),
+        );
 
         assert!(hash.is_some(), "new file should be committed");
         assert_eq!(head_changed_paths(&repo), vec!["foo.rs"]);
@@ -766,7 +852,13 @@ mod tests {
 
         write_file(&repo.join("foo.rs"), "fn foo() {}\n");
 
-        let hash = wrapper_commit(&repo, "FEAT-001", "loop wrapper commit", Some(&baseline));
+        let hash = wrapper_commit(
+            &repo,
+            "FEAT-001",
+            "loop wrapper commit",
+            Some(&baseline),
+            &empty_exclude(),
+        );
 
         assert!(hash.is_some(), "new file should be committed");
         assert_eq!(head_changed_paths(&repo), vec!["foo.rs"]);
@@ -786,7 +878,13 @@ mod tests {
 
         write_file(&repo.join("data/new.md"), "new\n");
 
-        let hash = wrapper_commit(&repo, "FEAT-001", "loop wrapper commit", Some(&baseline));
+        let hash = wrapper_commit(
+            &repo,
+            "FEAT-001",
+            "loop wrapper commit",
+            Some(&baseline),
+            &empty_exclude(),
+        );
 
         assert!(hash.is_some(), "new file should be committed");
         assert_eq!(head_changed_paths(&repo), vec!["data/new.md"]);
@@ -809,7 +907,13 @@ mod tests {
 
         write_file(&repo.join("b.txt"), "b changed by agent\n");
 
-        let hash = wrapper_commit(&repo, "FEAT-001", "loop wrapper commit", Some(&baseline));
+        let hash = wrapper_commit(
+            &repo,
+            "FEAT-001",
+            "loop wrapper commit",
+            Some(&baseline),
+            &empty_exclude(),
+        );
 
         assert!(
             hash.is_some(),
@@ -839,7 +943,13 @@ mod tests {
 
         write_file(&repo.join("agent.txt"), "agent work\n");
 
-        let hash = wrapper_commit(&repo, "FEAT-001", "loop wrapper commit", Some(&baseline));
+        let hash = wrapper_commit(
+            &repo,
+            "FEAT-001",
+            "loop wrapper commit",
+            Some(&baseline),
+            &empty_exclude(),
+        );
 
         assert!(hash.is_some(), "new agent path should be committed");
         assert_eq!(head_changed_paths(&repo), vec!["agent.txt"]);
@@ -864,7 +974,13 @@ mod tests {
 
         std::fs::remove_file(repo.join("a.txt")).expect("delete tracked file");
 
-        let hash = wrapper_commit(&repo, "FEAT-001", "loop wrapper commit", Some(&baseline));
+        let hash = wrapper_commit(
+            &repo,
+            "FEAT-001",
+            "loop wrapper commit",
+            Some(&baseline),
+            &empty_exclude(),
+        );
 
         assert!(hash.is_some(), "tracked deletion should be committed");
         assert_eq!(head_changed_paths(&repo), vec!["a.txt"]);
@@ -884,7 +1000,13 @@ mod tests {
 
         git_output(&repo, &["mv", "old.rs", "new.rs"]);
 
-        let hash = wrapper_commit(&repo, "FEAT-001", "loop wrapper commit", Some(&baseline));
+        let hash = wrapper_commit(
+            &repo,
+            "FEAT-001",
+            "loop wrapper commit",
+            Some(&baseline),
+            &empty_exclude(),
+        );
 
         assert!(hash.is_some(), "tracked rename should be committed");
         assert_eq!(head_changed_paths(&repo), vec!["new.rs", "old.rs"]);
@@ -909,7 +1031,13 @@ mod tests {
 
         write_file(&repo.join("a.txt"), "dirty after agent\n");
 
-        let hash = wrapper_commit(&repo, "FEAT-001", "loop wrapper commit", Some(&baseline));
+        let hash = wrapper_commit(
+            &repo,
+            "FEAT-001",
+            "loop wrapper commit",
+            Some(&baseline),
+            &empty_exclude(),
+        );
 
         assert!(
             hash.is_none(),
@@ -928,7 +1056,13 @@ mod tests {
         let before = git_head(&repo);
         write_file(&repo.join("foo.rs"), "fn foo() {}\n");
 
-        let hash = wrapper_commit(&repo, "FEAT-001", "loop wrapper commit", None);
+        let hash = wrapper_commit(
+            &repo,
+            "FEAT-001",
+            "loop wrapper commit",
+            None,
+            &empty_exclude(),
+        );
 
         assert!(hash.is_none());
         assert_eq!(git_head(&repo), before, "None baseline should not commit");
@@ -941,6 +1075,106 @@ mod tests {
         assert!(
             status_porcelain(&repo).contains("?? foo.rs"),
             "work should be left dirty for operator visibility"
+        );
+    }
+
+    #[test]
+    fn test_wrapper_commit_prd_only_dirt_is_not_committed() {
+        // Regression: agent self-committed; pipeline flips PRD passes → true.
+        // That orchestrator-owned dirt must not create a second wrapper commit.
+        let (_tmp, repo) = crate::loop_engine::test_utils::init_test_repo();
+        write_file(
+            &repo.join("tasks/feature.json"),
+            r#"{"userStories":[{"id":"FEAT-001","passes":false}]}"#,
+        );
+        commit_paths(&repo, "add prd", &["tasks/feature.json"]);
+        let baseline = capture_status_paths(&repo).expect("capture baseline");
+        assert!(baseline.is_empty());
+        let before = git_head(&repo);
+
+        write_file(
+            &repo.join("tasks/feature.json"),
+            r#"{"userStories":[{"id":"FEAT-001","passes":true}]}"#,
+        );
+        let exclude =
+            orchestrator_wrapper_exclude_paths(&repo, &repo.join("tasks/feature.json"));
+        assert!(
+            exclude.contains("tasks/feature.json"),
+            "PRD path must resolve into the exclude set"
+        );
+
+        let hash = wrapper_commit(
+            &repo,
+            "FEAT-001",
+            "loop wrapper commit",
+            Some(&baseline),
+            &exclude,
+        );
+
+        assert!(
+            hash.is_none(),
+            "PRD-only dirt after agent commit must not produce a wrapper commit"
+        );
+        assert_eq!(git_head(&repo), before);
+        assert!(
+            status_porcelain(&repo).contains("tasks/feature.json"),
+            "PRD passes flip must remain dirty for operator/end-of-loop"
+        );
+    }
+
+    #[test]
+    fn test_wrapper_commit_excludes_prd_but_commits_agent_residue() {
+        let (_tmp, repo) = crate::loop_engine::test_utils::init_test_repo();
+        write_file(
+            &repo.join("tasks/feature.json"),
+            r#"{"userStories":[{"id":"FEAT-001","passes":false}]}"#,
+        );
+        commit_paths(&repo, "add prd", &["tasks/feature.json"]);
+        let baseline = capture_status_paths(&repo).expect("capture baseline");
+
+        write_file(
+            &repo.join("tasks/feature.json"),
+            r#"{"userStories":[{"id":"FEAT-001","passes":true}]}"#,
+        );
+        write_file(&repo.join("src/leftover.rs"), "fn leftover() {}\n");
+        let exclude =
+            orchestrator_wrapper_exclude_paths(&repo, &repo.join("tasks/feature.json"));
+
+        let hash = wrapper_commit(
+            &repo,
+            "FEAT-001",
+            "loop wrapper commit",
+            Some(&baseline),
+            &exclude,
+        );
+
+        assert!(hash.is_some(), "agent residue should still be wrapped");
+        assert_eq!(head_changed_paths(&repo), vec!["src/leftover.rs"]);
+        assert!(
+            status_porcelain(&repo).contains("tasks/feature.json"),
+            "PRD must stay dirty outside the residual wrapper"
+        );
+        assert!(
+            !status_porcelain(&repo).contains("leftover.rs"),
+            "agent residue should be clean after wrap"
+        );
+    }
+
+    #[test]
+    fn test_repo_relative_status_path_strips_working_root() {
+        let (_tmp, repo) = crate::loop_engine::test_utils::init_test_repo();
+        let abs = repo.join("tasks/feature.json");
+        assert_eq!(
+            repo_relative_status_path(&repo, &abs).as_deref(),
+            Some("tasks/feature.json")
+        );
+        assert_eq!(
+            repo_relative_status_path(&repo, Path::new("tasks/feature.json")).as_deref(),
+            Some("tasks/feature.json")
+        );
+        assert_eq!(
+            repo_relative_status_path(&repo, Path::new("./tasks/feature.json")).as_deref(),
+            Some("tasks/feature.json")
         );
     }
 
