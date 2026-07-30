@@ -317,6 +317,9 @@ pub fn find_near_duplicate(
 /// Primary key is `(learning_id, model)` (migration v21). Replacing model A's
 /// vector never deletes model B's row for the same learning — profile switches
 /// retain prior catalog embeddings so only gaps need re-embedding.
+///
+/// On conflict, only `dimensions` and `embedding` are updated so `created_at`
+/// (first-embedded timestamp) is preserved.
 pub fn store_embedding(
     conn: &Connection,
     learning_id: i64,
@@ -326,7 +329,11 @@ pub fn store_embedding(
     let blob = embedding_to_blob(embedding);
     let dimensions = embedding.len() as i64;
     conn.execute(
-        "INSERT OR REPLACE INTO learning_embeddings (learning_id, model, dimensions, embedding) VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO learning_embeddings (learning_id, model, dimensions, embedding)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(learning_id, model) DO UPDATE SET
+           dimensions = excluded.dimensions,
+           embedding = excluded.embedding",
         rusqlite::params![learning_id, model, dimensions, blob],
     )?;
     Ok(())
@@ -423,11 +430,35 @@ pub fn count_rows_by_model(conn: &Connection) -> TaskMgrResult<Vec<(String, i64)
     Ok(results)
 }
 
+/// Per-model row counts for models OTHER than `keep_model` (including rows
+/// for retired learnings). Used to preview `--prune-stale` before delete.
+pub fn count_inactive_model_rows(
+    conn: &Connection,
+    keep_model: &str,
+) -> TaskMgrResult<Vec<(String, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT model, COUNT(*) FROM learning_embeddings
+         WHERE model != ?1
+         GROUP BY model
+         ORDER BY model",
+    )?;
+    let rows = stmt.query_map([keep_model], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row?);
+    }
+    Ok(results)
+}
+
 /// Delete all embedding rows stored under models OTHER than `keep_model`.
 ///
 /// Returns the number of rows deleted. This is the explicit reclaim path for
 /// the multi-model retention introduced by migration v21 — nothing else ever
 /// removes a non-active model's rows short of deleting the learning itself.
+///
+/// Callers MUST require an explicit operator confirm (e.g. `--yes`) before
+/// invoking this: a wrong `keep_model` string wipes every other model's
+/// vectors.
 pub fn delete_stale_model_embeddings(conn: &Connection, keep_model: &str) -> TaskMgrResult<usize> {
     let deleted = conn.execute(
         "DELETE FROM learning_embeddings WHERE model != ?1",
@@ -436,15 +467,22 @@ pub fn delete_stale_model_embeddings(conn: &Connection, keep_model: &str) -> Tas
     Ok(deleted)
 }
 
-/// Distinct `dimensions` values stored under `model`, ascending.
+/// Distinct `dimensions` values stored under `model` for **active** learnings,
+/// ascending.
 ///
 /// More than one entry means the model key holds internally inconsistent
-/// vectors (e.g. an Ollama tag was re-quantized to a different width without
-/// changing the model string) — cross-comparisons silently score 0.0.
+/// vectors among rows that affect recall (e.g. an Ollama tag was re-quantized
+/// to a different width without changing the model string) — cross-comparisons
+/// silently score 0.0. Retired learnings are excluded so a leftover retired
+/// row cannot keep a permanent multi-dims warning after active rows are fixed.
 pub fn stored_dims_for_model(conn: &Connection, model: &str) -> TaskMgrResult<Vec<i64>> {
     let mut stmt = conn.prepare(
-        "SELECT DISTINCT dimensions FROM learning_embeddings
-         WHERE model = ?1 ORDER BY dimensions ASC",
+        "SELECT DISTINCT le.dimensions
+         FROM learning_embeddings le
+         JOIN learnings l ON l.id = le.learning_id
+         WHERE le.model = ?1
+           AND l.retired_at IS NULL
+         ORDER BY le.dimensions ASC",
     )?;
     let rows = stmt.query_map([model], |row| row.get(0))?;
     let mut results = Vec::new();
@@ -921,6 +959,79 @@ mod tests {
             vec![3.0, 4.0, 5.0],
             "same-model store must replace prior vector"
         );
+    }
+
+    #[test]
+    fn test_store_preserves_created_at_on_replace() {
+        let (_dir, conn) = setup_db();
+        insert_learning(&conn, 1, "Test");
+
+        conn.execute(
+            "INSERT INTO learning_embeddings
+             (learning_id, model, dimensions, embedding, created_at)
+             VALUES (1, 'model-a', 2, X'0000803F00000040', '2020-01-01 00:00:00')",
+            [],
+        )
+        .unwrap();
+
+        store_embedding(&conn, 1, "model-a", &[9.0, 8.0]).unwrap();
+
+        let (created_at, dims): (String, i64) = conn
+            .query_row(
+                "SELECT created_at, dimensions FROM learning_embeddings
+                 WHERE learning_id = 1 AND model = 'model-a'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(created_at, "2020-01-01 00:00:00");
+        assert_eq!(dims, 2);
+        assert_eq!(
+            load_embedding(&conn, 1, "model-a").unwrap().unwrap(),
+            vec![9.0, 8.0]
+        );
+    }
+
+    #[test]
+    fn test_stored_dims_for_model_ignores_retired() {
+        let (_dir, conn) = setup_db();
+        insert_learning(&conn, 1, "Active");
+        insert_learning(&conn, 2, "Retired");
+        conn.execute(
+            "UPDATE learnings SET retired_at = datetime('now') WHERE id = 2",
+            [],
+        )
+        .unwrap();
+
+        store_embedding(&conn, 1, "m", &[1.0, 2.0]).unwrap(); // 2-d active
+        // Retired row with a different width must not pollute the active check.
+        conn.execute(
+            "INSERT INTO learning_embeddings (learning_id, model, dimensions, embedding)
+             VALUES (2, 'm', 4, X'0000803F000000400000404000008040')",
+            [],
+        )
+        .unwrap();
+
+        assert_eq!(stored_dims_for_model(&conn, "m").unwrap(), vec![2]);
+    }
+
+    #[test]
+    fn test_count_inactive_model_rows() {
+        let (_dir, conn) = setup_db();
+        insert_learning(&conn, 1, "A");
+        store_embedding(&conn, 1, "keep", &[1.0]).unwrap();
+        store_embedding(&conn, 1, "old-a", &[1.0]).unwrap();
+        store_embedding(&conn, 1, "old-b", &[1.0]).unwrap();
+
+        let inactive = count_inactive_model_rows(&conn, "keep").unwrap();
+        assert_eq!(
+            inactive,
+            vec![("old-a".to_string(), 1), ("old-b".to_string(), 1)]
+        );
+        assert!(count_inactive_model_rows(&conn, "old-a")
+            .unwrap()
+            .iter()
+            .any(|(m, _)| m == "keep"));
     }
 
     #[test]

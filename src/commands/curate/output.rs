@@ -136,11 +136,15 @@ pub fn format_embed_text(result: &EmbedResult) -> String {
             result.already_embedded, result.total_active, result.model
         );
         // Post-v21 multiple models coexist; show where the rows live so
-        // abandoned models' storage is visible (prune with --prune-stale).
+        // inactive models' storage is visible (prune with --prune-stale --yes).
         if result.rows_by_model.len() > 1 {
             out.push_str("Rows by model:\n");
             for mc in &result.rows_by_model {
-                let marker = if mc.model == result.model { "" } else { " (stale?)" };
+                let marker = if mc.model == result.model {
+                    ""
+                } else {
+                    " (inactive model)"
+                };
                 out.push_str(&format!("  {}: {} row(s){marker}\n", mc.model, mc.rows));
             }
         }
@@ -170,7 +174,11 @@ pub fn format_count_text(result: &CountResult) -> String {
     if result.rows_by_model.len() > 1 {
         out.push_str("Rows by model:\n");
         for mc in &result.rows_by_model {
-            let marker = if mc.model == result.embedding_model { "" } else { " (stale?)" };
+            let marker = if mc.model == result.embedding_model {
+                ""
+            } else {
+                " (inactive model)"
+            };
             out.push_str(&format!("  {}: {} row(s){marker}\n", mc.model, mc.rows));
         }
     }

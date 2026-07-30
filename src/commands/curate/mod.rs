@@ -1174,33 +1174,69 @@ pub fn curate_dedup(conn: &Connection, params: DedupParams) -> TaskMgrResult<Ded
 /// Embeds active learnings via Ollama and stores the vectors in `learning_embeddings`.
 ///
 /// Behaviour:
-/// - `params.prune_stale = true`: FIRST deletes all rows stored under models
-///   other than `params.model` (the explicit reclaim path for v21 multi-model
-///   retention). DB-only; combinable with `status`.
+/// - `params.prune_stale = true`: FIRST reclaims rows under models other than
+///   `params.model`. Requires `params.yes` when any such rows exist (wrong
+///   active model would otherwise wipe the retained multi-model corpus).
+///   DB-only; combinable with `status`.
 /// - `params.status = true`: returns counts without embedding.
 /// - `params.force = true`: re-embeds ALL active learnings for `params.model`
 ///   (replaces that model only; other models' rows for the same learning are kept).
 /// - Default: embeds only active learnings that have no entry for `params.model`
 ///   (gap-fill after a profile switch — prior models stay in the table).
+/// - Mixed dimensions under the active model (active learnings only): gap-fill
+///   is refused; use `--force` to re-embed and restore a single width.
 ///
 /// Learnings whose embedding text (title + content) is empty are skipped with
 /// a warning printed to stderr.  All other errors (Ollama call failures, store
 /// failures) are counted and reported in the result without aborting the run.
 pub fn curate_embed(conn: &Connection, params: EmbedParams) -> TaskMgrResult<EmbedResult> {
     use crate::learnings::embeddings::{
-        OllamaEmbedder, count_embedded, count_rows_by_model, delete_stale_model_embeddings,
-        format_embed_input, store_embedding, stored_dims_for_model,
+        OllamaEmbedder, count_embedded, count_inactive_model_rows, count_rows_by_model,
+        delete_stale_model_embeddings, format_embed_input, store_embedding, stored_dims_for_model,
     };
 
     // Prune runs first (before any counting) so status/gap-fill see the
     // post-prune table. DB-only: works without Ollama, including with --status.
+    // Requires --yes when there is anything to delete (config typo footgun).
     let pruned_stale = if params.prune_stale {
-        let deleted = delete_stale_model_embeddings(conn, &params.model)?;
-        ui::emit(&format!(
-            "Pruned {deleted} embedding row(s) stored under models other than '{}'",
-            params.model
-        ));
-        deleted
+        let inactive = count_inactive_model_rows(conn, &params.model)?;
+        let would_delete: i64 = inactive.iter().map(|(_, n)| n).sum();
+        if would_delete == 0 {
+            ui::emit(&format!(
+                "No inactive-model embedding rows to prune (keeping '{}')",
+                params.model
+            ));
+            0
+        } else if !params.yes {
+            ui::emit_err(&format!(
+                "Refusing to prune {would_delete} embedding row(s) under inactive models \
+                 without --yes (active/keep model: '{}'):",
+                params.model
+            ));
+            for (model, rows) in &inactive {
+                ui::emit_err(&format!("  {model}: {rows} row(s)"));
+            }
+            ui::emit_err(&format!(
+                "Re-run with: task-mgr curate embed --prune-stale --yes \
+                 (confirm keep model is correct in .task-mgr/config.json first)"
+            ));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "refusing to prune {would_delete} inactive-model embedding row(s) \
+                     without --yes (would keep only '{}')",
+                    params.model
+                ),
+            )
+            .into());
+        } else {
+            let deleted = delete_stale_model_embeddings(conn, &params.model)?;
+            ui::emit(&format!(
+                "Pruned {deleted} embedding row(s) stored under models other than '{}'",
+                params.model
+            ));
+            deleted
+        }
     } else {
         0
     };
@@ -1214,19 +1250,26 @@ pub fn curate_embed(conn: &Connection, params: EmbedParams) -> TaskMgrResult<Emb
 
     let already_embedded = count_embedded(conn, &params.model)?;
 
-    // Post-v21 a single model key must hold same-width vectors; more than one
-    // distinct dims value means the model was re-shaped behind its string
-    // (re-quantized tag, raw-model collision) and cross-comparisons score 0.0.
+    // Active learnings only: a single model key must hold same-width vectors.
+    // More than one distinct dims value means the model was re-shaped behind
+    // its string (re-quantized tag, raw-model collision) and cosine scores 0.0.
     let stored_dims = stored_dims_for_model(conn, &params.model)?;
-    if stored_dims.len() > 1 {
+    let mixed_dims = stored_dims.len() > 1;
+    if mixed_dims {
         ui::emit_err(&format!(
-            "Warning: model '{}' holds vectors with inconsistent dimensions {stored_dims:?}; \
-             similarity across them is meaningless — run `curate embed --force` to re-embed",
+            "Warning: model '{}' holds active vectors with inconsistent dimensions \
+             {stored_dims:?}; similarity across them is meaningless",
             params.model
         ));
     }
 
     if params.status {
+        if mixed_dims {
+            ui::emit_err(
+                "Hint: run `task-mgr curate embed --force` to re-embed all active \
+                 learnings for this model and restore a single width",
+            );
+        }
         if let Some(ref profile) = params.profile_id {
             ui::emit(&format!(
                 "embedding profile: {profile}  model: {}  dims: {}",
@@ -1256,13 +1299,33 @@ pub fn curate_embed(conn: &Connection, params: EmbedParams) -> TaskMgrResult<Emb
         });
     }
 
-    // Raw-model escape hatch has no catalog dims; validate new vectors against
-    // the width already stored under this key so gap-fill can't silently mix
-    // dimensions within one model.
+    // Gap-fill must not deepen a mixed-width corpus. --force rewrites every
+    // active row for this model and is the recovery path.
+    if mixed_dims && !params.force {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "model '{}' has inconsistent active embedding dimensions {stored_dims:?}; \
+                 refusing gap-fill. Run `task-mgr curate embed --force` to re-embed all \
+                 active learnings for this model",
+                params.model
+            ),
+        )
+        .into());
+    }
+
+    // Catalog expected_dims wins. Otherwise a single stored width is the
+    // source of truth for gap-fill. On --force with mixed dims, do not trust
+    // the stored set — Ollama's new vectors (and catalog expected_dims if set)
+    // define the space.
     let effective_dims = params.expected_dims.or_else(|| {
-        match stored_dims.as_slice() {
-            [single] => usize::try_from(*single).ok(),
-            _ => None,
+        if mixed_dims {
+            None
+        } else {
+            match stored_dims.as_slice() {
+                [single] => usize::try_from(*single).ok(),
+                _ => None,
+            }
         }
     });
 

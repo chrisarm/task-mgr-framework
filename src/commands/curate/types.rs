@@ -293,9 +293,13 @@ pub struct EmbedParams {
     pub force: bool,
     /// If true, only print status counts and model name; skip embedding.
     pub status: bool,
-    /// If true, delete embedding rows stored under models other than the
-    /// active one before anything else (combinable with `status`).
+    /// If true, reclaim embedding rows stored under models other than the
+    /// active one before anything else (combinable with `status`). Requires
+    /// [`Self::yes`] when any inactive-model rows would be deleted.
     pub prune_stale: bool,
+    /// Confirm destructive prune (`--prune-stale`). Without this, prune is
+    /// refused after printing a preview of rows that would be deleted.
+    pub yes: bool,
     /// Ollama server base URL (e.g. `http://localhost:11435`).
     pub ollama_url: String,
     /// Embedding model name as known to Ollama.
@@ -315,6 +319,7 @@ impl Default for EmbedParams {
             force: false,
             status: false,
             prune_stale: false,
+            yes: false,
             ollama_url: DEFAULT_OLLAMA_URL.to_string(),
             model: DEFAULT_EMBEDDING_MODEL.to_string(),
             passage_prefix: String::new(),

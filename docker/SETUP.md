@@ -118,9 +118,9 @@ active model is used for recall. Gap-fill embeddings for the newly active model
 
 ```sh
 task-mgr curate embed            # only learnings missing the active model
-# task-mgr curate embed --force  # re-embed ALL active learnings for active model only
-# task-mgr curate embed --prune-stale --status  # reclaim rows left by prior models (DB-only)
-task-mgr curate embed --status   # shows profile, model, dims, coverage, per-model rows
+# task-mgr curate embed --force  # re-embed ALL active for active model (also fixes mixed dims)
+task-mgr curate embed --status   # shows profile, model, dims, coverage, inactive models
+# task-mgr curate embed --prune-stale --yes --status  # reclaim prior models (requires --yes)
 task-mgr recall --query 'overflow recovery ladder' --limit 5
 ```
 

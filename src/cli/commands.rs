@@ -1938,8 +1938,9 @@ EXAMPLES:
     # are untouched)
     task-mgr curate embed --force
 
-    # Reclaim rows stored under previously configured models
-    task-mgr curate embed --prune-stale --status
+    # Preview inactive-model rows, then reclaim (requires --yes)
+    task-mgr curate embed --status
+    task-mgr curate embed --prune-stale --yes --status
 
 MODEL:
     Configured via .task-mgr/config.json field 'embeddingProfile' (or the raw
@@ -1948,10 +1949,12 @@ MODEL:
 
     Vectors are keyed by (learning, model) — see migration v21 — so switching
     profiles keeps prior models' rows; only the active model is used by recall.
+    --prune-stale without --yes prints a delete preview and exits non-zero.
 ")]
     Embed {
         /// Re-embed ALL active learnings for the active model, not just those
-        /// missing a vector (other models' rows are never touched)
+        /// missing a vector (other models' rows are never touched). Also the
+        /// recovery path when active vectors under the model have mixed dims.
         #[arg(long, default_value_t = false)]
         force: bool,
 
@@ -1961,10 +1964,16 @@ MODEL:
         status: bool,
 
         /// Delete embedding rows stored under models OTHER than the active one
-        /// (reclaims space left by previous embedding profiles; combinable
-        /// with --status for a DB-only prune)
+        /// (reclaims space left by previous embedding profiles). Requires
+        /// `--yes` when any such rows exist — a wrong active model would wipe
+        /// retained multi-model vectors. Combinable with `--status` (DB-only).
         #[arg(long = "prune-stale", default_value_t = false)]
         prune_stale: bool,
+
+        /// Confirm destructive `--prune-stale` (required when inactive-model
+        /// rows would be deleted)
+        #[arg(long, default_value_t = false)]
+        yes: bool,
     },
 
     /// Show learning statistics: total, active, retired, and embedded counts

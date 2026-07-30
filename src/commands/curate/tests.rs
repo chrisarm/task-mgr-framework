@@ -5357,7 +5357,7 @@ fn test_embed_gap_fill_targets_only_active_model_gaps() {
 
     assert_eq!(
         result.embedded_this_run, 1,
-        "only A (missing gap-model) is embedded; B's other-model row must not mask the gap"
+        "only A (missing gap-model) is embedded; B already has gap-model so is skipped"
     );
     assert_eq!(result.errors, 0);
     assert_eq!(
@@ -5398,7 +5398,39 @@ fn test_embed_force_replaces_active_model_only() {
     );
 }
 
-/// AC: --prune-stale deletes rows under non-active models (and only those);
+/// AC: --prune-stale without --yes previews and refuses (no rows deleted).
+#[test]
+fn test_embed_prune_stale_requires_yes() {
+    let (_tmp, conn) = setup_db();
+    let id_a = insert_learning(&conn, "A", Confidence::Medium, LearningOutcome::Pattern);
+    insert_embedding_row(&conn, id_a, "gap-model", 2);
+    insert_embedding_row(&conn, id_a, "old-model-1", 2);
+    insert_embedding_row(&conn, id_a, "old-model-2", 3);
+
+    let params = EmbedParams {
+        status: true,
+        prune_stale: true,
+        yes: false,
+        ollama_url: "http://127.0.0.1:1".to_string(),
+        model: "gap-model".to_string(),
+        expected_dims: Some(2),
+        profile_id: None,
+        ..Default::default()
+    };
+    let err = curate_embed(&conn, params).expect_err("prune without --yes must fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("--yes") || msg.contains("without --yes"),
+        "error should mention --yes, got: {msg}"
+    );
+    assert_eq!(
+        embedding_models_for(&conn, id_a).len(),
+        3,
+        "rows must be untouched without --yes"
+    );
+}
+
+/// AC: --prune-stale --yes deletes rows under non-active models (and only those);
 /// combined with --status it is DB-only (no Ollama server involved).
 #[test]
 fn test_embed_prune_stale_removes_other_models_db_only() {
@@ -5411,6 +5443,7 @@ fn test_embed_prune_stale_removes_other_models_db_only() {
     let params = EmbedParams {
         status: true,
         prune_stale: true,
+        yes: true,
         // Unreachable URL proves the prune+status path never touches Ollama.
         ollama_url: "http://127.0.0.1:1".to_string(),
         model: "gap-model".to_string(),
@@ -5420,7 +5453,7 @@ fn test_embed_prune_stale_removes_other_models_db_only() {
     };
     let result = curate_embed(&conn, params).expect("prune+status must not need Ollama");
 
-    assert_eq!(result.pruned_stale, 2, "both stale models' rows deleted");
+    assert_eq!(result.pruned_stale, 2, "both inactive models' rows deleted");
     assert_eq!(result.already_embedded, 1);
     assert_eq!(
         embedding_models_for(&conn, id_a),
@@ -5428,6 +5461,60 @@ fn test_embed_prune_stale_removes_other_models_db_only() {
         "active model's row survives the prune"
     );
     assert_eq!(result.rows_by_model.len(), 1, "breakdown reflects post-prune state");
+}
+
+/// AC: gap-fill refuses when active rows under the model have mixed dimensions.
+#[test]
+fn test_embed_gap_fill_refuses_mixed_active_dims() {
+    let (_tmp, conn) = setup_db();
+    let id_a = insert_learning(&conn, "A", Confidence::Medium, LearningOutcome::Pattern);
+    let id_b = insert_learning(&conn, "B", Confidence::Medium, LearningOutcome::Pattern);
+    insert_embedding_row(&conn, id_a, "raw-model", 2);
+    insert_embedding_row(&conn, id_b, "raw-model", 3);
+
+    let params = EmbedParams {
+        // Would hit Ollama only if the guard failed open — keep unreachable.
+        ollama_url: "http://127.0.0.1:1".to_string(),
+        model: "raw-model".to_string(),
+        expected_dims: None,
+        profile_id: None,
+        ..Default::default()
+    };
+    let err = curate_embed(&conn, params).expect_err("mixed dims must refuse gap-fill");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("inconsistent") && msg.contains("--force"),
+        "error should mention inconsistent dims and --force, got: {msg}"
+    );
+}
+
+/// AC: --force is allowed under mixed active dims (recovery path).
+#[test]
+fn test_embed_force_allowed_with_mixed_active_dims() {
+    let (_tmp, conn) = setup_db();
+    let id_a = insert_learning(&conn, "A", Confidence::Medium, LearningOutcome::Pattern);
+    let id_b = insert_learning(&conn, "B", Confidence::Medium, LearningOutcome::Pattern);
+    insert_embedding_row(&conn, id_a, "raw-model", 2);
+    insert_embedding_row(&conn, id_b, "raw-model", 3);
+
+    let mut server = mockito::Server::new();
+    let (_tags, _embed) = mock_ollama(
+        &mut server,
+        "raw-model",
+        &[&[1.0, 2.0, 3.0, 4.0], &[5.0, 6.0, 7.0, 8.0]],
+    );
+
+    let params = EmbedParams {
+        force: true,
+        ollama_url: server.url(),
+        model: "raw-model".to_string(),
+        expected_dims: Some(4),
+        profile_id: None,
+        ..Default::default()
+    };
+    let result = curate_embed(&conn, params).expect("force must recover mixed dims");
+    assert_eq!(result.embedded_this_run, 2);
+    assert_eq!(result.errors, 0);
 }
 
 /// AC: raw models (no catalog dims) validate new vectors against the width

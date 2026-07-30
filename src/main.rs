@@ -1664,6 +1664,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                     force,
                     status,
                     prune_stale,
+                    yes,
                 } => {
                     let proj_config = read_project_config(&cli.dir);
                     let resolved = proj_config.resolved_embedding().map_err(|e| {
@@ -1676,6 +1677,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                         force,
                         status,
                         prune_stale,
+                        yes,
                         ollama_url: resolved.ollama_url,
                         model: resolved.model,
                         passage_prefix: resolved.passage_prefix,

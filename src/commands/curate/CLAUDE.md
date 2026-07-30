@@ -34,16 +34,18 @@ Catalog (SSoT: `src/learnings/embeddings/profiles.rs`):
   the configured model. After a switch, run `task-mgr curate embed` (no
   `--force`) to gap-fill missing vectors for the new model; prior models are not
   erased. Use `--force` only to re-compute the *active* model for all active
-  learnings.
-- **Reclaiming stale rows**: `task-mgr curate embed --prune-stale` deletes rows
-  stored under models other than the active one (combinable with `--status` for
-  a DB-only prune). Nothing else ever removes a non-active model's rows.
+  learnings (also required if active rows under that model have mixed dims).
+- **Reclaiming inactive-model rows**: `task-mgr curate embed --prune-stale --yes`
+  deletes rows stored under models other than the active one (combinable with
+  `--status` for a DB-only prune). Without `--yes`, prints a per-model preview
+  and exits non-zero (wrong keep-model would wipe retained multi-model vectors).
+  Nothing else ever removes a non-active model's rows.
 - **Visibility**: `curate embed --status` and `curate count` print a per-model
-  row breakdown when more than one model is present; `curate count`'s
-  `embedded` figure is scoped to the ACTIVE model. Dimension inconsistency
-  within one model key (re-quantized tag, raw-model collision) triggers a
-  stderr warning from `curate embed`; raw models without catalog dims are
-  validated against the width already stored under their key.
+  row breakdown when more than one model is present (inactive models tagged
+  `(inactive model)`); `curate count`'s `embedded` figure is scoped to the
+  ACTIVE model. Dimension inconsistency among **active** rows for one model key
+  refuses gap-fill (use `--force`); raw models without catalog dims are
+  validated against the single width already stored under their key.
 - **Schema**: Migration v15 created `learning_embeddings` (BLOB, little-endian
   f32); v21 composite PK for multi-model retention
 
