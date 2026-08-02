@@ -391,6 +391,8 @@ Determine `externalGitRepo`:
 
 Create `tasks/{feature-name}.json`.
 
+**Required: `prdFile`** — set top-level `"prdFile": "{feature-name}.md"` so auto-review, worktree copy, and archive discovery resolve the lean brief (Step 8.5).
+
 **Required: `taskPrefix`** — **Do NOT generate this yourself.** Leave `taskPrefix` absent from the JSON. The `task-mgr init` command will auto-generate a deterministic prefix from `md5(branchName + ":" + filename)[..8]` and write it back to the JSON file. This ensures the prefix is stable across re-imports and matches what the loop engine uses.
 
 **Cross-PRD dependencies: `requires`** — If this task list depends on another PRD being completed first, add a top-level `requires` array:
@@ -412,6 +414,7 @@ The agent checks these before starting any task. If the required task hasn't pas
   "version": "1.0",
   "project": "{{PROJECT_NAME}}",
   "branchName": "feat/{feature-name}",
+  "prdFile": "{feature-name}.md",
   "externalGitRepo": "{{EXTERNAL_GIT_REPO_OR_OMIT}}",
   "description": "Brief description of the change",
   "requires": [],
@@ -540,6 +543,7 @@ The agent checks these before starting any task. If the required task hasn't pas
 
 **JSON field rules:**
 
+- `prdFile`: **Required.** Basename of the lean brief written in Step 8.5 (`"{feature-name}.md"`). Auto-review and worktree copy use this first.
 - `taskPrefix`: **Do NOT set.** Omit entirely. `task-mgr init` auto-generates the deterministic hash prefix from `branchName + ":" + filename` and writes it back.
 - `id`: Use FEAT-xxx for implementation, REFACTOR-001 for refactor gate, REVIEW-001 for review gate, FIX-xxx for review-spawned fixes, REFACTOR-FIX-xxx for refactor-spawned fixes. Do NOT include a project prefix — the system adds one.
 - `taskType`: Required on every task. Use `"implementation"`, `"review"`, `"verification"`, `"milestone"`, `"test"`, or `"analysis"`.
@@ -558,6 +562,47 @@ The agent checks these before starting any task. If the required task hasn't pas
 - `failureModes`: What goes wrong and how the system should respond.
 - `modifiesBehavior`: Set `true` if the task changes return values, side effects, caching, routing, or error handling of existing functions. When true, the task description MUST document which callers are affected and how.
 - **Do NOT populate** `synergyWith` / `batchWith` / `conflictsWith` — `task-mgr next` derives synergy from `touchesFiles` overlap at runtime.
+
+### Step 8.5: Write Lean PRD / Review Brief
+
+Create `tasks/{feature-name}.md` — a short review-oriented brief (not a full `/prd` document). Post-loop auto-review and `/review-loop` need this file to understand what was supposed to be built.
+
+**Minimum sections:**
+
+```markdown
+# {Feature Title}
+
+**Type**: plan-tasks lean brief
+**Branch**: feat/{feature-name}
+**Task list**: tasks/{feature-name}.json
+**Prompt**: tasks/{feature-name}-prompt.md
+
+## Problem
+
+{1–3 paragraphs: what is wrong / what we are building}
+
+## In scope
+
+- …
+
+## Out of scope
+
+- …
+
+## Success bar
+
+- {global acceptance / how review knows this is done}
+
+## Key files / subsystems
+
+- path/to/file — why it matters
+
+## Notes for review
+
+- {constraints, freezes, non-goals the reviewer must not reopen}
+```
+
+This file is the primary argument to `/review-loop tasks/{feature-name}.md`. Keep it space-free in the path (no whitespace in the filename).
 
 ### Step 9: Generate Prompt File
 
@@ -982,6 +1027,7 @@ Verify:
 - [ ] Each implementation task has `qualityDimensions` populated as a **flat array** (NOT `{correctness, performance, style}` sub-objects)
 - [ ] Each task's known edge cases appear in `edgeCases` field
 - [ ] Tasks with `modifiesBehavior: true` have caller impact documented in description
+- [ ] **Top-level `prdFile` set** to `"{feature}.md"` and that lean brief file exists on disk
 - [ ] **No `model` fields anywhere** (no per-task models AND no top-level PRD model; explicit models bypass the models+routing config, a top-level model is ignored and warns)
 - [ ] REFACTOR-001 and REVIEW-001 have `estimatedEffort: "high"` (strong tier via the anchor window) and `timeoutSecs: 1800`
 - [ ] REVIEW-001 (and any CODE-REVIEW etc. in full PRDs) rely on the built-in frontier force for review-class IDs; instructions do not hardcode a review model value into task entries
@@ -1002,7 +1048,8 @@ Report:
 
 ```
 Created:
-  - tasks/{feature}.json ({N} tasks)
+  - tasks/{feature}.md          # lean PRD / review brief (required for auto-review + /review-loop)
+  - tasks/{feature}.json ({N} tasks)  # must set top-level "prdFile": "{feature}.md"
   - tasks/{feature}-prompt.md
 
 Task breakdown:
@@ -1012,6 +1059,12 @@ Task breakdown:
 
 To run: task-mgr loop -y tasks/{feature}.json
 ```
+
+> **Why `{feature}.md` is mandatory**: post-loop auto-review resolves a markdown
+> PRD via `prdFile` → `{stem}.md` → `prd-{stem}.md` → `{stem}-prompt.md`. Without
+> a brief, babysit/non-TTY runs still get a weaker prompt fallback, but interactive
+> `/review-loop` and archive discovery expect a real brief. Always write the md
+> **and** set `"prdFile": "{feature}.md"` on the JSON.
 
 ## When NOT to Use This Skill
 

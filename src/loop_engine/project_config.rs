@@ -764,6 +764,16 @@ pub struct ProjectConfig {
     #[serde(default = "default_auto_review_min_tasks")]
     pub auto_review_min_tasks: u32,
 
+    /// How auto-review is launched relative to the parent TTY.
+    ///
+    /// - `"auto"` (default): interactive when stdout is a TTY; headless +
+    ///   pending-review receipt when not (babysit / redirected logs).
+    /// - `"interactive"`: only launch when TTY; otherwise write a receipt and hint.
+    /// - `"headless"`: always detach a single-turn review (even on TTY).
+    /// - `"off"`: never launch (receipt-free suppress; prefer `autoReview: false`).
+    #[serde(default = "default_auto_review_mode")]
+    pub auto_review_mode: AutoReviewMode,
+
     /// Provider-first model config (FR-001): the SOLE model-routing surface
     /// going forward. NOT serde-derived — a sparse user override deep-merges
     /// onto [`ModelsConfig::builtin_default`] (see [`merge_models_config`]), so
@@ -800,10 +810,26 @@ impl Default for ProjectConfig {
             slot_stash_limit: default_slot_stash_limit(),
             auto_review: default_auto_review(),
             auto_review_min_tasks: default_auto_review_min_tasks(),
+            auto_review_mode: default_auto_review_mode(),
             models: ModelsConfig::builtin_default(),
             routing: RoutingConfig::default(),
         }
     }
+}
+
+/// Launch strategy for post-loop `/review-loop` (see `auto_review` module).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum AutoReviewMode {
+    /// Interactive on TTY; headless when stdout is not a terminal.
+    #[default]
+    Auto,
+    /// Only launch an interactive session when a TTY is present.
+    Interactive,
+    /// Always run a detached headless single-turn review.
+    Headless,
+    /// Never launch (use `autoReview: false` for the usual disable path).
+    Off,
 }
 
 impl ProjectConfig {
@@ -908,6 +934,10 @@ fn default_auto_review() -> bool {
 /// Minimum completed tasks before auto-review fires (default 3).
 fn default_auto_review_min_tasks() -> u32 {
     3
+}
+
+fn default_auto_review_mode() -> AutoReviewMode {
+    AutoReviewMode::Auto
 }
 
 /// Check that `path` exists, is a regular file, and (on Unix) has the
@@ -1567,6 +1597,36 @@ mod tests {
         fs::write(dir.path().join("config.json"), r#"{"auto_review": false}"#).unwrap();
         let config = read_project_config(dir.path());
         assert!(config.auto_review, "snake_case key must not set the field");
+    }
+
+    #[test]
+    fn test_auto_review_mode_default_is_auto() {
+        assert_eq!(
+            ProjectConfig::default().auto_review_mode,
+            AutoReviewMode::Auto
+        );
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.json"), "{}").unwrap();
+        let config = read_project_config(dir.path());
+        assert_eq!(config.auto_review_mode, AutoReviewMode::Auto);
+    }
+
+    #[test]
+    fn test_auto_review_mode_round_trips_from_json() {
+        let dir = tempfile::tempdir().unwrap();
+        for (json, expected) in [
+            (r#"{"autoReviewMode":"headless"}"#, AutoReviewMode::Headless),
+            (
+                r#"{"autoReviewMode":"interactive"}"#,
+                AutoReviewMode::Interactive,
+            ),
+            (r#"{"autoReviewMode":"off"}"#, AutoReviewMode::Off),
+            (r#"{"autoReviewMode":"auto"}"#, AutoReviewMode::Auto),
+        ] {
+            fs::write(dir.path().join("config.json"), json).unwrap();
+            let config = read_project_config(dir.path());
+            assert_eq!(config.auto_review_mode, expected, "json={json}");
+        }
     }
 
     // ---- preflight_validate_and_probe tests (FR-002 hard break) ----

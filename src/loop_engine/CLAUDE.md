@@ -8,68 +8,86 @@ the code. Several specific don't-do-this rules have been migrated to
 
 ## Auto-launch /review-loop after loop end
 
-After a clean loop exit (all tasks complete), `task-mgr` can spawn an interactive
-`claude "/review-loop tasks/<prd>.md"` session automatically. The user lands directly
-in the review without a manual hand-off step.
+After a clean loop exit (all tasks complete), `task-mgr` can spawn a
+`/review-loop` session automatically so the operator does not need a manual
+hand-off.
 
-**Default behavior**: fires when `autoReview: true` (default) AND `tasks_completed >= autoReviewMinTasks`
-(default 3). Both live in `.task-mgr/config.json`. An empty config means both defaults apply.
+**Default behavior**: fires when `autoReview: true` (default) AND
+`tasks_completed >= autoReviewMinTasks` (default 3). Both live in
+`.task-mgr/config.json`. An empty config means both defaults apply.
+
+**Host selection**: follows `models.primaryProvider`:
+- `claude` → `$CLAUDE_BINARY` else `claude`
+- `grok` → `$GROK_BINARY` else `grok` (Grok loads global Claude skills, so
+  `/review-loop` from `~/.claude/commands/` is available)
+- `codex` / unknown → suppress with a recovery hint (not an interactive
+  review host)
+
+**Launch mode** (`autoReviewMode`, default `"auto"`):
+- `"auto"` — interactive when stdout is a TTY; **headless + pending-review
+  receipt** when not (babysit / redirected logs — the common
+  loop-operator path)
+- `"interactive"` — only launch on TTY; non-TTY writes a receipt + copy-paste
+  re-run command
+- `"headless"` — always detach a single-turn review (even on TTY)
+- `"off"` — never launch (prefer `autoReview: false` for the usual disable)
 
 **CLI overrides** (clap-enforced mutual exclusion):
 - `--auto-review` — force on; treats the task-count threshold as 1
 - `--no-auto-review` — force off unconditionally
 
-**Batch mode**: ONE review fires at end-of-batch for the LAST successful PRD that met the
-threshold — never per-PRD. Earlier PRDs in the batch are skipped even if they individually
-qualified.
+**Batch mode**: ONE review fires at end-of-batch for the LAST successful PRD
+that met the threshold — never per-PRD.
+
+**Markdown PRD resolution** (`prd_md_path`, first existing wins):
+1. JSON `prdFile` field (relative to the JSON parent)
+2. `{stem}.md`
+3. `prd-{stem}.md`
+4. `{stem}-prompt.md` (plan-tasks legacy fallback)
+
+`/plan-tasks` should emit `{feature}.md` + set `"prdFile"`; `/tasks` should
+set `"prdFile"` to the source PRD basename so resolution is explicit.
+
+**Pending-review receipt**: when gates would fire, always write
+`<worktree>/.task-mgr/pending-reviews/<stem>.json` with the interactive
+re-run command, host, mode, and (headless) log/findings paths. Headless
+findings land in `<worktree>/.task-mgr/reviews/<stem>.md`; logs in
+`<worktree>/.task-mgr/logs/auto-review-<stem>-<ts>.log`. Headless runs are
+**detached** (Unix `setsid`) so a babysitter exit does not kill the review,
+and they **do not** auto-chain `/compound`.
 
 **Suppression cases** (prints a recovery hint, continues, exit code unchanged):
-- Non-TTY stdout (CI, pipes) — hint: re-run interactively to get the review
-- `tasks/<prd>.md` not found AND `tasks/prd-<stem>.md` not found — hint: name the markdown file to match
-- Worktree path missing or cleaned up — hint: re-run `claude "/review-loop tasks/<prd>.md"` manually
+- Decision disabled / below min tasks / non-zero exit / was_stopped
+- No markdown candidate on disk
+- Worktree path missing or cleaned up
+- Path contains whitespace
+- primaryProvider not claude/grok
+- `autoReviewMode=interactive` with non-TTY (receipt only)
 
-**Process model**: `Command::status()` — blocking spawn, stdin/stdout/stderr inherit so the
-review session is fully interactive. `ANTHROPIC_API_KEY` and other env vars inherit automatically.
+**Process model**:
+- Interactive: `Command::status()`, stdio inherit, blocking
+- Headless: `Command::spawn()` + forget, stdin null, stdout/stderr → log file
+- Env vars inherit (no `env_clear`)
 
-**Module**: `src/loop_engine/auto_review.rs` — `Decision`, `resolve_decision`, `should_fire`,
-`ReviewLauncher` trait, `maybe_fire`.
+**Module**: `src/loop_engine/auto_review.rs` — `Decision`, `ReviewHost`,
+`LaunchMode`, `resolve_decision`, `resolve_review_host`,
+`resolve_launch_mode`, `should_fire`, `ReviewLauncher`, `maybe_fire` /
+`maybe_fire_with`.
 
 **Invariant**: auto-review failure NEVER changes the loop or batch exit code.
 
-**Known footgun — paths with whitespace**: `ProcessLauncher::launch`
-(`src/loop_engine/auto_review.rs:130`) interpolates the PRD path into a single
-slash-command argv element: `format!("/review-loop {}", md.display())`. Claude
-re-tokenizes the slash-command body on whitespace, so a PRD path containing
-spaces (e.g. `tasks/My PRD.md`) splits into multiple tokens and the review
-launch fails to find the file. Not a security issue (no shell, `Command::arg`
-is safe), but project convention is space-free `tasks/<feature>.md` paths for
-exactly this reason — keep it that way. If the Claude CLI grows a structured
-args form, prefer that over in-band quoting.
+**Known footgun — paths with whitespace**: the interactive launcher
+interpolates the PRD path into a single slash-command argv element:
+`format!("/review-loop {}", md.display())`. Hosts re-tokenize the
+slash-command body on whitespace, so a PRD path containing spaces splits
+into multiple tokens. Project convention is space-free `tasks/<feature>.md`
+paths. `maybe_fire_with` enforces this with a launch-boundary guard after
+`prd_md_path` and before `launcher.launch`.
 
-`maybe_fire` enforces this convention with a launch-boundary guard: if the
-resolved markdown path contains any `char::is_whitespace` character, the
-launch is suppressed and a stderr hint tells the operator to rename the file
-and re-run `/review-loop` manually. The guard sits AFTER `prd_md_path` (so it
-sees the actual file we'd hand to Claude) and BEFORE `launcher.launch` (so
-no fragmented argv ever reaches `claude`). It deliberately does not attempt
-to quote or escape — quoting Claude's slash-command body is brittle, and
-suppression with a clear hint is the simpler, more honest contract.
-
-**Outer/inner split for test reachability**: `maybe_fire` is a thin
-wrapper that performs the TTY pre-check and delegates to
-`maybe_fire_inner` (`pub(crate)`), which contains every launch-decision
-gate (decision, worktree existence, markdown path resolution, whitespace
-guard, launcher dispatch). `cargo test` runs in a non-TTY env, so a unit
-test that goes through the public `maybe_fire` would short-circuit at
-the TTY gate before reaching any inner gate — meaning a test asserting
-"this guard suppresses launch" via `CapturingLauncher` would pass even
-if the guard were deleted. Tests for inner-side gates
-(`maybe_fire_inner_*`) call the inner function directly to bypass the
-TTY gate and exercise the real guard logic; a single
-`maybe_fire_outer_suppresses_in_non_tty` test exercises the outer
-wrapper to prove the TTY gate still fires. When adding a new
-launch-boundary guard, add it inside `maybe_fire_inner` and test it via
-the inner — never via the outer.
+**TTY test seam**: `maybe_fire` probes real stdout TTY and delegates to
+`maybe_fire_with(..., is_tty)`. Unit tests call `maybe_fire_with` (or the
+compat alias `maybe_fire_inner` with synthetic `is_tty=true`) so interactive
+and headless branches are reachable under `cargo test` (non-TTY env).
 
 ## models + routing config and capability tiers (FR-001)
 
