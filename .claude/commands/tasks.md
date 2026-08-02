@@ -305,6 +305,8 @@ After building the dependency graph (Step 4) and enriching cross-boundary tasks 
 
 Generate `tasks/{feature}.json` following this schema.
 
+**Required: `prdFile`** — set top-level `"prdFile": "prd-{feature}.md"` (basename of the source PRD markdown you were given). Auto-review, worktree copy of the PRD, and archive discovery all resolve the markdown via this field first. Keep the original `tasks/prd-{feature}.md` on disk.
+
 **Required: `taskPrefix`** — **Do NOT generate this yourself.** Leave `taskPrefix` absent from the JSON. The `task-mgr init` command will auto-generate a deterministic prefix from `md5(branchName + ":" + filename)[..8]` and write it back to the JSON file. This ensures the prefix is stable across re-imports and matches what the loop engine uses. If you set a `taskPrefix` manually, it may conflict with the auto-generated one, causing tasks to be imported under the wrong namespace and breaking dependency tracking.
 
 **Cross-PRD dependencies: `requires`** — If this PRD depends on another PRD being completed first (e.g., proto changes must land before Home can use them), add a top-level `requires` array:
@@ -326,6 +328,7 @@ The agent checks these before starting any task. If the required task in the oth
   "version": "1.0",
   "project": "{{PROJECT_NAME}}",
   "branchName": "feat/{feature-name}",
+  "prdFile": "prd-{feature-name}.md",
   "externalGitRepo": "{{EXTERNAL_GIT_REPO_OR_OMIT}}",
   "mergeStrategy": "Merge to main after MILESTONE-FINAL passes. Squash commits optional.",
   "description": "{Feature description from PRD}",
@@ -1066,8 +1069,9 @@ Report to user:
 
 ```
 Created:
-  - tasks/{feature}.json ({N} tasks)
+  - tasks/{feature}.json ({N} tasks)  # top-level "prdFile": "prd-{feature}.md"
   - tasks/{feature}-prompt.md
+  - (source PRD kept at tasks/prd-{feature}.md — required for auto-review + /review-loop)
 
 Task breakdown:
   - {X} implementation tasks
