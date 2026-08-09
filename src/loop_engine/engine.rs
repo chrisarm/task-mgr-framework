@@ -1147,6 +1147,38 @@ mod tests {
         assert!(!claude_usage_check_enabled(true, &models, &routing));
     }
 
+    /// Full 2x2 of the PRE-iteration predicate: `env ∧ claude_enabled`. The
+    /// (false, false) corner is the one a partial matrix misses — it must stay
+    /// false rather than, say, degrading to "either flag wins".
+    #[test]
+    fn claude_usage_check_enabled_full_env_by_claude_matrix() {
+        fn models_with_claude(enabled: bool) -> ModelsConfig {
+            let mut models = ModelsConfig::builtin_default();
+            models
+                .providers
+                .get_mut(model::Provider::Claude.as_str())
+                .expect("builtin config includes Claude")
+                .enabled = enabled;
+            models
+        }
+
+        let routing = RoutingConfig::default();
+        for (env_enabled, claude_enabled, expected) in [
+            (true, true, true),
+            (true, false, false),
+            (false, true, false),
+            (false, false, false),
+        ] {
+            let models = models_with_claude(claude_enabled);
+            assert_eq!(
+                claude_usage_check_enabled(env_enabled, &models, &routing),
+                expected,
+                "pre-iteration gate is a CONJUNCTION: \
+                 env={env_enabled}, claude_enabled={claude_enabled} ⇒ {expected}"
+            );
+        }
+    }
+
     #[test]
     fn claude_usage_check_enabled_builtin_default_preserves_pregate() {
         assert!(claude_usage_check_enabled(

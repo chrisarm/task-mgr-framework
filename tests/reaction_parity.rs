@@ -3074,7 +3074,10 @@ impl IoSeamSpy {
 /// One rate-limited item whose output carries no parseable reset timestamp, so
 /// the wait-seconds fall back to `fallback_wait` (the `.stop` / fallback path
 /// the Claude-disabled loop is left with).
-fn rate_limited_item<'a>(task_id: &'a str, outcome: &'a IterationOutcome) -> OutputReactionItem<'a> {
+fn rate_limited_item<'a>(
+    task_id: &'a str,
+    outcome: &'a IterationOutcome,
+) -> OutputReactionItem<'a> {
     OutputReactionItem {
         task_id: Some(task_id),
         outcome,
@@ -3131,7 +3134,11 @@ fn claude_disabled_rate_limit_does_zero_anthropic_io() {
     );
     // The wait itself still runs — it is a local sleep + `.stop` poll, not
     // Anthropic I/O — so a Claude-disabled loop still backs off on a rate limit.
-    assert_eq!(spy.reset_wait_calls.get(), 1, "reset wait fires exactly once");
+    assert_eq!(
+        spy.reset_wait_calls.get(),
+        1,
+        "reset wait fires exactly once"
+    );
     assert_eq!(
         spy.reset_wait_secs.get(),
         Some(300),
@@ -3335,8 +3342,8 @@ fn claude_enabled_with_usage_env_off_still_wires_the_early_lift_probe() {
 /// the terminating comma. Panics with a readable message if the field is absent.
 fn account_io_assignment(rel_path: &str) -> String {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(rel_path);
-    let src = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let src =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     let field = "anthropic_account_io_allowed:";
     let start = src.find(field).unwrap_or_else(|| {
         panic!(
@@ -3372,4 +3379,260 @@ fn both_account_reaction_param_sites_key_anthropic_io_on_claude_enablement() {
              got `{assignment}`"
         );
     }
+}
+
+// ===========================================================================
+// TEST-001 — dual-predicate matrix for the POST-output path.
+//
+// The pre-iteration gate is a CONJUNCTION (`env && claude_enabled`, pinned by
+// the 2x2 in `engine.rs::claude_usage_check_enabled_full_env_by_claude_matrix`).
+// The post-output gate is a PROJECTION: Anthropic account I/O is keyed on
+// Claude enablement ALONE, and only the usage-API pre-load additionally honours
+// the env switch. The cases below walk the full 2x2 of
+// (`usage_enabled` x `anthropic_account_io_allowed`) through the production
+// wrapper with counting seams, so both predicates are observed independently.
+// ===========================================================================
+
+/// Run one truth-table cell through the production wrapper and report the
+/// observable Anthropic side effects: `(usage_gate_calls, probe_wired, probe_calls)`.
+fn post_output_io_cell(usage_enabled: bool, io_allowed: bool) -> (u32, Option<bool>, u32) {
+    disable_llm_extraction();
+    let (db_temp, mut conn) = setup_migrated_db();
+    insert_run(&conn);
+    insert_in_progress_task(&conn, "RP-RATE-0");
+
+    let rate = IterationOutcome::RateLimit;
+    let items = [rate_limited_item("RP-RATE-0", &rate)];
+    let mut p = params(db_temp.path(), 300);
+    p.usage_enabled = usage_enabled;
+    p.anthropic_account_io_allowed = io_allowed;
+
+    let spy = IoSeamSpy::new();
+    let mut blackout = BlackoutState::default();
+    react_to_outputs_with_io_seams(
+        &mut conn,
+        &items,
+        &p,
+        &mut blackout,
+        &spy.usage_gate(),
+        &spy.reset_wait(),
+        &spy.probe(),
+    );
+    (
+        spy.usage_gate_calls.get(),
+        spy.reset_wait_probe_wired.get(),
+        spy.probe_calls.get(),
+    )
+}
+
+#[test]
+fn post_output_anthropic_io_matrix_over_env_and_claude() {
+    // (usage_enabled, io_allowed) => (usage_gate_calls, probe_wired, probe_calls)
+    let cases = [
+        // Both on: the usage load runs, and the early-lift probe stays wired.
+        ((true, true), (1, Some(true), 1)),
+        // Claude disabled: ZERO Anthropic I/O, even with the env switch on.
+        ((true, false), (0, Some(false), 0)),
+        // Env off, Claude on: the usage pre-load is suppressed but the Claude
+        // probe REMAINS reachable — the env switch is pre-iteration-only.
+        ((false, true), (0, Some(true), 1)),
+        // Both off: same zero-I/O shape as Claude-disabled alone.
+        ((false, false), (0, Some(false), 0)),
+    ];
+    for ((usage_enabled, io_allowed), expected) in cases {
+        assert_eq!(
+            post_output_io_cell(usage_enabled, io_allowed),
+            expected,
+            "post-output cell usage_enabled={usage_enabled}, io_allowed={io_allowed}"
+        );
+    }
+
+    // The load-bearing discrimination: the two single-flag cells must NOT be
+    // interchangeable. A collapsed implementation makes them identical.
+    assert_ne!(
+        post_output_io_cell(true, false),
+        post_output_io_cell(false, true),
+        "FORBIDDEN COLLAPSE — (env on, Claude off) and (env off, Claude on) must \
+         differ; if they agree, the two predicates were folded into one flag"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// AC: sequential (1 item) and wave (3 items, 2 rate-limited) shapes fold
+// through the SAME coordinator under a Claude-disabled loop: identical
+// reaction, identical ZERO Anthropic I/O, and the wait still fires ONCE PER
+// WAVE rather than once per rate-limited slot (learnings #4866 / #5075).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn claude_disabled_zero_anthropic_io_agrees_across_seq_and_wave_shapes() {
+    disable_llm_extraction();
+    let rate = IterationOutcome::RateLimit;
+    let done = IterationOutcome::Completed;
+
+    // Sequential shape: a single rate-limited item.
+    let (seq_temp, mut seq_conn) = setup_migrated_db();
+    insert_run(&seq_conn);
+    insert_in_progress_task(&seq_conn, "RP-RATE-0");
+    let seq_items = [rate_limited_item("RP-RATE-0", &rate)];
+    let mut seq_p = params(seq_temp.path(), 300);
+    seq_p.usage_enabled = true;
+    seq_p.anthropic_account_io_allowed = false;
+    let seq_spy = IoSeamSpy::new();
+    let mut seq_blackout = BlackoutState::default();
+    let seq_reaction = react_to_outputs_with_io_seams(
+        &mut seq_conn,
+        &seq_items,
+        &seq_p,
+        &mut seq_blackout,
+        &seq_spy.usage_gate(),
+        &seq_spy.reset_wait(),
+        &seq_spy.probe(),
+    );
+
+    // Wave shape: two rate-limited slots plus one that completed this wave.
+    let (wave_temp, mut wave_conn) = setup_migrated_db();
+    insert_run(&wave_conn);
+    insert_in_progress_task(&wave_conn, "RP-RATE-0");
+    insert_done_task(&wave_conn, "RP-DONE-1");
+    insert_in_progress_task(&wave_conn, "RP-RATE-2");
+    let wave_items = [
+        rate_limited_item("RP-RATE-0", &rate),
+        OutputReactionItem {
+            task_id: Some("RP-DONE-1"),
+            outcome: &done,
+            output: "all good",
+        },
+        rate_limited_item("RP-RATE-2", &rate),
+    ];
+    let mut wave_p = params(wave_temp.path(), 300);
+    wave_p.usage_enabled = true;
+    wave_p.anthropic_account_io_allowed = false;
+    let wave_spy = IoSeamSpy::new();
+    let mut wave_blackout = BlackoutState::default();
+    let wave_reaction = react_to_outputs_with_io_seams(
+        &mut wave_conn,
+        &wave_items,
+        &wave_p,
+        &mut wave_blackout,
+        &wave_spy.usage_gate(),
+        &wave_spy.reset_wait(),
+        &wave_spy.probe(),
+    );
+
+    assert_eq!(
+        seq_reaction, wave_reaction,
+        "same Claude-disabled rate limit ⇒ same AccountReaction on both shapes"
+    );
+    assert_eq!(seq_reaction, AccountReaction::WaitedAndRetry);
+
+    for (shape, spy) in [("sequential", &seq_spy), ("wave", &wave_spy)] {
+        assert_eq!(
+            spy.usage_gate_calls.get(),
+            0,
+            "{shape}: Claude disabled ⇒ zero Anthropic usage loads"
+        );
+        assert_eq!(
+            spy.probe_calls.get(),
+            0,
+            "{shape}: Claude disabled ⇒ zero Claude CLI early-lift probes"
+        );
+        assert_eq!(
+            spy.reset_wait_probe_wired.get(),
+            Some(false),
+            "{shape}: Claude disabled ⇒ no probe handed to the reset wait"
+        );
+        assert_eq!(
+            spy.reset_wait_calls.get(),
+            1,
+            "{shape}: the wait fires once per wave, never once per rate-limited slot"
+        );
+    }
+
+    // Both shapes leave every rate-limited row retryable and never clobber a
+    // slot that already completed this wave.
+    assert_eq!(task_status(&seq_conn, "RP-RATE-0").as_deref(), Some("todo"));
+    assert_eq!(
+        all_task_statuses(&wave_conn),
+        vec![
+            ("RP-DONE-1".to_string(), "done".to_string()),
+            ("RP-RATE-0".to_string(), "todo".to_string()),
+            ("RP-RATE-2".to_string(), "todo".to_string()),
+        ]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// KNOWN-BAD DISCRIMINATOR (runs live): a wait closure that collapses the two
+// predicates into the single `usage_enabled` flag. Driven through the real
+// `react_to_outputs_inner` on the (env off, Claude ON) cell, it drops the
+// early-lift probe that the production wrapper wires — proving
+// `claude_enabled_with_usage_env_off_still_wires_the_early_lift_probe` and the
+// matrix above are not vacuous.
+// ---------------------------------------------------------------------------
+
+/// A deliberately-wrong wait closure: keys BOTH the usage load and the probe
+/// wiring off `usage_enabled`, ignoring `anthropic_account_io_allowed`.
+fn collapsed_single_flag_wait<'a>(
+    p: &'a AccountReactionParams<'a>,
+    spy: &'a IoSeamSpy,
+) -> impl Fn(u64) -> bool + 'a {
+    let usage_gate = spy.usage_gate();
+    let reset_wait = spy.reset_wait();
+    let probe_seam = spy.probe();
+    move |wait_secs: u64| {
+        // BUG: `anthropic_account_io_allowed` is never consulted.
+        if p.usage_enabled {
+            match usage_gate(p.threshold, p.tasks_dir, p.fallback_wait) {
+                UsageCheckResult::StopSignaled => return false,
+                UsageCheckResult::WaitedAndReset => return true,
+                _ => {}
+            }
+            let probe = || probe_seam(p.permission_mode);
+            reset_wait(wait_secs, p.tasks_dir, p.fallback_wait, Some(&probe))
+        } else {
+            reset_wait(wait_secs, p.tasks_dir, p.fallback_wait, None)
+        }
+    }
+}
+
+#[test]
+fn known_bad_collapsed_flag_drops_the_probe_on_env_off_claude_on() {
+    disable_llm_extraction();
+    let (db_temp, mut conn) = setup_migrated_db();
+    insert_run(&conn);
+    insert_in_progress_task(&conn, "RP-RATE-0");
+
+    let rate = IterationOutcome::RateLimit;
+    let items = [rate_limited_item("RP-RATE-0", &rate)];
+    // The discriminating cell: env switch OFF, Claude still ENABLED.
+    let mut p = params(db_temp.path(), 300);
+    p.usage_enabled = false;
+    p.anthropic_account_io_allowed = true;
+
+    let spy = IoSeamSpy::new();
+    let wait = collapsed_single_flag_wait(&p, &spy);
+    let mut blackout = BlackoutState::default();
+    let reaction = react_to_outputs_inner(&mut conn, &items, &p, &mut blackout, &wait);
+
+    // Same coarse reaction as the correct implementation — which is exactly why
+    // asserting only on `AccountReaction` would let the collapse through.
+    assert_eq!(reaction, AccountReaction::WaitedAndRetry);
+    assert_eq!(
+        spy.reset_wait_probe_wired.get(),
+        Some(false),
+        "the collapsed implementation drops the probe here"
+    );
+    assert_eq!(spy.probe_calls.get(), 0);
+
+    // The production wrapper, on the SAME inputs, keeps the probe wired. This
+    // inequality is the discriminator: the real assertions reject the collapse.
+    let (_, correct_probe_wired, correct_probe_calls) = post_output_io_cell(false, true);
+    assert_eq!(correct_probe_wired, Some(true));
+    assert_eq!(correct_probe_calls, 1);
+    assert_ne!(
+        spy.reset_wait_probe_wired.get(),
+        correct_probe_wired,
+        "known-bad must diverge from the production wrapper on (env off, Claude on)"
+    );
 }
