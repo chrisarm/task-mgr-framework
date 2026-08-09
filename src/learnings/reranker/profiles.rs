@@ -163,10 +163,13 @@ pub fn resolve_reranker_pair(
     }
 }
 
+/// `(model, max_doc_chars, max_query_chars, profile_id)` from profile/model config.
+type ResolvedModelSide = (Option<String>, usize, usize, Option<&'static str>);
+
 fn resolve_model_side(
     reranker_profile: Option<&str>,
     reranker_model: Option<&str>,
-) -> Result<(Option<String>, usize, usize, Option<&'static str>), String> {
+) -> Result<ResolvedModelSide, String> {
     let default_caps = (JINA_MAX_DOC_CHARS, JINA_MAX_QUERY_CHARS);
 
     if let Some(profile_id) = reranker_profile.map(str::trim).filter(|s| !s.is_empty()) {
@@ -306,7 +309,9 @@ mod tests {
     #[test]
     fn default_over_fetch_is_two_hundred() {
         assert_eq!(DEFAULT_RERANKER_OVER_FETCH_PERCENT, 200);
-        assert!(DEFAULT_RERANKER_OVER_FETCH_PERCENT <= MAX_RERANKER_OVER_FETCH_PERCENT);
+        const {
+            assert!(DEFAULT_RERANKER_OVER_FETCH_PERCENT <= MAX_RERANKER_OVER_FETCH_PERCENT);
+        }
     }
 
     #[test]

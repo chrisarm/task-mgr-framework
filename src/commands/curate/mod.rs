@@ -1216,10 +1216,10 @@ pub fn curate_embed(conn: &Connection, params: EmbedParams) -> TaskMgrResult<Emb
             for (model, rows) in &inactive {
                 ui::emit_err(&format!("  {model}: {rows} row(s)"));
             }
-            ui::emit_err(&format!(
+            ui::emit_err(
                 "Re-run with: task-mgr curate embed --prune-stale --yes \
-                 (confirm keep model is correct in .task-mgr/config.json first)"
-            ));
+                 (confirm keep model is correct in .task-mgr/config.json first)",
+            );
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(

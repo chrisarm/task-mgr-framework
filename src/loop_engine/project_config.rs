@@ -877,13 +877,13 @@ impl ProjectConfig {
             (true, true) => {}
         }
 
-        if let Some(p) = self.reranker_over_fetch_percent {
-            if p > crate::learnings::reranker::MAX_RERANKER_OVER_FETCH_PERCENT {
-                crate::output::warn(&format!(
-                    "rerankerOverFetchPercent={p} exceeds max {}; clamping",
-                    crate::learnings::reranker::MAX_RERANKER_OVER_FETCH_PERCENT
-                ));
-            }
+        if let Some(p) = self.reranker_over_fetch_percent
+            && p > crate::learnings::reranker::MAX_RERANKER_OVER_FETCH_PERCENT
+        {
+            crate::output::warn(&format!(
+                "rerankerOverFetchPercent={p} exceeds max {}; clamping",
+                crate::learnings::reranker::MAX_RERANKER_OVER_FETCH_PERCENT
+            ));
         }
 
         match crate::learnings::reranker::resolve_reranker_pair(

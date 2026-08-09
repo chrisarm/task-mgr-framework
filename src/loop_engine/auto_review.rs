@@ -551,19 +551,21 @@ fn launch_headless(
     Ok(())
 }
 
+/// Recorded args from a single [`CapturingLauncher`] call (test-only).
+#[cfg(test)]
+type CapturedLaunchCall = (
+    PathBuf,
+    Option<PathBuf>,
+    LaunchMode,
+    ReviewHost,
+    Option<PathBuf>,
+    Option<PathBuf>,
+);
+
 /// Test-only launcher that records calls instead of spawning processes.
 #[cfg(test)]
 pub(crate) struct CapturingLauncher {
-    pub calls: std::sync::Mutex<
-        Vec<(
-            PathBuf,
-            Option<PathBuf>,
-            LaunchMode,
-            ReviewHost,
-            Option<PathBuf>,
-            Option<PathBuf>,
-        )>,
-    >,
+    pub calls: std::sync::Mutex<Vec<CapturedLaunchCall>>,
 }
 
 #[cfg(test)]

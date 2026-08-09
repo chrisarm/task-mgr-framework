@@ -558,15 +558,15 @@ pub fn try_embed_learning(
         }
     };
 
-    if let Some(expected) = resolved.expected_dims {
-        if embedding.len() != expected {
-            eprintln!(
-                "Warning: embedding for learning {learning_id} has {} dims, expected {expected} for model {}",
-                embedding.len(),
-                resolved.model
-            );
-            return false;
-        }
+    if let Some(expected) = resolved.expected_dims
+        && embedding.len() != expected
+    {
+        eprintln!(
+            "Warning: embedding for learning {learning_id} has {} dims, expected {expected} for model {}",
+            embedding.len(),
+            resolved.model
+        );
+        return false;
     }
 
     if let Err(e) = store_embedding(conn, learning_id, &resolved.model, &embedding) {
@@ -631,14 +631,14 @@ pub fn try_embed_learnings_batch(
         match embedder.embed_batch(&texts) {
             Ok(embeddings) => {
                 for ((id, _), emb) in chunk.iter().zip(embeddings.iter()) {
-                    if let Some(expected) = resolved.expected_dims {
-                        if emb.len() != expected {
-                            eprintln!(
-                                "Warning: embedding for learning {id} has {} dims, expected {expected}",
-                                emb.len()
-                            );
-                            continue;
-                        }
+                    if let Some(expected) = resolved.expected_dims
+                        && emb.len() != expected
+                    {
+                        eprintln!(
+                            "Warning: embedding for learning {id} has {} dims, expected {expected}",
+                            emb.len()
+                        );
+                        continue;
                     }
                     if store_embedding(conn, *id, &resolved.model, emb).is_ok() {
                         stored += 1;

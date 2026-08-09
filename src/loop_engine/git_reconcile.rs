@@ -464,10 +464,10 @@ pub(crate) fn repo_relative_status_path(working_root: &Path, path: &Path) -> Opt
     }
 
     // Symlinks / non-canonical roots: best-effort canonicalize both sides.
-    if let (Ok(root), Ok(abs)) = (working_root.canonicalize(), candidate.canonicalize()) {
-        if let Ok(rel) = abs.strip_prefix(&root) {
-            return normalize(rel);
-        }
+    if let (Ok(root), Ok(abs)) = (working_root.canonicalize(), candidate.canonicalize())
+        && let Ok(rel) = abs.strip_prefix(&root)
+    {
+        return normalize(rel);
     }
 
     if !path.is_absolute() {
