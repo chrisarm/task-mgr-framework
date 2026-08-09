@@ -146,8 +146,7 @@ pub fn resolve_reranker_pair(
         (Some(url), Some(model)) => {
             // 0% extra is valid (slate == limit). Unset → default 200%.
             // Values above MAX_RERANKER_OVER_FETCH_PERCENT are clamped.
-            let raw =
-                reranker_over_fetch_percent.unwrap_or(DEFAULT_RERANKER_OVER_FETCH_PERCENT);
+            let raw = reranker_over_fetch_percent.unwrap_or(DEFAULT_RERANKER_OVER_FETCH_PERCENT);
             let over_fetch_percent = raw.min(MAX_RERANKER_OVER_FETCH_PERCENT);
             Ok(Some(ResolvedReranker {
                 url,
@@ -168,10 +167,7 @@ fn resolve_model_side(
     reranker_profile: Option<&str>,
     reranker_model: Option<&str>,
 ) -> Result<(Option<String>, usize, usize, Option<&'static str>), String> {
-    let default_caps = (
-        JINA_MAX_DOC_CHARS,
-        JINA_MAX_QUERY_CHARS,
-    );
+    let default_caps = (JINA_MAX_DOC_CHARS, JINA_MAX_QUERY_CHARS);
 
     if let Some(profile_id) = reranker_profile.map(str::trim).filter(|s| !s.is_empty()) {
         let profile = find_reranker_profile(profile_id).ok_or_else(|| {
@@ -216,21 +212,18 @@ mod tests {
 
     #[test]
     fn neither_set_disables() {
-        assert!(resolve_reranker_pair(None, None, None, None)
-            .unwrap()
-            .is_none());
+        assert!(
+            resolve_reranker_pair(None, None, None, None)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
     fn jina_profile_with_url() {
-        let r = resolve_reranker_pair(
-            Some("http://localhost:8181"),
-            Some("jina-v2"),
-            None,
-            None,
-        )
-        .unwrap()
-        .unwrap();
+        let r = resolve_reranker_pair(Some("http://localhost:8181"), Some("jina-v2"), None, None)
+            .unwrap()
+            .unwrap();
         assert_eq!(r.model, DEFAULT_RERANKER_MODEL);
         assert_eq!(r.max_doc_chars, 1024);
         assert_eq!(r.max_query_chars, 256);

@@ -1096,8 +1096,7 @@ mod tests {
             &repo.join("tasks/feature.json"),
             r#"{"userStories":[{"id":"FEAT-001","passes":true}]}"#,
         );
-        let exclude =
-            orchestrator_wrapper_exclude_paths(&repo, &repo.join("tasks/feature.json"));
+        let exclude = orchestrator_wrapper_exclude_paths(&repo, &repo.join("tasks/feature.json"));
         assert!(
             exclude.contains("tasks/feature.json"),
             "PRD path must resolve into the exclude set"
@@ -1137,8 +1136,7 @@ mod tests {
             r#"{"userStories":[{"id":"FEAT-001","passes":true}]}"#,
         );
         write_file(&repo.join("src/leftover.rs"), "fn leftover() {}\n");
-        let exclude =
-            orchestrator_wrapper_exclude_paths(&repo, &repo.join("tasks/feature.json"));
+        let exclude = orchestrator_wrapper_exclude_paths(&repo, &repo.join("tasks/feature.json"));
 
         let hash = wrapper_commit(
             &repo,

@@ -1290,11 +1290,7 @@ mod tests {
     #[test]
     fn test_escalate_tier_grok_single_rung_self_loops() {
         // Grok has one defined rung (Standard=GROK_MODEL); escalation self-loops.
-        let r = escalate_tier(
-            builtin_resolved_models(),
-            Provider::Grok,
-            Some(GROK_MODEL),
-        );
+        let r = escalate_tier(builtin_resolved_models(), Provider::Grok, Some(GROK_MODEL));
         assert_eq!(r, Some(GROK_MODEL.to_string()));
     }
 

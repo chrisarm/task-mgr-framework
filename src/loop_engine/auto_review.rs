@@ -459,11 +459,7 @@ fn launch_interactive(
                 "[auto-review] {host} exited with status {status}; \
                  re-run `{cmd}` manually if needed",
                 host = host.as_str(),
-                cmd = interactive_command(
-                    host,
-                    md,
-                    worktree.unwrap_or_else(|| Path::new("."))
-                ),
+                cmd = interactive_command(host, md, worktree.unwrap_or_else(|| Path::new("."))),
             );
             Ok(())
         }
@@ -975,7 +971,10 @@ mod tests {
 
     #[test]
     fn launch_mode_interactive_non_tty_is_none() {
-        assert_eq!(resolve_launch_mode(AutoReviewMode::Interactive, false), None);
+        assert_eq!(
+            resolve_launch_mode(AutoReviewMode::Interactive, false),
+            None
+        );
     }
 
     #[test]
@@ -1046,11 +1045,7 @@ mod tests {
         let md = tmp.path().join("custom-brief.md");
         fs::write(&md, "# brief").unwrap();
         let json = tmp.path().join("foo.json");
-        fs::write(
-            &json,
-            r#"{"prdFile":"custom-brief.md","userStories":[]}"#,
-        )
-        .unwrap();
+        fs::write(&json, r#"{"prdFile":"custom-brief.md","userStories":[]}"#).unwrap();
         assert_eq!(prd_md_path(&json), Some(md));
     }
 
@@ -1146,9 +1141,7 @@ mod tests {
         assert!(calls[0].5.is_some(), "headless must pass a findings path");
 
         // Receipt written
-        let receipt = tmp
-            .path()
-            .join(".task-mgr/pending-reviews/foo.json");
+        let receipt = tmp.path().join(".task-mgr/pending-reviews/foo.json");
         assert!(receipt.exists(), "pending-review receipt must be written");
     }
 

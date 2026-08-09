@@ -241,9 +241,8 @@ pub fn react_to_outputs(
         |wait_secs: u64, tasks_dir: &Path, fallback_wait: u64, probe: Option<&dyn Fn() -> bool>| {
             wait_for_usage_reset(wait_secs, tasks_dir, fallback_wait, probe)
         };
-    let probe = |permission_mode: &PermissionMode| -> bool {
-        probe_rate_limit_lifted(permission_mode)
-    };
+    let probe =
+        |permission_mode: &PermissionMode| -> bool { probe_rate_limit_lifted(permission_mode) };
     react_to_outputs_with_io_seams(
         conn,
         items,

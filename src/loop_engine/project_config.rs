@@ -852,9 +852,7 @@ impl ProjectConfig {
     /// (raw). Returns `None` silently when neither side is set; warns and
     /// returns `None` when exactly one is present. Unknown profile ids warn
     /// and disable the reranker (same soft-fail posture as incomplete pairs).
-    pub fn resolved_reranker_config(
-        &self,
-    ) -> Option<crate::learnings::reranker::ResolvedReranker> {
+    pub fn resolved_reranker_config(&self) -> Option<crate::learnings::reranker::ResolvedReranker> {
         let has_url = self
             .reranker_url
             .as_deref()
@@ -1400,7 +1398,10 @@ mod tests {
             r.over_fetch_percent,
             crate::learnings::reranker::MAX_RERANKER_OVER_FETCH_PERCENT
         );
-        assert_eq!(crate::learnings::reranker::MAX_RERANKER_OVER_FETCH_PERCENT, 300);
+        assert_eq!(
+            crate::learnings::reranker::MAX_RERANKER_OVER_FETCH_PERCENT,
+            300
+        );
     }
 
     #[test]

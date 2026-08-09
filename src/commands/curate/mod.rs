@@ -19,9 +19,9 @@ pub use output::{
 };
 pub use types::{
     CountResult, DedupCluster, DedupParams, DedupResult, DeduplicateLearningItem, EmbedParams,
-    EmbedResult, EnrichCandidate, EnrichParams, EnrichResult, MergeClusterParams, ModelRowCount,
-    MergeClusterResult, RawDedupCluster, RetireParams, RetireResult, RetirementCandidate,
-    UnretireResult,
+    EmbedResult, EnrichCandidate, EnrichParams, EnrichResult, MergeClusterParams,
+    MergeClusterResult, ModelRowCount, RawDedupCluster, RetireParams, RetireResult,
+    RetirementCandidate, UnretireResult,
 };
 
 use std::collections::{HashMap, HashSet, VecDeque};

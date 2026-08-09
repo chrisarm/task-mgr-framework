@@ -419,9 +419,8 @@ pub fn count_embedded(conn: &Connection, model: &str) -> TaskMgrResult<i64> {
 /// Post-v21 the table retains rows for every model ever embedded; this is the
 /// only surface that reveals rows lingering under non-active models.
 pub fn count_rows_by_model(conn: &Connection) -> TaskMgrResult<Vec<(String, i64)>> {
-    let mut stmt = conn.prepare(
-        "SELECT model, COUNT(*) FROM learning_embeddings GROUP BY model ORDER BY model",
-    )?;
+    let mut stmt = conn
+        .prepare("SELECT model, COUNT(*) FROM learning_embeddings GROUP BY model ORDER BY model")?;
     let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
     let mut results = Vec::new();
     for row in rows {
@@ -1028,10 +1027,12 @@ mod tests {
             inactive,
             vec![("old-a".to_string(), 1), ("old-b".to_string(), 1)]
         );
-        assert!(count_inactive_model_rows(&conn, "old-a")
-            .unwrap()
-            .iter()
-            .any(|(m, _)| m == "keep"));
+        assert!(
+            count_inactive_model_rows(&conn, "old-a")
+                .unwrap()
+                .iter()
+                .any(|(m, _)| m == "keep")
+        );
     }
 
     #[test]

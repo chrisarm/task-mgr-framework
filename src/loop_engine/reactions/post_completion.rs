@@ -249,8 +249,7 @@ pub fn react_to_completions_inner(
     //     followed by a second wrapper that only bookkeeping-dirtied the PRD.
     let mut wrapper_commit_hash = None;
     if wrapper_commit && let Some(id) = wrapper_commit_task_id {
-        let exclude =
-            git_reconcile::orchestrator_wrapper_exclude_paths(working_root, prd_file);
+        let exclude = git_reconcile::orchestrator_wrapper_exclude_paths(working_root, prd_file);
         wrapper_commit_hash = git_reconcile::wrapper_commit(
             working_root,
             id,

@@ -37,10 +37,9 @@ use task_mgr::commands::models::handle_set_anchor;
 use task_mgr::db::{create_schema, open_connection, run_migrations};
 use task_mgr::loop_engine::engine::IterationContext;
 use task_mgr::loop_engine::model::{
-    CODEX_EFFORT_FOR_DIFFICULTY, GROK_EFFORT_FOR_DIFFICULTY, CapabilityTier, FABLE_MODEL,
-    HAIKU_MODEL, OPUS_MODEL, PlanContext,
-    Provider, SONNET_MODEL, anchored_tier, provider_for_model, resolve_execution_plan,
-    resolve_models_config,
+    CODEX_EFFORT_FOR_DIFFICULTY, CapabilityTier, FABLE_MODEL, GROK_EFFORT_FOR_DIFFICULTY,
+    HAIKU_MODEL, OPUS_MODEL, PlanContext, Provider, SONNET_MODEL, anchored_tier,
+    provider_for_model, resolve_execution_plan, resolve_models_config,
 };
 use task_mgr::loop_engine::project_config::{
     ModelsConfig, RoutingConfig, detect_legacy_model_keys, preflight_validate_and_probe,
@@ -343,10 +342,7 @@ fn validate_models_config_rejects_grok_xhigh_effort() {
     let errs = validate_models_config(&models, &RoutingConfig::default()).unwrap_err();
     assert!(
         errs.iter().any(|e| {
-            e.contains("grok")
-                && e.contains("xhigh")
-                && e.contains("CLI")
-                && e.contains("effort")
+            e.contains("grok") && e.contains("xhigh") && e.contains("CLI") && e.contains("effort")
         }),
         "expected a grok xhigh CLI-constraint rejection naming the key: {errs:?}"
     );
