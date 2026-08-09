@@ -209,11 +209,15 @@ Anthropic account I/O uses a dual-predicate contract: `claude_provider_enabled`
 is resolved only through
 `resolve_models_config(&project_config.models, &project_config.routing).is_provider_enabled(Provider::Claude)`;
 pre-iteration `usage_params.enabled = LOOP_USAGE_CHECK_ENABLED &&
-claude_provider_enabled`, while post-output RateLimit
-`anthropic_account_io_allowed = claude_provider_enabled` and ignores the env
-switch. When Claude is disabled, post-output RateLimit must not call
-`load_usage_info` or `probe_rate_limit_lifted`, and `api_reset_secs` is always
-`None`.
+claude_provider_enabled`. Post-output RateLimit sets
+`anthropic_account_io_allowed = claude_provider_enabled` (never from
+`usage_params.enabled`). Production wait then splits: usage-API
+(`check_and_wait`) requires `anthropic_account_io_allowed && usage_enabled`
+(env still suppresses that leg); early-lift `probe_rate_limit_lifted` requires
+only `anthropic_account_io_allowed`. When Claude is disabled, neither
+`check_and_wait` nor `probe_rate_limit_lifted` runs; wait falls back to
+output-parsed / `fallback_wait` (no separate `api_reset_secs` field — the usage
+API reset path is unreachable).
 The per-task reactions (`resolve_task_execution`, `handle_overflow`) fold one
 call per slot. Each coordinator pairs a production entry point with a hermetic
 `_inner` core that takes the side-effecting step (wait / review) as an injected

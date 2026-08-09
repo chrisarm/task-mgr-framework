@@ -35,12 +35,17 @@ pub struct LoopConfig {
     ///   gates it off when the resolved models config has the Claude provider
     ///   disabled. Setting the env var to `false` forces the pre-check off even
     ///   when Claude is enabled.
-    /// - **Post-output RateLimit** (`reactions::account::react_to_outputs` →
-    ///   `load_usage_info` / `probe_rate_limit_lifted`):
-    ///   `anthropic_account_io_allowed = claude_enabled` **only**. This env var
-    ///   does NOT control that Anthropic I/O — `LOOP_USAGE_CHECK_ENABLED=false`
-    ///   with Claude still enabled leaves post-output Anthropic load/probe on.
-    ///   Disabling the Claude provider is the only way to silence it.
+    /// - **Post-output RateLimit** (`react_to_outputs` /
+    ///   `react_to_outputs_with_io_seams`):
+    ///   - allow-flag: `anthropic_account_io_allowed = claude_enabled` **only**
+    ///     (never assign from `usage_params.enabled`).
+    ///   - usage-API leg (`check_and_wait`):
+    ///     `anthropic_account_io_allowed && usage_enabled` — so this env still
+    ///     suppresses the **post** usage-API load when false (historical).
+    ///   - early-lift probe (`probe_rate_limit_lifted`):
+    ///     gated on `anthropic_account_io_allowed` alone — env does **not**
+    ///     silence the Claude CLI probe. With Claude on and env false, post
+    ///     still probes; only disabling Claude zeroes load **and** probe.
     ///
     /// `claude_enabled` is resolved exclusively via
     /// `model::resolve_models_config(..).is_provider_enabled(Provider::Claude)`
@@ -116,8 +121,8 @@ impl LoopConfig {
     /// - `LOOP_ITERATION_DELAY_SECS` → `iteration_delay_secs` (u64)
     /// - `LOOP_USAGE_FALLBACK_WAIT` → `usage_fallback_wait` (u64)
     /// - `LOOP_USAGE_CHECK_ENABLED` → `usage_check_enabled` (bool: "true"/"1"/"yes"; Claude-account
-    ///   (Anthropic) **pre-check** request only — also gated off when the Claude provider is
-    ///   disabled, and never a kill-switch for post-output RateLimit Anthropic I/O)
+    ///   (Anthropic) **pre-check** request + historical post usage-API leg; also gated off when
+    ///   Claude is disabled. Not a kill-switch for the post early-lift **probe** when Claude is on)
     /// - `LOOP_GIT_SCAN_DEPTH` → `git_scan_depth` (usize, default 7)
     /// - `LOOP_EXTERNAL_GIT_SCAN_DEPTH` → `external_git_scan_depth` (usize, default 50)
     /// - `LOOP_PARALLEL` → `parallel_slots` (usize, 1-3, default 2)

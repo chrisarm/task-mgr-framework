@@ -224,10 +224,12 @@ pub struct AccountReactionParams<'a> {
 /// Post-output rate-limit reaction (production entry point). Builds the real
 /// usage-wait closure and delegates to [`react_to_outputs_inner`].
 ///
-/// The injected wait mirrors the pre-convergence sequential logic: try the
-/// usage API first (when `usage_enabled` and Anthropic account I/O is allowed),
-/// then fall back to the output-parsed reset wait. The fallback uses the
-/// early-lift probe only when Anthropic account I/O is allowed.
+/// Wait dual-gate (do not collapse): try the usage API first only when
+/// `anthropic_account_io_allowed && usage_enabled` (Claude allow-flag **and**
+/// the pre/env usage switch — historical); then always fall back to the
+/// output-parsed / `fallback_wait` reset. The early-lift probe is handed to
+/// that fallback only when `anthropic_account_io_allowed` (Claude-only; env
+/// does not silence the probe).
 pub fn react_to_outputs(
     conn: &mut Connection,
     items: &[OutputReactionItem<'_>],

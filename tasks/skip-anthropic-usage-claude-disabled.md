@@ -11,7 +11,7 @@
 When Claude is disabled (true Grok-only / Codex-only: `models.providers.claude.enabled=false`), the loop still treats Anthropic Max/Pro usage and Claude OAuth as loop-global infrastructure:
 
 1. **Pre-iteration (default on via `LOOP_USAGE_CHECK_ENABLED`):** every iteration may call `oauth::ensure_valid_token()` (log: `OAuth token expiring, refreshing...`, bare `ureq` with **no timeout** → indefinite hang) and/or `account_usage_gate` → Anthropic usage API → wait up to **5h** after a successful above-threshold load.
-2. **Post-output RateLimit:** `react_to_outputs` **always** calls `load_usage_info()` and may spawn Claude via `probe_rate_limit_lifted`. `AccountReactionParams.usage_enabled` is intentionally ignored for hard RateLimit. Env kill-switch does **not** cover this path.
+2. **Post-output RateLimit:** when Claude is enabled, `react_to_outputs` may call `check_and_wait` (usage API) and/or `probe_rate_limit_lifted` (Claude CLI). Allow-flag is Claude-only; the usage-API leg still historically ANDs `usage_enabled`. Env is **not** a full Claude kill-switch (probe still runs).
 
 Routing was already correct; the bug is provider-agnostic wiring of Claude-only account metering.
 
@@ -24,9 +24,12 @@ claude_provider_enabled =
 // PRE only
 usage_params.enabled = LOOP_USAGE_CHECK_ENABLED && claude_provider_enabled
 
-// POST RateLimit Anthropic load + Claude probe
+// POST allow-flag (Claude only — never assign from usage_params.enabled)
 anthropic_account_io_allowed = claude_provider_enabled
-// env does NOT apply
+
+// POST production wait splits:
+//   check_and_wait     := anthropic_account_io_allowed && usage_enabled  (env still applies)
+//   probe_rate_limit   := anthropic_account_io_allowed                   (env does NOT apply)
 ```
 
 ## In scope
@@ -50,7 +53,7 @@ anthropic_account_io_allowed = claude_provider_enabled
 
 - Claude-disabled loops never block on Anthropic OAuth/usage (pre or post)
 - Claude-enabled defaults byte-identical for pre-gate
-- `LOOP_USAGE_CHECK_ENABLED=false` still only disables **pre** when Claude is on (post may still hit Anthropic)
+- `LOOP_USAGE_CHECK_ENABLED=false` with Claude on: pre off; post usage-API load off; early-lift **probe** still on
 - Full quality gate green at REVIEW-001
 
 ## Key files / subsystems

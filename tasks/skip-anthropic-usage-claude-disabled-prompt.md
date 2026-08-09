@@ -7,7 +7,7 @@ You are an autonomous coding agent implementing **Skip Anthropic usage/OAuth whe
 When Claude is disabled (true Grok-only / Codex-only: `models.providers.claude.enabled=false`), the loop still treats Anthropic Max/Pro usage and Claude OAuth as loop-global infrastructure:
 
 1. **Pre-iteration** (default `LOOP_USAGE_CHECK_ENABLED=true`): every iteration may call `oauth::ensure_valid_token()` — log `OAuth token expiring, refreshing...` then bare `ureq` with **no timeout** (primary hang) — and/or `account_usage_gate` → Anthropic usage API → wait up to **5h** only after a successful above-threshold load (secondary).
-2. **Post-output RateLimit**: `react_to_outputs` **always** calls `load_usage_info()` and may spawn Claude via `probe_rate_limit_lifted`. `usage_enabled` is intentionally ignored for hard RateLimit. Env kill-switch does **not** cover this.
+2. **Post-output RateLimit**: when Claude is enabled, production wait may call `check_and_wait` (usage API) and/or `probe_rate_limit_lifted` (Claude CLI). Allow-flag is Claude-only; usage-API leg still ANDs `usage_enabled` historically. Env is **not** a full kill-switch for the probe.
 
 Routing was already fine. Fix = dual predicate (do not collapse):
 
@@ -17,8 +17,12 @@ claude_provider_enabled = resolve_models_config(...).is_provider_enabled(Provide
 // PRE only
 usage_params.enabled = LOOP_USAGE_CHECK_ENABLED && claude_provider_enabled
 
-// POST RateLimit Anthropic load + Claude probe
-anthropic_account_io_allowed = claude_provider_enabled   // env does NOT apply
+// POST allow-flag (Claude only — never from usage_params.enabled)
+anthropic_account_io_allowed = claude_provider_enabled
+
+// POST production wait splits:
+//   check_and_wait   := anthropic_account_io_allowed && usage_enabled  (env still applies)
+//   probe_rate_limit := anthropic_account_io_allowed                   (env does NOT apply)
 ```
 
 ---
@@ -210,14 +214,18 @@ Construction sites (must stay in lockstep):
 - `src/loop_engine/iteration.rs` (~AccountReactionParams { ... })
 - `src/loop_engine/wave_scheduler.rs` (~AccountReactionParams { ... })
 
-Production `react_to_outputs`: when `!anthropic_account_io_allowed` → no `load_usage_info`, no `probe_rate_limit_lifted`, `api_reset_secs = None`.
+Production `react_to_outputs` / `react_to_outputs_with_io_seams`:
+
+- when `!anthropic_account_io_allowed` → no `check_and_wait`, no `probe_rate_limit_lifted`; wait uses output parse / `fallback_wait` only (no separate `api_reset_secs` field — usage-API reset path unreachable)
+- when Claude on + `usage_enabled=false` → no usage-API leg; early-lift probe still wired
 
 ### Forbidden collapse
 
 ```text
 // WRONG
 anthropic_account_io_allowed = usage_params.enabled
-// That would make LOOP_USAGE_CHECK_ENABLED=false silence post RateLimit when Claude is still on
+// That would make LOOP_USAGE_CHECK_ENABLED=false silence the post early-lift probe
+// when Claude is still on (env-independent Anthropic path is the probe)
 ```
 
 ---

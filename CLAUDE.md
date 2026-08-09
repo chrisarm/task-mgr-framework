@@ -125,19 +125,24 @@ Two footguns:
   block merges onto `ModelsConfig::builtin_default`, where Claude is enabled by
   default, so a config carrying only `{"providers":{"grok":{"enabled":true}}}`
   still has Claude enabled. Anthropic account I/O therefore stays on: the
-  pre-iteration usage/OAuth check still runs, and post-output RateLimit still
-  calls `load_usage_info` / `probe_rate_limit_lifted`. `models disable claude`
+  pre-iteration usage/OAuth check still runs, and post-output RateLimit may still
+  call `check_and_wait` (usage API) and always still wires
+  `probe_rate_limit_lifted` (Claude CLI early-lift). `models disable claude`
   is a separate, required step.
 
-**`LOOP_USAGE_CHECK_ENABLED` is not a Claude kill-switch.** It gates only the
-**pre-iteration** Anthropic usage/OAuth check
-(`enabled = LOOP_USAGE_CHECK_ENABLED ∧ Claude enabled`, so either one being
-false turns the pre-check off). It does **not** control post-output RateLimit
-Anthropic I/O — with Claude enabled, `LOOP_USAGE_CHECK_ENABLED=false` still
-leaves the post-output Anthropic load/probe running. Only disabling the Claude
-provider stops all Anthropic account I/O. See
-[`src/loop_engine/CLAUDE.md`](src/loop_engine/CLAUDE.md) "Account-global
-reactions" for the dual-predicate contract.
+**`LOOP_USAGE_CHECK_ENABLED` is not a Claude kill-switch.** Dual predicate:
+
+| Path | Gate |
+|------|------|
+| Pre-iteration OAuth + `account_usage_gate` | `LOOP_USAGE_CHECK_ENABLED ∧ Claude enabled` (`UsageParams.enabled`) |
+| Post RateLimit **usage-API** leg (`check_and_wait`) | `anthropic_account_io_allowed ∧ usage_enabled` (historical: env still suppresses this leg) |
+| Post RateLimit **early-lift probe** | `anthropic_account_io_allowed` only (= Claude enabled; **env does not apply**) |
+
+With Claude enabled and `LOOP_USAGE_CHECK_ENABLED=false`: pre is off; post usage-API
+load is also off; the Claude early-lift probe **still** runs on RateLimit. Only
+disabling the Claude provider zeroes **all** Anthropic account I/O (load + probe).
+See [`src/loop_engine/CLAUDE.md`](src/loop_engine/CLAUDE.md) "Account-global
+reactions".
 
 ## Deprecation policy
 

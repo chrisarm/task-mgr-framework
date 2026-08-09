@@ -322,7 +322,7 @@
       "estimatedEffort": "high",
       "id": "REVIEW-001",
       "notes": "Spawn fixes via task-mgr add --stdin --depended-on-by REVIEW-001. Verify manually if needed: Claude-disabled config without LOOP_USAGE_CHECK_ENABLED=false should not print OAuth token expiring, refreshing...",
-      "passes": false,
+      "passes": true,
       "priority": 99,
       "qualityDimensions": [
         "No unwrap in production",
