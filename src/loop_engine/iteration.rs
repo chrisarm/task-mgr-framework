@@ -58,6 +58,7 @@ use crate::loop_engine::engine::{
     resolve_effective_runner,
 };
 use crate::loop_engine::monitor;
+use crate::loop_engine::model::Provider;
 use crate::loop_engine::prd_reconcile::reconcile_passes_with_db;
 use crate::loop_engine::prompt::{self, BuildPromptParams};
 use crate::loop_engine::reactions;
@@ -784,6 +785,13 @@ pub fn run_iteration(
             let account_params = reactions::account::AccountReactionParams {
                 threshold: params.usage_params.threshold,
                 usage_enabled: params.usage_params.enabled,
+                // FEAT-002 dual predicate: post-output Anthropic I/O is keyed
+                // ONLY on Claude provider enablement — NEVER on
+                // `usage_params.enabled` (which folds in the
+                // `LOOP_USAGE_CHECK_ENABLED` env switch and is
+                // pre-iteration-only). Must stay byte-identical to the wave
+                // construction in `wave_scheduler.rs`.
+                anthropic_account_io_allowed: resolved_models.is_provider_enabled(Provider::Claude),
                 tasks_dir: params.tasks_dir,
                 fallback_wait: params.usage_params.fallback_wait,
                 prefix: params.task_prefix.unwrap_or(""),

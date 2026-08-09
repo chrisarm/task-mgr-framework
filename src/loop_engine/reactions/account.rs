@@ -173,6 +173,13 @@ pub struct OutputReactionItem<'a> {
 /// sleep). A type alias keeps `clippy::type_complexity` quiet.
 pub type WaitFn<'f> = &'f dyn Fn(u64) -> bool;
 
+/// Injected reset-wait seam for the production post-output wrapper. Mirrors
+/// [`wait_for_usage_reset`], including the optional early-lift probe.
+pub type ResetWaitFn<'f> = &'f dyn Fn(u64, &Path, u64, Option<&dyn Fn() -> bool>) -> bool;
+
+/// Injected early-lift probe seam for the production post-output wrapper.
+pub type RateLimitProbeFn<'f> = &'f dyn Fn(&PermissionMode) -> bool;
+
 /// Inputs to [`react_to_outputs`] / [`react_to_outputs_inner`]. Destructured
 /// exhaustively (no `..`) by the FEAT-006 body — the single-home parity lock.
 pub struct AccountReactionParams<'a> {
@@ -180,6 +187,10 @@ pub struct AccountReactionParams<'a> {
     pub threshold: u8,
     /// Whether the usage API pre-check is enabled (production wait path only).
     pub usage_enabled: bool,
+    /// Whether post-output RateLimit recovery may touch Anthropic account I/O
+    /// and spawn the Claude CLI early-lift probe. This is keyed only from the
+    /// resolved Claude provider enablement, not the pre-iteration usage env flag.
+    pub anthropic_account_io_allowed: bool,
     /// Loop tasks dir — `.stop`-signal polling + usage wait.
     pub tasks_dir: &'a Path,
     /// Wait seconds to use when the reset timestamp can't be parsed.
@@ -214,13 +225,48 @@ pub struct AccountReactionParams<'a> {
 /// usage-wait closure and delegates to [`react_to_outputs_inner`].
 ///
 /// The injected wait mirrors the pre-convergence sequential logic: try the
-/// usage API first (when `usage_enabled`), then fall back to the
-/// output-parsed reset wait with an early-lift probe.
+/// usage API first (when `usage_enabled` and Anthropic account I/O is allowed),
+/// then fall back to the output-parsed reset wait. The fallback uses the
+/// early-lift probe only when Anthropic account I/O is allowed.
 pub fn react_to_outputs(
     conn: &mut Connection,
     items: &[OutputReactionItem<'_>],
     params: &AccountReactionParams<'_>,
     blackout: &mut BlackoutState,
+) -> AccountReaction {
+    let usage_gate = |threshold: u8, tasks_dir: &Path, fallback_wait: u64| -> UsageCheckResult {
+        check_and_wait(threshold, tasks_dir, fallback_wait)
+    };
+    let reset_wait =
+        |wait_secs: u64, tasks_dir: &Path, fallback_wait: u64, probe: Option<&dyn Fn() -> bool>| {
+            wait_for_usage_reset(wait_secs, tasks_dir, fallback_wait, probe)
+        };
+    let probe = |permission_mode: &PermissionMode| -> bool {
+        probe_rate_limit_lifted(permission_mode)
+    };
+    react_to_outputs_with_io_seams(
+        conn,
+        items,
+        params,
+        blackout,
+        &usage_gate,
+        &reset_wait,
+        &probe,
+    )
+}
+
+/// Post-output rate-limit reaction with production I/O seams injected. Tests use
+/// this to prove the production wrapper's Anthropic/Claude side effects are
+/// skipped when Claude is disabled without touching live credentials or a real
+/// Claude binary.
+pub fn react_to_outputs_with_io_seams(
+    conn: &mut Connection,
+    items: &[OutputReactionItem<'_>],
+    params: &AccountReactionParams<'_>,
+    blackout: &mut BlackoutState,
+    usage_gate: UsageGateFn<'_>,
+    reset_wait: ResetWaitFn<'_>,
+    probe_rate_limit: RateLimitProbeFn<'_>,
 ) -> AccountReaction {
     // Exhaustive destructure (no `..`) — the single-home parity lock. Adding a
     // field to `AccountReactionParams` forces this coordinator to account for
@@ -229,6 +275,7 @@ pub fn react_to_outputs(
     let &AccountReactionParams {
         threshold,
         usage_enabled,
+        anthropic_account_io_allowed,
         tasks_dir,
         fallback_wait,
         prefix: _,
@@ -243,8 +290,8 @@ pub fn react_to_outputs(
     let wait = |wait_secs: u64| -> bool {
         // Try the usage API first (when enabled). It computes its own wait
         // internally, so the `wait_secs` arg is only consumed by the fallback.
-        if usage_enabled {
-            match check_and_wait(threshold, tasks_dir, fallback_wait) {
+        if anthropic_account_io_allowed && usage_enabled {
+            match usage_gate(threshold, tasks_dir, fallback_wait) {
                 UsageCheckResult::StopSignaled => return false,
                 UsageCheckResult::WaitedAndReset => return true,
                 // Skipped / BelowThreshold / ApiError — the API did not wait;
@@ -252,8 +299,12 @@ pub fn react_to_outputs(
                 _ => {}
             }
         }
-        let probe = || probe_rate_limit_lifted(permission_mode);
-        wait_for_usage_reset(wait_secs, tasks_dir, fallback_wait, Some(&probe))
+        if anthropic_account_io_allowed {
+            let probe = || probe_rate_limit(permission_mode);
+            reset_wait(wait_secs, tasks_dir, fallback_wait, Some(&probe))
+        } else {
+            reset_wait(wait_secs, tasks_dir, fallback_wait, None)
+        }
     };
 
     react_to_outputs_inner(conn, items, params, blackout, &wait)
