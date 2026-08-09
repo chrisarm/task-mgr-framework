@@ -22,10 +22,31 @@ pub struct LoopConfig {
     pub iteration_delay_secs: u64,
     /// Seconds to wait when usage check has no reset time available
     pub usage_fallback_wait: u64,
-    /// Whether to run Claude-account usage/OAuth pre-checks before iterations.
+    /// Whether to run Claude-account (Anthropic) usage/OAuth pre-checks before
+    /// iterations.
     ///
-    /// `LOOP_USAGE_CHECK_ENABLED=true` requests the check, but startup gates it
-    /// off when the resolved models config has the Claude provider disabled.
+    /// This is the **pre-iteration** half of a dual predicate — the two halves
+    /// are deliberately NOT collapsed:
+    ///
+    /// - **Pre-iteration** (`orchestrator::ensure_valid_token`,
+    ///   `reactions::account::account_usage_gate`):
+    ///   `usage_params.enabled = LOOP_USAGE_CHECK_ENABLED && claude_enabled`.
+    ///   `LOOP_USAGE_CHECK_ENABLED=true` only *requests* the check; startup
+    ///   gates it off when the resolved models config has the Claude provider
+    ///   disabled. Setting the env var to `false` forces the pre-check off even
+    ///   when Claude is enabled.
+    /// - **Post-output RateLimit** (`reactions::account::react_to_outputs` →
+    ///   `load_usage_info` / `probe_rate_limit_lifted`):
+    ///   `anthropic_account_io_allowed = claude_enabled` **only**. This env var
+    ///   does NOT control that Anthropic I/O — `LOOP_USAGE_CHECK_ENABLED=false`
+    ///   with Claude still enabled leaves post-output Anthropic load/probe on.
+    ///   Disabling the Claude provider is the only way to silence it.
+    ///
+    /// `claude_enabled` is resolved exclusively via
+    /// `model::resolve_models_config(..).is_provider_enabled(Provider::Claude)`
+    /// — never from `models.primaryProvider`. See `src/loop_engine/CLAUDE.md`
+    /// ("Account-global reactions") and the Grok-only recipe in the top-level
+    /// `CLAUDE.md`.
     pub usage_check_enabled: bool,
     /// Auto-confirm all prompts (non-interactive mode)
     pub yes_mode: bool,
@@ -94,7 +115,9 @@ impl LoopConfig {
     /// - `LOOP_MAX_CRASHES` → `max_crashes` (u8)
     /// - `LOOP_ITERATION_DELAY_SECS` → `iteration_delay_secs` (u64)
     /// - `LOOP_USAGE_FALLBACK_WAIT` → `usage_fallback_wait` (u64)
-    /// - `LOOP_USAGE_CHECK_ENABLED` → `usage_check_enabled` (bool: "true"/"1"/"yes"; Claude-account pre-check request, also gated off when Claude is disabled)
+    /// - `LOOP_USAGE_CHECK_ENABLED` → `usage_check_enabled` (bool: "true"/"1"/"yes"; Claude-account
+    ///   (Anthropic) **pre-check** request only — also gated off when the Claude provider is
+    ///   disabled, and never a kill-switch for post-output RateLimit Anthropic I/O)
     /// - `LOOP_GIT_SCAN_DEPTH` → `git_scan_depth` (usize, default 7)
     /// - `LOOP_EXTERNAL_GIT_SCAN_DEPTH` → `external_git_scan_depth` (usize, default 50)
     /// - `LOOP_PARALLEL` → `parallel_slots` (usize, 1-3, default 2)
