@@ -298,12 +298,13 @@ pub fn react_to_outputs_with_io_seams(
                 _ => {}
             }
         }
-        if anthropic_account_io_allowed {
-            let probe = || probe_rate_limit(permission_mode);
-            reset_wait(wait_secs, tasks_dir, fallback_wait, Some(&probe))
-        } else {
-            reset_wait(wait_secs, tasks_dir, fallback_wait, None)
-        }
+        // The reset wait itself always runs; only the early-lift probe is
+        // gated, because it spawns the Claude CLI. Single call site so a future
+        // signature change to `wait_for_usage_reset` can't be half-applied.
+        let probe = || probe_rate_limit(permission_mode);
+        let probe_arg: Option<&dyn Fn() -> bool> =
+            anthropic_account_io_allowed.then_some(&probe as &dyn Fn() -> bool);
+        reset_wait(wait_secs, tasks_dir, fallback_wait, probe_arg)
     };
 
     react_to_outputs_inner(conn, items, params, blackout, &wait)
