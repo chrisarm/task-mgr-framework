@@ -22,7 +22,10 @@ pub struct LoopConfig {
     pub iteration_delay_secs: u64,
     /// Seconds to wait when usage check has no reset time available
     pub usage_fallback_wait: u64,
-    /// Whether to check the usage API before iterations
+    /// Whether to run Claude-account usage/OAuth pre-checks before iterations.
+    ///
+    /// `LOOP_USAGE_CHECK_ENABLED=true` requests the check, but startup gates it
+    /// off when the resolved models config has the Claude provider disabled.
     pub usage_check_enabled: bool,
     /// Auto-confirm all prompts (non-interactive mode)
     pub yes_mode: bool,
@@ -91,7 +94,7 @@ impl LoopConfig {
     /// - `LOOP_MAX_CRASHES` → `max_crashes` (u8)
     /// - `LOOP_ITERATION_DELAY_SECS` → `iteration_delay_secs` (u64)
     /// - `LOOP_USAGE_FALLBACK_WAIT` → `usage_fallback_wait` (u64)
-    /// - `LOOP_USAGE_CHECK_ENABLED` → `usage_check_enabled` (bool: "true"/"1"/"yes")
+    /// - `LOOP_USAGE_CHECK_ENABLED` → `usage_check_enabled` (bool: "true"/"1"/"yes"; Claude-account pre-check request, also gated off when Claude is disabled)
     /// - `LOOP_GIT_SCAN_DEPTH` → `git_scan_depth` (usize, default 7)
     /// - `LOOP_EXTERNAL_GIT_SCAN_DEPTH` → `external_git_scan_depth` (usize, default 50)
     /// - `LOOP_PARALLEL` → `parallel_slots` (usize, 1-3, default 2)

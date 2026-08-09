@@ -10,7 +10,7 @@ use crate::loop_engine::detection;
 use crate::loop_engine::guidance::SessionGuidance;
 use crate::loop_engine::model;
 use crate::loop_engine::progress;
-use crate::loop_engine::project_config;
+use crate::loop_engine::project_config::{self, ModelsConfig, RoutingConfig};
 use crate::loop_engine::runner::{RunnerKind, runner_kind_for};
 use crate::loop_engine::signals::SignalFlag;
 use crate::loop_engine::stale::StaleTracker;
@@ -95,7 +95,7 @@ pub(crate) const AUTO_MODE_DEPRECATION_HINT: &str = concat!(
 /// Parameters for usage API monitoring within an iteration.
 #[derive(Debug, Clone)]
 pub struct UsageParams {
-    /// Whether usage checking is enabled.
+    /// Whether Claude-account usage/OAuth pre-checking is enabled.
     pub enabled: bool,
     /// Usage percentage threshold (0-100) to trigger wait.
     pub threshold: u8,
@@ -112,6 +112,21 @@ impl UsageParams {
             fallback_wait: 300,
         }
     }
+}
+
+/// Whether pre-iteration Claude account metering/OAuth should run.
+///
+/// The environment flag is necessary but not sufficient: Claude account I/O is
+/// only meaningful when the resolved models config still has Claude enabled.
+pub fn claude_usage_check_enabled(
+    env_enabled: bool,
+    models: &ModelsConfig,
+    routing: &RoutingConfig,
+) -> bool {
+    if !env_enabled {
+        return false;
+    }
+    model::resolve_models_config(models, routing).is_provider_enabled(model::Provider::Claude)
 }
 
 /// Parameters for a single iteration of the agent loop.
@@ -1105,6 +1120,7 @@ pub fn apply_status_updates(
 mod tests {
     use super::*;
     use crate::loop_engine::model::{HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL};
+    use crate::loop_engine::project_config::merge_models_config;
     use crate::loop_engine::runner::RunnerKind;
 
     // --- FEAT-005: resolve_effective_runner + IterationContext fields ---
@@ -1115,6 +1131,74 @@ mod tests {
     // is preserved byte-for-byte. An explicit `runner_overrides` entry
     // wins over the model-derived provider — that's how FEAT-007 / FEAT-008
     // pin a task to Grok once a fallback fires.
+
+    #[test]
+    fn claude_usage_check_enabled_uses_env_and_resolved_claude_provider() {
+        let routing = RoutingConfig::default();
+        let mut models = ModelsConfig::builtin_default();
+        assert!(claude_usage_check_enabled(true, &models, &routing));
+        assert!(!claude_usage_check_enabled(false, &models, &routing));
+
+        models
+            .providers
+            .get_mut(model::Provider::Claude.as_str())
+            .expect("builtin config includes Claude")
+            .enabled = false;
+        assert!(!claude_usage_check_enabled(true, &models, &routing));
+    }
+
+    #[test]
+    fn claude_usage_check_enabled_builtin_default_preserves_pregate() {
+        assert!(claude_usage_check_enabled(
+            true,
+            &ModelsConfig::builtin_default(),
+            &RoutingConfig::default()
+        ));
+    }
+
+    #[test]
+    fn claude_usage_check_enabled_does_not_key_off_primary_provider() {
+        let routing = RoutingConfig::default();
+        let mut models = ModelsConfig::builtin_default();
+        models.primary_provider = model::Provider::Grok.as_str().to_string();
+        models
+            .providers
+            .get_mut(model::Provider::Grok.as_str())
+            .expect("builtin config includes Grok")
+            .enabled = true;
+
+        assert!(claude_usage_check_enabled(true, &models, &routing));
+    }
+
+    #[test]
+    fn claude_usage_check_enabled_sparse_grok_opt_in_keeps_claude_enabled() {
+        let user = serde_json::json!({
+            "providers": {
+                "grok": {
+                    "enabled": true
+                }
+            }
+        });
+        let models = merge_models_config(Some(&user)).expect("sparse Grok opt-in merges");
+
+        assert!(claude_usage_check_enabled(
+            true,
+            &models,
+            &RoutingConfig::default()
+        ));
+    }
+
+    #[test]
+    fn claude_usage_check_enabled_fails_closed_when_claude_absent() {
+        let mut models = ModelsConfig::builtin_default();
+        models.providers.remove(model::Provider::Claude.as_str());
+
+        assert!(!claude_usage_check_enabled(
+            true,
+            &models,
+            &RoutingConfig::default()
+        ));
+    }
 
     #[test]
     fn feat_005_default_empty_ctx_with_no_model_resolves_to_claude() {

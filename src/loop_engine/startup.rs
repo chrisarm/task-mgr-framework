@@ -48,7 +48,7 @@ use crate::loop_engine::worktree;
 use crate::output::ui;
 
 use crate::loop_engine::engine::{
-    AUTO_MODE_DEPRECATION_HINT, LoopResult, LoopRunConfig, UsageParams,
+    AUTO_MODE_DEPRECATION_HINT, LoopResult, LoopRunConfig, UsageParams, claude_usage_check_enabled,
     read_prd_implicit_overlap_files,
 };
 
@@ -975,8 +975,16 @@ pub(crate) fn initialize_loop(
     }
 
     // Step 16: Build usage params
+    let usage_check_enabled = claude_usage_check_enabled(
+        run_config.config.usage_check_enabled,
+        &project_config.models,
+        &project_config.routing,
+    );
+    if run_config.config.usage_check_enabled && !usage_check_enabled {
+        ui::emit("Skipping Claude usage/OAuth pre-check (Claude provider disabled)");
+    }
     let usage_params = UsageParams {
-        enabled: run_config.config.usage_check_enabled,
+        enabled: usage_check_enabled,
         threshold: run_config.config.usage_threshold,
         fallback_wait: run_config.config.usage_fallback_wait,
     };
