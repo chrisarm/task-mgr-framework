@@ -205,6 +205,15 @@ Two mechanisms keep a reaction from being copy-pasted back into one path:
 Account-global reactions (`account_usage_gate`, `react_to_outputs`,
 `react_to_transient`) fire **exactly once per wave**, never once per
 rate-limited slot — they reflect shared API-account state, not per-task state.
+Anthropic account I/O uses a dual-predicate contract: `claude_provider_enabled`
+is resolved only through
+`resolve_models_config(&project_config.models, &project_config.routing).is_provider_enabled(Provider::Claude)`;
+pre-iteration `usage_params.enabled = LOOP_USAGE_CHECK_ENABLED &&
+claude_provider_enabled`, while post-output RateLimit
+`anthropic_account_io_allowed = claude_provider_enabled` and ignores the env
+switch. When Claude is disabled, post-output RateLimit must not call
+`load_usage_info` or `probe_rate_limit_lifted`, and `api_reset_secs` is always
+`None`.
 The per-task reactions (`resolve_task_execution`, `handle_overflow`) fold one
 call per slot. Each coordinator pairs a production entry point with a hermetic
 `_inner` core that takes the side-effecting step (wait / review) as an injected
