@@ -102,6 +102,43 @@ Codex routes are config-explicit only (byIdPrefix / taskClasses with
 `provider:"codex"`); never inferred from a model string. Blackout channel
 (`provider_blackouts`) is separate from permanent `runner_overrides` promotions.
 
+### Grok-only setup (disabling Claude entirely)
+
+There is **no `task-mgr models set-primary`** — `primaryProvider` is edited in
+the config JSON (or written by `task-mgr models init`). Exact recipe:
+
+```sh
+task-mgr models enable grok
+task-mgr models disable claude
+# then set "primaryProvider": "grok" inside the "models" block of
+# .task-mgr/config.json (manual edit, or via `task-mgr models init`)
+task-mgr models route FEAT --provider grok     # optional byIdPrefix forcing
+task-mgr models show                            # verify: claude disabled, primary grok
+```
+
+Two footguns:
+
+- **Leaving `primaryProvider: "claude"` while disabling Claude** fails
+  `preflight_validate_and_probe` with a validation error — the primary provider
+  must be enabled. Flip `primaryProvider` in the same edit as the disable.
+- **Sparse merge: `models enable grok` does NOT disable Claude.** The `models`
+  block merges onto `ModelsConfig::builtin_default`, where Claude is enabled by
+  default, so a config carrying only `{"providers":{"grok":{"enabled":true}}}`
+  still has Claude enabled. Anthropic account I/O therefore stays on: the
+  pre-iteration usage/OAuth check still runs, and post-output RateLimit still
+  calls `load_usage_info` / `probe_rate_limit_lifted`. `models disable claude`
+  is a separate, required step.
+
+**`LOOP_USAGE_CHECK_ENABLED` is not a Claude kill-switch.** It gates only the
+**pre-iteration** Anthropic usage/OAuth check
+(`enabled = LOOP_USAGE_CHECK_ENABLED ∧ Claude enabled`, so either one being
+false turns the pre-check off). It does **not** control post-output RateLimit
+Anthropic I/O — with Claude enabled, `LOOP_USAGE_CHECK_ENABLED=false` still
+leaves the post-output Anthropic load/probe running. Only disabling the Claude
+provider stops all Anthropic account I/O. See
+[`src/loop_engine/CLAUDE.md`](src/loop_engine/CLAUDE.md) "Account-global
+reactions" for the dual-predicate contract.
+
 ## Deprecation policy
 
 `task-mgr init --from-json <prd>` is a **permanent shim** — it will not be removed. Operators who use it today (scripts, docs, muscle memory) can continue to do so indefinitely. The shim prints a one-line stderr notice and dispatches to `task-mgr loop init` (N=1) or `task-mgr batch init` (N>1) after running `init_project`, so the DB state is byte-for-byte identical to the canonical path.
