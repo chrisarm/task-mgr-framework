@@ -19,9 +19,9 @@ pub use output::{
 };
 pub use types::{
     CountResult, DedupCluster, DedupParams, DedupResult, DeduplicateLearningItem, EmbedParams,
-    EmbedResult, EnrichCandidate, EnrichParams, EnrichResult, MergeClusterParams, ModelRowCount,
-    MergeClusterResult, RawDedupCluster, RetireParams, RetireResult, RetirementCandidate,
-    UnretireResult,
+    EmbedResult, EnrichCandidate, EnrichParams, EnrichResult, MergeClusterParams,
+    MergeClusterResult, ModelRowCount, RawDedupCluster, RetireParams, RetireResult,
+    RetirementCandidate, UnretireResult,
 };
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -1216,10 +1216,10 @@ pub fn curate_embed(conn: &Connection, params: EmbedParams) -> TaskMgrResult<Emb
             for (model, rows) in &inactive {
                 ui::emit_err(&format!("  {model}: {rows} row(s)"));
             }
-            ui::emit_err(&format!(
+            ui::emit_err(
                 "Re-run with: task-mgr curate embed --prune-stale --yes \
-                 (confirm keep model is correct in .task-mgr/config.json first)"
-            ));
+                 (confirm keep model is correct in .task-mgr/config.json first)",
+            );
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(

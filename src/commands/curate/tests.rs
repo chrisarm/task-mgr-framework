@@ -5365,7 +5365,10 @@ fn test_embed_gap_fill_targets_only_active_model_gaps() {
         vec!["gap-model".to_string(), "other-model".to_string()],
         "A gains gap-model and keeps other-model"
     );
-    assert_eq!(embedding_models_for(&conn, id_b), vec!["gap-model".to_string()]);
+    assert_eq!(
+        embedding_models_for(&conn, id_b),
+        vec!["gap-model".to_string()]
+    );
 }
 
 /// AC: --force re-embeds every active learning for the ACTIVE model while
@@ -5460,7 +5463,11 @@ fn test_embed_prune_stale_removes_other_models_db_only() {
         vec!["gap-model".to_string()],
         "active model's row survives the prune"
     );
-    assert_eq!(result.rows_by_model.len(), 1, "breakdown reflects post-prune state");
+    assert_eq!(
+        result.rows_by_model.len(),
+        1,
+        "breakdown reflects post-prune state"
+    );
 }
 
 /// AC: gap-fill refuses when active rows under the model have mixed dimensions.
@@ -5540,7 +5547,10 @@ fn test_embed_raw_model_dims_guard_rejects_mismatch() {
     };
     let result = curate_embed(&conn, params).expect("curate_embed raw model");
 
-    assert_eq!(result.embedded_this_run, 0, "mismatched vector must not be stored");
+    assert_eq!(
+        result.embedded_this_run, 0,
+        "mismatched vector must not be stored"
+    );
     assert_eq!(result.errors, 1);
     assert!(
         embedding_models_for(&conn, id_a).is_empty(),

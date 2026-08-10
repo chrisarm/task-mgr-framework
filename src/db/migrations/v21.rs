@@ -326,6 +326,9 @@ mod tests {
             .unwrap();
         assert_eq!(model, "jina-like");
         assert_eq!(dims, 2);
-        assert_eq!(pk_columns(&conn), vec!["learning_id".to_string(), "model".to_string()]);
+        assert_eq!(
+            pk_columns(&conn),
+            vec!["learning_id".to_string(), "model".to_string()]
+        );
     }
 }

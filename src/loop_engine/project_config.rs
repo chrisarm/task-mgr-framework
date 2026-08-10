@@ -852,9 +852,7 @@ impl ProjectConfig {
     /// (raw). Returns `None` silently when neither side is set; warns and
     /// returns `None` when exactly one is present. Unknown profile ids warn
     /// and disable the reranker (same soft-fail posture as incomplete pairs).
-    pub fn resolved_reranker_config(
-        &self,
-    ) -> Option<crate::learnings::reranker::ResolvedReranker> {
+    pub fn resolved_reranker_config(&self) -> Option<crate::learnings::reranker::ResolvedReranker> {
         let has_url = self
             .reranker_url
             .as_deref()
@@ -879,13 +877,13 @@ impl ProjectConfig {
             (true, true) => {}
         }
 
-        if let Some(p) = self.reranker_over_fetch_percent {
-            if p > crate::learnings::reranker::MAX_RERANKER_OVER_FETCH_PERCENT {
-                crate::output::warn(&format!(
-                    "rerankerOverFetchPercent={p} exceeds max {}; clamping",
-                    crate::learnings::reranker::MAX_RERANKER_OVER_FETCH_PERCENT
-                ));
-            }
+        if let Some(p) = self.reranker_over_fetch_percent
+            && p > crate::learnings::reranker::MAX_RERANKER_OVER_FETCH_PERCENT
+        {
+            crate::output::warn(&format!(
+                "rerankerOverFetchPercent={p} exceeds max {}; clamping",
+                crate::learnings::reranker::MAX_RERANKER_OVER_FETCH_PERCENT
+            ));
         }
 
         match crate::learnings::reranker::resolve_reranker_pair(
@@ -1400,7 +1398,10 @@ mod tests {
             r.over_fetch_percent,
             crate::learnings::reranker::MAX_RERANKER_OVER_FETCH_PERCENT
         );
-        assert_eq!(crate::learnings::reranker::MAX_RERANKER_OVER_FETCH_PERCENT, 300);
+        assert_eq!(
+            crate::learnings::reranker::MAX_RERANKER_OVER_FETCH_PERCENT,
+            300
+        );
     }
 
     #[test]

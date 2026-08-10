@@ -1,0 +1,346 @@
+{
+  "branchName": "feat/skip-anthropic-usage-claude-disabled",
+  "description": "Skip Anthropic OAuth/usage I/O when Claude provider is disabled. Dual predicate: pre-iteration gate = LOOP_USAGE_CHECK_ENABLED ∧ Claude enabled; post-output RateLimit Anthropic load + Claude probe = Claude enabled only (env does not silence post when Claude on). Fixes Grok-only hang on OAuth token expiring, refreshing...",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "No warnings in `cargo check` output",
+      "No warnings in `cargo clippy --all-targets -- -D warnings`",
+      "`cargo fmt --check` passes",
+      "Scoped tests for touched modules pass",
+      "No unwrap() in production code paths",
+      "Sequential and wave paths stay parity-locked for account reactions (exhaustive destructure, shared coordinators)"
+    ],
+    "description": "These criteria apply to ALL implementation tasks"
+  },
+  "prdFile": "skip-anthropic-usage-claude-disabled.md",
+  "priorityPhilosophy": {
+    "description": "Hierarchy of what matters most when implementing tasks",
+    "hierarchy": [
+      "1. PLAN — Anticipate edge cases before coding",
+      "2. PHASE 2 FOUNDATION — ~1 day now to save ~2+ weeks later (1:10+ ratio); we are pre-launch, foundations compound",
+      "3. FUNCTIONING CODE — Pragmatic, reliable, wired in per plan",
+      "4. CORRECTNESS — Compiles, type-checks, scoped tests pass deterministically",
+      "5. CODE QUALITY — Clean code, qualityDimensions satisfied, no warnings",
+      "6. POLISH — Docs, formatting, minor improvements"
+    ],
+    "principles": [
+      "Quality dimensions explicit — qualityDimensions on every task tells you what 'good' looks like",
+      "Edge cases = test cases — every known edge case must have a corresponding test",
+      "Scoped per-iteration tests, full suite at REVIEW-001 — REVIEW must leave the trunk green including pre-existing failures",
+      "Dual predicate is non-negotiable: never collapse pre and post into one flag",
+      "Ship working code with tests to prove it; handle Option/Result explicitly; avoid unwrap() in production"
+    ]
+  },
+  "prohibitedOutcomes": [
+    "Keying post-output Anthropic I/O solely on UsageParams.enabled / LOOP_USAGE_CHECK_ENABLED (would silence post when env=false and Claude still enabled)",
+    "Re-reading raw config JSON or inventing a second models merge for the Claude-enabled check",
+    "Using primaryProvider==grok as the skip predicate instead of is_provider_enabled(Claude)",
+    "Removing orchestrator ensure_valid_token as a required deliverable (out of scope)",
+    "Adding ureq timeouts, merge-resolver host changes, or Grok usage APIs in this task list",
+    "Bare eprintln! for the new startup skip notice (must use ui::emit / product channel)",
+    "Tests that only assert no crash without verifying zero Anthropic seam calls when Claude is disabled",
+    "Tests that require live Anthropic network or real ~/.claude credentials",
+    "Manual edits to tasks/*.json for status (use task-mgr CLI / task-status tags)",
+    "Error messages that don't identify what went wrong",
+    "Catch-all error handlers that swallow context"
+  ],
+  "project": "task-mgr",
+  "requires": [],
+  "taskPrefix": "57f877d2",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "Positive: Progress log (or CLAUDE.md one-liner + progress) states both predicates with env applying ONLY to pre",
+        "Positive: Contract states Claude-disabled post RateLimit ⇒ api_reset_secs always None and no Claude CLI probe",
+        "Positive: Contract states Claude-enabled + LOOP_USAGE_CHECK_ENABLED=false ⇒ pre off, post may still Anthropic",
+        "Positive: Contract names resolve_models_config + is_provider_enabled(Provider::Claude) as the only enablement API",
+        "Negative: Contract must NOT say primaryProvider alone controls the gate",
+        "Negative: Contract must NOT treat UsageParams.enabled as the post-output Anthropic switch",
+        "Known-bad: a single flag named usage_enabled used for both pre and post without documenting env asymmetry fails this contract"
+      ],
+      "dependsOn": [],
+      "description": "Materialize the dual-predicate contract that FEAT-001/002 implement. Write the contract into the progress log (and optionally a short note under src/loop_engine/CLAUDE.md account-global section if a one-liner fits). This is the design SSoT — not a large doc dump.\n\nDO: Define both predicates with exact names and semantics:\n1) `claude_provider_enabled` = `resolve_models_config(&project_config.models, &project_config.routing).is_provider_enabled(Provider::Claude)` (fail-closed if Claude absent).\n2) Pre-iteration: `usage_params.enabled = LOOP_USAGE_CHECK_ENABLED && claude_provider_enabled` — gates orchestrator `ensure_valid_token` + `account_usage_gate`.\n3) Post-output RateLimit: `anthropic_account_io_allowed = claude_provider_enabled` only — env does NOT apply. When false: no `load_usage_info`, no `probe_rate_limit_lifted`, `api_reset_secs` always None; wait from parse_reset_from_output / fallback_wait / blackout_fallback_secs only.\n4) Hang mapping: primary bug = indefinite OAuth refresh hang with Claude disabled; secondary = 5h wait after successful above-threshold usage load.\n5) Non-goals: ureq timeouts, merge host, ensure_valid_token removal, auto-disable Claude on Grok enable.\n\nDO NOT: Implement production code in this task (tests for pure helpers may live on FEAT-001). Do NOT collapse the two predicates into one bool.\n\nKnown-bad: documenting only 'skip when primary is Grok' would leave dual-provider (Grok primary + Claude enabled) incorrectly skipping Anthropic pre-check.",
+      "edgeCases": [
+        "Sparse merge enable-Grok-only: Claude remains enabled → both pre (if env) and post Anthropic stay allowed",
+        "Claude absent from providers map: is_provider_enabled fail-closed → treated as disabled"
+      ],
+      "estimatedEffort": "low",
+      "failureModes": [
+        {
+          "cause": "Implementer collapses dual predicate while coding FEAT-002",
+          "expectedBehavior": "CONTRACT acceptance criteria + TEST-001 env-false/Claude-on case fail the review"
+        }
+      ],
+      "id": "CONTRACT-001",
+      "modifiesBehavior": false,
+      "notes": "Approved plan dual-predicate section. Call sites for later feats: startup.rs Step 16; account.rs react_to_outputs; iteration.rs ~784; wave_scheduler.rs ~1056. Learning [5131]: preflight only probes enabled providers — mirror discipline for Anthropic I/O. Learning [4126]: seq+wave share account reactions. Learning [4866]/[5075]: account-global once-per-wave.",
+      "passes": true,
+      "priority": 1,
+      "qualityDimensions": [
+        "Contract is unambiguous enough that FEAT-001 and FEAT-002 cannot disagree on env vs Claude applicability",
+        "Non-goals listed so implementers do not expand scope",
+        "Hang symptom primary vs secondary is explicit for reviewers"
+      ],
+      "taskType": "contract",
+      "title": "Dual predicate: pre env∧Claude; post Anthropic I/O Claude-only",
+      "touchesFiles": [
+        "src/loop_engine/CLAUDE.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: helper(true, Claude enabled) → true; helper(true, Claude disabled) → false; helper(false, Claude enabled) → false",
+        "Positive: ModelsConfig::builtin_default() + env true → helper true (default Claude loops keep pre-gate)",
+        "Positive: startup builds UsageParams.enabled via helper; when auto-skipping, exactly one ui::emit skip line is produced (unit/integration or assert via test double if available; at minimum grep wiring)",
+        "Negative: helper must NOT return false solely because primary_provider is Grok while Claude is still enabled",
+        "Unit test: sparse opt-in Grok-enabled merge (Claude still enabled) keeps helper true when env true — Known-bad footgun",
+        "CONTRACT: helper/startup MUST use resolve_models_config + is_provider_enabled(Provider::Claude) — do NOT read models.providers[\"claude\"].enabled raw; grep to verify no alternate path",
+        "Failure mode: if Claude key absent from resolved map, is_provider_enabled fail-closed → pre-gate off (safe for Grok-only)",
+        "Known-bad: reading project_config.models.providers[\"claude\"].enabled without resolve_models_config is forbidden even if merge already ran — one code path with orchestrator"
+      ],
+      "dependsOn": [
+        "CONTRACT-001"
+      ],
+      "description": "Gate pre-iteration Anthropic usage/OAuth on Claude being enabled, without changing post-output behavior.\n\nDO:\n1. Add a small pure helper (engine.rs or usage.rs), e.g. `claude_usage_check_enabled(env_enabled: bool, models: &ModelsConfig, routing: &RoutingConfig) -> bool` or take `&ResolvedModelsConfig` — must use `resolve_models_config` + `is_provider_enabled(Provider::Claude)`, not raw JSON.\n2. In `startup.rs` Step 16: `enabled: helper(run_config.config.usage_check_enabled, &project_config.models, &project_config.routing)`.\n3. When env wants check (`usage_check_enabled`) but Claude is disabled: one `ui::emit` line e.g. `Skipping Claude usage/OAuth pre-check (Claude provider disabled)` — product channel, not bare eprintln.\n4. Document on `LoopConfig.usage_check_enabled` / `from_env` that the check is Claude-account metering and is also gated off when Claude is disabled.\n5. Unit tests for the pure helper truth table (env×Claude matrix).\n\nDO NOT: Change `react_to_outputs` in this task. Do NOT remove `orchestrator` ensure_valid_token. Do NOT use primaryProvider as the predicate. Do NOT invent a second merge path.\n\nmodifiesBehavior: true — Grok-only (Claude disabled) loops no longer run pre-iteration OAuth/usage; default Claude configs unchanged.",
+      "edgeCases": [
+        "usage_check_enabled false + Claude disabled: enabled false, no skip log required (or skip log only when env true and Claude false — prefer log only when auto-overriding env true)",
+        "Claude enabled mid-run config edit: usage_params fixed at startup (document; no hot-reload required)"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Wrong predicate uses primary==Claude only",
+          "expectedBehavior": "Unit test with primary=Grok + Claude enabled fails if gate incorrectly off"
+        }
+      ],
+      "id": "FEAT-001",
+      "modifiesBehavior": true,
+      "notes": "Depends on CONTRACT-001. project_config is already loaded before Step 16. Orchestrator later calls resolve_models_config again — reuse same API. Learning [4137]: tests use UsageParams::disabled() hermetically. Learning [5131]: enabled-only preflight pattern. Data contract: ProjectConfig.models + .routing → resolve_models_config → is_provider_enabled(Claude) → UsageParams.enabled. Callers of UsageParams.enabled: orchestrator ensure_valid_token; iteration + wave_orchestration account_usage_gate — all already honor the flag.",
+      "passes": true,
+      "priority": 2,
+      "qualityDimensions": [
+        "Single pure helper is the only place env∧Claude is combined for pre-gate",
+        "Skip notice uses ui::emit (CONTRACT-LOG-001), once at startup",
+        "Default Claude + env default remains pre-gate on (regression pinned by unit test)",
+        "No behavior change to post-output RateLimit in this task"
+      ],
+      "taskType": "implementation",
+      "title": "Startup: UsageParams.enabled = env ∧ Claude enabled + skip log",
+      "touchesFiles": [
+        "src/loop_engine/startup.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/usage.rs",
+        "src/loop_engine/config.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: production react_to_outputs with anthropic_account_io_allowed=false never calls load_usage_info or probe_rate_limit_lifted (counting test doubles / #[cfg(test)] seams or extract-and-inject pattern matching account_usage_gate_inner style)",
+        "Positive: Claude-disabled RateLimit still resets in_progress→todo and can Wait with fallback_wait / output parse; .stop still interrupts wait",
+        "Positive: Claude-enabled path still loads usage when RateLimit (existing behavior)",
+        "Negative: AccountReactionParams construction at seq and wave must set anthropic_account_io_allowed from is_provider_enabled(Claude), NOT from usage_params.enabled",
+        "Known-bad: setting anthropic_account_io_allowed = usage_params.enabled would fail TEST-001 case Claude-on + env-false (post must still allow Anthropic)",
+        "Positive: spend-limit / StopSpend copy is not Claude-only when anthropic_account_io_allowed is false",
+        "CONTRACT: exhaustive destructure of AccountReactionParams still has no `..` in account.rs coordinators",
+        "Failure mode: if load_usage_info panics when called — Claude-disabled path must not call it at all"
+      ],
+      "dependsOn": [
+        "CONTRACT-001"
+      ],
+      "description": "When Claude cannot run, hard RateLimit must not touch Anthropic credentials/APIs or spawn Claude for early-lift. Env flag must NOT control this path.\n\nDO:\n1. Plumb `anthropic_account_io_allowed: bool` (name flexible) onto `AccountReactionParams` OR branch only in production `react_to_outputs` using a new field — exhaustive destructure (no `..`) in coordinators. Prefer explicit field over overloading `usage_enabled`.\n2. Set the field at both call sites from `resolved_models.is_provider_enabled(Provider::Claude)` (iteration.rs ~784, wave_scheduler.rs ~1056) — NOT from `usage_params.enabled`.\n3. When `!anthropic_account_io_allowed`: do not call `load_usage_info`; do not call `probe_rate_limit_lifted`; pass `api_reset_secs = None` into inner; wait closure may still use tasks_dir `.stop` + fallback_wait / parse_reset from output via existing decide path.\n4. Soften spend-limit / StopSpend messaging so it does not hard-require 'Claude Code /usage-credits' when Claude is disabled (provider-neutral or gated copy).\n5. Keep Claude-enabled post path byte-compatible for hermetic inner tests (same decide order).\n6. Unit/production-entry tests with counting seams: Claude off ⇒ zero load, zero probe.\n\nDO NOT: Gate this on usage_params.enabled. Do NOT change pre-iteration path here except shared types if needed. Do NOT invent Grok usage API.\n\nmodifiesBehavior: true — RateLimit on Claude-disabled loops no longer hits Anthropic or Claude CLI.",
+      "edgeCases": [
+        "RateLimit with Claude disabled and empty CLI output: wait fallback_wait only",
+        "RateLimit with Claude disabled and parseable reset in output: use parsed secs, no API",
+        "Spillover enabled + Claude disabled: no Anthropic api_reset_secs; use blackout_fallback_secs / parse path only — no new Grok blackout design"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "Claude disabled but probe_rate_limit_lifted still invoked when load would have failed",
+          "expectedBehavior": "Production path short-circuits before probe; test asserts zero probe calls"
+        }
+      ],
+      "id": "FEAT-002",
+      "modifiesBehavior": true,
+      "notes": "Depends on CONTRACT-001 (predicate). FEAT-001 is independent of post path but finish FEAT-001 first for cleaner review. react_to_outputs today: usage_enabled: _ then always load_usage_info (account.rs ~290-335). probe_rate_limit_lifted in recovery.rs. Learning [4183]: wave RateLimit chain wired. Learning [4126]: shared reactions. Data contract: ResolvedModelsConfig.is_provider_enabled(Claude) → AccountReactionParams.anthropic_account_io_allowed; usage_params.enabled remains pre-only and may still be passed as usage_enabled for documentation/future but must not control Anthropic post I/O.",
+      "passes": true,
+      "priority": 3,
+      "qualityDimensions": [
+        "Dual predicate enforced at construction: pre flag and post flag never assigned from the same expression",
+        "Hermetic react_to_outputs_inner unchanged for pure decide logic where possible; production wrapper owns I/O skip",
+        "Seq and wave call sites stay in lockstep (same field assignment)",
+        "Spend UX honest for non-Claude runners when Claude disabled"
+      ],
+      "taskType": "implementation",
+      "title": "Post-output RateLimit: skip Anthropic load/probe when Claude disabled",
+      "touchesFiles": [
+        "src/loop_engine/reactions/account.rs",
+        "src/loop_engine/iteration.rs",
+        "src/loop_engine/wave_scheduler.rs",
+        "tests/reaction_parity.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Unit test matrix covers at least: (env,t Claude,t) (env,t Claude,f) (env,f Claude,t) (env,f Claude,f) for pre helper",
+        "Test: Claude disabled RateLimit → zero Anthropic load seam invocations",
+        "Test: Claude enabled + usage_enabled=false RateLimit → load seam still invoked (or production branch still enters load path)",
+        "Test: primary=Grok + Claude enabled → pre helper true when env true",
+        "Existing reaction_parity account tests still pass",
+        "Known-bad: a collapsed single-flag implementation fails the env-false/Claude-on post test"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002"
+      ],
+      "description": "Pin the dual predicate with hermetic tests (no network, no real credentials).\n\nDO:\n1. Expand pure helper tests if FEAT-001 left gaps (env×Claude×primary combinations).\n2. In tests/reaction_parity.rs (or co-located account tests): Claude-disabled RateLimit production entry (or inject seam) ⇒ zero load_usage_info, zero probe_rate_limit_lifted; still correct AccountReaction for wait/stop paths as applicable.\n3. Explicit test: Claude enabled + usage_enabled false + hard RateLimit ⇒ Anthropic path STILL allowed (api load may be stubbed as Some/None but the decision to call load is true) — proves env does not silence post.\n4. Seq vs wave shape parity remains for account_usage_gate_inner and react_to_outputs_inner.\n\nDO NOT: Call live Anthropic. Do NOT require ~/.claude/.credentials.json. Do NOT weaken existing parity tests.",
+      "edgeCases": [
+        "No RateLimit items in slice: no load regardless of flags (existing None path)"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Flaky test if real ureq is accidentally called",
+          "expectedBehavior": "Use DI/seams only; fail test setup if network is required"
+        }
+      ],
+      "id": "TEST-001",
+      "modifiesBehavior": false,
+      "notes": "Depends on FEAT-001 and FEAT-002. Prefer inject seams already used by account_usage_gate_inner / react_to_outputs_inner. Learning [4137] hermetic UsageParams. Learning [4866] once-per-wave.",
+      "passes": true,
+      "priority": 4,
+      "qualityDimensions": [
+        "Tests distinguish pre vs post applicability",
+        "Hermetic: no network, no sleeps longer than necessary (inject wait closures)",
+        "Known-bad discriminator for flag collapse"
+      ],
+      "taskType": "test",
+      "title": "Matrix + reaction_parity: dual-predicate hermetic coverage",
+      "touchesFiles": [
+        "tests/reaction_parity.rs",
+        "src/loop_engine/usage.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/reactions/account.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: config.rs or equivalent documents dual applicability (pre env∧Claude; post Claude-only)",
+        "Positive: Grok-only steps include disable claude AND primaryProvider grok without claiming models set-primary exists",
+        "Negative: docs must NOT say LOOP_USAGE_CHECK_ENABLED=false stops post RateLimit Anthropic when Claude is enabled",
+        "Positive: sparse-merge footgun (enable grok leaves Claude on) is stated"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002"
+      ],
+      "description": "Document operator-facing behavior so Grok-only setup is correct and the sparse-merge footgun is visible.\n\nDO:\n1. Update LoopConfig / env docs for LOOP_USAGE_CHECK_ENABLED: Claude (Anthropic) account usage pre-check; when Claude disabled, pre-gate auto-off; env false forces pre-off even if Claude enabled; env does not control post RateLimit Anthropic I/O.\n2. Grok-only recipe (exact):\n   - task-mgr models enable grok\n   - task-mgr models disable claude\n   - set \"primaryProvider\": \"grok\" in .task-mgr/config.json (manual / models init block — there is NO task-mgr models set-primary)\n   - optional byIdPrefix routes provider grok\n   - warn: leave primaryProvider claude while disabling Claude → preflight error\n   - warn: enable grok without disable claude → Anthropic pre-check remains on\n3. Light note in src/loop_engine/CLAUDE.md under account-global reactions if not already done in CONTRACT-001.\n\nDO NOT: Rename LOOP_USAGE_CHECK_ENABLED. Do NOT invent CLI set-primary. Do NOT claim env disables all Anthropic I/O.",
+      "edgeCases": [
+        "Operator disables Claude but forgets primaryProvider: preflight fails — documented"
+      ],
+      "estimatedEffort": "low",
+      "failureModes": [
+        {
+          "cause": "Docs invent set-primary CLI",
+          "expectedBehavior": "Review rejects; use config.json primaryProvider field"
+        }
+      ],
+      "id": "DOC-001",
+      "modifiesBehavior": false,
+      "notes": "May touch CLAUDE.md, src/loop_engine/CLAUDE.md, config.rs comments, optionally README/docs/QUICKSTART if they mention usage check. Learning [4439]: multi-provider configs need explicit mutual-exclusion documentation.",
+      "passes": true,
+      "priority": 5,
+      "qualityDimensions": [
+        "Operator can follow Grok-only recipe without preflight surprise",
+        "No false claims about env covering post path",
+        "Docs match implemented dual predicate"
+      ],
+      "taskType": "implementation",
+      "title": "Docs: env semantics + Grok-only recipe without set-primary",
+      "touchesFiles": [
+        "src/loop_engine/config.rs",
+        "src/loop_engine/CLAUDE.md",
+        "CLAUDE.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No code duplication of the Claude-enabled predicate (shared helper or single resolve call pattern)",
+        "Functions under 30 lines where practical (flag complex ones)",
+        "Clear separation: usage_params.enabled vs anthropic_account_io_allowed",
+        "Code follows existing project patterns (reactions exhaustive destructure)",
+        "Any issues found spawn REFACTOR-FIX-xxx via `task-mgr add --stdin --depended-on-by REVIEW-001`"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "TEST-001",
+        "DOC-001"
+      ],
+      "description": "Review all implementation for DRY violations, complexity, coupling, and maintainability.\n\nDO: Check for duplicated Claude-enabled checks, functions >30 lines, dual-predicate expressed in one place only for pre helper, clear separation between pre and post flags.\nDO NOT: Skip — this gate catches issues before the final review. Do not expand into ureq timeout work.",
+      "estimatedEffort": "high",
+      "id": "REFACTOR-001",
+      "notes": "If issues found: `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001` for each (priority 50-97). If no issues, invoke /simplify on any ugly touchpoint, then emit done.",
+      "passes": true,
+      "priority": 98,
+      "qualityDimensions": [
+        "DRY across modules",
+        "Single-responsibility functions",
+        "Pattern consistency with existing reactions framework"
+      ],
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Review for refactoring opportunities",
+      "touchesFiles": [
+        "src/loop_engine/startup.rs",
+        "src/loop_engine/reactions/account.rs",
+        "src/loop_engine/iteration.rs",
+        "src/loop_engine/wave_scheduler.rs",
+        "tests/reaction_parity.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: All new code reachable from production entry points (grep-verified)",
+        "Positive: Dual-predicate ACs 1–10 from plan verified (pre/post/env cases)",
+        "Positive: FULL cargo test, cargo clippy -- -D warnings, cargo fmt --check all clean (no scope filter)",
+        "Negative: No unwrap() in production code paths",
+        "Negative: Post path is not gated solely on usage_params.enabled",
+        "Documentation: Grok-only recipe accurate (no set-primary)",
+        "Task update: Remaining tasks reviewed if APIs/assumptions changed",
+        "Pre-existing test failures fixed (or spawned as FIX-xxx with verifyCommand if >~12 unrelated)",
+        "If issues found: FIX-xxx via `task-mgr add --stdin --depended-on-by REVIEW-001`"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "TEST-001",
+        "DOC-001",
+        "REFACTOR-001"
+      ],
+      "description": "Review all implementation for quality, security, integration wiring, and documentation. RUN THE FULL QUALITY GATE (unscoped test suite).\n\nDO: Verify dual predicate not collapsed; both call sites set anthropic_account_io_allowed from is_provider_enabled(Claude); startup skip uses ui::emit; docs match. Full cargo test / clippy -D warnings / fmt.\nDO NOT: Scope the test suite. Do not reopen out-of-scope items (ureq timeouts, merge resolver) as blockers unless they regressed.",
+      "estimatedEffort": "high",
+      "id": "REVIEW-001",
+      "notes": "Spawn fixes via task-mgr add --stdin --depended-on-by REVIEW-001. Verify manually if needed: Claude-disabled config without LOOP_USAGE_CHECK_ENABLED=false should not print OAuth token expiring, refreshing...",
+      "passes": true,
+      "priority": 99,
+      "qualityDimensions": [
+        "No unwrap in production",
+        "All new code wired to production entry point",
+        "Full suite green including pre-existing",
+        "Dual predicate preserved under review pressure"
+      ],
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Code review + final verification",
+      "touchesFiles": [
+        "src/loop_engine/startup.rs",
+        "src/loop_engine/reactions/account.rs",
+        "src/loop_engine/iteration.rs",
+        "src/loop_engine/wave_scheduler.rs",
+        "tests/reaction_parity.rs"
+      ]
+    }
+  ],
+  "version": "1.0"
+}

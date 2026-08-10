@@ -121,10 +121,7 @@ pub fn resolve_embedding(
         // Raw escape hatch: if the string matches a catalog ollama_model, adopt
         // that profile's prefixes so operators who only set embeddingModel still
         // get correct Nemotron formatting.
-        if let Some(profile) = EMBEDDING_PROFILES
-            .iter()
-            .find(|p| p.ollama_model == model)
-        {
+        if let Some(profile) = EMBEDDING_PROFILES.iter().find(|p| p.ollama_model == model) {
             return Ok(ResolvedEmbedding {
                 ollama_url: url,
                 model: model.to_string(),

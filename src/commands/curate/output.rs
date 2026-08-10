@@ -116,7 +116,10 @@ pub fn format_dedup_text(result: &DedupResult) -> String {
 /// Format `curate embed` output as human-readable text.
 pub fn format_embed_text(result: &EmbedResult) -> String {
     let pruned = if result.pruned_stale > 0 {
-        format!("Pruned {} stale row(s) from other models.\n", result.pruned_stale)
+        format!(
+            "Pruned {} stale row(s) from other models.\n",
+            result.pruned_stale
+        )
     } else {
         String::new()
     };

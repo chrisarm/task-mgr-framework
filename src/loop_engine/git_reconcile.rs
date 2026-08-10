@@ -464,10 +464,10 @@ pub(crate) fn repo_relative_status_path(working_root: &Path, path: &Path) -> Opt
     }
 
     // Symlinks / non-canonical roots: best-effort canonicalize both sides.
-    if let (Ok(root), Ok(abs)) = (working_root.canonicalize(), candidate.canonicalize()) {
-        if let Ok(rel) = abs.strip_prefix(&root) {
-            return normalize(rel);
-        }
+    if let (Ok(root), Ok(abs)) = (working_root.canonicalize(), candidate.canonicalize())
+        && let Ok(rel) = abs.strip_prefix(&root)
+    {
+        return normalize(rel);
     }
 
     if !path.is_absolute() {
@@ -1096,8 +1096,7 @@ mod tests {
             &repo.join("tasks/feature.json"),
             r#"{"userStories":[{"id":"FEAT-001","passes":true}]}"#,
         );
-        let exclude =
-            orchestrator_wrapper_exclude_paths(&repo, &repo.join("tasks/feature.json"));
+        let exclude = orchestrator_wrapper_exclude_paths(&repo, &repo.join("tasks/feature.json"));
         assert!(
             exclude.contains("tasks/feature.json"),
             "PRD path must resolve into the exclude set"
@@ -1137,8 +1136,7 @@ mod tests {
             r#"{"userStories":[{"id":"FEAT-001","passes":true}]}"#,
         );
         write_file(&repo.join("src/leftover.rs"), "fn leftover() {}\n");
-        let exclude =
-            orchestrator_wrapper_exclude_paths(&repo, &repo.join("tasks/feature.json"));
+        let exclude = orchestrator_wrapper_exclude_paths(&repo, &repo.join("tasks/feature.json"));
 
         let hash = wrapper_commit(
             &repo,
