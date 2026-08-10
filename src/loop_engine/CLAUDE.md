@@ -557,6 +557,21 @@ completion fallback didn't fire. The single-pipeline contract makes
 parity-divergence a compile-time concern (any new step is added in one
 place; both call sites pick it up).
 
+**Claim-scoped short `<task-status>` / `<completed>` id rewrite** (plan-tasks
+`claim-short-status-id`): agents commonly emit bare story ids
+(`REFACTOR-001:done`) while the loop claimed the PRD-prefixed DB id
+(`97be64d7-REFACTOR-001`). Lifecycle dispatch stays **exact-id only** (SSoT).
+Before `apply_status_updates` (Step 3, all status keywords) and before Step 4b
+`<completed>` → `mark_task_done`, the pipeline rewrites **only** tags that
+refer to this iteration's claim via pure helpers in `output_parsing.rs`
+(`tag_id_refers_to_claimed` / `resolve_tag_id_to_claimed`): identity → real
+`strip_task_prefix` → 8-lowercase-hex body equality. Never unrestricted
+`ends_with` / substring (tag `001` must not match). Peer bare ids and
+`task_id: None` stay exact-id (TaskNotFound). Operator `ui::emit` note fires
+only on actual rewrite. Seq + wave both inherit the fix from this single
+insertion point — do not reimplement short-id logic in `TaskLifecycle` or
+wave-local code.
+
 **Prompt-builder companion**: `src/loop_engine/prompt/mod.rs` documents the
 three-builder layout (`core` / `sequential` / `slot`) plus the main-thread
 bundle rule — slot prompts must be built on the main thread before

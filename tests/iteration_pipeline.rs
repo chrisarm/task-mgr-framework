@@ -912,6 +912,311 @@ fn crash_tracker_record_success_fires_exactly_once_after_completion_ladder() {
 }
 
 // ---------------------------------------------------------------------------
+// FEAT-002: claim-scoped short status-id / <completed> rewrite
+//
+// Agents emit bare story ids (`REFACTOR-001:done`) while the loop claimed
+// the PRD-prefixed DB id (`aaaaaaaa-REFACTOR-001`). Rewrite only tags that
+// refer to this claim before lifecycle dispatch; peer bare ids stay exact.
+// ---------------------------------------------------------------------------
+
+/// Read the current status column for a task (empty if missing).
+fn task_status(conn: &Connection, task_id: &str) -> String {
+    conn.query_row("SELECT status FROM tasks WHERE id = ?1", [task_id], |row| {
+        row.get(0)
+    })
+    .unwrap_or_else(|_| String::new())
+}
+
+#[test]
+fn short_task_status_done_rewrites_to_claimed_and_completes() {
+    let (db_temp, mut conn) = setup_migrated_db();
+    disable_llm_extraction();
+    let claimed = "aaaaaaaa-REFACTOR-001";
+    insert_todo_task(&conn, claimed);
+
+    let mut outcome = IterationOutcome::Empty;
+    let mut fx = PipelineFixture::new(db_temp.path());
+    let output = "<task-status>REFACTOR-001:done</task-status>\n";
+    let result = process_iteration_output(ProcessingParams {
+        conn: &mut conn,
+        run_id: "test-run",
+        iteration: 1,
+        task_id: Some(claimed),
+        output,
+        conversation: None,
+        shown_learning_ids: &[],
+        outcome: &mut outcome,
+        working_root: fx.project.path(),
+        git_scan_depth: 5,
+        skip_git_completion_detection: true,
+        prd_path: &fx.prd_path,
+        task_prefix: Some("aaaaaaaa"),
+        progress_path: &fx.progress_path,
+        db_dir: &fx.db_dir,
+        signal_flag: &fx.signal_flag,
+        ctx: &mut fx.ctx,
+        files_modified: &[],
+        effective_model: None,
+        effective_effort: None,
+        effective_runner: None,
+        slot_index: None,
+    });
+
+    assert_eq!(
+        task_status(&conn, claimed),
+        "done",
+        "short REFACTOR-001:done must mark full claimed id done in DB"
+    );
+    assert_eq!(
+        result.status_updates_applied, 1,
+        "status_updates_applied must count the rewritten dispatch"
+    );
+    assert_eq!(outcome, IterationOutcome::Completed);
+    assert!(
+        result.completed_task_ids.contains(&claimed.to_string()),
+        "completed_task_ids must use FULL claimed id after rewrite; got {:?}",
+        result.completed_task_ids,
+    );
+    assert_eq!(result.tasks_completed, 1);
+}
+
+#[test]
+fn short_task_status_other_id_does_not_complete_claim() {
+    let (db_temp, mut conn) = setup_migrated_db();
+    disable_llm_extraction();
+    let claimed = "aaaaaaaa-REFACTOR-001";
+    insert_todo_task(&conn, claimed);
+
+    let mut outcome = IterationOutcome::Empty;
+    let mut fx = PipelineFixture::new(db_temp.path());
+    // Peer bare id — must NOT rewrite to claim (Learning 2188 / 2238).
+    let output = "<task-status>OTHER-001:done</task-status>\n";
+    let result = process_iteration_output(ProcessingParams {
+        conn: &mut conn,
+        run_id: "test-run",
+        iteration: 1,
+        task_id: Some(claimed),
+        output,
+        conversation: None,
+        shown_learning_ids: &[],
+        outcome: &mut outcome,
+        working_root: fx.project.path(),
+        git_scan_depth: 5,
+        skip_git_completion_detection: true,
+        prd_path: &fx.prd_path,
+        task_prefix: Some("aaaaaaaa"),
+        progress_path: &fx.progress_path,
+        db_dir: &fx.db_dir,
+        signal_flag: &fx.signal_flag,
+        ctx: &mut fx.ctx,
+        files_modified: &[],
+        effective_model: None,
+        effective_effort: None,
+        effective_runner: None,
+        slot_index: None,
+    });
+
+    assert_eq!(
+        task_status(&conn, claimed),
+        "in_progress",
+        "OTHER-001:done must not mark the claimed task done"
+    );
+    assert_eq!(
+        result.status_updates_applied, 0,
+        "non-matching bare tag must not count as applied (TaskNotFound)"
+    );
+    assert_ne!(outcome, IterationOutcome::Completed);
+    assert!(
+        !result.completed_task_ids.contains(&claimed.to_string()),
+        "claimed id must not appear in completed_task_ids; got {:?}",
+        result.completed_task_ids,
+    );
+}
+
+#[test]
+fn full_task_status_id_still_completes_claim() {
+    let (db_temp, mut conn) = setup_migrated_db();
+    disable_llm_extraction();
+    let claimed = "aaaaaaaa-REFACTOR-001";
+    insert_todo_task(&conn, claimed);
+
+    let mut outcome = IterationOutcome::Empty;
+    let mut fx = PipelineFixture::new(db_temp.path());
+    let output = format!("<task-status>{claimed}:done</task-status>\n");
+    let result = process_iteration_output(ProcessingParams {
+        conn: &mut conn,
+        run_id: "test-run",
+        iteration: 1,
+        task_id: Some(claimed),
+        output: &output,
+        conversation: None,
+        shown_learning_ids: &[],
+        outcome: &mut outcome,
+        working_root: fx.project.path(),
+        git_scan_depth: 5,
+        skip_git_completion_detection: true,
+        prd_path: &fx.prd_path,
+        task_prefix: Some("aaaaaaaa"),
+        progress_path: &fx.progress_path,
+        db_dir: &fx.db_dir,
+        signal_flag: &fx.signal_flag,
+        ctx: &mut fx.ctx,
+        files_modified: &[],
+        effective_model: None,
+        effective_effort: None,
+        effective_runner: None,
+        slot_index: None,
+    });
+
+    assert_eq!(task_status(&conn, claimed), "done");
+    assert_eq!(result.status_updates_applied, 1);
+    assert_eq!(outcome, IterationOutcome::Completed);
+    assert!(result.completed_task_ids.contains(&claimed.to_string()));
+}
+
+#[test]
+fn short_task_status_failed_rewrites_and_blocks_claim() {
+    let (db_temp, mut conn) = setup_migrated_db();
+    disable_llm_extraction();
+    let claimed = "aaaaaaaa-REFACTOR-001";
+    insert_todo_task(&conn, claimed);
+
+    let mut outcome = IterationOutcome::Empty;
+    let mut fx = PipelineFixture::new(db_temp.path());
+    // `:blocked` maps to Failed → Blocked via lifecycle; rewrite applies to
+    // ALL status keywords, not only done.
+    let output = "<task-status>REFACTOR-001:blocked</task-status>\n";
+    let result = process_iteration_output(ProcessingParams {
+        conn: &mut conn,
+        run_id: "test-run",
+        iteration: 1,
+        task_id: Some(claimed),
+        output,
+        conversation: None,
+        shown_learning_ids: &[],
+        outcome: &mut outcome,
+        working_root: fx.project.path(),
+        git_scan_depth: 5,
+        skip_git_completion_detection: true,
+        prd_path: &fx.prd_path,
+        task_prefix: Some("aaaaaaaa"),
+        progress_path: &fx.progress_path,
+        db_dir: &fx.db_dir,
+        signal_flag: &fx.signal_flag,
+        ctx: &mut fx.ctx,
+        files_modified: &[],
+        effective_model: None,
+        effective_effort: None,
+        effective_runner: None,
+        slot_index: None,
+    });
+
+    assert_eq!(
+        task_status(&conn, claimed),
+        "blocked",
+        "short REFACTOR-001:blocked must apply Failed→blocked on full claimed id"
+    );
+    assert_eq!(result.status_updates_applied, 1);
+    // Failed does not flip iteration outcome to Completed.
+    assert_ne!(outcome, IterationOutcome::Completed);
+    assert!(!result.completed_task_ids.contains(&claimed.to_string()));
+}
+
+#[test]
+fn short_completed_tag_rewrites_to_claimed_and_completes() {
+    let (db_temp, mut conn) = setup_migrated_db();
+    disable_llm_extraction();
+    let claimed = "aaaaaaaa-REFACTOR-001";
+    insert_todo_task(&conn, claimed);
+
+    let mut outcome = IterationOutcome::Empty;
+    let mut fx = PipelineFixture::new(db_temp.path());
+    let output = "<completed>REFACTOR-001</completed>\n";
+    let result = process_iteration_output(ProcessingParams {
+        conn: &mut conn,
+        run_id: "test-run",
+        iteration: 1,
+        task_id: Some(claimed),
+        output,
+        conversation: None,
+        shown_learning_ids: &[],
+        outcome: &mut outcome,
+        working_root: fx.project.path(),
+        git_scan_depth: 5,
+        skip_git_completion_detection: true,
+        prd_path: &fx.prd_path,
+        task_prefix: Some("aaaaaaaa"),
+        progress_path: &fx.progress_path,
+        db_dir: &fx.db_dir,
+        signal_flag: &fx.signal_flag,
+        ctx: &mut fx.ctx,
+        files_modified: &[],
+        effective_model: None,
+        effective_effort: None,
+        effective_runner: None,
+        slot_index: None,
+    });
+
+    assert_eq!(
+        task_status(&conn, claimed),
+        "done",
+        "short <completed>REFACTOR-001</completed> must mark full claimed id done"
+    );
+    assert_eq!(outcome, IterationOutcome::Completed);
+    assert!(
+        result.completed_task_ids.contains(&claimed.to_string()),
+        "completed_task_ids must contain full claimed id; got {:?}",
+        result.completed_task_ids,
+    );
+}
+
+#[test]
+fn task_id_none_leaves_bare_status_exact_id_only() {
+    // Failure mode: without a claimed task_id, rewrite does not run —
+    // bare REFACTOR-001 stays exact-id-only and cannot complete a prefixed row.
+    let (db_temp, mut conn) = setup_migrated_db();
+    disable_llm_extraction();
+    let claimed = "aaaaaaaa-REFACTOR-001";
+    insert_todo_task(&conn, claimed);
+
+    let mut outcome = IterationOutcome::Empty;
+    let mut fx = PipelineFixture::new(db_temp.path());
+    let output = "<task-status>REFACTOR-001:done</task-status>\n";
+    let result = process_iteration_output(ProcessingParams {
+        conn: &mut conn,
+        run_id: "test-run",
+        iteration: 1,
+        task_id: None,
+        output,
+        conversation: None,
+        shown_learning_ids: &[],
+        outcome: &mut outcome,
+        working_root: fx.project.path(),
+        git_scan_depth: 5,
+        skip_git_completion_detection: true,
+        prd_path: &fx.prd_path,
+        task_prefix: Some("aaaaaaaa"),
+        progress_path: &fx.progress_path,
+        db_dir: &fx.db_dir,
+        signal_flag: &fx.signal_flag,
+        ctx: &mut fx.ctx,
+        files_modified: &[],
+        effective_model: None,
+        effective_effort: None,
+        effective_runner: None,
+        slot_index: None,
+    });
+
+    assert_eq!(
+        task_status(&conn, claimed),
+        "in_progress",
+        "without claimed task_id, bare status tag must not touch the prefixed row"
+    );
+    assert_eq!(result.status_updates_applied, 0);
+    assert_ne!(outcome, IterationOutcome::Completed);
+}
+
+// ---------------------------------------------------------------------------
 // Type-level guards: ProcessingOutcome::default() returns the empty
 // outcome, and `_outcome` constructions compile against the actual
 // signature. These run unconditionally so the file always exercises the

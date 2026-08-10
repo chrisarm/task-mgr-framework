@@ -16,6 +16,8 @@
 
 **Gotcha — stale slot-worktree test binaries after a parallel-slot loop.** The repo's shared cargo target dir (`~/.cargo-target`) caches test binaries keyed independently of which worktree built them. When a parallel-slot loop's `…-slot-N` worktree is pruned at merge-back, fixture-reading test binaries (`cli_tests`, `concurrent`) keep the dead slot's compiled-in `CARGO_MANIFEST_DIR`, so a later `cargo test` (e.g. during `/review-loop`) fails en masse with `Failed to read .../<branch>-slot-N/tests/fixtures/…: No such file or directory`. This is **not** a code regression — the giveaway is that only fixture-reading binaries fail and every error points at the same removed `-slot-N` path. Fix: force a recompile in the current worktree (`touch tests/<binary>.rs` then re-run). Rebuild before concluding a parallel-slot loop introduced test failures. (learning #4753)
 
+**Gotcha — bare `<task-status>` / `<completed>` ids vs claimed PRD-prefixed ids.** Agents often emit `REFACTOR-001:done` while the claim is `97be64d7-REFACTOR-001`. The shared pipeline (`process_iteration_output`) rewrites **claim-matching** bare tags only (identity → prefix-strip → 8-hex body); peers and `task_id: None` stay exact-id. Lifecycle never learns short ids; never reintroduce `ends_with`-only matching (false positive on `001`). See `src/loop_engine/CLAUDE.md` "Iteration pipeline (shared)".
+
 ## Subsystem design notes
 
 Module-level CLAUDE.md files (auto-loaded when files in the module are read):

@@ -23,6 +23,75 @@ pub(crate) fn strip_task_prefix<'a>(task_id: &'a str, prefix: Option<&str>) -> &
     }
 }
 
+/// Strip a standard 8-lowercase-hex PRD prefix (`[0-9a-f]{8}-`) from a task id.
+///
+/// Mirrors the private `model::strip_prd_prefix` rule without coupling to
+/// `model.rs`. Only exactly 8 lowercase hex chars followed by `-` are stripped
+/// — never a generic first-dash split (would corrupt `REFACTOR-…` ids).
+///
+/// Returns the body after the prefix, or `id` unchanged when no valid prefix.
+fn strip_8hex_prd_prefix(id: &str) -> &str {
+    if id.len() > 9
+        && id.as_bytes()[8] == b'-'
+        && id[..8]
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        &id[9..]
+    } else {
+        id
+    }
+}
+
+/// True when `tag_id` names this iteration's claimed task (full id, prefix-
+/// stripped bare form, or body after a standard 8-hex PRD prefix).
+///
+/// Match order (first hit wins):
+/// 1. Identity: `tag_id == claimed_id`
+/// 2. Explicit prefix strip: `strip_task_prefix(claimed, task_prefix)` is a
+///    real strip (`bare != claimed`) and `tag_id == bare`
+/// 3. 8-hex fallback: claimed has `[0-9a-f]{8}-…` and the body equals `tag_id`
+///    (covers missing/wrong `task_prefix` on production ids)
+///
+/// Never uses unrestricted `ends_with` / substring matching — e.g. tag `"001"`
+/// must not match claim `"97be64d7-REFACTOR-001"`.
+pub(crate) fn tag_id_refers_to_claimed(
+    tag_id: &str,
+    claimed_id: &str,
+    task_prefix: Option<&str>,
+) -> bool {
+    // (a) Identity
+    if tag_id == claimed_id {
+        return true;
+    }
+
+    // (b) Explicit prefix strip — only when strip actually removes something
+    let bare = strip_task_prefix(claimed_id, task_prefix);
+    if bare != claimed_id && tag_id == bare {
+        return true;
+    }
+
+    // (c) 8-hex PRD prefix fallback (handles missing/wrong task_prefix)
+    let body = strip_8hex_prd_prefix(claimed_id);
+    body != claimed_id && tag_id == body
+}
+
+/// Resolve a status-tag id to the full claimed id when it refers to this
+/// claim; otherwise return `tag_id` unchanged (identity on non-match).
+///
+/// Pure string helper — no DB lookup. Pipeline owns the rewrite loop.
+pub(crate) fn resolve_tag_id_to_claimed<'a>(
+    tag_id: &'a str,
+    claimed_id: &'a str,
+    task_prefix: Option<&str>,
+) -> &'a str {
+    if tag_id_refers_to_claimed(tag_id, claimed_id, task_prefix) {
+        claimed_id
+    } else {
+        tag_id
+    }
+}
+
 /// Parse `<completed>TASK-ID</completed>` tags from Claude's output.
 ///
 /// Returns a vec of full task IDs found. Multiple tags per iteration are supported.
@@ -134,6 +203,141 @@ mod tests {
         assert_eq!(
             strip_task_prefix("OTHER-FIX-001", Some("aeb10a1f")),
             "OTHER-FIX-001"
+        );
+    }
+
+    // --- tag_id_refers_to_claimed / resolve_tag_id_to_claimed ---
+    // Table rows from FEAT-001 acceptance criteria. Known-bad: ends_with-only
+    // implementations must FAIL the '001' negative test.
+
+    #[test]
+    fn resolve_bare_story_with_matching_prefix_to_full_claim() {
+        // Positive: resolve('REFACTOR-001', '97be64d7-REFACTOR-001', Some('97be64d7')) → full
+        let claimed = "97be64d7-REFACTOR-001";
+        assert!(tag_id_refers_to_claimed(
+            "REFACTOR-001",
+            claimed,
+            Some("97be64d7")
+        ));
+        assert_eq!(
+            resolve_tag_id_to_claimed("REFACTOR-001", claimed, Some("97be64d7")),
+            claimed
+        );
+    }
+
+    #[test]
+    fn resolve_full_id_identity() {
+        // Positive: resolve(full, full, Some(prefix)) → full (identity)
+        let claimed = "97be64d7-REFACTOR-001";
+        assert!(tag_id_refers_to_claimed(claimed, claimed, Some("97be64d7")));
+        assert_eq!(
+            resolve_tag_id_to_claimed(claimed, claimed, Some("97be64d7")),
+            claimed
+        );
+    }
+
+    #[test]
+    fn resolve_bare_story_via_8hex_fallback_when_prefix_none() {
+        // Positive: resolve('REFACTOR-001', '97be64d7-REFACTOR-001', None) → full via 8-hex
+        let claimed = "97be64d7-REFACTOR-001";
+        assert!(tag_id_refers_to_claimed("REFACTOR-001", claimed, None));
+        assert_eq!(
+            resolve_tag_id_to_claimed("REFACTOR-001", claimed, None),
+            claimed
+        );
+    }
+
+    #[test]
+    fn resolve_bare_equals_claimed_identity() {
+        // Positive: resolve('REFACTOR-001', 'REFACTOR-001', None) → identity
+        assert!(tag_id_refers_to_claimed(
+            "REFACTOR-001",
+            "REFACTOR-001",
+            None
+        ));
+        assert_eq!(
+            resolve_tag_id_to_claimed("REFACTOR-001", "REFACTOR-001", None),
+            "REFACTOR-001"
+        );
+    }
+
+    #[test]
+    fn resolve_other_story_unchanged() {
+        // Negative: resolve('OTHER-001', '97be64d7-REFACTOR-001', Some('97be64d7')) → OTHER-001
+        let claimed = "97be64d7-REFACTOR-001";
+        assert!(!tag_id_refers_to_claimed(
+            "OTHER-001",
+            claimed,
+            Some("97be64d7")
+        ));
+        assert_eq!(
+            resolve_tag_id_to_claimed("OTHER-001", claimed, Some("97be64d7")),
+            "OTHER-001"
+        );
+    }
+
+    #[test]
+    fn resolve_partial_suffix_001_unchanged_no_loose_ends_with() {
+        // Negative (Known-bad guard): resolve('001', full, Some(prefix)) → '001' unchanged.
+        // An implementation using claimed.ends_with(tag_id) alone would FAIL this.
+        let claimed = "97be64d7-REFACTOR-001";
+        assert!(!tag_id_refers_to_claimed("001", claimed, Some("97be64d7")));
+        assert_eq!(
+            resolve_tag_id_to_claimed("001", claimed, Some("97be64d7")),
+            "001"
+        );
+        // Also guard pure ends_with would have matched:
+        assert!(
+            claimed.ends_with("001"),
+            "precondition: ends_with alone would falsely match"
+        );
+    }
+
+    #[test]
+    fn resolve_non_hex_custom_prefix_without_task_prefix_no_rewrite() {
+        // Negative: resolve('FEAT-001', 'P5.1-FEAT-001', None) → FEAT-001 unchanged
+        // (non-hex custom prefix + no task_prefix → 8-hex fallback does not apply)
+        let claimed = "P5.1-FEAT-001";
+        assert!(!tag_id_refers_to_claimed("FEAT-001", claimed, None));
+        assert_eq!(
+            resolve_tag_id_to_claimed("FEAT-001", claimed, None),
+            "FEAT-001"
+        );
+    }
+
+    #[test]
+    fn resolve_bare_story_via_8hex_when_task_prefix_wrong() {
+        // Positive: resolve('REFACTOR-001', full, Some('wrongpfx')) → full via 8-hex fallback
+        let claimed = "97be64d7-REFACTOR-001";
+        assert!(tag_id_refers_to_claimed(
+            "REFACTOR-001",
+            claimed,
+            Some("wrongpfx")
+        ));
+        assert_eq!(
+            resolve_tag_id_to_claimed("REFACTOR-001", claimed, Some("wrongpfx")),
+            claimed
+        );
+    }
+
+    #[test]
+    fn resolve_identity_when_no_strip_and_no_8hex() {
+        // Failure mode: strip returns claimed unchanged and 8-hex does not apply → identity, no panic
+        let claimed = "P5.1-FEAT-001";
+        assert!(!tag_id_refers_to_claimed(
+            "OTHER-001",
+            claimed,
+            Some("wrong")
+        ));
+        assert_eq!(
+            resolve_tag_id_to_claimed("OTHER-001", claimed, Some("wrong")),
+            "OTHER-001"
+        );
+        // bare claimed with wrong tag
+        assert!(!tag_id_refers_to_claimed("OTHER-001", "FEAT-001", None));
+        assert_eq!(
+            resolve_tag_id_to_claimed("OTHER-001", "FEAT-001", None),
+            "OTHER-001"
         );
     }
 

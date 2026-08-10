@@ -28,7 +28,8 @@
 //!    `tm-decisions` review.
 //! 3. `<task-status>` tag dispatch via `engine::apply_status_updates` —
 //!    routes `done`/`failed`/`skipped`/`irrelevant`/`blocked` updates through
-//!    the `task-mgr` CLI.
+//!    the `task-mgr` CLI. Before dispatch, claim-matching bare ids are rewritten
+//!    to the full claimed task id (all status keywords; peer bare ids untouched).
 //! 4. Completion ladder (first hit wins):
 //!    `<task-status>:done` → `<completed>` tag → git commit detection (gated
 //!    on `skip_git_completion_detection`) → output scan
@@ -79,7 +80,9 @@ use crate::loop_engine::engine::apply_status_updates;
 use crate::loop_engine::feedback;
 use crate::loop_engine::git_reconcile::check_git_for_task_completion;
 use crate::loop_engine::model::Provider;
-use crate::loop_engine::output_parsing::{parse_completed_tasks, scan_output_for_completed_tasks};
+use crate::loop_engine::output_parsing::{
+    parse_completed_tasks, resolve_tag_id_to_claimed, scan_output_for_completed_tasks,
+};
 use crate::loop_engine::prd_reconcile::{mark_task_done, update_prd_task_passes};
 use crate::loop_engine::progress;
 use crate::loop_engine::runner::RunnerKind;
@@ -268,7 +271,25 @@ pub fn process_iteration_output(params: ProcessingParams<'_>) -> ProcessingOutco
     }
 
     // Step 3: side-band `<task-status>` dispatch.
-    let status_updates = detection::extract_status_updates(output);
+    //
+    // Claim-scoped short-id rewrite (FEAT-002): agents often emit bare story
+    // ids (`REFACTOR-001:done`) while the loop claimed the PRD-prefixed DB id.
+    // Rewrite ONLY tags that refer to this iteration's claim so lifecycle
+    // exact-id dispatch succeeds. Peer bare ids are left alone (Learning 2188).
+    // When `task_id` is None, behavior remains exact-id-only (no rewrite).
+    let mut status_updates = detection::extract_status_updates(output);
+    if let Some(claimed) = task_id {
+        for update in &mut status_updates {
+            let resolved = resolve_tag_id_to_claimed(&update.task_id, claimed, task_prefix);
+            if resolved != update.task_id.as_str() {
+                ui::emit(&format!(
+                    "Note: resolved short task-status id {} → {} (claimed this iteration)",
+                    update.task_id, claimed
+                ));
+                update.task_id = claimed.to_string();
+            }
+        }
+    }
     // FEAT-010: `apply_status_updates` is a deprecated shim around
     // `TaskLifecycle::apply`; this call site is documented in the prompt
     // ("Common Wiring Failures") and stays during the Phase 1 migration.
@@ -332,8 +353,18 @@ pub fn process_iteration_output(params: ProcessingParams<'_>) -> ProcessingOutco
 
         // 4b: <completed> tags. Multiple tags may complete cross-task IDs
         // (peer tasks Claude finished alongside the claimed one).
+        // Claim-scoped short-id rewrite mirrors Step 3 so bare
+        // `<completed>REFACTOR-001</completed>` marks the full claimed id done.
         let completed_tags = parse_completed_tasks(output);
-        for completed_id in &completed_tags {
+        for completed_id_raw in &completed_tags {
+            let resolved = resolve_tag_id_to_claimed(completed_id_raw, claimed_id, task_prefix);
+            if resolved != completed_id_raw.as_str() {
+                ui::emit(&format!(
+                    "Note: resolved short completed id {} → {} (claimed this iteration)",
+                    completed_id_raw, claimed_id
+                ));
+            }
+            let completed_id = resolved;
             match mark_task_done(
                 conn,
                 completed_id,

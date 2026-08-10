@@ -28,3 +28,30 @@ Operators who set `LOOP_USAGE_CHECK_ENABLED=false` should know: pre OAuth/usage
 off; post early-lift probe still runs while Claude is enabled.
 
 ---
+
+## Claim-scoped short `<task-status>` id resolve
+
+**Branch**: `feat/claim-short-status-id`
+**PRD**: `tasks/claim-short-status-id.md`
+
+### What shipped
+
+When an agent emits a bare story id in `<task-status>` or `<completed>` that is
+the prefix-stripped form of this iteration's claimed task, the shared
+post-Claude pipeline rewrites it to the full claimed DB id before lifecycle
+dispatch. Short claim-matching tags now complete (or fail/block) the claim
+instead of leaving it stuck `in_progress` until stale recovery re-picks it.
+
+### Why it matters
+
+Production loops were burning iterations on correct work: agents routinely
+omit the 8-hex PRD prefix in status tags, exact-id lifecycle returned Task not
+found, and the claim never flipped to `done`. Seq and wave both pick up the
+fix via a single insertion in `process_iteration_output`.
+
+### Breaking changes
+
+None. Lifecycle remains exact-id SSoT; non-matching bare ids still fail
+dispatch; no global short-id table lookup.
+
+---
