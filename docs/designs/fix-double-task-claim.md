@@ -10,7 +10,7 @@
 Loop iterations sometimes leave **two tasks in `in_progress`** because two independent selectors both claim work:
 
 1. **Engine pin** — `build_prompt` selects and claims a task, then injects it as `## Current Task` in the iteration prompt.
-2. **Prompt step 1** — Generated `*-prompt.md` files (from `/tasks` or `/plan-tasks`) instruct the agent to run `task-mgr next --prefix $PREFIX --claim` as its first action.
+2. **Prompt step 1** — Generated `*-prompt.md` files (from `/prd-tasks` or `/plan-tasks`) instruct the agent to run `task-mgr next --prefix $PREFIX --claim` as its first action.
 
 The agent log states the mismatch plainly: *"task-mgr next is currently pointing at FEAT-007, while your prompt explicitly scoped this turn to FEAT-006."*
 
@@ -42,7 +42,7 @@ Parallel/wave mode uses the same pattern: the wave scheduler selects tasks and `
 
 Generated `*-prompt.md` files from:
 
-- [`.claude/commands/tasks.md`](../../.claude/commands/tasks.md)
+- [`.claude/commands/prd-tasks.md`](../../.claude/commands/prd-tasks.md)
 - [`.claude/commands/plan-tasks.md`](../../.claude/commands/plan-tasks.md)
 
 …instruct step 1:
@@ -130,7 +130,7 @@ Multiple targeted `task-mgr recall --query …` runs (OR syntax not supported by
 
 | ID | Title | Takeaway for plan |
 |----|-------|-------------------|
-| **737** | Mirror documentation across prompt template and skill file | Template edits in `.claude/commands/tasks.md` must be mirrored in generated `tasks/*-prompt.md`. Validates the two-layer approach: engine guard for **existing** prompts + template rewrite for **new** ones. |
+| **737** | Mirror documentation across prompt template and skill file | Template edits in `.claude/commands/prd-tasks.md` must be mirrored in generated `tasks/*-prompt.md`. Validates the two-layer approach: engine guard for **existing** prompts + template rewrite for **new** ones. |
 | **5225** | Mock script robustness requires respecting prompt structure boundaries | `## Current Task` is the canonical task-identity boundary in assembled prompts. Reinforces making it the sole work authority (not `next` output). |
 | **4224** | Use task-mgr CLI exclusively for task operations | After fix, agent should use `task-mgr show <id>` / `<task-status>` — not `next --claim` — consistent with CLI-only workflow. |
 
@@ -189,7 +189,7 @@ Having the prompt call `task-mgr next` **without** `--claim` does not fix the mi
 
 Three mitigations, ordered by salience (see **Placement note** below):
 
-1. **Template rewrite (primary)** — Remove `next --claim` from `/tasks` and `/plan-tasks` generators so new `*-prompt.md` files never instruct claim-as-step-1.
+1. **Template rewrite (primary)** — Remove `next --claim` from `/prd-tasks` and `/plan-tasks` generators so new `*-prompt.md` files never instruct claim-as-step-1.
 2. **Early `task_ops` rule (primary)** — Strong prohibition immediately after `## Current Task`, before the large base prompt.
 3. **Late `pin_authority` guard (safety net)** — Critical section after `base_prompt` overriding stale template text still present in in-flight prompts.
 
@@ -254,7 +254,7 @@ Reasonably out of scope; recovery sweeps (`recover_in_progress_for_prefix`) alre
 
 Wave/parallel (main-thread claim, `pending_reorder_hints`), Codex/Grok/Claude runners (shared prompt builders), recovery/rate-limit/overflow/human CLARIFY/batch — all inherit guard via `build_prompt` / slot roster. No impact on DB lock (`tests/concurrent.rs`), `try_claim` contract, or claim predicates.
 
-Skill embedding: `.claude/commands/tasks.md` + `plan-tasks.md` changes flow via `include_str!` in `src/skills.rs` + manifest-guarded staging on `init` / `loop init` / `batch init`. In-flight loops do **not** need re-init for the engine guard.
+Skill embedding: `.claude/commands/prd-tasks.md` + `plan-tasks.md` changes flow via `include_str!` in `src/skills.rs` + manifest-guarded staging on `init` / `loop init` / `batch init`. In-flight loops do **not** need re-init for the engine guard.
 
 ## Implementation plan
 
@@ -288,7 +288,7 @@ Appears immediately after the task envelope, **before** base prompt — this is 
 
 ### 3. Update prompt templates
 
-In [`.claude/commands/tasks.md`](../../.claude/commands/tasks.md) and [`.claude/commands/plan-tasks.md`](../../.claude/commands/plan-tasks.md):
+In [`.claude/commands/prd-tasks.md`](../../.claude/commands/prd-tasks.md) and [`.claude/commands/plan-tasks.md`](../../.claude/commands/plan-tasks.md):
 
 | Location | Change |
 |----------|--------|
@@ -323,7 +323,7 @@ No change to `next` scoring or claim predicates (per learnings **#3386**, **#343
 | Audience | Action |
 |----------|--------|
 | All active `loop run` / `batch run` | Engine guard applies on binary upgrade + next run — no `*-prompt.md` edit or re-init required |
-| New PRDs | Regenerate via `/tasks` or `/plan-tasks` for cleaner base prompts (primary salience fix) |
+| New PRDs | Regenerate via `/prd-tasks` or `/plan-tasks` for cleaner base prompts (primary salience fix) |
 | Archived / example `tasks/*-prompt.md` | Not bulk-updated; engine guard covers runtime |
 | `scripts/claude-loop.sh` users | **Not protected** by engine guard — must update external `prompt.md` / script manually |
 
@@ -331,7 +331,7 @@ No change to `next` scoring or claim predicates (per learnings **#3386**, **#343
 
 - **New:** `src/loop_engine/prompt_sections/pin_authority.rs`
 - **Edit:** `task_ops.rs`, `sequential.rs`, `slot.rs`, `prompt_sections/mod.rs`
-- **Edit:** `.claude/commands/tasks.md`, `.claude/commands/plan-tasks.md`
+- **Edit:** `.claude/commands/prd-tasks.md`, `.claude/commands/plan-tasks.md`
 - **Test:** snapshot + integration test
 
 ## Out of scope

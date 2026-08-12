@@ -1,12 +1,12 @@
-# /tasks - Convert PRD to Claude Loop Task List
+# /prd-tasks - Convert PRD to Claude Loop Task List
 
 Convert a markdown PRD into JSON task list and prompt file for task-mgr loop execution.
 
 ## Usage
 
 ```
-/tasks tasks/prd-{feature}.md
-/tasks                          # Will prompt for PRD path
+/prd-tasks tasks/prd-{feature}.md
+/prd-tasks                      # Will prompt for PRD path
 ```
 
 ## Instructions
@@ -224,7 +224,7 @@ Use context-appropriate prefixes. Set the `taskType` field on each task to let t
 **Special `taskType` values:**
 
 - `"research"` — For spike/evaluation tasks (e.g., "evaluate 3 libraries, write ADR"). Set `requiresHuman: true` so the loop agent skips it and flags it for human attention. Set `difficulty: "high"` so the loop controller selects a larger model if it does attempt the task.
-- `"contract"` — Design-only task that defines a stable foundational abstraction, interface, data shape or error model used by 2+ downstream FEAT/FIX tasks. The agent produces precise signatures + edge cases + invariants + known-bad discriminators + rationale, records the full contract in the progress log, and emits no production code. Later tasks list it in `dependsOn`. Use only when the decision has clear multi-story ramifications (see `/spike` and `/tasks` guidance on when to emit one).
+- `"contract"` — Design-only task that defines a stable foundational abstraction, interface, data shape or error model used by 2+ downstream FEAT/FIX tasks. The agent produces precise signatures + edge cases + invariants + known-bad discriminators + rationale, records the full contract in the progress log, and emits no production code. Later tasks list it in `dependsOn`. Use only when the decision has clear multi-story ramifications (see `/spike` and `/prd-tasks` guidance on when to emit one).
 - `"milestone"` — Agent behavior: review completed work, update remaining tasks, check sibling PRDs.
 - `"review"` — Agent behavior: read and analyze code, spawn fix tasks, don't implement.
 - `"verification"` — Agent behavior: run full test suite, verify integration, update docs.
@@ -913,7 +913,7 @@ Every task list follows a lean phased structure. The table below is the spine fo
 
 ### Notes that don't fit in the table
 
-- **CONTRACT-xxx** (optional, early) — Use only when a design decision (abstraction, interface, data shape, error model, ownership) has clear ramifications on 2+ downstream stories. The task is design-only. Its acceptance criteria focus on precision, known-bad discriminators, alternatives considered, and an explicit "Downstream Impact" list. The full contract text must be recorded in the progress log so dependents can read it. Produced by `/spike` or by the person running `/tasks` when the PRD identifies the need. See the `CONTRACT-xxx` template below.
+- **CONTRACT-xxx** (optional, early) — Use only when a design decision (abstraction, interface, data shape, error model, ownership) has clear ramifications on 2+ downstream stories. The task is design-only. Its acceptance criteria focus on precision, known-bad discriminators, alternatives considered, and an explicit "Downstream Impact" list. The full contract text must be recorded in the progress log so dependents can read it. Produced by `/spike` or by the person running `/prd-tasks` when the PRD identifies the need. See the `CONTRACT-xxx` template below.
 
 - **ANALYSIS-xxx** (opt-in) — Only for behavior-modifying changes that span >2 top-level directories *or* when the PRD/spike author explicitly requests it (set `requiresConsumerAnalysis: true` or create the task manually). For small localized changes, document the callers directly in the FEAT task description instead.
 

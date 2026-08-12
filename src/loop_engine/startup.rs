@@ -737,19 +737,28 @@ pub(crate) fn initialize_loop(
                 let halt_threshold = project_config.merge_fail_halt_threshold;
                 // Reconcile auto-recovery (FEAT-005): try to merge stale
                 // ephemerals back into the base branch using the same
-                // preflight + ClaudeMergeResolver path live waves take. Owned
+                // preflight + LlmMergeResolver path live waves take. Owned
                 // strings live for the duration of the reconcile call only;
                 // the synthetic `run_id` is good enough for stash-tag
                 // disambiguation because real run-id allocation is downstream
                 // (Step 12 `run_cmd::begin`). The signal flag is fresh — no
                 // handler has been installed yet at this point in startup, so
                 // SIGINT/SIGTERM during the brief recovery window proceeds via
-                // the spawned Claude's own signal handling.
+                // the spawned provider CLI's own signal handling.
                 let recovery_signal_flag = SignalFlag::new();
-                // The legacy project-level `defaultModel` surface was hard-broken
-                // (REFACTOR-006); the startup merge-back auto-recovery resolver
-                // uses the Sonnet baseline directly.
-                let recovery_model = model::SONNET_MODEL.to_string();
+                // Provider-agnostic plan from the project's models block
+                // (primary + optional fallback, standard tier). Same helper
+                // live waves use so startup and wave merge-back cannot drift.
+                let resolved_models = model::resolve_models_config(
+                    &project_config.models,
+                    &project_config.routing,
+                );
+                let recovery_plan = model::merge_resolver_plan(&resolved_models);
+                // Own model strings for the duration of the reconcile call
+                // (plan borrows from resolved_models which is local).
+                let recovery_primary_model = recovery_plan.primary.model.map(str::to_string);
+                let recovery_fallback_model =
+                    recovery_plan.fallback.and_then(|f| f.model.map(str::to_string));
                 let recovery_effort = project_config
                     .merge_resolver_effort
                     .clone()
@@ -760,11 +769,15 @@ pub(crate) fn initialize_loop(
                 // slot's progress into slot 0 before its branch is deleted.
                 let recovery_progress_fname = branch::progress_file_name(task_prefix.as_deref());
                 let recovery_cfg = worktree::AutoRecoveryConfig {
-                    model: recovery_model.as_str(),
+                    primary_provider: recovery_plan.primary.provider,
+                    primary_model: recovery_primary_model.as_deref(),
+                    fallback_provider: recovery_plan.fallback.map(|f| f.provider),
+                    fallback_model: recovery_fallback_model.as_deref(),
                     effort: recovery_effort.as_str(),
-                    claude_timeout: recovery_timeout,
+                    timeout: recovery_timeout,
                     signal_flag: recovery_signal_flag.inner(),
                     db_dir: Some(run_config.db_dir.as_path()),
+                    tasks_dir: Some(paths.tasks_dir.as_path()),
                     run_id: "startup-reconcile",
                     stash_limit: project_config.slot_stash_limit,
                     progress_file_name: recovery_progress_fname.as_str(),

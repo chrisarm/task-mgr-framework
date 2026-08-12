@@ -93,7 +93,7 @@ Most efforts actually use *both*. A common pattern:
 
 1. **Plan mode** — Explore the codebase, understand the problem, design the approach
 2. **`/prd`** — Turn your plan into a structured PRD
-3. **`/tasks`** — Convert the PRD into an ordered task list
+3. **`/prd-tasks`** — Convert the PRD into an ordered task list
 4. **`task-mgr loop`** — Let the agent execute unattended
 
 Plan mode is where you think. task-mgr is where you execute.
@@ -252,7 +252,7 @@ This produces a structured PRD markdown file at `tasks/prd-batch-mode.md` with r
 ### Convert a PRD into a task list
 
 ```
-/tasks tasks/prd-batch-mode.md
+/prd-tasks tasks/prd-batch-mode.md
 ```
 
 This produces:

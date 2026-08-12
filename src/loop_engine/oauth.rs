@@ -55,11 +55,29 @@ pub fn credentials_path() -> PathBuf {
 
 /// Read credentials from the credentials file.
 ///
+/// Supports both formats Claude Code has used:
+/// - Nested (current): `{ "claudeAiOauth": { "accessToken", "refreshToken", "expiresAt", ... } }`
+/// - Flat (legacy / tests): `{ "accessToken", "refreshToken", "expiresAt" }`
+///
 /// Returns `None` if the file doesn't exist or can't be parsed.
 /// **Never** logs the file contents.
 pub fn read_credentials(path: &PathBuf) -> Option<Credentials> {
     let content = fs::read_to_string(path).ok()?;
-    serde_json::from_str(&content).ok()
+    let value: serde_json::Value = serde_json::from_str(&content).ok()?;
+    // Prefer nested Claude Code shape; fall back to flat for older layouts/tests.
+    if let Some(nested) = value.get("claudeAiOauth")
+        && let Some(creds) = credentials_from_value(nested)
+    {
+        return Some(creds);
+    }
+    credentials_from_value(&value)
+}
+
+/// Parse a `Credentials` object from a JSON value using camelCase field names.
+/// Unknown sibling keys are ignored by serde (forward-compatible with Claude
+/// Code metadata such as `scopes` / `subscriptionType`).
+fn credentials_from_value(value: &serde_json::Value) -> Option<Credentials> {
+    serde_json::from_value(value.clone()).ok()
 }
 
 /// Check if the token expires within the given buffer (in minutes).
@@ -154,10 +172,14 @@ pub fn ensure_valid_token() -> TokenResult {
 
 /// Write credentials atomically using tempfile + rename.
 ///
+/// When the existing file uses the nested `claudeAiOauth` shape (Claude Code's
+/// current layout), only the token fields under that object are updated — sibling
+/// keys (`mcpOAuth`, scopes, subscription metadata, …) are preserved. Flat files
+/// (legacy / tests) are rewritten as a flat `Credentials` object.
+///
 /// Sets file permissions to 600 (owner read/write only) on Unix.
 fn write_credentials_atomic(path: &PathBuf, creds: &Credentials) -> Result<(), String> {
-    let json = serde_json::to_string_pretty(creds)
-        .map_err(|e| format!("Failed to serialize credentials: {}", e))?;
+    let json = serialize_credentials_for_write(path, creds)?;
 
     let parent = path
         .parent()
@@ -185,6 +207,42 @@ fn write_credentials_atomic(path: &PathBuf, creds: &Credentials) -> Result<(), S
         .map_err(|e| format!("Failed to atomically update credentials file: {}", e))?;
 
     Ok(())
+}
+
+/// Build the on-disk JSON for a credentials write, preserving nested layout
+/// when present. Pure (aside from reading `path`); extracted for unit tests.
+fn serialize_credentials_for_write(path: &PathBuf, creds: &Credentials) -> Result<String, String> {
+    let existing = fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+
+    let root = match existing {
+        Some(mut value) if value.get("claudeAiOauth").is_some() => {
+            // In-place update of nested OAuth block — keep mcpOAuth etc.
+            if let Some(oauth) = value.get_mut("claudeAiOauth")
+                && let Some(obj) = oauth.as_object_mut()
+            {
+                obj.insert(
+                    "accessToken".to_string(),
+                    serde_json::Value::String(creds.access_token.clone()),
+                );
+                obj.insert(
+                    "refreshToken".to_string(),
+                    serde_json::Value::String(creds.refresh_token.clone()),
+                );
+                obj.insert(
+                    "expiresAt".to_string(),
+                    serde_json::Value::Number(creds.expires_at.into()),
+                );
+            }
+            value
+        }
+        _ => serde_json::to_value(creds)
+            .map_err(|e| format!("Failed to serialize credentials: {}", e))?,
+    };
+
+    serde_json::to_string_pretty(&root)
+        .map_err(|e| format!("Failed to serialize credentials: {}", e))
 }
 
 /// Sanitize OAuth error messages to ensure tokens are not leaked.
@@ -221,6 +279,76 @@ mod tests {
         assert_eq!(c.access_token, "test-token-123");
         assert_eq!(c.refresh_token, "refresh-token-456");
         assert_eq!(c.expires_at, 1700000000000);
+    }
+
+    #[test]
+    fn test_read_credentials_nested_claude_ai_oauth() {
+        // Claude Code's current on-disk shape nests tokens under claudeAiOauth
+        // alongside mcpOAuth and other sibling keys.
+        let temp_dir = TempDir::new().unwrap();
+        let creds_path = temp_dir.path().join("creds.json");
+
+        let json = r#"{
+            "mcpOAuth": { "someServer": { "accessToken": "mcp-tok" } },
+            "claudeAiOauth": {
+                "accessToken": "nested-access",
+                "refreshToken": "nested-refresh",
+                "expiresAt": 1800000000000,
+                "scopes": ["user:inference"],
+                "subscriptionType": "max"
+            }
+        }"#;
+        fs::write(&creds_path, json).unwrap();
+
+        let path = PathBuf::from(&creds_path);
+        let creds = read_credentials(&path).expect("nested claudeAiOauth must parse");
+        assert_eq!(creds.access_token, "nested-access");
+        assert_eq!(creds.refresh_token, "nested-refresh");
+        assert_eq!(creds.expires_at, 1800000000000);
+    }
+
+    #[test]
+    fn test_write_credentials_preserves_nested_siblings() {
+        let temp_dir = TempDir::new().unwrap();
+        let creds_path = temp_dir.path().join("creds.json");
+
+        let original = r#"{
+            "mcpOAuth": { "srv": { "accessToken": "keep-me" } },
+            "claudeAiOauth": {
+                "accessToken": "old-access",
+                "refreshToken": "old-refresh",
+                "expiresAt": 1000,
+                "subscriptionType": "max"
+            }
+        }"#;
+        fs::write(&creds_path, original).unwrap();
+
+        let updated = Credentials {
+            access_token: "new-access".to_string(),
+            refresh_token: "new-refresh".to_string(),
+            expires_at: 9999,
+        };
+        let json = serialize_credentials_for_write(&creds_path, &updated).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(
+            value["claudeAiOauth"]["accessToken"].as_str(),
+            Some("new-access")
+        );
+        assert_eq!(
+            value["claudeAiOauth"]["refreshToken"].as_str(),
+            Some("new-refresh")
+        );
+        assert_eq!(value["claudeAiOauth"]["expiresAt"].as_u64(), Some(9999));
+        // Sibling keys and nested metadata must survive the write.
+        assert_eq!(
+            value["mcpOAuth"]["srv"]["accessToken"].as_str(),
+            Some("keep-me")
+        );
+        assert_eq!(
+            value["claudeAiOauth"]["subscriptionType"].as_str(),
+            Some("max")
+        );
     }
 
     #[test]

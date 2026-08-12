@@ -185,7 +185,7 @@ Decision tree based on findings:
 
 - **Worktree not found** → ask the user for the path.
 - **No commits in worktree** → warn that the loop may not have completed; do not proceed.
-- **`tasks/<feature>.json` missing** → tell the user the PRD hasn't been through `/tasks`.
+- **`tasks/<feature>.json` missing** → tell the user the PRD hasn't been through `/prd-tasks`.
 - **Code-review subagent timeout** → report what completed; recommend adding `/compound` to the fix plan or follow-up tasks.
 - **Push to main rejected ("changes must come through a PR")** → you committed to the wrong branch. The compound/fix commit landed on local `main` instead of `$WORKTREE`. Recover by: (a) cherry-pick the commit onto the worktree branch via `git -C "$WORKTREE" cherry-pick <hash>`, (b) push the worktree branch, (c) reset local main via `git reset --keep origin/main`. Then audit: re-read the "Where commits and edits land" section above to make sure the next run uses `cd "$WORKTREE"` + `git -C "$WORKTREE"` + `$WORKTREE/`-prefixed Edit paths from the start.
 - **Edit/Write targeted the main repo by mistake** (file_path started with the main-repo path, not `$WORKTREE/`) → the change is now on the wrong working tree. Recover by: (a) capture the diff via `git -C <main-repo> diff -- <path>`, (b) revert in the main repo (`git -C <main-repo> restore <path>`), (c) re-apply the same edit with `file_path = $WORKTREE/<path>`, (d) commit in the worktree.

@@ -26,7 +26,7 @@ The first three phases — plan, work, review — produce a feature. The compoun
 
 If either is missing, tell the user and stop — `/compound` depends on their outputs.
 
-## Context Economy (same rules as `/tasks`)
+## Context Economy (same rules as `/prd-tasks`)
 
 - **Never Read `tasks/*.json`** — use `jq` for specific fields.
 - **The progress log is the ONE exception to the tail rule** — compound needs the full arc of the PRD to extract patterns, so read the file in its entirety. It's bounded to this PRD.
@@ -408,7 +408,7 @@ When that PRD ships, **update `/compound` iter 2** to replace iter-1 fallbacks w
 ## Error handling
 
 - PRD filename not given → prompt user.
-- Task JSON missing → tell user the PRD hasn't been through `/tasks` yet.
+- Task JSON missing → tell user the PRD hasn't been through `/prd-tasks` yet.
 - Progress file missing → tell user the loop hasn't run.
 - Code review not in progress log → tell user to run `/review-loop` first.
 - Any verify failure → report but do not retry automatically; the human decides.

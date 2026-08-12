@@ -45,7 +45,7 @@ that met the threshold — never per-PRD.
 3. `prd-{stem}.md`
 4. `{stem}-prompt.md` (plan-tasks legacy fallback)
 
-`/plan-tasks` should emit `{feature}.md` + set `"prdFile"`; `/tasks` should
+`/plan-tasks` should emit `{feature}.md` + set `"prdFile"`; `/prd-tasks` should
 set `"prdFile"` to the source PRD basename so resolution is explicit.
 
 **Pending-review receipt**: when gates would fire, always write
@@ -232,7 +232,7 @@ Only two kinds of post-Claude work are deliberately left at the
 - **pause-signal handling** — owns the signal-flag / `.stop` polling the
   per-iteration reactions do not carry.
 - **slot merge resolution** (`worktree::merge_slot_branches_with_resolver`,
-  `merge_resolver::ClaudeMergeResolver`) — requires the slot-0 merge worktree
+  `merge_resolver::LlmMergeResolver`) — requires the slot-0 merge worktree
   state owned by `run_wave_iteration`, not a per-iteration post-Claude concern
   (see "Slot merge-back conflict resolution").
 
@@ -692,14 +692,23 @@ regardless of status, so an archived row would otherwise mis-classify the drain
 When parallel-slot waves finish, `merge_slot_branches_with_resolver` (in
 `src/loop_engine/worktree.rs`) runs `git merge --no-edit` from slot 0 for each ephemeral
 slot branch. On a non-zero exit it lists the conflicted files and invokes a `MergeResolver`
-(callback seam, `pub(crate) trait`); the engine wires `ClaudeMergeResolver` from
-`src/loop_engine/merge_resolver.rs`, which spawns Claude in slot 0's already-conflicted
-worktree (`PermissionMode::Auto`, `working_dir = slot0_path`, 600s timeout) with a prompt
-that explicitly prohibits push, branch deletion, hard reset outside the merge, and history
-rewrites. The resolver's `Resolved` claim is **never trusted**: the caller re-inspects
-MERGE_HEAD and HEAD post-spawn and downgrades a lying resolver to `failed_slots` with a
-forced `git reset --hard pre_merge_head`. `SlotFailureKind::ResolverAttempted` vs
-`PreResolver` lets engine.rs pick the right warning text without string-sniffing.
+(callback seam, `pub(crate) trait`); the engine wires `LlmMergeResolver` from
+`src/loop_engine/merge_resolver.rs`, which dispatches via `runner::dispatch` to the
+**primary provider** from `models.primaryProvider` (standard-tier model from
+`merge_resolver_plan`) in slot 0's already-conflicted worktree
+(`PermissionMode::Auto`, `working_dir = slot0_path`, timeout/effort from
+`mergeResolverTimeoutSecs` / `mergeResolverEffort`). On any
+`MergeResolverOutcome::Failed` (spawn/auth/timeout/incomplete), a **one-shot**
+fallback to `models.providers.<primary>.fallback` is attempted when that target
+is enabled and distinct — `Resolved` and `Aborted` never fall through.
+`DisallowedTools` is set when the runner supports it (Claude/Grok); Codex omits
+it and takes a `protected_state` snapshot instead. The prompt explicitly
+prohibits push, branch deletion, hard reset outside the merge, and history
+rewrites. The resolver's `Resolved` claim is **never trusted**: the caller
+re-inspects MERGE_HEAD and HEAD post-spawn and downgrades a lying resolver to
+`failed_slots` with a forced `git reset --hard pre_merge_head`.
+`SlotFailureKind::ResolverAttempted` vs `PreResolver` lets engine.rs pick the
+right warning text without string-sniffing.
 
 Note: merge resolution is intentionally NOT part of the shared
 `iteration_pipeline` (see "Iteration pipeline (shared)" above) — it requires
@@ -713,7 +722,7 @@ source of slot-0 dirtiness — slot 1 commits to it on every wave iteration —
 and git's merge precondition aborts when slot 0 has uncommitted local
 changes to a file the incoming merge would touch (`"Your local changes to
 the following files would be overwritten by merge"`, non-zero exit with **no
-conflict markers**). The `ClaudeMergeResolver` then correctly short-circuits
+conflict markers**). The `LlmMergeResolver` then correctly short-circuits
 because there's nothing to act on, and the slot's commits get stranded.
 `task-mgr init` writes/refreshes a managed marker-block in `.gitignore`
 covering `tasks/progress-*.txt` and runs a one-time `git rm --cached`
@@ -742,19 +751,19 @@ conflict-handling branch) goes through the same `cleanup_preparation` call.
 No auto-commit — that would pollute base-branch history with `chore(progress)`
 commits. Stash tags include `run_id` so concurrent loops don't poach each
 other's stashes. See `src/loop_engine/worktree.rs::prepare_slot0_for_merge`
-and `cleanup_preparation`. `merge_resolver.rs:278` annotates the
+and `cleanup_preparation`. `LlmMergeResolver::resolve` annotates the
 "no conflicts reported, refusing to spawn" diagnostic with a preflight
 pointer so the next operator who hits a regression knows where to look.
 
 ### Reconcile auto-recovery (FEAT-005, slot-merge-preflight PRD)
 
 `reconcile_stale_ephemeral_slots` now accepts an optional
-`AutoRecoveryConfig` (model / effort / claude_timeout / signal_flag /
-db_dir / run_id / stash_limit). When `Some`, the function attempts an
-automatic merge-back of each `CleanUnmerged` stale ephemeral at loop
-startup using the same preflight + `ClaudeMergeResolver` path live waves
-take — `prepare_slot0_for_merge` → `git merge --no-edit` →
-`ClaudeMergeResolver` on conflict → `cleanup_preparation` → `git worktree
+`AutoRecoveryConfig` (primary/fallback provider+model / effort / timeout /
+signal_flag / db_dir / tasks_dir / run_id / stash_limit). When `Some`, the
+function attempts an automatic merge-back of each `CleanUnmerged` stale
+ephemeral at loop startup using the same preflight + `LlmMergeResolver`
+path live waves take — `prepare_slot0_for_merge` → `git merge --no-edit` →
+`LlmMergeResolver` on conflict → `cleanup_preparation` → `git worktree
 remove` + `git branch -D` on success. `slot0_path` is `project_root`
 because reconcile runs **before** `ensure_slot_worktrees` — slot 0 IS the
 loop's main worktree at startup. Per-branch failures keep the branch in
@@ -767,9 +776,10 @@ still always abort regardless of `auto_recovery` — auto-recovery never
 runs on a worktree that has uncommitted work, by design.
 Test-injection seam: `reconcile_stale_ephemeral_slots_inner` (pub(crate))
 accepts an explicit `&dyn MergeResolver` so unit tests exercise the
-resolver-Failed branch without spawning Claude. Engine wiring lives in
-`src/loop_engine/engine.rs` at the FEAT-005 reconcile call site (Step 9.5)
-— it builds a one-off `AutoRecoveryConfig` from `project_default_model` /
+resolver-Failed branch without spawning an LLM. Engine wiring lives in
+`src/loop_engine/startup.rs` at the FEAT-005 reconcile call site (Step 9.5)
+— it builds a one-off `AutoRecoveryConfig` from
+`merge_resolver_plan(resolve_models_config(...))` +
 `project_config.merge_resolver_effort` / `merge_resolver_timeout_secs` /
 `slot_stash_limit` with a fresh `SignalFlag` and a synthetic
 `"startup-reconcile"` run-id (real run-id allocation happens later in
@@ -1171,7 +1181,7 @@ For the full site→verb audit table and source-allowance matrix see
 | Cross-provider promotion primitive (overflow rung-4) | `src/loop_engine/recovery.rs` | `promote_once`, `PendingPromotion`, `apply_pending_promotion` |
 | Auto-review launch boundary | `src/loop_engine/auto_review.rs` | `maybe_fire`, `maybe_fire_inner`, `ProcessLauncher` |
 | Shared post-Claude pipeline | `src/loop_engine/iteration_pipeline.rs` | `process_iteration_output` |
-| Merge resolver | `src/loop_engine/merge_resolver.rs` | `ClaudeMergeResolver`, `MergeResolver` trait |
+| Merge resolver | `src/loop_engine/merge_resolver.rs` | `LlmMergeResolver`, `MergeResolver` trait |
 | Stash preflight | `src/loop_engine/worktree.rs` | `prepare_slot0_for_merge`, `cleanup_preparation`, `run_slot_merge_attempt` |
 | Post-merge slot reconcile | `src/loop_engine/git_reconcile.rs` | `reconcile_merged_slot_completions` |
 | Wrapper-commit baseline-diff (#8) | `src/loop_engine/git_reconcile.rs` | `capture_status_paths` (single porcelain source), `wrapper_commit`, `wrapper_commit_paths`, `stage_wrapper_commit_paths` (scoped `git add -A -- <path>` only; baseline diff vs pre-iteration dirty set minus `orchestrator_wrapper_exclude_paths` / PRD), `repo_relative_status_path` |

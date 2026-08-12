@@ -40,13 +40,6 @@ pub struct EmbeddedSkill {
     pub content: &'static str,
 }
 
-/// Deprecation banner prepended to the `prd-tasks` alias content. The alias
-/// ships the current `/tasks` skill under the legacy name; the banner is the
-/// only channel through which the deprecation can reach its audience (it lands
-/// in the agent's context when `/prd-tasks` is invoked).
-pub const PRD_TASKS_DEPRECATION_BANNER: &str =
-    "> **Deprecated**: `/prd-tasks` is an alias for `/tasks`; update references to `/tasks`.\n\n";
-
 /// All skill files managed by task-mgr. Adding a `.md` file to
 /// `.claude/commands/` requires adding an entry here — enforced by
 /// `registry_matches_commands_directory`.
@@ -64,6 +57,10 @@ pub const EMBEDDED_SKILLS: &[EmbeddedSkill] = &[
         content: include_str!("../.claude/commands/prd.md"),
     },
     EmbeddedSkill {
+        name: "prd-tasks",
+        content: include_str!("../.claude/commands/prd-tasks.md"),
+    },
+    EmbeddedSkill {
         name: "review-loop",
         content: include_str!("../.claude/commands/review-loop.md"),
     },
@@ -74,10 +71,6 @@ pub const EMBEDDED_SKILLS: &[EmbeddedSkill] = &[
     EmbeddedSkill {
         name: "spike",
         content: include_str!("../.claude/commands/spike.md"),
-    },
-    EmbeddedSkill {
-        name: "tasks",
-        content: include_str!("../.claude/commands/tasks.md"),
     },
     EmbeddedSkill {
         name: "tm-apply",
@@ -107,29 +100,11 @@ pub const EMBEDDED_SKILLS: &[EmbeddedSkill] = &[
         name: "tm-status",
         content: include_str!("../.claude/commands/tm-status.md"),
     },
-    // Deprecated alias for /tasks under its pre-rename name. Keep the banner
-    // literal in sync with PRD_TASKS_DEPRECATION_BANNER (pinned by test).
-    EmbeddedSkill {
-        name: "prd-tasks",
-        content: concat!(
-            "> **Deprecated**: `/prd-tasks` is an alias for `/tasks`; update references to `/tasks`.\n\n",
-            include_str!("../.claude/commands/tasks.md")
-        ),
-    },
 ];
 
-/// Alias entries that exist only as staged files, with no source `.md` of
-/// their own in `.claude/commands/`.
-const ALIAS_NAMES: &[&str] = &["prd-tasks"];
-
-/// Skill names doctor expects in the global commands directory (aliases
-/// excluded — doctor should not demand the deprecated name).
+/// Skill names doctor expects in the global commands directory.
 pub fn expected_skill_names() -> Vec<&'static str> {
-    EMBEDDED_SKILLS
-        .iter()
-        .map(|s| s.name)
-        .filter(|n| !ALIAS_NAMES.contains(n))
-        .collect()
+    EMBEDDED_SKILLS.iter().map(|s| s.name).collect()
 }
 
 /// Embedded content for a registry skill name, if it exists.
@@ -364,11 +339,8 @@ mod tests {
                     .then(|| p.file_stem().unwrap().to_string_lossy().into_owned())
             })
             .collect();
-        let in_registry: BTreeSet<String> = EMBEDDED_SKILLS
-            .iter()
-            .map(|s| s.name.to_string())
-            .filter(|n| !ALIAS_NAMES.contains(&n.as_str()))
-            .collect();
+        let in_registry: BTreeSet<String> =
+            EMBEDDED_SKILLS.iter().map(|s| s.name.to_string()).collect();
         assert_eq!(
             on_disk, in_registry,
             "every .claude/commands/*.md must have an EMBEDDED_SKILLS entry (and vice versa)"
@@ -376,19 +348,10 @@ mod tests {
     }
 
     #[test]
-    fn prd_tasks_alias_is_banner_plus_tasks_content() {
-        let alias = skill("prd-tasks").content;
-        let tasks = skill("tasks").content;
-        assert!(alias.starts_with(PRD_TASKS_DEPRECATION_BANNER));
-        assert_eq!(&alias[PRD_TASKS_DEPRECATION_BANNER.len()..], tasks);
-    }
-
-    #[test]
-    fn expected_names_exclude_alias() {
+    fn expected_names_cover_the_whole_registry() {
         let names = expected_skill_names();
-        assert!(!names.contains(&"prd-tasks"));
-        assert!(names.contains(&"tasks"));
-        assert_eq!(names.len(), EMBEDDED_SKILLS.len() - ALIAS_NAMES.len());
+        assert!(names.contains(&"prd-tasks"));
+        assert_eq!(names.len(), EMBEDDED_SKILLS.len());
     }
 
     #[test]
@@ -508,7 +471,7 @@ mod tests {
         // Manifest was rebuilt for the adopted (current) files:
         let manifest: Manifest =
             serde_json::from_slice(&fs::read(dir.path().join(MANIFEST_FILE)).unwrap()).unwrap();
-        assert!(manifest.skills.contains_key("tasks"));
+        assert!(manifest.skills.contains_key("prd-tasks"));
         assert!(!manifest.skills.contains_key("spike"));
     }
 

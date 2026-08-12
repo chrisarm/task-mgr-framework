@@ -64,9 +64,9 @@ This block is managed by `task-mgr enhance` — edits inside the
 
 ### Recommended planning & PRD flow (2026 update)
 
-- **Default for most work**: short plan-mode interview → `/spike "risky area or multi-impact abstraction"` (when the riskiest assumption or a contract used by 2+ stories is unclear) → `/plan-tasks` (lean) or light `/tasks`.
+- **Default for most work**: short plan-mode interview → `/spike "risky area or multi-impact abstraction"` (when the riskiest assumption or a contract used by 2+ stories is unclear) → `/plan-tasks` (lean) or light `/prd-tasks`.
 - `/spike` owns exploration, thin vertical slice, 2-3 approaches, and (when warranted) emits a `CONTRACT-xxx` task for foundational abstractions.
-- Full `/prd "..."` + heavy `/tasks` is reserved for large cross-subsystem efforts. The expensive design critique now lives in the spike.
+- Full `/prd "..."` + heavy `/prd-tasks` is reserved for large cross-subsystem efforts. The expensive design critique now lives in the spike.
 - PRDs contain a new **2.6 Boundary Contracts & Modularity Targets** section. This is the source for `CONTRACT-xxx` tasks (`taskType: "contract"`).
 - Wire dependents with `--depended-on-by CONTRACT-001` (or the PRD milestone). The contract text lives in the progress log.
 

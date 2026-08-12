@@ -708,8 +708,8 @@ pub(crate) fn reconcile_stale_ephemeral_slots(
 /// Same contract as [`reconcile_stale_ephemeral_slots`] but accepts an explicit
 /// `MergeResolver` injection point for unit tests. When `auto_recovery` is
 /// `Some` and `test_resolver` is `Some`, the injected resolver is used in
-/// place of the production [`crate::loop_engine::merge_resolver::ClaudeMergeResolver`]
-/// — letting tests exercise the resolver-Failed branch without spawning Claude.
+/// place of the production [`crate::loop_engine::merge_resolver::LlmMergeResolver`]
+/// — letting tests exercise the resolver-Failed branch without spawning an LLM.
 /// When `test_resolver` is `None`, behavior is identical to the public function
 /// (production callers always pass `None` for `test_resolver`).
 pub(crate) fn reconcile_stale_ephemeral_slots_inner(
@@ -772,19 +772,31 @@ pub(crate) fn reconcile_stale_ephemeral_slots_inner(
         && !unmerged.is_empty()
     {
         // Build the resolver once for all auto-recovery attempts in this pass.
-        // SignalFlag wraps the Arc so the existing ClaudeMergeResolver API
-        // (which takes `Option<&SignalFlag>`) is satisfied without changing
-        // its public shape.
+        // SignalFlag wraps the Arc so the LlmMergeResolver API (which takes
+        // `Option<&SignalFlag>`) is satisfied without changing its shape.
         let signal_flag =
             crate::loop_engine::signals::SignalFlag::from_arc(cfg.signal_flag.clone());
-        let claude_resolver = crate::loop_engine::merge_resolver::ClaudeMergeResolver {
-            model: cfg.model.to_string(),
-            db_dir: cfg.db_dir,
-            signal_flag: Some(&signal_flag),
-            claude_timeout: cfg.claude_timeout,
-            effort: cfg.effort.to_string(),
+        let plan = crate::loop_engine::model::MergeResolverPlan {
+            primary: crate::loop_engine::model::AuxiliaryLlmPlan {
+                provider: cfg.primary_provider,
+                model: cfg.primary_model,
+            },
+            fallback: cfg.fallback_provider.map(|fb| {
+                crate::loop_engine::model::AuxiliaryLlmPlan {
+                    provider: fb,
+                    model: cfg.fallback_model,
+                }
+            }),
         };
-        let resolver: &dyn MergeResolver = test_resolver.unwrap_or(&claude_resolver);
+        let llm_resolver = crate::loop_engine::merge_resolver::LlmMergeResolver::from_plan(
+            &plan,
+            cfg.effort.to_string(),
+            cfg.timeout,
+            Some(&signal_flag),
+            cfg.db_dir,
+            cfg.tasks_dir,
+        );
+        let resolver: &dyn MergeResolver = test_resolver.unwrap_or(&llm_resolver);
 
         let mut recovered: Vec<String> = Vec::new();
         for (ephemeral, _commits) in &unmerged {
@@ -1163,19 +1175,23 @@ pub(crate) enum CleanupOutcome {
 /// values outlive the call. `signal_flag` is an `Arc<AtomicBool>` rather than a
 /// `&SignalFlag` so callers can pass a flag they've already cloned for other
 /// startup machinery without coupling lifetimes — `SignalFlag::from_arc`
-/// rewraps it for the `ClaudeMergeResolver`.
+/// rewraps it for the `LlmMergeResolver`.
 ///
 /// When `auto_recovery` is `None`, reconcile preserves its pre-FEAT-005
 /// behavior byte-for-byte (warn + abort on stale ephemerals). When `Some`,
 /// reconcile attempts to merge each stale ephemeral back into the base branch
 /// using the same preflight/resolver path as live waves: `prepare_slot0_for_merge`
-/// → `git merge --no-edit` → `ClaudeMergeResolver` on conflict → `cleanup_preparation`.
+/// → `git merge --no-edit` → `LlmMergeResolver` on conflict → `cleanup_preparation`.
 pub(crate) struct AutoRecoveryConfig<'a> {
-    pub model: &'a str,
+    pub primary_provider: crate::loop_engine::model::Provider,
+    pub primary_model: Option<&'a str>,
+    pub fallback_provider: Option<crate::loop_engine::model::Provider>,
+    pub fallback_model: Option<&'a str>,
     pub effort: &'a str,
-    pub claude_timeout: Duration,
+    pub timeout: Duration,
     pub signal_flag: Arc<AtomicBool>,
     pub db_dir: Option<&'a Path>,
+    pub tasks_dir: Option<&'a Path>,
     pub run_id: &'a str,
     pub stash_limit: u32,
     /// Progress file name (`branch::progress_file_name(prefix)`) so a
@@ -1857,7 +1873,7 @@ pub(crate) trait MergeResolver {
 
 /// Test-only resolver that always reports failure. Used by unit tests that
 /// want to exercise the conflict-handling pipeline without spawning Claude;
-/// production callers always wire `ClaudeMergeResolver`.
+/// production callers always wire `LlmMergeResolver`.
 #[cfg(test)]
 pub(crate) struct NoOpResolver;
 
@@ -5681,18 +5697,22 @@ detached
         }
     }
 
-    /// Build a minimal `AutoRecoveryConfig` whose Claude params are inert —
+    /// Build a minimal `AutoRecoveryConfig` whose LLM params are inert —
     /// they're never consumed when callers pass a `test_resolver` via
     /// `reconcile_stale_ephemeral_slots_inner`. The signal_flag is a fresh
     /// (unset) Arc; the run_id is a fixed string so stash tags from the test
     /// don't collide across runs.
     fn make_recovery_cfg<'a>(run_id: &'a str, stash_limit: u32) -> AutoRecoveryConfig<'a> {
         AutoRecoveryConfig {
-            model: "claude-sonnet-test",
+            primary_provider: crate::loop_engine::model::Provider::Claude,
+            primary_model: Some("claude-sonnet-test"),
+            fallback_provider: None,
+            fallback_model: None,
             effort: "medium",
-            claude_timeout: Duration::from_secs(60),
+            timeout: Duration::from_secs(60),
             signal_flag: Arc::new(AtomicBool::new(false)),
             db_dir: None,
+            tasks_dir: None,
             run_id,
             stash_limit,
             progress_file_name: "progress.txt",

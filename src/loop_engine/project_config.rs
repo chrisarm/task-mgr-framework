@@ -708,14 +708,17 @@ pub struct ProjectConfig {
     pub reranker_over_fetch_percent: Option<u32>,
 
     /// Hard cap (seconds) on a single parallel-slot merge-conflict resolution
-    /// Claude run. Defaults to 600 (10 min). Lift for projects with large
-    /// merges; lower for tight feedback loops.
+    /// LLM run (primary or fallback provider). Defaults to 600 (10 min). Lift
+    /// for projects with large merges; lower for tight feedback loops. The
+    /// provider is selected from `models.primaryProvider` with optional
+    /// `providers.<primary>.fallback` — not hard-wired to Claude.
     #[serde(default)]
     pub merge_resolver_timeout_secs: Option<u64>,
 
-    /// `--effort` value passed to Claude when resolving a parallel-slot merge
-    /// conflict. Defaults to `"medium"`. Use `"high"` for cross-cutting
-    /// refactors that conflict on semantic logic.
+    /// Effort level passed to the merge-resolver LLM when the runner supports
+    /// effort (Claude/Grok `--effort`, Codex `model_reasoning_effort`).
+    /// Defaults to `"medium"`. Use `"high"` for cross-cutting refactors that
+    /// conflict on semantic logic.
     #[serde(default)]
     pub merge_resolver_effort: Option<String>,
 

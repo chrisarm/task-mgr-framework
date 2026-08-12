@@ -86,7 +86,7 @@ Now that you have data from the thin slice:
 - Rank the top 2 risks that remain after the experiment.
 
 **Decision output** (one of):
-- A) Proceed with implementation using approach X — hand off to `/plan-tasks` or light `/tasks`.
+- A) Proceed with implementation using approach X — hand off to `/plan-tasks` or light `/prd-tasks`.
 - B) The uncertain part is now clear; the real artifact needed is a `CONTRACT-xxx` for downstream stories — emit the task.
 - C) Kill the idea or radically change scope — document why.
 
@@ -132,7 +132,7 @@ Example minimal `CONTRACT-xxx` JSON shape (adapt from the plan-tasks REVIEW temp
 }
 ```
 
-Then tell the user: "Run `/plan-tasks` (or `/tasks`) next. The generated task list can now include `CONTRACT-001` as an early dependency for the affected FEATs."
+Then tell the user: "Run `/plan-tasks` (or `/prd-tasks`) next. The generated task list can now include `CONTRACT-001` as an early dependency for the affected FEATs."
 
 ### Step 6: Record the Spike Result (Mandatory)
 
@@ -165,11 +165,11 @@ This is what `/compound` will later read to answer "Did we run the experiment we
 
 1. If you emitted a `CONTRACT-xxx`:
    - Run the exact `task-mgr add --stdin` command (or paste the JSON) so the contract task exists in the DB.
-   - Immediately run the task generator for the PRD (`/plan-tasks` preferred for lean work, or light `/tasks`).
+   - Immediately run the task generator for the PRD (`/plan-tasks` preferred for lean work, or light `/prd-tasks`).
    - The generator will automatically see the early CONTRACT task and wire `dependsOn` edges correctly.
 
 2. If no `CONTRACT-xxx` was needed:
-   - Just say: "Ready for `/plan-tasks \"the original description\"` (or `/tasks` for a full PRD). The thin slice + chosen approach + experiment result are recorded above."
+   - Just say: "Ready for `/plan-tasks \"the original description\"` (or `/prd-tasks` for a full PRD). The thin slice + chosen approach + experiment result are recorded above."
 
 Do **not** tell the user to run bare `task-mgr init --from-json` at this point — use the canonical `task-mgr loop init ... --append --update-existing` only if you need to import an existing PRD JSON that doesn’t yet contain the CONTRACT task.
 
@@ -177,7 +177,7 @@ Do **not** tell the user to run bare `task-mgr init --from-json` at this point �
 
 ## Notes for Future Iterations of This Skill
 
-- We may later add structured output (JSON) from `/spike` that can be fed directly into `/plan-tasks` or `/tasks`.
+- We may later add structured output (JSON) from `/spike` that can be fed directly into `/plan-tasks` or `/prd-tasks`.
 - Agent graduation path: if a particular domain produces many high-quality spikes that keep making the same class of discovery, that pattern can graduate into a specialist sub-agent (see `/compound` graduation logic).
 - The "cheapest falsifying experiment" framing should be reused in the PRD and plan-mode templates so the language is consistent across the whole workflow.
 
@@ -192,7 +192,7 @@ For most work above ~4 tasks:
 1. Short plan-mode interview or `/review-plan`.
 2. If anything is risky or will define a contract used by 2+ later pieces → `/spike "..."`.
 3. Spike outcome is either:
-   - "Proceed — thin slice validated approach X" → run `/plan-tasks` (lean) or light `/tasks`.
+   - "Proceed — thin slice validated approach X" → run `/plan-tasks` (lean) or light `/prd-tasks`.
    - "Need stable CONTRACT-xxx first" → the spike emits the `CONTRACT-xxx` task (via `task-mgr add` or JSON for the user). Then run the task generator; it will wire the early dependency.
 4. Implementation proceeds with the lean skeleton (FEATs contain their tests, single final `REVIEW-001` is the milestone).
 5. `/review-loop` + `/compound` now also audit spike fidelity and contract health.

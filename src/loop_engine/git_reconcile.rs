@@ -166,7 +166,7 @@ pub(crate) fn reconcile_external_git_completions(
 /// bounds the range to commits this wave introduced.
 ///
 /// `--no-merges` is **load-bearing**: it excludes merge commits produced by
-/// `ClaudeMergeResolver`, whose `git commit --no-edit` carries merged-in commit
+/// `LlmMergeResolver`, whose `git commit --no-edit` carries merged-in commit
 /// bodies and would otherwise let a resolver merge commit on slot A mark
 /// slot B's task done. Slot agents write single-parent commits; the resolver
 /// writes merge commits.

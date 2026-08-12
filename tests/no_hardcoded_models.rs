@@ -14,7 +14,7 @@
 //!   a runtime path (e.g. `default_grok_provider`), which the Claude-only
 //!   regex used to miss.
 //!
-//! See `src/loop_engine/model.rs` for why; see `.claude/commands/tasks.md`
+//! See `src/loop_engine/model.rs` for why; see `.claude/commands/prd-tasks.md`
 //! and `tests/fixtures/*.json.tmpl` for how other call sites derive from it.
 
 use std::fs;
@@ -79,7 +79,7 @@ fn no_hardcoded_model_strings_outside_model_rs() {
 fn task_generation_docs_do_not_stamp_models_on_feat_tasks() {
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     for rel in [
-        ".claude/commands/tasks.md",
+        ".claude/commands/prd-tasks.md",
         ".claude/commands/plan-tasks.md",
     ] {
         let contents = fs::read_to_string(repo_root.join(rel)).expect("read command doc");

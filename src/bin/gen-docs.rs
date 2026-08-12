@@ -1,4 +1,4 @@
-//! Regenerates the MODELS block in `.claude/commands/tasks.md` from the
+//! Regenerates the MODELS block in `.claude/commands/prd-tasks.md` from the
 //! canonical source-of-truth constants in `src/loop_engine/model.rs`.
 //!
 //! Usage:
@@ -35,7 +35,7 @@ fn main() -> ExitCode {
     };
     let model_rs = root.join("src/loop_engine/model.rs");
     let targets = [
-        root.join(".claude/commands/tasks.md"),
+        root.join(".claude/commands/prd-tasks.md"),
         root.join(".claude/commands/plan-tasks.md"),
     ];
 

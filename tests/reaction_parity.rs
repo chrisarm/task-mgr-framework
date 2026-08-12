@@ -245,6 +245,7 @@ fn wait_once_fires_wait_exactly_once_for_multi_rate_limit_wave() {
         &items,
         &params(db_temp.path(), 600),
         &mut BlackoutState::default(),
+        None, // api_reset_secs — hermetic; production loads via load_usage_info
         &wait as WaitFn,
     );
 
@@ -295,6 +296,7 @@ fn mixed_wave_resets_only_rate_limited_task_and_preserves_completed() {
         &items,
         &params(db_temp.path(), 600),
         &mut BlackoutState::default(),
+        None, // api_reset_secs — hermetic; production loads via load_usage_info
         &wait as WaitFn,
     );
 
@@ -346,6 +348,7 @@ fn rate_limit_output_does_not_trigger_completions_or_learnings() {
         &items,
         &params(db_temp.path(), 600),
         &mut BlackoutState::default(),
+        None, // api_reset_secs — hermetic; production loads via load_usage_info
         &wait as WaitFn,
     );
 
@@ -392,6 +395,7 @@ fn parse_fail_falls_back_to_fallback_wait_and_both_shapes_agree() {
         &seq_items,
         &params(seq_temp.path(), FALLBACK),
         &mut BlackoutState::default(),
+        None,
         &seq_wait as WaitFn,
     );
 
@@ -420,6 +424,7 @@ fn parse_fail_falls_back_to_fallback_wait_and_both_shapes_agree() {
         &wave_items,
         &params(wave_temp.path(), FALLBACK),
         &mut BlackoutState::default(),
+        None,
         &wave_wait as WaitFn,
     );
 
@@ -473,6 +478,7 @@ fn no_rate_limit_returns_none_and_writes_nothing() {
         &items,
         &params(db_temp.path(), 600),
         &mut BlackoutState::default(),
+        None, // api_reset_secs — hermetic; production loads via load_usage_info
         &wait as WaitFn,
     );
 
@@ -518,6 +524,7 @@ fn stop_signal_during_wait_returns_stop() {
         &items,
         &params(db_temp.path(), 600),
         &mut BlackoutState::default(),
+        None, // api_reset_secs — hermetic; production loads via load_usage_info
         &wait as WaitFn,
     );
 
@@ -564,6 +571,7 @@ fn reroute_and_retry_records_blackout_and_skips_wait_both_shapes() {
         &seq_items,
         &seq_params,
         &mut seq_blackout,
+        None,
         &seq_wait as WaitFn,
     );
 
@@ -618,6 +626,7 @@ fn reroute_and_retry_records_blackout_and_skips_wait_both_shapes() {
         &wave_items,
         &wave_params,
         &mut wave_blackout,
+        None,
         &wave_wait as WaitFn,
     );
 
@@ -3613,7 +3622,7 @@ fn known_bad_collapsed_flag_drops_the_probe_on_env_off_claude_on() {
     let spy = IoSeamSpy::new();
     let wait = collapsed_single_flag_wait(&p, &spy);
     let mut blackout = BlackoutState::default();
-    let reaction = react_to_outputs_inner(&mut conn, &items, &p, &mut blackout, &wait);
+    let reaction = react_to_outputs_inner(&mut conn, &items, &p, &mut blackout, None, &wait);
 
     // Same coarse reaction as the correct implementation — which is exactly why
     // asserting only on `AccountReaction` would let the collapse through.

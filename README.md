@@ -391,7 +391,7 @@ task-mgr is designed around a 5-phase iterative workflow that takes you from ide
   Full workflow (large tasks):
   ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐
   │  1. Plan │───▶│  2. PRD  │───▶│ 3. Tasks │───▶│ 4. Build │───▶│ 5. Learn │
-  │          │    │  /prd    │    │  /tasks  │    │          │    │          │
+  │          │    │  /prd    │    │/prd-tasks│    │          │    │          │
   │  Explore │    │  Define  │    │  Break   │    │  Execute │    │  Capture │
   │  & Design│    │  Quality │    │  Down &  │    │  Loop or │    │  Lessons │
   └──────────┘    └──────────┘    │  Sequence│    │  Batch   │    └──────────┘
@@ -416,10 +416,10 @@ This produces a `tasks/prd-{feature}.md` file with quality dimensions, edge case
 
 ### Phase 3: Tasks
 
-The `/tasks` skill converts a PRD into a JSON task list and prompt file for loop execution:
+The `/prd-tasks` skill converts a PRD into a JSON task list and prompt file for loop execution:
 
 ```bash
-/tasks tasks/prd-batch-mode.md
+/prd-tasks tasks/prd-batch-mode.md
 ```
 
 This produces:
@@ -441,7 +441,7 @@ Use `/plan-tasks` when:
 - A reference implementation or existing pattern exists to follow
 - The change is a refactor, enhancement, or bug fix to existing code
 
-Use `/prd` + `/tasks` when:
+Use `/prd` + `/prd-tasks` when:
 - The task is large (7+ files, architectural decisions, multiple phases)
 - Scope is uncertain and needs crystallizing
 - Multiple stakeholders need to review requirements
@@ -481,12 +481,12 @@ When a learning blocks progress (e.g., "tests can't run because service X is dow
 
 All skills are included in this repo at `.claude/commands/`. There are two categories:
 
-**Workflow skills** (`/prd`, `/tasks`, `/plan-tasks`) — used during planning phases:
+**Workflow skills** (`/prd`, `/prd-tasks`, `/plan-tasks`) — used during planning phases:
 
 | Skill | Purpose |
 |-------|---------|
 | `/prd` | Generate structured PRD from rough requirements |
-| `/tasks` | Convert PRD to JSON task list + prompt file |
+| `/prd-tasks` | Convert PRD to JSON task list + prompt file |
 | `/plan-tasks` | Combined planning + task generation (skip PRD for small work) |
 
 **Task-mgr skills** (`/tm-apply`, `/tm-learn`, `/tm-recall`, `/tm-invalidate`, `/tm-status`, `/tm-next`) — used during build/learn phases.
@@ -501,7 +501,7 @@ Staging is guarded by a manifest (`~/.claude/commands/.task-mgr-skills.json`) th
 
 `task-mgr doctor --setup` reports skill freshness (missing / stale / locally modified) and `--auto-fix` stages anything safely refreshable.
 
-> **Note:** Don't hand-edit the staged copies in `~/.claude/commands/` unless you mean to fork them — edits are detected and skipped on refresh, leaving you on a stale fork. To change a skill for everyone, edit it in this repo's `.claude/commands/`, reinstall the binary, and re-run any init. `prd-tasks.md` is staged as a deprecated alias of `tasks.md`.
+> **Note:** Don't hand-edit the staged copies in `~/.claude/commands/` unless you mean to fork them — edits are detected and skipped on refresh, leaving you on a stale fork. To change a skill for everyone, edit it in this repo's `.claude/commands/`, reinstall the binary, and re-run any init.
 
 ## Shell Integration
 

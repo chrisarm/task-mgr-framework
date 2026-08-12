@@ -889,6 +889,10 @@ mod tests {
             "You've hit your limit · resets 4pm (America/Los_Angeles)"
         ));
         assert!(is_rate_limited("You've hit your limit"));
+        // Live CLI copy when session/extra-usage is exhausted (no "resets" token).
+        assert!(is_rate_limited(
+            "You've hit your individual spend limit · run /usage-credits to raise it, or visit claude.ai/admin-settings/usage"
+        ));
     }
 
     #[test]

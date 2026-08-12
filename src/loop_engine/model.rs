@@ -6,7 +6,7 @@
 //! # Source of Truth
 //!
 //! This file is the canonical source of truth for Claude model IDs and the
-//! difficulty→effort mapping. `.claude/commands/tasks.md` is regenerated from
+//! difficulty→effort mapping. `.claude/commands/prd-tasks.md` is regenerated from
 //! this file by `cargo run --bin gen-docs`; CI enforces sync via
 //! `cargo run --bin gen-docs -- --check`.
 //!
@@ -484,6 +484,40 @@ pub fn cost_efficient_auxiliary_plan(resolved: &ResolvedModelsConfig) -> Auxilia
         provider,
         model: resolved.model_for(provider, CapabilityTier::CostEfficient),
     }
+}
+
+/// Primary + optional fallback provider/model for parallel-slot merge conflict
+/// resolution.
+///
+/// Uses the **standard** capability tier (historical Sonnet/Opus-class default
+/// quality for merge work), not cost-efficient auxiliary routing. Fallback is
+/// the configured `providers.<primary>.fallback` only when that target is
+/// enabled and distinct from primary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MergeResolverPlan<'a> {
+    pub primary: AuxiliaryLlmPlan<'a>,
+    pub fallback: Option<AuxiliaryLlmPlan<'a>>,
+}
+
+/// Resolve the merge-resolver LLM plan from the operator's models config.
+///
+/// Pure / allocation-free. Does not probe CLI binaries — preflight already
+/// validates enabled providers; mid-run binary disappearance is handled by
+/// the resolver's spawn-error → fallback path.
+pub fn merge_resolver_plan(resolved: &ResolvedModelsConfig) -> MergeResolverPlan<'_> {
+    let primary_provider = resolved.primary_provider;
+    let primary = AuxiliaryLlmPlan {
+        provider: primary_provider,
+        model: resolved.model_for(primary_provider, CapabilityTier::Standard),
+    };
+    let fallback = resolved
+        .fallback_provider(primary_provider)
+        .filter(|fb| *fb != primary_provider && resolved.is_provider_enabled(*fb))
+        .map(|fb| AuxiliaryLlmPlan {
+            provider: fb,
+            model: resolved.model_for(fb, CapabilityTier::Standard),
+        });
+    MergeResolverPlan { primary, fallback }
 }
 
 /// The built-in default resolved config (Claude full ladder enabled, grok/codex
@@ -2134,6 +2168,126 @@ mod tests {
         assert_eq!(
             cost_efficient_auxiliary_plan(&cost_efficient_anchor).model,
             Some(SONNET_MODEL)
+        );
+    }
+
+    #[test]
+    fn merge_resolver_plan_builtin_claude_uses_standard_tier_no_fallback() {
+        let plan = merge_resolver_plan(builtin_resolved_models());
+        assert_eq!(plan.primary.provider, Provider::Claude);
+        assert_eq!(plan.primary.model, Some(OPUS_MODEL));
+        assert!(
+            plan.fallback.is_none(),
+            "builtin config has no primary fallback"
+        );
+    }
+
+    #[test]
+    fn merge_resolver_plan_honors_custom_standard_tier() {
+        let r = resolved_single(
+            Provider::Claude,
+            &[
+                (CapabilityTier::CostEfficient, Some(HAIKU_MODEL)),
+                (CapabilityTier::Standard, Some(SONNET_MODEL)),
+                (CapabilityTier::Frontier, Some(OPUS_MODEL)),
+            ],
+        );
+        let plan = merge_resolver_plan(&r);
+        assert_eq!(plan.primary.provider, Provider::Claude);
+        assert_eq!(plan.primary.model, Some(SONNET_MODEL));
+        assert_ne!(
+            plan.primary.model,
+            Some(HAIKU_MODEL),
+            "must use standard, not cost-efficient"
+        );
+    }
+
+    #[test]
+    fn merge_resolver_plan_includes_enabled_fallback() {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "grok".to_string(),
+            ProviderConfig {
+                enabled: true,
+                tiers: [(
+                    "standard".to_string(),
+                    Some(GROK_DEFAULT_TIER_MODELS[0].1.to_string()),
+                )]
+                .into_iter()
+                .collect(),
+                effort: HashMap::new(),
+                fallback: Some("claude".to_string()),
+                cli_binary: None,
+            },
+        );
+        providers.insert(
+            "claude".to_string(),
+            ProviderConfig {
+                enabled: true,
+                tiers: [("standard".to_string(), Some(OPUS_MODEL.to_string()))]
+                    .into_iter()
+                    .collect(),
+                effort: HashMap::new(),
+                fallback: None,
+                cli_binary: None,
+            },
+        );
+        let models = ModelsConfig {
+            primary_provider: "grok".to_string(),
+            anchor: "standard".to_string(),
+            providers,
+        };
+        let r = resolve_models_config(&models, &RoutingConfig::default());
+        let plan = merge_resolver_plan(&r);
+        assert_eq!(plan.primary.provider, Provider::Grok);
+        assert_eq!(plan.primary.model, Some(GROK_DEFAULT_TIER_MODELS[0].1));
+        let fb = plan.fallback.expect("enabled claude fallback must surface");
+        assert_eq!(fb.provider, Provider::Claude);
+        assert_eq!(fb.model, Some(OPUS_MODEL));
+        assert_ne!(fb.provider, plan.primary.provider);
+    }
+
+    #[test]
+    fn merge_resolver_plan_drops_disabled_fallback() {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "grok".to_string(),
+            ProviderConfig {
+                enabled: true,
+                tiers: [(
+                    "standard".to_string(),
+                    Some(GROK_DEFAULT_TIER_MODELS[0].1.to_string()),
+                )]
+                .into_iter()
+                .collect(),
+                effort: HashMap::new(),
+                fallback: Some("claude".to_string()),
+                cli_binary: None,
+            },
+        );
+        providers.insert(
+            "claude".to_string(),
+            ProviderConfig {
+                enabled: false,
+                tiers: [("standard".to_string(), Some(OPUS_MODEL.to_string()))]
+                    .into_iter()
+                    .collect(),
+                effort: HashMap::new(),
+                fallback: None,
+                cli_binary: None,
+            },
+        );
+        let models = ModelsConfig {
+            primary_provider: "grok".to_string(),
+            anchor: "standard".to_string(),
+            providers,
+        };
+        let r = resolve_models_config(&models, &RoutingConfig::default());
+        let plan = merge_resolver_plan(&r);
+        assert_eq!(plan.primary.provider, Provider::Grok);
+        assert!(
+            plan.fallback.is_none(),
+            "disabled fallback target must not surface"
         );
     }
 

@@ -19,8 +19,10 @@ use crate::loop_engine::config::{IterationOutcome, PermissionMode};
 use crate::loop_engine::engine::BlackoutState;
 use crate::loop_engine::model::Provider;
 use crate::loop_engine::recovery::probe_rate_limit_lifted;
-use crate::loop_engine::usage::{UsageCheckResult, check_usage_api};
-use crate::loop_engine::{display, oauth, signals};
+use crate::loop_engine::usage::{
+    UsageCheckResult, load_usage_info, usage_suggests_lifted,
+};
+use crate::loop_engine::{display, signals};
 
 /// Inputs to [`account_usage_gate`] / [`account_usage_gate_inner`].
 /// Destructured exhaustively (no `..`) by the FEAT-003 body — the single-home
@@ -162,15 +164,13 @@ pub struct OutputReactionItem<'a> {
 /// Injected wait seam (inner/outer split, mirrors
 /// `auto_review::{maybe_fire, maybe_fire_inner}`).
 ///
-/// Called **at most once** per [`react_to_outputs_inner`] invocation, with the
-/// computed wait-seconds (`parse_reset_from_output(first_rate_limited_output)
-/// .unwrap_or(fallback_wait)`). Returns `true` when the wait completed (the
-/// caller should retry), `false` when interrupted by a `.stop` signal.
+/// Called **at most once** per [`react_to_outputs_inner`] on the legacy wait
+/// path, with the **already-resolved** wait seconds from
+/// [`decide_account_rate_limit`] (`0` = ready now → return true immediately).
+/// Returns `true` when the wait completed (or was already ready), `false` when
+/// interrupted by a `.stop` signal.
 ///
-/// Production builds this from `usage::check_and_wait` (pre-check) +
-/// `usage::wait_for_usage_reset` (with `probe_rate_limit_lifted`); tests inject
-/// a counting closure so they are hermetic (no OAuth, no usage API, no real
-/// sleep). A type alias keeps `clippy::type_complexity` quiet.
+/// Tests inject a counting closure (hermetic — no OAuth, no sleep).
 pub type WaitFn<'f> = &'f dyn Fn(u64) -> bool;
 
 /// Injected reset-wait seam for the production post-output wrapper. Mirrors
@@ -180,6 +180,71 @@ pub type ResetWaitFn<'f> = &'f dyn Fn(u64, &Path, u64, Option<&dyn Fn() -> bool>
 /// Injected early-lift probe seam for the production post-output wrapper.
 pub type RateLimitProbeFn<'f> = &'f dyn Fn(&PermissionMode) -> bool;
 
+/// Pure post-rate-limit decision (no I/O). Order is intentional:
+/// 1. pure spend-stop (no API/output reset) → never blackout, never wait
+/// 2. spillover → blackout with resolved secs
+/// 3. legacy → wait with resolved secs
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RateLimitAction {
+    /// Credits/spend limit with no time-based reset — stop the loop.
+    StopSpend,
+    /// Sleep `secs` then retry (`0` = already ready).
+    Wait { secs: u64 },
+    /// Record a provider blackout for `secs` and reroute (spillover path).
+    Blackout { secs: u64 },
+}
+
+/// Resolve wait/blackout seconds: API wins, then CLI output, then fallback.
+///
+/// `Some(0)` means **ready now** (past reset) and is preserved — it must NOT
+/// collapse to `fallback`. Only when both sources are `None` do we use
+/// `fallback`.
+pub(crate) fn resolve_wait_secs(
+    api: Option<u64>,
+    output: Option<u64>,
+    fallback: u64,
+) -> u64 {
+    match (api, output) {
+        (Some(s), _) => s,
+        (None, Some(s)) => s,
+        (None, None) => fallback,
+    }
+}
+
+/// Pure rate-limit action after a `RateLimit` hit (no I/O).
+///
+/// `api_secs` / `output_secs`: `None` = unknown; `Some(0)` = ready; `Some(n>0)` = wait n.
+pub(crate) fn decide_account_rate_limit(
+    api_secs: Option<u64>,
+    output_secs: Option<u64>,
+    output: &str,
+    spillover_enabled: bool,
+    fallback_wait: u64,
+    blackout_fallback_secs: u64,
+) -> RateLimitAction {
+    // Pure spend/credits with no time-based reset: stop before blackout/wait.
+    if api_secs.is_none() && output_secs.is_none() && is_spend_limit_message(output) {
+        return RateLimitAction::StopSpend;
+    }
+
+    if spillover_enabled {
+        let secs = resolve_wait_secs(api_secs, output_secs, blackout_fallback_secs);
+        return RateLimitAction::Blackout { secs };
+    }
+
+    let secs = resolve_wait_secs(api_secs, output_secs, fallback_wait);
+    RateLimitAction::Wait { secs }
+}
+
+/// Narrow spend/credits phrasing — not plain "monthly usage limit".
+pub(crate) fn is_spend_limit_message(output: &str) -> bool {
+    let lower = output.to_lowercase();
+    lower.contains("spend limit")
+        || lower.contains("usage-credits")
+        || lower.contains("admin-settings/usage")
+        || (lower.contains("usage credits") && lower.contains("limit"))
+}
+
 /// Inputs to [`react_to_outputs`] / [`react_to_outputs_inner`]. Destructured
 /// exhaustively (no `..`) by the FEAT-006 body — the single-home parity lock.
 pub struct AccountReactionParams<'a> {
@@ -188,8 +253,8 @@ pub struct AccountReactionParams<'a> {
     /// Whether the usage API pre-check is enabled (production wait path only).
     pub usage_enabled: bool,
     /// Whether post-output RateLimit recovery may touch Anthropic account I/O
-    /// and spawn the Claude CLI early-lift probe. This is keyed only from the
-    /// resolved Claude provider enablement, not the pre-iteration usage env flag.
+    /// and spawn the Claude CLI early-lift probe. Keyed only from resolved
+    /// Claude provider enablement, not the pre-iteration usage env flag.
     pub anthropic_account_io_allowed: bool,
     /// Loop tasks dir — `.stop`-signal polling + usage wait.
     pub tasks_dir: &'a Path,
@@ -221,15 +286,12 @@ pub struct AccountReactionParams<'a> {
     pub now_secs: u64,
 }
 
-/// Post-output rate-limit reaction (production entry point). Builds the real
-/// usage-wait closure and delegates to [`react_to_outputs_inner`].
+/// Post-output rate-limit reaction (production entry point).
 ///
-/// Wait dual-gate (do not collapse): try the usage API first only when
-/// `anthropic_account_io_allowed && usage_enabled` (Claude allow-flag **and**
-/// the pre/env usage switch — historical); then always fall back to the
-/// output-parsed / `fallback_wait` reset. The early-lift probe is handed to
-/// that fallback only when `anthropic_account_io_allowed` (Claude-only; env
-/// does not silence the probe).
+/// Dual-gate (do not collapse): load usage / try usage-gate only when
+/// `anthropic_account_io_allowed` (Claude enablement). Env `usage_enabled` still
+/// gates the pre-iteration-style usage_gate path when both allow. Early-lift
+/// probe is Claude-only. Delegates to hermetic core with optional API reset.
 pub fn react_to_outputs(
     conn: &mut Connection,
     items: &[OutputReactionItem<'_>],
@@ -240,8 +302,10 @@ pub fn react_to_outputs(
         check_and_wait(threshold, tasks_dir, fallback_wait)
     };
     let reset_wait =
-        |wait_secs: u64, tasks_dir: &Path, fallback_wait: u64, probe: Option<&dyn Fn() -> bool>| {
-            wait_for_usage_reset(wait_secs, tasks_dir, fallback_wait, probe)
+        |wait_secs: u64, tasks_dir: &Path, _fallback_wait: u64, probe: Option<&dyn Fn() -> bool>| {
+            // Local wait_for_usage_reset resolves unknown duration upstream
+            // via decide_account_rate_limit; fallback_wait is unused here.
+            wait_for_usage_reset(wait_secs, tasks_dir, probe)
         };
     let probe =
         |permission_mode: &PermissionMode| -> bool { probe_rate_limit_lifted(permission_mode) };
@@ -257,9 +321,8 @@ pub fn react_to_outputs(
 }
 
 /// Post-output rate-limit reaction with production I/O seams injected. Tests use
-/// this to prove the production wrapper's Anthropic/Claude side effects are
-/// skipped when Claude is disabled without touching live credentials or a real
-/// Claude binary.
+/// this to prove Anthropic/Claude side effects are skipped when Claude is
+/// disabled without live credentials or a real Claude binary.
 pub fn react_to_outputs_with_io_seams(
     conn: &mut Connection,
     items: &[OutputReactionItem<'_>],
@@ -269,10 +332,7 @@ pub fn react_to_outputs_with_io_seams(
     reset_wait: ResetWaitFn<'_>,
     probe_rate_limit: RateLimitProbeFn<'_>,
 ) -> AccountReaction {
-    // Exhaustive destructure (no `..`) — the single-home parity lock. Adding a
-    // field to `AccountReactionParams` forces this coordinator to account for
-    // it. All fields are `Copy`, so the `&Struct { .. }` pattern copies each
-    // out by value while leaving `params` borrowed for the inner delegation.
+    // Exhaustive destructure (no `..`) — the single-home parity lock.
     let &AccountReactionParams {
         threshold,
         usage_enabled,
@@ -288,33 +348,61 @@ pub fn react_to_outputs_with_io_seams(
         now_secs: _,
     } = params;
 
+    // Usage load only when Claude account I/O is allowed (skip Anthropic when
+    // Claude is disabled). Feeds decide_account_rate_limit's api_secs.
+    let api_secs = if anthropic_account_io_allowed {
+        let usage = load_usage_info();
+        let secs = usage
+            .as_ref()
+            .and_then(|u| u.reset_at.as_deref())
+            .and_then(estimate_reset_seconds);
+        if let Some(s) = secs {
+            if s > 0 {
+                eprintln!(
+                    "Usage API: window resets in {}.",
+                    display::format_duration(s)
+                );
+            } else {
+                eprintln!("Usage API: reset window already open (ready).");
+            }
+        }
+        secs
+    } else {
+        None
+    };
+
     let wait = |wait_secs: u64| -> bool {
-        // Try the usage API first (when enabled). It computes its own wait
-        // internally, so the `wait_secs` arg is only consumed by the fallback.
+        // Optional usage-gate first when both Claude allow-flag and env enablement.
         if anthropic_account_io_allowed && usage_enabled {
             match usage_gate(threshold, tasks_dir, fallback_wait) {
                 UsageCheckResult::StopSignaled => return false,
                 UsageCheckResult::WaitedAndReset => return true,
-                // Skipped / BelowThreshold / ApiError — the API did not wait;
-                // fall through to the output-parsed reset wait.
                 _ => {}
             }
         }
-        // The reset wait itself always runs; only the early-lift probe is
-        // gated, because it spawns the Claude CLI. Single call site so a future
-        // signature change to `wait_for_usage_reset` can't be half-applied.
+        // Reset wait always runs; early-lift probe is Claude-only (spawns CLI).
+        // Do not fold a live usage re-fetch into this probe — FEAT-002 spies
+        // assert `probe_rate_limit` is invoked when wired.
         let probe = || probe_rate_limit(permission_mode);
         let probe_arg: Option<&dyn Fn() -> bool> =
             anthropic_account_io_allowed.then_some(&probe as &dyn Fn() -> bool);
         reset_wait(wait_secs, tasks_dir, fallback_wait, probe_arg)
     };
 
-    react_to_outputs_inner(conn, items, params, blackout, &wait)
+    react_to_outputs_inner(conn, items, params, blackout, api_secs, &wait)
 }
 
-/// Hermetic core of the post-output rate-limit reaction. Detects `RateLimit`
-/// across `items`, resets the affected `in_progress` task(s) to `todo`, and
-/// fires `wait` **exactly once**, then maps the result to an [`AccountReaction`].
+/// Hermetic core of the post-output rate-limit reaction.
+///
+/// `api_reset_secs`: inject `None` in tests (or a known value) so the pure
+/// [`decide_account_rate_limit`] path is hermetic. Production
+/// [`react_to_outputs`] loads this via [`load_usage_info`].
+///
+/// Order (same for spillover and legacy after the spend check):
+/// 1. reset `in_progress` → `todo`
+/// 2. pure spend-stop → message → [`AccountReaction::Stop`] (no blackout)
+/// 3. spillover → blackout with resolved secs → Reroute / Proceed
+/// 4. legacy → `wait(secs)` → WaitedAndRetry / Stop
 ///
 /// The contract is pinned by the parity tests in `tests/reaction_parity.rs`.
 pub fn react_to_outputs_inner(
@@ -322,6 +410,7 @@ pub fn react_to_outputs_inner(
     items: &[OutputReactionItem<'_>],
     params: &AccountReactionParams<'_>,
     blackout: &mut BlackoutState,
+    api_reset_secs: Option<u64>,
     wait: WaitFn<'_>,
 ) -> AccountReaction {
     // No `RateLimit` item ⇒ nothing to do. ZERO DB writes, no wait.
@@ -332,48 +421,48 @@ pub fn react_to_outputs_inner(
         return AccountReaction::None;
     };
 
-    // A rate/session limit hit the shared account mid-wave. Reset every
-    // `in_progress` row under this PRD prefix back to `todo` so the next
-    // wave/iteration re-runs them. Slots that already completed THIS wave
-    // (flipped to `done` by `process_slot_result`) are never clobbered
-    // (FEAT-006 B1) — the `status = 'in_progress'` guard is inside the helper.
-    // Runs in BOTH the spillover and the legacy paths.
+    // Always reset in_progress first so work isn't stuck if we StopSpend.
     reset_in_progress_tasks(conn, params.run_id, params.prefix, "rate limit");
 
-    // The reset timestamp is parsed once from the FIRST rate-limited output and
-    // shared by both paths (the spillover blackout window and the legacy wait).
-    let reset_secs = parse_reset_from_output(first_rate_limited.output);
+    let output_secs = parse_reset_from_output(first_rate_limited.output);
+    let action = decide_account_rate_limit(
+        api_reset_secs,
+        output_secs,
+        first_rate_limited.output,
+        params.spillover_enabled,
+        params.fallback_wait,
+        params.blackout_fallback_secs,
+    );
 
-    // FEAT-008 quota-aware failover. When difficulty-spillover is enabled, the
-    // shared account's primary provider is blacked out (ephemerally, on
-    // `ctx.provider_blackouts`) and the wait is SKIPPED: the next selection pass
-    // reroutes spillover-eligible work to another provider, and the no-eligible
-    // deferral branch waits only if EVERY remaining task is quota-deferred. This
-    // channel is EPHEMERAL — it never reads or writes `runner_overrides` (the
-    // permanent cross-provider promotion channel owned by `promote_once`). With
-    // spillover DISABLED (the default), this branch is skipped entirely and the
-    // reaction is byte-identical to the pre-FEAT-008 reset-and-wait path.
-    if params.spillover_enabled {
-        let blackout_secs = reset_secs.unwrap_or(params.blackout_fallback_secs);
-        let already_active = blackout
-            .active(params.now_secs)
-            .contains(&params.primary_provider);
-        blackout.record(params.primary_provider, params.now_secs, blackout_secs);
-        return if already_active {
-            AccountReaction::ProceedWithSpillover
-        } else {
-            AccountReaction::RerouteAndRetry
-        };
-    }
-
-    // Legacy reset-and-wait path. Compute the wait once and fire the injected
-    // wait seam EXACTLY once for the whole wave — never once per rate-limited
-    // slot.
-    let wait_secs = reset_secs.unwrap_or(params.fallback_wait);
-    if wait(wait_secs) {
-        AccountReaction::WaitedAndRetry
-    } else {
-        AccountReaction::Stop
+    match action {
+        RateLimitAction::StopSpend => {
+            eprintln!(
+                "Usage/spend limit with no time-based reset from the API or CLI output.\n\
+                 Raise credits: Claude Code /usage-credits (or admin usage settings).\n\
+                 Stopping the loop (tasks left as todo)."
+            );
+            AccountReaction::Stop
+        }
+        RateLimitAction::Blackout { secs } => {
+            // FEAT-008: ephemeral blackout; never touches runner_overrides.
+            let already_active = blackout
+                .active(params.now_secs)
+                .contains(&params.primary_provider);
+            blackout.record(params.primary_provider, params.now_secs, secs);
+            if already_active {
+                AccountReaction::ProceedWithSpillover
+            } else {
+                AccountReaction::RerouteAndRetry
+            }
+        }
+        RateLimitAction::Wait { secs } => {
+            // Fire wait EXACTLY once for the whole wave.
+            if wait(secs) {
+                AccountReaction::WaitedAndRetry
+            } else {
+                AccountReaction::Stop
+            }
+        }
     }
 }
 
@@ -427,14 +516,15 @@ pub fn handle_quota_deferral(
     blackout: &mut BlackoutState,
     now_secs: u64,
     tasks_dir: &Path,
-    fallback_wait: u64,
+    _fallback_wait: u64,
 ) -> QuotaDeferral {
     let wait = |wait_secs: u64| -> bool {
-        // No early-lift probe: a quota blackout reopens on its own schedule, and
-        // the probe is an OAuth/usage-API call we deliberately avoid on this
-        // deferral path. `.stop` polling inside `wait_for_usage_reset` still
-        // applies, so the wait stays interruptible.
-        wait_for_usage_reset(wait_secs, tasks_dir, fallback_wait, None)
+        // No early-lift probe: a quota blackout reopens on its own schedule.
+        // `.stop` polling inside `wait_for_usage_reset` still applies.
+        // `wait_secs` is remaining blackout duration (`0` = ready immediately).
+        // `_fallback_wait` is unused: blackout max_remaining is authoritative
+        // (callers still pass LOOP fallback for signature stability).
+        wait_for_usage_reset(wait_secs, tasks_dir, None)
     };
     handle_quota_deferral_inner(conn, task_prefix, blackout, now_secs, &wait)
 }
@@ -715,82 +805,118 @@ pub fn react_to_transient_inner(
 /// Maximum wait time for usage reset: 5 hours in seconds.
 const MAX_WAIT_SECS: u64 = 5 * 3600;
 
-/// Interval between .stop signal checks during wait: 10 seconds.
-const WAIT_CHECK_INTERVAL_SECS: u64 = 10;
+/// Production wait-loop intervals.
+const PROD_TIMING: WaitTiming = WaitTiming {
+    stop_check_secs: 10,
+    probe_secs: 30,
+    status_secs: 12 * 60,
+};
 
-/// Interval between rate-limit probe checks: 60 seconds.
-const PROBE_INTERVAL_SECS: u64 = 60;
+/// Intervals for [`wait_for_usage_reset_inner`]. Production uses [`PROD_TIMING`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WaitTiming {
+    /// Silent `.stop` poll interval.
+    pub stop_check_secs: u64,
+    /// Early-lift probe interval.
+    pub probe_secs: u64,
+    /// Sparse status-line interval.
+    pub status_secs: u64,
+}
 
-/// Wait for usage to reset, displaying a countdown to stderr.
+/// Production wait wrapper: fixed timing + real sleep.
 ///
-/// Checks the `.stop` signal file every `WAIT_CHECK_INTERVAL_SECS` seconds.
-/// When `probe_fn` is `Some`, calls it every ~60 seconds to check if the
-/// rate limit has been lifted early. The probe returns `true` if the limit
-/// is lifted (resume immediately).
+/// **`wait_secs` semantics (must not regress):**
+/// - `0` = **ready now** → return `true` immediately (never becomes 300s fallback)
+/// - `n > 0` = sleep up to `min(n, MAX_WAIT_SECS)`; if `n > MAX`, log the true
+///   duration and the cap
 ///
-/// Returns `true` if the wait completed (or probe succeeded),
-/// `false` if interrupted by `.stop`.
-///
-/// The `wait_secs` parameter specifies how long to wait. It is capped at
-/// `MAX_WAIT_SECS` (5 hours).
+/// Unknown duration is resolved **before** this function (`resolve_wait_secs` /
+/// `decide_account_rate_limit`); this function never invents a fallback.
 pub(crate) fn wait_for_usage_reset(
     wait_secs: u64,
     tasks_dir: &Path,
-    fallback_wait: u64,
     probe_fn: Option<&dyn Fn() -> bool>,
 ) -> bool {
-    let effective_wait = if wait_secs == 0 {
-        fallback_wait
-    } else {
-        wait_secs.min(MAX_WAIT_SECS)
-    };
+    wait_for_usage_reset_inner(
+        wait_secs,
+        tasks_dir,
+        probe_fn,
+        PROD_TIMING,
+        |d| thread::sleep(d),
+    )
+}
 
-    eprintln!(
-        "Usage limit reached. Waiting {} for reset{}...",
-        display::format_duration(effective_wait),
-        if probe_fn.is_some() {
-            format!(" (probing every {}s)", PROBE_INTERVAL_SECS)
-        } else {
-            String::new()
-        }
-    );
+/// Injectable wait body (hermetic tests pass tiny timing + no-op / virtual sleep).
+pub(crate) fn wait_for_usage_reset_inner(
+    wait_secs: u64,
+    tasks_dir: &Path,
+    probe_fn: Option<&dyn Fn() -> bool>,
+    timing: WaitTiming,
+    sleep: impl Fn(Duration),
+) -> bool {
+    // Ready now — do not treat 0 as "unknown" / fallback.
+    if wait_secs == 0 {
+        eprintln!("Usage window ready. Resuming...");
+        return true;
+    }
+
+    let capped = wait_secs > MAX_WAIT_SECS;
+    let effective_wait = wait_secs.min(MAX_WAIT_SECS);
+    if capped {
+        eprintln!(
+            "Usage API reset in {}; waiting max {} then retrying.",
+            display::format_duration(wait_secs),
+            display::format_duration(MAX_WAIT_SECS),
+        );
+    } else {
+        eprintln!(
+            "Waiting {} for usage reset{} (status every {})...",
+            display::format_duration(effective_wait),
+            if probe_fn.is_some() {
+                format!("; probing every {}s", timing.probe_secs)
+            } else {
+                String::new()
+            },
+            display::format_duration(timing.status_secs),
+        );
+    }
 
     let mut remaining = effective_wait;
-    // Start at the probe interval so the first probe fires immediately
-    let mut since_last_probe: u64 = PROBE_INTERVAL_SECS;
+    // First probe after one full interval (account still limited right after hit).
+    let mut since_last_probe: u64 = 0;
+    // First status after status_secs (banner already has initial duration).
+    let mut since_last_status: u64 = 0;
 
     while remaining > 0 {
-        // Check for stop signal
         if signals::check_stop_signal(tasks_dir, None) {
             eprintln!("Stop signal detected during usage wait. Exiting wait.");
             return false;
         }
 
-        // Periodic probe: check if rate limit has been lifted early
         if let Some(ref probe) = probe_fn
-            && since_last_probe >= PROBE_INTERVAL_SECS
+            && since_last_probe >= timing.probe_secs
         {
             since_last_probe = 0;
-            eprintln!("  Probing whether rate limit has been lifted...");
             if probe() {
-                eprintln!("  Rate limit lifted early! Resuming...");
+                eprintln!("  Rate limit lifted early (usage API). Resuming...");
                 return true;
             }
-            eprintln!("  Still rate-limited. Continuing wait...");
+            // Still limited — quiet.
         }
 
-        // Display countdown every interval
-        let sleep_time = remaining.min(WAIT_CHECK_INTERVAL_SECS);
+        if since_last_status >= timing.status_secs {
+            since_last_status = 0;
+            eprintln!(
+                "  Still waiting — {} remaining.",
+                display::format_duration(remaining)
+            );
+        }
 
-        eprintln!(
-            "  Usage reset in {} (checking .stop every {}s)...",
-            display::format_duration(remaining),
-            WAIT_CHECK_INTERVAL_SECS
-        );
-
-        thread::sleep(Duration::from_secs(sleep_time));
+        let sleep_time = remaining.min(timing.stop_check_secs).max(1);
+        sleep(Duration::from_secs(sleep_time));
         remaining = remaining.saturating_sub(sleep_time);
-        since_last_probe += sleep_time;
+        since_last_probe = since_last_probe.saturating_add(sleep_time);
+        since_last_status = since_last_status.saturating_add(sleep_time);
     }
 
     eprintln!("Usage wait complete. Resuming...");
@@ -897,15 +1023,15 @@ fn parse_time_token(token: &str) -> Option<(u32, u32)> {
 
 /// Estimate seconds until reset from an ISO 8601 timestamp string.
 ///
-/// Returns `None` if the timestamp can't be parsed or is in the past.
-fn estimate_reset_seconds(reset_at: &str) -> Option<u64> {
-    // Try parsing common ISO 8601 formats
-    // Format: "2024-01-15T12:00:00Z" or "2024-01-15T12:00:00+00:00"
+/// - Unparseable → `None` (unknown)
+/// - Past or ≤0  → `Some(0)` (**ready now** — not unknown)
+/// - Future      → `Some(secs)`
+pub(crate) fn estimate_reset_seconds(reset_at: &str) -> Option<u64> {
+    // Format: "2024-01-15T12:00:00Z" or "2024-01-15T12:00:00+00:00" / fractional
     let parsed = chrono::DateTime::parse_from_rfc3339(reset_at)
         .ok()
         .map(|dt| dt.timestamp())
         .or_else(|| {
-            // Try without timezone
             chrono::NaiveDateTime::parse_from_str(reset_at, "%Y-%m-%dT%H:%M:%S")
                 .ok()
                 .map(|dt| dt.and_utc().timestamp())
@@ -917,16 +1043,15 @@ fn estimate_reset_seconds(reset_at: &str) -> Option<u64> {
     if reset_epoch > now {
         Some((reset_epoch - now) as u64)
     } else {
-        None // Reset time is in the past
+        Some(0) // ready — do not return None (that would thrash into fallback)
     }
 }
 
 /// Check usage and wait if above threshold. Main entry point for pre-iteration usage check.
 ///
 /// Orchestrates:
-/// 1. Ensure OAuth token is valid
-/// 2. Check usage API
-/// 3. If above threshold, wait for reset
+/// 1. `load_usage_info` (creds + refresh + OAuth/org usage API)
+/// 2. If above threshold, wait for reset with API early-lift probe
 ///
 /// Returns the result of the check-and-wait cycle.
 pub(crate) fn check_and_wait(
@@ -934,34 +1059,13 @@ pub(crate) fn check_and_wait(
     tasks_dir: &Path,
     fallback_wait: u64,
 ) -> UsageCheckResult {
-    // Step 1: Ensure token is valid
-    let path = oauth::credentials_path();
-    let creds = match oauth::read_credentials(&path) {
-        Some(c) => c,
-        None => return UsageCheckResult::Skipped,
-    };
-
-    // Refresh if needed
-    if oauth::is_token_expiring(&creds, 5) {
-        match oauth::refresh_token(&path, &creds) {
-            Ok(_) => eprintln!("OAuth token refreshed for usage check"),
-            Err(e) => {
-                eprintln!("Warning: could not refresh token for usage check: {}", e);
-                // Try with existing token anyway
-            }
-        }
-    }
-
-    // Re-read credentials (may have been refreshed)
-    let creds = match oauth::read_credentials(&path) {
-        Some(c) => c,
-        None => return UsageCheckResult::Skipped,
-    };
-
-    // Step 2: Check usage API
-    let usage = match check_usage_api(&creds.access_token) {
+    let usage = match load_usage_info() {
         Some(u) => u,
-        None => return UsageCheckResult::ApiError("Failed to check usage API".to_string()),
+        None => {
+            // Distinguish "no creds" from "API failed" is best-effort: load
+            // already degraded; surface as skipped when nothing usable.
+            return UsageCheckResult::Skipped;
+        }
     };
 
     eprintln!(
@@ -973,14 +1077,26 @@ pub(crate) fn check_and_wait(
         return UsageCheckResult::BelowThreshold;
     }
 
-    // Step 3: Usage is above threshold, wait for reset
+    // Above threshold: wait. Some(0) = ready now; None = unknown → fallback.
     let wait_secs = usage
         .reset_at
         .as_deref()
         .and_then(estimate_reset_seconds)
-        .unwrap_or(0);
+        .unwrap_or(fallback_wait);
 
-    let completed = wait_for_usage_reset(wait_secs, tasks_dir, fallback_wait, None);
+    let probe = || {
+        if let Some(info) = load_usage_info() {
+            if usage_suggests_lifted(&info, threshold, false) {
+                return true;
+            }
+            if let Some(r) = info.reset_at.as_deref() {
+                return estimate_reset_seconds(r) == Some(0);
+            }
+        }
+        false
+    };
+
+    let completed = wait_for_usage_reset(wait_secs, tasks_dir, Some(&probe));
 
     if completed {
         UsageCheckResult::WaitedAndReset
@@ -1010,11 +1126,15 @@ mod tests {
     }
 
     #[test]
-    fn test_estimate_reset_seconds_past_returns_none() {
+    fn test_estimate_reset_seconds_past_returns_ready_zero() {
         let past = chrono::Utc::now() - chrono::Duration::hours(1);
         let ts = past.to_rfc3339();
         let result = estimate_reset_seconds(&ts);
-        assert!(result.is_none(), "Past timestamp should return None");
+        assert_eq!(
+            result,
+            Some(0),
+            "Past timestamp must be Some(0) ready, not None (avoids fallback thrash)"
+        );
     }
 
     #[test]
@@ -1046,13 +1166,14 @@ mod tests {
     }
 
     #[test]
-    fn test_estimate_reset_seconds_exactly_now() {
+    fn test_estimate_reset_seconds_exactly_now_is_ready() {
         let now = chrono::Utc::now();
         let ts = now.to_rfc3339();
         let result = estimate_reset_seconds(&ts);
-        assert!(
-            result.is_none(),
-            "Timestamp at exact now should return None (not in future)"
+        assert_eq!(
+            result,
+            Some(0),
+            "Timestamp at exact now is ready (Some(0)), not unknown"
         );
     }
 
@@ -1090,82 +1211,161 @@ mod tests {
         assert!(secs < 610, "Expected <610 but got {}", secs);
     }
 
+    // --- resolve / decide pure tests ---
+
+    #[test]
+    fn test_resolve_wait_secs_api_wins_including_zero() {
+        assert_eq!(resolve_wait_secs(Some(0), Some(500), 300), 0);
+        assert_eq!(resolve_wait_secs(Some(120), Some(500), 300), 120);
+        assert_eq!(resolve_wait_secs(None, Some(500), 300), 500);
+        assert_eq!(resolve_wait_secs(None, None, 300), 300);
+    }
+
+    #[test]
+    fn test_decide_spend_stop_no_resets() {
+        let action = decide_account_rate_limit(
+            None,
+            None,
+            "You've hit your individual spend limit · run /usage-credits",
+            false,
+            300,
+            3600,
+        );
+        assert_eq!(action, RateLimitAction::StopSpend);
+    }
+
+    #[test]
+    fn test_decide_spend_with_api_reset_waits() {
+        let action = decide_account_rate_limit(
+            Some(3600),
+            None,
+            "You've hit your individual spend limit · run /usage-credits",
+            false,
+            300,
+            3600,
+        );
+        assert_eq!(action, RateLimitAction::Wait { secs: 3600 });
+    }
+
+    #[test]
+    fn test_decide_spillover_blackout_uses_api_secs() {
+        let action = decide_account_rate_limit(
+            Some(7200),
+            None,
+            "rate limited",
+            true,
+            300,
+            3600,
+        );
+        assert_eq!(action, RateLimitAction::Blackout { secs: 7200 });
+    }
+
+    #[test]
+    fn test_decide_spillover_pure_spend_stops_no_blackout() {
+        let action = decide_account_rate_limit(
+            None,
+            None,
+            "spend limit · usage-credits",
+            true,
+            300,
+            3600,
+        );
+        assert_eq!(
+            action,
+            RateLimitAction::StopSpend,
+            "pure spend must not record a short blackout"
+        );
+    }
+
+    #[test]
+    fn test_is_spend_limit_message_narrow() {
+        assert!(is_spend_limit_message(
+            "You've hit your individual spend limit · run /usage-credits"
+        ));
+        assert!(!is_spend_limit_message(
+            "You've hit your org's monthly usage limit"
+        ));
+        assert!(!is_spend_limit_message(
+            "You've hit your limit · resets 4pm"
+        ));
+    }
+
     // --- wait_for_usage_reset tests ---
 
     #[test]
-    fn test_wait_for_usage_reset_zero_wait_uses_fallback() {
+    fn test_wait_zero_is_ready_not_fallback() {
         let temp_dir = TempDir::new().unwrap();
-        let completed = wait_for_usage_reset(0, temp_dir.path(), 1, None);
-        assert!(completed, "Should complete with very short fallback");
+        // Must complete immediately — never sleep fallback 300s.
+        let completed = wait_for_usage_reset(0, temp_dir.path(), None);
+        assert!(completed, "Some(0) ready must return true immediately");
     }
 
     #[test]
     fn test_wait_for_usage_reset_stop_signal_interrupts() {
         let temp_dir = TempDir::new().unwrap();
         std::fs::write(temp_dir.path().join(STOP_FILE), "").unwrap();
-        let completed = wait_for_usage_reset(60, temp_dir.path(), 300, None);
+        let completed = wait_for_usage_reset(60, temp_dir.path(), None);
         assert!(!completed, "Should be interrupted by stop signal");
-    }
-
-    #[test]
-    fn test_wait_for_usage_reset_caps_at_max() {
-        assert_eq!(MAX_WAIT_SECS, 18000);
     }
 
     #[test]
     fn test_wait_for_usage_reset_short_wait_completes() {
         let temp_dir = TempDir::new().unwrap();
-        let completed = wait_for_usage_reset(1, temp_dir.path(), 1, None);
+        let completed = wait_for_usage_reset(1, temp_dir.path(), None);
         assert!(completed);
     }
 
     #[test]
-    fn test_wait_for_usage_reset_very_short_wait() {
-        let temp_dir = TempDir::new().unwrap();
-        let completed = wait_for_usage_reset(0, temp_dir.path(), 0, None);
-        assert!(completed, "Zero effective wait should complete immediately");
-    }
-
-    #[test]
-    fn test_wait_for_usage_reset_capped_at_max() {
+    fn test_wait_for_usage_reset_capped_stop_interrupts() {
         let temp_dir = TempDir::new().unwrap();
         std::fs::write(temp_dir.path().join(STOP_FILE), "").unwrap();
-        let completed = wait_for_usage_reset(u64::MAX, temp_dir.path(), 300, None);
+        let completed = wait_for_usage_reset(u64::MAX, temp_dir.path(), None);
         assert!(!completed, "Should be interrupted by stop signal");
-    }
-
-    #[test]
-    fn test_wait_for_usage_reset_fallback_not_used_when_wait_nonzero() {
-        let temp_dir = TempDir::new().unwrap();
-        let completed = wait_for_usage_reset(1, temp_dir.path(), 3600, None);
-        assert!(completed, "Should complete quickly with 1 second wait");
     }
 
     #[test]
     fn test_wait_for_usage_reset_stop_file_created_during_wait() {
         let temp_dir = TempDir::new().unwrap();
         std::fs::write(temp_dir.path().join(STOP_FILE), "").unwrap();
-        let completed = wait_for_usage_reset(100, temp_dir.path(), 300, None);
+        let completed = wait_for_usage_reset(100, temp_dir.path(), None);
         assert!(!completed, "Stop file should interrupt wait");
     }
 
     #[test]
-    fn test_wait_for_usage_reset_probe_exits_early() {
+    fn test_wait_probe_exits_early_with_tiny_timing() {
         let temp_dir = TempDir::new().unwrap();
         let probe = || true;
-        let completed = wait_for_usage_reset(3600, temp_dir.path(), 300, Some(&probe));
+        let timing = WaitTiming {
+            stop_check_secs: 1,
+            probe_secs: 1,
+            status_secs: 100,
+        };
+        // Fake sleep: no wall clock; probe fires after first "interval".
+        let completed = wait_for_usage_reset_inner(
+            10,
+            temp_dir.path(),
+            Some(&probe),
+            timing,
+            |_| {}, // no-op sleep — loop advances remaining via sleep_time
+        );
+        // With no-op sleep remaining still decreases... wait, if sleep is no-op
+        // remaining still decreases each iteration. Probe fires when
+        // since_last_probe >= 1 after first sleep chunk. Good.
         assert!(completed, "Probe returning true should exit wait early");
     }
 
     #[test]
-    fn test_wait_for_usage_reset_probe_false_continues() {
+    fn test_wait_probe_false_completes_with_tiny_timing() {
         let temp_dir = TempDir::new().unwrap();
         let probe = || false;
-        let completed = wait_for_usage_reset(1, temp_dir.path(), 1, Some(&probe));
-        assert!(
-            completed,
-            "Probe returning false should not prevent completion"
-        );
+        let timing = WaitTiming {
+            stop_check_secs: 1,
+            probe_secs: 1,
+            status_secs: 100,
+        };
+        let completed =
+            wait_for_usage_reset_inner(2, temp_dir.path(), Some(&probe), timing, |_| {});
+        assert!(completed, "false probe must not block completion");
     }
 
     // --- Constants ---
@@ -1176,8 +1376,10 @@ mod tests {
     }
 
     #[test]
-    fn test_wait_check_interval_is_10_seconds() {
-        assert_eq!(WAIT_CHECK_INTERVAL_SECS, 10);
+    fn test_prod_timing_intervals() {
+        assert_eq!(PROD_TIMING.stop_check_secs, 10);
+        assert_eq!(PROD_TIMING.probe_secs, 30);
+        assert_eq!(PROD_TIMING.status_secs, 12 * 60);
     }
 
     // --- parse_reset_from_output tests ---

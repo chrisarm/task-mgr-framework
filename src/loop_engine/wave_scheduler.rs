@@ -1252,34 +1252,18 @@ pub fn run_wave_iteration(
     // shadow runs (FEAT-010 AC5). Stays empty when no merge-back happened.
     let mut post_merge_completed: Vec<String> = Vec::new();
     if params.parallel_slots > 1 {
-        let resolved_model = params
-            .default_model
-            .filter(|m| !m.trim().is_empty())
-            .unwrap_or(model::SONNET_MODEL)
-            .to_string();
-        // Per-project overrides for the merge-conflict resolver. Both fall
-        // back to safe defaults so projects without a config.json keep the
-        // pre-existing behavior (600s / "medium"). The shared `project_config`
-        // was loaded once at run-loop startup and threaded through
-        // `WaveParams` (Fix 2 from /review-loop).
-        let claude_timeout = Duration::from_secs(
-            params
-                .project_config
-                .merge_resolver_timeout_secs
-                .unwrap_or(600),
+        // Provider-agnostic merge resolver: primary + optional fallback from
+        // `models` config (standard tier). Timeout/effort knobs still come
+        // from project_config; both fall back to safe defaults (600s /
+        // "medium") when unset. Run-scoped `ctx.resolved_models` — never
+        // re-read config mid-wave.
+        let resolver = merge_resolver::LlmMergeResolver::from_config(
+            &ctx.resolved_models,
+            params.project_config,
+            Some(params.signal_flag),
+            Some(params.db_dir),
+            Some(params.tasks_dir),
         );
-        let effort = params
-            .project_config
-            .merge_resolver_effort
-            .clone()
-            .unwrap_or_else(|| "medium".to_string());
-        let resolver = merge_resolver::ClaudeMergeResolver {
-            model: resolved_model,
-            db_dir: Some(params.db_dir),
-            signal_flag: Some(params.signal_flag),
-            claude_timeout,
-            effort,
-        };
         let outcomes = worktree::merge_slot_branches_with_resolver(
             params.source_root,
             params.branch,

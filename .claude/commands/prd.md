@@ -11,7 +11,7 @@ Generate a structured PRD from rough requirements or bug reports.
 
 ## Instructions
 
-> **Canonical reference:** `~/.claude/docs/task-mgr-best-practices.md` — recommended flow after this PRD (`/spike` → `/tasks` → `loop init` → `loop run` → `/review-loop` → `/compound`).
+> **Canonical reference:** `~/.claude/docs/task-mgr-best-practices.md` — recommended flow after this PRD (`/spike` → `/prd-tasks` → `loop init` → `loop run` → `/review-loop` → `/compound`).
 
 You are a product manager helping to create a clear, actionable PRD. Follow this process:
 
@@ -198,7 +198,7 @@ task-mgr recall --tags "{domain}" --query "{concept}" --limit 10
 - Also try query-based: `task-mgr recall --query "library evaluation benchmark spike" --limit 10`
 - Past spikes have crashed when the agent tried to run Docker or heavy evaluation code. If the PRD includes evaluation work:
   - Mark the task as `taskType: "research"` with `requiresHuman: true` so the loop agent flags it for human attention
-  - Recommend `estimatedEffort: "high"`; `/tasks` owns any explicit model field assignment
+  - Recommend `estimatedEffort: "high"`; `/prd-tasks` owns any explicit model field assignment
   - Require a clear fallback decision: "if evaluation takes >3 days, default to X and document why"
   - Consider splitting: "define evaluation criteria" (automatable) vs "run benchmarks + write ADR" (requires human)
 - Embed relevant learnings in the PRD's Technical Considerations section so the implementing agent doesn't repeat past mistakes.
@@ -222,7 +222,7 @@ Before generating the PRD, define the public interfaces this change introduces o
 
 3. **Document in PRD**: Add to the "Public Contracts" section in Section 6 (Technical Considerations).
 
-> **Scope**: Only document public-facing interfaces (module APIs, HTTP endpoints, GenServer calls, PubSub topics). Internal helpers are implementation details for `/tasks`.
+> **Scope**: Only document public-facing interfaces (module APIs, HTTP endpoints, GenServer calls, PubSub topics). Internal helpers are implementation details for `/prd-tasks`.
 
 ### Step 4.6: Define Data Flow Contracts
 
@@ -528,7 +528,7 @@ After creating the PRD, provide:
 
 1. File path where PRD was saved
 2. Brief summary of what was documented
-3. Suggested next step: `/tasks tasks/prd-{feature-name}.md`
+3. Suggested next step: `/prd-tasks tasks/prd-{feature-name}.md`
 
 ## Example
 
@@ -562,7 +562,7 @@ Created: tasks/prd-dark-mode.md
 Summary: PRD for dark mode toggle with MVP scope (OS preference + manual override),
 accessible from settings and header quick-toggle, synced to user account.
 
-Next step: Run `/tasks tasks/prd-dark-mode.md` to generate the task breakdown.
+Next step: Run `/prd-tasks tasks/prd-dark-mode.md` to generate the task breakdown.
 ```
 
 ## Notes

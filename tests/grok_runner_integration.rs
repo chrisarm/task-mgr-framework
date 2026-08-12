@@ -23,7 +23,7 @@
 //! real autonomous-loop iteration prompt:
 //!
 //! 1. **CLAUDE.md** — project-level instructions (~11 KB).
-//! 2. **`.claude/commands/tasks.md`** — loop-protocol skill including the
+//! 2. **`.claude/commands/prd-tasks.md`** — loop-protocol skill including the
 //!    control-tag definitions (~61 KB).
 //! 3. **Synthetic learnings** — plausible-looking learning entries that pad
 //!    the prompt into the representative 10–100 KB range.
@@ -94,7 +94,7 @@ fn claude_md_content() -> String {
 /// Read the loop-protocol skill file; fall back to an inline tag summary so
 /// the test is not silently vacuous when the file is missing.
 fn skill_content() -> String {
-    std::fs::read_to_string(".claude/commands/tasks.md").unwrap_or_else(|_| {
+    std::fs::read_to_string(".claude/commands/prd-tasks.md").unwrap_or_else(|_| {
         // Minimal tag protocol so grok still understands the control tags.
         r#"## Task-Mgr Control Tags
 

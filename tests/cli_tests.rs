@@ -2984,19 +2984,14 @@ fn test_init_stages_embedded_skills_into_home() {
 
     let commands = home.join(".claude").join("commands");
     assert!(commands.join("plan-tasks.md").exists());
-    assert!(commands.join("tasks.md").exists());
+    assert!(commands.join("prd-tasks.md").exists());
     assert!(
-        commands.join("prd-tasks.md").exists(),
-        "deprecated alias must be staged"
+        !commands.join("tasks.md").exists(),
+        "the pre-rename name must never be staged"
     );
     assert!(
         commands.join(".task-mgr-skills.json").exists(),
         "manifest must be written"
-    );
-    let alias = fs::read_to_string(commands.join("prd-tasks.md")).unwrap();
-    assert!(
-        alias.starts_with("> **Deprecated**"),
-        "alias must carry the deprecation banner"
     );
 }
 

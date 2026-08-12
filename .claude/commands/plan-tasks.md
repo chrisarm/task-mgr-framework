@@ -181,7 +181,7 @@ These flow directly into each task's flat `qualityDimensions` array and `edgeCas
 | New public APIs            | 0                 | 1-2                | 2-3                       |
 | Existing tests to update   | 0-5               | 5-15               | 15-25                     |
 
-If the task exceeds the upper-medium range (7+ files, 4+ design decisions, 25+ test updates), suggest using `/prd` + `/tasks` instead.
+If the task exceeds the upper-medium range (7+ files, 4+ design decisions, 25+ test updates), suggest using `/prd` + `/prd-tasks` instead.
 
 ### Step 5: Resolve Model IDs
 
@@ -273,7 +273,7 @@ Access: task.acceptance_criteria = serde_json::to_string(&story.acceptanceCriter
 
 1. **Each task = coherent unit of change + its tests.** Don't separate "write code" from "write tests for that code."
 2. **Foundational contracts come first.** If a `/spike` or the problem description identifies an abstraction that multiple stories will depend on, create the `CONTRACT-xxx` predecessor (with full extreme details) before the dependent FEATs. This is the only time a predecessor design task is warranted in the lean path.
-2. **Target 2-10 tasks max.** If you need more, the task is probably Large — use `/prd` + `/tasks`.
+2. **Target 2-10 tasks max.** If you need more, the task is probably Large — use `/prd` + `/prd-tasks`.
 3. **One review gate, at the end.** The loop's scoped per-iteration quality checks (cargo test scoped, clippy, fmt) enforce correctness each iteration; REVIEW-001 runs the FULL gate.
 4. **No separate milestone tasks.** REVIEW-001 IS the milestone.
 5. **Every task has both positive and negative requirements.** What to do AND what not to do. What good looks like AND what bad looks like.
@@ -1042,7 +1042,7 @@ Verify:
   - [ ] Grep the generated prompt for `{{` — zero hits confirms all placeholders substituted
 - [ ] Prompt splits **scoped per-iteration** vs **full-suite at REVIEW-001** quality gates
 - [ ] Documentation needs identified and included in REVIEW-001 criteria
-- [ ] Task count is 2-10 (if more, suggest `/prd` + `/tasks`)
+- [ ] Task count is 2-10 (if more, suggest `/prd` + `/prd-tasks`)
 
 Report:
 
@@ -1068,10 +1068,10 @@ To run: task-mgr loop -y tasks/{feature}.json
 
 ## When NOT to Use This Skill
 
-- **Large tasks** (7+ files, architectural decisions, multiple phases): Use `/prd` → `/tasks`
+- **Large tasks** (7+ files, architectural decisions, multiple phases): Use `/prd` → `/prd-tasks`
 - **Trivial tasks** (typo fix, one-line change): Just do it directly — no task list needed
 - **Uncertain scope** (need to explore extensively before knowing what to build): Use `/prd` first to crystallize requirements
-- **Behavior-modifying changes needing deep consumer analysis**: Use `/prd` + `/tasks` (which supports ANALYSIS tasks and full consumer impact tables)
+- **Behavior-modifying changes needing deep consumer analysis**: Use `/prd` + `/prd-tasks` (which supports ANALYSIS tasks and full consumer impact tables)
 
 ## When to Use This Skill
 

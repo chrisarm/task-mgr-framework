@@ -42,7 +42,7 @@ single file: `src/loop_engine/model.rs` (`FABLE_MODEL` / `OPUS_MODEL` /
 tables). After bumping a value or table there:
 
 ```sh
-cargo run --bin gen-docs   # regenerates the MODELS block (with tier matrix + anchor explanation) in .claude/commands/tasks.md and plan-tasks.md
+cargo run --bin gen-docs   # regenerates the MODELS block (with tier matrix + anchor explanation) in .claude/commands/prd-tasks.md and plan-tasks.md
 ```
 
 CI runs `cargo run --bin gen-docs -- --check` which fails if the doc is stale.
@@ -160,7 +160,7 @@ Canonical forms for new scripts and docs:
 
 See PRD §11 (shim permanence) for the rationale.
 
-**Current recommended process (2026)**: For most work, use plan mode + `/spike` (when uncertainty or a multi-impact abstraction exists) followed by `/plan-tasks` (lean) or light `/tasks`. Full `/prd` + heavy `/tasks` is for large efforts. See the managed "task-mgr workflow" block below for the detailed cheat sheet and flow.
+**Current recommended process (2026)**: For most work, use plan mode + `/spike` (when uncertainty or a multi-impact abstraction exists) followed by `/plan-tasks` (lean) or light `/prd-tasks`. Full `/prd` + heavy `/prd-tasks` is for large efforts. See the managed "task-mgr workflow" block below for the detailed cheat sheet and flow.
 
 <!-- TASK_MGR:BEGIN -->
 ## task-mgr workflow
@@ -193,9 +193,9 @@ This block is managed by `task-mgr enhance` — edits inside the
 
 ### Recommended planning & PRD flow (2026 update)
 
-- **Default for most work**: short plan-mode interview → `/spike "risky area or multi-impact abstraction"` (when the riskiest assumption or a contract used by 2+ stories is unclear) → `/plan-tasks` (lean) or light `/tasks`.
+- **Default for most work**: short plan-mode interview → `/spike "risky area or multi-impact abstraction"` (when the riskiest assumption or a contract used by 2+ stories is unclear) → `/plan-tasks` (lean) or light `/prd-tasks`.
 - `/spike` owns exploration, thin vertical slice, 2-3 approaches, and (when warranted) emits a `CONTRACT-xxx` task for foundational abstractions.
-- Full `/prd "..."` + heavy `/tasks` is reserved for large cross-subsystem efforts. The expensive design critique now lives in the spike.
+- Full `/prd "..."` + heavy `/prd-tasks` is reserved for large cross-subsystem efforts. The expensive design critique now lives in the spike.
 - PRDs contain a new **2.6 Boundary Contracts & Modularity Targets** section. This is the source for `CONTRACT-xxx` tasks (`taskType: "contract"`).
 - Wire dependents with `--depended-on-by CONTRACT-001` (or the PRD milestone). The contract text lives in the progress log.
 

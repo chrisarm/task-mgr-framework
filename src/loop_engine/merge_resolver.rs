@@ -1,44 +1,51 @@
-//! Claude-driven `MergeResolver` for parallel-slot merge-back conflicts.
+//! Provider-agnostic `MergeResolver` for parallel-slot merge-back conflicts.
 //!
 //! When `merge_slot_branches_with_resolver` (FEAT-001) hits a non-zero
-//! `git merge --no-edit` exit, this resolver spawns Claude in slot 0's
-//! already-conflicted worktree, hands it the conflict context, and lets it
-//! commit the resolution (or `git merge --abort`). The merge function then
+//! `git merge --no-edit` exit, this resolver spawns the configured primary
+//! LLM provider in slot 0's already-conflicted worktree, hands it the conflict
+//! context, and lets it commit the resolution (or `git merge --abort`). On any
+//! `Failed` outcome, an optional one-shot fallback to
+//! `models.providers.<primary>.fallback` is attempted. The merge function then
 //! re-validates by inspecting MERGE_HEAD/HEAD, so a dishonest "Resolved" is
 //! caught and downgraded by the caller — this module's contract is only:
 //! pick the right post-spawn outcome based on observable git state.
 //!
-//! Wired by FEAT-003 at the engine wave-merge call site.
+//! Wired at the engine wave-merge call site and startup auto-recovery.
 
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
-use crate::loop_engine::claude::{SpawnOpts, spawn_claude};
 use crate::loop_engine::config::PermissionMode;
+use crate::loop_engine::model::{MergeResolverPlan, Provider, ResolvedModelsConfig};
+use crate::loop_engine::project_config::ProjectConfig;
+use crate::loop_engine::protected_state;
+use crate::loop_engine::runner::{self, RunnerCapability, RunnerOpts, runner_kind_for};
 use crate::loop_engine::signals::SignalFlag;
 use crate::loop_engine::watchdog::TimeoutConfig;
 use crate::loop_engine::worktree::{
     MergeResolver, MergeResolverOutcome, ResolverContext, has_unresolved_merge, rev_parse_head,
 };
+use crate::output::ui;
 
-/// Soft budget (chars) the prompt suggests Claude stay under for narration so
+/// Soft budget (chars) the prompt suggests the agent stay under for narration so
 /// the stream tee remains readable when many slots conflict in one wave. Not
-/// enforced — Claude is allowed to exceed it; the orchestrator never truncates.
+/// enforced — the agent is allowed to exceed it; the orchestrator never truncates.
 const RESPONSE_CHAR_BUDGET_HINT: usize = 4000;
 
-/// Tools Claude must never invoke from inside a merge-resolver spawn. The
-/// list is enforced via `--disallowedTools` so even prompt-injection through
-/// adversarial commit messages on the ephemeral branch (which the prompt
-/// directs Claude to read) cannot trigger destructive history-rewriting or
-/// network-publishing operations. Listed prefix-style; anything starting with
+/// Tools runners that support `DisallowedTools` must never invoke from inside
+/// a merge-resolver spawn. Enforced via `--disallowedTools` /
+/// `--disallowed-tools` so even prompt-injection through adversarial commit
+/// messages on the ephemeral branch cannot trigger destructive history-rewriting
+/// or network-publishing operations. Listed prefix-style; anything starting with
 /// the matched form is denied. Intentionally does NOT include `git reset` —
 /// the resolver is allowed to use `git merge --abort` (which uses a reset
 /// internally), and a blanket reset prohibition would break that path. The
 /// prompt's textual prohibition handles the residual `reset --hard <other>`
 /// risk; combined with `working_dir` scoping that is the defense-in-depth
-/// posture.
+/// posture. Codex does not support this flag — it relies on the prompt +
+/// `protected_state` snapshot instead.
 const RESOLVER_DISALLOWED_TOOLS: &str = "Bash(git push:*),\
 Bash(git push --force:*),\
 Bash(git push --force-with-lease:*),\
@@ -50,21 +57,22 @@ Bash(git reflog expire:*),\
 Bash(git update-ref:*),\
 Bash(git commit --amend:*)";
 
-/// Coarse summary of a `spawn_claude` call, used only by `infer_outcome` so
-/// the inference logic stays a pure function (no `ClaudeResult`/IO types).
+/// Coarse summary of a runner spawn, used only by `infer_outcome` so
+/// the inference logic stays a pure function (no runner/IO types).
 ///
 /// `Success` / `NonZero` / `TimedOut` come from a successfully-spawned
-/// process; `SpawnErr` represents a `spawn_claude` `Err(...)` (binary
-/// missing, ENOENT, etc.) where no inspection was possible.
+/// process; `SpawnErr` represents a dispatch `Err(...)` (binary missing,
+/// auth failure, capability reject, ENOENT, etc.) where no inspection was
+/// possible.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum SpawnSummary {
+pub(crate) enum SpawnSummary {
     Success,
     NonZero(i32),
     TimedOut(u64),
     SpawnErr(String),
 }
 
-/// Inspect the worktree after Claude has exited and return `(merge_head_present,
+/// Inspect the worktree after the agent has exited and return `(merge_head_present,
 /// head_changed)`. Fails with a descriptive message if either git probe errors.
 fn probe_post_spawn(slot0_path: &Path, pre_merge_head: &str) -> Result<(bool, bool), String> {
     let merge_head_present = has_unresolved_merge(slot0_path)
@@ -77,9 +85,9 @@ fn probe_post_spawn(slot0_path: &Path, pre_merge_head: &str) -> Result<(bool, bo
 
 /// Map post-spawn git state to a `MergeResolverOutcome`.
 ///
-/// Pure: takes only the booleans + spawn summary, returns the outcome. The
-/// caller in `merge_slot_branches_with_resolver` already re-validates a
-/// returned `Resolved`, so this function trusts observable state when both
+/// Pure: takes only the booleans + spawn summary + provider label, returns the
+/// outcome. The caller in `merge_slot_branches_with_resolver` already re-validates
+/// a returned `Resolved`, so this function trusts observable state when both
 /// the merge state AND the spawn agree (MERGE_HEAD absent + HEAD advanced +
 /// success exit). A non-zero/timed-out exit is treated as Failed regardless
 /// of state — losing the crash signal would mask a genuinely broken run that
@@ -99,24 +107,30 @@ fn infer_outcome(
     merge_head_present: bool,
     head_changed: bool,
     spawn_result: &SpawnSummary,
+    provider_label: &str,
 ) -> MergeResolverOutcome {
     if let SpawnSummary::SpawnErr(msg) = spawn_result {
         return MergeResolverOutcome::Failed(format!("spawn error: {}", msg));
     }
     if merge_head_present {
         let reason = match spawn_result {
-            SpawnSummary::TimedOut(secs) => format!("Claude timed out after {}s", secs),
-            SpawnSummary::NonZero(code) => format!("Claude exited with code {}", code),
-            SpawnSummary::Success => {
-                "incomplete: MERGE_HEAD still set after Claude exited cleanly".to_string()
+            SpawnSummary::TimedOut(secs) => {
+                format!("{} timed out after {}s", provider_label, secs)
             }
+            SpawnSummary::NonZero(code) => {
+                format!("{} exited with code {}", provider_label, code)
+            }
+            SpawnSummary::Success => format!(
+                "incomplete: MERGE_HEAD still set after {} exited cleanly",
+                provider_label
+            ),
             SpawnSummary::SpawnErr(_) => unreachable!("handled above"),
         };
         return MergeResolverOutcome::Failed(reason);
     }
     // MERGE_HEAD absent — but a non-zero or timed-out exit still means the
     // resolver run was unhealthy. Don't silently downgrade a crash to Aborted
-    // just because the tree looks clean (Claude could have aborted then
+    // just because the tree looks clean (agent could have aborted then
     // panicked, or never aborted but exited late after a previous abort).
     let state = if head_changed {
         "HEAD advanced"
@@ -124,26 +138,28 @@ fn infer_outcome(
         "HEAD unchanged"
     };
     match spawn_result {
-        SpawnSummary::TimedOut(secs) => {
-            MergeResolverOutcome::Failed(format!("Claude timed out after {}s ({})", secs, state))
-        }
-        SpawnSummary::NonZero(code) => {
-            MergeResolverOutcome::Failed(format!("Claude exited with code {} ({})", code, state))
-        }
+        SpawnSummary::TimedOut(secs) => MergeResolverOutcome::Failed(format!(
+            "{} timed out after {}s ({})",
+            provider_label, secs, state
+        )),
+        SpawnSummary::NonZero(code) => MergeResolverOutcome::Failed(format!(
+            "{} exited with code {} ({})",
+            provider_label, code, state
+        )),
         SpawnSummary::Success if head_changed => MergeResolverOutcome::Resolved,
         SpawnSummary::Success => MergeResolverOutcome::Aborted,
         SpawnSummary::SpawnErr(_) => unreachable!("handled at top"),
     }
 }
 
-/// Build the prompt handed to Claude in slot 0's conflicted worktree.
+/// Build the prompt handed to the coding agent in slot 0's conflicted worktree.
 ///
 /// The prompt scopes the work to the listed files only (no broad refactors),
 /// names the ephemeral branch being merged in, and spells out the two valid
 /// exits — `git commit --no-edit` after resolving every marker, or
 /// `git merge --abort` if it judges the conflict unresolvable. Explicit
 /// prohibitions for `git push`, branch deletion, and resets outside the
-/// merge keep Claude from writing to shared state if it goes off-script.
+/// merge keep the agent from writing to shared state if it goes off-script.
 ///
 /// Pure / no IO. Tested by literal substring assertion.
 fn build_resolver_prompt(
@@ -211,90 +227,232 @@ need to summarize the resolution — just do the work and exit.\n",
     )
 }
 
-/// `MergeResolver` that spawns Claude in slot 0's conflicted worktree.
+/// Spawn override used by unit tests to avoid real CLI binaries. Production
+/// always leaves this `None` and routes through `runner::dispatch`.
+pub(crate) type MergeSpawnOverride =
+    Arc<dyn Fn(Provider, Option<&str>) -> SpawnSummary + Send + Sync>;
+
+/// `MergeResolver` that dispatches to the configured primary (and optional
+/// fallback) LLM provider in slot 0's conflicted worktree.
 ///
-/// Wired by FEAT-003 at the engine wave-merge call site. Holds borrowed
-/// references to the loop's signal flag and DB dir for the duration of a
-/// single wave's merge-back, plus the resolved Claude model and a
-/// configurable per-conflict timeout.
-pub(crate) struct ClaudeMergeResolver<'a> {
-    /// Loop's resolved default Claude model — passed straight through to
-    /// `--model`. Owned `String` so the resolver outlives any per-call
-    /// borrow site.
-    pub model: String,
+/// Wired at the engine wave-merge call site and startup auto-recovery. Holds
+/// borrowed references to the loop's signal flag and DB/tasks dirs for the
+/// duration of a single wave's merge-back, plus the resolved provider plan and
+/// a configurable per-conflict timeout.
+pub(crate) struct LlmMergeResolver<'a> {
+    pub primary_provider: Provider,
+    pub primary_model: Option<String>,
+    pub fallback_provider: Option<Provider>,
+    pub fallback_model: Option<String>,
     /// `TASK_MGR_DIR` to pin for the spawned subprocess. None disables.
     pub db_dir: Option<&'a Path>,
+    /// Tasks directory for Codex `protected_state` snapshots. None skips the
+    /// guard even for Codex (tests / callers without a tasks dir).
+    pub tasks_dir: Option<&'a Path>,
     /// Loop's shared signal flag so SIGINT/SIGTERM kills the resolver too.
     pub signal_flag: Option<&'a SignalFlag>,
-    /// Hard cap on a single merge-resolution Claude run.
-    pub claude_timeout: Duration,
-    /// `--effort` value handed to Claude. Defaults the engine to "medium";
-    /// projects with frequent semantic conflicts can configure "high".
+    /// Hard cap on a single merge-resolution provider run.
+    pub timeout: Duration,
+    /// Effort value handed to the runner when it supports Effort. Defaults the
+    /// engine to "medium"; projects with frequent semantic conflicts can
+    /// configure "high".
     pub effort: String,
+    /// When set, called instead of `runner::dispatch`. Production always
+    /// leaves this `None`.
+    pub spawn_override: Option<MergeSpawnOverride>,
 }
 
-impl<'a> ClaudeMergeResolver<'a> {
-    /// Build the prompt, construct spawn options, call `spawn_claude`, and map
-    /// the result to a `SpawnSummary`. No git IO; pure subprocess orchestration.
-    fn run_resolver_spawn(&self, ctx: &ResolverContext<'_>) -> SpawnSummary {
+impl<'a> LlmMergeResolver<'a> {
+    /// Build from a [`MergeResolverPlan`] + project knobs. Shared by live waves
+    /// and startup auto-recovery so plan resolution cannot drift.
+    pub fn from_config(
+        resolved: &ResolvedModelsConfig,
+        project_config: &ProjectConfig,
+        signal_flag: Option<&'a SignalFlag>,
+        db_dir: Option<&'a Path>,
+        tasks_dir: Option<&'a Path>,
+    ) -> Self {
+        let plan = crate::loop_engine::model::merge_resolver_plan(resolved);
+        Self::from_plan(
+            &plan,
+            project_config
+                .merge_resolver_effort
+                .clone()
+                .unwrap_or_else(|| "medium".to_string()),
+            Duration::from_secs(project_config.merge_resolver_timeout_secs.unwrap_or(600)),
+            signal_flag,
+            db_dir,
+            tasks_dir,
+        )
+    }
+
+    /// Build from an already-resolved plan (tests / callers that own the plan).
+    pub fn from_plan(
+        plan: &MergeResolverPlan<'_>,
+        effort: String,
+        timeout: Duration,
+        signal_flag: Option<&'a SignalFlag>,
+        db_dir: Option<&'a Path>,
+        tasks_dir: Option<&'a Path>,
+    ) -> Self {
+        Self {
+            primary_provider: plan.primary.provider,
+            primary_model: plan.primary.model.map(str::to_string),
+            fallback_provider: plan.fallback.map(|f| f.provider),
+            fallback_model: plan.fallback.and_then(|f| f.model.map(str::to_string)),
+            db_dir,
+            tasks_dir,
+            signal_flag,
+            timeout,
+            effort,
+            spawn_override: None,
+        }
+    }
+
+    /// Dispatch (or override) for one provider attempt and map to `SpawnSummary`.
+    fn run_resolver_spawn(
+        &self,
+        provider: Provider,
+        model: Option<&str>,
+        ctx: &ResolverContext<'_>,
+    ) -> SpawnSummary {
+        if let Some(ref override_fn) = self.spawn_override {
+            return override_fn(provider, model);
+        }
+
         let prompt = build_resolver_prompt(ctx.slot, ctx.ephemeral_branch, ctx.conflicted_files);
+        let kind = runner_kind_for(provider);
         let timeout = TimeoutConfig {
-            base_timeout: self.claude_timeout,
+            base_timeout: self.timeout,
             initial_extension: Duration::from_secs(0),
             last_activity_epoch: Arc::new(AtomicU64::new(0)),
         };
         let permission_mode = PermissionMode::Auto {
             allowed_tools: None,
         };
-        match spawn_claude(
+        let effort = if kind.supports(RunnerCapability::Effort) {
+            Some(self.effort.as_str())
+        } else {
+            None
+        };
+        let disallowed_tools = if kind.supports(RunnerCapability::DisallowedTools) {
+            Some(RESOLVER_DISALLOWED_TOOLS)
+        } else {
+            None
+        };
+
+        // Codex (and any future state-guarded runner): snapshot orchestrator-
+        // owned files before the agent can rewrite them.
+        let protected_snapshot = match (self.db_dir, self.tasks_dir) {
+            (Some(db), Some(tasks)) => protected_state::Snapshot::take(db, tasks, kind),
+            _ => None,
+        };
+
+        let spawn_result = runner::dispatch(
+            kind,
             &prompt,
             &permission_mode,
-            SpawnOpts {
+            RunnerOpts {
                 signal_flag: self.signal_flag,
                 working_dir: Some(ctx.slot0_path),
-                model: Some(self.model.as_str()),
-                effort: Some(self.effort.as_str()),
+                model,
                 timeout: Some(timeout),
+                stream_json: false,
+                effort,
+                disallowed_tools,
                 db_dir: self.db_dir,
-                disallowed_tools: Some(RESOLVER_DISALLOWED_TOOLS),
-                ..SpawnOpts::default()
+                use_pty: false,
+                ..RunnerOpts::default()
             },
-        ) {
-            Ok(result) if result.timed_out => SpawnSummary::TimedOut(self.claude_timeout.as_secs()),
+        );
+
+        if let Some(ref snap) = protected_snapshot {
+            // Best-effort restore; merge resolution continues either way.
+            // Fatal SQLite corruption is logged but does not change the spawn
+            // summary — the merge caller's HEAD re-validation is authoritative
+            // for whether the slot is considered resolved.
+            let _ = protected_state::apply_verify_outcome(snap, "merge-resolver");
+        }
+
+        match spawn_result {
+            Ok(result) if result.timed_out => SpawnSummary::TimedOut(self.timeout.as_secs()),
             Ok(result) if result.exit_code == 0 => SpawnSummary::Success,
             Ok(result) => SpawnSummary::NonZero(result.exit_code),
             Err(e) => SpawnSummary::SpawnErr(e.to_string()),
         }
     }
-}
 
-impl<'a> MergeResolver for ClaudeMergeResolver<'a> {
-    fn resolve(&self, ctx: ResolverContext<'_>) -> MergeResolverOutcome {
-        // Defensive short-circuit: no conflicts means nothing for Claude to
-        // act on; a spawn here would let it freelance an unrelated edit.
-        if ctx.conflicted_files.is_empty() {
-            return MergeResolverOutcome::Failed(
-                "no conflicts reported, refusing to spawn (likely dirty WT blocked merge precondition; preflight should have prevented this — see worktree::prepare_slot0_for_merge; if this fires, check for non-gitignored dirty files in slot 0)".to_string(),
-            );
-        }
-        let spawn_summary = self.run_resolver_spawn(&ctx);
+    /// One full resolve attempt for a single provider: spawn + probe + infer.
+    fn resolve_once(
+        &self,
+        provider: Provider,
+        model: Option<&str>,
+        ctx: &ResolverContext<'_>,
+    ) -> MergeResolverOutcome {
+        let label = provider.as_str();
+        let spawn_summary = self.run_resolver_spawn(provider, model, ctx);
         // SpawnErr: worktree is unchanged past the original failed merge, so
         // MERGE_HEAD is definitionally still set. Skip git probes.
         if let SpawnSummary::SpawnErr(_) = &spawn_summary {
-            return infer_outcome(true, false, &spawn_summary);
+            return infer_outcome(true, false, &spawn_summary, label);
         }
         match probe_post_spawn(ctx.slot0_path, ctx.pre_merge_head) {
             Ok((merge_head_present, head_changed)) => {
-                infer_outcome(merge_head_present, head_changed, &spawn_summary)
+                infer_outcome(merge_head_present, head_changed, &spawn_summary, label)
             }
             Err(e) => MergeResolverOutcome::Failed(e),
         }
     }
 }
 
+impl<'a> MergeResolver for LlmMergeResolver<'a> {
+    fn resolve(&self, ctx: ResolverContext<'_>) -> MergeResolverOutcome {
+        // Defensive short-circuit: no conflicts means nothing for the agent to
+        // act on; a spawn here would let it freelance an unrelated edit.
+        if ctx.conflicted_files.is_empty() {
+            return MergeResolverOutcome::Failed(
+                "no conflicts reported, refusing to spawn (likely dirty WT blocked merge precondition; preflight should have prevented this — see worktree::prepare_slot0_for_merge; if this fires, check for non-gitignored dirty files in slot 0)".to_string(),
+            );
+        }
+
+        let primary_outcome = self.resolve_once(
+            self.primary_provider,
+            self.primary_model.as_deref(),
+            &ctx,
+        );
+        match &primary_outcome {
+            MergeResolverOutcome::Resolved | MergeResolverOutcome::Aborted => primary_outcome,
+            MergeResolverOutcome::Failed(primary_msg) => {
+                let Some(fb_provider) = self.fallback_provider else {
+                    return primary_outcome;
+                };
+                // Only retry when the conflict is still live. If primary left
+                // MERGE_HEAD cleared (e.g. aborted then crashed), re-spawning
+                // is pointless / dangerous.
+                let still_conflicted = has_unresolved_merge(ctx.slot0_path).unwrap_or(true);
+                if !still_conflicted {
+                    return primary_outcome;
+                }
+                ui::emit(&format!(
+                    "merge resolver: primary {} failed ({}); retrying with fallback {}",
+                    self.primary_provider.as_str(),
+                    primary_msg,
+                    fb_provider.as_str()
+                ));
+                self.resolve_once(fb_provider, self.fallback_model.as_deref(), &ctx)
+            }
+        }
+    }
+}
+
+// Re-export SpawnSummary constructors for the override type in tests via a
+// thin public test helper module pattern — tests in this file use the private
+// enum directly.
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     // --- build_resolver_prompt ---
 
@@ -337,7 +495,7 @@ mod tests {
 
     #[test]
     fn disallowed_tools_blocks_destructive_git_operations() {
-        // The constant feeds directly into spawn_claude's --disallowedTools.
+        // The constant feeds into runners that support DisallowedTools.
         // If any of these regress, the prompt-injection defense lapses.
         for forbidden in [
             "Bash(git push:*)",
@@ -361,7 +519,6 @@ mod tests {
     #[test]
     fn prompt_includes_marker_triplet() {
         let prompt = build_resolver_prompt(1, "any-branch", &["x.rs".into()]);
-        // All three marker types per spec (d/c instructions).
         assert!(prompt.contains("<<<<<<<"));
         assert!(prompt.contains("======="));
         assert!(prompt.contains(">>>>>>>"));
@@ -372,7 +529,7 @@ mod tests {
         let prompt = build_resolver_prompt(1, "b", &["f.rs".into()]);
         assert!(
             prompt.contains(&RESPONSE_CHAR_BUDGET_HINT.to_string()),
-            "must reference the char cap so Claude knows the budget"
+            "must reference the char cap so the agent knows the budget"
         );
     }
 
@@ -389,23 +546,24 @@ mod tests {
 
     #[test]
     fn infer_resolved_when_merge_head_absent_and_head_advanced() {
-        let outcome = infer_outcome(false, true, &SpawnSummary::Success);
+        let outcome = infer_outcome(false, true, &SpawnSummary::Success, "claude");
         assert_eq!(outcome, MergeResolverOutcome::Resolved);
     }
 
     #[test]
     fn infer_aborted_when_merge_head_absent_and_head_unchanged() {
-        let outcome = infer_outcome(false, false, &SpawnSummary::Success);
+        let outcome = infer_outcome(false, false, &SpawnSummary::Success, "claude");
         assert_eq!(outcome, MergeResolverOutcome::Aborted);
     }
 
     #[test]
     fn infer_failed_when_merge_head_present_with_clean_exit() {
-        let outcome = infer_outcome(true, false, &SpawnSummary::Success);
+        let outcome = infer_outcome(true, false, &SpawnSummary::Success, "grok");
         match outcome {
             MergeResolverOutcome::Failed(msg) => {
                 assert!(msg.contains("incomplete"), "got: {}", msg);
                 assert!(msg.contains("MERGE_HEAD"), "got: {}", msg);
+                assert!(msg.contains("grok"), "must name provider: {}", msg);
             }
             other => panic!("expected Failed, got {:?}", other),
         }
@@ -413,11 +571,12 @@ mod tests {
 
     #[test]
     fn infer_failed_when_merge_head_present_with_timeout() {
-        let outcome = infer_outcome(true, false, &SpawnSummary::TimedOut(600));
+        let outcome = infer_outcome(true, false, &SpawnSummary::TimedOut(600), "codex");
         match outcome {
             MergeResolverOutcome::Failed(msg) => {
                 assert!(msg.contains("timed out"), "got: {}", msg);
                 assert!(msg.contains("600"), "must include duration: {}", msg);
+                assert!(msg.contains("codex"), "must name provider: {}", msg);
             }
             other => panic!("expected Failed, got {:?}", other),
         }
@@ -425,7 +584,7 @@ mod tests {
 
     #[test]
     fn infer_failed_when_merge_head_present_with_nonzero_exit() {
-        let outcome = infer_outcome(true, true, &SpawnSummary::NonZero(2));
+        let outcome = infer_outcome(true, true, &SpawnSummary::NonZero(2), "claude");
         match outcome {
             MergeResolverOutcome::Failed(msg) => {
                 assert!(msg.contains("code 2"), "got: {}", msg);
@@ -437,8 +596,8 @@ mod tests {
     #[test]
     fn infer_failed_when_clean_state_but_nonzero_exit() {
         // S1 fix: a non-zero exit must not be silently downgraded to Aborted
-        // just because MERGE_HEAD is absent. Could be a Claude crash post-abort.
-        let outcome = infer_outcome(false, false, &SpawnSummary::NonZero(2));
+        // just because MERGE_HEAD is absent. Could be a crash post-abort.
+        let outcome = infer_outcome(false, false, &SpawnSummary::NonZero(2), "claude");
         match outcome {
             MergeResolverOutcome::Failed(msg) => {
                 assert!(msg.contains("code 2"), "got: {}", msg);
@@ -450,9 +609,7 @@ mod tests {
 
     #[test]
     fn infer_failed_when_clean_state_but_timed_out() {
-        // S1 fix: same as above for timeouts. Watchdog-killed runs must not
-        // pretend to be Aborted.
-        let outcome = infer_outcome(false, true, &SpawnSummary::TimedOut(600));
+        let outcome = infer_outcome(false, true, &SpawnSummary::TimedOut(600), "claude");
         match outcome {
             MergeResolverOutcome::Failed(msg) => {
                 assert!(msg.contains("timed out"), "got: {}", msg);
@@ -468,7 +625,8 @@ mod tests {
         let outcome = infer_outcome(
             false,
             true,
-            &SpawnSummary::SpawnErr("ENOENT: claude binary not found".into()),
+            &SpawnSummary::SpawnErr("ENOENT: binary not found".into()),
+            "grok",
         );
         match outcome {
             MergeResolverOutcome::Failed(msg) => {
@@ -483,25 +641,39 @@ mod tests {
         }
     }
 
-    // --- ClaudeMergeResolver short-circuit ---
+    // --- LlmMergeResolver short-circuit + fallback ---
 
-    /// AC: empty `conflicted_files` returns Failed without spawning Claude.
-    /// Uses `CLAUDE_BINARY=/nonexistent/binary` so that IF the resolver
-    /// failed to short-circuit, the spawn would error with a different
-    /// message. The exact-substring assertion distinguishes the two paths.
+    fn base_resolver<'a>(
+        signal_flag: &'a SignalFlag,
+        spawn_override: Option<MergeSpawnOverride>,
+    ) -> LlmMergeResolver<'a> {
+        LlmMergeResolver {
+            primary_provider: Provider::Grok,
+            primary_model: Some("grok-build".into()),
+            fallback_provider: Some(Provider::Claude),
+            fallback_model: Some("claude-opus-5".into()),
+            db_dir: None,
+            tasks_dir: None,
+            signal_flag: Some(signal_flag),
+            timeout: Duration::from_secs(60),
+            effort: "medium".to_string(),
+            spawn_override,
+        }
+    }
+
+    /// AC: empty `conflicted_files` returns Failed without spawning.
     #[test]
     fn empty_conflicted_files_short_circuits_failed_without_spawn() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_c = Arc::clone(&calls);
         let signal_flag = SignalFlag::new();
-        let resolver = ClaudeMergeResolver {
-            model: "test-model".to_string(),
-            db_dir: None,
-            signal_flag: Some(&signal_flag),
-            claude_timeout: Duration::from_secs(60),
-            effort: "medium".to_string(),
-        };
-        // Note: we deliberately pass a path that doesn't exist; the
-        // short-circuit must trigger before any git/claude call would
-        // touch it.
+        let resolver = base_resolver(
+            &signal_flag,
+            Some(Arc::new(move |_p, _m| {
+                calls_c.fetch_add(1, Ordering::SeqCst);
+                SpawnSummary::Success
+            })),
+        );
         let outcome = resolver.resolve(ResolverContext {
             slot: 1,
             slot0_path: Path::new("/this/path/does/not/exist/xyzzy"),
@@ -524,5 +696,109 @@ mod tests {
             }
             other => panic!("expected Failed(no conflicts...), got {:?}", other),
         }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "must not spawn when conflicted_files is empty"
+        );
+    }
+
+    /// Primary SpawnErr + configured fallback: fallback is invoked.
+    /// Uses a non-existent path so probe_post_spawn on fallback Success
+    /// path fails the probe → Failed (still proves fallback was called).
+    #[test]
+    fn fallback_invoked_when_primary_spawn_fails() {
+        let calls: Arc<std::sync::Mutex<Vec<Provider>>> = Arc::new(std::sync::Mutex::new(vec![]));
+        let calls_c = Arc::clone(&calls);
+        let signal_flag = SignalFlag::new();
+        let resolver = base_resolver(
+            &signal_flag,
+            Some(Arc::new(move |p, _m| {
+                calls_c.lock().unwrap().push(p);
+                match p {
+                    Provider::Grok => SpawnSummary::SpawnErr("ENOENT: grok missing".into()),
+                    Provider::Claude => SpawnSummary::SpawnErr("ENOENT: claude missing".into()),
+                    other => SpawnSummary::SpawnErr(format!("unexpected {other:?}")),
+                }
+            })),
+        );
+        let outcome = resolver.resolve(ResolverContext {
+            slot: 1,
+            // Path does not need to exist for SpawnErr (skips probes).
+            slot0_path: Path::new("/this/path/does/not/exist/xyzzy"),
+            ephemeral_branch: "feat-x-slot-1",
+            conflicted_files: &["src/foo.rs".into()],
+            pre_merge_head: "deadbeef",
+        });
+        match outcome {
+            MergeResolverOutcome::Failed(msg) => {
+                assert!(msg.contains("spawn error"), "got: {}", msg);
+            }
+            other => panic!("expected Failed after both spawns fail, got {:?}", other),
+        }
+        let seen = calls.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![Provider::Grok, Provider::Claude],
+            "primary then fallback must both run on primary SpawnErr"
+        );
+    }
+
+    /// Aborted (success + head unchanged) must NOT fire fallback.
+    /// We simulate that without git by overriding spawn to Success and
+    /// making probe return head-unchanged — but probe needs real git.
+    /// Instead: unit-test the match arm logic by verifying a Success
+    /// SpawnErr path that... actually for Aborted we need MERGE_HEAD
+    /// absent. Skip full Aborted-no-fallback integration here; the pure
+    /// `infer_outcome` Aborted case is covered, and resolve only falls
+    /// through on Failed.
+    #[test]
+    fn no_fallback_when_fallback_not_configured() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_c = Arc::clone(&calls);
+        let signal_flag = SignalFlag::new();
+        let mut resolver = base_resolver(
+            &signal_flag,
+            Some(Arc::new(move |_p, _m| {
+                calls_c.fetch_add(1, Ordering::SeqCst);
+                SpawnSummary::SpawnErr("boom".into())
+            })),
+        );
+        resolver.fallback_provider = None;
+        resolver.fallback_model = None;
+        let outcome = resolver.resolve(ResolverContext {
+            slot: 1,
+            slot0_path: Path::new("/this/path/does/not/exist/xyzzy"),
+            ephemeral_branch: "feat-x-slot-1",
+            conflicted_files: &["src/foo.rs".into()],
+            pre_merge_head: "deadbeef",
+        });
+        assert!(matches!(outcome, MergeResolverOutcome::Failed(_)));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "without fallback only primary may spawn"
+        );
+    }
+
+    #[test]
+    fn from_plan_copies_primary_and_fallback() {
+        let plan = MergeResolverPlan {
+            primary: crate::loop_engine::model::AuxiliaryLlmPlan {
+                provider: Provider::Grok,
+                model: Some("grok-build"),
+            },
+            fallback: Some(crate::loop_engine::model::AuxiliaryLlmPlan {
+                provider: Provider::Claude,
+                model: Some("claude-opus-5"),
+            }),
+        };
+        let r = LlmMergeResolver::from_plan(&plan, "high".into(), Duration::from_secs(120), None, None, None);
+        assert_eq!(r.primary_provider, Provider::Grok);
+        assert_eq!(r.primary_model.as_deref(), Some("grok-build"));
+        assert_eq!(r.fallback_provider, Some(Provider::Claude));
+        assert_eq!(r.fallback_model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(r.effort, "high");
+        assert_eq!(r.timeout, Duration::from_secs(120));
     }
 }
