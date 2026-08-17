@@ -304,8 +304,9 @@ pub fn handle_overflow(params: HandleOverflowParams<'_>) -> RecoveryAction {
         RecoveryAction::FallbackToProvider { ref model, .. } => {
             let _ = TaskLifecycle::new(conn).resurrect_with_model_override(task_id, model);
         }
+        // Rungs 1–3: in_progress → todo only (claimed row; overflow runs before pipeline).
         _ => {
-            let _ = TaskLifecycle::new(conn).resurrect_for_iteration(None, &[task_id]);
+            let _ = TaskLifecycle::new(conn).recover_in_progress(task_id);
         }
     }
 

@@ -2,15 +2,18 @@
 //!
 //! This module owns every mutation of the `tasks.status` column plus its
 //! side effects (`run_tasks` bookkeeping, PRD JSON sync, decay columns,
-//! notes formatting, exact stderr warning shape). Six public verbs cover
-//! all five audit categories from PRD §6:
+//! notes formatting, exact stderr warning shape). Public verbs cover all
+//! five audit categories from PRD §6:
 //!
 //! - **Category A** (user-intent + LoopStatusTag) — [`TaskLifecycle::apply`]
 //! - **Category B** (race-safe pre-claim) — [`TaskLifecycle::try_claim`]
-//! - **Category C** (bulk recovery) —
+//! - **Category C** (bulk + per-id recovery) —
 //!   [`TaskLifecycle::recover_in_progress_for_prefix`],
+//!   [`TaskLifecycle::recover_in_progress`],
+//!   [`TaskLifecycle::reopen_after_merge_fail`],
 //!   [`TaskLifecycle::auto_block_after_failures`],
 //!   [`TaskLifecycle::resurrect_for_iteration`],
+//!   [`TaskLifecycle::resurrect_with_model_override`],
 //!   [`TaskLifecycle::decay_reset`]
 //! - **Category D** (PRD-driven) — [`TaskLifecycle::reconcile_from_prd`]
 //! - **Category D** (doctor heuristic) — [`TaskLifecycle::repair_stale`]
@@ -19,6 +22,12 @@
 //! doctor sub-decision: doctor never consults the PRD JSON and its
 //! source-allowance set ([`TransitionSource::DoctorRepair`]) is narrower
 //! than `ReconcilePrd`. Folding them is explicitly prohibited.
+//!
+//! Per-id orphan reclaim vs merge-fail reopen are **two predicates**
+//! ([`TaskLifecycle::recover_in_progress`] vs
+//! [`TaskLifecycle::reopen_after_merge_fail`]); do not collapse them into
+//! one `in_progress`-only helper. `resurrect_for_iteration` stays the
+//! unguarded force-any-status escape hatch (learning #4358).
 //!
 //! # Hard contracts preserved bit-identically
 //!

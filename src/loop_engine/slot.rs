@@ -77,8 +77,8 @@ fn slot_early_exit(slot: &SlotContext, exit: SlotEarlyExit) -> SlotResult {
             shown_learning_ids: Vec::new(),
         },
         // Early exit always runs after a successful claim (the slot thread
-        // started); the orphan reset must consider this task pending until
-        // process_slot_result clears it.
+        // started); keep the id on the pending tracker until process_slot_result
+        // drains it on `:done` (or step 17.6 reclaims if still in_progress).
         claim_succeeded: true,
         shown_learning_ids: slot.prompt_bundle.shown_learning_ids.clone(),
         prompt_for_overflow: None,
@@ -448,9 +448,11 @@ pub(super) fn claim_slot_task(conn: &mut Connection, task_id: &str) -> bool {
 ///
 /// `claim_succeeded` distinguishes two cases:
 ///   - `true`: claim went through, but the slot thread later panicked / crashed
-///     while its task was already `in_progress` — the orphan reset must run.
-///   - `false`: claim itself failed (task already `done`/`blocked`) and no row
-///     was ever moved to `in_progress` — orphan reset must skip this entry.
+///     while its task was already `in_progress` — keep the id on
+///     `pending_slot_tasks` so step 17.6 can `recover_in_progress` if the
+///     row is still stranded.
+///   - `false`: claim itself failed (task already terminal) and no row was
+///     ever moved to `in_progress` — do not list the id; reclaim is a no-op.
 ///
 /// `shown_learning_ids` is left empty on this path: the bundle was either
 /// never built (claim failed) or has been moved into the panicked worker
@@ -519,10 +521,10 @@ pub(super) fn process_slot_result(
     let slot_idx = slot_result.slot_index;
     let task_id = slot_result.iteration_result.task_id.clone();
 
-    // Track every claimed slot task as pending until we observe a "done"
-    // signal for it. The post-loop cleanup uses this to reset rows still in
-    // `in_progress` when the loop exits via deadline / max-iterations rather
-    // than waiting for the next process's step 6.6 recovery.
+    // Tracker hygiene: list every successfully claimed id. Drain is
+    // `:done`-only (and merge-fail retain elsewhere) — not orphan policy.
+    // Step 17.6 reclaims with recover_in_progress (still-in_progress only);
+    // honest terminals may remain listed until exit without being reopened.
     if slot_result.claim_succeeded
         && let Some(ref tid) = task_id
         && !ctx.pending_slot_tasks.contains(tid)
@@ -654,11 +656,11 @@ pub(super) fn process_slot_result(
 
     slot_result.iteration_result.key_decisions_count = processing_outcome.key_decisions_count;
 
-    // The claimed task was completed in this pass iff its id appears in the
-    // pipeline's deduped completion list. Cross-task `<completed>Y</completed>`
-    // entries land in the list too but never satisfy this predicate — Y stays
-    // out of `pending_slot_tasks` (it was a peer slot's task or was already
-    // terminal), so the orphan-reset semantics are preserved.
+    // `completed_task_ids` is done-only. Drain the claimed id from the
+    // pending tracker on `:done` (tracker hygiene — not the orphan gate).
+    // Cross-task `<completed>Y</completed>` peers never match this slot's id.
+    // Honest terminals do not drain here; step 17.6 still lists them but
+    // `recover_in_progress` refuses to reopen.
     let slot_marked_done = task_id
         .as_ref()
         .map(|tid| {

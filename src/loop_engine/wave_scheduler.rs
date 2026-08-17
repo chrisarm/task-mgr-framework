@@ -451,10 +451,10 @@ pub(crate) fn classify_drained_queue(
 ///   the symmetric "all tasks complete" relabel is optional polish.
 ///
 /// MUST be called ONLY on the outer post-`while` path, BEFORE step 17.5
-/// `reset_task_to_todo` — after that reset the only-terminal rows would make a
-/// budget-exhausted PRD falsely report complete. Never call it from wave
-/// terminal paths, `classify_drained_queue` short-circuits, or `should_stop`
-/// match arms.
+/// orphan reclaim (`reset_orphan_claim_to_todo`) — after a true-orphan reset
+/// the only-terminal rows would make a budget-exhausted PRD falsely report
+/// complete. Never call it from wave terminal paths, `classify_drained_queue`
+/// short-circuits, or `should_stop` match arms.
 ///
 /// Failure mode: a `count_remaining_active_tasks` query failure returns 0 (per
 /// the existing helper), which this treats as drained — documented existing
@@ -514,26 +514,50 @@ fn wait_inter_wave_delay(delay: Duration, signal_flag: &SignalFlag) -> bool {
     false
 }
 
-/// Reset a listed task back to `todo` (used by wave FEAT-002 and overflow
-/// recovery rungs). The per-ID `resurrect_for_iteration` verb intentionally
-/// accepts any status for the IDs in the list — callers are responsible for
-/// only passing tasks whose state warrants a reset to the next iteration.
-/// Contrast with `recover_in_progress_for_prefix`, which keeps the
-/// `status = 'in_progress'` guard.
+/// Loop-exit orphan reclaim for steps 17.5 / 17.6.
 ///
-/// Used by:
-/// - The wave-loop FEAT-002 reset/halt-check contract — a slot's task whose
-///   merge-back failed must not stay pinned in `in_progress`.
-/// - Post-loop cleanup (Step 17.5 / 17.6) when the loop exits via deadline /
-///   max-iterations rather than a per-task done signal.
+/// Calls [`TaskLifecycle::recover_in_progress`] — atomic `in_progress → todo`
+/// only. Honest terminals (`blocked` / `skipped` / `irrelevant` / `done`),
+/// already-`todo`, and missing rows are silent no-ops. Trackers
+/// (`last_claimed_task`, `pending_slot_tasks`) are **not** reset authority:
+/// they may still list a terminal-close id after an honest `:blocked` (they
+/// drain only on `:done`); this helper refuses to reopen those rows.
 ///
-/// Logs success / no-op / failure to stderr; failures never propagate
-/// (matches the FEAT-002 failure-mode AC: "if reset itself fails for a task,
-/// log the failure but continue with remaining failed slots").
+/// Emits `Reset {kind_label} {task_id} to todo` **only** on `Ok(true)`.
+/// Does **not** call unguarded [`TaskLifecycle::resurrect_for_iteration`].
+/// Merge-fail reopen is a separate predicate — see [`reset_task_to_todo`]
+/// (FIX-002 → `reopen_after_merge_fail`); do not share this helper with
+/// merge-fail or premature `:done` will strand on the feature branch.
+pub(super) fn reset_orphan_claim_to_todo(conn: &mut Connection, task_id: &str, kind_label: &str) {
+    match TaskLifecycle::new(conn).recover_in_progress(task_id) {
+        Ok(true) => ui::emit(&format!("Reset {} {} to todo", kind_label, task_id)),
+        Ok(false) => {} // terminal / todo / missing — intentional silent no-op
+        Err(e) => tracing::warn!(
+            task_id = %task_id,
+            kind = %kind_label,
+            error = %e,
+            "failed to reclaim orphan in_progress task to todo",
+        ),
+    }
+}
+
+/// FEAT-002 merge-fail reopen wrapper. Calls
+/// [`TaskLifecycle::reopen_after_merge_fail`] (`in_progress|done → todo`).
+///
+/// Atomic conditional UPDATE — no SELECT-then-write. Premature `:done` on a
+/// failed-slot ephemeral reopens so work is not stranded; honest terminals
+/// (`blocked` / `skipped` / `irrelevant`) are silent no-ops. Orphan reclaim
+/// is a different predicate: [`reset_orphan_claim_to_todo`]
+/// (`recover_in_progress` only). Does **not** call unguarded
+/// [`TaskLifecycle::resurrect_for_iteration`] (learning #4358).
+///
+/// Emits `Reset {kind_label} {task_id} to todo` **only** on `Ok(true)`.
+/// Failures are logged and never fatal (FEAT-002: continue remaining slots;
+/// halt counter / pending drain are independent of the status write).
 pub(super) fn reset_task_to_todo(conn: &mut Connection, task_id: &str, kind_label: &str) {
-    match TaskLifecycle::new(conn).resurrect_for_iteration(None, &[task_id]) {
-        Ok(1) => ui::emit(&format!("Reset {} {} to todo", kind_label, task_id)),
-        Ok(_) => {} // row missing, or status changed by reconciliation
+    match TaskLifecycle::new(conn).reopen_after_merge_fail(task_id) {
+        Ok(true) => ui::emit(&format!("Reset {} {} to todo", kind_label, task_id)),
+        Ok(false) => {} // honest terminal / todo / missing — intentional silent no-op
         Err(e) => tracing::warn!(
             task_id = %task_id,
             kind = %kind_label,
@@ -3212,6 +3236,237 @@ mod tests {
         .unwrap();
     }
 
+    fn insert_task_with_status(conn: &Connection, id: &str, status: &str) {
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, priority) VALUES \
+             (?1, 'orphan-reclaim test', ?2, 1)",
+            rusqlite::params![id, status],
+        )
+        .unwrap();
+        if status == "in_progress" {
+            conn.execute(
+                "UPDATE tasks SET started_at = datetime('now') WHERE id = ?",
+                [id],
+            )
+            .unwrap();
+        }
+    }
+
+    // --- FIX-001: loop-exit orphan reclaim (17.5 / 17.6 helper) ---
+    //
+    // Prefer insert-status → call `reset_orphan_claim_to_todo` → assert DB.
+    // No full overflow+wave+exit e2e. Log emission is gated on Ok(true) in the
+    // helper body (source-audited below); stderr capture is brittle under
+    // libtest, so we pin DB status + source structure.
+
+    /// AC: honest terminals survive the 17.6 helper. `:failed` / `:fail` /
+    /// `:blocked` all seed `status='blocked'` (no `'failed'` row in CHECK).
+    /// Also pins `:skipped` / `:irrelevant` / `done` / `todo`.
+    #[test]
+    fn orphan_helper_preserves_terminal_and_todo_statuses() {
+        // (seed_status, label for assertion messages)
+        let cases: &[(&str, &str)] = &[
+            ("blocked", ":blocked/:failed/:fail → blocked"),
+            ("skipped", ":skipped"),
+            ("irrelevant", ":irrelevant"),
+            ("done", ":done"),
+            ("todo", "already todo"),
+        ];
+        for (status, label) in cases {
+            let (_dir, mut conn) = crate::loop_engine::test_utils::setup_test_db();
+            let id = "WAVE-CLAIM-1";
+            insert_task_with_status(&conn, id, status);
+            reset_orphan_claim_to_todo(&mut conn, id, "uncompleted slot task");
+            let got = crate::loop_engine::test_utils::get_task_status(&conn, id);
+            assert_eq!(
+                got, *status,
+                "orphan helper must not reopen {label}; got {got}"
+            );
+        }
+    }
+
+    /// AC: true orphan (`in_progress`, no status tag) still resets to `todo`.
+    /// Message contract: helper emits `Reset {kind} {id} to todo` only on
+    /// Ok(true) — format string pinned by source audit below.
+    #[test]
+    fn orphan_helper_resets_true_orphan_in_progress_to_todo() {
+        let (_dir, mut conn) = crate::loop_engine::test_utils::setup_test_db();
+        let id = "ORPHAN-001";
+        insert_task_with_status(&conn, id, "in_progress");
+        reset_orphan_claim_to_todo(&mut conn, id, "uncompleted slot task");
+        let (status, started): (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, started_at FROM tasks WHERE id = ?",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "todo", "true orphan must reclaim to todo");
+        assert!(started.is_none(), "started_at must clear on orphan reclaim");
+    }
+
+    /// AC: overflow rung 5 (policy block, not a status tag) then helper —
+    /// `blocked` survives. Fails if anyone "simplifies" to tag-history drain.
+    #[test]
+    fn orphan_helper_preserves_overflow_rung5_blocked() {
+        let (_dir, mut conn) = crate::loop_engine::test_utils::setup_test_db();
+        let id = "OVF-R5-001";
+        insert_task_with_status(&conn, id, "in_progress");
+        // Rung 5 path: auto_block_after_failures (no status tag written).
+        let applied = {
+            let lc = TaskLifecycle::new(&mut conn);
+            lc.auto_block_after_failures(id, "overflow rung 5: max retries", 3)
+                .unwrap()
+        };
+        assert!(applied, "rung-5 auto-block must apply on in_progress");
+        assert_eq!(
+            crate::loop_engine::test_utils::get_task_status(&conn, id),
+            "blocked"
+        );
+
+        reset_orphan_claim_to_todo(&mut conn, id, "uncompleted slot task");
+        assert_eq!(
+            crate::loop_engine::test_utils::get_task_status(&conn, id),
+            "blocked",
+            "overflow rung-5 blocked must survive orphan helper"
+        );
+    }
+
+    /// AC: `auto_block_after_failures` then helper — blocked survives.
+    #[test]
+    fn orphan_helper_preserves_auto_block_blocked() {
+        let (_dir, mut conn) = crate::loop_engine::test_utils::setup_test_db();
+        let id = "AUTOBLOCK-001";
+        insert_task_with_status(&conn, id, "in_progress");
+        {
+            let lc = TaskLifecycle::new(&mut conn);
+            assert!(
+                lc.auto_block_after_failures(id, "consecutive failures exceeded", 7)
+                    .unwrap()
+            );
+        }
+        reset_orphan_claim_to_todo(&mut conn, id, "uncompleted task");
+        assert_eq!(
+            crate::loop_engine::test_utils::get_task_status(&conn, id),
+            "blocked",
+            "auto-block blocked must survive orphan helper"
+        );
+    }
+
+    /// Structural pin: 17.5/17.6 call the orphan helper (recover_in_progress);
+    /// they must not call unguarded resurrect / the merge-fail reset helper.
+    /// Also pins log-on-Ok(true) and the operator message format.
+    #[test]
+    fn orphan_helper_and_orchestrator_wiring_source_contract() {
+        let orch = std::fs::read_to_string("src/loop_engine/orchestrator.rs")
+            .expect("read orchestrator.rs");
+        let wave = std::fs::read_to_string("src/loop_engine/wave_scheduler.rs")
+            .expect("read wave_scheduler.rs");
+
+        // 17.5 / 17.6 body (between prd_complete and record_session_guidance).
+        let start = orch
+            .find("let prd_complete = count_remaining_active_tasks")
+            .expect("prd_complete snapshot");
+        let end = orch[start..]
+            .find("record_session_guidance(")
+            .expect("step 18 record_session_guidance");
+        let exit_cleanup = &orch[start..start + end];
+        assert!(
+            exit_cleanup.contains("reset_orphan_claim_to_todo("),
+            "steps 17.5/17.6 MUST call reset_orphan_claim_to_todo"
+        );
+        assert!(
+            !exit_cleanup.contains("reset_task_to_todo("),
+            "steps 17.5/17.6 must NOT call merge-fail reset_task_to_todo"
+        );
+        assert!(
+            !exit_cleanup.contains("resurrect_for_iteration"),
+            "steps 17.5/17.6 must NOT call resurrect_for_iteration"
+        );
+        // Comments must not equate closed with <completed> only.
+        assert!(
+            !exit_cleanup.contains("without a `<completed>` tag"),
+            "17.5/17.6 comments must not say closed = <completed>"
+        );
+
+        // Helper *body* only (skip rustdoc, which may name sibling verbs).
+        let fn_start = wave
+            .find("pub(super) fn reset_orphan_claim_to_todo(")
+            .expect("reset_orphan_claim_to_todo definition");
+        let fn_rest = &wave[fn_start..];
+        let body_start = fn_rest.find("{\n").expect("orphan helper opening brace");
+        let fn_end = fn_rest
+            .find("\n/// Unguarded force-to-`todo`")
+            .or_else(|| fn_rest.find("\npub(super) fn reset_task_to_todo("))
+            .expect("reset_task_to_todo follows orphan helper");
+        let helper_body = &fn_rest[body_start..fn_end];
+        assert!(
+            helper_body.contains("recover_in_progress("),
+            "orphan helper MUST call recover_in_progress"
+        );
+        assert!(
+            !helper_body.contains("resurrect_for_iteration("),
+            "orphan helper must NOT call resurrect_for_iteration"
+        );
+        assert!(
+            helper_body.contains("Ok(true)") && helper_body.contains("Reset {} {} to todo"),
+            "orphan helper must log 'Reset {{kind}} {{id}} to todo' only on Ok(true)"
+        );
+        // Merge-fail uses reopen_after_merge_fail (in_progress|done), not
+        // the orphan-only predicate and not unguarded resurrect.
+        let merge_fn_start = wave
+            .find("pub(super) fn reset_task_to_todo(")
+            .expect("reset_task_to_todo definition");
+        let merge_rest = &wave[merge_fn_start..];
+        let merge_body_start = merge_rest
+            .find("{\n")
+            .expect("merge-fail helper opening brace");
+        let merge_end = merge_rest
+            .find("\n/// Sentinel slot index")
+            .or_else(|| merge_rest.find("\npub(crate) const SYNTHETIC_DEADLOCK_SLOT"))
+            .unwrap_or(merge_rest.len().min(800));
+        let merge_body = &merge_rest[merge_body_start..merge_end];
+        assert!(
+            merge_body.contains("reopen_after_merge_fail("),
+            "merge-fail reset_task_to_todo MUST call reopen_after_merge_fail"
+        );
+        assert!(
+            !merge_body.contains("resurrect_for_iteration("),
+            "merge-fail must NOT call resurrect_for_iteration"
+        );
+        assert!(
+            !merge_body.contains("recover_in_progress("),
+            "merge-fail must not silently inherit the orphan predicate"
+        );
+        assert!(
+            merge_body.contains("Ok(true)") && merge_body.contains("Reset {} {} to todo"),
+            "merge-fail helper must log 'Reset {{kind}} {{id}} to todo' only on Ok(true)"
+        );
+
+        // apply_merge_fail_reset_and_halt_check wires through reset_task_to_todo.
+        let apply_start = wave
+            .find("pub(super) fn apply_merge_fail_reset_and_halt_check(")
+            .expect("apply_merge_fail_reset_and_halt_check definition");
+        let apply_rest = &wave[apply_start..];
+        let apply_body_start = apply_rest
+            .find("{\n")
+            .expect("apply_merge_fail opening brace");
+        let apply_end = apply_rest
+            .find("\n/// Read the PRD JSON")
+            .or_else(|| apply_rest.find("\npub(super) fn read_prd_implicit_overlap_files"))
+            .unwrap_or(apply_rest.len().min(1200));
+        let apply_body = &apply_rest[apply_body_start..apply_end];
+        assert!(
+            apply_body.contains("reset_task_to_todo("),
+            "apply_merge_fail_reset_and_halt_check MUST call reset_task_to_todo"
+        );
+        assert!(
+            !apply_body.contains("resurrect_for_iteration(")
+                && !apply_body.contains("recover_in_progress("),
+            "apply_merge_fail must not call resurrect/recover_in_progress directly"
+        );
+    }
+
     /// AC: WaveOutcome.failed_merges is empty when no merge failures
     /// (e.g. preflight bail-out / no-eligible-tasks).
     #[test]
@@ -3320,6 +3575,88 @@ mod tests {
         assert_eq!(status, "todo");
         // pending_slot_tasks drained.
         assert!(!ctx.pending_slot_tasks.contains(&"FEAT-001".to_string()));
+    }
+
+    /// FIX-002 pin: merge-fail after premature `:done` on the ephemeral must
+    /// reopen to `todo`. Fails if merge-fail is pointed at `recover_in_progress`
+    /// (orphan-only predicate) instead of `reopen_after_merge_fail`.
+    #[test]
+    fn test_merge_fail_reopens_done_to_todo() {
+        let (_dir, mut conn) = crate::loop_engine::test_utils::setup_test_db();
+        insert_task_with_status(&conn, "FEAT-DONE", "done");
+        let mut ctx = IterationContext::new(5);
+        ctx.pending_slot_tasks.push("FEAT-DONE".to_string());
+        ctx.consecutive_merge_fail_waves = 0;
+
+        let decision = apply_merge_fail_reset_and_halt_check(
+            &mut conn,
+            &mut ctx,
+            "feat/test",
+            &[FailedMerge {
+                slot: 1,
+                task_id: Some("FEAT-DONE".into()),
+            }],
+            2,
+        );
+        assert_eq!(decision, MergeFailHaltDecision::Continue);
+        assert_eq!(
+            crate::loop_engine::test_utils::get_task_status(&conn, "FEAT-DONE"),
+            "todo",
+            "merge-fail must reopen premature :done so work is not stranded"
+        );
+        assert!(
+            !ctx.pending_slot_tasks.contains(&"FEAT-DONE".to_string()),
+            "pending must still drain when status reopens"
+        );
+        assert_eq!(
+            ctx.consecutive_merge_fail_waves, 1,
+            "halt counter must increment when done reopens"
+        );
+    }
+
+    /// FIX-002: honest terminals survive merge-fail; pending drain and halt
+    /// counter are independent of the status write (no-op must not skip them).
+    #[test]
+    fn test_merge_fail_preserves_honest_terminals_but_drains_and_increments() {
+        // (seed_status, label)
+        let cases: &[(&str, &str)] = &[
+            ("blocked", ":blocked/:failed/:fail"),
+            ("skipped", ":skipped"),
+            ("irrelevant", ":irrelevant"),
+        ];
+        for (status, label) in cases {
+            let (_dir, mut conn) = crate::loop_engine::test_utils::setup_test_db();
+            let id = "WAVE-TERM-1";
+            insert_task_with_status(&conn, id, status);
+            let mut ctx = IterationContext::new(5);
+            ctx.pending_slot_tasks.push(id.to_string());
+            ctx.consecutive_merge_fail_waves = 0;
+
+            let decision = apply_merge_fail_reset_and_halt_check(
+                &mut conn,
+                &mut ctx,
+                "feat/test",
+                &[FailedMerge {
+                    slot: 1,
+                    task_id: Some(id.into()),
+                }],
+                2,
+            );
+            assert_eq!(decision, MergeFailHaltDecision::Continue);
+            assert_eq!(
+                crate::loop_engine::test_utils::get_task_status(&conn, id),
+                *status,
+                "merge-fail must not reopen honest terminal {label}"
+            );
+            assert!(
+                !ctx.pending_slot_tasks.contains(&id.to_string()),
+                "pending must still drain when status write no-ops ({label})"
+            );
+            assert_eq!(
+                ctx.consecutive_merge_fail_waves, 1,
+                "halt counter must still increment when status write no-ops ({label})"
+            );
+        }
     }
 
     /// AC: threshold reached → Halt with non-zero exit and reason citing the

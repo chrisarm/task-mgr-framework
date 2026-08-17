@@ -1144,9 +1144,19 @@ verbs. Do **not** add raw `UPDATE tasks SET status …` SQL here.
 |---|---|---|
 | Loop `<task-status>` tag dispatch | `apply()` | `TaskLifecycle::with_run(conn, run_id).with_prd_sync(path, prefix)` |
 | Slot pre-claim (wave) | `try_claim()` | same connection, no run context needed |
-| Stuck in-progress reset (stale sweep, slot release) | `recover_in_progress_for_prefix()` | `TaskLifecycle::with_run(conn, run_id)` |
+| Stuck in-progress bulk sweep (stale / startup) | `recover_in_progress_for_prefix()` | `TaskLifecycle::with_run(conn, run_id)` |
+| Loop-exit orphan reclaim (17.5 / 17.6) | `recover_in_progress()` | `TaskLifecycle::new(conn)` via `reset_orphan_claim_to_todo` |
+| Overflow rungs 1–3 retry reset | `recover_in_progress()` | `TaskLifecycle::new(conn)` (post_output ladder) |
+| FEAT-002 merge-fail reopen (`in_progress\|done → todo`) | `reopen_after_merge_fail()` | `TaskLifecycle::new(conn)` via `reset_task_to_todo` |
 | Consecutive-failure auto-block | `auto_block_after_failures()` | `TaskLifecycle::with_run(conn, run_id)` |
-| Overflow rung reset / provider promote | `resurrect_for_iteration()` | `TaskLifecycle::with_run(conn, run_id)` |
+| Overflow rung 4 provider promote | `resurrect_with_model_override()` | `TaskLifecycle::with_run(conn, run_id)` |
+| Unguarded force-to-`todo` escape hatch | `resurrect_for_iteration()` | do **not** add `WHERE status = 'in_progress'` (learning #4358) |
+
+Orphan reclaim and merge-fail are **two predicates**: `recover_in_progress`
+(`in_progress` only) vs `reopen_after_merge_fail` (`in_progress|done`). Do not
+share one helper. Trackers (`pending_slot_tasks`, `last_claimed_task`) drain
+on `:done` / merge-fail retain only — they are **not** reset authority; the
+verb's WHERE is.
 
 For the full site→verb audit table and source-allowance matrix see
 [`src/lifecycle/CLAUDE.md`](../lifecycle/CLAUDE.md).
@@ -1155,7 +1165,7 @@ For the full site→verb audit table and source-allowance matrix see
 
 | Concern | File | Symbol |
 | --- | --- | --- |
-| Status mutation SSoT | `src/lifecycle/mod.rs` | `TaskLifecycle`, six public verbs |
+| Status mutation SSoT | `src/lifecycle/mod.rs` | `TaskLifecycle` (apply / try_claim / Recovery family / reconcile / repair) |
 | Outer loop entry point | `src/loop_engine/orchestrator.rs` | `run_loop`, `on_run_completed` |
 | Linear startup phase (WS-3.2 carve) | `src/loop_engine/startup.rs` | `initialize_loop`, `LoopInitContext` |
 | Sequential iteration body | `src/loop_engine/iteration.rs` | `run_iteration` |

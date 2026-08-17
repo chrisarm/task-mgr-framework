@@ -710,9 +710,10 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
     // `while` because it hit the iteration ceiling or the deadline with active
     // work still in the queue, upgrade the ambiguous exit 0 to a non-zero code
     // so `batch run --chain` stops instead of stacking the next PRD on an
-    // incomplete branch tip. MUST run BEFORE step 17.5's `reset_task_to_todo` —
-    // after the reset, a stranded task is still counted, but reading here keeps
-    // the count tied to the authoritative terminal classifications above.
+    // incomplete branch tip. MUST run BEFORE step 17.5 orphan reclaim —
+    // after a true-orphan reset a stranded task becomes `todo` and is still
+    // counted, but reading here keeps the count tied to the authoritative
+    // terminal classifications above (learning #5151: do not reorder).
     reconcile_ambiguous_exit(
         &conn,
         task_prefix.as_deref(),
@@ -724,23 +725,31 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
 
     // Layer 2 (observable PRD completion): snapshot whether every task for this
     // prefix is terminal, reading the SAME post-reconcile DB state. MUST be read
-    // BEFORE step 17.5's `reset_task_to_todo` — after the reset a stranded task
-    // is flipped back to `todo` and would still count, but capturing here ties
-    // the flag to the authoritative terminal classifications. `batch run --chain`
-    // consumes this via `LoopResult.prd_complete` to stop the chain on an
-    // incomplete PRD even when the exit code is an ambiguous 0.
+    // BEFORE step 17.5 orphan reclaim — after a true-orphan reset a stranded
+    // task is flipped back to `todo` and would still count, but capturing here
+    // ties the flag to the authoritative terminal classifications.
+    // `batch run --chain` consumes this via `LoopResult.prd_complete` to stop
+    // the chain on an incomplete PRD even when the exit code is an ambiguous 0.
     let prd_complete = count_remaining_active_tasks(&conn, task_prefix.as_deref()) == 0;
 
-    // Step 17.5: Reset uncompleted claimed task so it's not stuck in_progress for next run
+    // Step 17.5: Orphan reclaim for the last sequential claim.
+    // Calls `reset_orphan_claim_to_todo` → `TaskLifecycle::recover_in_progress`
+    // (atomic WHERE status='in_progress'). Honest terminals
+    // (blocked/skipped/irrelevant/done) and already-todo are silent no-ops.
+    // `last_claimed_task` clears on `:done` only, so a last-iter honest
+    // `:blocked` may still be listed; DB status is the gate, not the tracker.
     if let Some(ref task_id) = last_claimed_task {
-        reset_task_to_todo(&mut conn, task_id, "uncompleted task");
+        reset_orphan_claim_to_todo(&mut conn, task_id, "uncompleted task");
     }
 
-    // Step 17.6: Reset any parallel-mode slot tasks still pending. Sequential
-    // mode is fully covered by step 17.5 above; the wave path tracks every
-    // claimed task in `ctx.pending_slot_tasks` and removes it on `done`, so
-    // anything remaining was claimed but never closed (deadline / max-iter
-    // exit, slot crash, or output without a `<completed>` tag).
+    // Step 17.6: Orphan reclaim for parallel-mode slot claims still listed in
+    // `ctx.pending_slot_tasks`. Sequential mode is covered by 17.5; the wave
+    // path tracks every claimed id and drains only on `:done` / merge-fail
+    // retain, so the list may still hold honest terminal closes as well as
+    // true orphans (deadline / max-iter exit, slot crash, no status tag).
+    // Same helper as 17.5: `recover_in_progress` only — reclaims **still
+    // `in_progress`** rows; does not reopen terminals; tracker membership is
+    // not authority (DB-status gating).
     //
     // Clone the IDs out of ctx so the mutable borrow on conn doesn't conflict
     // with the immutable borrow on ctx.pending_slot_tasks across iterations.
@@ -751,7 +760,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
         .cloned()
         .collect();
     for task_id in &pending_slot_task_ids {
-        reset_task_to_todo(&mut conn, task_id, "uncompleted slot task");
+        reset_orphan_claim_to_todo(&mut conn, task_id, "uncompleted slot task");
     }
 
     // Step 18: Record session guidance if any

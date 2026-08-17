@@ -19,9 +19,7 @@ use crate::loop_engine::config::{IterationOutcome, PermissionMode};
 use crate::loop_engine::engine::BlackoutState;
 use crate::loop_engine::model::Provider;
 use crate::loop_engine::recovery::probe_rate_limit_lifted;
-use crate::loop_engine::usage::{
-    UsageCheckResult, load_usage_info, usage_suggests_lifted,
-};
+use crate::loop_engine::usage::{UsageCheckResult, load_usage_info, usage_suggests_lifted};
 use crate::loop_engine::{display, signals};
 
 /// Inputs to [`account_usage_gate`] / [`account_usage_gate_inner`].
@@ -199,11 +197,7 @@ pub enum RateLimitAction {
 /// `Some(0)` means **ready now** (past reset) and is preserved — it must NOT
 /// collapse to `fallback`. Only when both sources are `None` do we use
 /// `fallback`.
-pub(crate) fn resolve_wait_secs(
-    api: Option<u64>,
-    output: Option<u64>,
-    fallback: u64,
-) -> u64 {
+pub(crate) fn resolve_wait_secs(api: Option<u64>, output: Option<u64>, fallback: u64) -> u64 {
     match (api, output) {
         (Some(s), _) => s,
         (None, Some(s)) => s,
@@ -301,12 +295,14 @@ pub fn react_to_outputs(
     let usage_gate = |threshold: u8, tasks_dir: &Path, fallback_wait: u64| -> UsageCheckResult {
         check_and_wait(threshold, tasks_dir, fallback_wait)
     };
-    let reset_wait =
-        |wait_secs: u64, tasks_dir: &Path, _fallback_wait: u64, probe: Option<&dyn Fn() -> bool>| {
-            // Local wait_for_usage_reset resolves unknown duration upstream
-            // via decide_account_rate_limit; fallback_wait is unused here.
-            wait_for_usage_reset(wait_secs, tasks_dir, probe)
-        };
+    let reset_wait = |wait_secs: u64,
+                      tasks_dir: &Path,
+                      _fallback_wait: u64,
+                      probe: Option<&dyn Fn() -> bool>| {
+        // Local wait_for_usage_reset resolves unknown duration upstream
+        // via decide_account_rate_limit; fallback_wait is unused here.
+        wait_for_usage_reset(wait_secs, tasks_dir, probe)
+    };
     let probe =
         |permission_mode: &PermissionMode| -> bool { probe_rate_limit_lifted(permission_mode) };
     react_to_outputs_with_io_seams(
@@ -837,13 +833,9 @@ pub(crate) fn wait_for_usage_reset(
     tasks_dir: &Path,
     probe_fn: Option<&dyn Fn() -> bool>,
 ) -> bool {
-    wait_for_usage_reset_inner(
-        wait_secs,
-        tasks_dir,
-        probe_fn,
-        PROD_TIMING,
-        |d| thread::sleep(d),
-    )
+    wait_for_usage_reset_inner(wait_secs, tasks_dir, probe_fn, PROD_TIMING, |d| {
+        thread::sleep(d)
+    })
 }
 
 /// Injectable wait body (hermetic tests pass tiny timing + no-op / virtual sleep).
@@ -1249,27 +1241,14 @@ mod tests {
 
     #[test]
     fn test_decide_spillover_blackout_uses_api_secs() {
-        let action = decide_account_rate_limit(
-            Some(7200),
-            None,
-            "rate limited",
-            true,
-            300,
-            3600,
-        );
+        let action = decide_account_rate_limit(Some(7200), None, "rate limited", true, 300, 3600);
         assert_eq!(action, RateLimitAction::Blackout { secs: 7200 });
     }
 
     #[test]
     fn test_decide_spillover_pure_spend_stops_no_blackout() {
-        let action = decide_account_rate_limit(
-            None,
-            None,
-            "spend limit · usage-credits",
-            true,
-            300,
-            3600,
-        );
+        let action =
+            decide_account_rate_limit(None, None, "spend limit · usage-credits", true, 300, 3600);
         assert_eq!(
             action,
             RateLimitAction::StopSpend,
