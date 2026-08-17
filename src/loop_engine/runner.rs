@@ -552,8 +552,7 @@ impl LlmRunner for ClaudeRunner {
             active_prefix,
             // Grok-only knob; Claude resolves its binary purely via $CLAUDE_BINARY.
             // cleanup_title_artifact is a capability-gate signal enforced at dispatch;
-            // spawn body does not read it. Use `..` to elide all remaining fields.
-            fallback_cli_binary: _,
+            // spawn body does not read it.
             ..
         } = opts;
         let binary = std::env::var("CLAUDE_BINARY").unwrap_or_else(|_| "claude".to_string());

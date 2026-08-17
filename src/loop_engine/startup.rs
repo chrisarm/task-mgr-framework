@@ -306,14 +306,8 @@ pub(crate) fn initialize_loop(
             Some(generate_prefix(pre_lock_branch.as_deref(), filename))
         }
     }
-    .and_then(|p| {
-        // Only use prefix if it is safe for filenames
-        if validate_prefix(&p).is_ok() {
-            Some(p)
-        } else {
-            None
-        }
-    });
+    // Only use prefix if it is safe for filenames
+    .filter(|p| validate_prefix(p).is_ok());
     let lock_name = match &pre_lock_prefix {
         Some(p) => format!("loop-{p}.lock"),
         None => "loop.lock".to_string(),
