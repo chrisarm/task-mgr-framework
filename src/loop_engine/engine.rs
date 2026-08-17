@@ -63,13 +63,16 @@ pub use crate::loop_engine::recovery::{
 // `run_parallel_wave` are re-exported `pub` so the external import paths
 // integration tests rely on stay valid (FR-008). `run_loop` calls
 // `apply_merge_fail_reset_and_halt_check`, `read_prd_implicit_overlap_files`,
-// and `reset_task_to_todo` by bare name, so those are re-exported `pub(super)`
-// unconditionally. After the test-relocation refactor (PRD 02, FEAT-006),
-// `build_slot_contexts`, `apply_post_merge_reconcile`, and `SYNTHETIC_DEADLOCK_SLOT`
-// are only referenced by wave_scheduler.rs's own test module (via `use super::*`),
+// and `reset_orphan_claim_to_todo` by bare name, so those are re-exported
+// `pub(super)` unconditionally. Merge-fail's `reset_task_to_todo`
+// (`reopen_after_merge_fail`) stays private to wave_scheduler. After the
+// test-relocation refactor (PRD 02, FEAT-006), `build_slot_contexts`,
+// `apply_post_merge_reconcile`, and `SYNTHETIC_DEADLOCK_SLOT` are only
+// referenced by wave_scheduler.rs's own test module (via `use super::*`),
 // so no engine.rs re-export is needed for them.
 pub(super) use crate::loop_engine::wave_scheduler::{
-    apply_merge_fail_reset_and_halt_check, read_prd_implicit_overlap_files, reset_task_to_todo,
+    apply_merge_fail_reset_and_halt_check, read_prd_implicit_overlap_files,
+    reset_orphan_claim_to_todo,
 };
 pub use crate::loop_engine::wave_scheduler::{run_parallel_wave, run_wave_iteration};
 
@@ -388,12 +391,18 @@ pub struct IterationContext {
     /// influence on the next selection — hints surface in operator logs and
     /// remain available for future selection-side wiring.
     pub pending_reorder_hints: Vec<String>,
-    /// Task IDs that `claim_slot_task` set to `in_progress` in a parallel wave
-    /// but whose slot did not mark them `done` (e.g. crash, no `<completed>`
-    /// tag emitted, output-scan miss). Tracks across waves so the post-loop
-    /// cleanup can reset still-`in_progress` rows when the loop exits via
-    /// deadline / max-iterations rather than waiting for the next process's
-    /// step 6.6 recovery.
+    /// Claimed slot-task IDs across parallel waves: every id that
+    /// `claim_slot_task` successfully moved to `in_progress`.
+    ///
+    /// Tracker hygiene only — drained on `:done` and on merge-fail retain,
+    /// **not** on honest terminals (`:blocked` / `:skipped` / `:irrelevant`).
+    /// A terminal-close id may therefore still appear here at loop exit.
+    /// Step 17.6 walks this list and reclaims via
+    /// [`crate::lifecycle::TaskLifecycle::recover_in_progress`] (wrapper
+    /// `reset_orphan_claim_to_todo`); only rows **still `in_progress`** flip
+    /// to `todo`. Tracker membership is not reset authority — the DB WHERE
+    /// is. Survives across waves so deadline / max-iter exits reclaim true
+    /// orphans without waiting for the next process's stale sweep.
     pub pending_slot_tasks: Vec<String>,
     /// Count of consecutive parallel-slot waves whose merge-back step
     /// produced at least one failed slot. Reset to `0` after every wave that
@@ -616,8 +625,9 @@ pub struct SlotResult {
     pub iteration_result: IterationResult,
     /// Whether `claim_slot_task` successfully transitioned this slot's task to
     /// `in_progress`. `false` only for `slot_failure_result` entries where the
-    /// task was already `done` / `blocked` and the slot thread never spawned.
-    /// Drives the post-loop orphan reset (see `IterationContext::pending_slot_tasks`).
+    /// task was already terminal and the slot thread never spawned. Gates
+    /// listing on `IterationContext::pending_slot_tasks` (step 17.6 then
+    /// reclaims only rows still `in_progress` via `recover_in_progress`).
     pub claim_succeeded: bool,
     /// Learnings shown in the slot's prompt, threaded back from
     /// `SlotContext::prompt_bundle::shown_learning_ids` so the main thread

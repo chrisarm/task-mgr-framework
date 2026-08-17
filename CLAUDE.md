@@ -18,11 +18,13 @@
 
 **Gotcha — bare `<task-status>` / `<completed>` ids vs claimed PRD-prefixed ids.** Agents often emit `REFACTOR-001:done` while the claim is `97be64d7-REFACTOR-001`. The shared pipeline (`process_iteration_output`) rewrites **claim-matching** bare tags only (identity → prefix-strip → 8-hex body); peers and `task_id: None` stay exact-id. Lifecycle never learns short ids; never reintroduce `ends_with`-only matching (false positive on `001`). See `src/loop_engine/CLAUDE.md` "Iteration pipeline (shared)".
 
+**Gotcha — two Recovery predicates, not one reset helper.** Loop-exit 17.5/17.6 and overflow rungs 1–3 call `recover_in_progress` (`in_progress → todo` only). Merge-fail calls `reopen_after_merge_fail` (`in_progress|done → todo`). Sharing one helper either reopens an honest `:blocked` at process exit or strands a premature `:done` after a failed slot merge. `resurrect_for_iteration` stays the unguarded escape hatch — do not add `WHERE status = 'in_progress'` to it (learning #4358). Trackers (`pending_slot_tasks`, `last_claimed_task`) drain on `:done` / merge-fail retain only; they are **not** reset authority. See `src/lifecycle/CLAUDE.md` "Recovery verb families".
+
 ## Subsystem design notes
 
 Module-level CLAUDE.md files (auto-loaded when files in the module are read):
 
-- [`src/lifecycle/CLAUDE.md`](src/lifecycle/CLAUDE.md) — status mutation SSoT, six lifecycle verbs, five hard invariants, FR-006 site→verb mapping table
+- [`src/lifecycle/CLAUDE.md`](src/lifecycle/CLAUDE.md) — status mutation SSoT, lifecycle verbs (incl. per-id `recover_in_progress` / `reopen_after_merge_fail`), five hard invariants, FR-006 site→verb mapping table
 - [`src/loop_engine/CLAUDE.md`](src/loop_engine/CLAUDE.md) — overflow recovery, auto-review, parallel slots, merge-back conflict resolution, shared iteration pipeline
 - [`src/commands/curate/CLAUDE.md`](src/commands/curate/CLAUDE.md) — Ollama embeddings, reranker, dedup dismissals, session cleanup
 - [`src/commands/next/CLAUDE.md`](src/commands/next/CLAUDE.md) — soft-dep guard for milestone scheduling

@@ -151,7 +151,12 @@ pub(crate) fn parse_oauth_usage_json(json: &serde_json::Value) -> Option<UsageIn
     let mut windows: Vec<UsageWindow> = Vec::new();
 
     // Named buckets Claude Code exposes.
-    for key in ["five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet"] {
+    for key in [
+        "five_hour",
+        "seven_day",
+        "seven_day_opus",
+        "seven_day_sonnet",
+    ] {
         if let Some(bucket) = json.get(key)
             && let Some(util) = bucket_utilization(bucket)
         {
@@ -171,10 +176,12 @@ pub(crate) fn parse_oauth_usage_json(json: &serde_json::Value) -> Option<UsageIn
     // Structured limits array (severity / percent / kind).
     if let Some(limits) = json.get("limits").and_then(|v| v.as_array()) {
         for limit in limits {
-            let percent = limit
-                .get("percent")
-                .and_then(|v| v.as_f64())
-                .or_else(|| limit.get("percent").and_then(|v| v.as_u64()).map(|u| u as f64));
+            let percent = limit.get("percent").and_then(|v| v.as_f64()).or_else(|| {
+                limit
+                    .get("percent")
+                    .and_then(|v| v.as_u64())
+                    .map(|u| u as f64)
+            });
             let Some(p) = percent else {
                 continue;
             };
@@ -262,11 +269,14 @@ pub fn load_usage_info() -> Option<UsageInfo> {
     if super::oauth::is_token_expiring(&creds, 5) {
         match super::oauth::refresh_token(&path, &creds) {
             Ok(refreshed) => {
-                eprintln!("OAuth token refreshed for usage check");
+                crate::output::ui::emit("OAuth token refreshed for usage check");
                 creds = refreshed;
             }
             Err(e) => {
-                eprintln!("Warning: could not refresh token for usage check: {}", e);
+                crate::output::ui::emit_err(&format!(
+                    "Warning: could not refresh token for usage check: {}",
+                    e
+                ));
                 // Try with existing token anyway.
             }
         }
