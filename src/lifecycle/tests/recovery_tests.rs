@@ -28,6 +28,187 @@ fn insert_task(conn: &Connection, id: &str, status: &str) {
     .unwrap();
 }
 
+// --- recover_in_progress (per-id orphan reclaim) ---
+
+/// Predicate matrix for orphan reclaim: only `in_progress` flips to `todo`.
+/// Covers PRD §2.5 statuses that 17.5/17.6 and overflow rungs 1–3 must not
+/// reopen (honest terminals, already-todo, missing).
+#[test]
+fn recover_in_progress_table_driven_status_predicate() {
+    // (status_or_none, expect_applied, expect_final_status_or_none)
+    // None id → missing row; final status N/A.
+    let cases: &[(&str, Option<&str>, bool, Option<&str>)] = &[
+        ("in_progress", Some("in_progress"), true, Some("todo")),
+        ("done", Some("done"), false, Some("done")),
+        ("blocked", Some("blocked"), false, Some("blocked")),
+        ("skipped", Some("skipped"), false, Some("skipped")),
+        ("irrelevant", Some("irrelevant"), false, Some("irrelevant")),
+        ("todo", Some("todo"), false, Some("todo")),
+        ("missing", None, false, None),
+    ];
+
+    for (label, initial, expect_applied, expect_final) in cases {
+        let (_dir, mut conn) = setup();
+        let id = "FEAT-REC-1";
+        if let Some(status) = initial {
+            insert_task(&conn, id, status);
+            if *status == "in_progress" {
+                conn.execute(
+                    "UPDATE tasks SET started_at = datetime('now') WHERE id = ?",
+                    [id],
+                )
+                .unwrap();
+            }
+        }
+
+        let applied = {
+            let lc = TaskLifecycle::new(&mut conn);
+            lc.recover_in_progress(id).unwrap()
+        };
+        assert_eq!(
+            applied, *expect_applied,
+            "recover_in_progress({label}): Ok(true) iff one in_progress row updated"
+        );
+
+        match expect_final {
+            None => {
+                let exists: bool = conn
+                    .query_row("SELECT COUNT(*) > 0 FROM tasks WHERE id = ?", [id], |r| {
+                        r.get(0)
+                    })
+                    .unwrap();
+                assert!(!exists, "missing row must stay missing ({label})");
+            }
+            Some(final_status) => {
+                let (status, started): (String, Option<String>) = conn
+                    .query_row(
+                        "SELECT status, started_at FROM tasks WHERE id = ?",
+                        [id],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    status, *final_status,
+                    "status after recover_in_progress({label})"
+                );
+                if *expect_applied {
+                    assert!(
+                        started.is_none(),
+                        "started_at must clear when recover_in_progress applies ({label})"
+                    );
+                }
+            }
+        }
+    }
+}
+
+// --- reopen_after_merge_fail (per-id merge-fail reopen) ---
+
+/// Predicate matrix for merge-fail: `in_progress` and `done` reopen to `todo`.
+/// Honest terminals and already-todo must no-op (PRD §2.5 merge-fail edges).
+#[test]
+fn reopen_after_merge_fail_table_driven_status_predicate() {
+    let cases: &[(&str, Option<&str>, bool, Option<&str>)] = &[
+        ("in_progress", Some("in_progress"), true, Some("todo")),
+        ("done", Some("done"), true, Some("todo")),
+        ("blocked", Some("blocked"), false, Some("blocked")),
+        ("skipped", Some("skipped"), false, Some("skipped")),
+        ("irrelevant", Some("irrelevant"), false, Some("irrelevant")),
+        ("todo", Some("todo"), false, Some("todo")),
+        ("missing", None, false, None),
+    ];
+
+    for (label, initial, expect_applied, expect_final) in cases {
+        let (_dir, mut conn) = setup();
+        let id = "FEAT-MRG-1";
+        if let Some(status) = initial {
+            insert_task(&conn, id, status);
+            if *status == "in_progress" || *status == "done" {
+                // done may still carry started_at from a prior claim; clear on apply.
+                conn.execute(
+                    "UPDATE tasks SET started_at = datetime('now') WHERE id = ?",
+                    [id],
+                )
+                .unwrap();
+            }
+        }
+
+        let applied = {
+            let lc = TaskLifecycle::new(&mut conn);
+            lc.reopen_after_merge_fail(id).unwrap()
+        };
+        assert_eq!(
+            applied, *expect_applied,
+            "reopen_after_merge_fail({label}): Ok(true) iff in_progress|done updated"
+        );
+
+        match expect_final {
+            None => {
+                let exists: bool = conn
+                    .query_row("SELECT COUNT(*) > 0 FROM tasks WHERE id = ?", [id], |r| {
+                        r.get(0)
+                    })
+                    .unwrap();
+                assert!(!exists, "missing row must stay missing ({label})");
+            }
+            Some(final_status) => {
+                let (status, started): (String, Option<String>) = conn
+                    .query_row(
+                        "SELECT status, started_at FROM tasks WHERE id = ?",
+                        [id],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    status, *final_status,
+                    "status after reopen_after_merge_fail({label})"
+                );
+                if *expect_applied {
+                    assert!(
+                        started.is_none(),
+                        "started_at must clear when reopen_after_merge_fail applies ({label})"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Pin: merge-fail of premature `:done` must reopen — a shared
+/// `in_progress`-only helper would strand this row (known-bad).
+#[test]
+fn reopen_after_merge_fail_reopens_done_while_recover_in_progress_does_not() {
+    let (_dir, mut conn) = setup();
+    insert_task(&conn, "FEAT-DONE", "done");
+
+    let orphan = {
+        let lc = TaskLifecycle::new(&mut conn);
+        lc.recover_in_progress("FEAT-DONE").unwrap()
+    };
+    assert!(
+        !orphan,
+        "recover_in_progress must not reopen done (orphan predicate)"
+    );
+    let status: String = conn
+        .query_row("SELECT status FROM tasks WHERE id = 'FEAT-DONE'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(status, "done");
+
+    let merge = {
+        let lc = TaskLifecycle::new(&mut conn);
+        lc.reopen_after_merge_fail("FEAT-DONE").unwrap()
+    };
+    assert!(merge, "reopen_after_merge_fail must reopen done → todo");
+    let status: String = conn
+        .query_row("SELECT status FROM tasks WHERE id = 'FEAT-DONE'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(status, "todo");
+}
+
 // --- recover_in_progress_for_prefix ---
 
 #[test]

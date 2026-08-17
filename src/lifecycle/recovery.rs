@@ -1,15 +1,22 @@
-//! Category C recovery primitives — three bulk verbs.
+//! Category C recovery primitives — bulk + per-id Recovery verbs.
 //!
 //! Today's call sites:
-//! - `recover_in_progress_for_prefix` — `engine.rs:2407` (mid-run sweep),
-//!   `engine.rs:3258` (Step 6.6 startup).
-//! - `auto_block_after_failures` — `engine.rs:5145` (`auto_block_task`,
-//!   inside `handle_task_failure` tx).
-//! - `resurrect_for_iteration` — per-id reset (cf. `reset_task_to_todo`
-//!   at `engine.rs:1642` + overflow rungs 1-3 at `overflow.rs:473`).
+//! - `recover_in_progress_for_prefix` — `startup.rs`, `iteration.rs`,
+//!   `reactions/account.rs` (bulk stale / rate-limit sweeps).
+//! - `recover_in_progress` — per-id orphan reclaim (17.5/17.6 via
+//!   `reset_orphan_claim_to_todo`) and overflow rungs 1–3 (`post_output`).
+//! - `reopen_after_merge_fail` — FEAT-002 merge-fail reopen of
+//!   `in_progress|done` (via `wave_scheduler::reset_task_to_todo`).
+//! - `auto_block_after_failures` — overflow rung 5 (`post_output`) and the
+//!   `auto_block_task` shim inside `handle_task_failure`.
+//! - `resurrect_for_iteration` — unguarded per-id force-to-todo escape hatch
+//!   (tests + intentional force-any-status only — not orphan reclaim or merge-fail).
 //!
-//! All three issue a single UPDATE statement — SQLite autocommit makes each
-//! call atomic (the "single transaction" contract from FEAT-005 AC).
+//! Every verb issues a single UPDATE — SQLite autocommit makes each call
+//! atomic (the "single transaction" contract from FEAT-005 AC). Gated verbs
+//! use conditional WHERE on `status`; they do **not** SELECT-then-write
+//! (learning #4810). `resurrect_for_iteration` deliberately omits a status
+//! guard (learning #4358) — do not "fix" it.
 //!
 //! Source variant: every transition emitted by this module is
 //! [`crate::lifecycle::matrix::TransitionSource::Recovery`].
@@ -22,6 +29,62 @@ use crate::db::prefix::prefix_and;
 use super::TaskLifecycle;
 
 impl<'a> TaskLifecycle<'a> {
+    /// Per-id orphan reclaim: `in_progress → todo` with `started_at` cleared.
+    ///
+    /// Atomic conditional UPDATE — no SELECT-then-write (learning #4810):
+    /// ```sql
+    /// UPDATE tasks SET status='todo', started_at=NULL, updated_at=datetime('now')
+    /// WHERE id = ? AND status = 'in_progress'
+    /// ```
+    ///
+    /// Returns `Ok(true)` iff exactly one row was updated. Missing rows,
+    /// terminal statuses (`done`/`blocked`/`skipped`/`irrelevant`), and
+    /// already-`todo` rows are a clean `Ok(false)` no-op (no log obligation
+    /// here — wrappers log only on `true`).
+    ///
+    /// **Callers (post CONTRACT-001):** loop-exit 17.5/17.6 (FIX-001) and
+    /// overflow rungs 1–3 (FIX-003). Not for merge-fail — that needs
+    /// [`Self::reopen_after_merge_fail`] so premature `:done` on the
+    /// ephemeral can reopen. Not a substitute for unguarded
+    /// [`Self::resurrect_for_iteration`].
+    pub fn recover_in_progress(&self, task_id: &str) -> Result<bool, TaskMgrError> {
+        let rows = self.conn.execute(
+            "UPDATE tasks SET status = 'todo', started_at = NULL, \
+             updated_at = datetime('now') \
+             WHERE id = ? AND status = 'in_progress'",
+            params![task_id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Per-id merge-fail reopen: `in_progress|done → todo` with `started_at`
+    /// cleared.
+    ///
+    /// Atomic conditional UPDATE — no SELECT-then-write (learning #4810):
+    /// ```sql
+    /// UPDATE tasks SET status='todo', started_at=NULL, updated_at=datetime('now')
+    /// WHERE id = ? AND status IN ('in_progress', 'done')
+    /// ```
+    ///
+    /// Returns `Ok(true)` iff exactly one row was updated. Terminal honest
+    /// closes (`blocked`/`skipped`/`irrelevant`), already-`todo`, and missing
+    /// rows are `Ok(false)`. The `done` arm is intentional: merge-fail after
+    /// premature `:done` on a slot-local ephemeral must reopen so work is not
+    /// stranded on the feature branch (a shared `in_progress`-only helper
+    /// fails this contract).
+    ///
+    /// **Callers (post CONTRACT-001):** FEAT-002 merge-fail path only
+    /// (FIX-002). Do not reuse for 17.5/17.6 orphan reclaim.
+    pub fn reopen_after_merge_fail(&self, task_id: &str) -> Result<bool, TaskMgrError> {
+        let rows = self.conn.execute(
+            "UPDATE tasks SET status = 'todo', started_at = NULL, \
+             updated_at = datetime('now') \
+             WHERE id = ? AND status IN ('in_progress', 'done')",
+            params![task_id],
+        )?;
+        Ok(rows > 0)
+    }
+
     /// Bulk reset every `in_progress` row (optionally scoped to `prefix`)
     /// back to `todo`. Idempotent — running twice is a no-op.
     ///
@@ -101,13 +164,15 @@ impl<'a> TaskLifecycle<'a> {
     ///
     /// Unlike [`recover_in_progress_for_prefix`], the `prefix` argument here
     /// is appended raw (`prefix || '%'`) — callers pass `"FEAT-"` if they
-    /// want the trailing-dash semantic. This matches the call shape at
-    /// `engine.rs:1642` / `overflow.rs:473`.
+    /// want the trailing-dash semantic. Production orphan / overflow /
+    /// merge-fail callers have moved off this verb; it is the unguarded
+    /// escape hatch (tests + intentional force-any-status only).
     ///
     /// **Contract note**: This verb deliberately does *not* guard on
     /// `status = 'in_progress'` (unlike the bulk prefix recovery verb).
-    /// Callers (wave FEAT-002 reset, overflow rungs) may list any task ID
-    /// they want forced back to `todo` for the next iteration.
+    /// Callers may force any listed ID back to `todo`. Do **not** use for
+    /// orphan reclaim (`recover_in_progress`) or merge-fail
+    /// (`reopen_after_merge_fail`) — learning #4358.
     ///
     /// An empty `ids` slice short-circuits to `Ok(0)` with no DB round-trip
     /// (the "no transaction commit" AC).

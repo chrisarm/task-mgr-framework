@@ -499,6 +499,65 @@ fn test_escalation_fires_before_auto_block_ordering() {
     );
 }
 
+// ── handle_task_failure: skip when row is already terminal ────────────────────
+
+/// Already-terminal row (honest pipeline close / overflow rung-5 / auto-block)
+/// must not bump consecutive_failures. Shared skip lives inside
+/// handle_task_failure_with_runner (FIX-004).
+///
+/// Also locks that `todo` is NOT skipped — overflow rungs 1–3 still need the
+/// counter after recover_in_progress flips the claim back to todo.
+#[test]
+fn test_handle_task_failure_skips_already_terminal_row() {
+    let (_dir, mut conn) = setup_db();
+    let mut ctx = IterationContext::new(8);
+
+    // Terminal statuses: consecutive_failures and status must stay put.
+    for (id, terminal_status) in [
+        ("TERM-BLOCKED", "blocked"),
+        ("TERM-DONE", "done"),
+        ("TERM-SKIPPED", "skipped"),
+        ("TERM-IRRELEVANT", "irrelevant"),
+    ] {
+        insert_retry_task(&conn, id, Some(SONNET_MODEL), 3, 2);
+        conn.execute(
+            "UPDATE tasks SET status = ? WHERE id = ?",
+            rusqlite::params![terminal_status, id],
+        )
+        .unwrap();
+
+        handle_task_failure(&mut conn, id, 1, &mut ctx).unwrap();
+
+        let (count, _, status, _) = read_task_state(&conn, id);
+        assert_eq!(
+            count, 2,
+            "{id}: consecutive_failures must be unchanged for terminal row"
+        );
+        assert_eq!(
+            status, terminal_status,
+            "{id}: status must stay terminal (not re-auto-blocked or resurrected)"
+        );
+    }
+
+    // todo is NOT terminal: counter must still increment (overflow 1–3).
+    insert_retry_task(&conn, "TERM-TODO", Some(SONNET_MODEL), 5, 1);
+    conn.execute(
+        "UPDATE tasks SET status = 'todo' WHERE id = 'TERM-TODO'",
+        [],
+    )
+    .unwrap();
+    handle_task_failure(&mut conn, "TERM-TODO", 1, &mut ctx).unwrap();
+    let (count, _, status, _) = read_task_state(&conn, "TERM-TODO");
+    assert_eq!(
+        count, 2,
+        "todo must still increment consecutive_failures (overflow rungs 1–3)"
+    );
+    assert_eq!(
+        status, "todo",
+        "todo status is unchanged by handle_task_failure when below auto-block"
+    );
+}
+
 // ── reset_consecutive_failures: does not unblock ──────────────────────────────
 
 /// Resetting the counter on a blocked task clears consecutive_failures to 0

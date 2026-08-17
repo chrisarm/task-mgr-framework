@@ -159,10 +159,10 @@ pub fn validate(
 /// `source`, including `Operator` / `LoopStatusTag` / `Recovery`, because
 /// those verbs do not produce flat target-keyed plans.
 ///
-/// **Recovery policy**: The three Recovery verbs intentionally bypass this
+/// **Recovery policy**: Category C Recovery verbs intentionally bypass this
 /// matrix for the reasons documented in `src/lifecycle/CLAUDE.md` §"Recovery
-/// verb families". They use their own status predicates (or none, in the
-/// case of `resurrect_for_iteration`).
+/// verb families". They use their own status predicates (`recover_in_progress`
+/// / `reopen_after_merge_fail` / bulk twins) or none (`resurrect_for_iteration`).
 #[must_use]
 pub(crate) fn allowed_from_for_plan(
     target: TaskStatus,

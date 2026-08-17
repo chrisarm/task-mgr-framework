@@ -451,6 +451,15 @@ pub fn handle_task_failure_with_runner(
     ctx: &mut IterationContext,
     executed_runner: Option<RunnerKind>,
 ) -> TaskMgrResult<()> {
+    // Honest terminal closes (pipeline :blocked/:skipped/:irrelevant/:done) and
+    // overflow-rung-5 / auto_block already left the row terminal. Do not bump
+    // consecutive_failures or re-auto-block. Shared for sequential + wave —
+    // keep the skip here, not at orchestrator/wave call sites. `todo` is NOT
+    // terminal (overflow rungs 1–3 still need the counter).
+    if crate::lifecycle::read_status(conn, task_id).is_some_and(|s| s.is_terminal()) {
+        return Ok(());
+    }
+
     // Resolve the effective runner before entering the transaction.
     // `escalate_task_model_if_needed_inner` requires an explicit RunnerKind;
     // callers that know the executed runner (production paths) thread it via
