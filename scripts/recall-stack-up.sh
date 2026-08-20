@@ -14,6 +14,10 @@
 # Environment overrides:
 #   OLLAMA_URL        (default: http://localhost:11435)
 #   RERANKER_URL      (default: http://localhost:8181)
+#   RECALL_BIND_ADDR  (default: 127.0.0.1 — host interface the containers'
+#                     published ports bind to. Set to 0.0.0.0 ONLY if you
+#                     deliberately want the stack reachable from the LAN;
+#                     docker's published ports bypass ufw/firewalld rules.)
 #   RERANKER_MODEL    (default: derived from --rerank-profile)
 #   EMBED_MODEL_SUBSTR (default: derived from --embed-profile)
 #   OLLAMA_MODEL / RERANK_HF_* / RERANK_MODEL_PATH  (compose build args)
@@ -23,6 +27,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 COMPOSE_FILE="$PROJECT_ROOT/docker/docker-compose.yml"
+
+# Loopback-only publishing by default: ollama and llama-box have no auth, so a
+# 0.0.0.0 bind exposes model inference (and ollama's model-pull API) to anyone
+# who can route to this host.
+export RECALL_BIND_ADDR="${RECALL_BIND_ADDR:-127.0.0.1}"
 
 OLLAMA_URL="${OLLAMA_URL:-http://localhost:11435}"
 RERANKER_URL="${RERANKER_URL:-http://localhost:8181}"
@@ -124,7 +133,7 @@ while (( $# > 0 )); do
       apply_rerank_profile "$1"
       ;;
     --list-profiles) LIST_PROFILES=1 ;;
-    -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,26p' "$0"; exit 0 ;;
     *) printf 'unknown arg: %s\n' "$1" >&2; exit 2 ;;
   esac
   shift
@@ -236,6 +245,11 @@ main() {
   fi
 
   log "profile: $PROFILE  embed=$EMBED_PROFILE  rerank=$RERANK_PROFILE"
+  if [[ "$RECALL_BIND_ADDR" == "127.0.0.1" || "$RECALL_BIND_ADDR" == "localhost" ]]; then
+    log "bind: $RECALL_BIND_ADDR (loopback only)"
+  else
+    warn "bind: $RECALL_BIND_ADDR — ports are reachable beyond localhost and neither service has auth"
+  fi
   log "compose: $COMPOSE_FILE"
   log "OLLAMA_MODEL=$OLLAMA_MODEL"
   log "RERANK_MODEL_PATH=$RERANK_MODEL_PATH"
