@@ -467,6 +467,41 @@ fn launch_interactive(
     }
 }
 
+/// Headless argv *after* the binary name.
+///
+/// **`--output-format` is host-specific.** Claude accepts `text` (default
+/// under `--print`). Grok's clap enum is `plain | json | streaming-json |
+/// streaming-messages-json` and rejects `text` immediately (`invalid value
+/// 'text'`), which is why grok-primary headless auto-review died before
+/// writing findings. `plain` is Grok's equivalent of Claude's `text`.
+fn headless_cli_args(
+    host: ReviewHost,
+    worktree: &Path,
+    prompt: &str,
+    prompt_file: &Path,
+) -> Vec<String> {
+    match host {
+        ReviewHost::Claude => vec![
+            "--print".to_string(),
+            "--dangerously-skip-permissions".to_string(),
+            "--no-session-persistence".to_string(),
+            "--output-format".to_string(),
+            "text".to_string(),
+            "-p".to_string(),
+            prompt.to_string(),
+        ],
+        ReviewHost::Grok => vec![
+            "--cwd".to_string(),
+            worktree.display().to_string(),
+            "--always-approve".to_string(),
+            "--prompt-file".to_string(),
+            prompt_file.display().to_string(),
+            "--output-format".to_string(),
+            "plain".to_string(),
+        ],
+    }
+}
+
 fn launch_headless(
     binary: &str,
     host: ReviewHost,
@@ -499,26 +534,7 @@ fn launch_headless(
     let log_err = log.try_clone()?;
 
     let mut cmd = Command::new(binary);
-    match host {
-        ReviewHost::Claude => {
-            cmd.arg("--print")
-                .arg("--dangerously-skip-permissions")
-                .arg("--no-session-persistence")
-                .arg("--output-format")
-                .arg("text")
-                .arg("-p")
-                .arg(&prompt);
-        }
-        ReviewHost::Grok => {
-            cmd.arg("--cwd")
-                .arg(worktree)
-                .arg("--always-approve")
-                .arg("--prompt-file")
-                .arg(&prompt_file)
-                .arg("--output-format")
-                .arg("text");
-        }
-    }
+    cmd.args(headless_cli_args(host, worktree, &prompt, &prompt_file));
     cmd.current_dir(worktree)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
@@ -1338,5 +1354,54 @@ mod tests {
         let calls = launcher.calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, prompt);
+    }
+
+    fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+        args.windows(2)
+            .find(|w| w[0] == flag)
+            .map(|w| w[1].as_str())
+    }
+
+    #[test]
+    fn grok_headless_cli_args_use_plain_not_text() {
+        let wt = Path::new("/tmp/wt");
+        let pf = Path::new("/tmp/prompt.md");
+        let args = headless_cli_args(ReviewHost::Grok, wt, "unused", pf);
+        assert_eq!(
+            flag_value(&args, "--output-format"),
+            Some("plain"),
+            "Grok clap rejects Claude's `text`; use `plain` (Grok's default). got {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a == "text"),
+            "Grok headless argv must not contain `text` (invalid --output-format). got {args:?}"
+        );
+        assert_eq!(
+            flag_value(&args, "--prompt-file"),
+            Some(pf.to_str().unwrap())
+        );
+        assert_eq!(flag_value(&args, "--cwd"), Some(wt.to_str().unwrap()));
+        assert!(
+            args.iter().any(|a| a == "--always-approve"),
+            "headless grok must auto-approve tools. got {args:?}"
+        );
+    }
+
+    #[test]
+    fn claude_headless_cli_args_use_text() {
+        let wt = Path::new("/tmp/wt");
+        let pf = Path::new("/tmp/prompt.md");
+        let prompt = "review this";
+        let args = headless_cli_args(ReviewHost::Claude, wt, prompt, pf);
+        assert_eq!(
+            flag_value(&args, "--output-format"),
+            Some("text"),
+            "Claude --print accepts `text`. got {args:?}"
+        );
+        assert_eq!(flag_value(&args, "-p"), Some(prompt));
+        assert!(
+            args.iter().any(|a| a == "--print"),
+            "Claude headless requires --print. got {args:?}"
+        );
     }
 }

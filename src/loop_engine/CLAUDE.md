@@ -68,6 +68,8 @@ and they **do not** auto-chain `/compound`.
 - Interactive: `Command::status()`, stdio inherit, blocking
 - Headless: `Command::spawn()` + forget, stdin null, stdout/stderr → log file
 - Env vars inherit (no `env_clear`)
+- Headless `--output-format` is host-specific: Claude `text`; Grok `plain`
+  (Grok clap rejects `text` and dies before writing findings)
 
 **Module**: `src/loop_engine/auto_review.rs` — `Decision`, `ReviewHost`,
 `LaunchMode`, `resolve_decision`, `resolve_review_host`,
