@@ -749,16 +749,15 @@ pub(crate) fn initialize_loop(
                 // Provider-agnostic plan from the project's models block
                 // (primary + optional fallback, standard tier). Same helper
                 // live waves use so startup and wave merge-back cannot drift.
-                let resolved_models = model::resolve_models_config(
-                    &project_config.models,
-                    &project_config.routing,
-                );
+                let resolved_models =
+                    model::resolve_models_config(&project_config.models, &project_config.routing);
                 let recovery_plan = model::merge_resolver_plan(&resolved_models);
                 // Own model strings for the duration of the reconcile call
                 // (plan borrows from resolved_models which is local).
                 let recovery_primary_model = recovery_plan.primary.model.map(str::to_string);
-                let recovery_fallback_model =
-                    recovery_plan.fallback.and_then(|f| f.model.map(str::to_string));
+                let recovery_fallback_model = recovery_plan
+                    .fallback
+                    .and_then(|f| f.model.map(str::to_string));
                 let recovery_effort = project_config
                     .merge_resolver_effort
                     .clone()

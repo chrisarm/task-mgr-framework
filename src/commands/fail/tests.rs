@@ -40,11 +40,22 @@ fn test_fail_todo_task_requires_force() {
     assert!(result.is_err());
     match result {
         Err(TaskMgrError::InvalidTransition {
-            task_id, from, to, ..
+            task_id,
+            from,
+            to,
+            hint,
         }) => {
             assert_eq!(task_id, "US-001");
             assert_eq!(from, "todo");
             assert_eq!(to, "blocked");
+            assert!(
+                hint.contains("--force"),
+                "hint must name --force on this command, got: {hint}"
+            );
+            assert!(
+                !hint.contains("next --claim US-001"),
+                "--claim takes no task id; hint must not look like a claim-this-id command: {hint}"
+            );
         }
         _ => panic!("Expected InvalidTransition error"),
     }
