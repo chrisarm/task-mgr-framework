@@ -189,8 +189,12 @@ pub fn complete(
     })
 }
 
-/// CLI-side invalid-transition hint (references `task-mgr next --claim` /
-/// `--force` affordances, so it doesn't belong in the lifecycle service).
+/// CLI-side invalid-transition hint. Lives here (not in the lifecycle
+/// service) because it names CLI flags.
+///
+/// Never suggest `task-mgr next --claim {task_id}`: `--claim` is a bare
+/// boolean and `next` takes no task id. That command would claim the
+/// highest-priority ready task across all prefixes in a shared DB.
 fn invalid_transition_error(task_id: &str, previous: TaskStatus) -> TaskMgrError {
     let valid = previous.valid_transitions();
     let hint = if valid.is_empty() {
@@ -199,7 +203,7 @@ fn invalid_transition_error(task_id: &str, previous: TaskStatus) -> TaskMgrError
         )
     } else if previous == TaskStatus::Todo {
         format!(
-            "Task '{task_id}' is in 'todo' status. Use 'task-mgr next --claim {task_id}' to claim it first, then complete. Or use --force to override."
+            "Task '{task_id}' is in 'todo' status. Use 'task-mgr complete {task_id} --commit <sha> --force' to complete it from todo. `next --claim` takes no task id and would claim the highest-priority ready task across all prefixes."
         )
     } else {
         format!(
@@ -398,11 +402,22 @@ mod tests {
         assert!(result.is_err());
         match result {
             Err(TaskMgrError::InvalidTransition {
-                task_id, from, to, ..
+                task_id,
+                from,
+                to,
+                hint,
             }) => {
                 assert_eq!(task_id, "US-001");
                 assert_eq!(from, "todo");
                 assert_eq!(to, "done");
+                assert!(
+                    hint.contains("task-mgr complete US-001 --commit <sha> --force"),
+                    "hint must name the id-scoped force complete, got: {hint}"
+                );
+                assert!(
+                    !hint.contains("next --claim US-001"),
+                    "--claim takes no task id; hint must not look like a claim-this-id command: {hint}"
+                );
             }
             _ => panic!("Expected InvalidTransition error"),
         }

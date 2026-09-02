@@ -21,6 +21,13 @@ const OAUTH_USAGE_API_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 /// Beta header required by the OAuth usage endpoint.
 const OAUTH_USAGE_BETA: &str = "oauth-2025-04-20";
 
+/// Fallback UA when `claude --version` cannot be read.
+///
+/// The OAuth usage endpoint rate-limits callers that omit a `claude-code/`
+/// prefix into an aggressive 429 bucket, so the 30s early-lift probe never
+/// succeeds. Keep the family even when the version probe fails.
+const OAUTH_USAGE_USER_AGENT_FALLBACK: &str = "claude-code/unknown";
+
 /// Legacy org-level usage endpoint (API-key / org accounts).
 const ORG_USAGE_API_URL: &str = "https://api.anthropic.com/v1/organizations/usage";
 
@@ -77,6 +84,7 @@ fn fetch_oauth_usage(access_token: &str) -> Option<UsageInfo> {
     let mut response = match ureq::get(OAUTH_USAGE_API_URL)
         .header("Authorization", format!("Bearer {}", access_token))
         .header("anthropic-beta", OAUTH_USAGE_BETA)
+        .header("User-Agent", oauth_usage_user_agent())
         .header("Content-Type", "application/json")
         .call()
     {
@@ -99,6 +107,62 @@ fn fetch_oauth_usage(access_token: &str) -> Option<UsageInfo> {
     };
 
     parse_oauth_usage_json(&json)
+}
+
+/// User-Agent for `GET /api/oauth/usage`.
+///
+/// Reads the installed Claude Code version once per process (`$CLAUDE_BINARY
+/// --version`, default `claude`) so a CLI upgrade is picked up on the next
+/// loop start without a hardcoded pin. Cached: the 30s early-lift probe must
+/// not spawn a process on every tick.
+fn oauth_usage_user_agent() -> &'static str {
+    static CACHED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CACHED.get_or_init(detect_claude_code_user_agent)
+}
+
+fn detect_claude_code_user_agent() -> String {
+    match query_claude_cli_version() {
+        Some(ver) => format!("claude-code/{ver}"),
+        None => OAUTH_USAGE_USER_AGENT_FALLBACK.to_string(),
+    }
+}
+
+fn query_claude_cli_version() -> Option<String> {
+    let binary = std::env::var("CLAUDE_BINARY").unwrap_or_else(|_| "claude".to_string());
+    let output = std::process::Command::new(&binary)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_claude_version_output(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Pull a `x.y` / `x.y.z` version from `claude --version` stdout.
+///
+/// Live CLI prints `2.1.257 (Claude Code)`. First semver-like token wins.
+pub(crate) fn parse_claude_version_output(stdout: &str) -> Option<String> {
+    let line = stdout.lines().next()?.trim();
+    for tok in line.split_whitespace() {
+        let tok = tok.trim_matches(|c: char| !(c.is_ascii_digit() || c == '.'));
+        if is_dotted_version(tok) {
+            return Some(tok.to_string());
+        }
+    }
+    None
+}
+
+fn is_dotted_version(s: &str) -> bool {
+    !s.is_empty()
+        && s.contains('.')
+        && !s.starts_with('.')
+        && !s.ends_with('.')
+        && s.chars().any(|c| c.is_ascii_digit())
+        && s.chars().all(|c| c.is_ascii_digit() || c == '.')
 }
 
 /// Fetch legacy org-level usage endpoint.
@@ -151,7 +215,12 @@ pub(crate) fn parse_oauth_usage_json(json: &serde_json::Value) -> Option<UsageIn
     let mut windows: Vec<UsageWindow> = Vec::new();
 
     // Named buckets Claude Code exposes.
-    for key in ["five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet"] {
+    for key in [
+        "five_hour",
+        "seven_day",
+        "seven_day_opus",
+        "seven_day_sonnet",
+    ] {
         if let Some(bucket) = json.get(key)
             && let Some(util) = bucket_utilization(bucket)
         {
@@ -171,10 +240,12 @@ pub(crate) fn parse_oauth_usage_json(json: &serde_json::Value) -> Option<UsageIn
     // Structured limits array (severity / percent / kind).
     if let Some(limits) = json.get("limits").and_then(|v| v.as_array()) {
         for limit in limits {
-            let percent = limit
-                .get("percent")
-                .and_then(|v| v.as_f64())
-                .or_else(|| limit.get("percent").and_then(|v| v.as_u64()).map(|u| u as f64));
+            let percent = limit.get("percent").and_then(|v| v.as_f64()).or_else(|| {
+                limit
+                    .get("percent")
+                    .and_then(|v| v.as_u64())
+                    .map(|u| u as f64)
+            });
             let Some(p) = percent else {
                 continue;
             };
@@ -218,14 +289,10 @@ pub(crate) fn parse_oauth_usage_json(json: &serde_json::Value) -> Option<UsageIn
 }
 
 fn bucket_utilization(bucket: &serde_json::Value) -> Option<f64> {
-    // Live API uses 0–100. Some clients report 0.0–1.0 fractions.
-    // Heuristic: values ≤ 1.0 are treated as fractions (so 1.0 → 100%).
-    let raw = bucket.get("utilization")?.as_f64()?;
-    if raw <= 1.0 {
-        Some(raw * 100.0)
-    } else {
-        Some(raw)
-    }
+    // Live OAuth `/api/oauth/usage` reports utilization as a 0–100 percentage
+    // (`1.0` is one percent, not exhausted). Do not scale values ≤ 1.0: that
+    // heuristic parks the loop at 100% after the first ~1% of a new window.
+    bucket.get("utilization")?.as_f64()
 }
 
 /// Pick the chronologically soonest ISO-8601 reset timestamp from an iterator
@@ -389,16 +456,67 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_oauth_usage_fractional_utilization() {
-        // Some clients report utilization as 0.0–1.0 fractions.
+    fn test_parse_oauth_usage_one_percent_is_not_exhausted() {
+        // Live API: utilization 1.0 means 1%, not 100%. Scaling ≤1.0 as a
+        // fraction parked loops after the first small task of a new window.
+        let json = serde_json::json!({
+            "five_hour": {
+                "utilization": 1.0,
+                "resets_at": "2026-09-01T23:00:00Z"
+            },
+            "seven_day": {
+                "utilization": 11.0,
+                "resets_at": "2026-09-05T19:00:00Z"
+            }
+        });
+        let info = parse_oauth_usage_json(&json).expect("oauth json must parse");
+        assert!(
+            (info.percentage - 11.0).abs() < f64::EPSILON,
+            "max window is weekly 11%, not five_hour 1.0 scaled to 100; got {}",
+            info.percentage
+        );
+        assert_eq!(
+            info.reset_at.as_deref(),
+            Some("2026-09-01T23:00:00Z"),
+            "nothing exhausted → prefer five_hour.resets_at"
+        );
+    }
+
+    #[test]
+    fn test_parse_oauth_usage_sonnet_one_percent_does_not_park() {
+        // Live sample: seven_day_sonnet appears at 1.0 after the first Sonnet
+        // task of a weekly window. Must not become the max-100 gate.
+        let json = serde_json::json!({
+            "five_hour": {
+                "utilization": 33.0,
+                "resets_at": "2026-04-11T07:00:00Z"
+            },
+            "seven_day": {
+                "utilization": 13.0,
+                "resets_at": "2026-04-17T00:59:59Z"
+            },
+            "seven_day_sonnet": {
+                "utilization": 1.0,
+                "resets_at": "2026-04-16T03:00:00Z"
+            }
+        });
+        let info = parse_oauth_usage_json(&json).expect("oauth json must parse");
+        assert!((info.percentage - 33.0).abs() < f64::EPSILON);
+        assert_eq!(info.reset_at.as_deref(), Some("2026-04-11T07:00:00Z"));
+    }
+
+    #[test]
+    fn test_parse_oauth_usage_sub_one_percent_stays_sub_one() {
+        // OAuth reports 0–100. A true 0.42% must stay below the 92% threshold,
+        // not be scaled to 42%.
         let json = serde_json::json!({
             "five_hour": {
                 "utilization": 0.42,
                 "resets_at": "2026-02-28T17:00:00Z"
             }
         });
-        let info = parse_oauth_usage_json(&json).expect("fractional util must parse");
-        assert!((info.percentage - 42.0).abs() < f64::EPSILON);
+        let info = parse_oauth_usage_json(&json).expect("sub-one percent must parse");
+        assert!((info.percentage - 0.42).abs() < f64::EPSILON);
         assert_eq!(info.reset_at.as_deref(), Some("2026-02-28T17:00:00Z"));
     }
 
@@ -678,6 +796,45 @@ mod tests {
         assert!(
             OAUTH_USAGE_API_URL.contains("/api/oauth/usage"),
             "OAuth usage path must match Claude Code /usage HUD endpoint"
+        );
+        assert!(
+            OAUTH_USAGE_USER_AGENT_FALLBACK.starts_with("claude-code/"),
+            "OAuth usage UA must look like Claude Code or the endpoint 429s probes"
+        );
+    }
+
+    #[test]
+    fn test_parse_claude_version_live_cli_shape() {
+        assert_eq!(
+            parse_claude_version_output("2.1.257 (Claude Code)\n"),
+            Some("2.1.257".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_claude_version_bare_semver() {
+        assert_eq!(
+            parse_claude_version_output("2.1.257\n"),
+            Some("2.1.257".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_claude_version_prefixed_line() {
+        assert_eq!(
+            parse_claude_version_output("claude 2.0.14 extra"),
+            Some("2.0.14".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_claude_version_garbage_is_none() {
+        assert_eq!(parse_claude_version_output(""), None);
+        assert_eq!(parse_claude_version_output("not-a-version\n"), None);
+        assert_eq!(
+            parse_claude_version_output("2\n"),
+            None,
+            "bare major is not dotted"
         );
     }
 

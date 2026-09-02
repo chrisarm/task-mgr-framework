@@ -781,12 +781,12 @@ pub(crate) fn reconcile_stale_ephemeral_slots_inner(
                 provider: cfg.primary_provider,
                 model: cfg.primary_model,
             },
-            fallback: cfg.fallback_provider.map(|fb| {
-                crate::loop_engine::model::AuxiliaryLlmPlan {
+            fallback: cfg
+                .fallback_provider
+                .map(|fb| crate::loop_engine::model::AuxiliaryLlmPlan {
                     provider: fb,
                     model: cfg.fallback_model,
-                }
-            }),
+                }),
         };
         let llm_resolver = crate::loop_engine::merge_resolver::LlmMergeResolver::from_plan(
             &plan,

@@ -78,7 +78,8 @@ pub fn fail_single_task(
 
 /// Validate that the matrix transition is allowed. Lives at the CLI layer
 /// (rather than inside `TaskLifecycle::apply`) because the hint text
-/// references CLI affordances (`task-mgr next --claim`, `--force`).
+/// references CLI affordances (`--force`). Never suggest
+/// `next --claim {task_id}`: `--claim` takes no task id.
 fn validate_transition(
     task_id: &str,
     previous_status: TaskStatus,
@@ -103,7 +104,7 @@ fn validate_transition(
         )
     } else if previous_status == TaskStatus::Todo {
         format!(
-            "Task '{task_id}' is in 'todo' status. Use 'task-mgr next --claim {task_id}' to claim it first, then mark as {status_name}. Or use --force to override."
+            "Task '{task_id}' is in 'todo' status. Re-run with --force to mark it {status_name} from todo. `next --claim` takes no task id and would claim the highest-priority ready task across all prefixes."
         )
     } else {
         format!(

@@ -415,11 +415,8 @@ impl<'a> MergeResolver for LlmMergeResolver<'a> {
             );
         }
 
-        let primary_outcome = self.resolve_once(
-            self.primary_provider,
-            self.primary_model.as_deref(),
-            &ctx,
-        );
+        let primary_outcome =
+            self.resolve_once(self.primary_provider, self.primary_model.as_deref(), &ctx);
         match &primary_outcome {
             MergeResolverOutcome::Resolved | MergeResolverOutcome::Aborted => primary_outcome,
             MergeResolverOutcome::Failed(primary_msg) => {
@@ -793,7 +790,14 @@ mod tests {
                 model: Some("claude-opus-5"),
             }),
         };
-        let r = LlmMergeResolver::from_plan(&plan, "high".into(), Duration::from_secs(120), None, None, None);
+        let r = LlmMergeResolver::from_plan(
+            &plan,
+            "high".into(),
+            Duration::from_secs(120),
+            None,
+            None,
+            None,
+        );
         assert_eq!(r.primary_provider, Provider::Grok);
         assert_eq!(r.primary_model.as_deref(), Some("grok-build"));
         assert_eq!(r.fallback_provider, Some(Provider::Claude));

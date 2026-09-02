@@ -103,7 +103,7 @@ TaskMgrError::InvalidTransition {
     task_id: "US-001".to_string(),
     from: TaskStatus::Todo,
     to: TaskStatus::Done,
-    hint: "Use `next --claim` to start the task first".to_string(),
+    hint: "Use `task-mgr complete US-001 --commit <sha> --force`".to_string(),
 }
 
 // Avoid: generic errors without guidance

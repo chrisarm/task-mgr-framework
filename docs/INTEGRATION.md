@@ -568,13 +568,11 @@ task-mgr doctor --auto-fix
 
 **Solution**:
 ```bash
-# Use --force to override
-task-mgr complete US-001 --force
-
-# Or claim first, then complete
-task-mgr next --claim  # Claims the next task
-task-mgr complete US-001
+# Force-complete this id (does not claim a different task)
+task-mgr complete US-001 --commit <sha> --force
 ```
+
+Do **not** run `task-mgr next --claim US-001`. `--claim` is a boolean; `next` takes no task id and would claim the highest-priority ready task across all prefixes in a shared DB.
 
 ### "Database is locked"
 
