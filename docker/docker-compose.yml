@@ -15,7 +15,7 @@ services:
         #   docker compose build --build-arg OLLAMA_MODEL=...
         OLLAMA_MODEL: ${OLLAMA_MODEL:-hf.co/jinaai/jina-embeddings-v5-text-small-retrieval-GGUF:Q8_0}
     ports:
-      - "11435:11434"
+      - "${RECALL_BIND_ADDR:-127.0.0.1}:11435:11434"
     restart: unless-stopped
     healthcheck:
       # /api/tags lists installed models — cheap, 200 even on empty install.
@@ -49,7 +49,7 @@ services:
     ports:
       # Host 8181 (project default — avoids clashing with other projects
       # that commonly publish on 8080); container internal stays at 8080.
-      - "8181:8080"
+      - "${RECALL_BIND_ADDR:-127.0.0.1}:8181:8080"
     restart: unless-stopped
     healthcheck:
       # Try /health, fall back to /v1/models (OpenAI-compat, 200 when model loaded),
@@ -79,7 +79,7 @@ services:
       args:
         OLLAMA_MODEL: ${OLLAMA_MODEL:-hf.co/jinaai/jina-embeddings-v5-text-small-retrieval-GGUF:Q8_0}
     ports:
-      - "11435:11434"
+      - "${RECALL_BIND_ADDR:-127.0.0.1}:11435:11434"
     restart: unless-stopped
     healthcheck:
       # Same probe as GPU variant; start_period covers model load on CPU.
@@ -102,7 +102,7 @@ services:
         MODEL_PATH: ${RERANK_MODEL_PATH:-/models/jina-reranker-v2.gguf}
     ports:
       # Host 8181 (see GPU variant above for rationale).
-      - "8181:8080"
+      - "${RECALL_BIND_ADDR:-127.0.0.1}:8181:8080"
     restart: unless-stopped
     healthcheck:
       # Same probe as GPU variant; wget preferred (confirmed available in base image).
