@@ -491,14 +491,26 @@ pub fn react_to_outputs_inner(
         return AccountReaction::None;
     };
 
+    // Prefer a rung-scoped RateLimit for decide when any match — aligns with the
+    // `any()` skip in `react_to_outputs_with_io_seams`. Mixed wave
+    // [account hit-your-limit, Fable switch-models] must Wait(blackout_fallback_secs)
+    // and never Blackout, even when the non-Fable item is first.
+    let decide_item = items
+        .iter()
+        .find(|item| {
+            *item.outcome == IterationOutcome::RateLimit
+                && is_rung_scoped_rate_limit_message(item.output)
+        })
+        .unwrap_or(first_rate_limited);
+
     // Always reset in_progress first so work isn't stuck if we StopSpend.
     reset_in_progress_tasks(conn, params.run_id, params.prefix, "rate limit");
 
-    let output_secs = parse_reset_from_output(first_rate_limited.output);
+    let output_secs = parse_reset_from_output(decide_item.output);
     let action = decide_account_rate_limit(
         api_reset_secs,
         output_secs,
-        first_rate_limited.output,
+        decide_item.output,
         params.spillover_enabled,
         params.fallback_wait,
         params.blackout_fallback_secs,

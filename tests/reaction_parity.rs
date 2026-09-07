@@ -3734,6 +3734,68 @@ fn fable_rate_limit_wave_waits_once_3600_never_blackouts() {
 }
 
 // ---------------------------------------------------------------------------
+// CODE-FIX-001: Mixed wave — non-Fable account RateLimit FIRST + Fable second
+// + spillover_enabled. Decide must prefer the rung-scoped item (Wait 3600),
+// never Blackout from the leading account hit. Without the prefer-rung-scoped
+// pick, first_rate_limited would Blackout while any() still skipped the probe.
+// ---------------------------------------------------------------------------
+
+const ACCOUNT_HIT_YOUR_LIMIT_OUTPUT: &str =
+    "Claude AI usage limit reached · hit your limit · resets 4pm (America/Los_Angeles)";
+
+#[test]
+fn mixed_wave_prefers_rung_scoped_rate_limit_over_leading_account_hit() {
+    disable_llm_extraction();
+    let (db_temp, mut conn) = setup_migrated_db();
+    insert_run(&conn);
+    insert_in_progress_task(&conn, "RP-ACCT-0");
+    insert_in_progress_task(&conn, "RP-FABLE-1");
+
+    let rate = IterationOutcome::RateLimit;
+    let items = [
+        OutputReactionItem {
+            task_id: Some("RP-ACCT-0"),
+            outcome: &rate,
+            output: ACCOUNT_HIT_YOUR_LIMIT_OUTPUT,
+        },
+        OutputReactionItem {
+            task_id: Some("RP-FABLE-1"),
+            outcome: &rate,
+            output: FABLE_RATE_LIMIT_OUTPUT,
+        },
+    ];
+    let mut p = params(db_temp.path(), 300);
+    p.spillover_enabled = true;
+    p.blackout_fallback_secs = 3600;
+    p.now_secs = 1_000;
+    let mut blackout = BlackoutState::default();
+    let spy = WaitSpy::completing();
+    let wait = spy.closure();
+    let reaction = react_to_outputs_inner(
+        &mut conn,
+        &items,
+        &p,
+        &mut blackout,
+        Some(7200), // would drive Blackout if decide used the leading account item
+        &wait as WaitFn,
+    );
+
+    assert_eq!(reaction, AccountReaction::WaitedAndRetry);
+    assert_eq!(spy.calls.get(), 1, "exactly one wait for the whole wave");
+    assert_eq!(
+        spy.last_secs.get(),
+        Some(3600),
+        "rung-scoped item must win decide → Wait(blackout_fallback_secs)"
+    );
+    assert!(
+        blackout.active(1_000).is_empty(),
+        "any Fable/rung-scoped RateLimit in the wave must never record provider_blackouts"
+    );
+    assert_eq!(task_status(&conn, "RP-ACCT-0").as_deref(), Some("todo"));
+    assert_eq!(task_status(&conn, "RP-FABLE-1").as_deref(), Some("todo"));
+}
+
+// ---------------------------------------------------------------------------
 // (d) Production wait closure: Fable phrasing must NOT call load_usage_info,
 // invoke usage_gate, or wire probe_rate_limit_lifted (sleep is stop-signal-
 // aware only). Hermetic with anthropic_account_io_allowed=true via the
@@ -3799,6 +3861,67 @@ fn fable_rate_limit_skips_usage_gate_and_probe() {
         "wait secs = blackout_fallback_secs"
     );
     assert!(blackout.active(0).is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// CODE-FIX-001 AC: mixed wave still skips usage_gate / probe when ANY item is
+// rung-scoped (leading account RateLimit must not re-enable Anthropic I/O).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn mixed_wave_rung_scoped_still_skips_usage_gate_and_probe() {
+    disable_llm_extraction();
+    let (db_temp, mut conn) = setup_migrated_db();
+    insert_run(&conn);
+    insert_in_progress_task(&conn, "RP-ACCT-0");
+    insert_in_progress_task(&conn, "RP-FABLE-1");
+
+    let rate = IterationOutcome::RateLimit;
+    let items = [
+        OutputReactionItem {
+            task_id: Some("RP-ACCT-0"),
+            outcome: &rate,
+            output: ACCOUNT_HIT_YOUR_LIMIT_OUTPUT,
+        },
+        OutputReactionItem {
+            task_id: Some("RP-FABLE-1"),
+            outcome: &rate,
+            output: FABLE_RATE_LIMIT_OUTPUT,
+        },
+    ];
+    let mut p = params(db_temp.path(), 300);
+    p.usage_enabled = true;
+    p.anthropic_account_io_allowed = true;
+    p.spillover_enabled = true;
+    p.blackout_fallback_secs = 3600;
+    p.now_secs = 1_000;
+
+    let boom_load = || -> Option<UsageInfo> {
+        panic!("load_usage_info reached when any RateLimit item is rung-scoped");
+    };
+    let spy = IoSeamSpy::new();
+    let mut blackout = BlackoutState::default();
+    let reaction = react_to_outputs_with_io_seams(
+        &mut conn,
+        &items,
+        &p,
+        &mut blackout,
+        &spy.usage_gate(),
+        &spy.reset_wait(),
+        &spy.probe(),
+        &boom_load,
+    );
+
+    assert_eq!(reaction, AccountReaction::WaitedAndRetry);
+    assert_eq!(spy.usage_gate_calls.get(), 0);
+    assert_eq!(spy.reset_wait_probe_wired.get(), Some(false));
+    assert_eq!(spy.probe_calls.get(), 0);
+    assert_eq!(spy.reset_wait_calls.get(), 1);
+    assert_eq!(spy.reset_wait_secs.get(), Some(3600));
+    assert!(
+        blackout.active(1_000).is_empty(),
+        "prefer-rung-scoped decide + any() skip must both hold on mixed waves"
+    );
 }
 
 // ---------------------------------------------------------------------------
