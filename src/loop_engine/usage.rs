@@ -112,8 +112,9 @@ pub enum UsageCheckResult {
     Skipped,
     /// API call failed but we continue anyway (graceful degradation).
     ApiError(String),
-    /// PR-2: operator forbade tierFallback downgrade and ask TTL is 0 — no
-    /// sleep, no continue (soft-stop for operator intervention).
+    /// Operator forbade tierFallback downgrade and ask TTL is 0 — no sleep,
+    /// no continue (soft-stop for operator intervention). TTL > 0 sleeps via
+    /// Ask then continues ([`UsageCheckResult::WaitedAndReset`]) or stops.
     Deferred,
 }
 

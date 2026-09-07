@@ -252,7 +252,8 @@ inputs — never ask, never `other_rungs_runnable`). Apply in `account.rs`
 from remaining work + `routing.tierFallback`. Factory default
 `tierFallback` is `{maxDifficulty: high, includeReview: true, includeForced:
 false}` — absent key deserializes to that `Some` (auto-unavailable / downgrade);
-explicit JSON `null` is the ask opt-out (TTL 0 → defer, no sleep). Horizon:
+explicit JSON `null` is the ask opt-out (`askTtlMinutes` 0 → defer, no sleep;
+TTL > 0 → stop-signal-aware sleep then continue). Horizon:
 wait if reset ≤ `waitIfResetWithinMinutes` (60); (60m, 12h] wait capped at
 `MAX_WAIT_SECS` (5h); >12h + nothing else runnable → stop (`in_progress` →
 `todo`). Scoped unavailable is **excluded** from the next selection via

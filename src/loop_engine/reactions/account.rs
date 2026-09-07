@@ -1015,8 +1015,9 @@ pub enum QuotaAccountAction {
     Wait { secs: u64 },
     /// Stop this PRD (`in_progress` → `todo`). Next-PRD inherit of unavailable is PR-3.
     Stop,
-    /// Operator forbade downgrade; ask (TTL > 0 would sleep — PR-3).
-    Ask,
+    /// Operator forbade downgrade; sleep up to `ttl_minutes` (stop-signal-aware)
+    /// then continue. Only emitted when `ask_ttl_minutes > 0`.
+    Ask { ttl_minutes: u64 },
     /// Ask with TTL 0: no sleep, no continue (soft-stop for operator).
     Defer,
 }
@@ -1180,13 +1181,17 @@ pub fn apply_quota(
     }
 
     // stop beats ask
-    if matches!(account, QuotaAccountAction::Ask | QuotaAccountAction::Defer)
-        && (spend_stop || explicit_stop)
+    if matches!(
+        account,
+        QuotaAccountAction::Ask { .. } | QuotaAccountAction::Defer
+    ) && (spend_stop || explicit_stop)
     {
         account = QuotaAccountAction::Stop;
     }
-    if matches!(account, QuotaAccountAction::Ask | QuotaAccountAction::Defer)
-        && matches!(latest, Some(secs) if secs > stop_beyond_secs)
+    if matches!(
+        account,
+        QuotaAccountAction::Ask { .. } | QuotaAccountAction::Defer
+    ) && matches!(latest, Some(secs) if secs > stop_beyond_secs)
         && !work.other_rungs_runnable
     {
         account = QuotaAccountAction::Stop;
@@ -1202,7 +1207,9 @@ fn ask_or_defer(ask_ttl_minutes: u64) -> QuotaAccountAction {
     if ask_ttl_minutes == 0 {
         QuotaAccountAction::Defer
     } else {
-        QuotaAccountAction::Ask
+        QuotaAccountAction::Ask {
+            ttl_minutes: ask_ttl_minutes,
+        }
     }
 }
 
@@ -1586,9 +1593,19 @@ fn execute_quota_account_action(action: &QuotaAccountAction, wait: WaitFn<'_>) -
             }
         }
         QuotaAccountAction::Stop => UsageCheckResult::StopSignaled,
-        QuotaAccountAction::Ask => {
-            // PR-3 would TTL-sleep; PR-2 factory default TTL is 0 → Defer.
-            UsageCheckResult::Deferred
+        QuotaAccountAction::Ask { ttl_minutes } => {
+            // Config knob (askTtlMinutes): stop-signal-aware sleep up to TTL,
+            // then continue. TTL 0 is Defer at apply time (no sleep). Clap
+            // --use-other-models-ttl / mid-wait config re-eval stay PR-3.
+            let secs = ttl_minutes.saturating_mul(60);
+            if secs == 0 {
+                return UsageCheckResult::Deferred;
+            }
+            if wait(secs) {
+                UsageCheckResult::WaitedAndReset
+            } else {
+                UsageCheckResult::StopSignaled
+            }
         }
         QuotaAccountAction::Defer => UsageCheckResult::Deferred,
     }
@@ -2795,6 +2812,165 @@ mod tests {
         let applied = apply_quota(&eval, &[frontier], &policy, None, &work);
         assert!(applied.unavailable.is_empty());
         assert_eq!(applied.account, QuotaAccountAction::Defer);
+    }
+
+    #[test]
+    fn apply_forbade_ask_ttl_15_emits_ask_not_defer() {
+        let frontier = pct_bucket(
+            "weekly_scoped",
+            "weekly_scoped",
+            5.0,
+            6 * 24 * 3600,
+            Some(vec![(Provider::Claude, CapabilityTier::Frontier)]),
+        );
+        let mut policy = UsagePolicy::default();
+        policy.ask_ttl_minutes = 15;
+        let eval = evaluate_quota(std::slice::from_ref(&frontier), &policy, 8);
+        let work = RemainingWorkSnapshot {
+            other_rungs_runnable: true,
+            max_difficulty: Some("high"),
+            ..RemainingWorkSnapshot::default()
+        };
+        let applied = apply_quota(&eval, &[frontier], &policy, None, &work);
+        assert!(applied.unavailable.is_empty());
+        assert_eq!(applied.account, QuotaAccountAction::Ask { ttl_minutes: 15 });
+    }
+
+    #[test]
+    fn execute_ask_ttl_0_defers_without_sleep() {
+        // apply emits Defer when ask_ttl_minutes == 0; preflight must not wait.
+        use std::cell::RefCell;
+        let frontier = pct_bucket(
+            "weekly_scoped",
+            "weekly_scoped",
+            5.0,
+            6 * 24 * 3600,
+            Some(vec![(Provider::Claude, CapabilityTier::Frontier)]),
+        );
+        let policy = UsagePolicy::default(); // ask_ttl_minutes = 0 → Defer
+        let work = RemainingWorkSnapshot {
+            other_rungs_runnable: true,
+            max_difficulty: Some("high"),
+            ..RemainingWorkSnapshot::default()
+        };
+        let waited = RefCell::new(Vec::<u64>::new());
+        let wait = |secs: u64| {
+            waited.borrow_mut().push(secs);
+            true
+        };
+        let mut set = HashSet::new();
+        let result = account_quota_preflight_inner(
+            QuotaPreflightParams {
+                threshold: 8,
+                tasks_dir: Path::new("/tmp"),
+                fallback_wait: 300,
+                policy: &policy,
+                tier_fallback: None, // ask opt-out
+                execute_account_action: true,
+                unavailable_rungs: &mut set,
+                work: &work,
+                buckets: Some(std::slice::from_ref(&frontier)),
+                account_remaining: Some(76.0),
+                account_reset_at: None,
+            },
+            &wait,
+        );
+        assert_eq!(result, UsageCheckResult::Deferred);
+        assert!(
+            waited.borrow().is_empty(),
+            "askTtlMinutes 0 must not sleep (got {:?})",
+            waited.borrow()
+        );
+    }
+
+    #[test]
+    fn execute_ask_ttl_15_sleeps_900s_then_continues() {
+        use std::cell::RefCell;
+        let frontier = pct_bucket(
+            "weekly_scoped",
+            "weekly_scoped",
+            5.0,
+            6 * 24 * 3600,
+            Some(vec![(Provider::Claude, CapabilityTier::Frontier)]),
+        );
+        let mut policy = UsagePolicy::default();
+        policy.ask_ttl_minutes = 15;
+        let work = RemainingWorkSnapshot {
+            other_rungs_runnable: true,
+            max_difficulty: Some("high"),
+            ..RemainingWorkSnapshot::default()
+        };
+        let waited = RefCell::new(Vec::<u64>::new());
+        let wait = |secs: u64| {
+            waited.borrow_mut().push(secs);
+            true
+        };
+        let mut set = HashSet::new();
+        let result = account_quota_preflight_inner(
+            QuotaPreflightParams {
+                threshold: 8,
+                tasks_dir: Path::new("/tmp"),
+                fallback_wait: 300,
+                policy: &policy,
+                tier_fallback: None, // ask opt-out
+                execute_account_action: true,
+                unavailable_rungs: &mut set,
+                work: &work,
+                buckets: Some(std::slice::from_ref(&frontier)),
+                account_remaining: Some(76.0),
+                account_reset_at: None,
+            },
+            &wait,
+        );
+        assert_eq!(result, UsageCheckResult::WaitedAndReset);
+        assert_eq!(
+            *waited.borrow(),
+            vec![15 * 60],
+            "askTtlMinutes 15 must sleep exactly 900s stop-signal-aware"
+        );
+    }
+
+    #[test]
+    fn execute_ask_ttl_15_stop_signal_exits() {
+        use std::cell::RefCell;
+        let frontier = pct_bucket(
+            "weekly_scoped",
+            "weekly_scoped",
+            5.0,
+            6 * 24 * 3600,
+            Some(vec![(Provider::Claude, CapabilityTier::Frontier)]),
+        );
+        let mut policy = UsagePolicy::default();
+        policy.ask_ttl_minutes = 15;
+        let work = RemainingWorkSnapshot {
+            other_rungs_runnable: true,
+            max_difficulty: Some("high"),
+            ..RemainingWorkSnapshot::default()
+        };
+        let waited = RefCell::new(Vec::<u64>::new());
+        let wait = |secs: u64| {
+            waited.borrow_mut().push(secs);
+            false // stop signal during TTL wait
+        };
+        let mut set = HashSet::new();
+        let result = account_quota_preflight_inner(
+            QuotaPreflightParams {
+                threshold: 8,
+                tasks_dir: Path::new("/tmp"),
+                fallback_wait: 300,
+                policy: &policy,
+                tier_fallback: None,
+                execute_account_action: true,
+                unavailable_rungs: &mut set,
+                work: &work,
+                buckets: Some(std::slice::from_ref(&frontier)),
+                account_remaining: Some(76.0),
+                account_reset_at: None,
+            },
+            &wait,
+        );
+        assert_eq!(result, UsageCheckResult::StopSignaled);
+        assert_eq!(*waited.borrow(), vec![900]);
     }
 
     #[test]
