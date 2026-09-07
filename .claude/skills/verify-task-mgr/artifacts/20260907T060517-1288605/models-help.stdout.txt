@@ -1,0 +1,41 @@
+Manage the provider-first `models` + `routing` config (tiers, anchor, routes)
+
+Usage: task-mgr models [OPTIONS] <COMMAND>
+
+Commands:
+  init            Write the FR-001 default `models`/`routing` config block
+  show            Show the resolved routing table, anchor-derived mapping, and notes
+  list            List the merged provider tier ladders (reverse lookup)
+  set-anchor      Set the anchor capability tier (centers the difficulty window)
+  enable          Enable a provider (probes its CLI binary BEFORE writing)
+  disable         Disable a provider (never probes)
+  set-tier        Pin a model to a provider's capability tier (omit MODEL to route with no model flag)
+  unset-tier      Clear a provider tier override (the built-in default rung, if any, reapplies)
+  set-effort      Set a provider's per-difficulty effort level (omit EFFORT for no flag)
+  set-fallback    Set a provider's tier-preserving cross-provider fallback target
+  unset-fallback  Remove a provider's fallback target
+  route           Add or replace a routing.byIdPrefix forced route
+  unroute         Remove a routing.byIdPrefix route
+  help            Print this message or the help of the given subcommand(s)
+
+Options:
+      --dir <DIR>
+          Directory for task-mgr database files
+          
+          [env: TASK_MGR_DIR=]
+          [default: .task-mgr]
+
+      --format <FORMAT>
+          Output format
+
+          Possible values:
+          - text: Human-readable text output
+          - json: JSON output for machine parsing
+          
+          [default: text]
+
+  -v, --verbose
+          Enable verbose output (show detailed debug information)
+
+  -h, --help
+          Print help (see a summary with '-h')
