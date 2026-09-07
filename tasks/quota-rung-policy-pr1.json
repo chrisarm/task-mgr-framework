@@ -1,11 +1,22 @@
 {
-  "version": "1.0",
-  "project": "task-mgr",
   "branchName": "feat/quota-rung-policy-pr1",
-  "prdFile": "prd-quota-rung-policy.md",
   "description": "PR-1 only (FR-001 + FR-002 / US-001 + US-002). Stop folding rung-scoped Claude usage (frontier weekly / seven_day_opus / seven_day_sonnet / severity=critical) into the account wait clock. Keep UsageInfo.percentage as used 0–100. Classify Fable/rung-scoped CLI as RateLimit with a narrow 3600s Wait that ignores api_secs/output_secs, does not Blackout the provider, and does not run usage_gate or probe_rate_limit_lifted. Pin (set-tier claude frontier to the standard model) is required for parallel/wave. No auto-downgrade, no remaining banners, no horizon/ask TTL, no rung blackout channel.",
-  "requires": [],
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "No warnings in `cargo check` output",
+      "No warnings in `cargo clippy --all-targets -- -D warnings`",
+      "`cargo fmt --check` passes",
+      "Scoped tests for touched modules pass",
+      "No unwrap() in production code paths",
+      "Sequential and wave paths stay parity-locked for account reactions (exhaustive destructure, shared coordinators)",
+      "UsageInfo.percentage remains used 0–100; compare stays `percentage >= usage_threshold` (default 92)",
+      "No new CLI flags in this PR",
+      "No live Anthropic / real ~/.claude credentials in tests"
+    ],
+    "description": "These criteria apply to ALL implementation tasks"
+  },
   "mergeStrategy": "Merge to main after REVIEW-001 passes. Squash commits optional.",
+  "prdFile": "prd-quota-rung-policy.md",
   "priorityPhilosophy": {
     "description": "Hierarchy of what matters most when implementing tasks",
     "hierarchy": [
@@ -46,34 +57,19 @@
     "unwrap() in production paths",
     "Catch-all error handlers that swallow context"
   ],
-  "globalAcceptanceCriteria": {
-    "description": "These criteria apply to ALL implementation tasks",
-    "criteria": [
-      "No warnings in `cargo check` output",
-      "No warnings in `cargo clippy --all-targets -- -D warnings`",
-      "`cargo fmt --check` passes",
-      "Scoped tests for touched modules pass",
-      "No unwrap() in production code paths",
-      "Sequential and wave paths stay parity-locked for account reactions (exhaustive destructure, shared coordinators)",
-      "UsageInfo.percentage remains used 0–100; compare stays `percentage >= usage_threshold` (default 92)",
-      "No new CLI flags in this PR",
-      "No live Anthropic / real ~/.claude credentials in tests"
-    ]
-  },
+  "project": "task-mgr",
+  "requires": [],
   "reviewGuidelines": {
     "priorityGuidelines": {
       "critical": "1-10: Blocks further work, fix immediately",
       "high": "11-20: Fix before phase completion",
-      "medium": "21-50: Fix in current phase if time permits",
-      "low": "51-99: Defer to hardening phase"
+      "low": "51-99: Defer to hardening phase",
+      "medium": "21-50: Fix in current phase if time permits"
     }
   },
+  "taskPrefix": "04391085",
   "userStories": [
     {
-      "id": "FIX-001",
-      "title": "Account wait uses only session and weekly-all used percent",
-      "taskType": "implementation",
-      "description": "PR-1 / FR-001 / US-001. parse_oauth_usage_json currently max-folds every utilization window — named five_hour/seven_day/seven_day_opus/seven_day_sonnet plus every limits[] row, treating severity=critical as exhausted — so a Fable weekly_scoped 95% parks the pre-iteration gate until next week. Compute UsageInfo.percentage / reset_at from account-binding windows only: named five_hour and seven_day, plus limits[] kind session or weekly_all. Keep percentage as used 0–100 (do not invert to remaining). Independently shippable — do not wait on CONTRACT-001 and do not create quota.rs.",
       "acceptanceCriteria": [
         "Live fixture (five_hour 24, seven_day 55, weekly_scoped Fable 95 critical is_active, seven_day_opus/sonnet 100): parse_oauth_usage_json → percentage ≈ 55 (max of account-binding used), reset_at = session; 55 < usage_threshold 92 implies the existing check_and_wait compare would return BelowThreshold — do not call check_and_wait / load_usage_info in this test",
         "Inverse: seven_day / limits[] weekly_all used 100 with session 20 → percentage = 100, reset_at = weekly (narrowing must not disable the real weekly gate)",
@@ -85,47 +81,28 @@
         "Existing tests still hold: test_parse_oauth_usage_one_percent_is_not_exhausted (util 1.0 is 1% used), sub-one percent stays sub-one, extra_usage-only returns None, none-exhausted prefers five_hour.resets_at",
         "No live network in tests; fixtures are production-shaped serde_json::Value (named buckets + limits[] with kind/percent/severity/is_active/scope.model.display_name)"
       ],
-      "priority": 2,
-      "estimatedEffort": "medium",
-      "passes": false,
-      "requiresHuman": false,
-      "notes": "PR-1 unstick of the false account park. After this lands, mw_integrations still needs `task-mgr models set-tier claude frontier <standard-model>` until PR-3 (required for parallel/wave — documented on FIX-002). Do not invert percentage to remaining. Do not treat util≥100 or severity=critical as the exhausted predicate — gate-relevant means used ≥ usage_threshold (default 92). parse_oauth_usage_json may keep the default 92 for reset_at selection (load_usage_info has no threshold); check_and_wait still applies the live threshold to percentage. Prefer session reset when no account-binding window is ≥ threshold (named five_hour or limits[] kind=session). Drop soonest_reset among exhausted; add latest among gate-relevant account-binding windows. The 95/50 band is the known-bad for a fold-only patch that still uses exhausted=≥100 (percentage waits, reset_at stays session → 5h-cap on the wrong window). Tests are parse_oauth_usage_json only — never call check_and_wait / load_usage_info. Data contract: json.get(\"five_hour\")?.get(\"utilization\")?.as_f64(); json[\"limits\"][i][\"kind\"]; json[\"limits\"][i][\"percent\"] u64 or f64; skip kind weekly_scoped / extra_usage / promotional. Learning [5090] is about parse_reset_from_output, not this parser. Learning [5075]/[4866]: gate remains once-per-wave. Known-bad: storing remaining 45 in percentage luckily passes the live fixture and fails the weekly-all 100 inverse.",
-      "touchesFiles": [
-        "src/loop_engine/usage.rs"
-      ],
-      "dependsOn": [],
-      "modifiesBehavior": true,
-      "qualityDimensions": [
-        "PR-1 keeps used-percent: UsageInfo.percentage is used 0–100; wait is percentage >= usage_threshold (default 92)",
-        "Account-binding vs rung-scoped: only session (five_hour / kind=session) and weekly-all (seven_day / kind=weekly_all) may wait the account; scoped windows simply do not enter the fold",
-        "severity / is_active are display hints, not the default exhausted predicate",
-        "No unwrap on API JSON; skip malformed buckets",
-        "Do not reintroduce substring tier classification",
-        "Usage fetch remains once per sequential iteration / once per wave — this task does not add a GET",
-        "ui/tracing split: tests assert parse results, not a live fetch; existing stderr `Usage: 55.0% (threshold: 92%)` may stay"
-      ],
       "consumerAnalysis": {
         "consumers": [
           {
             "file": "src/loop_engine/reactions/account.rs",
-            "line": 1068,
-            "usage": "check_and_wait compares usage.percentage to threshold with `percentage < threshold` → BelowThreshold",
             "impact": "BREAKS (bugfix)",
-            "mitigation": "Keep used 0–100. Live fixture 55 < 92 proceeds. Inverse weekly 100 waits. Do not store remaining 45."
+            "line": 1068,
+            "mitigation": "Keep used 0–100. Live fixture 55 < 92 proceeds. Inverse weekly 100 waits. Do not store remaining 45.",
+            "usage": "check_and_wait compares usage.percentage to threshold with `percentage < threshold` → BelowThreshold"
           },
           {
             "file": "src/loop_engine/reactions/account.rs",
-            "line": 350,
-            "usage": "load_usage_info reset_at → api_secs for post-output wait",
             "impact": "NEEDS_REVIEW",
-            "mitigation": "Scoped buckets must not supply weekly Fable resets_at as account wait. FIX-002 still ignores api_secs for Fable CLI phrasing."
+            "line": 350,
+            "mitigation": "Scoped buckets must not supply weekly Fable resets_at as account wait. FIX-002 still ignores api_secs for Fable CLI phrasing.",
+            "usage": "load_usage_info reset_at → api_secs for post-output wait"
           },
           {
             "file": "src/loop_engine/usage.rs",
-            "line": 349,
-            "usage": "usage_suggests_lifted compares percentage < 95 post-limit / < threshold pre-gate",
             "impact": "OK",
-            "mitigation": "Unused on Fable phrasing because FIX-002 skips the probe. Keep used-percent compare."
+            "line": 349,
+            "mitigation": "Unused on Fable phrasing because FIX-002 skips the probe. Keep used-percent compare.",
+            "usage": "usage_suggests_lifted compares percentage < 95 post-limit / < threshold pre-gate"
           }
         ],
         "semanticDistinctions": [
@@ -141,6 +118,8 @@
           }
         ]
       },
+      "dependsOn": [],
+      "description": "PR-1 / FR-001 / US-001. parse_oauth_usage_json currently max-folds every utilization window — named five_hour/seven_day/seven_day_opus/seven_day_sonnet plus every limits[] row, treating severity=critical as exhausted — so a Fable weekly_scoped 95% parks the pre-iteration gate until next week. Compute UsageInfo.percentage / reset_at from account-binding windows only: named five_hour and seven_day, plus limits[] kind session or weekly_all. Keep percentage as used 0–100 (do not invert to remaining). Independently shippable — do not wait on CONTRACT-001 and do not create quota.rs.",
       "edgeCases": [
         "Fable weekly_scoped 95% critical + session 24% + week 55% → percentage ≈ 55, reset_at = session, no wait",
         "weekly_all 100%, session 20% → percentage = 100, wait on weekly reset_at",
@@ -150,10 +129,7 @@
         "LOOP_USAGE_THRESHOLD=92 still set → PR-1 env still drives used-percent threshold (do not preflight-error; that is PR-2)",
         "limits[].severity=critical and is_active on a scoped row do not exhaust the account"
       ],
-      "invariants": [
-        "UsageInfo.percentage is max used of account-binding windows only, never remaining, never max of scoped/named-opus/sonnet windows",
-        "When no account-binding window is ≥ usage_threshold, reset_at prefers the session window"
-      ],
+      "estimatedEffort": "medium",
       "failureModes": [
         {
           "cause": "Still taking max(util) across limits[] including weekly_scoped",
@@ -171,13 +147,33 @@
           "cause": "reset_at still uses exhausted=util≥100",
           "expectedBehavior": "95/50 band test fails (session reset instead of weekly)"
         }
+      ],
+      "id": "FIX-001",
+      "invariants": [
+        "UsageInfo.percentage is max used of account-binding windows only, never remaining, never max of scoped/named-opus/sonnet windows",
+        "When no account-binding window is ≥ usage_threshold, reset_at prefers the session window"
+      ],
+      "modifiesBehavior": true,
+      "notes": "PR-1 unstick of the false account park. After this lands, mw_integrations still needs `task-mgr models set-tier claude frontier <standard-model>` until PR-3 (required for parallel/wave — documented on FIX-002). Do not invert percentage to remaining. Do not treat util≥100 or severity=critical as the exhausted predicate — gate-relevant means used ≥ usage_threshold (default 92). parse_oauth_usage_json may keep the default 92 for reset_at selection (load_usage_info has no threshold); check_and_wait still applies the live threshold to percentage. Prefer session reset when no account-binding window is ≥ threshold (named five_hour or limits[] kind=session). Drop soonest_reset among exhausted; add latest among gate-relevant account-binding windows. The 95/50 band is the known-bad for a fold-only patch that still uses exhausted=≥100 (percentage waits, reset_at stays session → 5h-cap on the wrong window). Tests are parse_oauth_usage_json only — never call check_and_wait / load_usage_info. Data contract: json.get(\"five_hour\")?.get(\"utilization\")?.as_f64(); json[\"limits\"][i][\"kind\"]; json[\"limits\"][i][\"percent\"] u64 or f64; skip kind weekly_scoped / extra_usage / promotional. Learning [5090] is about parse_reset_from_output, not this parser. Learning [5075]/[4866]: gate remains once-per-wave. Known-bad: storing remaining 45 in percentage luckily passes the live fixture and fails the weekly-all 100 inverse.",
+      "passes": true,
+      "priority": 2,
+      "qualityDimensions": [
+        "PR-1 keeps used-percent: UsageInfo.percentage is used 0–100; wait is percentage >= usage_threshold (default 92)",
+        "Account-binding vs rung-scoped: only session (five_hour / kind=session) and weekly-all (seven_day / kind=weekly_all) may wait the account; scoped windows simply do not enter the fold",
+        "severity / is_active are display hints, not the default exhausted predicate",
+        "No unwrap on API JSON; skip malformed buckets",
+        "Do not reintroduce substring tier classification",
+        "Usage fetch remains once per sequential iteration / once per wave — this task does not add a GET",
+        "ui/tracing split: tests assert parse results, not a live fetch; existing stderr `Usage: 55.0% (threshold: 92%)` may stay"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Account wait uses only session and weekly-all used percent",
+      "touchesFiles": [
+        "src/loop_engine/usage.rs"
       ]
     },
     {
-      "id": "FIX-002",
-      "title": "Fable/rung-scoped CLI is RateLimit with narrow 3600s Wait, not crash or Blackout",
-      "taskType": "implementation",
-      "description": "PR-1 / FR-002 / US-002. Live CLI `You've reached your Fable limit. … switch models with /model.` matches neither `hit your` nor `usage limit`, so is_rate_limited misses it and the iteration classifies as a crash (auto-block). After classification, decide_account_rate_limit still prefers api_secs (session ~5h or weekly ~6d), spillover records a provider Blackout, unknown-reset falls through to usage_fallback_wait 300s, and react_to_outputs always wires usage_gate + probe_rate_limit_lifted (30s CLI probe with no -m lifts the wait). Coordinator contract: widen detection enough for the live sentence; key the 3600 Wait override on a NARROW predicate (model token fable|opus|sonnet|haiku followed by `limit`, OR co-occurrence with `switch models`). `/model` alone is not sufficient. Plain `reached your … limit` is ordinary RateLimit and keeps api_secs. Independently shippable. No auto-downgrade.",
       "acceptanceCriteria": [
         "(a) is_rate_limited is true for the live sentence `You've reached your Fable limit`; analyze_output classifies it as IterationOutcome::RateLimit (not Crash). Consecutive-failure / auto-block do not increment (RateLimit already excluded at both handle_task_failure callers)",
         "3600 Wait override keys on a narrow Fable/rung-scoped predicate: a model token (`fable|opus|sonnet|haiku`) followed by `limit`, OR co-occurrence with `switch models`. `/model` alone is NOT sufficient. Non-Fable fixture: `You've reached your Opus limit` → Wait { 3600 } (override must not be `contains(\"fable\")` only)",
@@ -191,74 +187,49 @@
         "(h) output containing only `/model` (no model token, no `switch models`, no `limit`) does not take the 3600 override; if classified RateLimit at all, keep api_secs / may Blackout",
         "Docs: PR-1 pin is required for parallel/wave (one Fable RateLimit sleeps the whole wave 3600s), not recommended. Recipe: `task-mgr models set-tier claude frontier <standard-model>` until PR-3. Sequential without the pin: that task waits 3600s (accepted, no auto-downgrade). Record in src/loop_engine/CLAUDE.md account-global section; one-liner in CLAUDE.md models/workflow if a pin recipe fits"
       ],
-      "priority": 3,
-      "estimatedEffort": "high",
-      "passes": false,
-      "requiresHuman": false,
-      "notes": "Two predicates, do not collapse: (1) is_rate_limited classification may widen to catch `You've reached your Fable limit` (and may also classify plain `You've reached your session limit` as RateLimit — that is OK). (2) the 3600 Wait override is NARROWER — model token + limit OR `switch models`; not `/model` alone (test h); not every RateLimit; not plain reached-your-limit. Non-Fable fixture `You've reached your Opus limit` → Wait 3600 so the override is not contains(\"fable\") only. Implement the override in decide_account_rate_limit AND skip usage_gate/probe in react_to_outputs_with_io_seams when the narrow predicate matches (the skip cannot live only in the inner — the production wait closure always loads api_secs and wires the probe today). Use blackout_fallback_secs even when spillover is off; do not use fallback_wait 300. Exhaustive AccountReactionParams destructure must still compile (parity lock). Tests belong next to existing decide_* unit tests in account.rs and IoSeamSpy / WaitSpy cases in tests/reaction_parity.rs. Learning [5090]: malformed quota messages fall back — do not add Sep 12 parse to paper over None. Learning [5297]/[5298]/[5301]: dual predicate unchanged except this Fable-phrasing skip of BOTH usage_gate AND probe. Learning [5075]/[4866]/[4171]/[4151]: account-global once per wave. Learning [5088]/[3927]: must not fall through handle_quota_deferral; never provider_blackouts.record on this phrasing. Learning [4126]/[4182]: seq+wave share the coordinator. Known-bad: matching `/model` alone; using api_secs when Fable matches; Blackout when spillover on; still wiring probe; contains(\"fable\") only.",
-      "touchesFiles": [
-        "src/loop_engine/detection.rs",
-        "src/loop_engine/reactions/account.rs",
-        "tests/reaction_parity.rs",
-        "src/loop_engine/CLAUDE.md",
-        "CLAUDE.md"
-      ],
-      "dependsOn": [],
-      "modifiesBehavior": true,
-      "qualityDimensions": [
-        "Fable/rung-scoped CLI is RateLimit never crash/auto-block",
-        "3600 Wait override is the narrow predicate (model token + limit OR switch models); ordinary RateLimit keeps api_secs",
-        "Dual predicates unchanged except FR-002 skip of usage_gate AND probe_rate_limit_lifted for that phrasing even when Claude is enabled",
-        "Account-global reaction fires exactly once per wave; sequential and wave share the inner",
-        "Follow existing reaction coordinators: production entry + hermetic _inner + exhaustive param destructure (no `..`)",
-        "ui::* for operator lines; tracing for diagnostics; byte-stable wait banners stay on stderr",
-        "PR-1 Fable CLI must not call provider_blackouts.record even when spillover is enabled; spillover is never a working rung for rung-scoped decisions",
-        "Do not reintroduce substring tier classification; the only allowed contains is ingest of CLI phrasing in detection.rs",
-        "No unwrap in production"
-      ],
       "consumerAnalysis": {
         "consumers": [
           {
             "file": "src/loop_engine/detection.rs",
-            "line": 67,
-            "usage": "analyze_output routes is_rate_limited → IterationOutcome::RateLimit",
             "impact": "OK / widen",
-            "mitigation": "Live Fable sentence becomes RateLimit so handle_task_failure is skipped"
+            "line": 67,
+            "mitigation": "Live Fable sentence becomes RateLimit so handle_task_failure is skipped",
+            "usage": "analyze_output routes is_rate_limited → IterationOutcome::RateLimit"
           },
           {
             "file": "src/loop_engine/recovery.rs",
-            "line": 654,
-            "usage": "probe_rate_limit_lifted uses is_rate_limited to decide whether the CLI is still limited",
             "impact": "OK",
-            "mitigation": "Fable phrasing must not invoke this probe at all (test d)"
+            "line": 654,
+            "mitigation": "Fable phrasing must not invoke this probe at all (test d)",
+            "usage": "probe_rate_limit_lifted uses is_rate_limited to decide whether the CLI is still limited"
           },
           {
             "file": "src/loop_engine/orchestrator.rs",
-            "line": 592,
-            "usage": "RateLimit excluded from handle_task_failure",
             "impact": "OK",
-            "mitigation": "Classification is enough for the auto-block AC; do not duplicate the exclusion"
+            "line": 592,
+            "mitigation": "Classification is enough for the auto-block AC; do not duplicate the exclusion",
+            "usage": "RateLimit excluded from handle_task_failure"
           },
           {
             "file": "src/loop_engine/reactions/account.rs",
-            "line": 211,
-            "usage": "decide_account_rate_limit: api_secs wins; spillover → Blackout; else resolve_wait_secs with fallback_wait 300",
             "impact": "BREAKS for Fable/rung-scoped phrasing",
-            "mitigation": "Narrow predicate → Wait { blackout_fallback_secs } ignoring api/output; no Blackout"
+            "line": 211,
+            "mitigation": "Narrow predicate → Wait { blackout_fallback_secs } ignoring api/output; no Blackout",
+            "usage": "decide_account_rate_limit: api_secs wins; spillover → Blackout; else resolve_wait_secs with fallback_wait 300"
           },
           {
             "file": "src/loop_engine/reactions/account.rs",
-            "line": 370,
-            "usage": "production wait closure always runs usage_gate when Claude+env and always wires probe when Claude allowed",
             "impact": "BREAKS for Fable phrasing",
-            "mitigation": "Skip both seams when the narrow predicate matches; sleep is stop-signal-aware only"
+            "line": 370,
+            "mitigation": "Skip both seams when the narrow predicate matches; sleep is stop-signal-aware only",
+            "usage": "production wait closure always runs usage_gate when Claude+env and always wires probe when Claude allowed"
           },
           {
             "file": "tests/reaction_parity.rs",
-            "line": 546,
-            "usage": "spillover RateLimit records provider blackout and skips wait (seq+wave)",
             "impact": "NEEDS_REVIEW",
-            "mitigation": "Add Fable fixture that must NOT take this path; existing 4pm / generic RateLimit cases stay"
+            "line": 546,
+            "mitigation": "Add Fable fixture that must NOT take this path; existing 4pm / generic RateLimit cases stay",
+            "usage": "spillover RateLimit records provider blackout and skips wait (seq+wave)"
           }
         ],
         "semanticDistinctions": [
@@ -279,6 +250,8 @@
           }
         ]
       },
+      "dependsOn": [],
+      "description": "PR-1 / FR-002 / US-002. Live CLI `You've reached your Fable limit. … switch models with /model.` matches neither `hit your` nor `usage limit`, so is_rate_limited misses it and the iteration classifies as a crash (auto-block). After classification, decide_account_rate_limit still prefers api_secs (session ~5h or weekly ~6d), spillover records a provider Blackout, unknown-reset falls through to usage_fallback_wait 300s, and react_to_outputs always wires usage_gate + probe_rate_limit_lifted (30s CLI probe with no -m lifts the wait). Coordinator contract: widen detection enough for the live sentence; key the 3600 Wait override on a NARROW predicate (model token fable|opus|sonnet|haiku followed by `limit`, OR co-occurrence with `switch models`). `/model` alone is not sufficient. Plain `reached your … limit` is ordinary RateLimit and keeps api_secs. Independently shippable. No auto-downgrade.",
       "edgeCases": [
         "`You've reached your Fable limit` → RateLimit; Wait 3600 ignoring api_secs/output_secs; no Blackout; no probe",
         "`You've reached your Opus limit` → Wait 3600 (non-Fable model token; not `contains(\"fable\")` only)",
@@ -290,11 +263,7 @@
         "PR-1 without the standard pin: one Fable RateLimit sleeps the whole wave 3600s — pin is required for parallel/wave, not recommended. Sequential without the pin: that task waits 3600s (accepted)",
         "Wave: one Fable RateLimit + two completions → exactly one 3600s wait, no provider_blackouts.record"
       ],
-      "invariants": [
-        "Narrow Fable/rung-scoped phrasing never records a provider blackout and never runs usage_gate or probe_rate_limit_lifted",
-        "Wait in react_to_outputs_inner fires exactly once per wave",
-        "parse_reset_from_output still returns None for month-name tokens in this PR"
-      ],
+      "estimatedEffort": "high",
       "failureModes": [
         {
           "cause": "is_rate_limited misses the live Fable sentence",
@@ -328,13 +297,40 @@
           "cause": "3600 override implemented as contains(\"fable\") only",
           "expectedBehavior": "`You've reached your Opus limit` fixture fails (must Wait 3600)"
         }
+      ],
+      "id": "FIX-002",
+      "invariants": [
+        "Narrow Fable/rung-scoped phrasing never records a provider blackout and never runs usage_gate or probe_rate_limit_lifted",
+        "Wait in react_to_outputs_inner fires exactly once per wave",
+        "parse_reset_from_output still returns None for month-name tokens in this PR"
+      ],
+      "modifiesBehavior": true,
+      "notes": "Two predicates, do not collapse: (1) is_rate_limited classification may widen to catch `You've reached your Fable limit` (and may also classify plain `You've reached your session limit` as RateLimit — that is OK). (2) the 3600 Wait override is NARROWER — model token + limit OR `switch models`; not `/model` alone (test h); not every RateLimit; not plain reached-your-limit. Non-Fable fixture `You've reached your Opus limit` → Wait 3600 so the override is not contains(\"fable\") only. Implement the override in decide_account_rate_limit AND skip usage_gate/probe in react_to_outputs_with_io_seams when the narrow predicate matches (the skip cannot live only in the inner — the production wait closure always loads api_secs and wires the probe today). Use blackout_fallback_secs even when spillover is off; do not use fallback_wait 300. Exhaustive AccountReactionParams destructure must still compile (parity lock). Tests belong next to existing decide_* unit tests in account.rs and IoSeamSpy / WaitSpy cases in tests/reaction_parity.rs. Learning [5090]: malformed quota messages fall back — do not add Sep 12 parse to paper over None. Learning [5297]/[5298]/[5301]: dual predicate unchanged except this Fable-phrasing skip of BOTH usage_gate AND probe. Learning [5075]/[4866]/[4171]/[4151]: account-global once per wave. Learning [5088]/[3927]: must not fall through handle_quota_deferral; never provider_blackouts.record on this phrasing. Learning [4126]/[4182]: seq+wave share the coordinator. Known-bad: matching `/model` alone; using api_secs when Fable matches; Blackout when spillover on; still wiring probe; contains(\"fable\") only.",
+      "passes": true,
+      "priority": 3,
+      "qualityDimensions": [
+        "Fable/rung-scoped CLI is RateLimit never crash/auto-block",
+        "3600 Wait override is the narrow predicate (model token + limit OR switch models); ordinary RateLimit keeps api_secs",
+        "Dual predicates unchanged except FR-002 skip of usage_gate AND probe_rate_limit_lifted for that phrasing even when Claude is enabled",
+        "Account-global reaction fires exactly once per wave; sequential and wave share the inner",
+        "Follow existing reaction coordinators: production entry + hermetic _inner + exhaustive param destructure (no `..`)",
+        "ui::* for operator lines; tracing for diagnostics; byte-stable wait banners stay on stderr",
+        "PR-1 Fable CLI must not call provider_blackouts.record even when spillover is enabled; spillover is never a working rung for rung-scoped decisions",
+        "Do not reintroduce substring tier classification; the only allowed contains is ingest of CLI phrasing in detection.rs",
+        "No unwrap in production"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Fable/rung-scoped CLI is RateLimit with narrow 3600s Wait, not crash or Blackout",
+      "touchesFiles": [
+        "src/loop_engine/detection.rs",
+        "src/loop_engine/reactions/account.rs",
+        "tests/reaction_parity.rs",
+        "src/loop_engine/CLAUDE.md",
+        "CLAUDE.md"
       ]
     },
     {
-      "id": "CODE-REVIEW-1",
-      "title": "Review PR-1 parse fold and Fable coordinator contract",
-      "taskType": "review",
-      "description": "Review FIX-001 and FIX-002 only. Language idioms, security, error handling, qualityDimensions, wiring, dual predicate, used-percent (not remaining), narrow 3600 predicate, seq/wave parity. Spawn CODE-FIX / WIRE-FIX via task-mgr add --stdin --depended-on-by REVIEW-001. Do not implement PR-2/PR-3 (horizon, remaining banners, TTL CLI, rung clamp, default tierFallback, quota.rs).",
       "acceptanceCriteria": [
         "Progress log lists findings or `No issues found`",
         "Confirm live-fixture + weekly-all 100 inverse + 95/50 band tests exist, use production-shaped JSON, and do not call check_and_wait / load_usage_info",
@@ -345,32 +341,35 @@
         "Confirm no new CLI flags and no quota.rs / evaluate_quota / tierFallback / remaining banners",
         "Any issues found spawn CODE-FIX / WIRE-FIX via `task-mgr add --stdin --depended-on-by REVIEW-001 --from-json tasks/quota-rung-policy-pr1.json`"
       ],
-      "priority": 13,
+      "dependsOn": [
+        "FIX-001",
+        "FIX-002"
+      ],
+      "description": "Review FIX-001 and FIX-002 only. Language idioms, security, error handling, qualityDimensions, wiring, dual predicate, used-percent (not remaining), narrow 3600 predicate, seq/wave parity. Spawn CODE-FIX / WIRE-FIX via task-mgr add --stdin --depended-on-by REVIEW-001. Do not implement PR-2/PR-3 (horizon, remaining banners, TTL CLI, rung clamp, default tierFallback, quota.rs).",
       "estimatedEffort": "high",
-      "passes": false,
-      "requiresHuman": false,
+      "id": "CODE-REVIEW-1",
+      "modifiesBehavior": false,
       "notes": "Do not implement in this task. Use rust-python-code-reviewer and loop-engine-parity-auditor if available. For each issue: echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001 --from-json tasks/quota-rung-policy-pr1.json. If no issues, emit done with a one-line progress note. Learning [5297]/[5301] dual predicate; [5075] once-per-wave; [4126] shared coordinators.",
+      "passes": false,
+      "priority": 13,
+      "qualityDimensions": [
+        "Wiring: parse results actually reach check_and_wait; Fable predicate actually reaches decide_account_rate_limit and the production wait closure",
+        "Parity lock not broken (seq and wave share the inner; exhaustive destructure)",
+        "Used-percent not remaining; narrow 3600 predicate not every RateLimit",
+        "No model-id engine state (fable only as CLI ingest in detection.rs)"
+      ],
+      "requiresHuman": false,
+      "taskType": "review",
+      "title": "Review PR-1 parse fold and Fable coordinator contract",
       "touchesFiles": [
         "src/loop_engine/usage.rs",
         "src/loop_engine/detection.rs",
         "src/loop_engine/reactions/account.rs",
         "tests/reaction_parity.rs",
         "src/loop_engine/CLAUDE.md"
-      ],
-      "dependsOn": ["FIX-001", "FIX-002"],
-      "modifiesBehavior": false,
-      "qualityDimensions": [
-        "Wiring: parse results actually reach check_and_wait; Fable predicate actually reaches decide_account_rate_limit and the production wait closure",
-        "Parity lock not broken (seq and wave share the inner; exhaustive destructure)",
-        "Used-percent not remaining; narrow 3600 predicate not every RateLimit",
-        "No model-id engine state (fable only as CLI ingest in detection.rs)"
       ]
     },
     {
-      "id": "REVIEW-001",
-      "title": "Final gate: full suite + PR-1 independent-ship check",
-      "taskType": "review",
-      "description": "REVIEW-001 is the milestone for this PR-1 slice. Run the full unscoped quality gate and leave the repo green including pre-existing failures. Prove FR-001 + FR-002 only. Drive verify-task-mgr via `loop run --help` (the skill refuses `loop run` / `batch run`). Unit/coordinator tests are the proof of parse + detection + wait contract. No live Anthropic. Do not implement PR-2/PR-3.",
       "acceptanceCriteria": [
         "All prior stories have passes: true (or spawned CODE-FIX/WIRE-FIX that this review depends on have landed)",
         "Positive: live fixture parse percentage ≈ 55 / session reset; inverse weekly-all 100 / weekly reset; 95/50 band reset_at = weekly",
@@ -383,12 +382,29 @@
         "Pre-existing test failures fixed (or spawned as FIX-xxx with verifyCommand if >~12 unrelated)",
         "If issues found: FIX-xxx via `task-mgr add --stdin --depended-on-by REVIEW-001 --from-json tasks/quota-rung-policy-pr1.json`"
       ],
-      "priority": 99,
+      "dependsOn": [
+        "CODE-REVIEW-1",
+        "CODE-FIX-001",
+        "CODE-FIX-002",
+        "CODE-FIX-003"
+      ],
+      "description": "REVIEW-001 is the milestone for this PR-1 slice. Run the full unscoped quality gate and leave the repo green including pre-existing failures. Prove FR-001 + FR-002 only. Drive verify-task-mgr via `loop run --help` (the skill refuses `loop run` / `batch run`). Unit/coordinator tests are the proof of parse + detection + wait contract. No live Anthropic. Do not implement PR-2/PR-3.",
       "estimatedEffort": "high",
-      "passes": false,
-      "requiresHuman": false,
-      "timeoutSecs": 1800,
+      "id": "REVIEW-001",
+      "modifiesBehavior": false,
       "notes": "Spawn fixes via task-mgr add --stdin --depended-on-by REVIEW-001 --from-json tasks/quota-rung-policy-pr1.json. Verification skill: .claude/skills/verify-task-mgr/SKILL.md — refuses loop run / batch run; loop run --help is the safe probe. Do not invent a second harness. PR-1 independent-ship check from the PRD appendix must hold. Learning [4753]: if cargo test fails with paths to a removed -slot-N worktree, touch tests/<binary>.rs and rebuild — not a code regression.",
+      "passes": false,
+      "priority": 99,
+      "qualityDimensions": [
+        "Full suite green including pre-existing",
+        "No unwrap in production",
+        "PR-1 independent-ship table holds (false account park gone; inverse weekly gate intact; Fable CLI Wait 3600; no auto-downgrade)",
+        "Verification skill named and followed; no live Anthropic"
+      ],
+      "requiresHuman": false,
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Final gate: full suite + PR-1 independent-ship check",
       "touchesFiles": [
         "src/loop_engine/usage.rs",
         "src/loop_engine/detection.rs",
@@ -396,15 +412,60 @@
         "tests/reaction_parity.rs",
         "src/loop_engine/CLAUDE.md",
         "CLAUDE.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "When any RateLimit item matches is_rung_scoped_rate_limit_message, decide_account_rate_limit uses that item (not merely the first RateLimit) so Wait blackout_fallback_secs wins",
+        "Mixed-wave WaitSpy test: non-Fable RateLimit first + Fable second + spillover_enabled → Wait 3600, blackout.active empty, WaitSpy.calls==1",
+        "usage_gate/probe still skipped when any item is rung-scoped",
+        "Seq path with a single RateLimit item remains byte-identical"
       ],
-      "dependsOn": ["CODE-REVIEW-1"],
-      "modifiesBehavior": false,
-      "qualityDimensions": [
-        "Full suite green including pre-existing",
-        "No unwrap in production",
-        "PR-1 independent-ship table holds (false account park gone; inverse weekly gate intact; Fable CLI Wait 3600; no auto-downgrade)",
-        "Verification skill named and followed; no live Anthropic"
+      "description": "High finding from CODE-REVIEW-1: react_to_outputs_with_io_seams sets rung_scoped via items.any(Fable), but react_to_outputs_inner decides from the first RateLimit only. Mixed wave [account hit-your-limit, Fable switch-models] with spillover can Blackout while still skipping the probe — violates Fable never-Blackout / Wait 3600. Prefer a rung-scoped RateLimit item for decide (align with the any skip).",
+      "estimatedEffort": "medium",
+      "id": "CODE-FIX-001",
+      "passes": false,
+      "priority": 0,
+      "title": "Prefer rung-scoped RateLimit item when deciding wave wait",
+      "touchesFiles": [
+        "src/loop_engine/reactions/account.rs",
+        "tests/reaction_parity.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "When rung_scoped is true, react_to_outputs_with_io_seams does not call load_usage_info (api_secs=None) — same skip family as usage_gate/probe",
+        "No Usage API reset banner printed before a forced 3600 Wait",
+        "Test (d) fable_rate_limit_skips_usage_gate_and_probe stays hermetic with anthropic_account_io_allowed=true (no live Anthropic / ~/.claude credentials); assert or isolate so CI and developer machines cannot hit the network",
+        "Ordinary (non-rung-scoped) RateLimit still loads api_secs when anthropic_account_io_allowed"
+      ],
+      "description": "Medium finding from CODE-REVIEW-1: Fable path still calls production load_usage_info when Claude I/O is allowed. Test (d) must set anthropic_account_io_allowed=true to prove the gate/probe skip, so it hits live OAuth/usage (~136s on a machine with ~/.claude credentials) and can print a multi-hour reset banner that decide then ignores. Skip the load when rung_scoped (api_secs unused) or inject a usage-load seam; keep dual predicate for ordinary RateLimit.",
+      "estimatedEffort": "medium",
+      "id": "CODE-FIX-002",
+      "passes": false,
+      "priority": -1,
+      "title": "Skip load_usage_info on rung-scoped RateLimit (hermetic test d)",
+      "touchesFiles": [
+        "src/loop_engine/reactions/account.rs",
+        "tests/reaction_parity.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "model_token_followed_by_limit never panics on a multi-byte char inside the 64-byte post-token window",
+        "Regression unit test with a multi-byte character in the window after an ASCII model token",
+        "Existing Fable/Opus/session predicate tests still pass"
+      ],
+      "description": "Medium/Low finding from CODE-REVIEW-1: model_token_followed_by_limit computes window_end = (end+64).min(len) then slices lower[end..window_end]. end+64 can land mid-codepoint in mixed Unicode agent output → production panic. Floor to a char boundary (floor_char_boundary or is_char_boundary walk) before slicing.",
+      "estimatedEffort": "low",
+      "id": "CODE-FIX-003",
+      "passes": false,
+      "priority": -2,
+      "title": "Floor UTF-8 char boundary in rung-scoped limit window slice",
+      "touchesFiles": [
+        "src/loop_engine/reactions/account.rs"
       ]
     }
-  ]
+  ],
+  "version": "1.0"
 }
