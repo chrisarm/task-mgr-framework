@@ -2160,6 +2160,76 @@ mod tests {
         assert_eq!(exit_reason, "blocked");
     }
 
+    /// CODE-FIX-009: Proceed left frontier unavailable on the proto-channel;
+    /// every todo resolves to that rung → empty selection must soft-stop as
+    /// quota-empty (reset in_progress, no stale-abort). Must NOT fall through
+    /// to the stale tracker and must not treat this as a provider-blackout
+    /// deferral (`handle_quota_deferral` is skipped when rung-only fires first).
+    #[test]
+    fn test_run_wave_iteration_rung_only_empty_soft_stops_not_stale() {
+        let (temp, mut conn) = setup_test_db();
+        insert_task(&conn, "FEAT-A", "Frontier only", "todo", 10);
+        conn.execute(
+            "UPDATE tasks SET difficulty = 'high' WHERE id = 'FEAT-A'",
+            [],
+        )
+        .unwrap();
+        insert_task(&conn, "FEAT-B", "Stranded", "in_progress", 20);
+        conn.execute(
+            "UPDATE tasks SET difficulty = 'high' WHERE id = 'FEAT-B'",
+            [],
+        )
+        .unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base_prompt = tmp.path().join("base.md");
+        std::fs::write(&base_prompt, "base").unwrap();
+        let prd = tmp.path().join("prd.json");
+        let progress = tmp.path().join("progress.txt");
+        let mode = PermissionMode::Dangerous;
+        let signal = SignalFlag::new();
+        let mut ctx = IterationContext::new(5);
+        // Proto-channel: frontier unavailable, empty provider_blackouts.
+        ctx.unavailable_rungs.insert((
+            crate::loop_engine::model::Provider::Claude,
+            crate::loop_engine::model::CapabilityTier::Frontier,
+        ));
+        let project_cfg = crate::loop_engine::project_config::ProjectConfig::default();
+        let prd_implicit: Vec<String> = Vec::new();
+        let outcome = run_wave_iteration(
+            make_wave_params(
+                &mut conn,
+                temp.path(),
+                tmp.path(),
+                "main",
+                &[],
+                &base_prompt,
+                &mode,
+                &signal,
+                tmp.path(),
+                &prd,
+                &progress,
+                2,
+                &project_cfg,
+                &prd_implicit,
+            ),
+            &mut ctx,
+        );
+        let t = outcome.terminal.expect("quota-empty must be terminal");
+        assert_eq!(t.exit_code, 0, "quota soft-stop exit 0, got {t:?}");
+        assert_eq!(t.reason, "quota soft-stop");
+        assert_eq!(
+            ctx.stale_tracker.count(),
+            0,
+            "rung-only empty must not bump stale-abort"
+        );
+        assert!(
+            ctx.provider_blackouts.is_empty(),
+            "must not record a provider blackout for rung-only empty"
+        );
+        assert_eq!(get_task_status(&conn, "FEAT-B"), "todo");
+        assert!(!outcome.was_stopped, "not an operator .stop");
+    }
+
     /// Regression: a wave that selects nothing because a prior wave left a
     /// task stranded in `in_progress` (merge-back / completion-detection
     /// gap) must auto-recover it to `todo` and retry next wave WITHOUT

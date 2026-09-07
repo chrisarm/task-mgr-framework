@@ -18,7 +18,7 @@ use rusqlite::Connection;
 use crate::lifecycle::TaskLifecycle;
 use crate::loop_engine::config::{IterationOutcome, PermissionMode};
 use crate::loop_engine::engine::BlackoutState;
-use crate::loop_engine::model::{CapabilityTier, Provider};
+use crate::loop_engine::model::{CapabilityTier, Provider, ResolvedModelsConfig};
 use crate::loop_engine::project_config::TierFallback;
 use crate::loop_engine::quota::{
     AccountLowInput, BucketEval, OnLowAction, QuotaBucket, QuotaEval, UsagePolicy, evaluate_quota,
@@ -727,6 +727,70 @@ pub fn handle_quota_deferral_inner(
     QuotaDeferral::Deferred {
         stopped: !completed,
     }
+}
+
+/// Verdict for [`handle_rung_only_empty_selection`] — sibling of
+/// [`QuotaDeferral`] for proto-channel exhaustion (learning 3927 / 5088).
+///
+/// Must NOT be folded into [`handle_quota_deferral`]: that path waits on a
+/// provider blackout; rung-only empty has no blackout and must soft-stop
+/// without touching the stale-abort tracker.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RungOnlyEmpty {
+    /// Not a rung-only empty selection — caller continues to blackout deferral /
+    /// drain / recover / stale as usual.
+    Inactive,
+    /// Proto-channel exclusions emptied the eligible set. `in_progress` rows
+    /// under the prefix were reset to `todo`. Caller must soft-stop WITHOUT
+    /// calling [`handle_quota_deferral`] and WITHOUT marking the stale tracker.
+    Exhausted,
+}
+
+/// Detect Proceed + proto-channel exclusions that leave no selectable todo.
+///
+/// When `unavailable_rungs` is non-empty, no provider blackout is active, todo
+/// work remains, and every remaining todo/`in_progress` resolves onto an
+/// unavailable rung (`!other_rungs_runnable`), the empty selection is
+/// **quota-empty** — not a stale queue and not a blackout deferral. Resets
+/// `in_progress` → `todo` via [`TaskLifecycle::recover_in_progress_for_prefix`]
+/// and returns [`RungOnlyEmpty::Exhausted`].
+///
+/// Called **before** [`handle_quota_deferral`] by both no-eligible paths so the
+/// blackout wait helper is never invoked for this case.
+pub fn handle_rung_only_empty_selection(
+    conn: &mut Connection,
+    task_prefix: Option<&str>,
+    unavailable_rungs: &HashSet<(Provider, CapabilityTier)>,
+    runner_overrides: &HashMap<String, RunnerKind>,
+    models: &ResolvedModelsConfig,
+    blackout: &BlackoutState,
+    now_secs: u64,
+) -> RungOnlyEmpty {
+    if unavailable_rungs.is_empty() {
+        return RungOnlyEmpty::Inactive;
+    }
+    // Active provider blackout owns the empty selection — deferral waits.
+    if blackout.any_active(now_secs) {
+        return RungOnlyEmpty::Inactive;
+    }
+    if count_todo_tasks(conn, task_prefix) == 0 {
+        return RungOnlyEmpty::Inactive;
+    }
+    let preview: Vec<(Provider, CapabilityTier)> = unavailable_rungs.iter().copied().collect();
+    let work =
+        compute_remaining_work_snapshot(conn, task_prefix, models, &preview, runner_overrides);
+    if work.other_rungs_runnable {
+        // Some todo/in_progress still lands on an available rung — not
+        // rung-only exhaustion (soft-deps / recover / stale own that case).
+        return RungOnlyEmpty::Inactive;
+    }
+    // Quota-empty: park any stranded in_progress back to todo, then soft-stop.
+    if let Err(e) = TaskLifecycle::new(conn).recover_in_progress_for_prefix(task_prefix) {
+        eprintln!(
+            "Warning: failed to reset in_progress tasks after rung-only empty selection: {e}"
+        );
+    }
+    RungOnlyEmpty::Exhausted
 }
 
 // ---------------------------------------------------------------------------
@@ -3657,5 +3721,159 @@ mod tests {
             "Codex-pinned task must count as other-rung runnable when only Claude \
              frontier is unavailable; got {work:?}"
         );
+    }
+
+    // --- handle_rung_only_empty_selection (CODE-FIX-009) ---
+
+    fn rung_empty_seed_conn() -> Connection {
+        let conn = Connection::open_in_memory().expect("in-memory");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE tasks (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'todo',
+                model TEXT,
+                difficulty TEXT,
+                started_at TEXT,
+                updated_at TEXT,
+                archived_at TEXT
+            );
+            "#,
+        )
+        .expect("schema");
+        conn
+    }
+
+    #[test]
+    fn rung_only_empty_exhausts_resets_in_progress_no_deferral() {
+        // Proceed + every todo on unavailable frontier: Exhausted, in_progress
+        // → todo. Discriminator vs handle_quota_deferral: empty blackouts.
+        let mut conn = rung_empty_seed_conn();
+        conn.execute_batch(
+            r#"
+            INSERT INTO tasks (id, status, difficulty, started_at) VALUES
+                ('t-frontier', 'todo', 'high', NULL),
+                ('t-stranded', 'in_progress', 'high', datetime('now'));
+            "#,
+        )
+        .expect("seed");
+        let models = crate::loop_engine::model::builtin_resolved_models();
+        let unavailable = HashSet::from([(Provider::Claude, CapabilityTier::Frontier)]);
+        let overrides = HashMap::new();
+        let blackout = BlackoutState::default();
+        let now = 1_700_000_000u64;
+
+        // Prove the blackout deferral helper would be Inactive (and must not
+        // be the path we take — callers check rung-only first).
+        let mut blackout_for_deferral = BlackoutState::default();
+        let wait = |_secs: u64| -> bool {
+            panic!("handle_quota_deferral must not wait");
+        };
+        assert_eq!(
+            handle_quota_deferral_inner(&conn, None, &mut blackout_for_deferral, now, &wait),
+            QuotaDeferral::Inactive,
+            "rung-only empty has no blackout — deferral must stay Inactive"
+        );
+
+        let verdict = handle_rung_only_empty_selection(
+            &mut conn,
+            None,
+            &unavailable,
+            &overrides,
+            models,
+            &blackout,
+            now,
+        );
+        assert_eq!(verdict, RungOnlyEmpty::Exhausted);
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM tasks WHERE id = 't-stranded'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "todo", "in_progress must reset to todo");
+    }
+
+    #[test]
+    fn rung_only_empty_inactive_when_other_rung_todo_remains() {
+        let mut conn = rung_empty_seed_conn();
+        conn.execute_batch(
+            r#"
+            INSERT INTO tasks (id, status, difficulty) VALUES
+                ('t-frontier', 'todo', 'high'),
+                ('t-standard', 'todo', 'medium');
+            "#,
+        )
+        .expect("seed");
+        let models = crate::loop_engine::model::builtin_resolved_models();
+        let unavailable = HashSet::from([(Provider::Claude, CapabilityTier::Frontier)]);
+        let overrides = HashMap::new();
+        let blackout = BlackoutState::default();
+        let verdict = handle_rung_only_empty_selection(
+            &mut conn,
+            None,
+            &unavailable,
+            &overrides,
+            models,
+            &blackout,
+            1_700_000_000,
+        );
+        assert_eq!(
+            verdict,
+            RungOnlyEmpty::Inactive,
+            "standard todo must keep selection alive"
+        );
+    }
+
+    #[test]
+    fn rung_only_empty_inactive_when_provider_blackout_active() {
+        // Blackout owns the empty selection — deferral waits; rung helper
+        // must not Exhausted (would skip the wait).
+        let mut conn = rung_empty_seed_conn();
+        conn.execute_batch(
+            "INSERT INTO tasks (id, status, difficulty) VALUES ('t-frontier', 'todo', 'high');",
+        )
+        .expect("seed");
+        let models = crate::loop_engine::model::builtin_resolved_models();
+        let unavailable = HashSet::from([(Provider::Claude, CapabilityTier::Frontier)]);
+        let overrides = HashMap::new();
+        let mut blackout = BlackoutState::default();
+        let now = 1_700_000_000u64;
+        blackout.record(Provider::Claude, now, 3600);
+        let verdict = handle_rung_only_empty_selection(
+            &mut conn,
+            None,
+            &unavailable,
+            &overrides,
+            models,
+            &blackout,
+            now,
+        );
+        assert_eq!(verdict, RungOnlyEmpty::Inactive);
+    }
+
+    #[test]
+    fn rung_only_empty_inactive_when_proto_channel_empty() {
+        let mut conn = rung_empty_seed_conn();
+        conn.execute_batch(
+            "INSERT INTO tasks (id, status, difficulty) VALUES ('t-frontier', 'todo', 'high');",
+        )
+        .expect("seed");
+        let models = crate::loop_engine::model::builtin_resolved_models();
+        let unavailable = HashSet::new();
+        let overrides = HashMap::new();
+        let blackout = BlackoutState::default();
+        let verdict = handle_rung_only_empty_selection(
+            &mut conn,
+            None,
+            &unavailable,
+            &overrides,
+            models,
+            &blackout,
+            1_700_000_000,
+        );
+        assert_eq!(verdict, RungOnlyEmpty::Inactive);
     }
 }

@@ -607,14 +607,38 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
 
         // Track consecutive stale iterations and abort if stuck
         if matches!(result.outcome, IterationOutcome::NoEligibleTasks) {
-            // FEAT-008 deferral-first — ordered BEFORE drained classification
+            // (0a) Rung-only empty — BEFORE blackout deferral, in parity with
+            // the wave path. Proceed + proto-channel exclusions can empty the
+            // eligible set with no provider blackout; that is quota-empty
+            // (reset in_progress, soft-stop), NOT stale and NOT
+            // `handle_quota_deferral` (learning 3927 / 5088).
+            let now = crate::loop_engine::engine::now_unix_secs();
+            match reactions::account::handle_rung_only_empty_selection(
+                &mut conn,
+                task_prefix.as_deref(),
+                &ctx.unavailable_rungs,
+                &ctx.runner_overrides,
+                &ctx.resolved_models,
+                &ctx.provider_blackouts,
+                now,
+            ) {
+                reactions::account::RungOnlyEmpty::Inactive => {}
+                reactions::account::RungOnlyEmpty::Exhausted => {
+                    ui::emit(
+                        "All remaining todos are on unavailable rungs — quota empty, soft-stopping",
+                    );
+                    exit_code = 0;
+                    exit_reason = "quota soft-stop".to_string();
+                    break;
+                }
+            }
+            // (0b) FEAT-008 deferral-first — ordered BEFORE drained classification
             // and the stale tracker, in parity with the wave path's
             // `handle_no_eligible_tasks`. When a provider blackout is active and
             // todo work remains, the empty selection is quota-DEFERRAL, not a
             // stale or drained queue: wait for the reset (reusing
             // `wait_for_usage_reset`), clear the blackout, and retry WITHOUT
             // marking the stale tracker (learning 3927).
-            let now = crate::loop_engine::engine::now_unix_secs();
             match reactions::account::handle_quota_deferral(
                 &conn,
                 task_prefix.as_deref(),

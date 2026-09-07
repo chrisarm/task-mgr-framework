@@ -227,7 +227,49 @@ pub(super) fn handle_no_eligible_tasks(
     let task_prefix = params.task_prefix;
     let prd_path = params.prd_path;
 
-    // (0) FEAT-008 deferral-first — ordered BEFORE drained classification,
+    // (0a) Rung-only empty — BEFORE blackout deferral. Proceed + proto-channel
+    // exclusions can empty the eligible set with no provider blackout; that is
+    // quota-empty (reset in_progress, soft-stop), NOT stale and NOT
+    // `handle_quota_deferral` (learning 3927 / 5088).
+    let now = crate::loop_engine::engine::now_unix_secs();
+    match reactions::account::handle_rung_only_empty_selection(
+        params.conn,
+        task_prefix,
+        &ctx.unavailable_rungs,
+        &ctx.runner_overrides,
+        &ctx.resolved_models,
+        &ctx.provider_blackouts,
+        now,
+    ) {
+        reactions::account::RungOnlyEmpty::Inactive => {}
+        reactions::account::RungOnlyEmpty::Exhausted => {
+            ui::emit("All remaining todos are on unavailable rungs — quota empty, soft-stopping");
+            progress::log_iteration(progress::LogIterationParams {
+                progress_path: params.progress_path,
+                iteration: params.iteration,
+                task_id: None,
+                outcome: &IterationOutcome::Empty,
+                files: &[],
+                model: None,
+                effort: None,
+                slot: None,
+            });
+            return WaveOutcome {
+                tasks_completed: 0,
+                iteration_consumed: true,
+                terminal: Some(WaveTerminal {
+                    exit_code: 0,
+                    reason: "quota soft-stop".to_string(),
+                    run_status: None,
+                }),
+                was_stopped: false,
+                failed_merges: Vec::new(),
+                rate_limited_retry: false,
+            };
+        }
+    }
+
+    // (0b) FEAT-008 deferral-first — ordered BEFORE drained classification,
     // auto-recovery, and the stale tracker. When a provider blackout is active
     // and todo work remains, the empty selection is quota-DEFERRAL (every
     // candidate resolves to a blacked-out provider it cannot reroute off of),
@@ -236,7 +278,6 @@ pub(super) fn handle_no_eligible_tasks(
     // retry WITHOUT touching the stale tracker (learning 3927). The wait gives
     // back the loop-bound iteration (B2) and skips the FEAT-002 reset/halt
     // check (B3) exactly like a rate-limit retry wave.
-    let now = crate::loop_engine::engine::now_unix_secs();
     match reactions::account::handle_quota_deferral(
         params.conn,
         task_prefix,
