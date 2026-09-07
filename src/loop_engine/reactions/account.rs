@@ -19,7 +19,9 @@ use crate::loop_engine::config::{IterationOutcome, PermissionMode};
 use crate::loop_engine::engine::BlackoutState;
 use crate::loop_engine::model::Provider;
 use crate::loop_engine::recovery::probe_rate_limit_lifted;
-use crate::loop_engine::usage::{UsageCheckResult, load_usage_info, usage_suggests_lifted};
+use crate::loop_engine::usage::{
+    UsageCheckResult, UsageInfo, load_usage_info, usage_suggests_lifted,
+};
 use crate::loop_engine::{display, signals};
 
 /// Inputs to [`account_usage_gate`] / [`account_usage_gate_inner`].
@@ -177,6 +179,12 @@ pub type ResetWaitFn<'f> = &'f dyn Fn(u64, &Path, u64, Option<&dyn Fn() -> bool>
 
 /// Injected early-lift probe seam for the production post-output wrapper.
 pub type RateLimitProbeFn<'f> = &'f dyn Fn(&PermissionMode) -> bool;
+
+/// Injected usage-API load seam for [`react_to_outputs_with_io_seams`].
+/// Production wires [`load_usage_info`]; tests inject a hermetic closure so
+/// rung-scoped RateLimit never hits live OAuth/usage (and so ordinary
+/// RateLimit can assert the load without credentials).
+pub type LoadUsageFn<'f> = &'f dyn Fn() -> Option<UsageInfo>;
 
 /// Pure post-rate-limit decision (no I/O). Order is intentional:
 /// 1. pure spend-stop (no API/output reset) → never blackout, never wait
@@ -354,6 +362,7 @@ pub fn react_to_outputs(
     };
     let probe =
         |permission_mode: &PermissionMode| -> bool { probe_rate_limit_lifted(permission_mode) };
+    let load_usage = || load_usage_info();
     react_to_outputs_with_io_seams(
         conn,
         items,
@@ -362,12 +371,15 @@ pub fn react_to_outputs(
         &usage_gate,
         &reset_wait,
         &probe,
+        &load_usage,
     )
 }
 
 /// Post-output rate-limit reaction with production I/O seams injected. Tests use
 /// this to prove Anthropic/Claude side effects are skipped when Claude is
-/// disabled without live credentials or a real Claude binary.
+/// disabled (or when RateLimit is rung-scoped) without live credentials or a
+/// real Claude binary.
+#[allow(clippy::too_many_arguments)] // four distinct I/O seams; packing relocates noise
 pub fn react_to_outputs_with_io_seams(
     conn: &mut Connection,
     items: &[OutputReactionItem<'_>],
@@ -376,6 +388,7 @@ pub fn react_to_outputs_with_io_seams(
     usage_gate: UsageGateFn<'_>,
     reset_wait: ResetWaitFn<'_>,
     probe_rate_limit: RateLimitProbeFn<'_>,
+    load_usage: LoadUsageFn<'_>,
 ) -> AccountReaction {
     // Exhaustive destructure (no `..`) — the single-home parity lock.
     let &AccountReactionParams {
@@ -393,22 +406,21 @@ pub fn react_to_outputs_with_io_seams(
         now_secs: _,
     } = params;
 
-    // Narrow rung-scoped phrasing (Fable/Opus/…): skip usage_gate + early-lift
-    // probe in the production wait closure. The skip cannot live only in the
-    // hermetic inner — this wrapper always loads api_secs and wires the probe
-    // today, and either would undo the 3600s Wait (used 55% < 92 →
-    // BelowThreshold, or the 30s no `-m` probe lifts).
+    // Narrow rung-scoped phrasing (Fable/Opus/…): skip load_usage_info,
+    // usage_gate, and early-lift probe. The skip cannot live only in the
+    // hermetic inner — loading api_secs would still hit OAuth/usage and print
+    // a multi-hour reset banner that decide then ignores; wiring the probe
+    // would undo the 3600s Wait in ~30s (or used 55% < 92 → BelowThreshold).
     let rung_scoped = items.iter().any(|item| {
         *item.outcome == IterationOutcome::RateLimit
             && is_rung_scoped_rate_limit_message(item.output)
     });
 
-    // Usage load only when Claude account I/O is allowed (skip Anthropic when
-    // Claude is disabled). Feeds decide_account_rate_limit's api_secs.
-    // Rung-scoped Wait ignores api_secs, but loading is harmless and keeps the
-    // dual Anthropic I/O predicates intact for ordinary RateLimit.
-    let api_secs = if anthropic_account_io_allowed {
-        let usage = load_usage_info();
+    // Usage load only when Claude account I/O is allowed AND the RateLimit is
+    // not rung-scoped. Ordinary RateLimit still feeds decide's api_secs;
+    // rung-scoped Wait ignores api_secs (forced blackout_fallback_secs).
+    let api_secs = if !rung_scoped && anthropic_account_io_allowed {
+        let usage = load_usage();
         let secs = usage
             .as_ref()
             .and_then(|u| u.reset_at.as_deref())
