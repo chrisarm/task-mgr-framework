@@ -136,7 +136,7 @@ Two footguns:
 
 | Path | Gate |
 |------|------|
-| Pre-iteration OAuth + `account_usage_gate` | `LOOP_USAGE_CHECK_ENABLED ∧ Claude enabled` (`UsageParams.enabled`) |
+| Pre-iteration OAuth + `run_account_quota_gate` | `LOOP_USAGE_CHECK_ENABLED ∧ Claude enabled` (`UsageParams.enabled`); env false ⇒ no load / keep proto snapshot |
 | Post RateLimit **usage-API** leg (`check_and_wait`) | `anthropic_account_io_allowed ∧ usage_enabled` (historical: env still suppresses this leg) |
 | Post RateLimit **early-lift probe** | `anthropic_account_io_allowed` only (= Claude enabled; **env does not apply**) |
 
@@ -145,6 +145,13 @@ load is also off; the Claude early-lift probe **still** runs on RateLimit. Only
 disabling the Claude provider zeroes **all** Anthropic account I/O (load + probe).
 See [`src/loop_engine/CLAUDE.md`](src/loop_engine/CLAUDE.md) "Account-global
 reactions".
+
+**Remaining-percent floor (PR-2):** gate unit is remaining 0–100 (not used-percent).
+Precedence: `LOOP_USAGE_REMAINING_MIN` (env) > `usagePolicy.remainingMinPercent`
+(config) > **8**. Old `used ≥ 92` ≡ `remaining ≤ 8`. Legacy `LOOP_USAGE_THRESHOLD`
+hard-errors at loop/batch `preflight_validate_and_probe` (names
+`LOOP_USAGE_REMAINING_MIN`); non-loop commands ignore it. Operator banners use
+`% left` (rung labels like `frontier`, never model ids).
 
 **PR-1 Fable pin (required for parallel/wave until PR-3):** one Fable RateLimit
 sleeps the whole wave 3600s — pin frontier off Fable with

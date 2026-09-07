@@ -197,16 +197,17 @@ Two mechanisms keep a reaction from being copy-pasted back into one path:
 | # | Coordinator | Module | Sequential call site | Wave call site | Relocated leaf (`#[deprecated]` shim) |
 |---|---|---|---|---|---|
 | #2 | `pre_spawn::resolve_task_execution` | `pre_spawn` | `iteration.rs:387` | `wave_scheduler.rs:1058` (per slot) | `recovery::{check_override_invalidation, check_crash_escalation}` |
-| #3 | `account::account_usage_gate` | `account` | `iteration.rs:130` | `wave_scheduler.rs:249` (once/wave) | `usage::check_and_wait` |
+| #3 | `account::run_account_quota_gate` | `account` | `iteration.rs:130` | `wave_orchestration.rs:91` (once/wave) | (parity helper: `account_usage_gate`) |
 | #5 | `post_output::handle_overflow` | `post_output` | `iteration.rs:755` | `slot.rs:535` (per slot) | `overflow::handle_prompt_too_long` |
 | #6 | `account::react_to_outputs` | `account` | `iteration.rs:703` | `wave_scheduler.rs:1170` (once/wave) | `usage::{parse_reset_from_output, wait_for_usage_reset}` |
 | #10 | `post_completion::react_to_completions` | `post_completion` | `orchestrator.rs:1207` | `wave_scheduler.rs:1482` | `orchestrator::trigger_human_reviews` |
 | #13 | `account_iteration_budget` | `reactions` (mod) | `orchestrator.rs:1312` | `orchestrator.rs:1027` | (inline `iteration -= 1` / `saturating_sub`) |
 | — | `account::react_to_transient` (FEAT-014) | `account` | `orchestrator.rs:1282` | `wave_scheduler.rs:1236` | (new; no pre-existing leaf) |
 
-Account-global reactions (`account_usage_gate`, `react_to_outputs`,
+Account-global reactions (`run_account_quota_gate`, `react_to_outputs`,
 `react_to_transient`) fire **exactly once per wave**, never once per
 rate-limited slot — they reflect shared API-account state, not per-task state.
+(`account_usage_gate` remains as the hermetic parity-test helper.)
 Anthropic account I/O uses a dual-predicate contract: `claude_provider_enabled`
 is resolved only through
 `resolve_models_config(&project_config.models, &project_config.routing).is_provider_enabled(Provider::Claude)`;
@@ -229,17 +230,52 @@ ignoring api_secs / output_secs, never `RateLimitAction::Blackout` /
 `usage_gate` and `probe_rate_limit_lifted` in the production wait closure.
 Match only: (1) live phrase `reached your (fable|opus|sonnet|haiku) limit`,
 (2) a **whitespace-bounded** model token followed by `limit` (hyphen /
-underscore are **not** word boundaries — otherwise `claude-opus-5` in ordinary
-session stdout false-triggers 3600), or (3) `switch models` on the **same
-line** as `reached`/`limit` (whole-capture `contains` matches docs/commentary).
+underscore are **not** word boundaries — otherwise hyphenated `OPUS_MODEL` /
+`FABLE_MODEL` ids in ordinary session stdout false-trigger 3600), or (3)
+`switch models` on the **same line** as `reached`/`limit` (whole-capture
+`contains` matches docs/commentary).
 `/model` alone is not enough. Plain `reached your session limit` / `hit your
 limit · resets 4pm` stay ordinary RateLimit. Account-binding `reset_at` uses
-the live `usage_threshold`, not compile-time 92. Because one Fable RateLimit
+the live `usage_remaining_min` (remaining floor, default 8; old used≥92 ≡
+remaining≤8), not a hardcoded compile-time value. Because one Fable RateLimit
 sleeps the **whole wave** 3600s, the operator pin is **required** for
 parallel/wave until PR-3:
 `task-mgr models set-tier claude frontier <standard-model>` (e.g. opus).
 Sequential without the pin: that task waits 3600s (accepted; no auto-downgrade
 in PR-1).
+
+**PR-2 quota contract (CONTRACT-001 / FEAT-005):** remaining 0–100 is the gate
+unit (`LOOP_USAGE_REMAINING_MIN` > `usagePolicy.remainingMinPercent` > 8).
+`evaluate_quota` is pure per-bucket (ignore / unavailable + account wait/stop
+inputs — never ask, never `other_rungs_runnable`). Apply in `account.rs`
+(`apply_quota` / `run_account_quota_gate`) resolves ask/wait/stop/unavailable
+from remaining work + `routing.tierFallback`. Factory default
+`tierFallback` is `{maxDifficulty: high, includeReview: true, includeForced:
+false}` — absent key deserializes to that `Some` (auto-unavailable / downgrade);
+explicit JSON `null` is the ask opt-out (`askTtlMinutes` 0 → defer, no sleep;
+TTL > 0 → stop-signal-aware sleep then continue). Horizon:
+wait if reset ≤ `waitIfResetWithinMinutes` (60); (60m, 12h] wait capped at
+`MAX_WAIT_SECS` (5h); >12h + nothing else runnable → stop (`in_progress` →
+`todo`). Scoped unavailable is **excluded** from the next selection via
+proto-channel `IterationContext.unavailable_rungs:
+HashSet<(Provider, CapabilityTier)>` — replace the set on each successful
+evaluate+apply; keep snapshot on API fail; do **not** account-wait for a
+scoped rung; do **not** gate exclusion on non-empty `provider_blackouts`
+(empty blackouts is the production case).
+`LOOP_USAGE_CHECK_ENABLED=false` skips the pre-gate load entirely (no OAuth /
+`load_usage_info`) and keeps the proto-channel snapshot — dual predicate is
+env ∧ Claude enabled; do not treat disabled as a replace-on-evaluate exception.
+Spillover is never a working rung.
+Next-PRD inherit of rung-unavailable is PR-3 (documented, not implemented).
+Account-binding weekly-all beyond 12h **Stops** even if other Claude rungs look
+runnable (they share that bucket). Factory `includeForced: false` is not a
+global forbid when some todos have `tasks.model`. `Wait { 0 }` is ready-now,
+not `fallback_wait` 300s. Horizon Stop is `HorizonStopped` /
+`operator_stopped: false` (not a `.stop` file). Rung-only empty selection
+calls `handle_rung_only_empty_selection` **before** stale-abort and never
+`handle_quota_deferral`. Explicit `onLow` wait/stop/ask on a scoped bucket
+emits `AccountLow` so apply can honor it.
+Full copy-paste lives under `## CONTRACT-001` in the progress log.
 
 The per-task reactions (`resolve_task_execution`, `handle_overflow`) fold one
 call per slot. Each coordinator pairs a production entry point with a hermetic

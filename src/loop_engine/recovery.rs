@@ -584,6 +584,7 @@ pub(super) fn prompt_overflow_result(
         task_id: Some(task_id),
         files_modified: vec![],
         should_stop: true,
+        operator_stopped: false,
         output: String::new(),
         effective_model: None,
         effective_effort: None,

@@ -9,17 +9,25 @@
 /// - 45 → "45s"
 /// - 90 → "1m 30s"
 /// - 3723 → "1h 2m 3s"
-/// - 86400 → "24h 0m 0s"
+/// - 86400 → "1d"
+/// - 478800 → "5d 13h" (≥ 24h uses a days band)
 pub fn format_duration(secs: u64) -> String {
     if secs < 60 {
         return format!("{}s", secs);
     }
 
-    let hours = secs / 3600;
+    let days = secs / 86_400;
+    let hours = (secs % 86_400) / 3600;
     let minutes = (secs % 3600) / 60;
     let seconds = secs % 60;
 
-    if hours > 0 {
+    if days > 0 {
+        if hours > 0 {
+            format!("{}d {}h", days, hours)
+        } else {
+            format!("{}d", days)
+        }
+    } else if hours > 0 {
         format!("{}h {}m {}s", hours, minutes, seconds)
     } else {
         format!("{}m {}s", minutes, seconds)
@@ -435,13 +443,16 @@ mod tests {
     fn test_format_duration_hours_minutes_seconds() {
         assert_eq!(format_duration(3600), "1h 0m 0s");
         assert_eq!(format_duration(3723), "1h 2m 3s");
-        assert_eq!(format_duration(86400), "24h 0m 0s");
+        assert_eq!(format_duration(86_399), "23h 59m 59s");
     }
 
     #[test]
-    fn test_format_duration_large_values() {
-        // 100 hours
-        assert_eq!(format_duration(360000), "100h 0m 0s");
+    fn test_format_duration_days_band() {
+        assert_eq!(format_duration(86_400), "1d");
+        assert_eq!(format_duration(86_400 + 13 * 3600), "1d 13h");
+        assert_eq!(format_duration(5 * 86_400 + 13 * 3600), "5d 13h");
+        // 100 hours = 4d 4h
+        assert_eq!(format_duration(360_000), "4d 4h");
     }
 
     // --- truncate_display tests ---

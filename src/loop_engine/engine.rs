@@ -97,7 +97,9 @@ pub(crate) const AUTO_MODE_DEPRECATION_HINT: &str = concat!(
 pub struct UsageParams {
     /// Whether Claude-account usage/OAuth pre-checking is enabled.
     pub enabled: bool,
-    /// Usage percentage threshold (0-100) to trigger wait.
+    /// Remaining-percent floor (0–100). Wait when account remaining ≤ this.
+    /// Default **8** (old used≥92 ≡ remaining≤8). Field name kept for call-site
+    /// stability; semantics are remaining-min, not used-percent.
     pub threshold: u8,
     /// Fallback wait time in seconds when no reset time is available.
     pub fallback_wait: u64,
@@ -108,7 +110,7 @@ impl UsageParams {
     pub fn disabled() -> Self {
         Self {
             enabled: false,
-            threshold: 92,
+            threshold: 8,
             fallback_wait: 300,
         }
     }
@@ -193,6 +195,10 @@ pub struct IterationResult {
     pub files_modified: Vec<String>,
     /// Whether the loop should stop after this iteration
     pub should_stop: bool,
+    /// True when the stop was an operator `.stop` file (including mid-wait).
+    /// False for quota horizon Stop / Deferred soft-stops that end this PRD
+    /// without meaning "operator halt the batch chain" (`LoopResult.was_stopped`).
+    pub operator_stopped: bool,
     /// Claude's stdout output (for output-based completion detection)
     pub output: String,
     /// Effective model used for this iteration (post-crash-escalation).
@@ -444,6 +450,15 @@ pub struct IterationContext {
     /// [`BlackoutState::active`]), the quota-deferral wait, and the
     /// excluded-id computation. See [`BlackoutState`] for the three rules.
     pub provider_blackouts: BlackoutState,
+    /// PR-2 proto-channel: rungs marked unavailable by quota apply (sibling of
+    /// [`BlackoutState`], never written into `provider_blackouts` /
+    /// `runner_overrides`). Main-thread only (learning 1810).
+    ///
+    /// Replace the entire set on each **successful** evaluate+apply. Keep the
+    /// snapshot on API fail (do not clear). No expiry in PR-2 (TTL is PR-3).
+    /// Consulted by [`reactions::pre_spawn::compute_quota_excluded_ids`] even
+    /// when `provider_blackouts` is empty (the production case).
+    pub unavailable_rungs: std::collections::HashSet<(model::Provider, model::CapabilityTier)>,
     /// The operator-resolved provider-first config (`models` + `routing`),
     /// built ONCE per run in `run_loop` from `ProjectConfig` and threaded to the
     /// per-task recovery paths that resolve Claude tier ladders — consecutive-
@@ -481,6 +496,7 @@ impl IterationContext {
             overflow_original_task_model: std::collections::HashMap::new(),
             transient_backend_attempts: 0,
             provider_blackouts: BlackoutState::default(),
+            unavailable_rungs: std::collections::HashSet::new(),
             resolved_models: model::builtin_resolved_models().clone(),
         }
     }
@@ -1384,6 +1400,7 @@ mod tests {
             task_id: Some("FEAT-001".to_string()),
             files_modified: vec!["src/lib.rs".to_string()],
             should_stop: false,
+            operator_stopped: false,
             output: String::new(),
             effective_model: None,
             effective_effort: None,
