@@ -19,7 +19,8 @@ use chrono::{DateTime, Utc};
 
 use crate::loop_engine::display;
 use crate::loop_engine::model::{
-    CapabilityTier, Provider, ResolvedModelsConfig, builtin_resolved_models,
+    CapabilityTier, FABLE_MODEL, HAIKU_MODEL, OPUS_MODEL, Provider, ResolvedModelsConfig,
+    SONNET_MODEL, builtin_resolved_models,
 };
 use crate::loop_engine::quota::{Measurement, MeasurementUnit, QuotaBucket};
 
@@ -550,11 +551,11 @@ fn map_scope_to_rungs(
     if let Some(name) = display_name
         && let Some(tier) = hud_tier_from_label(name)
     {
-        return Some(extra_mark_rungs(models, provider, tier));
+        return Some(extra_mark_for_hud_tier(models, provider, tier, model_id));
     }
     if let Some(id) = model_id {
         if let Some(tier) = hud_tier_from_label(id) {
-            return Some(extra_mark_rungs(models, provider, tier));
+            return Some(extra_mark_for_hud_tier(models, provider, tier, Some(id)));
         }
         // Unlabeled id: family-token substring against configured model strings.
         let token = family_token_from_id(id);
@@ -566,22 +567,68 @@ fn map_scope_to_rungs(
     None
 }
 
-/// After HUD maps to rung R, also mark every defined rung whose configured
-/// model string equals R's (exact string equality, no clamp / no tier_of).
-fn extra_mark_rungs(
+/// Built-in family model id for a HUD-mapped capability rung.
+///
+/// HUD tokens (`fable`/`opus`/…) map onto rungs; this returns the stable
+/// family constant for that rung — **not** the run config's `exact_model_for`.
+fn canonical_model_for_hud_tier(tier: CapabilityTier) -> Option<&'static str> {
+    match tier {
+        CapabilityTier::Frontier => Some(FABLE_MODEL),
+        CapabilityTier::Standard => Some(OPUS_MODEL),
+        CapabilityTier::CostEfficient => Some(SONNET_MODEL),
+        CapabilityTier::Cheapest => Some(HAIKU_MODEL),
+    }
+}
+
+/// After HUD maps `display_name`/`id` → rung R, build identity set
+/// `I = {canonical_model_for_hud_tier(R)} ∪ {scope.model.id?}` and extra-mark
+/// every defined Claude rung whose `exact_model_for` equals any member of I.
+/// Always includes HUD primary. Never keys on `exact_model_for(R)`.
+fn extra_mark_for_hud_tier(
     models: &ResolvedModelsConfig,
     provider: Provider,
     primary: CapabilityTier,
+    model_id: Option<&str>,
 ) -> Vec<(Provider, CapabilityTier)> {
-    let mut out = vec![(provider, primary)];
-    let Some(primary_model) = models.exact_model_for(provider, primary) else {
-        return out;
-    };
+    let mut identities: Vec<&str> = Vec::with_capacity(2);
+    if let Some(canonical) = canonical_model_for_hud_tier(primary) {
+        identities.push(canonical);
+    }
+    if let Some(id) = model_id {
+        identities.push(id);
+    }
+    let mut out = extra_mark_rungs_matching(models, provider, identities);
+    // Always include HUD primary even when no identity matched a configured model.
+    if !out.iter().any(|(_, t)| *t == primary) {
+        out.push((provider, primary));
+    }
+    out.sort_by_key(|(_, t)| *t);
+    out.dedup();
+    out
+}
+
+/// Extra-mark every defined rung on `provider` whose configured model string
+/// equals **any** member of `identities` (string equality only — not substring
+/// `tier_of`, not `model_for` clamp, not `exact_model_for(mapped_rung)`).
+///
+/// Call sites pass Claude only; do not iterate Grok/Codex ladders.
+pub(crate) fn extra_mark_rungs_matching<'a, I>(
+    models: &ResolvedModelsConfig,
+    provider: Provider,
+    identities: I,
+) -> Vec<(Provider, CapabilityTier)>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let identity_set: Vec<&str> = identities.into_iter().collect();
+    if identity_set.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
     for tier in CapabilityTier::ALL {
-        if tier == primary {
-            continue;
-        }
-        if models.exact_model_for(provider, tier) == Some(primary_model) {
+        if let Some(configured) = models.exact_model_for(provider, tier)
+            && identity_set.contains(&configured)
+        {
             out.push((provider, tier));
         }
     }
@@ -995,7 +1042,7 @@ fn banner_labels_for_bucket(bucket: &QuotaBucket) -> Vec<String> {
         return Vec::new();
     }
     if let Some(rungs) = bucket.rungs.as_ref() {
-        // Preserve ingest order (CapabilityTier sort from extra_mark_rungs).
+        // Preserve ingest order (CapabilityTier sort from extra_mark_rungs_matching).
         let mut labels: Vec<String> = Vec::new();
         for (_, tier) in rungs {
             let name = tier.as_str().to_string();
@@ -2134,6 +2181,77 @@ mod tests {
         assert!(
             rungs.contains(&(Provider::Claude, CapabilityTier::Frontier)),
             "extra-mark must also mark frontier when it shares the standard model string; got {rungs:?}"
+        );
+    }
+
+    /// FEAT-008 / CONTRACT-002: Fable HUD + frontier→opus pin must mark
+    /// frontier only — identity is FABLE_MODEL, not exact_model_for(frontier).
+    #[test]
+    fn ingest_fable_hud_with_frontier_opus_pin_marks_frontier_only() {
+        let models = models_with_frontier_pinned_to_standard();
+        for (label, display_name) in [
+            ("bare Fable", "Fable"),
+            ("Current week (Fable)", "Current week (Fable)"),
+        ] {
+            let json = serde_json::json!({
+                "limits": [{
+                    "kind": "weekly_scoped",
+                    "percent": 95,
+                    "scope": { "model": { "display_name": display_name } }
+                }]
+            });
+            let buckets = ingest_oauth_value(&json, &models);
+            let b = bucket_by_id(&buckets, "limits[0].weekly_scoped");
+            assert_eq!(
+                b.rungs.as_deref(),
+                Some(&[(Provider::Claude, CapabilityTier::Frontier)][..]),
+                "{label}: Fable HUD under frontier=opus pin must mark frontier only, NOT standard; got {:?}",
+                b.rungs
+            );
+        }
+    }
+
+    /// FEAT-008: live-shaped Fable limits[] row under the same pin stays frontier-only.
+    #[test]
+    fn ingest_live_shaped_fable_row_with_frontier_opus_pin_marks_frontier_only() {
+        let models = models_with_frontier_pinned_to_standard();
+        let buckets = ingest_oauth_value(&live_shaped_oauth_json(), &models);
+        let fable = bucket_by_id(&buckets, "limits[2].weekly_scoped");
+        assert_eq!(
+            fable.rungs.as_deref(),
+            Some(&[(Provider::Claude, CapabilityTier::Frontier)][..]),
+            "live-shaped Fable row under pin must not extra-mark standard; got {:?}",
+            fable.rungs
+        );
+    }
+
+    /// FEAT-008: Opus HUD + snapshot id under frontier→opus pin still unions
+    /// OPUS_MODEL (marks standard+frontier) — do not prefer snapshot id alone.
+    #[test]
+    fn ingest_opus_snapshot_id_with_frontier_pin_marks_standard_and_frontier() {
+        let models = models_with_frontier_pinned_to_standard();
+        let json = serde_json::json!({
+            "limits": [{
+                "kind": "weekly_scoped",
+                "percent": 95,
+                "scope": {
+                    "model": {
+                        "display_name": "Opus",
+                        "id": "claude-opus-5-SNAPSHOT"
+                    }
+                }
+            }]
+        });
+        let buckets = ingest_oauth_value(&json, &models);
+        let b = bucket_by_id(&buckets, "limits[0].weekly_scoped");
+        let rungs = b.rungs.as_ref().expect("Opus HUD must map rungs");
+        assert!(
+            rungs.contains(&(Provider::Claude, CapabilityTier::Standard)),
+            "canonical OPUS_MODEL must still mark standard under snapshot id; got {rungs:?}"
+        );
+        assert!(
+            rungs.contains(&(Provider::Claude, CapabilityTier::Frontier)),
+            "pin extra-mark via OPUS_MODEL must mark frontier; got {rungs:?}"
         );
     }
 
