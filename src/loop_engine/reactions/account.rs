@@ -267,16 +267,29 @@ pub(crate) fn is_spend_limit_message(output: &str) -> bool {
 /// probe.
 ///
 /// True when a capability-rung model token (`fable|opus|sonnet|haiku`) is
-/// followed by `limit` within a short window, OR the output co-occurs with
-/// `switch models`. `/model` alone is **not** sufficient. Plain
-/// `You've reached your session limit` / account `hit your limit · resets 4pm`
-/// do **not** match — those keep api_secs / may Blackout.
+/// followed by `limit` within a short window, OR `switch models` appears on
+/// the **same line** as `reached` or `limit` (not an unanchored whole-capture
+/// contains — docs/commentary on a later line must not force Wait 3600).
+/// `/model` alone is **not** sufficient. Plain `You've reached your session
+/// limit` / account `hit your limit · resets 4pm` do **not** match — those
+/// keep api_secs / may Blackout.
 pub(crate) fn is_rung_scoped_rate_limit_message(output: &str) -> bool {
     let lower = output.to_lowercase();
-    if lower.contains("switch models") {
+    if switch_models_on_rate_limit_line(&lower) {
         return true;
     }
     model_token_followed_by_limit(&lower)
+}
+
+/// `switch models` only counts toward the 3600 override when it shares a line
+/// with `reached` or `limit` (live Fable: one line, two sentences).
+fn switch_models_on_rate_limit_line(lower: &str) -> bool {
+    for line in lower.lines() {
+        if line.contains("switch models") && (line.contains("reached") || line.contains("limit")) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Word-bounded model token followed by `limit` within 64 bytes of the token.
@@ -1410,7 +1423,9 @@ mod tests {
         assert!(is_rung_scoped_rate_limit_message(
             "You've reached your Sonnet limit"
         ));
-        assert!(is_rung_scoped_rate_limit_message(
+        // Unanchored "switch models" (no reached/limit on the same line) is
+        // not the 3600 override — docs/help copy must not trip it.
+        assert!(!is_rung_scoped_rate_limit_message(
             "Please switch models to continue"
         ));
         // Plain session / account copy — ordinary RateLimit, no 3600 override.
@@ -1420,10 +1435,28 @@ mod tests {
         assert!(!is_rung_scoped_rate_limit_message(
             "You've hit your limit · resets 4pm"
         ));
-        // `/model` alone is not sufficient (no model token, no "switch models").
+        // `/model` alone is not sufficient (no model token, no anchored
+        // "switch models").
         assert!(!is_rung_scoped_rate_limit_message(
             "Try /model to pick another model"
         ));
+        // Account banner + later commentary mentioning "switch models" must
+        // not take the rung-scoped override (line-scoped, not whole-capture).
+        let mixed = "You've hit your limit · resets 4pm\n\
+             Docs: when Fable is exhausted, switch models with /model.";
+        assert!(!is_rung_scoped_rate_limit_message(mixed));
+    }
+
+    #[test]
+    fn test_decide_switch_models_on_later_line_keeps_output_secs() {
+        let mixed = "You've hit your limit · resets 4pm\n\
+             Commentary: switch models with /model per the docs.";
+        let action = decide_account_rate_limit(None, Some(500), mixed, false, 300, 3600);
+        assert_eq!(
+            action,
+            RateLimitAction::Wait { secs: 500 },
+            "switch models on a later line must not force Wait 3600"
+        );
     }
 
     #[test]
