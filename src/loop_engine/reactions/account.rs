@@ -1026,9 +1026,13 @@ pub struct QuotaApplyResult {
 
 /// Whether factory/allowing `tierFallback` permits auto-unavailable for `work`.
 ///
-/// `None` (explicit JSON null) → forbade. Narrower `maxDifficulty`,
-/// `includeReview: false` with review work, or `includeForced: false` with
-/// forced work → forbade.
+/// `None` (explicit JSON null) → forbade. Narrower `maxDifficulty`, or
+/// `includeReview: false` with review work → forbade.
+///
+/// `includeForced: false` is **not** a global forbid: factory defaults keep
+/// auto-unavailable for eligible rungs even when some todos carry
+/// `tasks.model`. Forced-model tasks stay selectable until the PR-3
+/// family-match walker defers them per-task.
 pub fn tier_fallback_allows(fb: Option<&TierFallback>, work: &RemainingWorkSnapshot) -> bool {
     let Some(fb) = fb else {
         return false;
@@ -1036,9 +1040,8 @@ pub fn tier_fallback_allows(fb: Option<&TierFallback>, work: &RemainingWorkSnaps
     if work.has_review && !fb.include_review {
         return false;
     }
-    if work.has_forced && !fb.include_forced {
-        return false;
-    }
+    // `include_forced` / `has_forced` are PR-3 per-task family-match, not a
+    // whole-PRD opt-out — factory defaults still auto-unavailable here.
     let fb_rank = difficulty_rank_str(&fb.max_difficulty).unwrap_or(0);
     let work_rank = work
         .max_difficulty
@@ -2694,6 +2697,75 @@ mod tests {
             vec![(Provider::Claude, CapabilityTier::Frontier)]
         );
         assert_eq!(applied.account, QuotaAccountAction::Proceed);
+    }
+
+    #[test]
+    fn apply_factory_with_forced_model_still_unavailable_proceed() {
+        // Overflow / explicit tasks.model sets has_forced. Factory
+        // includeForced:false must NOT globally forbid unavailable — leave
+        // forced tasks selectable (PR-3 walker) and proceed on standard.
+        let frontier = pct_bucket(
+            "weekly_scoped",
+            "weekly_scoped",
+            5.0,
+            6 * 24 * 3600,
+            Some(vec![(Provider::Claude, CapabilityTier::Frontier)]),
+        );
+        let policy = UsagePolicy::default();
+        let eval = evaluate_quota(std::slice::from_ref(&frontier), &policy, 8);
+        let work = RemainingWorkSnapshot {
+            other_rungs_runnable: true,
+            has_forced: true,
+            max_difficulty: Some("high"),
+            ..RemainingWorkSnapshot::default()
+        };
+        let fb = factory_fb();
+        assert!(
+            !fb.include_forced,
+            "factory includeForced must stay false (PR-3 per-task)"
+        );
+        assert!(
+            tier_fallback_allows(Some(&fb), &work),
+            "factory defaults must still allow unavailable when has_forced"
+        );
+        let applied = apply_quota(&eval, &[frontier], &policy, Some(&fb), &work);
+        assert_eq!(
+            applied.unavailable,
+            vec![(Provider::Claude, CapabilityTier::Frontier)]
+        );
+        assert_eq!(
+            applied.account,
+            QuotaAccountAction::Proceed,
+            "factory + has_forced must not Defer (would claim tierFallback forbade)"
+        );
+    }
+
+    #[test]
+    fn apply_include_review_false_defers_when_review_is_remaining() {
+        let frontier = pct_bucket(
+            "weekly_scoped",
+            "weekly_scoped",
+            5.0,
+            6 * 24 * 3600,
+            Some(vec![(Provider::Claude, CapabilityTier::Frontier)]),
+        );
+        let policy = UsagePolicy::default(); // ask_ttl_minutes = 0 → Defer
+        let eval = evaluate_quota(std::slice::from_ref(&frontier), &policy, 8);
+        let fb = TierFallback {
+            max_difficulty: "high".into(),
+            include_review: false,
+            include_forced: false,
+        };
+        let work = RemainingWorkSnapshot {
+            other_rungs_runnable: true,
+            has_review: true,
+            max_difficulty: Some("high"),
+            ..RemainingWorkSnapshot::default()
+        };
+        assert!(!tier_fallback_allows(Some(&fb), &work));
+        let applied = apply_quota(&eval, &[frontier], &policy, Some(&fb), &work);
+        assert!(applied.unavailable.is_empty());
+        assert_eq!(applied.account, QuotaAccountAction::Defer);
     }
 
     #[test]
