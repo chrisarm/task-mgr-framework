@@ -14,8 +14,10 @@ const ITERATION_HEADROOM_MULTIPLIER: f64 = 1.75;
 pub struct LoopConfig {
     /// Maximum iterations before stopping (0 = auto-calculate from task count)
     pub max_iterations: usize,
-    /// Usage API threshold percentage (0-100) to trigger wait-for-reset
-    pub usage_threshold: u8,
+    /// Remaining-percent floor (0–100). Wait when account remaining ≤ this.
+    /// Default **8**. Precedence at startup: `LOOP_USAGE_REMAINING_MIN` >
+    /// `usagePolicy.remainingMinPercent` > 8. Old used≥92 ≡ remaining≤8.
+    pub usage_remaining_min: u8,
     /// Maximum consecutive crashes before aborting the loop
     pub max_crashes: u8,
     /// Delay in seconds between iterations
@@ -92,7 +94,7 @@ impl Default for LoopConfig {
     fn default() -> Self {
         Self {
             max_iterations: 0,
-            usage_threshold: 92,
+            usage_remaining_min: 8,
             max_crashes: 3,
             iteration_delay_secs: 2,
             usage_fallback_wait: 300,
@@ -116,7 +118,9 @@ impl LoopConfig {
     /// if missing). Then reads these env vars:
     ///
     /// - `LOOP_MAX_ITERATIONS` → `max_iterations` (usize)
-    /// - `LOOP_USAGE_THRESHOLD` → `usage_threshold` (u8, 0-100)
+    /// - `LOOP_USAGE_REMAINING_MIN` → `usage_remaining_min` (u8, 0-100).
+    ///   Invalid values are ignored (default 8). Legacy `LOOP_USAGE_THRESHOLD`
+    ///   is **not** read here — loop/batch preflight hard-errors if it is set.
     /// - `LOOP_MAX_CRASHES` → `max_crashes` (u8)
     /// - `LOOP_ITERATION_DELAY_SECS` → `iteration_delay_secs` (u64)
     /// - `LOOP_USAGE_FALLBACK_WAIT` → `usage_fallback_wait` (u64)
@@ -135,7 +139,8 @@ impl LoopConfig {
 
         Self {
             max_iterations: parse_env("LOOP_MAX_ITERATIONS").unwrap_or(defaults.max_iterations),
-            usage_threshold: parse_env("LOOP_USAGE_THRESHOLD").unwrap_or(defaults.usage_threshold),
+            usage_remaining_min: parse_env("LOOP_USAGE_REMAINING_MIN")
+                .unwrap_or(defaults.usage_remaining_min),
             max_crashes: parse_env("LOOP_MAX_CRASHES").unwrap_or(defaults.max_crashes),
             iteration_delay_secs: parse_env("LOOP_ITERATION_DELAY_SECS")
                 .unwrap_or(defaults.iteration_delay_secs),
@@ -156,6 +161,14 @@ impl LoopConfig {
                 .unwrap_or(defaults.parallel_slots),
         }
     }
+}
+
+/// Resolve the live remaining-percent floor.
+///
+/// Precedence: `LOOP_USAGE_REMAINING_MIN` (when present + valid) >
+/// `usagePolicy.remainingMinPercent` (config) > **8**.
+pub fn resolve_usage_remaining_min(env: Option<u8>, config_remaining_min: u8) -> u8 {
+    env.unwrap_or(config_remaining_min)
 }
 
 /// Parse a string value into a type that implements `FromStr`.
@@ -596,15 +609,67 @@ pub fn auto_max_iterations(task_count: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     // --- LoopConfig defaults ---
 
     #[test]
-    fn test_loop_config_default_usage_threshold() {
+    fn test_loop_config_default_usage_remaining_min() {
         let config = LoopConfig::default();
         assert_eq!(
-            config.usage_threshold, 92,
-            "USAGE_THRESHOLD should default to 92"
+            config.usage_remaining_min, 8,
+            "usage_remaining_min should default to 8"
+        );
+    }
+
+    #[test]
+    fn test_resolve_usage_remaining_min_precedence() {
+        assert_eq!(resolve_usage_remaining_min(Some(15), 10), 15);
+        assert_eq!(resolve_usage_remaining_min(None, 10), 10);
+        assert_eq!(resolve_usage_remaining_min(None, 8), 8);
+    }
+
+    static USAGE_REMAINING_ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn test_from_env_usage_remaining_min_valid() {
+        let _guard = USAGE_REMAINING_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::remove_var("LOOP_USAGE_THRESHOLD") };
+        unsafe { std::env::set_var("LOOP_USAGE_REMAINING_MIN", "12") };
+        let config = LoopConfig::from_env();
+        unsafe { std::env::remove_var("LOOP_USAGE_REMAINING_MIN") };
+        assert_eq!(config.usage_remaining_min, 12);
+    }
+
+    #[test]
+    fn test_from_env_usage_remaining_min_invalid_ignored() {
+        let _guard = USAGE_REMAINING_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::remove_var("LOOP_USAGE_THRESHOLD") };
+        unsafe { std::env::set_var("LOOP_USAGE_REMAINING_MIN", "not-a-number") };
+        let config = LoopConfig::from_env();
+        unsafe { std::env::remove_var("LOOP_USAGE_REMAINING_MIN") };
+        assert_eq!(
+            config.usage_remaining_min, 8,
+            "invalid LOOP_USAGE_REMAINING_MIN must fall back to default 8"
+        );
+    }
+
+    #[test]
+    fn test_from_env_ignores_legacy_usage_threshold() {
+        let _guard = USAGE_REMAINING_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::remove_var("LOOP_USAGE_REMAINING_MIN") };
+        unsafe { std::env::set_var("LOOP_USAGE_THRESHOLD", "92") };
+        let config = LoopConfig::from_env();
+        unsafe { std::env::remove_var("LOOP_USAGE_THRESHOLD") };
+        assert_eq!(
+            config.usage_remaining_min, 8,
+            "LOOP_USAGE_THRESHOLD must not silently drive usage_remaining_min"
         );
     }
 
@@ -1271,8 +1336,6 @@ mod tests {
     // --- permission_mode_from_env() ---
     // These tests mutate environment variables and must be serialised.
 
-    use std::sync::Mutex;
-
     static PERM_ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
@@ -1416,7 +1479,7 @@ mod tests {
         // If LoopConfig had a permission_mode field, this destructuring would need it.
         let LoopConfig {
             max_iterations: _,
-            usage_threshold: _,
+            usage_remaining_min: _,
             max_crashes: _,
             iteration_delay_secs: _,
             usage_fallback_wait: _,
@@ -1439,7 +1502,7 @@ mod tests {
     fn test_loop_config_clone() {
         let config = LoopConfig::default();
         let cloned = config.clone();
-        assert_eq!(cloned.usage_threshold, config.usage_threshold);
+        assert_eq!(cloned.usage_remaining_min, config.usage_remaining_min);
         assert_eq!(cloned.max_crashes, config.max_crashes);
         assert_eq!(cloned.iteration_delay_secs, config.iteration_delay_secs);
     }

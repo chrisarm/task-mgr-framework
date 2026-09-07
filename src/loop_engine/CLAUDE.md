@@ -234,7 +234,8 @@ session stdout false-triggers 3600), or (3) `switch models` on the **same
 line** as `reached`/`limit` (whole-capture `contains` matches docs/commentary).
 `/model` alone is not enough. Plain `reached your session limit` / `hit your
 limit · resets 4pm` stay ordinary RateLimit. Account-binding `reset_at` uses
-the live `usage_threshold`, not compile-time 92. Because one Fable RateLimit
+the live `usage_remaining_min` (remaining floor, default 8; old used≥92 ≡
+remaining≤8), not a hardcoded compile-time value. Because one Fable RateLimit
 sleeps the **whole wave** 3600s, the operator pin is **required** for
 parallel/wave until PR-3:
 `task-mgr models set-tier claude frontier <standard-model>` (e.g. opus).

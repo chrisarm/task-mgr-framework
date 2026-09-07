@@ -31,7 +31,7 @@ use crate::loop_engine::{display, signals};
 /// `account` is `pub` so this is reachable from the integration parity harness
 /// (`tests/reaction_parity.rs`).
 pub struct AccountUsageGateParams<'a> {
-    /// Usage-API percentage threshold above which the gate waits.
+    /// Remaining-percent floor (0–100). Wait when account remaining ≤ this.
     pub threshold: u8,
     /// Loop tasks dir — `.stop`-signal polling during the wait.
     pub tasks_dir: &'a Path,
@@ -1205,11 +1205,19 @@ pub(crate) fn estimate_reset_seconds(reset_at: &str) -> Option<u64> {
     }
 }
 
-/// Check usage and wait if above threshold. Main entry point for pre-iteration usage check.
+fn format_remaining_pct(remaining: f64) -> String {
+    if (remaining - remaining.round()).abs() < f64::EPSILON {
+        format!("{}", remaining.round() as i64)
+    } else {
+        format!("{remaining:.1}")
+    }
+}
+
+/// Check usage and wait if remaining is at or below the floor.
 ///
 /// Orchestrates:
 /// 1. `load_usage_info` (creds + refresh + OAuth/org usage API)
-/// 2. If above threshold, wait for reset with API early-lift probe
+/// 2. If remaining ≤ floor, wait for reset with API early-lift probe
 ///
 /// Returns the result of the check-and-wait cycle.
 pub(crate) fn check_and_wait(
@@ -1217,8 +1225,8 @@ pub(crate) fn check_and_wait(
     tasks_dir: &Path,
     fallback_wait: u64,
 ) -> UsageCheckResult {
-    // Pass live threshold into parse so reset_at uses the same gate-relevant
-    // bar as the percentage compare below (not compile-time 92).
+    // Pass live remaining-min into parse so reset_at uses the same floor as
+    // the remaining compare below (not a hardcoded 8).
     let usage = match load_usage_info_with_threshold(threshold) {
         Some(u) => u,
         None => {
@@ -1228,12 +1236,18 @@ pub(crate) fn check_and_wait(
         }
     };
 
-    eprintln!(
-        "Usage: {:.1}% (threshold: {}%)",
-        usage.percentage, threshold
-    );
+    if let Some(banner) = usage.remaining_banner.as_deref() {
+        eprintln!("{banner}");
+    } else {
+        eprintln!(
+            "{}% left (floor {}%)",
+            format_remaining_pct(usage.percentage),
+            threshold
+        );
+    }
 
-    if usage.percentage < f64::from(threshold) {
+    // Proceed when remaining > floor (old used≥92 ≡ remaining≤8).
+    if usage.percentage > f64::from(threshold) {
         return UsageCheckResult::BelowThreshold;
     }
 

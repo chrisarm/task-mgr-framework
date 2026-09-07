@@ -1619,7 +1619,7 @@ mod tests {
     const TEST_USAGE_PARAMS: crate::loop_engine::engine::UsageParams =
         crate::loop_engine::engine::UsageParams {
             enabled: false,
-            threshold: 92,
+            threshold: 8,
             fallback_wait: 300,
         };
 

@@ -146,6 +146,13 @@ disabling the Claude provider zeroes **all** Anthropic account I/O (load + probe
 See [`src/loop_engine/CLAUDE.md`](src/loop_engine/CLAUDE.md) "Account-global
 reactions".
 
+**Remaining-percent floor (PR-2):** gate unit is remaining 0–100 (not used-percent).
+Precedence: `LOOP_USAGE_REMAINING_MIN` (env) > `usagePolicy.remainingMinPercent`
+(config) > **8**. Old `used ≥ 92` ≡ `remaining ≤ 8`. Legacy `LOOP_USAGE_THRESHOLD`
+hard-errors at loop/batch `preflight_validate_and_probe` (names
+`LOOP_USAGE_REMAINING_MIN`); non-loop commands ignore it. Operator banners use
+`% left` (rung labels like `frontier`, never model ids).
+
 **PR-1 Fable pin (required for parallel/wave until PR-3):** one Fable RateLimit
 sleeps the whole wave 3600s — pin frontier off Fable with
 `task-mgr models set-tier claude frontier <standard-model>` (e.g. opus).

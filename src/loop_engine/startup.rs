@@ -995,9 +995,17 @@ pub(crate) fn initialize_loop(
     if run_config.config.usage_check_enabled && !usage_check_enabled {
         ui::emit("Skipping Claude usage/OAuth pre-check (Claude provider disabled)");
     }
+    // Precedence: LOOP_USAGE_REMAINING_MIN (env) > usagePolicy.remainingMinPercent > 8.
+    let env_remaining = std::env::var("LOOP_USAGE_REMAINING_MIN")
+        .ok()
+        .and_then(|v| v.parse::<u8>().ok());
+    let remaining_min = crate::loop_engine::config::resolve_usage_remaining_min(
+        env_remaining,
+        project_config.usage_policy.remaining_min_percent,
+    );
     let usage_params = UsageParams {
         enabled: usage_check_enabled,
-        threshold: run_config.config.usage_threshold,
+        threshold: remaining_min,
         fallback_wait: run_config.config.usage_fallback_wait,
     };
 

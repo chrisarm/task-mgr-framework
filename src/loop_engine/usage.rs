@@ -1,8 +1,8 @@
 //! Usage API monitoring for the autonomous agent loop.
 //!
-//! Checks API usage percentage before each iteration and waits for reset
-//! when usage exceeds the configured threshold. Gracefully degrades if
-//! credentials are unavailable or the API is unreachable.
+//! Checks remaining quota before each iteration and waits for reset when
+//! account remaining is at or below the configured floor. Gracefully degrades
+//! if credentials are unavailable or the API is unreachable.
 //!
 //! All output goes to stderr (stdout reserved for Claude subprocess passthrough).
 //!
@@ -15,7 +15,12 @@
 //! It returns per-window utilization + `resets_at` for the 5-hour session and
 //! weekly buckets. The older org usage endpoint is kept as a fallback.
 
-use crate::loop_engine::model::{CapabilityTier, Provider, ResolvedModelsConfig};
+use chrono::{DateTime, Utc};
+
+use crate::loop_engine::display;
+use crate::loop_engine::model::{
+    CapabilityTier, Provider, ResolvedModelsConfig, builtin_resolved_models,
+};
 use crate::loop_engine::quota::{Measurement, MeasurementUnit, QuotaBucket};
 
 /// Claude Code OAuth usage endpoint (matches `/usage` HUD).
@@ -34,12 +39,12 @@ const OAUTH_USAGE_USER_AGENT_FALLBACK: &str = "claude-code/unknown";
 /// Legacy org-level usage endpoint (API-key / org accounts).
 const ORG_USAGE_API_URL: &str = "https://api.anthropic.com/v1/organizations/usage";
 
-/// Default used-percent threshold for selecting `reset_at` among account-binding
-/// windows. Matches `LoopConfig::usage_threshold` default (92). Callers that
-/// know the live config (`check_and_wait`, post-output load) pass
-/// `LoopConfig::usage_threshold` so wait duration tracks the same bar as the
-/// percentage compare.
-const DEFAULT_USAGE_THRESHOLD: f64 = 92.0;
+/// Default remaining-percent floor for selecting `reset_at` among account-binding
+/// windows. Matches `LoopConfig::usage_remaining_min` default (8). Callers that
+/// know the live config (`check_and_wait`, post-output load) pass the live floor
+/// so wait duration tracks the same bar as the remaining compare.
+/// Old used≥92 ≡ remaining≤8.
+const DEFAULT_USAGE_REMAINING_MIN: f64 = 8.0;
 
 /// Connect + response budget for usage GETs. Without this, a SYN hang to
 /// Anthropic (or a wedged path when `~/.claude` credentials exist during unit
@@ -62,30 +67,32 @@ fn usage_http_agent() -> &'static ureq::Agent {
 /// Usage information returned from the API.
 #[derive(Debug, Clone)]
 pub struct UsageInfo {
-    /// Current usage as a percentage (0.0 - 100.0) of **used** quota.
+    /// Account remaining percent (0.0–100.0).
     ///
-    /// For the OAuth endpoint: **max used** across account-binding windows only
-    /// (named `five_hour` / `seven_day`, plus `limits[]` with `kind` `session`
-    /// or `weekly_all`). Rung-scoped windows (`seven_day_opus` /
-    /// `seven_day_sonnet`, `limits[].kind = weekly_scoped`) are omitted so a
-    /// frontier-only bucket cannot park the account gate.
+    /// For the OAuth endpoint: **min remaining** across account-binding windows
+    /// only (named `five_hour` / `seven_day`, plus `limits[]` with `kind`
+    /// `session` or `weekly_all`). Remaining = `(100 - used).clamp(0, 100)`.
+    /// Rung-scoped windows are omitted so a frontier-only bucket cannot park
+    /// the account gate.
     pub percentage: f64,
     /// ISO 8601 reset timestamp for waiting, if available.
     ///
     /// For the OAuth endpoint: **latest** `resets_at` among account-binding
-    /// windows whose used percent is ≥ the live gate threshold (default
-    /// [`DEFAULT_USAGE_THRESHOLD`] / 92, or `LoopConfig::usage_threshold` when
-    /// threaded through [`load_usage_info_with_threshold`]); if none are
+    /// windows whose remaining is ≤ the live floor (default
+    /// [`DEFAULT_USAGE_REMAINING_MIN`] / 8, or `LoopConfig::usage_remaining_min`
+    /// when threaded through [`load_usage_info_with_threshold`]); if none are
     /// gate-relevant, prefer the session window (`five_hour` or `limits[]`
     /// kind `session`), else any account-binding reset. Not the soonest
     /// exhausted / severity-critical timestamp across all windows.
     pub reset_at: Option<String>,
+    /// Multi-bucket `% left` operator banner when OAuth HUD JSON was parsed.
+    pub remaining_banner: Option<String>,
 }
 
 /// Result of a usage check-and-wait cycle.
 #[derive(Debug, PartialEq)]
 pub enum UsageCheckResult {
-    /// Usage is below threshold, proceed.
+    /// Remaining is above the floor, proceed.
     BelowThreshold,
     /// Waited for reset successfully, now below threshold.
     WaitedAndReset,
@@ -107,11 +114,11 @@ pub enum UsageCheckResult {
 ///
 /// Returns `None` if both calls fail (logged via tracing).
 pub fn check_usage_api(access_token: &str) -> Option<UsageInfo> {
-    check_usage_api_with_threshold(access_token, DEFAULT_USAGE_THRESHOLD as u8)
+    check_usage_api_with_threshold(access_token, DEFAULT_USAGE_REMAINING_MIN as u8)
 }
 
 /// Like [`check_usage_api`], but `reset_at` uses `threshold` as the
-/// gate-relevant bar (same value `check_and_wait` compares against
+/// remaining-min floor (same value `check_and_wait` compares against
 /// `percentage`).
 pub fn check_usage_api_with_threshold(access_token: &str, threshold: u8) -> Option<UsageInfo> {
     match fetch_oauth_usage(access_token, threshold) {
@@ -148,7 +155,9 @@ fn fetch_oauth_usage(access_token: &str, threshold: u8) -> Option<UsageInfo> {
         }
     };
 
-    parse_oauth_usage_json_with_threshold(&json, f64::from(threshold))
+    let mut info = parse_oauth_usage_json_with_threshold(&json, f64::from(threshold))?;
+    info.remaining_banner = Some(format_oauth_remaining_banner(&json, threshold, Utc::now()));
+    Some(info)
 }
 
 /// User-Agent for `GET /api/oauth/usage`.
@@ -238,11 +247,18 @@ fn fetch_org_usage(access_token: &str) -> Option<UsageInfo> {
 
 /// One account-binding utilization window from the OAuth usage payload.
 struct UsageWindow {
+    /// Used percent 0–100 as reported by the API.
     util: f64,
     reset: Option<String>,
     /// Named `five_hour` or `limits[]` kind `session` — preferred when no
-    /// account-binding window is ≥ the live gate threshold.
+    /// account-binding window is ≤ the live remaining floor.
     is_session: bool,
+}
+
+impl UsageWindow {
+    fn remaining(&self) -> f64 {
+        (100.0 - self.util).clamp(0.0, 100.0)
+    }
 }
 
 /// Ingest every OAuth usage object sibling and `limits[]` row into generic
@@ -407,6 +423,12 @@ fn measurements_from_object(value: &serde_json::Value) -> Option<Vec<Measurement
             unit: MeasurementUnit::Dollars,
         });
     }
+    if let Some(tokens) = value.get("tokens").and_then(json_number_as_f64) {
+        out.push(Measurement {
+            remaining: tokens,
+            unit: MeasurementUnit::Tokens,
+        });
+    }
     if out.is_empty() { None } else { Some(out) }
 }
 
@@ -427,6 +449,12 @@ fn measurements_from_limit(limit: &serde_json::Value) -> Option<Vec<Measurement>
         out.push(Measurement {
             remaining: dollars,
             unit: MeasurementUnit::Dollars,
+        });
+    }
+    if let Some(tokens) = limit.get("tokens").and_then(json_number_as_f64) {
+        out.push(Measurement {
+            remaining: tokens,
+            unit: MeasurementUnit::Tokens,
         });
     }
     if out.is_empty() { None } else { Some(out) }
@@ -549,35 +577,34 @@ fn map_unlabeled_token(
 }
 
 /// Parse the Claude Code OAuth usage JSON into [`UsageInfo`] using the default
-/// gate threshold ([`DEFAULT_USAGE_THRESHOLD`] / 92).
+/// remaining floor ([`DEFAULT_USAGE_REMAINING_MIN`] / 8).
 ///
 /// Test convenience wrapper. Production always calls
 /// [`parse_oauth_usage_json_with_threshold`] with the live
-/// `LoopConfig::usage_threshold` so `reset_at` matches the percentage compare
+/// `LoopConfig::usage_remaining_min` so `reset_at` matches the remaining compare
 /// in `check_and_wait`.
 #[cfg(test)]
 pub(crate) fn parse_oauth_usage_json(json: &serde_json::Value) -> Option<UsageInfo> {
-    parse_oauth_usage_json_with_threshold(json, DEFAULT_USAGE_THRESHOLD)
+    parse_oauth_usage_json_with_threshold(json, DEFAULT_USAGE_REMAINING_MIN)
 }
 
 /// Parse the Claude Code OAuth usage JSON into [`UsageInfo`].
 ///
-/// Account-binding fold (PR-1 / FR-001):
-/// - **percentage** = max **used** (0–100) across account-binding windows only:
-///   named `five_hour` / `seven_day`, plus `limits[]` with `kind` `session` or
-///   `weekly_all`. Named `seven_day_opus` / `seven_day_sonnet` and
-///   `limits[]` kinds `weekly_scoped` / `extra_usage` / `promotional` are
-///   skipped. `severity` / `is_active` are display hints and do not enter the
-///   fold.
-/// - **reset_at** = latest among those windows with used ≥ `gate_threshold`
-///   (live `LoopConfig::usage_threshold`, default 92); if none, prefer
-///   session; else any account-binding reset. Gate-relevant means used ≥
-///   threshold — not util ≥ 100 or `severity=critical`.
+/// Account-binding fold (PR-2 remaining unit):
+/// - **percentage** = min **remaining** (0–100) across account-binding windows
+///   only: named `five_hour` / `seven_day`, plus `limits[]` with `kind`
+///   `session` or `weekly_all`. Remaining = `(100 - used).clamp(0, 100)`.
+///   Named `seven_day_opus` / `seven_day_sonnet` and `limits[]` kinds
+///   `weekly_scoped` / `extra_usage` / `promotional` are skipped.
+/// - **reset_at** = latest among those windows with remaining ≤ `remaining_min`
+///   (live floor, default 8); if none, prefer session; else any account-binding
+///   reset. Gate-relevant means remaining ≤ floor (old used≥92 ≡ remaining≤8).
 ///
-/// Pure / unit-testable — no I/O.
+/// Pure / unit-testable — no I/O. Does not set [`UsageInfo::remaining_banner`]
+/// (call [`format_oauth_remaining_banner`] separately).
 pub(crate) fn parse_oauth_usage_json_with_threshold(
     json: &serde_json::Value,
-    gate_threshold: f64,
+    remaining_min: f64,
 ) -> Option<UsageInfo> {
     let mut windows: Vec<UsageWindow> = Vec::new();
 
@@ -631,12 +658,16 @@ pub(crate) fn parse_oauth_usage_json_with_threshold(
         return None;
     }
 
-    let percentage = windows.iter().map(|w| w.util).fold(0.0_f64, f64::max);
+    // Account remaining = min of account-binding remaining.
+    let percentage = windows
+        .iter()
+        .map(UsageWindow::remaining)
+        .fold(100.0_f64, f64::min);
 
     let reset_at = latest_reset(
         windows
             .iter()
-            .filter(|w| w.util >= gate_threshold)
+            .filter(|w| w.remaining() <= remaining_min)
             .map(|w| &w.reset),
     )
     .or_else(|| {
@@ -650,6 +681,7 @@ pub(crate) fn parse_oauth_usage_json_with_threshold(
     Some(UsageInfo {
         percentage,
         reset_at,
+        remaining_banner: None,
     })
 }
 
@@ -703,18 +735,18 @@ fn latest_reset<'a>(resets: impl Iterator<Item = &'a Option<String>>) -> Option<
 
 /// Single chokepoint: credentials path → read → optional refresh → usage API.
 ///
-/// Uses the default gate threshold (92) for `reset_at` selection. Prefer
-/// [`load_usage_info_with_threshold`] when the live `usage_threshold` is known.
+/// Uses the default remaining floor (8) for `reset_at` selection. Prefer
+/// [`load_usage_info_with_threshold`] when the live `usage_remaining_min` is known.
 ///
 /// Used by the pre-iteration gate, post-rate-limit resolve, spillover blackout
 /// duration, and early-lift probes. Returns `None` when credentials are missing
 /// or both usage endpoints fail.
 pub fn load_usage_info() -> Option<UsageInfo> {
-    load_usage_info_with_threshold(DEFAULT_USAGE_THRESHOLD as u8)
+    load_usage_info_with_threshold(DEFAULT_USAGE_REMAINING_MIN as u8)
 }
 
 /// Like [`load_usage_info`], but `reset_at` is selected with `threshold` as the
-/// gate-relevant bar (same value compared to `percentage` in `check_and_wait`).
+/// remaining-min floor (same value compared to `percentage` in `check_and_wait`).
 pub fn load_usage_info_with_threshold(threshold: u8) -> Option<UsageInfo> {
     let path = super::oauth::credentials_path();
     let mut creds = super::oauth::read_credentials(&path)?;
@@ -738,26 +770,20 @@ pub fn load_usage_info_with_threshold(threshold: u8) -> Option<UsageInfo> {
 
 /// Whether an early-lift probe should treat the account as recovered.
 ///
-/// - Pre-gate: percentage below the configured threshold, OR reset is ready
-///   (`estimate` would be 0 — caller may pass `reset_ready`).
-/// - Post-limit: percentage dropped below 95 (window flipped) OR reset ready.
+/// Both pre-gate and post-limit: remaining **above** the rule floor
+/// (`percentage` is remaining 0–100). No magic 0.05 ratio and no used<95.
 pub fn usage_suggests_lifted(info: &UsageInfo, threshold: u8, post_limit: bool) -> bool {
-    if post_limit {
-        info.percentage < 95.0
-    } else {
-        info.percentage < f64::from(threshold)
-    }
+    let _ = post_limit; // same remaining > floor rule for both legs
+    info.percentage > f64::from(threshold)
 }
 
 /// Parse the legacy org usage JSON.
 fn parse_org_usage_json(json: &serde_json::Value) -> Option<UsageInfo> {
-    // Try to extract usage percentage from the response.
-    // The API response format may vary, so try multiple paths.
-    let percentage = json["usage_percentage"]
+    // Org endpoint historically reported **used** percent; invert to remaining.
+    let used = json["usage_percentage"]
         .as_f64()
         .or_else(|| json["percentage"].as_f64())
         .or_else(|| {
-            // Try computing from used/limit if available
             let used = json["used"].as_f64()?;
             let limit = json["limit"].as_f64()?;
             if limit > 0.0 {
@@ -767,13 +793,14 @@ fn parse_org_usage_json(json: &serde_json::Value) -> Option<UsageInfo> {
             }
         });
 
-    let percentage = match percentage {
+    let used = match used {
         Some(p) => p,
         None => {
             tracing::warn!("usage API response missing percentage data");
             return None;
         }
     };
+    let percentage = (100.0 - used).clamp(0.0, 100.0);
 
     let reset_at = json["reset_at"]
         .as_str()
@@ -783,7 +810,142 @@ fn parse_org_usage_json(json: &serde_json::Value) -> Option<UsageInfo> {
     Some(UsageInfo {
         percentage,
         reset_at,
+        remaining_banner: None,
     })
+}
+
+/// Format the operator remaining banner from OAuth HUD JSON (hermetic).
+///
+/// Shape: `session 76% left (3m) · week 45% left (5d 13h) · frontier 5% left (5d 13h) (floor 8%)`.
+/// Rung labels use capability-tier names (`frontier`), never model ids (`fable`).
+pub fn format_oauth_remaining_banner(
+    json: &serde_json::Value,
+    remaining_min: u8,
+    now: DateTime<Utc>,
+) -> String {
+    let buckets = ingest_oauth_value(json, builtin_resolved_models());
+    format_remaining_usage_banner(&buckets, remaining_min, now)
+}
+
+/// Format a remaining banner from already-ingested [`QuotaBucket`]s.
+pub fn format_remaining_usage_banner(
+    buckets: &[QuotaBucket],
+    remaining_min: u8,
+    now: DateTime<Utc>,
+) -> String {
+    let mut segments: Vec<String> = Vec::new();
+    let mut saw_session = false;
+    let mut saw_week = false;
+    let mut saw_rungs: Vec<CapabilityTier> = Vec::new();
+
+    for bucket in buckets {
+        let label = match banner_label_for_bucket(bucket) {
+            Some(l) => l,
+            None => continue,
+        };
+        match label.as_str() {
+            "session" if saw_session => continue,
+            "week" if saw_week => continue,
+            _ => {}
+        }
+        if bucket.rungs.as_ref().is_some_and(|r| !r.is_empty()) {
+            // Deduplicate by primary rung already encoded in `label`.
+            if let Ok(tier) = CapabilityTier::parse(&label) {
+                if saw_rungs.contains(&tier) {
+                    continue;
+                }
+                saw_rungs.push(tier);
+            }
+        }
+        let Some(meas) = primary_measurement(bucket) else {
+            continue;
+        };
+        let amount = format_measurement_left(meas);
+        let dur = bucket
+            .resets_at
+            .as_deref()
+            .and_then(|r| duration_until_reset(r, now))
+            .map(|s| format!(" ({s})"))
+            .unwrap_or_default();
+        segments.push(format!("{label} {amount}{dur}"));
+        if label == "session" {
+            saw_session = true;
+        } else if label == "week" {
+            saw_week = true;
+        }
+    }
+
+    if segments.is_empty() {
+        format!("(floor {remaining_min}%)")
+    } else {
+        format!("{} (floor {remaining_min}%)", segments.join(" · "))
+    }
+}
+
+fn banner_label_for_bucket(bucket: &QuotaBucket) -> Option<String> {
+    let is_account = bucket.rungs.as_ref().is_none_or(|r| r.is_empty());
+    if is_account {
+        return match bucket.kind.as_str() {
+            "session" => Some("session".into()),
+            "weekly_all" => Some("week".into()),
+            // Dollar/token-only spend buckets without a percent: show kind/id.
+            _ if bucket.measurements.iter().any(|m| {
+                matches!(
+                    m.unit,
+                    MeasurementUnit::Dollars | MeasurementUnit::Tokens | MeasurementUnit::Credits
+                )
+            }) =>
+            {
+                let name = if bucket.label.is_empty() {
+                    bucket.kind.as_str()
+                } else {
+                    bucket.label.as_str()
+                };
+                Some(name.to_string())
+            }
+            _ => None,
+        };
+    }
+    // Rung-scoped: only labeled HUD rows (skip unlabeled named seven_day_*).
+    if bucket.label.is_empty() {
+        return None;
+    }
+    hud_tier_from_label(&bucket.label).map(|t| t.as_str().to_string())
+}
+
+fn primary_measurement(bucket: &QuotaBucket) -> Option<&Measurement> {
+    bucket
+        .measurements
+        .iter()
+        .find(|m| m.unit == MeasurementUnit::Percent)
+        .or_else(|| bucket.measurements.first())
+}
+
+fn format_measurement_left(m: &Measurement) -> String {
+    match m.unit {
+        MeasurementUnit::Percent => format!("{}% left", format_compact_number(m.remaining)),
+        MeasurementUnit::Dollars => format!("${} left", format_compact_number(m.remaining)),
+        MeasurementUnit::Tokens => format!("{} tokens left", format_compact_number(m.remaining)),
+        MeasurementUnit::Credits => format!("{} credits left", format_compact_number(m.remaining)),
+    }
+}
+
+fn format_compact_number(v: f64) -> String {
+    if (v - v.round()).abs() < f64::EPSILON {
+        format!("{}", v.round() as i64)
+    } else {
+        format!("{v:.1}")
+    }
+}
+
+fn duration_until_reset(reset_at: &str, now: DateTime<Utc>) -> Option<String> {
+    let ts = parse_reset_timestamp(reset_at)?;
+    let secs = if ts > now.timestamp() {
+        (ts - now.timestamp()) as u64
+    } else {
+        0
+    };
+    Some(display::format_duration(secs))
 }
 
 /// Sanitize API error messages to prevent token leakage.
@@ -804,6 +966,7 @@ mod tests {
         let info = UsageInfo {
             percentage: 85.5,
             reset_at: Some("2024-01-15T12:00:00Z".to_string()),
+            remaining_banner: None,
         };
         assert!((info.percentage - 85.5).abs() < f64::EPSILON);
         assert_eq!(info.reset_at, Some("2024-01-15T12:00:00Z".to_string()));
@@ -842,7 +1005,8 @@ mod tests {
             ]
         });
         let info = parse_oauth_usage_json(&json).expect("oauth json must parse");
-        assert!((info.percentage - 100.0).abs() < f64::EPSILON);
+        // Account remaining = min(session 0, week 89) = 0.
+        assert!((info.percentage - 0.0).abs() < f64::EPSILON);
         assert_eq!(
             info.reset_at.as_deref(),
             Some("2026-08-06T01:19:59.584282+00:00"),
@@ -866,14 +1030,14 @@ mod tests {
         });
         let info = parse_oauth_usage_json(&json).expect("oauth json must parse");
         assert!(
-            (info.percentage - 11.0).abs() < f64::EPSILON,
-            "max window is weekly 11%, not five_hour 1.0 scaled to 100; got {}",
+            (info.percentage - 89.0).abs() < f64::EPSILON,
+            "min remaining is weekly 89 (used 11), not five_hour 1.0 scaled; got {}",
             info.percentage
         );
         assert_eq!(
             info.reset_at.as_deref(),
             Some("2026-09-01T23:00:00Z"),
-            "nothing exhausted → prefer five_hour.resets_at"
+            "nothing ≤ floor 8 → prefer five_hour.resets_at"
         );
     }
 
@@ -896,14 +1060,15 @@ mod tests {
             }
         });
         let info = parse_oauth_usage_json(&json).expect("oauth json must parse");
-        assert!((info.percentage - 33.0).abs() < f64::EPSILON);
+        // min remaining of session 67 / week 87 = 67; sonnet named window omitted.
+        assert!((info.percentage - 67.0).abs() < f64::EPSILON);
         assert_eq!(info.reset_at.as_deref(), Some("2026-04-11T07:00:00Z"));
     }
 
     #[test]
     fn test_parse_oauth_usage_sub_one_percent_stays_sub_one() {
-        // OAuth reports 0–100. A true 0.42% must stay below the 92% threshold,
-        // not be scaled to 42%.
+        // OAuth reports used 0–100. A true 0.42% used → 99.58% remaining; must
+        // not be scaled as a fraction.
         let json = serde_json::json!({
             "five_hour": {
                 "utilization": 0.42,
@@ -911,7 +1076,7 @@ mod tests {
             }
         });
         let info = parse_oauth_usage_json(&json).expect("sub-one percent must parse");
-        assert!((info.percentage - 0.42).abs() < f64::EPSILON);
+        assert!((info.percentage - 99.58).abs() < 1e-9);
         assert_eq!(info.reset_at.as_deref(), Some("2026-02-28T17:00:00Z"));
     }
 
@@ -926,7 +1091,7 @@ mod tests {
 
     #[test]
     fn test_parse_oauth_usage_weekly_exhausted_session_low() {
-        // Weekly at 100%, session fine → percentage 100, reset = weekly.
+        // Weekly at 100% used (0 remaining), session fine → remaining 0, reset = weekly.
         let json = serde_json::json!({
             "five_hour": {
                 "utilization": 20.0,
@@ -938,7 +1103,7 @@ mod tests {
             }
         });
         let info = parse_oauth_usage_json(&json).expect("must parse");
-        assert!((info.percentage - 100.0).abs() < f64::EPSILON);
+        assert!((info.percentage - 0.0).abs() < f64::EPSILON);
         assert_eq!(
             info.reset_at.as_deref(),
             Some("2026-08-12T19:00:00Z"),
@@ -959,19 +1124,22 @@ mod tests {
             }
         });
         let info = parse_oauth_usage_json(&json).expect("must parse");
-        assert!((info.percentage - 90.0).abs() < f64::EPSILON);
+        // remaining 10 for both; 10 > floor 8 → prefer session reset.
+        assert!((info.percentage - 10.0).abs() < f64::EPSILON);
         assert_eq!(
             info.reset_at.as_deref(),
             Some("2026-08-06T01:00:00Z"),
-            "when nothing exhausted, prefer five_hour.resets_at"
+            "when nothing ≤ floor, prefer five_hour.resets_at"
         );
     }
 
     #[test]
     fn test_parse_oauth_usage_live_fixture_ignores_scoped_and_named_rungs() {
-        // Production-shaped HUD: session 24%, weekly-all 55%, Fable weekly_scoped
-        // 95% critical + named opus/sonnet 100. Account fold must be max(24,55)=55
-        // with session reset — 55 < default threshold 92 ⇒ BelowThreshold.
+        // Production-shaped HUD: session used 24 (rem 76), weekly-all used 55
+        // (rem 45), Fable weekly_scoped used 95 + named opus/sonnet 100.
+        // Account fold = min(76,45)=45 with session reset — 45 > floor 8
+        // ⇒ BelowThreshold. Discriminator: keeping used≥92 after rename would
+        // treat 45 as used and never wait when remaining is 8.
         let json = serde_json::json!({
             "five_hour": {
                 "utilization": 24.0,
@@ -1018,18 +1186,18 @@ mod tests {
         });
         let info = parse_oauth_usage_json(&json).expect("live fixture must parse");
         assert!(
-            (info.percentage - 55.0).abs() < f64::EPSILON,
-            "account-binding max used is weekly-all 55, not Fable 95; got {}",
+            (info.percentage - 45.0).abs() < f64::EPSILON,
+            "account-binding min remaining is weekly-all 45, not Fable 5; got {}",
             info.percentage
         );
         assert_eq!(
             info.reset_at.as_deref(),
             Some("2026-09-07T06:00:00Z"),
-            "nothing ≥ 92 → prefer session reset, not weekly Fable"
+            "nothing ≤ floor 8 → prefer session reset, not weekly Fable"
         );
         assert!(
-            info.percentage < DEFAULT_USAGE_THRESHOLD,
-            "55 < 92 implies check_and_wait would return BelowThreshold"
+            info.percentage > DEFAULT_USAGE_REMAINING_MIN,
+            "45 > 8 implies check_and_wait would return BelowThreshold"
         );
     }
 
@@ -1063,17 +1231,17 @@ mod tests {
             ]
         });
         let info = parse_oauth_usage_json(&json).expect("must parse");
-        assert!((info.percentage - 100.0).abs() < f64::EPSILON);
+        assert!((info.percentage - 0.0).abs() < f64::EPSILON);
         assert_eq!(
             info.reset_at.as_deref(),
             Some("2026-09-12T19:00:00Z"),
-            "weekly_all 100 ≥ 92 → reset_at is weekly, not session"
+            "weekly_all remaining 0 ≤ 8 → reset_at is weekly, not session"
         );
     }
 
     #[test]
     fn test_parse_oauth_usage_latest_among_gate_relevant() {
-        // Several account-binding windows ≥ 92 → latest timestamp, not soonest.
+        // Several account-binding windows remaining ≤ 8 → latest timestamp, not soonest.
         let json = serde_json::json!({
             "five_hour": {
                 "utilization": 95.0,
@@ -1085,18 +1253,19 @@ mod tests {
             }
         });
         let info = parse_oauth_usage_json(&json).expect("must parse");
-        assert!((info.percentage - 95.0).abs() < f64::EPSILON);
+        // min remaining of 5 and 7 = 5
+        assert!((info.percentage - 5.0).abs() < f64::EPSILON);
         assert_eq!(
             info.reset_at.as_deref(),
             Some("2026-09-13T19:00:00Z"),
-            "latest among ≥92 must win over soonest session reset"
+            "latest among remaining≤8 must win over soonest session reset"
         );
     }
 
     #[test]
     fn test_parse_oauth_usage_band_95_50_uses_weekly_reset() {
         // Known-bad for exhausted=≥100: percentage would wait but reset_at would
-        // stay session. Gate-relevant (≥92) must pick weekly.
+        // stay session. Gate-relevant (remaining ≤ 8) must pick weekly.
         let json = serde_json::json!({
             "five_hour": {
                 "utilization": 50.0,
@@ -1124,18 +1293,18 @@ mod tests {
             ]
         });
         let info = parse_oauth_usage_json(&json).expect("must parse");
-        assert!((info.percentage - 95.0).abs() < f64::EPSILON);
+        assert!((info.percentage - 5.0).abs() < f64::EPSILON);
         assert_eq!(
             info.reset_at.as_deref(),
             Some("2026-09-12T19:00:00Z"),
-            "95 ≥ 92 weekly must win; exhausted=≥100 would wrongly keep session"
+            "weekly remaining 5 ≤ 8 must win; exhausted=≥100 would wrongly keep session"
         );
     }
 
     #[test]
-    fn test_parse_oauth_usage_live_threshold_80_weekly_85() {
-        // LOOP_USAGE_THRESHOLD=80: weekly 85 is gate-relevant for the wait, so
-        // reset_at must be weekly — not session (compile-time 92 would miss it).
+    fn test_parse_oauth_usage_live_remaining_min_20_weekly_15() {
+        // LOOP_USAGE_REMAINING_MIN=20 (old used-threshold 80): weekly used 85
+        // → remaining 15 ≤ 20 is gate-relevant, so reset_at must be weekly.
         let json = serde_json::json!({
             "five_hour": {
                 "utilization": 50.0,
@@ -1162,20 +1331,20 @@ mod tests {
                 }
             ]
         });
-        let info =
-            parse_oauth_usage_json_with_threshold(&json, 80.0).expect("must parse at threshold 80");
-        assert!((info.percentage - 85.0).abs() < f64::EPSILON);
+        let info = parse_oauth_usage_json_with_threshold(&json, 20.0)
+            .expect("must parse at remaining_min 20");
+        assert!((info.percentage - 15.0).abs() < f64::EPSILON);
         assert_eq!(
             info.reset_at.as_deref(),
             Some("2026-09-12T19:00:00Z"),
-            "85 ≥ live threshold 80 → reset_at is weekly"
+            "remaining 15 ≤ live floor 20 → reset_at is weekly"
         );
-        // Default-92 path still prefers session (85 < 92) — the bug this fixes.
+        // Default floor 8 still prefers session (15 > 8).
         let info_default = parse_oauth_usage_json(&json).expect("default parse");
         assert_eq!(
             info_default.reset_at.as_deref(),
             Some("2026-09-07T06:00:00Z"),
-            "default 92 must still prefer session when weekly is 85"
+            "default floor 8 must still prefer session when weekly remaining is 15"
         );
     }
 
@@ -1205,11 +1374,12 @@ mod tests {
             ]
         });
         let info = parse_oauth_usage_json(&json).expect("must parse");
-        assert!((info.percentage - 30.0).abs() < f64::EPSILON);
+        // min remaining of session 90 / week 70 = 70
+        assert!((info.percentage - 70.0).abs() < f64::EPSILON);
         assert_eq!(
             info.reset_at.as_deref(),
             Some("2026-09-07T06:00:00Z"),
-            "scoped critical must not set reset_at or raise percentage"
+            "scoped critical must not set reset_at or lower remaining"
         );
     }
 
@@ -1235,27 +1405,31 @@ mod tests {
         });
         let info = parse_oauth_usage_json(&json).expect("must parse");
         assert!(
-            (info.percentage - 40.0).abs() < f64::EPSILON,
-            "named opus/sonnet at 100 must not raise percentage; got {}",
+            (info.percentage - 60.0).abs() < f64::EPSILON,
+            "named opus/sonnet at 100 must not lower remaining; got {}",
             info.percentage
         );
         assert_eq!(info.reset_at.as_deref(), Some("2026-09-07T06:00:00Z"));
     }
 
     #[test]
-    fn test_usage_suggests_lifted_post_limit() {
-        let high = UsageInfo {
-            percentage: 100.0,
+    fn test_usage_suggests_lifted_uses_remaining_floor() {
+        // percentage is remaining. Floor 80: remaining 90 is lifted; 70 is not.
+        // Same rule for pre-gate and post-limit (no magic used<95).
+        let lifted = UsageInfo {
+            percentage: 90.0,
             reset_at: None,
+            remaining_banner: None,
         };
         let low = UsageInfo {
-            percentage: 40.0,
+            percentage: 70.0,
             reset_at: None,
+            remaining_banner: None,
         };
-        assert!(!usage_suggests_lifted(&high, 80, true));
-        assert!(usage_suggests_lifted(&low, 80, true));
-        assert!(!usage_suggests_lifted(&high, 80, false));
-        assert!(usage_suggests_lifted(&low, 80, false));
+        assert!(usage_suggests_lifted(&lifted, 80, true));
+        assert!(!usage_suggests_lifted(&low, 80, true));
+        assert!(usage_suggests_lifted(&lifted, 80, false));
+        assert!(!usage_suggests_lifted(&low, 80, false));
     }
 
     #[test]
@@ -1263,8 +1437,76 @@ mod tests {
         let info = UsageInfo {
             percentage: 50.0,
             reset_at: None,
+            remaining_banner: None,
         };
         assert!(info.reset_at.is_none());
+    }
+
+    #[test]
+    fn test_live_fixture_remaining_banner_shape() {
+        // Hermetic — no load_usage_info / live GET. Fixture resets are fixed
+        // RFC3339 so we pin `now` and assert content, not exact day strings.
+        let json = live_shaped_oauth_json();
+        let now = DateTime::parse_from_rfc3339("2026-09-07T05:57:00Z")
+            .expect("fixture now")
+            .with_timezone(&Utc);
+        let banner = format_oauth_remaining_banner(&json, 8, now);
+        assert!(
+            banner.contains("76% left"),
+            "session remaining missing: {banner}"
+        );
+        assert!(
+            banner.contains("45% left") || banner.contains("week "),
+            "week remaining missing: {banner}"
+        );
+        assert!(
+            banner.contains("5% left"),
+            "frontier remaining missing: {banner}"
+        );
+        assert!(
+            banner.contains("frontier"),
+            "rung label must be frontier not fable: {banner}"
+        );
+        assert!(
+            !banner.to_ascii_lowercase().contains("fable"),
+            "must not print model id fable: {banner}"
+        );
+        assert!(banner.contains("(floor 8%)"), "floor missing: {banner}");
+        assert!(
+            !banner.contains("95%") && !banner.contains("Usage:"),
+            "must not print used-percent / old banner: {banner}"
+        );
+        assert!(
+            !banner.contains("threshold:"),
+            "must not print old threshold shape: {banner}"
+        );
+        // Days band present for weekly/frontier resets (~5d out from pinned now).
+        assert!(
+            banner.contains('d'),
+            "format_duration days band expected for ≥24h resets: {banner}"
+        );
+    }
+
+    #[test]
+    fn test_remaining_banner_dollar_unit() {
+        let buckets = vec![QuotaBucket {
+            id: "extra".into(),
+            kind: "extra_usage".into(),
+            label: String::new(),
+            measurements: vec![Measurement {
+                remaining: 12.5,
+                unit: MeasurementUnit::Dollars,
+            }],
+            resets_at: None,
+            severity: None,
+            is_active: None,
+            rungs: None,
+        }];
+        let banner = format_remaining_usage_banner(&buckets, 8, Utc::now());
+        assert!(
+            banner.contains("$12.5 left"),
+            "dollar buckets must print in unit: {banner}"
+        );
     }
 
     // --- UsageCheckResult tests ---
@@ -1343,6 +1585,7 @@ mod tests {
         let info = UsageInfo {
             percentage: 0.0,
             reset_at: None,
+            remaining_banner: None,
         };
         assert!((info.percentage).abs() < f64::EPSILON);
     }
@@ -1352,6 +1595,7 @@ mod tests {
         let info = UsageInfo {
             percentage: 100.0,
             reset_at: Some("2025-01-01T00:00:00Z".to_string()),
+            remaining_banner: None,
         };
         assert!((info.percentage - 100.0).abs() < f64::EPSILON);
     }
@@ -1362,6 +1606,7 @@ mod tests {
         let info = UsageInfo {
             percentage: 105.3,
             reset_at: None,
+            remaining_banner: None,
         };
         assert!((info.percentage - 105.3).abs() < f64::EPSILON);
     }
@@ -1371,6 +1616,7 @@ mod tests {
         let info = UsageInfo {
             percentage: 91.999,
             reset_at: None,
+            remaining_banner: None,
         };
         assert!((info.percentage - 91.999).abs() < f64::EPSILON);
     }
@@ -1511,52 +1757,50 @@ mod tests {
     // --- Threshold comparison edge cases ---
 
     #[test]
-    fn test_usage_at_exactly_threshold() {
-        let threshold: u8 = 92;
-        let usage_pct: f64 = 92.0;
+    fn test_usage_at_exactly_floor_waits() {
+        // remaining == floor → wait (not BelowThreshold). Proceed only when remaining > floor.
+        let floor: u8 = 8;
+        let remaining: f64 = 8.0;
         assert!(
-            usage_pct >= f64::from(threshold),
-            "92.0 < 92.0 should be false (triggers wait)"
+            !(remaining > f64::from(floor)),
+            "remaining == floor must wait"
         );
     }
 
     #[test]
-    fn test_usage_just_below_threshold() {
-        let threshold: u8 = 92;
-        let usage_pct: f64 = 91.999;
+    fn test_usage_just_above_floor_proceeds() {
+        let floor: u8 = 8;
+        let remaining: f64 = 8.001;
         assert!(
-            usage_pct < f64::from(threshold),
-            "91.999 < 92.0 should be true (below threshold)"
+            remaining > f64::from(floor),
+            "remaining just above floor proceeds"
         );
     }
 
     #[test]
-    fn test_usage_just_above_threshold() {
-        let threshold: u8 = 92;
-        let usage_pct: f64 = 92.001;
+    fn test_usage_just_at_or_below_floor_waits() {
+        let floor: u8 = 8;
+        let remaining: f64 = 7.999;
         assert!(
-            usage_pct >= f64::from(threshold),
-            "92.001 < 92.0 should be false (above threshold)"
+            !(remaining > f64::from(floor)),
+            "remaining just below floor must wait"
         );
     }
 
     #[test]
-    fn test_threshold_zero_always_triggers() {
-        let threshold: u8 = 0;
-        let usage_pct: f64 = 0.001;
-        assert!(
-            usage_pct >= f64::from(threshold),
-            "Any positive usage should trigger when threshold is 0"
-        );
+    fn test_floor_zero_only_proceeds_when_positive() {
+        let floor: u8 = 0;
+        assert!(0.001 > f64::from(floor), "any positive remaining proceeds");
+        assert!(!(0.0 > f64::from(floor)), "remaining 0 at floor 0 waits");
     }
 
     #[test]
-    fn test_threshold_max_never_triggers() {
-        let threshold: u8 = 255;
-        let usage_pct: f64 = 100.0;
+    fn test_floor_max_never_proceeds_at_100() {
+        let floor: u8 = 255;
+        let remaining: f64 = 100.0;
         assert!(
-            usage_pct < f64::from(threshold),
-            "100% usage should be below u8::MAX threshold"
+            !(remaining > f64::from(floor)),
+            "100% remaining cannot exceed u8::MAX floor"
         );
     }
 

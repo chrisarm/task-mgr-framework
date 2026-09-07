@@ -97,7 +97,9 @@ pub(crate) const AUTO_MODE_DEPRECATION_HINT: &str = concat!(
 pub struct UsageParams {
     /// Whether Claude-account usage/OAuth pre-checking is enabled.
     pub enabled: bool,
-    /// Usage percentage threshold (0-100) to trigger wait.
+    /// Remaining-percent floor (0–100). Wait when account remaining ≤ this.
+    /// Default **8** (old used≥92 ≡ remaining≤8). Field name kept for call-site
+    /// stability; semantics are remaining-min, not used-percent.
     pub threshold: u8,
     /// Fallback wait time in seconds when no reset time is available.
     pub fallback_wait: u64,
@@ -108,7 +110,7 @@ impl UsageParams {
     pub fn disabled() -> Self {
         Self {
             enabled: false,
-            threshold: 92,
+            threshold: 8,
             fallback_wait: 300,
         }
     }
