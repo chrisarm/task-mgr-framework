@@ -364,3 +364,34 @@ Strike pin-required; pin optional after PRE-PR-3 extra-mark identity.
 - Outcome: NoEligibleTasks
 - Files: CLAUDE.md, src/loop_engine/CLAUDE.md
 ---
+---
+## 2026-09-07 - a593d39e-CODE-REVIEW-1
+
+Reviewed CONTRACT-002 / FEAT-008 / FEAT-009 / FIX-010 / FIX-011 / FIX-012 /
+DOCS-001 via rust-python-code-reviewer + loop-engine-parity-auditor + local AC
+greps/fixtures.
+
+**No issues found.**
+
+AC confirmations:
+- Extra-mark identity set (`extra_mark_rungs_matching` / `extra_mark_for_hud_tier`):
+  Fable+pin → frontier only; Opus+SNAPSHOT+pin → standard∧frontier; no
+  fable/claude-fable-5 in prod quota.rs/engine.rs; HUD tokens in usage.rs
+- Unlabeled `seven_day_*` → `rungs: None`; live-shaped evaluate unavailable
+  {frontier} only; snapshot other_rungs_runnable; exclude high/frontier not
+  medium/standard (± pin)
+- `Wait { secs, account_binding }`; `wait_probe_lifted` after apply; scoped-only
+  + week 45% does not lift; post-output `WaitFn = Fn(u64)`; QuotaPreflightParams
+  models exhaustive
+- `OperatorStopped`/`StopSpend` (no `Stop`); seq Empty; wave exit 0; spend scan
+  before prefer-rung-scoped
+- `has_review = is_frontier_class`; extra_usage Ignore-at-evaluate; remaining-min
+  >100 names LOOP_USAGE_REMAINING_MIN; banner via react_to_outputs closure
+- Pin docs optional not required; all-high clamp still PR-3; no
+  --use-other-models-ttl / walker / inherit / FR-008 CLI in help
+
+Nit only (not spawned): `RUNG_MODEL_TOKENS` CLI phrase match still in account.rs
+(CONTRACT-002 HUD-ingest scope is usage.rs; quota/engine clean). Cross-module
+env mutex for LOOP_USAGE_REMAINING_MIN tests (USAGE_REMAINING_ENV_MUTEX vs
+CLAUDE_BINARY_MUTEX) can race under filtered parallel runs — production
+preflight OK; not an AC fail.
