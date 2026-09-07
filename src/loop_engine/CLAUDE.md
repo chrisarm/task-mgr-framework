@@ -197,16 +197,17 @@ Two mechanisms keep a reaction from being copy-pasted back into one path:
 | # | Coordinator | Module | Sequential call site | Wave call site | Relocated leaf (`#[deprecated]` shim) |
 |---|---|---|---|---|---|
 | #2 | `pre_spawn::resolve_task_execution` | `pre_spawn` | `iteration.rs:387` | `wave_scheduler.rs:1058` (per slot) | `recovery::{check_override_invalidation, check_crash_escalation}` |
-| #3 | `account::account_usage_gate` | `account` | `iteration.rs:130` | `wave_scheduler.rs:249` (once/wave) | `usage::check_and_wait` |
+| #3 | `account::run_account_quota_gate` | `account` | `iteration.rs:130` | `wave_orchestration.rs:91` (once/wave) | (parity helper: `account_usage_gate`) |
 | #5 | `post_output::handle_overflow` | `post_output` | `iteration.rs:755` | `slot.rs:535` (per slot) | `overflow::handle_prompt_too_long` |
 | #6 | `account::react_to_outputs` | `account` | `iteration.rs:703` | `wave_scheduler.rs:1170` (once/wave) | `usage::{parse_reset_from_output, wait_for_usage_reset}` |
 | #10 | `post_completion::react_to_completions` | `post_completion` | `orchestrator.rs:1207` | `wave_scheduler.rs:1482` | `orchestrator::trigger_human_reviews` |
 | #13 | `account_iteration_budget` | `reactions` (mod) | `orchestrator.rs:1312` | `orchestrator.rs:1027` | (inline `iteration -= 1` / `saturating_sub`) |
 | — | `account::react_to_transient` (FEAT-014) | `account` | `orchestrator.rs:1282` | `wave_scheduler.rs:1236` | (new; no pre-existing leaf) |
 
-Account-global reactions (`account_usage_gate`, `react_to_outputs`,
+Account-global reactions (`run_account_quota_gate`, `react_to_outputs`,
 `react_to_transient`) fire **exactly once per wave**, never once per
 rate-limited slot — they reflect shared API-account state, not per-task state.
+(`account_usage_gate` remains as the hermetic parity-test helper.)
 Anthropic account I/O uses a dual-predicate contract: `claude_provider_enabled`
 is resolved only through
 `resolve_models_config(&project_config.models, &project_config.routing).is_provider_enabled(Provider::Claude)`;
