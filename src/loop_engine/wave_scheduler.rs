@@ -1073,12 +1073,13 @@ pub fn run_wave_iteration(
             blackout_fallback_secs: resolved_models.routing.spillover.blackout_fallback_secs,
             now_secs,
         };
-        match reactions::account::react_to_outputs(
+        let reaction = reactions::account::react_to_outputs(
             params.conn,
             &rate_limit_items,
             &account_params,
             &mut ctx.provider_blackouts,
-        ) {
+        );
+        match reaction {
             reactions::account::AccountReaction::None => {}
             // A completed wait OR a recorded quota blackout (FEAT-008
             // RerouteAndRetry / ProceedWithSpillover): the wave retries WITHOUT
@@ -1098,16 +1099,21 @@ pub fn run_wave_iteration(
                     rate_limited_retry: true,
                 };
             }
-            reactions::account::AccountReaction::Stop => {
+            // FR-010 Stop split: OperatorStopped vs StopSpend. Known-bad was
+            // every Stop → exit 130; both are now exit 0 via the shared mapping.
+            reactions::account::AccountReaction::OperatorStopped
+            | reactions::account::AccountReaction::StopSpend => {
+                let mapping = reactions::account::account_stop_wave_mapping(&reaction)
+                    .expect("OperatorStopped/StopSpend map");
                 return WaveOutcome {
                     tasks_completed: agg.tasks_completed,
                     iteration_consumed: true,
                     terminal: Some(WaveTerminal {
-                        exit_code: 130,
-                        reason: "stop signal during rate-limit wait".to_string(),
+                        exit_code: mapping.exit_code,
+                        reason: mapping.reason.to_string(),
                         run_status: None,
                     }),
-                    was_stopped: true,
+                    was_stopped: mapping.was_stopped,
                     failed_merges: Vec::new(),
                     rate_limited_retry: false,
                 };

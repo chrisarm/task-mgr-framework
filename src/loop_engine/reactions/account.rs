@@ -129,9 +129,17 @@ pub enum AccountReaction {
     /// wave/iteration WITHOUT consuming the iteration budget (FEAT-006 B2), and
     /// MUST NOT zero `ctx.consecutive_merge_fail_waves` (FEAT-006 B3).
     WaitedAndRetry,
-    /// The usage wait was interrupted by a `.stop` signal. The caller stops
-    /// (sequential: `should_stop` early return; wave: terminal exit 130).
-    Stop,
+    /// The usage wait was interrupted by a `.stop` signal. Sequential maps to
+    /// `Empty` + `operator_stopped: true` (pre-gate `StopSignaled` triple →
+    /// orchestrator exit 0 + `was_stopped`). Wave: `was_stopped: true`, exit 0,
+    /// reason `"stop signal during rate-limit wait"` (not 130).
+    OperatorStopped,
+    /// Credits/spend limit with no time-based API reset. Sequential maps to
+    /// `Empty` + `operator_stopped: false` + `should_stop` (HorizonStopped-
+    /// shaped → orchestrator quota soft-stop exit 0). Wave: `was_stopped: false`,
+    /// exit 0, reason `"usage/spend limit"` (not 130). Not an operator stop —
+    /// `--chain` may still abort on `!prd_complete` (PR-3 inherit).
+    StopSpend,
     /// FEAT-008 quota-aware failover: a Claude rate-limit hit while
     /// difficulty-spillover is enabled. A provider blackout was **freshly**
     /// recorded on `ctx.provider_blackouts` from the reset timestamp (or
@@ -150,6 +158,65 @@ pub enum AccountReaction {
     /// so the reaction does not misreport a re-entrant rate-limit as a brand-new
     /// blackout. NEVER touches `runner_overrides`.
     ProceedWithSpillover,
+}
+
+/// Sequential wrapper fields for [`AccountReaction::OperatorStopped`] /
+/// [`AccountReaction::StopSpend`] (PRE-PR-3 / FR-010). Both map to
+/// `IterationOutcome::Empty` + `should_stop: true`; only `operator_stopped`
+/// differs. Horizon/Deferred/StopSpend/rung-only empty are **not** operator stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccountStopSequentialMapping {
+    pub operator_stopped: bool,
+}
+
+/// Wave wrapper terminal for [`AccountReaction::OperatorStopped`] /
+/// [`AccountReaction::StopSpend`] (PRE-PR-3 / FR-010). Known-bad before this
+/// split: every `Stop` → exit 130. Both variants are exit 0; only
+/// `was_stopped` / reason differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccountStopWaveMapping {
+    pub exit_code: i32,
+    pub reason: &'static str,
+    pub was_stopped: bool,
+}
+
+/// Sequential mapping for the Stop split. `None` for non-stop reactions.
+pub fn account_stop_sequential_mapping(
+    reaction: &AccountReaction,
+) -> Option<AccountStopSequentialMapping> {
+    match reaction {
+        AccountReaction::OperatorStopped => Some(AccountStopSequentialMapping {
+            operator_stopped: true,
+        }),
+        AccountReaction::StopSpend => Some(AccountStopSequentialMapping {
+            operator_stopped: false,
+        }),
+        AccountReaction::None
+        | AccountReaction::WaitedAndRetry
+        | AccountReaction::RerouteAndRetry
+        | AccountReaction::ProceedWithSpillover => None,
+    }
+}
+
+/// Wave mapping for the Stop split. `None` for non-stop reactions.
+/// Known-bad lock: `StopSpend` must **not** return exit 130.
+pub fn account_stop_wave_mapping(reaction: &AccountReaction) -> Option<AccountStopWaveMapping> {
+    match reaction {
+        AccountReaction::OperatorStopped => Some(AccountStopWaveMapping {
+            exit_code: 0,
+            reason: "stop signal during rate-limit wait",
+            was_stopped: true,
+        }),
+        AccountReaction::StopSpend => Some(AccountStopWaveMapping {
+            exit_code: 0,
+            reason: "usage/spend limit",
+            was_stopped: false,
+        }),
+        AccountReaction::None
+        | AccountReaction::WaitedAndRetry
+        | AccountReaction::RerouteAndRetry
+        | AccountReaction::ProceedWithSpillover => None,
+    }
 }
 
 /// One per-slot (or the single sequential) output the reaction inspects.
@@ -557,9 +624,10 @@ pub fn react_to_outputs_with_io_seams(
 ///
 /// Order (same for spillover and legacy after the spend check):
 /// 1. reset `in_progress` → `todo`
-/// 2. pure spend-stop → message → [`AccountReaction::Stop`] (no blackout)
-/// 3. spillover → blackout with resolved secs → Reroute / Proceed
-/// 4. legacy → `wait(secs)` → WaitedAndRetry / Stop
+/// 2. spend scan **before** prefer-rung decide — any spend + `api_secs` None
+///    → [`AccountReaction::StopSpend`] (mixed Fable+spend must not Wait 3600)
+/// 3. prefer-rung-scoped decide → spillover Blackout / legacy Wait
+/// 4. wait interrupted by `.stop` → [`AccountReaction::OperatorStopped`]
 ///
 /// The contract is pinned by the parity tests in `tests/reaction_parity.rs`.
 pub fn react_to_outputs_inner(
@@ -578,6 +646,26 @@ pub fn react_to_outputs_inner(
         return AccountReaction::None;
     };
 
+    // Always reset in_progress first so work isn't stuck if we StopSpend.
+    reset_in_progress_tasks(conn, params.run_id, params.prefix, "rate limit");
+
+    // Spend scan BEFORE prefer-rung-scoped decide_item (FR-010). Mixed wave
+    // [Fable switch-models, spend/credits] must StopSpend — prefer-rung alone
+    // would mask it as Wait 3600. Wrapper rung-scoped skip forces api_secs=None
+    // when any Fable item is present, so the scan fires in production.
+    if api_reset_secs.is_none()
+        && items.iter().any(|item| {
+            *item.outcome == IterationOutcome::RateLimit && is_spend_limit_message(item.output)
+        })
+    {
+        eprintln!(
+            "Usage/spend limit with no time-based reset from the API or CLI output.\n\
+             Raise credits: Claude Code /usage-credits (or admin usage settings).\n\
+             Stopping the loop (tasks left as todo)."
+        );
+        return AccountReaction::StopSpend;
+    }
+
     // Prefer a rung-scoped RateLimit for decide when any match — aligns with the
     // `any()` skip in `react_to_outputs_with_io_seams`. Mixed wave
     // [account hit-your-limit, Fable switch-models] must Wait(blackout_fallback_secs)
@@ -589,9 +677,6 @@ pub fn react_to_outputs_inner(
                 && is_rung_scoped_rate_limit_message(item.output)
         })
         .unwrap_or(first_rate_limited);
-
-    // Always reset in_progress first so work isn't stuck if we StopSpend.
-    reset_in_progress_tasks(conn, params.run_id, params.prefix, "rate limit");
 
     let output_secs = parse_reset_from_output(decide_item.output);
     let action = decide_account_rate_limit(
@@ -610,7 +695,7 @@ pub fn react_to_outputs_inner(
                  Raise credits: Claude Code /usage-credits (or admin usage settings).\n\
                  Stopping the loop (tasks left as todo)."
             );
-            AccountReaction::Stop
+            AccountReaction::StopSpend
         }
         RateLimitAction::Blackout { secs } => {
             // FEAT-008: ephemeral blackout; never touches runner_overrides.
@@ -629,7 +714,7 @@ pub fn react_to_outputs_inner(
             if wait(secs) {
                 AccountReaction::WaitedAndRetry
             } else {
-                AccountReaction::Stop
+                AccountReaction::OperatorStopped
             }
         }
     }
@@ -2304,6 +2389,32 @@ mod tests {
     }
 
     // --- resolve / decide pure tests ---
+
+    #[test]
+    fn test_account_stop_wrapper_mappings_fr010() {
+        // Sequential: OperatorStopped = StopSignaled triple; StopSpend = HorizonStopped.
+        assert_eq!(
+            account_stop_sequential_mapping(&AccountReaction::OperatorStopped),
+            Some(AccountStopSequentialMapping {
+                operator_stopped: true
+            })
+        );
+        assert_eq!(
+            account_stop_sequential_mapping(&AccountReaction::StopSpend),
+            Some(AccountStopSequentialMapping {
+                operator_stopped: false
+            })
+        );
+        // Wave: both exit 0; known-bad was StopSpend → 130.
+        let spend = account_stop_wave_mapping(&AccountReaction::StopSpend).unwrap();
+        assert_eq!(spend.exit_code, 0);
+        assert!(!spend.was_stopped);
+        assert_eq!(spend.reason, "usage/spend limit");
+        let op = account_stop_wave_mapping(&AccountReaction::OperatorStopped).unwrap();
+        assert_eq!(op.exit_code, 0);
+        assert!(op.was_stopped);
+        assert_eq!(op.reason, "stop signal during rate-limit wait");
+    }
 
     #[test]
     fn test_resolve_wait_secs_api_wins_including_zero() {
