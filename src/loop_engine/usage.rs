@@ -32,9 +32,10 @@ const OAUTH_USAGE_USER_AGENT_FALLBACK: &str = "claude-code/unknown";
 const ORG_USAGE_API_URL: &str = "https://api.anthropic.com/v1/organizations/usage";
 
 /// Default used-percent threshold for selecting `reset_at` among account-binding
-/// windows. Matches `LoopConfig::usage_threshold` default (92). `load_usage_info`
-/// has no live threshold; `check_and_wait` still applies the configured value to
-/// `percentage`.
+/// windows. Matches `LoopConfig::usage_threshold` default (92). Callers that
+/// know the live config (`check_and_wait`, post-output load) pass
+/// `LoopConfig::usage_threshold` so wait duration tracks the same bar as the
+/// percentage compare.
 const DEFAULT_USAGE_THRESHOLD: f64 = 92.0;
 
 /// Connect + response budget for usage GETs. Without this, a SYN hang to
@@ -69,10 +70,12 @@ pub struct UsageInfo {
     /// ISO 8601 reset timestamp for waiting, if available.
     ///
     /// For the OAuth endpoint: **latest** `resets_at` among account-binding
-    /// windows whose used percent is ≥ [`DEFAULT_USAGE_THRESHOLD`] (92); if
-    /// none are gate-relevant, prefer the session window (`five_hour` or
-    /// `limits[]` kind `session`), else any account-binding reset. Not the
-    /// soonest exhausted / severity-critical timestamp across all windows.
+    /// windows whose used percent is ≥ the live gate threshold (default
+    /// [`DEFAULT_USAGE_THRESHOLD`] / 92, or `LoopConfig::usage_threshold` when
+    /// threaded through [`load_usage_info_with_threshold`]); if none are
+    /// gate-relevant, prefer the session window (`five_hour` or `limits[]`
+    /// kind `session`), else any account-binding reset. Not the soonest
+    /// exhausted / severity-critical timestamp across all windows.
     pub reset_at: Option<String>,
 }
 
@@ -101,14 +104,21 @@ pub enum UsageCheckResult {
 ///
 /// Returns `None` if both calls fail (logged via tracing).
 pub fn check_usage_api(access_token: &str) -> Option<UsageInfo> {
-    match fetch_oauth_usage(access_token) {
+    check_usage_api_with_threshold(access_token, DEFAULT_USAGE_THRESHOLD as u8)
+}
+
+/// Like [`check_usage_api`], but `reset_at` uses `threshold` as the
+/// gate-relevant bar (same value `check_and_wait` compares against
+/// `percentage`).
+pub fn check_usage_api_with_threshold(access_token: &str, threshold: u8) -> Option<UsageInfo> {
+    match fetch_oauth_usage(access_token, threshold) {
         Some(info) => Some(info),
         None => fetch_org_usage(access_token),
     }
 }
 
 /// Fetch Claude Code OAuth usage (five_hour / seven_day / limits[]).
-fn fetch_oauth_usage(access_token: &str) -> Option<UsageInfo> {
+fn fetch_oauth_usage(access_token: &str, threshold: u8) -> Option<UsageInfo> {
     let mut response = match usage_http_agent()
         .get(OAUTH_USAGE_API_URL)
         .header("Authorization", format!("Bearer {}", access_token))
@@ -135,7 +145,7 @@ fn fetch_oauth_usage(access_token: &str) -> Option<UsageInfo> {
         }
     };
 
-    parse_oauth_usage_json(&json)
+    parse_oauth_usage_json_with_threshold(&json, f64::from(threshold))
 }
 
 /// User-Agent for `GET /api/oauth/usage`.
@@ -228,8 +238,20 @@ struct UsageWindow {
     util: f64,
     reset: Option<String>,
     /// Named `five_hour` or `limits[]` kind `session` — preferred when no
-    /// account-binding window is ≥ [`DEFAULT_USAGE_THRESHOLD`].
+    /// account-binding window is ≥ the live gate threshold.
     is_session: bool,
+}
+
+/// Parse the Claude Code OAuth usage JSON into [`UsageInfo`] using the default
+/// gate threshold ([`DEFAULT_USAGE_THRESHOLD`] / 92).
+///
+/// Test convenience wrapper. Production always calls
+/// [`parse_oauth_usage_json_with_threshold`] with the live
+/// `LoopConfig::usage_threshold` so `reset_at` matches the percentage compare
+/// in `check_and_wait`.
+#[cfg(test)]
+pub(crate) fn parse_oauth_usage_json(json: &serde_json::Value) -> Option<UsageInfo> {
+    parse_oauth_usage_json_with_threshold(json, DEFAULT_USAGE_THRESHOLD)
 }
 
 /// Parse the Claude Code OAuth usage JSON into [`UsageInfo`].
@@ -241,13 +263,16 @@ struct UsageWindow {
 ///   `limits[]` kinds `weekly_scoped` / `extra_usage` / `promotional` are
 ///   skipped. `severity` / `is_active` are display hints and do not enter the
 ///   fold.
-/// - **reset_at** = latest among those windows with used ≥
-///   [`DEFAULT_USAGE_THRESHOLD`] (92); if none, prefer session; else any
-///   account-binding reset. Gate-relevant means used ≥ threshold — not
-///   util ≥ 100 or `severity=critical`.
+/// - **reset_at** = latest among those windows with used ≥ `gate_threshold`
+///   (live `LoopConfig::usage_threshold`, default 92); if none, prefer
+///   session; else any account-binding reset. Gate-relevant means used ≥
+///   threshold — not util ≥ 100 or `severity=critical`.
 ///
 /// Pure / unit-testable — no I/O.
-pub(crate) fn parse_oauth_usage_json(json: &serde_json::Value) -> Option<UsageInfo> {
+pub(crate) fn parse_oauth_usage_json_with_threshold(
+    json: &serde_json::Value,
+    gate_threshold: f64,
+) -> Option<UsageInfo> {
     let mut windows: Vec<UsageWindow> = Vec::new();
 
     // Account-binding named buckets only (not seven_day_opus / seven_day_sonnet).
@@ -305,7 +330,7 @@ pub(crate) fn parse_oauth_usage_json(json: &serde_json::Value) -> Option<UsageIn
     let reset_at = latest_reset(
         windows
             .iter()
-            .filter(|w| w.util >= DEFAULT_USAGE_THRESHOLD)
+            .filter(|w| w.util >= gate_threshold)
             .map(|w| &w.reset),
     )
     .or_else(|| {
@@ -372,10 +397,19 @@ fn latest_reset<'a>(resets: impl Iterator<Item = &'a Option<String>>) -> Option<
 
 /// Single chokepoint: credentials path → read → optional refresh → usage API.
 ///
+/// Uses the default gate threshold (92) for `reset_at` selection. Prefer
+/// [`load_usage_info_with_threshold`] when the live `usage_threshold` is known.
+///
 /// Used by the pre-iteration gate, post-rate-limit resolve, spillover blackout
 /// duration, and early-lift probes. Returns `None` when credentials are missing
 /// or both usage endpoints fail.
 pub fn load_usage_info() -> Option<UsageInfo> {
+    load_usage_info_with_threshold(DEFAULT_USAGE_THRESHOLD as u8)
+}
+
+/// Like [`load_usage_info`], but `reset_at` is selected with `threshold` as the
+/// gate-relevant bar (same value compared to `percentage` in `check_and_wait`).
+pub fn load_usage_info_with_threshold(threshold: u8) -> Option<UsageInfo> {
     let path = super::oauth::credentials_path();
     let mut creds = super::oauth::read_credentials(&path)?;
     if super::oauth::is_token_expiring(&creds, 5) {
@@ -393,7 +427,7 @@ pub fn load_usage_info() -> Option<UsageInfo> {
             }
         }
     }
-    check_usage_api(&creds.access_token)
+    check_usage_api_with_threshold(&creds.access_token, threshold)
 }
 
 /// Whether an early-lift probe should treat the account as recovered.
@@ -789,6 +823,53 @@ mod tests {
             info.reset_at.as_deref(),
             Some("2026-09-12T19:00:00Z"),
             "95 ≥ 92 weekly must win; exhausted=≥100 would wrongly keep session"
+        );
+    }
+
+    #[test]
+    fn test_parse_oauth_usage_live_threshold_80_weekly_85() {
+        // LOOP_USAGE_THRESHOLD=80: weekly 85 is gate-relevant for the wait, so
+        // reset_at must be weekly — not session (compile-time 92 would miss it).
+        let json = serde_json::json!({
+            "five_hour": {
+                "utilization": 50.0,
+                "resets_at": "2026-09-07T06:00:00Z"
+            },
+            "seven_day": {
+                "utilization": 85.0,
+                "resets_at": "2026-09-12T19:00:00Z"
+            },
+            "limits": [
+                {
+                    "kind": "session",
+                    "percent": 50,
+                    "severity": "normal",
+                    "resets_at": "2026-09-07T06:00:00Z",
+                    "is_active": true
+                },
+                {
+                    "kind": "weekly_all",
+                    "percent": 85,
+                    "severity": "normal",
+                    "resets_at": "2026-09-12T19:00:00Z",
+                    "is_active": false
+                }
+            ]
+        });
+        let info =
+            parse_oauth_usage_json_with_threshold(&json, 80.0).expect("must parse at threshold 80");
+        assert!((info.percentage - 85.0).abs() < f64::EPSILON);
+        assert_eq!(
+            info.reset_at.as_deref(),
+            Some("2026-09-12T19:00:00Z"),
+            "85 ≥ live threshold 80 → reset_at is weekly"
+        );
+        // Default-92 path still prefers session (85 < 92) — the bug this fixes.
+        let info_default = parse_oauth_usage_json(&json).expect("default parse");
+        assert_eq!(
+            info_default.reset_at.as_deref(),
+            Some("2026-09-07T06:00:00Z"),
+            "default 92 must still prefer session when weekly is 85"
         );
     }
 

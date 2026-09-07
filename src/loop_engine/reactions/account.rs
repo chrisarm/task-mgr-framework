@@ -20,7 +20,7 @@ use crate::loop_engine::engine::BlackoutState;
 use crate::loop_engine::model::Provider;
 use crate::loop_engine::recovery::probe_rate_limit_lifted;
 use crate::loop_engine::usage::{
-    UsageCheckResult, UsageInfo, load_usage_info, usage_suggests_lifted,
+    UsageCheckResult, UsageInfo, load_usage_info_with_threshold, usage_suggests_lifted,
 };
 use crate::loop_engine::{display, signals};
 
@@ -368,7 +368,8 @@ pub fn react_to_outputs(
     };
     let probe =
         |permission_mode: &PermissionMode| -> bool { probe_rate_limit_lifted(permission_mode) };
-    let load_usage = || load_usage_info();
+    let threshold = params.threshold;
+    let load_usage = || load_usage_info_with_threshold(threshold);
     react_to_outputs_with_io_seams(
         conn,
         items,
@@ -1151,7 +1152,9 @@ pub(crate) fn check_and_wait(
     tasks_dir: &Path,
     fallback_wait: u64,
 ) -> UsageCheckResult {
-    let usage = match load_usage_info() {
+    // Pass live threshold into parse so reset_at uses the same gate-relevant
+    // bar as the percentage compare below (not compile-time 92).
+    let usage = match load_usage_info_with_threshold(threshold) {
         Some(u) => u,
         None => {
             // Distinguish "no creds" from "API failed" is best-effort: load
@@ -1177,7 +1180,7 @@ pub(crate) fn check_and_wait(
         .unwrap_or(fallback_wait);
 
     let probe = || {
-        if let Some(info) = load_usage_info() {
+        if let Some(info) = load_usage_info_with_threshold(threshold) {
             if usage_suggests_lifted(&info, threshold, false) {
                 return true;
             }
