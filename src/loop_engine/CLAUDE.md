@@ -241,6 +241,16 @@ parallel/wave until PR-3:
 Sequential without the pin: that task waits 3600s (accepted; no auto-downgrade
 in PR-1).
 
+**PR-2 quota contract (CONTRACT-001):** remaining 0–100 is the gate unit;
+`evaluate_quota` is pure per-bucket (ignore / unavailable + account wait/stop
+inputs — never ask, never `other_rungs_runnable`); apply in `account.rs`
+resolves ask/wait/stop from remaining work + factory-default `tierFallback`
+(absent key → Some; explicit null → ask opt-out); scoped unavailable excludes
+rungs via proto-channel `HashSet<(Provider, CapabilityTier)>` replace-on-
+evaluate (do not account-wait; do not gate exclusion on non-empty
+`provider_blackouts`). Full copy-paste lives under `## CONTRACT-001` in the
+progress log.
+
 The per-task reactions (`resolve_task_execution`, `handle_overflow`) fold one
 call per slot. Each coordinator pairs a production entry point with a hermetic
 `_inner` core that takes the side-effecting step (wait / review) as an injected
