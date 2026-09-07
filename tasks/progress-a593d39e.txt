@@ -336,3 +336,31 @@ Hygiene: is_frontier_class has_review; extra_usage Ignore-at-evaluate; remaining
 - Outcome: NoEligibleTasks
 - Files: src/loop_engine/quota.rs, src/loop_engine/reactions/account.rs, src/loop_engine/project_config.rs, src/loop_engine/iteration.rs, src/loop_engine/wave_scheduler.rs, tests/reaction_parity.rs
 ---
+---
+
+## 2026-09-07 - a593d39e-DOCS-001
+
+Strike pin-required; pin optional after PRE-PR-3 extra-mark identity.
+
+- CLAUDE.md models section: Fable frontier pin optional (not required) for
+  mixed standard/medium; recipe set-tier claude frontier <standard-model>
+  documented as optional; all-high/review clamp still PR-3; Fable CLI 3600
+  residual named when a Fable-routed task still spawns.
+- src/loop_engine/CLAUDE.md account-global: struck pin-required; expanded
+  PRE-PR-3 block with identity union (Fable+pin→frontier only;
+  Opus+pin+snapshot→standard+frontier), wait-driving probe after apply,
+  AccountReaction OperatorStopped vs StopSpend (seq Empty; wave exit 0),
+  has_review=is_frontier_class, extra_usage Ignore at evaluate,
+  remaining-min >100 preflight. Grok-only recipe untouched.
+- verify-task-mgr: models-show (primaryProvider/anchor; no remaining %);
+  loop-help has no --use-other-models-ttl.
+  Evidence: .claude/skills/verify-task-mgr/artifacts/20260907T104301-1868658/
+
+
+## 2026-09-07 17:43:35 UTC - Iteration 7
+- Task: a593d39e-DOCS-001
+- Model: grok-4.5
+- Effort: medium
+- Outcome: NoEligibleTasks
+- Files: CLAUDE.md, src/loop_engine/CLAUDE.md
+---
