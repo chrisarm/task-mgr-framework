@@ -74,7 +74,7 @@ at preflight.
 task-mgr models list                     # offline — built-in model IDs + per-provider tier/effort tables + anchor
 task-mgr models list --remote            # live /v1/models (Anthropic; requires ANTHROPIC_API_KEY + TASK_MGR_USE_API=1)
 task-mgr models list --refresh           # bust cache before fetch
-task-mgr models show                     # resolved models/routing table, anchor window, blackout note, codex route-only note, empty states
+task-mgr models show                     # resolved models/routing + usagePolicy + tierFallback; remaining % only with list --remote opt-in
 task-mgr models init [--force-replace-legacy] [--dry-run]  # write default models+routing block (migration deletes old keys)
 task-mgr models set-anchor <tier>        # cheapest|cost-efficient|standard|frontier
 task-mgr models enable|disable <provider>   # claude|grok|codex (claude defaults enabled)
@@ -85,6 +85,9 @@ task-mgr models set-fallback <provider> [target-provider]   # tier-preserving ru
 task-mgr models unset-fallback <provider>
 task-mgr models route <prefix> [--provider <p>] [--tier <t>]   # byIdPrefix forcing
 task-mgr models unroute <prefix>
+task-mgr models set-usage-rule --kind <k>|--id <id> --on-low wait|unavailable|stop|ask|ignore
+task-mgr models set-tier-fallback <low|medium|high> [--include-review[=true|false]] [--include-forced]
+task-mgr models unset-tier-fallback      # writes JSON null (ask opt-out); does NOT delete the key
 ```
 
 `models show` prints the full merged routing table, the anchor-derived

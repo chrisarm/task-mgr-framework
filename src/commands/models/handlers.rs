@@ -23,6 +23,11 @@
 //!   the tier-preserving cross-provider `models.providers.<p>.fallback`.
 //! - `route <prefix> --provider <p> [--tier <t>]` / `unroute <prefix>` — manage
 //!   `routing.byIdPrefix`.
+//! - `set-usage-rule --kind/--id --on-low` — append/replace a
+//!   `usagePolicy.rules` entry.
+//! - `set-tier-fallback <low|medium|high> [--include-review] [--include-forced]`
+//!   / `unset-tier-fallback` — write `routing.tierFallback` (unset = JSON
+//!   `null`, never key deletion).
 //!
 //! Every mutating verb (1) hard-errors on a config still carrying legacy keys
 //! (the migration is `models init --force-replace-legacy`), (2) strictly
@@ -48,7 +53,10 @@ use crate::loop_engine::project_config::{
     fr_001_default_block, legacy_model_keys_message, merge_models_config,
     probe_enabled_provider_binaries, read_project_config, validate_models_config,
 };
+use crate::loop_engine::quota::{OnLowAction, UsagePolicy};
+use crate::loop_engine::usage::{load_usage_info, remaining_banner_for_run_models};
 use crate::output::ui;
+use chrono::Utc;
 
 /// Provider display order used everywhere the routing table is rendered.
 const DISPLAY_PROVIDERS: [Provider; 3] = [Provider::Claude, Provider::Grok, Provider::Codex];
@@ -520,6 +528,165 @@ pub fn handle_unroute(db_dir: &Path, prefix: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// Accepted `--on-low` values (CLI wire form; matches serde camelCase of
+/// [`OnLowAction`]).
+const ON_LOW_ACCEPTED: &str = "wait, unavailable, stop, ask, ignore";
+
+fn parse_on_low(raw: &str) -> Result<OnLowAction, io::Error> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "wait" => Ok(OnLowAction::Wait),
+        "unavailable" => Ok(OnLowAction::Unavailable),
+        "stop" => Ok(OnLowAction::Stop),
+        "ask" => Ok(OnLowAction::Ask),
+        "ignore" => Ok(OnLowAction::Ignore),
+        other => Err(config_err(format!(
+            "on-low {other:?} is not one of: {ON_LOW_ACCEPTED}"
+        ))),
+    }
+}
+
+fn on_low_wire(action: OnLowAction) -> &'static str {
+    match action {
+        OnLowAction::Wait => "wait",
+        OnLowAction::Unavailable => "unavailable",
+        OnLowAction::Stop => "stop",
+        OnLowAction::Ask => "ask",
+        OnLowAction::Ignore => "ignore",
+    }
+}
+
+/// `task-mgr models set-usage-rule --kind/--id --on-low` — append or replace a
+/// `usagePolicy.rules` entry. At least one of `--kind` / `--id` is required.
+pub fn handle_set_usage_rule(
+    db_dir: &Path,
+    kind: Option<&str>,
+    id: Option<&str>,
+    on_low: &str,
+) -> io::Result<()> {
+    reject_legacy_project_config(db_dir)?;
+    let kind = kind.map(str::trim).filter(|s| !s.is_empty());
+    let id = id.map(str::trim).filter(|s| !s.is_empty());
+    if kind.is_none() && id.is_none() {
+        return Err(config_err(
+            "set-usage-rule requires --kind and/or --id (at least one must be set)",
+        ));
+    }
+    let action = parse_on_low(on_low)?;
+
+    let mut rule = serde_json::Map::new();
+    if let Some(k) = kind {
+        rule.insert(
+            "kind".to_string(),
+            serde_json::Value::String(k.to_string()),
+        );
+    }
+    if let Some(i) = id {
+        rule.insert("id".to_string(), serde_json::Value::String(i.to_string()));
+    }
+    rule.insert(
+        "onLow".to_string(),
+        serde_json::Value::String(on_low_wire(action).to_string()),
+    );
+    let rule_val = serde_json::Value::Object(rule);
+
+    let mut value = read_config_value(db_dir)?;
+    // Ensure usagePolicy.rules is an array, then append-or-replace by kind+id identity.
+    let usage = value
+        .as_object_mut()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "config.json is not a JSON object",
+            )
+        })?
+        .entry("usagePolicy".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if !usage.is_object() {
+        *usage = serde_json::json!({});
+    }
+    let rules = usage
+        .as_object_mut()
+        .expect("usagePolicy object")
+        .entry("rules".to_string())
+        .or_insert_with(|| serde_json::json!([]));
+    if !rules.is_array() {
+        *rules = serde_json::json!([]);
+    }
+    let arr = rules.as_array_mut().expect("rules array");
+    let replace_at = arr.iter().position(|existing| {
+        let ek = existing.get("kind").and_then(|v| v.as_str());
+        let ei = existing.get("id").and_then(|v| v.as_str());
+        ek == kind && ei == id
+    });
+    match replace_at {
+        Some(i) => arr[i] = rule_val,
+        None => arr.push(rule_val),
+    }
+
+    validate_and_write(db_dir, &value)?;
+    let mut parts = Vec::new();
+    if let Some(k) = kind {
+        parts.push(format!("kind={k}"));
+    }
+    if let Some(i) = id {
+        parts.push(format!("id={i}"));
+    }
+    ui::emit_data(&format!(
+        "Set usagePolicy.rules[{}] onLow={}",
+        parts.join(", "),
+        on_low_wire(action)
+    ));
+    Ok(())
+}
+
+/// `task-mgr models set-tier-fallback <low|medium|high> [--include-review]
+/// [--include-forced]`. Omitted flags keep struct defaults
+/// (`includeReview: true`, `includeForced: false`).
+pub fn handle_set_tier_fallback(
+    db_dir: &Path,
+    difficulty: &str,
+    include_review: bool,
+    include_forced: bool,
+) -> io::Result<()> {
+    reject_legacy_project_config(db_dir)?;
+    if difficulty_rank(Some(difficulty)).is_none() {
+        return Err(config_err(format!(
+            "difficulty {difficulty:?} is not one of: low, medium, high"
+        )));
+    }
+    let key = difficulty.trim().to_ascii_lowercase();
+    let leaf = serde_json::json!({
+        "maxDifficulty": key,
+        "includeReview": include_review,
+        "includeForced": include_forced,
+    });
+    let mut value = read_config_value(db_dir)?;
+    set_json_path(&mut value, &["routing", "tierFallback"], Some(leaf))?;
+    validate_and_write(db_dir, &value)?;
+    ui::emit_data(&format!(
+        "Set routing.tierFallback maxDifficulty={key} includeReview={include_review} \
+         includeForced={include_forced}"
+    ));
+    Ok(())
+}
+
+/// `task-mgr models unset-tier-fallback` — write JSON `null` (ask opt-out).
+///
+/// Must NOT delete the key: an absent `tierFallback` deserializes to factory
+/// `Some`, which is the opposite of the ask opt-out.
+pub fn handle_unset_tier_fallback(db_dir: &Path) -> io::Result<()> {
+    reject_legacy_project_config(db_dir)?;
+    let mut value = read_config_value(db_dir)?;
+    set_json_path(
+        &mut value,
+        &["routing", "tierFallback"],
+        Some(serde_json::Value::Null),
+    )?;
+    validate_and_write(db_dir, &value)?;
+    ui::emit_data("Set routing.tierFallback to null (ask opt-out)");
+    Ok(())
+}
+
 // ============================================================================
 // list
 // ============================================================================
@@ -605,6 +772,10 @@ pub fn handle_show_to<W: io::Write>(
 ) -> io::Result<()> {
     let cfg = read_project_config(db_dir);
     let resolved = resolve_models_config(&cfg.models, &cfg.routing);
+    // Raw Value needed to distinguish omitted tierFallback (factory) from
+    // explicit JSON null (ask opt-out) — typed RoutingConfig collapses both
+    // into Option and applies the serde default for absent keys.
+    let raw = read_config_value(db_dir).unwrap_or_else(|_| serde_json::json!({ "version": 1 }));
 
     // Legacy detect-and-instruct banner (read verbs NEVER hard-fail on legacy).
     if let Some(legacy) = detect_legacy_keys_in_file(db_dir) {
@@ -628,7 +799,23 @@ pub fn handle_show_to<W: io::Write>(
     render_provider_ladders(writer, &cfg.models)?;
 
     writeln!(writer)?;
-    render_routing(writer, &cfg.routing)?;
+    render_routing(writer, &cfg.routing, raw.get("routing"))?;
+
+    writeln!(writer)?;
+    render_usage_policy(writer, &cfg.usage_policy)?;
+
+    // Remaining numbers ONLY behind the same live-fetch gate as `models list
+    // --remote` (`TASK_MGR_USE_API=1` via check_opt_in). Offline show must not
+    // print `% left`. Silent fallback when not opted in (not a hard error).
+    if check_opt_in().is_ok()
+        && let Some(info) = load_usage_info()
+    {
+        let floor = cfg.usage_policy.remaining_min_percent;
+        if let Some(banner) = remaining_banner_for_run_models(&info, &resolved, floor, Utc::now()) {
+            writeln!(writer)?;
+            writeln!(writer, "remaining (live): {banner}")?;
+        }
+    }
 
     writeln!(writer)?;
     render_anchor_mapping(writer, &resolved)?;
@@ -722,7 +909,14 @@ fn render_one_provider<W: io::Write>(
 }
 
 /// Render the `routing` block with explicit empty states.
-fn render_routing<W: io::Write>(writer: &mut W, routing: &RoutingConfig) -> io::Result<()> {
+///
+/// `raw_routing` is the raw JSON `routing` object (if any) so `tierFallback`
+/// can distinguish omitted (factory) from explicit `null` (ask opt-out).
+fn render_routing<W: io::Write>(
+    writer: &mut W,
+    routing: &RoutingConfig,
+    raw_routing: Option<&serde_json::Value>,
+) -> io::Result<()> {
     writeln!(writer, "routing:")?;
 
     writeln!(writer, "  byIdPrefix:")?;
@@ -768,6 +962,90 @@ fn render_routing<W: io::Write>(writer: &mut W, routing: &RoutingConfig) -> io::
     match &routing.spillover.max_difficulty {
         Some(d) => writeln!(writer, "  spillover: maxDifficulty={d}")?,
         None => writeln!(writer, "  spillover: disabled")?,
+    }
+
+    render_tier_fallback(writer, raw_routing)?;
+    Ok(())
+}
+
+/// Print `routing.tierFallback` from the raw JSON so null ≠ omitted.
+fn render_tier_fallback<W: io::Write>(
+    writer: &mut W,
+    raw_routing: Option<&serde_json::Value>,
+) -> io::Result<()> {
+    let Some(routing_obj) = raw_routing.and_then(|v| v.as_object()) else {
+        // No routing key at all → same as omitted tierFallback → factory.
+        writeln!(
+            writer,
+            "  tierFallback: (factory default: maxDifficulty=high includeReview=true \
+             includeForced=false)"
+        )?;
+        return Ok(());
+    };
+    match routing_obj.get("tierFallback") {
+        None => writeln!(
+            writer,
+            "  tierFallback: (factory default: maxDifficulty=high includeReview=true \
+             includeForced=false)"
+        )?,
+        Some(v) if v.is_null() => writeln!(writer, "  tierFallback: (unset)")?,
+        Some(v) => {
+            let max = v
+                .get("maxDifficulty")
+                .and_then(|x| x.as_str())
+                .unwrap_or("high");
+            let include_review = v
+                .get("includeReview")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(true);
+            let include_forced = v
+                .get("includeForced")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false);
+            writeln!(
+                writer,
+                "  tierFallback: maxDifficulty={max} includeReview={include_review} \
+                 includeForced={include_forced}"
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Print `usagePolicy` knobs + rules (always; remaining numbers are separate).
+fn render_usage_policy<W: io::Write>(writer: &mut W, policy: &UsagePolicy) -> io::Result<()> {
+    writeln!(writer, "usagePolicy:")?;
+    writeln!(
+        writer,
+        "  remainingMinPercent: {}",
+        policy.remaining_min_percent
+    )?;
+    writeln!(
+        writer,
+        "  waitIfResetWithinMinutes: {}",
+        policy.wait_if_reset_within_minutes
+    )?;
+    writeln!(
+        writer,
+        "  stopIfResetBeyondHours: {}",
+        policy.stop_if_reset_beyond_hours
+    )?;
+    writeln!(writer, "  askTtlMinutes: {}", policy.ask_ttl_minutes)?;
+    writeln!(writer, "  rules:")?;
+    if policy.rules.is_empty() {
+        writeln!(writer, "    (none)")?;
+    } else {
+        for (i, rule) in policy.rules.iter().enumerate() {
+            let mut parts = Vec::new();
+            if let Some(k) = rule.kind.as_deref() {
+                parts.push(format!("kind={k}"));
+            }
+            if let Some(id) = rule.id.as_deref() {
+                parts.push(format!("id={id}"));
+            }
+            parts.push(format!("onLow={}", on_low_wire(rule.on_low)));
+            writeln!(writer, "    [{i}] {}", parts.join(" "))?;
+        }
     }
     Ok(())
 }
@@ -1408,5 +1686,146 @@ mod tests {
         assert!(out.contains(HAIKU_MODEL), "{out}");
         assert!(out.contains(FABLE_MODEL), "{out}");
         assert!(out.contains("Grok"), "{out}");
+    }
+
+    // ---- set-usage-rule / set-tier-fallback / show policy (FEAT-008) -------
+
+    #[test]
+    fn set_usage_rule_writes_camelcase_on_low_and_preserves_sparse_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{"version":1,"additionalAllowedTools":["Bash(docker:*)"],"embeddingModel":"nomic"}"#,
+        )
+        .unwrap();
+        handle_set_usage_rule(dir.path(), Some("weekly_scoped"), None, "unavailable").unwrap();
+        let raw = read_raw(dir.path());
+        assert!(
+            raw.contains("\"onLow\""),
+            "must write camelCase onLow:\n{raw}"
+        );
+        assert!(
+            raw.contains("\"unavailable\""),
+            "onLow value missing:\n{raw}"
+        );
+        assert!(
+            raw.contains("additionalAllowedTools"),
+            "sparse preserve tools:\n{raw}"
+        );
+        assert!(
+            raw.contains("embeddingModel"),
+            "sparse preserve embedding:\n{raw}"
+        );
+        let v = read_value(dir.path());
+        assert_eq!(v["usagePolicy"]["rules"][0]["kind"], "weekly_scoped");
+        assert_eq!(v["usagePolicy"]["rules"][0]["onLow"], "unavailable");
+    }
+
+    #[test]
+    fn set_usage_rule_replaces_same_identity_and_rejects_bad_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        handle_set_usage_rule(dir.path(), Some("weekly_scoped"), None, "wait").unwrap();
+        handle_set_usage_rule(dir.path(), Some("weekly_scoped"), None, "ask").unwrap();
+        let v = read_value(dir.path());
+        let rules = v["usagePolicy"]["rules"].as_array().unwrap();
+        assert_eq!(rules.len(), 1, "same kind+id must replace, not append");
+        assert_eq!(rules[0]["onLow"], "ask");
+
+        let err = handle_set_usage_rule(dir.path(), None, None, "wait").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("CONFIG ERROR"), "{msg}");
+        assert!(msg.contains("--kind") || msg.contains("--id"), "{msg}");
+
+        let err = handle_set_usage_rule(dir.path(), Some("weekly_scoped"), None, "nope").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("CONFIG ERROR"), "{msg}");
+        assert!(msg.contains("wait"), "must name accepted set: {msg}");
+        assert!(msg.contains("unavailable"), "{msg}");
+    }
+
+    #[test]
+    fn set_tier_fallback_high_with_flags_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{"version":1,"embeddingModel":"x"}"#,
+        )
+        .unwrap();
+        handle_set_tier_fallback(dir.path(), "high", true, true).unwrap();
+        let raw = read_raw(dir.path());
+        assert!(raw.contains("embeddingModel"), "sparse preserve:\n{raw}");
+        let v = read_value(dir.path());
+        assert_eq!(v["routing"]["tierFallback"]["maxDifficulty"], "high");
+        assert_eq!(v["routing"]["tierFallback"]["includeReview"], true);
+        assert_eq!(v["routing"]["tierFallback"]["includeForced"], true);
+        assert_validates_clean(dir.path());
+    }
+
+    #[test]
+    fn unset_tier_fallback_writes_json_null_not_key_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        handle_set_tier_fallback(dir.path(), "medium", true, false).unwrap();
+        handle_unset_tier_fallback(dir.path()).unwrap();
+        let raw = read_raw(dir.path());
+        assert!(
+            raw.contains("\"tierFallback\": null") || raw.contains("\"tierFallback\":null"),
+            "must write JSON null, not delete key:\n{raw}"
+        );
+        let v = read_value(dir.path());
+        assert!(
+            v["routing"]["tierFallback"].is_null(),
+            "tierFallback must be null:\n{v}"
+        );
+        // Key present (null), not absent.
+        assert!(
+            v["routing"]
+                .as_object()
+                .unwrap()
+                .contains_key("tierFallback"),
+            "key must remain present as null"
+        );
+    }
+
+    #[test]
+    fn set_tier_fallback_typo_is_config_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = handle_set_tier_fallback(dir.path(), "hiigh", true, false).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("CONFIG ERROR"), "{msg}");
+        assert!(msg.contains("low") && msg.contains("medium") && msg.contains("high"), "{msg}");
+    }
+
+    #[test]
+    fn show_to_without_opt_in_prints_policy_without_percent_left() {
+        // Ensure TASK_MGR_USE_API is off for this process (integration sandbox
+        // also clears it; unit tests may inherit a developer export).
+        use crate::loop_engine::test_utils::EnvGuard;
+        let _guard = EnvGuard::remove("TASK_MGR_USE_API");
+        let dir = tempfile::tempdir().unwrap();
+        handle_init(dir.path(), false, false).unwrap();
+        handle_set_usage_rule(dir.path(), Some("weekly_scoped"), None, "unavailable").unwrap();
+        handle_set_tier_fallback(dir.path(), "high", true, false).unwrap();
+        let out = show_output(dir.path());
+        assert!(out.contains("usagePolicy:"), "policy block missing:\n{out}");
+        assert!(out.contains("remainingMinPercent:"), "{out}");
+        assert!(out.contains("waitIfResetWithinMinutes:"), "{out}");
+        assert!(out.contains("stopIfResetBeyondHours:"), "{out}");
+        assert!(out.contains("askTtlMinutes:"), "{out}");
+        assert!(out.contains("kind=weekly_scoped"), "{out}");
+        assert!(out.contains("onLow=unavailable"), "{out}");
+        assert!(out.contains("tierFallback:"), "{out}");
+        assert!(out.contains("maxDifficulty=high"), "{out}");
+        assert!(
+            !out.contains("% left"),
+            "offline show must not print remaining percents:\n{out}"
+        );
+
+        handle_unset_tier_fallback(dir.path()).unwrap();
+        let out2 = show_output(dir.path());
+        assert!(
+            out2.contains("tierFallback: (unset)"),
+            "null must render as (unset):\n{out2}"
+        );
+        assert!(!out2.contains("% left"), "{out2}");
     }
 }

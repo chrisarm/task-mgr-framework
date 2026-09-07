@@ -1490,7 +1490,8 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
             use task_mgr::commands::models::{
                 ListOpts, handle_init, handle_list, handle_route, handle_set_anchor,
                 handle_set_effort, handle_set_enabled, handle_set_fallback, handle_set_tier,
-                handle_show, handle_unroute, handle_unset_fallback, handle_unset_tier,
+                handle_set_tier_fallback, handle_set_usage_rule, handle_show, handle_unroute,
+                handle_unset_fallback, handle_unset_tier, handle_unset_tier_fallback,
             };
             match action {
                 ModelsAction::Init {
@@ -1546,6 +1547,24 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                 }
                 ModelsAction::Unroute { prefix } => {
                     handle_unroute(&cli.dir, &prefix)?;
+                }
+                ModelsAction::SetUsageRule { kind, id, on_low } => {
+                    handle_set_usage_rule(&cli.dir, kind.as_deref(), id.as_deref(), &on_low)?;
+                }
+                ModelsAction::SetTierFallback {
+                    difficulty,
+                    include_review,
+                    include_forced,
+                } => {
+                    handle_set_tier_fallback(
+                        &cli.dir,
+                        &difficulty,
+                        include_review,
+                        include_forced,
+                    )?;
+                }
+                ModelsAction::UnsetTierFallback => {
+                    handle_unset_tier_fallback(&cli.dir)?;
                 }
             }
             Ok(())
