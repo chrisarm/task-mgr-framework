@@ -540,6 +540,8 @@ fn slot_build_prompt_missing_base_prompt_path_degrades_gracefully() {
         models_config: task_mgr::loop_engine::project_config::default_models_config(),
         routing_config: task_mgr::loop_engine::project_config::default_routing_config(),
         provider_blackouts: Default::default(),
+        unavailable_rungs: Default::default(),
+        tier_fallback: None,
     };
 
     let bundle: SlotPromptBundle =
@@ -582,6 +584,8 @@ fn slot_build_prompt_with_real_base_prompt_file_includes_content() {
         models_config: task_mgr::loop_engine::project_config::default_models_config(),
         routing_config: task_mgr::loop_engine::project_config::default_routing_config(),
         provider_blackouts: Default::default(),
+        unavailable_rungs: Default::default(),
+        tier_fallback: None,
     };
 
     let bundle = task_mgr::loop_engine::prompt::slot::build_prompt(&conn, &task, &params);
@@ -612,6 +616,8 @@ fn slot_build_prompt_large_base_prompt_is_truncated() {
         models_config: task_mgr::loop_engine::project_config::default_models_config(),
         routing_config: task_mgr::loop_engine::project_config::default_routing_config(),
         provider_blackouts: Default::default(),
+        unavailable_rungs: Default::default(),
+        tier_fallback: None,
     };
 
     let bundle = task_mgr::loop_engine::prompt::slot::build_prompt(&conn, &task, &params);

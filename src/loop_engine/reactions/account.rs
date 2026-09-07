@@ -3982,7 +3982,7 @@ mod tests {
             max_difficulty: Some("high"),
             ..RemainingWorkSnapshot::default()
         };
-        let eval = evaluate_quota(&[frontier.clone()], &policy, 8);
+        let eval = evaluate_quota(std::slice::from_ref(&frontier), &policy, 8);
         let applied = apply_quota_with_ask_ttl(
             &eval,
             &[frontier],
@@ -4012,7 +4012,7 @@ mod tests {
             max_difficulty: Some("high"),
             ..RemainingWorkSnapshot::default()
         };
-        let eval = evaluate_quota(&[frontier.clone()], &policy, 8);
+        let eval = evaluate_quota(std::slice::from_ref(&frontier), &policy, 8);
         let applied =
             apply_quota_with_ask_ttl(&eval, &[frontier], &policy, Some(&factory_fb()), &work, 15);
         assert_eq!(applied.account, QuotaAccountAction::Proceed);

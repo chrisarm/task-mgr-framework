@@ -3698,7 +3698,15 @@ fn known_bad_collapsed_flag_drops_the_probe_on_env_off_claude_on() {
     let spy = IoSeamSpy::new();
     let wait = collapsed_single_flag_wait(&p, &spy);
     let mut blackout = BlackoutState::default();
-    let reaction = react_to_outputs_inner(&mut conn, &items, &p, &mut blackout, &mut UnavailableRungsMap::new(), None, &wait);
+    let reaction = react_to_outputs_inner(
+        &mut conn,
+        &items,
+        &p,
+        &mut blackout,
+        &mut UnavailableRungsMap::new(),
+        None,
+        &wait,
+    );
 
     // Same coarse reaction as the correct implementation — which is exactly why
     // asserting only on `AccountReaction` would let the collapse through.
@@ -3894,8 +3902,15 @@ fn mixed_wave_fable_plus_spend_returns_stop_spend_not_wait_3600() {
     let spy = WaitSpy::completing();
     let wait = spy.closure();
     // api_secs None mirrors production wrapper skip when any item is rung-scoped.
-    let reaction =
-        react_to_outputs_inner(&mut conn, &items, &p, &mut blackout, &mut UnavailableRungsMap::new(), None, &wait as WaitFn);
+    let reaction = react_to_outputs_inner(
+        &mut conn,
+        &items,
+        &p,
+        &mut blackout,
+        &mut UnavailableRungsMap::new(),
+        None,
+        &wait as WaitFn,
+    );
 
     assert_eq!(
         reaction,

@@ -139,6 +139,8 @@ fn resolve_via_builder(
         models_config: models,
         routing_config: routing,
         provider_blackouts: blackouts,
+        unavailable_rungs: Default::default(),
+        tier_fallback: None,
     };
     let bundle: SlotPromptBundle = build_prompt(conn, task, &params);
     assert_eq!(bundle.task_id, task.id, "bundle must mirror the task id");
