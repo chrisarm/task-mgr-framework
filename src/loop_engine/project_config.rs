@@ -1071,6 +1071,31 @@ pub fn preflight_validate_and_probe(db_dir: &Path, cfg: &ProjectConfig) -> TaskM
         });
     }
 
+    // 0b. Remaining-percent floor must be 0–100 (env or config). Same loop/batch
+    // chokepoint as LOOP_USAGE_THRESHOLD — non-loop commands stay silent.
+    if let Ok(raw) = std::env::var("LOOP_USAGE_REMAINING_MIN")
+        && let Ok(v) = raw.parse::<u16>()
+        && v > 100
+    {
+        return Err(TaskMgrError::InvalidConfig {
+            field: "LOOP_USAGE_REMAINING_MIN".to_string(),
+            message: format!(
+                "LOOP_USAGE_REMAINING_MIN must be 0–100 (got {v}); \
+                 remaining-percent floor cannot exceed 100"
+            ),
+        });
+    }
+    if cfg.usage_policy.remaining_min_percent > 100 {
+        return Err(TaskMgrError::InvalidConfig {
+            field: "LOOP_USAGE_REMAINING_MIN".to_string(),
+            message: format!(
+                "LOOP_USAGE_REMAINING_MIN / usagePolicy.remainingMinPercent must be 0–100 \
+                 (got {}); remaining-percent floor cannot exceed 100",
+                cfg.usage_policy.remaining_min_percent
+            ),
+        });
+    }
+
     // 1. Hard break: legacy keys are fatal at the loop/batch entry.
     reject_legacy_model_config(db_dir)?;
 
@@ -1733,6 +1758,59 @@ mod tests {
         assert!(
             msg.contains("LOOP_USAGE_THRESHOLD"),
             "error must name the legacy env: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_preflight_rejects_loop_usage_remaining_min_above_100() {
+        // Known-bad: u8 200 (>100) must hard-error at loop/batch preflight only.
+        let _guard = CLAUDE_BINARY_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _legacy = EnvGuard::remove("LOOP_USAGE_THRESHOLD");
+        let _remaining = EnvGuard::set("LOOP_USAGE_REMAINING_MIN", "200");
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.json"), "{}").unwrap();
+        let cfg = read_project_config(dir.path());
+        let err = preflight_validate_and_probe(dir.path(), &cfg)
+            .expect_err("LOOP_USAGE_REMAINING_MIN=200 must hard-error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("LOOP_USAGE_REMAINING_MIN"),
+            "error must name LOOP_USAGE_REMAINING_MIN: {msg}"
+        );
+        assert!(
+            msg.contains("200") || msg.contains("100"),
+            "error must be actionable about the bound: {msg}"
+        );
+        // Non-loop path stays silent: read_project_config must not error.
+        let _ = read_project_config(dir.path());
+    }
+
+    #[test]
+    fn test_preflight_rejects_usage_policy_remaining_min_percent_above_100() {
+        let _guard = CLAUDE_BINARY_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _legacy = EnvGuard::remove("LOOP_USAGE_THRESHOLD");
+        let _remaining = EnvGuard::remove("LOOP_USAGE_REMAINING_MIN");
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{"usagePolicy":{"remainingMinPercent":200}}"#,
+        )
+        .unwrap();
+        let cfg = read_project_config(dir.path());
+        assert_eq!(
+            cfg.usage_policy.remaining_min_percent, 200,
+            "serde must accept u8 200 so preflight is the chokepoint"
+        );
+        let err = preflight_validate_and_probe(dir.path(), &cfg)
+            .expect_err("remainingMinPercent=200 must hard-error at preflight");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("LOOP_USAGE_REMAINING_MIN"),
+            "error must name LOOP_USAGE_REMAINING_MIN: {msg}"
         );
     }
 

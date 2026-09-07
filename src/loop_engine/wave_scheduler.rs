@@ -1072,6 +1072,7 @@ pub fn run_wave_iteration(
             primary_provider: resolved_models.primary_provider,
             blackout_fallback_secs: resolved_models.routing.spillover.blackout_fallback_secs,
             now_secs,
+            models: resolved_models,
         };
         let reaction = reactions::account::react_to_outputs(
             params.conn,

@@ -43,7 +43,7 @@ use task_mgr::db::migrations::run_migrations;
 use task_mgr::db::{create_schema, open_connection};
 use task_mgr::loop_engine::config::{IterationOutcome, PermissionMode};
 use task_mgr::loop_engine::engine::BlackoutState;
-use task_mgr::loop_engine::model::Provider;
+use task_mgr::loop_engine::model::{Provider, builtin_resolved_models};
 use task_mgr::loop_engine::reactions::account::{
     AccountReaction, AccountReactionParams, AccountStopSequentialMapping, AccountStopWaveMapping,
     OutputReactionItem, WaitFn, account_stop_sequential_mapping, account_stop_wave_mapping,
@@ -203,6 +203,7 @@ fn params<'a>(tasks_dir: &'a Path, fallback_wait: u64) -> AccountReactionParams<
         primary_provider: Provider::Claude,
         blackout_fallback_secs: 3600,
         now_secs: 0,
+        models: builtin_resolved_models(),
     }
 }
 
@@ -1236,7 +1237,7 @@ fn pre_spawn_and_gate_harness_compiles_and_setup_works() {
 //   AC5  → known_bad_overflow_skipping_rung1_fails_the_downgrade_assertion (LIVE)
 // ===========================================================================
 
-use task_mgr::loop_engine::model::{builtin_resolved_models, escalate_below_ceiling, to_1m_model};
+use task_mgr::loop_engine::model::{escalate_below_ceiling, to_1m_model};
 use task_mgr::loop_engine::overflow::{OverflowEvent, RecoveryAction, sanitize_id_for_filename};
 use task_mgr::loop_engine::project_config::{ModelsConfig, ProjectConfig};
 use task_mgr::loop_engine::prompt::PromptResult;
@@ -3790,8 +3791,7 @@ fn fable_rate_limit_wave_waits_once_3600_never_blackouts() {
 const ACCOUNT_HIT_YOUR_LIMIT_OUTPUT: &str =
     "Claude AI usage limit reached · hit your limit · resets 4pm (America/Los_Angeles)";
 
-const SPEND_LIMIT_OUTPUT: &str =
-    "You've hit your individual spend limit · run /usage-credits";
+const SPEND_LIMIT_OUTPUT: &str = "You've hit your individual spend limit · run /usage-credits";
 
 #[test]
 fn mixed_wave_prefers_rung_scoped_rate_limit_over_leading_account_hit() {
@@ -3880,14 +3880,8 @@ fn mixed_wave_fable_plus_spend_returns_stop_spend_not_wait_3600() {
     let spy = WaitSpy::completing();
     let wait = spy.closure();
     // api_secs None mirrors production wrapper skip when any item is rung-scoped.
-    let reaction = react_to_outputs_inner(
-        &mut conn,
-        &items,
-        &p,
-        &mut blackout,
-        None,
-        &wait as WaitFn,
-    );
+    let reaction =
+        react_to_outputs_inner(&mut conn, &items, &p, &mut blackout, None, &wait as WaitFn);
 
     assert_eq!(
         reaction,
@@ -3983,7 +3977,10 @@ fn account_stop_wrapper_parity_operator_stopped_and_stop_spend() {
             was_stopped: true,
         }
     );
-    assert_ne!(wave_op.exit_code, 130, "OperatorStopped must not be exit 130");
+    assert_ne!(
+        wave_op.exit_code, 130,
+        "OperatorStopped must not be exit 130"
+    );
 
     let wave_spend = account_stop_wave_mapping(&spend).expect("StopSpend wave map");
     assert_eq!(

@@ -70,7 +70,15 @@ pub type UsageGateFn<'f> = &'f dyn Fn(u8, &Path, u64) -> UsageCheckResult;
 /// single legitimate caller; the engine paths route through here instead.
 pub fn account_usage_gate(params: AccountUsageGateParams<'_>) -> UsageCheckResult {
     let gate = |threshold: u8, tasks_dir: &Path, fallback_wait: u64| -> UsageCheckResult {
-        check_and_wait(threshold, tasks_dir, fallback_wait)
+        // Pre-iteration gate has no run-models param on AccountUsageGateParams;
+        // builtins match fetch's provisional snapshot. Post-output banners use
+        // run models via AccountReactionParams (react_to_outputs closure).
+        check_and_wait(
+            threshold,
+            tasks_dir,
+            fallback_wait,
+            crate::loop_engine::model::builtin_resolved_models(),
+        )
     };
     account_usage_gate_inner(params, &gate)
 }
@@ -480,6 +488,10 @@ pub struct AccountReactionParams<'a> {
     /// FEAT-008: the "now" (Unix-epoch seconds) the blackout expiry is keyed on.
     /// Threaded as an input so the spillover path is deterministic in tests.
     pub now_secs: u64,
+    /// Run-resolved models for post-output remaining banners (`check_and_wait`
+    /// rebuilds via [`remaining_banner_for_run_models`] when `oauth_json` is
+    /// present). Not used to widen [`WaitFn`] / [`UsageGateFn`].
+    pub models: &'a ResolvedModelsConfig,
 }
 
 /// Post-output rate-limit reaction (production entry point).
@@ -494,8 +506,10 @@ pub fn react_to_outputs(
     params: &AccountReactionParams<'_>,
     blackout: &mut BlackoutState,
 ) -> AccountReaction {
+    // Capture run models in the gate closure — UsageGateFn stays (u8, &Path, u64).
+    let models = params.models;
     let usage_gate = |threshold: u8, tasks_dir: &Path, fallback_wait: u64| -> UsageCheckResult {
-        check_and_wait(threshold, tasks_dir, fallback_wait)
+        check_and_wait(threshold, tasks_dir, fallback_wait, models)
     };
     let reset_wait = |wait_secs: u64,
                       tasks_dir: &Path,
@@ -550,6 +564,7 @@ pub fn react_to_outputs_with_io_seams(
         primary_provider: _,
         blackout_fallback_secs: _,
         now_secs: _,
+        models: _,
     } = params;
 
     // Narrow rung-scoped phrasing (Fable/Opus/…): skip load_usage_info,
@@ -1436,10 +1451,7 @@ fn explicit_on_low_for_bucket(
 }
 
 fn is_spend_kind(kind: &str) -> bool {
-    matches!(
-        kind,
-        "spend" | "dollars" | "credits" | "tokens" | "extra_usage"
-    )
+    matches!(kind, "spend" | "dollars" | "credits" | "tokens")
 }
 
 fn account_low_is_amount_only(low: &AccountLowInput, buckets: &[QuotaBucket]) -> bool {
@@ -1918,8 +1930,9 @@ pub fn compute_remaining_work_snapshot(
         if model_col.as_ref().is_some_and(|m| !m.is_empty()) {
             has_forced = true;
         }
-        // Review-class heuristic (no task_type column): id tokens.
-        if id.contains("REVIEW") || id.contains("CODE-REVIEW") {
+        // Review-class SSoT (model.rs) — strips 8-hex claim prefix; excludes
+        // REFACTOR-REVIEW-*. Do not reimplement prefix stripping here.
+        if crate::loop_engine::model::is_frontier_class(&id) {
             has_review = true;
         }
         if let Some(r) = difficulty.as_deref().and_then(difficulty_rank_str) {
@@ -2221,11 +2234,15 @@ fn format_remaining_pct(remaining: f64) -> String {
 /// 1. `load_usage_info` (creds + refresh + OAuth/org usage API)
 /// 2. If remaining ≤ floor, wait for reset with API early-lift probe
 ///
+/// `models` rebuilds the remaining banner via [`remaining_banner_for_run_models`]
+/// when `oauth_json` is present (does not mutate fetch's builtin snapshot).
+///
 /// Returns the result of the check-and-wait cycle.
 pub(crate) fn check_and_wait(
     threshold: u8,
     tasks_dir: &Path,
     fallback_wait: u64,
+    models: &ResolvedModelsConfig,
 ) -> UsageCheckResult {
     // Pass live remaining-min into parse so reset_at uses the same floor as
     // the remaining compare below (not a hardcoded 8).
@@ -2238,7 +2255,7 @@ pub(crate) fn check_and_wait(
         }
     };
 
-    if let Some(banner) = usage.remaining_banner.as_deref() {
+    if let Some(banner) = remaining_banner_for_run_models(&usage, models, threshold, Utc::now()) {
         eprintln!("{banner}");
     } else {
         eprintln!(
@@ -3677,6 +3694,92 @@ mod tests {
     }
 
     #[test]
+    fn apply_spend_dollars_zero_stops_after_evaluate_account_low() {
+        let spend = QuotaBucket {
+            id: "spend".into(),
+            kind: "spend".into(),
+            label: String::new(),
+            measurements: vec![crate::loop_engine::quota::Measurement {
+                remaining: 0.0,
+                unit: crate::loop_engine::quota::MeasurementUnit::Dollars,
+            }],
+            resets_at: None,
+            severity: None,
+            is_active: None,
+            rungs: None,
+        };
+        let policy = UsagePolicy::default();
+        let eval = evaluate_quota(std::slice::from_ref(&spend), &policy, 8);
+        assert!(
+            matches!(eval.per_bucket[0].1, BucketEval::AccountLow { .. }),
+            "spend dollars 0 must AccountLow"
+        );
+        let work = RemainingWorkSnapshot::default();
+        let applied = apply_quota(&eval, &[spend], &policy, Some(&factory_fb()), &work);
+        assert_eq!(applied.account, QuotaAccountAction::Stop);
+    }
+
+    #[test]
+    fn apply_hand_built_extra_usage_account_low_still_stops_via_amount_only() {
+        // Discriminator: dropping extra_usage from is_spend_kind alone is not
+        // enough — account_low_is_amount_only still Stops. evaluate_one Ignore
+        // is the load-bearing fix (extra_usage dollars 0 never reaches apply).
+        let bucket = QuotaBucket {
+            id: "extra_usage".into(),
+            kind: "extra_usage".into(),
+            label: String::new(),
+            measurements: vec![crate::loop_engine::quota::Measurement {
+                remaining: 0.0,
+                unit: crate::loop_engine::quota::MeasurementUnit::Dollars,
+            }],
+            resets_at: None,
+            severity: None,
+            is_active: None,
+            rungs: None,
+        };
+        assert!(
+            !is_spend_kind("extra_usage"),
+            "extra_usage must be dropped from is_spend_kind"
+        );
+        let eval = QuotaEval {
+            per_bucket: vec![(
+                "extra_usage".into(),
+                BucketEval::AccountLow {
+                    remaining: 0.0,
+                    reset_secs: None,
+                    kind: "extra_usage".into(),
+                    low: true,
+                },
+            )],
+            unavailable: Vec::new(),
+            account_low: vec![AccountLowInput {
+                bucket_id: "extra_usage".into(),
+                remaining: 0.0,
+                reset_secs: None,
+                kind: "extra_usage".into(),
+                low: true,
+            }],
+        };
+        assert!(
+            account_low_is_amount_only(&eval.account_low[0], std::slice::from_ref(&bucket)),
+            "dollars-only extra_usage is amount-only"
+        );
+        let work = RemainingWorkSnapshot::default();
+        let applied = apply_quota(
+            &eval,
+            std::slice::from_ref(&bucket),
+            &UsagePolicy::default(),
+            Some(&factory_fb()),
+            &work,
+        );
+        assert_eq!(
+            applied.account,
+            QuotaAccountAction::Stop,
+            "hand-built AccountLow for extra_usage still Stops via amount-only"
+        );
+    }
+
+    #[test]
     fn apply_stop_beats_ask() {
         let frontier = pct_bucket(
             "weekly_scoped",
@@ -4218,6 +4321,72 @@ mod tests {
         )
         .expect("seed");
         conn
+    }
+
+    fn snapshot_conn_with_ids(ids: &[&str]) -> Connection {
+        let conn = Connection::open_in_memory().expect("in-memory");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE tasks (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'todo',
+                model TEXT,
+                difficulty TEXT,
+                archived_at TEXT
+            );
+            "#,
+        )
+        .expect("schema");
+        for id in ids {
+            conn.execute(
+                "INSERT INTO tasks (id, status, difficulty) VALUES (?1, 'todo', 'medium')",
+                rusqlite::params![id],
+            )
+            .expect("insert");
+        }
+        conn
+    }
+
+    #[test]
+    fn snapshot_has_review_via_is_frontier_class_only() {
+        let models = crate::loop_engine::model::builtin_resolved_models();
+        let empty_overrides = HashMap::new();
+        let unavailable: [(Provider, CapabilityTier); 0] = [];
+
+        let milestone = snapshot_conn_with_ids(&["MILESTONE-FINAL"]);
+        let work = compute_remaining_work_snapshot(
+            &milestone,
+            None,
+            models,
+            &unavailable,
+            &empty_overrides,
+        );
+        assert!(
+            work.has_review,
+            "MILESTONE-FINAL must set has_review via is_frontier_class"
+        );
+
+        let refactor = snapshot_conn_with_ids(&["REFACTOR-REVIEW-FINAL"]);
+        let work = compute_remaining_work_snapshot(
+            &refactor,
+            None,
+            models,
+            &unavailable,
+            &empty_overrides,
+        );
+        assert!(
+            !work.has_review,
+            "REFACTOR-REVIEW-FINAL must NOT set has_review (false-positive under contains REVIEW)"
+        );
+
+        let claimed = snapshot_conn_with_ids(&["8d71d1f7-CODE-REVIEW-1"]);
+        let work =
+            compute_remaining_work_snapshot(&claimed, None, models, &unavailable, &empty_overrides);
+        assert!(
+            work.has_review,
+            "claimed 8d71d1f7-CODE-REVIEW-1 must set has_review (prefix strip in is_frontier_class)"
+        );
     }
 
     #[test]

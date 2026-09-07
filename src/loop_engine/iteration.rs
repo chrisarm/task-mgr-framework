@@ -857,6 +857,7 @@ pub fn run_iteration(
                 primary_provider: resolved_models.primary_provider,
                 blackout_fallback_secs: resolved_models.routing.spillover.blackout_fallback_secs,
                 now_secs: crate::loop_engine::engine::now_unix_secs(),
+                models: resolved_models,
             };
             reactions::account::react_to_outputs(
                 params.conn,
