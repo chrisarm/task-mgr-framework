@@ -266,16 +266,25 @@ pub(crate) fn is_spend_limit_message(output: &str) -> bool {
 /// `blackout_fallback_secs` Wait (default 3600) and skips usage_gate + early-lift
 /// probe.
 ///
-/// True when a capability-rung model token (`fable|opus|sonnet|haiku`) is
-/// followed by `limit` within a short window, OR `switch models` appears on
-/// the **same line** as `reached` or `limit` (not an unanchored whole-capture
-/// contains — docs/commentary on a later line must not force Wait 3600).
+/// True when:
+/// - a capability-rung model token (`fable|opus|sonnet|haiku`) is a real word
+///   (start/end/whitespace — **not** hyphen/underscore) and is followed by
+///   `limit` within a short window, **or**
+/// - the live phrase `reached your (fable|opus|sonnet|haiku) limit`, **or**
+/// - `switch models` appears on the **same line** as `reached` or `limit`
+///   (not an unanchored whole-capture contains — docs/commentary on a later
+///   line must not force Wait 3600).
+///
 /// `/model` alone is **not** sufficient. Plain `You've reached your session
 /// limit` / account `hit your limit · resets 4pm` do **not** match — those
-/// keep api_secs / may Blackout.
+/// keep api_secs / may Blackout. Model ids like `claude-opus-5` /
+/// `claude-fable-5` must **not** count as a token match.
 pub(crate) fn is_rung_scoped_rate_limit_message(output: &str) -> bool {
     let lower = output.to_lowercase();
     if switch_models_on_rate_limit_line(&lower) {
+        return true;
+    }
+    if reached_your_model_limit_phrase(&lower) {
         return true;
     }
     model_token_followed_by_limit(&lower)
@@ -292,17 +301,60 @@ fn switch_models_on_rate_limit_line(lower: &str) -> bool {
     false
 }
 
+const RUNG_MODEL_TOKENS: &[&str] = &["fable", "opus", "sonnet", "haiku"];
+
+/// Live CLI copy: `You've reached your Fable limit` (and Opus/Sonnet/Haiku).
+fn reached_your_model_limit_phrase(lower: &str) -> bool {
+    for token in RUNG_MODEL_TOKENS {
+        // Avoid allocation: scan for "reached your <token> limit".
+        let mut from = 0;
+        while let Some(rel) = lower[from..].find("reached your ") {
+            let phrase_start = from + rel;
+            let after_prefix = phrase_start + "reached your ".len();
+            if lower[after_prefix..].starts_with(token) {
+                let after_token = after_prefix + token.len();
+                if lower[after_token..].starts_with(" limit") {
+                    return true;
+                }
+            }
+            from = phrase_start + 1;
+        }
+    }
+    false
+}
+
+/// True at string start/end or when the adjacent char is whitespace.
+/// Hyphen and underscore are **not** word boundaries — otherwise
+/// `claude-opus-5` / `claude_fable_5` falsely match `opus`/`fable`.
+fn is_real_word_boundary(lower: &str, index: usize, before: bool) -> bool {
+    if before {
+        if index == 0 {
+            return true;
+        }
+        // Tokens are ASCII so `index` is a char boundary; take the prior char.
+        lower[..index]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_whitespace())
+    } else if index >= lower.len() {
+        true
+    } else {
+        lower[index..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_whitespace())
+    }
+}
+
 /// Word-bounded model token followed by `limit` within 64 bytes of the token.
 fn model_token_followed_by_limit(lower: &str) -> bool {
-    const TOKENS: &[&str] = &["fable", "opus", "sonnet", "haiku"];
-    for token in TOKENS {
+    for token in RUNG_MODEL_TOKENS {
         let mut from = 0;
         while let Some(rel) = lower[from..].find(token) {
             let start = from + rel;
             let end = start + token.len();
-            let before_ok = start == 0 || !lower.as_bytes()[start - 1].is_ascii_alphanumeric();
-            let after_ok = end >= lower.len() || !lower.as_bytes()[end].is_ascii_alphanumeric();
-            if before_ok && after_ok {
+            if is_real_word_boundary(lower, start, true) && is_real_word_boundary(lower, end, false)
+            {
                 // end+64 can land mid-codepoint in mixed Unicode agent output.
                 let window_end = lower.floor_char_boundary((end + 64).min(lower.len()));
                 if lower[end..window_end].contains("limit") {
@@ -1429,6 +1481,7 @@ mod tests {
             "Please switch models to continue"
         ));
         // Plain session / account copy — ordinary RateLimit, no 3600 override.
+        // (e)(f)
         assert!(!is_rung_scoped_rate_limit_message(
             "You've reached your session limit"
         ));
@@ -1436,7 +1489,7 @@ mod tests {
             "You've hit your limit · resets 4pm"
         ));
         // `/model` alone is not sufficient (no model token, no anchored
-        // "switch models").
+        // "switch models"). (h)
         assert!(!is_rung_scoped_rate_limit_message(
             "Try /model to pick another model"
         ));
@@ -1445,6 +1498,32 @@ mod tests {
         let mixed = "You've hit your limit · resets 4pm\n\
              Docs: when Fable is exhausted, switch models with /model.";
         assert!(!is_rung_scoped_rate_limit_message(mixed));
+        // Hyphen/underscore are NOT word boundaries — model ids in ordinary
+        // session RateLimit stdout must not force Wait 3600.
+        assert!(
+            !is_rung_scoped_rate_limit_message(
+                "model: claude-opus-5\nYou've hit your limit · resets 4pm"
+            ),
+            "claude-opus-5 must not match token opus"
+        );
+        assert!(
+            !is_rung_scoped_rate_limit_message(
+                "model: claude-fable-5\nYou've hit your limit · resets 4pm"
+            ),
+            "claude-fable-5 must not match token fable"
+        );
+        assert!(
+            !is_rung_scoped_rate_limit_message(
+                "use claude-opus-5 for this task; you hit a rate limit later"
+            ),
+            "hyphenated model id + later 'limit' must not match"
+        );
+        assert!(
+            !is_rung_scoped_rate_limit_message(
+                "model: claude_opus_5\nYou've hit your limit · resets 4pm"
+            ),
+            "underscore must not count as a word boundary either"
+        );
     }
 
     #[test]
@@ -1547,6 +1626,28 @@ mod tests {
             3600,
         );
         assert_eq!(action, RateLimitAction::Wait { secs: 500 });
+    }
+
+    #[test]
+    fn test_decide_model_id_plus_hit_your_limit_still_blackouts_under_spillover() {
+        // Full CLI stdout often embeds `claude-opus-5` / `claude-fable-5`
+        // alongside ordinary account RateLimit copy. Hyphen must not create a
+        // false rung-scoped Wait 3600; spillover still Blackouts.
+        let with_opus = "Running claude-opus-5\nYou've hit your limit · resets 4pm";
+        let action = decide_account_rate_limit(None, Some(500), with_opus, true, 300, 3600);
+        assert_eq!(
+            action,
+            RateLimitAction::Blackout { secs: 500 },
+            "model id + account hit-your-limit must use output_secs Blackout, not Wait 3600"
+        );
+
+        let with_fable = "Running claude-fable-5\nYou've hit your limit · resets 4pm";
+        let action = decide_account_rate_limit(Some(7200), Some(500), with_fable, true, 300, 3600);
+        assert_eq!(
+            action,
+            RateLimitAction::Blackout { secs: 7200 },
+            "claude-fable-5 + account copy must prefer api_secs Blackout, not Wait 3600"
+        );
     }
 
     #[test]

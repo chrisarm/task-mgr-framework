@@ -4009,3 +4009,52 @@ fn slash_model_alone_does_not_take_3600_override() {
         "/model alone may Blackout under spillover"
     );
 }
+
+// ---------------------------------------------------------------------------
+// CODE-FIX-004: hyphenated model ids (claude-opus-5 / claude-fable-5) in
+// ordinary session RateLimit stdout must NOT take Wait 3600 — hyphen is not
+// a word boundary. Spillover still Blackouts with api_secs / output_secs.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn model_id_in_session_rate_limit_stdout_still_blackouts_not_3600() {
+    disable_llm_extraction();
+    let (db_temp, mut conn) = setup_migrated_db();
+    insert_run(&conn);
+    insert_in_progress_task(&conn, "RP-HYPHEN-0");
+
+    // Realistic capture: model id in the banner + ordinary account RateLimit.
+    let output = "Running with claude-opus-5\nYou've hit your limit · resets 4pm";
+    let rate = IterationOutcome::RateLimit;
+    let items = [OutputReactionItem {
+        task_id: Some("RP-HYPHEN-0"),
+        outcome: &rate,
+        output,
+    }];
+    let mut p = params(db_temp.path(), 300);
+    p.spillover_enabled = true;
+    p.blackout_fallback_secs = 3600;
+    p.now_secs = 1_000;
+    let mut blackout = BlackoutState::default();
+    let spy = WaitSpy::completing();
+    let wait = spy.closure();
+    let reaction = react_to_outputs_inner(
+        &mut conn,
+        &items,
+        &p,
+        &mut blackout,
+        Some(7200), // api_secs must win for Blackout, not be ignored as 3600 Wait
+        &wait as WaitFn,
+    );
+
+    assert_eq!(
+        reaction,
+        AccountReaction::RerouteAndRetry,
+        "ordinary account RateLimit with model id in stdout must Blackout under spillover"
+    );
+    assert_eq!(spy.calls.get(), 0, "Blackout path must not Wait 3600");
+    assert!(
+        blackout.active(1_000).contains(&Provider::Claude),
+        "spillover Blackout must still record Claude when hyphenated model id is present"
+    );
+}
