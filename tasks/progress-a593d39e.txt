@@ -395,3 +395,11 @@ Nit only (not spawned): `RUNG_MODEL_TOKENS` CLI phrase match still in account.rs
 env mutex for LOOP_USAGE_REMAINING_MIN tests (USAGE_REMAINING_ENV_MUTEX vs
 CLAUDE_BINARY_MUTEX) can race under filtered parallel runs — production
 preflight OK; not an AC fail.
+
+## 2026-09-07 17:49:46 UTC - Iteration 8
+- Task: a593d39e-CODE-REVIEW-1
+- Model: grok-4.5
+- Effort: high
+- Outcome: TransientBackend (retry_after_secs: None)
+- Files: src/loop_engine/usage.rs, src/loop_engine/quota.rs, src/loop_engine/reactions/account.rs, src/loop_engine/reactions/pre_spawn.rs, src/loop_engine/iteration.rs, src/loop_engine/wave_scheduler.rs, src/loop_engine/project_config.rs, src/loop_engine/engine.rs, tests/reaction_parity.rs, src/loop_engine/CLAUDE.md
+---
