@@ -992,6 +992,11 @@ pub(crate) const MAX_WAIT_SECS: u64 = 5 * 3600;
 pub struct RemainingWorkSnapshot {
     /// At least one remaining task can run on a rung/provider outside the
     /// evaluate-unavailable set. Spillover is never a working rung.
+    ///
+    /// Used only for **scoped** unavailable horizon decisions (Proceed vs
+    /// Stop/Ask). Account-binding lows (`session` / `weekly_all`) ignore this
+    /// flag beyond the stop horizon — those buckets are shared across Claude
+    /// rungs, so same-provider siblings are not an alternative.
     pub other_rungs_runnable: bool,
     /// Remaining work includes review-class tasks.
     pub has_review: bool,
@@ -1134,6 +1139,7 @@ pub fn apply_quota(
     }
 
     // Merge wait candidates; among multiple low wait buckets use the LATEST reset.
+    let has_account_binding_wait = !account_wait_resets.is_empty();
     let mut wait_resets = account_wait_resets;
     wait_resets.extend(scoped_wait_resets);
     wait_resets.extend(explicit_wait);
@@ -1153,19 +1159,21 @@ pub fn apply_quota(
             account = QuotaAccountAction::Wait {
                 secs: secs.min(MAX_WAIT_SECS),
             };
-        } else {
-            // Beyond horizon: stop only when nothing else can run.
+        } else if has_account_binding_wait {
+            // Account-binding (session / weekly_all) beyond horizon: every
+            // Claude rung shares that bucket, so other_rungs_runnable is not a
+            // working alternative — Stop (do not keep burning quota).
+            account = QuotaAccountAction::Stop;
+        } else if !work.other_rungs_runnable {
+            // Scoped-only beyond horizon and nothing else can run → Stop.
             // other_rungs_runnable ignores spillover (caller's responsibility).
-            let runnable_after_exclude = work.other_rungs_runnable;
-            if !runnable_after_exclude {
-                account = QuotaAccountAction::Stop;
-            } else if pending_ask || explicit_ask {
-                account = ask_or_defer(policy.ask_ttl_minutes);
-            } else {
-                // Account low beyond horizon but other work remains — do not
-                // 5h-cap-loop; proceed with exclusions only.
-                account = QuotaAccountAction::Proceed;
-            }
+            account = QuotaAccountAction::Stop;
+        } else if pending_ask || explicit_ask {
+            account = ask_or_defer(policy.ask_ttl_minutes);
+        } else {
+            // Scoped unavailable beyond horizon; other work remains → Proceed
+            // with exclusions only (factory / allowing tierFallback).
+            account = QuotaAccountAction::Proceed;
         }
     } else if pending_ask || explicit_ask {
         account = ask_or_defer(policy.ask_ttl_minutes);
@@ -2805,6 +2813,54 @@ mod tests {
                 assert!(secs > 2 * 3600);
             }
             other => panic!("expected Wait, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_account_low_3h_waits_capped_even_when_other_rungs_runnable() {
+        // Session-only AccountLow in the middle band still Wait-caps; runnable
+        // siblings must not flip the account action to Proceed/Stop.
+        let session = pct_bucket("five_hour", "session", 5.0, 3 * 3600, None);
+        let policy = UsagePolicy::default();
+        let eval = evaluate_quota(std::slice::from_ref(&session), &policy, 8);
+        let work = RemainingWorkSnapshot {
+            other_rungs_runnable: true,
+            ..RemainingWorkSnapshot::default()
+        };
+        let applied = apply_quota(&eval, &[session], &policy, Some(&factory_fb()), &work);
+        match applied.account {
+            QuotaAccountAction::Wait { secs } => {
+                assert!(secs <= MAX_WAIT_SECS);
+                assert!(secs > 2 * 3600);
+            }
+            other => panic!("expected capped Wait, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_account_weekly_all_6d_stops_even_when_other_rungs_runnable() {
+        // Account-binding weekly_all shares quota across Claude rungs.
+        // other_rungs_runnable (standard still "looks" selectable after scoped
+        // subtract) must NOT Proceed and keep burning the weekly bucket.
+        for remaining in [5.0_f64, 0.0] {
+            let week = pct_bucket("seven_day", "weekly_all", remaining, 6 * 24 * 3600, None);
+            let policy = UsagePolicy::default();
+            let eval = evaluate_quota(std::slice::from_ref(&week), &policy, 8);
+            let work = RemainingWorkSnapshot {
+                other_rungs_runnable: true,
+                max_difficulty: Some("high"),
+                ..RemainingWorkSnapshot::default()
+            };
+            let applied = apply_quota(&eval, &[week], &policy, Some(&factory_fb()), &work);
+            assert_eq!(
+                applied.account,
+                QuotaAccountAction::Stop,
+                "weekly_all remaining {remaining} @ 6d must Stop, not Proceed"
+            );
+            assert!(
+                applied.unavailable.is_empty(),
+                "account-binding must not emit scoped unavailable"
+            );
         }
     }
 
