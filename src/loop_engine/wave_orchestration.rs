@@ -81,7 +81,8 @@ pub(super) fn wave_preflight_check(
 
     // Pre-iteration quota gate (PR-2 / FEAT-005): account-global, EXACTLY once
     // per wave. Same `run_account_quota_gate` as sequential Step 1.5 — evaluate
-    // + apply + proto-channel replace; wait/stop only when usage_params.enabled.
+    // + apply + proto-channel replace when usage_params.enabled; otherwise skip
+    // load/OAuth and keep the proto-channel snapshot.
     // Ordered after the stop check and before crash backoff.
     if ctx
         .resolved_models

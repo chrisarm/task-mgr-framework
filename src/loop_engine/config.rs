@@ -31,12 +31,13 @@ pub struct LoopConfig {
     /// are deliberately NOT collapsed:
     ///
     /// - **Pre-iteration** (`orchestrator::ensure_valid_token`,
-    ///   `reactions::account::account_usage_gate`):
+    ///   `reactions::account::run_account_quota_gate`):
     ///   `usage_params.enabled = LOOP_USAGE_CHECK_ENABLED && claude_enabled`.
     ///   `LOOP_USAGE_CHECK_ENABLED=true` only *requests* the check; startup
     ///   gates it off when the resolved models config has the Claude provider
     ///   disabled. Setting the env var to `false` forces the pre-check off even
-    ///   when Claude is enabled.
+    ///   when Claude is enabled (no `load_usage_info` / OAuth GET; proto-channel
+    ///   snapshot kept).
     /// - **Post-output RateLimit** (`react_to_outputs` /
     ///   `react_to_outputs_with_io_seams`):
     ///   - allow-flag: `anthropic_account_io_allowed = claude_enabled` **only**

@@ -136,7 +136,7 @@ Two footguns:
 
 | Path | Gate |
 |------|------|
-| Pre-iteration OAuth + `account_usage_gate` | `LOOP_USAGE_CHECK_ENABLED ∧ Claude enabled` (`UsageParams.enabled`) |
+| Pre-iteration OAuth + `run_account_quota_gate` | `LOOP_USAGE_CHECK_ENABLED ∧ Claude enabled` (`UsageParams.enabled`); env false ⇒ no load / keep proto snapshot |
 | Post RateLimit **usage-API** leg (`check_and_wait`) | `anthropic_account_io_allowed ∧ usage_enabled` (historical: env still suppresses this leg) |
 | Post RateLimit **early-lift probe** | `anthropic_account_io_allowed` only (= Claude enabled; **env does not apply**) |
 

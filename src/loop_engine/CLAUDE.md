@@ -260,8 +260,10 @@ HashSet<(Provider, CapabilityTier)>` — replace the set on each successful
 evaluate+apply; keep snapshot on API fail; do **not** account-wait for a
 scoped rung; do **not** gate exclusion on non-empty `provider_blackouts`
 (empty blackouts is the production case).
-`LOOP_USAGE_CHECK_ENABLED=false` turns off wait/stop but still replaces the
-proto-channel on successful evaluate. Spillover is never a working rung.
+`LOOP_USAGE_CHECK_ENABLED=false` skips the pre-gate load entirely (no OAuth /
+`load_usage_info`) and keeps the proto-channel snapshot — dual predicate is
+env ∧ Claude enabled; do not treat disabled as a replace-on-evaluate exception.
+Spillover is never a working rung.
 Next-PRD inherit of rung-unavailable is PR-3 (documented, not implemented).
 Full copy-paste lives under `## CONTRACT-001` in the progress log.
 

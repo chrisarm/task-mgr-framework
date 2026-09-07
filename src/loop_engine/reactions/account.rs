@@ -1312,8 +1312,8 @@ pub struct QuotaPreflightParams<'a> {
     pub fallback_wait: u64,
     pub policy: &'a UsagePolicy,
     pub tier_fallback: Option<&'a TierFallback>,
-    /// When false (`LOOP_USAGE_CHECK_ENABLED=false`): still evaluate + replace
-    /// proto-channel on success, but do not sleep/stop on account actions.
+    /// When false (`LOOP_USAGE_CHECK_ENABLED=false`): skip evaluate/replace/
+    /// wait/stop and keep the proto-channel snapshot.
     pub execute_account_action: bool,
     pub unavailable_rungs: &'a mut HashSet<(Provider, CapabilityTier)>,
     /// Preview of remaining work used by apply (caller computes from DB +
@@ -1345,8 +1345,8 @@ pub struct RunAccountQuotaGateParams<'a> {
     pub threshold: u8,
     pub tasks_dir: &'a Path,
     pub fallback_wait: u64,
-    /// When false (`LOOP_USAGE_CHECK_ENABLED=false`): still refresh
-    /// proto-channel on success, but do not sleep/stop/defer.
+    /// When false (`LOOP_USAGE_CHECK_ENABLED=false`): skip OAuth/usage load,
+    /// keep the proto-channel snapshot, and do not sleep/stop/defer.
     pub execute_account_action: bool,
 }
 
@@ -1354,12 +1354,26 @@ pub struct RunAccountQuotaGateParams<'a> {
 ///
 /// Shared by sequential (`iteration.rs`) and wave (`wave_orchestration.rs`)
 /// so both paths produce the same decision for the same buckets+policy.
-/// When `execute_account_action` is false the proto-channel is still replaced
-/// on a successful load/evaluate (LOOP_USAGE_CHECK_ENABLED=false case).
+/// When `execute_account_action` is false (`LOOP_USAGE_CHECK_ENABLED=false`),
+/// returns [`UsageCheckResult::Skipped`] without calling the usage loader —
+/// proto-channel snapshot is kept. Dual predicate: pre-gate I/O requires
+/// env ∧ Claude enabled (`UsageParams.enabled`).
 ///
 /// On [`QuotaAccountAction::Stop`], resets `in_progress` → `todo` under
 /// `task_prefix` before returning [`UsageCheckResult::StopSignaled`].
 pub fn run_account_quota_gate(params: RunAccountQuotaGateParams<'_>) -> UsageCheckResult {
+    let threshold = params.threshold;
+    let load = || load_usage_info_with_threshold(threshold);
+    run_account_quota_gate_inner(params, &load)
+}
+
+/// Hermetic core of [`run_account_quota_gate`]. Production wires
+/// [`load_usage_info_with_threshold`]; tests inject a spy so
+/// `LOOP_USAGE_CHECK_ENABLED=false` can assert zero OAuth/usage I/O.
+pub fn run_account_quota_gate_inner(
+    params: RunAccountQuotaGateParams<'_>,
+    load_usage: LoadUsageFn<'_>,
+) -> UsageCheckResult {
     let RunAccountQuotaGateParams {
         conn,
         task_prefix,
@@ -1374,7 +1388,14 @@ pub fn run_account_quota_gate(params: RunAccountQuotaGateParams<'_>) -> UsageChe
         fallback_wait,
         execute_account_action,
     } = params;
-    let usage = load_usage_info_with_threshold(threshold);
+
+    // Dual predicate (pre-iteration): env off ⇒ no load_usage_info / OAuth GET.
+    // Keep proto-channel snapshot; do not document a replace-on-disabled exception.
+    if !execute_account_action {
+        return UsageCheckResult::Skipped;
+    }
+
+    let usage = load_usage();
     // Re-ingest OAuth HUD with the run's ResolvedModelsConfig so extra-mark
     // sees pins (e.g. frontier→opus). Builtin snapshot on info.buckets alone
     // would leave frontier selectable after an Opus HUD low (WIRE-FIX-001).
@@ -1443,7 +1464,7 @@ pub fn run_account_quota_gate(params: RunAccountQuotaGateParams<'_>) -> UsageChe
         account_reset_at,
     });
 
-    if horizon_stop && execute_account_action && matches!(result, UsageCheckResult::StopSignaled) {
+    if horizon_stop && matches!(result, UsageCheckResult::StopSignaled) {
         // Horizon Stop: park in_progress back to todo for this PRD.
         let prefix = task_prefix.unwrap_or("");
         reset_in_progress_tasks(conn, run_id, prefix, "quota horizon stop");
@@ -1494,6 +1515,11 @@ pub fn account_quota_preflight_inner(
         account_reset_at,
     } = params;
 
+    // Env-disabled pre-gate: keep proto-channel snapshot; no evaluate/replace.
+    if !execute_account_action {
+        return UsageCheckResult::Skipped;
+    }
+
     let applied = match buckets {
         Some(buckets) => {
             let (_eval, applied) =
@@ -1506,11 +1532,6 @@ pub fn account_quota_preflight_inner(
             None
         }
     };
-
-    if !execute_account_action {
-        // Proto-channel may have been refreshed above; skip wait/stop/defer.
-        return UsageCheckResult::Skipped;
-    }
 
     if let Some(applied) = applied {
         return execute_quota_account_action(&applied.account, fallback_wait, wait);
@@ -2909,7 +2930,7 @@ mod tests {
     }
 
     #[test]
-    fn preflight_disabled_still_replaces_proto_channel() {
+    fn preflight_disabled_keeps_proto_channel_snapshot() {
         let frontier = pct_bucket(
             "weekly_scoped",
             "weekly_scoped",
@@ -2917,7 +2938,8 @@ mod tests {
             3600,
             Some(vec![(Provider::Claude, CapabilityTier::Frontier)]),
         );
-        let mut set = HashSet::new();
+        // Pre-existing snapshot must survive LOOP_USAGE_CHECK_ENABLED=false.
+        let mut set = HashSet::from([(Provider::Claude, CapabilityTier::Standard)]);
         let policy = UsagePolicy::default();
         let fb = factory_fb();
         let work = RemainingWorkSnapshot {
@@ -2943,7 +2965,94 @@ mod tests {
             &wait,
         );
         assert_eq!(result, UsageCheckResult::Skipped);
-        assert!(set.contains(&(Provider::Claude, CapabilityTier::Frontier)));
+        assert_eq!(
+            set,
+            HashSet::from([(Provider::Claude, CapabilityTier::Standard)]),
+            "disabled preflight must keep snapshot (no replace from buckets)"
+        );
+    }
+
+    #[test]
+    fn gate_disabled_skips_usage_load_and_keeps_snapshot() {
+        // AC: LOOP_USAGE_CHECK_ENABLED=false + Claude enabled → no load_usage_info.
+        use std::cell::Cell;
+        let load_calls = Cell::new(0u32);
+        let load = || {
+            load_calls.set(load_calls.get() + 1);
+            None
+        };
+        let mut set = HashSet::from([(Provider::Claude, CapabilityTier::Frontier)]);
+        let mut conn = Connection::open_in_memory().expect("in-memory");
+        let models = crate::loop_engine::model::builtin_resolved_models();
+        let policy = UsagePolicy::default();
+        let fb = factory_fb();
+        let overrides = HashMap::new();
+        let result = run_account_quota_gate_inner(
+            RunAccountQuotaGateParams {
+                conn: &mut conn,
+                task_prefix: None,
+                run_id: "run",
+                unavailable_rungs: &mut set,
+                runner_overrides: &overrides,
+                models,
+                policy: &policy,
+                tier_fallback: Some(&fb),
+                threshold: 8,
+                tasks_dir: Path::new("/tmp"),
+                fallback_wait: 300,
+                execute_account_action: false,
+            },
+            &load,
+        );
+        assert_eq!(result, UsageCheckResult::Skipped);
+        assert_eq!(
+            load_calls.get(),
+            0,
+            "disabled gate must not call load_usage_info"
+        );
+        assert!(
+            set.contains(&(Provider::Claude, CapabilityTier::Frontier)),
+            "disabled gate must keep proto-channel snapshot"
+        );
+    }
+
+    #[test]
+    fn gate_enabled_invokes_usage_load() {
+        use std::cell::Cell;
+        let load_calls = Cell::new(0u32);
+        let load = || {
+            load_calls.set(load_calls.get() + 1);
+            None
+        };
+        let mut set = HashSet::new();
+        let mut conn = Connection::open_in_memory().expect("in-memory");
+        let models = crate::loop_engine::model::builtin_resolved_models();
+        let policy = UsagePolicy::default();
+        let fb = factory_fb();
+        let overrides = HashMap::new();
+        let result = run_account_quota_gate_inner(
+            RunAccountQuotaGateParams {
+                conn: &mut conn,
+                task_prefix: None,
+                run_id: "run",
+                unavailable_rungs: &mut set,
+                runner_overrides: &overrides,
+                models,
+                policy: &policy,
+                tier_fallback: Some(&fb),
+                threshold: 8,
+                tasks_dir: Path::new("/tmp"),
+                fallback_wait: 300,
+                execute_account_action: true,
+            },
+            &load,
+        );
+        assert_eq!(result, UsageCheckResult::Skipped); // no buckets → skipped
+        assert_eq!(
+            load_calls.get(),
+            1,
+            "enabled gate must call load_usage_info once"
+        );
     }
 
     // --- compute_remaining_work_snapshot honors runner_overrides pins ---

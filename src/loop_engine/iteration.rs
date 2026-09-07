@@ -123,9 +123,9 @@ pub fn run_iteration(
     }
 
     // Step 1.5: Pre-iteration quota gate (account-global). PR-2: evaluate+apply
-    // + proto-channel replace, shared with the wave path. Runs whenever Claude
-    // is enabled so LOOP_USAGE_CHECK_ENABLED=false still refreshes unavailable
-    // rungs; wait/stop/defer only when `usage_params.enabled`.
+    // + proto-channel replace, shared with the wave path. Called whenever Claude
+    // is enabled; `execute_account_action` (= usage_params.enabled = env ∧
+    // Claude) skips load/OAuth and keeps the proto-channel snapshot when false.
     if ctx.resolved_models.is_provider_enabled(Provider::Claude) {
         let check_result = reactions::account::run_account_quota_gate(
             reactions::account::RunAccountQuotaGateParams {
