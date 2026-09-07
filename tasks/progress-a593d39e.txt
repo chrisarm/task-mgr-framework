@@ -403,3 +403,31 @@ preflight OK; not an AC fail.
 - Outcome: TransientBackend (retry_after_secs: None)
 - Files: src/loop_engine/usage.rs, src/loop_engine/quota.rs, src/loop_engine/reactions/account.rs, src/loop_engine/reactions/pre_spawn.rs, src/loop_engine/iteration.rs, src/loop_engine/wave_scheduler.rs, src/loop_engine/project_config.rs, src/loop_engine/engine.rs, tests/reaction_parity.rs, src/loop_engine/CLAUDE.md
 ---
+---
+## 2026-09-07 - a593d39e-REVIEW-001
+
+Final PRE-PR-3 gate (2b). Prior stories all passes:true. Unit/coordinator
+proofs green; verify-task-mgr launch+sandbox+loop run --help+models show
+(artifact 20260907T105108-1884743, no --use-other-models-ttl); full
+unscoped fmt/check/clippy/test clean.
+
+Gate fixes landed:
+- usage.rs: Opus SNAPSHOT fixture builds id via OPUS_MODEL (no_hardcoded)
+- merge_resolver.rs: test fixtures use OPUS_MODEL constant
+- config.rs: remaining-min env tests share CLAUDE_BINARY_MUTEX with
+  project_config (fixes cross-module LOOP_USAGE_* race)
+
+Negative ACs: WaitFn Fn(u64); UsageGateFn (u8,&Path,u64); no
+AccountReaction::Stop; no fable/claude-fable-5 in quota.rs/engine.rs;
+no set-usage-rule / down-only walker / inherit / account_quota_stopped.
+Docs: identity union, wait-probe, OperatorStopped vs StopSpend, pin
+optional, remaining-min >100, all-high clamp still PR-3.
+
+
+## 2026-09-07 18:00:21 UTC - Iteration 9
+- Task: a593d39e-REVIEW-001
+- Model: grok-4.5
+- Effort: high
+- Outcome: NoEligibleTasks
+- Files: src/loop_engine/usage.rs, src/loop_engine/quota.rs, src/loop_engine/reactions/account.rs, src/loop_engine/reactions/pre_spawn.rs, src/loop_engine/iteration.rs, src/loop_engine/wave_scheduler.rs, src/loop_engine/project_config.rs, src/loop_engine/engine.rs, tests/reaction_parity.rs, src/loop_engine/CLAUDE.md
+---
