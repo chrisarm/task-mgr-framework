@@ -178,11 +178,19 @@ fn fetch_oauth_usage(access_token: &str, threshold: u8) -> Option<UsageInfo> {
     };
 
     let mut info = parse_oauth_usage_json_with_threshold(&json, f64::from(threshold))?;
-    info.remaining_banner = Some(format_oauth_remaining_banner(&json, threshold, Utc::now()));
-    // Builtin ingest is a display/default snapshot only (matches
-    // format_oauth_remaining_banner). Evaluate/apply MUST re-ingest via
-    // buckets_for_run_models with the run ResolvedModelsConfig so a
-    // frontier→opus pin extra-marks both rungs (WIRE-FIX-001).
+    // Provisional builtin banner for callers without run models (e.g.
+    // check_and_wait). Production pre-dispatch gate MUST rebuild via
+    // remaining_banner_for_run_models / format_oauth_remaining_banner with
+    // the run ResolvedModelsConfig so frontier→opus pins label both rungs.
+    info.remaining_banner = Some(format_oauth_remaining_banner(
+        &json,
+        threshold,
+        Utc::now(),
+        builtin_resolved_models(),
+    ));
+    // Builtin ingest is a display/default snapshot only. Evaluate/apply MUST
+    // re-ingest via buckets_for_run_models with the run ResolvedModelsConfig
+    // so a frontier→opus pin extra-marks both rungs (WIRE-FIX-001).
     info.buckets = ingest_oauth_value(&json, builtin_resolved_models());
     info.oauth_json = Some(json);
     Some(info)
@@ -865,15 +873,39 @@ pub fn buckets_for_run_models(
 ///
 /// Shape: `session 76% left (3m) · week 45% left (5d 13h) · frontier 5% left (5d 13h) (floor 8%)`.
 /// Rung labels use capability-tier names (`frontier`), never model ids (`fable`).
-/// Label-only: uses builtin ladder; evaluate buckets must use
-/// [`buckets_for_run_models`] with the run config.
+///
+/// `models` must be the same run [`ResolvedModelsConfig`] used by
+/// [`buckets_for_run_models`] / evaluate / apply so a frontier→opus pin
+/// extra-marks both rungs on the Opus HUD line.
 pub fn format_oauth_remaining_banner(
     json: &serde_json::Value,
     remaining_min: u8,
     now: DateTime<Utc>,
+    models: &ResolvedModelsConfig,
 ) -> String {
-    let buckets = ingest_oauth_value(json, builtin_resolved_models());
+    let buckets = ingest_oauth_value(json, models);
     format_remaining_usage_banner(&buckets, remaining_min, now)
+}
+
+/// Rebuild the remaining banner with the run's [`ResolvedModelsConfig`].
+///
+/// Prefer this over [`UsageInfo::remaining_banner`] (which may be a builtin
+/// snapshot from fetch) so production stderr matches evaluate/apply extra-mark.
+pub fn remaining_banner_for_run_models(
+    info: &UsageInfo,
+    models: &ResolvedModelsConfig,
+    remaining_min: u8,
+    now: DateTime<Utc>,
+) -> Option<String> {
+    match &info.oauth_json {
+        Some(json) => Some(format_oauth_remaining_banner(
+            json,
+            remaining_min,
+            now,
+            models,
+        )),
+        None => info.remaining_banner.clone(),
+    }
 }
 
 /// Format a remaining banner from already-ingested [`QuotaBucket`]s.
@@ -888,23 +920,9 @@ pub fn format_remaining_usage_banner(
     let mut saw_rungs: Vec<CapabilityTier> = Vec::new();
 
     for bucket in buckets {
-        let label = match banner_label_for_bucket(bucket) {
-            Some(l) => l,
-            None => continue,
-        };
-        match label.as_str() {
-            "session" if saw_session => continue,
-            "week" if saw_week => continue,
-            _ => {}
-        }
-        if bucket.rungs.as_ref().is_some_and(|r| !r.is_empty()) {
-            // Deduplicate by primary rung already encoded in `label`.
-            if let Ok(tier) = CapabilityTier::parse(&label) {
-                if saw_rungs.contains(&tier) {
-                    continue;
-                }
-                saw_rungs.push(tier);
-            }
+        let labels = banner_labels_for_bucket(bucket);
+        if labels.is_empty() {
+            continue;
         }
         let Some(meas) = primary_measurement(bucket) else {
             continue;
@@ -916,11 +934,24 @@ pub fn format_remaining_usage_banner(
             .and_then(|r| duration_until_reset(r, now))
             .map(|s| format!(" ({s})"))
             .unwrap_or_default();
-        segments.push(format!("{label} {amount}{dur}"));
-        if label == "session" {
-            saw_session = true;
-        } else if label == "week" {
-            saw_week = true;
+        for label in labels {
+            match label.as_str() {
+                "session" if saw_session => continue,
+                "week" if saw_week => continue,
+                _ => {}
+            }
+            if let Ok(tier) = CapabilityTier::parse(&label) {
+                if saw_rungs.contains(&tier) {
+                    continue;
+                }
+                saw_rungs.push(tier);
+            }
+            segments.push(format!("{label} {amount}{dur}"));
+            if label == "session" {
+                saw_session = true;
+            } else if label == "week" {
+                saw_week = true;
+            }
         }
     }
 
@@ -931,12 +962,16 @@ pub fn format_remaining_usage_banner(
     }
 }
 
-fn banner_label_for_bucket(bucket: &QuotaBucket) -> Option<String> {
+/// Labels for one bucket. Account-binding → session/week/spend name.
+/// Rung-scoped labeled HUD rows → every configured/extra-marked rung (not
+/// HUD-primary alone), so frontier=opus pins show both `frontier` and
+/// `standard` for an Opus line.
+fn banner_labels_for_bucket(bucket: &QuotaBucket) -> Vec<String> {
     let is_account = bucket.rungs.as_ref().is_none_or(|r| r.is_empty());
     if is_account {
         return match bucket.kind.as_str() {
-            "session" => Some("session".into()),
-            "weekly_all" => Some("week".into()),
+            "session" => vec!["session".into()],
+            "weekly_all" => vec!["week".into()],
             // Dollar/token-only spend buckets without a percent: show kind/id.
             _ if bucket.measurements.iter().any(|m| {
                 matches!(
@@ -950,16 +985,32 @@ fn banner_label_for_bucket(bucket: &QuotaBucket) -> Option<String> {
                 } else {
                     bucket.label.as_str()
                 };
-                Some(name.to_string())
+                vec![name.to_string()]
             }
-            _ => None,
+            _ => Vec::new(),
         };
     }
     // Rung-scoped: only labeled HUD rows (skip unlabeled named seven_day_*).
     if bucket.label.is_empty() {
-        return None;
+        return Vec::new();
     }
-    hud_tier_from_label(&bucket.label).map(|t| t.as_str().to_string())
+    if let Some(rungs) = bucket.rungs.as_ref() {
+        // Preserve ingest order (CapabilityTier sort from extra_mark_rungs).
+        let mut labels: Vec<String> = Vec::new();
+        for (_, tier) in rungs {
+            let name = tier.as_str().to_string();
+            if !labels.contains(&name) {
+                labels.push(name);
+            }
+        }
+        if !labels.is_empty() {
+            return labels;
+        }
+    }
+    // Fallback: HUD table primary only (should be rare once rungs are set).
+    hud_tier_from_label(&bucket.label)
+        .map(|t| vec![t.as_str().to_string()])
+        .unwrap_or_default()
 }
 
 fn primary_measurement(bucket: &QuotaBucket) -> Option<&Measurement> {
@@ -1507,7 +1558,7 @@ mod tests {
         let now = DateTime::parse_from_rfc3339("2026-09-07T05:57:00Z")
             .expect("fixture now")
             .with_timezone(&Utc);
-        let banner = format_oauth_remaining_banner(&json, 8, now);
+        let banner = format_oauth_remaining_banner(&json, 8, now, builtin_resolved_models());
         assert!(
             banner.contains("76% left"),
             "session remaining missing: {banner}"
@@ -2139,6 +2190,71 @@ mod tests {
         // Compile-time guard: PR-1 fold must not grow a models param.
         let _f: fn(&serde_json::Value, f64) -> Option<UsageInfo> =
             parse_oauth_usage_json_with_threshold;
+    }
+
+    /// CODE-FIX-007: production remaining banner must ingest with run models.
+    /// After frontier→opus pin, Opus HUD line labels both frontier and standard
+    /// (builtin-only ingest would print only `standard`). Hermetic — no live Anthropic.
+    #[test]
+    fn remaining_banner_extra_marks_frontier_under_opus_pin() {
+        let pinned = models_with_frontier_pinned_to_standard();
+        let json = serde_json::json!({
+            "limits": [{
+                "kind": "weekly_scoped",
+                "percent": 95,
+                "severity": "critical",
+                "resets_at": "2026-09-12T19:00:00Z",
+                "scope": { "model": { "display_name": "Opus" } }
+            }]
+        });
+        let now = DateTime::parse_from_rfc3339("2026-09-07T05:57:00Z")
+            .expect("fixture now")
+            .with_timezone(&Utc);
+
+        let builtin_banner =
+            format_oauth_remaining_banner(&json, 8, now, builtin_resolved_models());
+        assert!(
+            builtin_banner.contains("standard"),
+            "precondition: builtin Opus HUD → standard: {builtin_banner}"
+        );
+        assert!(
+            !builtin_banner.contains("frontier"),
+            "precondition: builtin must NOT label frontier when Fable≠Opus: {builtin_banner}"
+        );
+
+        let run_banner = format_oauth_remaining_banner(&json, 8, now, &pinned);
+        assert!(
+            run_banner.contains("standard"),
+            "run models must still label standard: {run_banner}"
+        );
+        assert!(
+            run_banner.contains("frontier"),
+            "run models under frontier=opus pin must also label frontier: {run_banner}"
+        );
+        assert!(
+            run_banner.contains("5% left"),
+            "remaining amount missing: {run_banner}"
+        );
+
+        // Production helper: UsageInfo with builtin snapshot + oauth_json must
+        // rebuild via run models (not the provisional remaining_banner).
+        let info = UsageInfo {
+            percentage: 100.0,
+            reset_at: None,
+            remaining_banner: Some(builtin_banner.clone()),
+            buckets: ingest_oauth_value(&json, builtin_resolved_models()),
+            oauth_json: Some(json),
+        };
+        let rebuilt =
+            remaining_banner_for_run_models(&info, &pinned, 8, now).expect("oauth_json present");
+        assert!(
+            rebuilt.contains("frontier") && rebuilt.contains("standard"),
+            "remaining_banner_for_run_models must extra-mark both rungs; got {rebuilt}"
+        );
+        assert_ne!(
+            rebuilt, builtin_banner,
+            "production banner must not reuse builtin-only ingest"
+        );
     }
 
     /// WIRE-FIX-001: production gate must re-ingest with run models. Simulates

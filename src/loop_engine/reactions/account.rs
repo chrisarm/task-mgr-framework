@@ -12,7 +12,7 @@ use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
-use chrono::TimeZone;
+use chrono::{TimeZone, Utc};
 use rusqlite::Connection;
 
 use crate::lifecycle::TaskLifecycle;
@@ -27,7 +27,7 @@ use crate::loop_engine::recovery::probe_rate_limit_lifted;
 use crate::loop_engine::runner::RunnerKind;
 use crate::loop_engine::usage::{
     UsageCheckResult, UsageInfo, buckets_for_run_models, load_usage_info_with_threshold,
-    usage_suggests_lifted,
+    remaining_banner_for_run_models, usage_suggests_lifted,
 };
 use crate::loop_engine::{display, signals};
 
@@ -1486,7 +1486,12 @@ pub fn run_account_quota_gate_inner(
         .map(|info| buckets_for_run_models(info, models));
     let (buckets, account_remaining, account_reset_at) = match (&usage, &run_buckets) {
         (Some(info), Some(owned)) => {
-            if let Some(banner) = info.remaining_banner.as_deref() {
+            // Rebuild banner with run ResolvedModelsConfig (not the provisional
+            // builtin snapshot on info.remaining_banner) so frontier→opus pins
+            // label both rungs (CODE-FIX-007).
+            if let Some(banner) =
+                remaining_banner_for_run_models(info, models, threshold, Utc::now())
+            {
                 eprintln!("{banner}");
             } else {
                 eprintln!(
