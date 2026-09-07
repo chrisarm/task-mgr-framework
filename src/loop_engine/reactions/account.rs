@@ -285,7 +285,8 @@ fn model_token_followed_by_limit(lower: &str) -> bool {
             let before_ok = start == 0 || !lower.as_bytes()[start - 1].is_ascii_alphanumeric();
             let after_ok = end >= lower.len() || !lower.as_bytes()[end].is_ascii_alphanumeric();
             if before_ok && after_ok {
-                let window_end = (end + 64).min(lower.len());
+                // end+64 can land mid-codepoint in mixed Unicode agent output.
+                let window_end = lower.floor_char_boundary((end + 64).min(lower.len()));
                 if lower[end..window_end].contains("limit") {
                     return true;
                 }
@@ -1384,6 +1385,20 @@ mod tests {
         assert!(!is_rung_scoped_rate_limit_message(
             "Try /model to pick another model"
         ));
+    }
+
+    #[test]
+    fn test_model_token_window_floors_utf8_char_boundary() {
+        // "opus" (ASCII) + 63 ASCII bytes + € (U+20AC, 3 UTF-8 bytes).
+        // Without floor_char_boundary, end+64 lands on the second byte of € and
+        // `lower[end..window_end]` panics. With the floor, the slice stops before €.
+        let mid_codepoint = format!("opus{}{}", "a".repeat(63), "€");
+        assert!(!is_rung_scoped_rate_limit_message(&mid_codepoint));
+
+        // Positive: "limit" still found inside the floored window before the
+        // multi-byte char that would otherwise split the raw end+64 index.
+        let with_limit = format!("opus limit{}{}", "a".repeat(50), "€");
+        assert!(is_rung_scoped_rate_limit_message(&with_limit));
     }
 
     #[test]
