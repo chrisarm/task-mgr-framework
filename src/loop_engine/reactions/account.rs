@@ -27,7 +27,7 @@ use crate::loop_engine::recovery::probe_rate_limit_lifted;
 use crate::loop_engine::runner::RunnerKind;
 use crate::loop_engine::usage::{
     UsageCheckResult, UsageInfo, buckets_for_run_models, load_usage_info_with_threshold,
-    remaining_banner_for_run_models, usage_suggests_lifted,
+    remaining_banner_for_run_models, usage_suggests_lifted, wait_probe_lifted,
 };
 use crate::loop_engine::{display, signals};
 
@@ -70,7 +70,15 @@ pub type UsageGateFn<'f> = &'f dyn Fn(u8, &Path, u64) -> UsageCheckResult;
 /// single legitimate caller; the engine paths route through here instead.
 pub fn account_usage_gate(params: AccountUsageGateParams<'_>) -> UsageCheckResult {
     let gate = |threshold: u8, tasks_dir: &Path, fallback_wait: u64| -> UsageCheckResult {
-        check_and_wait(threshold, tasks_dir, fallback_wait)
+        // Pre-iteration gate has no run-models param on AccountUsageGateParams;
+        // builtins match fetch's provisional snapshot. Post-output banners use
+        // run models via AccountReactionParams (react_to_outputs closure).
+        check_and_wait(
+            threshold,
+            tasks_dir,
+            fallback_wait,
+            crate::loop_engine::model::builtin_resolved_models(),
+        )
     };
     account_usage_gate_inner(params, &gate)
 }
@@ -129,9 +137,17 @@ pub enum AccountReaction {
     /// wave/iteration WITHOUT consuming the iteration budget (FEAT-006 B2), and
     /// MUST NOT zero `ctx.consecutive_merge_fail_waves` (FEAT-006 B3).
     WaitedAndRetry,
-    /// The usage wait was interrupted by a `.stop` signal. The caller stops
-    /// (sequential: `should_stop` early return; wave: terminal exit 130).
-    Stop,
+    /// The usage wait was interrupted by a `.stop` signal. Sequential maps to
+    /// `Empty` + `operator_stopped: true` (pre-gate `StopSignaled` triple →
+    /// orchestrator exit 0 + `was_stopped`). Wave: `was_stopped: true`, exit 0,
+    /// reason `"stop signal during rate-limit wait"` (not 130).
+    OperatorStopped,
+    /// Credits/spend limit with no time-based API reset. Sequential maps to
+    /// `Empty` + `operator_stopped: false` + `should_stop` (HorizonStopped-
+    /// shaped → orchestrator quota soft-stop exit 0). Wave: `was_stopped: false`,
+    /// exit 0, reason `"usage/spend limit"` (not 130). Not an operator stop —
+    /// `--chain` may still abort on `!prd_complete` (PR-3 inherit).
+    StopSpend,
     /// FEAT-008 quota-aware failover: a Claude rate-limit hit while
     /// difficulty-spillover is enabled. A provider blackout was **freshly**
     /// recorded on `ctx.provider_blackouts` from the reset timestamp (or
@@ -150,6 +166,65 @@ pub enum AccountReaction {
     /// so the reaction does not misreport a re-entrant rate-limit as a brand-new
     /// blackout. NEVER touches `runner_overrides`.
     ProceedWithSpillover,
+}
+
+/// Sequential wrapper fields for [`AccountReaction::OperatorStopped`] /
+/// [`AccountReaction::StopSpend`] (PRE-PR-3 / FR-010). Both map to
+/// `IterationOutcome::Empty` + `should_stop: true`; only `operator_stopped`
+/// differs. Horizon/Deferred/StopSpend/rung-only empty are **not** operator stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccountStopSequentialMapping {
+    pub operator_stopped: bool,
+}
+
+/// Wave wrapper terminal for [`AccountReaction::OperatorStopped`] /
+/// [`AccountReaction::StopSpend`] (PRE-PR-3 / FR-010). Known-bad before this
+/// split: every `Stop` → exit 130. Both variants are exit 0; only
+/// `was_stopped` / reason differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccountStopWaveMapping {
+    pub exit_code: i32,
+    pub reason: &'static str,
+    pub was_stopped: bool,
+}
+
+/// Sequential mapping for the Stop split. `None` for non-stop reactions.
+pub fn account_stop_sequential_mapping(
+    reaction: &AccountReaction,
+) -> Option<AccountStopSequentialMapping> {
+    match reaction {
+        AccountReaction::OperatorStopped => Some(AccountStopSequentialMapping {
+            operator_stopped: true,
+        }),
+        AccountReaction::StopSpend => Some(AccountStopSequentialMapping {
+            operator_stopped: false,
+        }),
+        AccountReaction::None
+        | AccountReaction::WaitedAndRetry
+        | AccountReaction::RerouteAndRetry
+        | AccountReaction::ProceedWithSpillover => None,
+    }
+}
+
+/// Wave mapping for the Stop split. `None` for non-stop reactions.
+/// Known-bad lock: `StopSpend` must **not** return exit 130.
+pub fn account_stop_wave_mapping(reaction: &AccountReaction) -> Option<AccountStopWaveMapping> {
+    match reaction {
+        AccountReaction::OperatorStopped => Some(AccountStopWaveMapping {
+            exit_code: 0,
+            reason: "stop signal during rate-limit wait",
+            was_stopped: true,
+        }),
+        AccountReaction::StopSpend => Some(AccountStopWaveMapping {
+            exit_code: 0,
+            reason: "usage/spend limit",
+            was_stopped: false,
+        }),
+        AccountReaction::None
+        | AccountReaction::WaitedAndRetry
+        | AccountReaction::RerouteAndRetry
+        | AccountReaction::ProceedWithSpillover => None,
+    }
 }
 
 /// One per-slot (or the single sequential) output the reaction inspects.
@@ -413,6 +488,10 @@ pub struct AccountReactionParams<'a> {
     /// FEAT-008: the "now" (Unix-epoch seconds) the blackout expiry is keyed on.
     /// Threaded as an input so the spillover path is deterministic in tests.
     pub now_secs: u64,
+    /// Run-resolved models for post-output remaining banners (`check_and_wait`
+    /// rebuilds via [`remaining_banner_for_run_models`] when `oauth_json` is
+    /// present). Not used to widen [`WaitFn`] / [`UsageGateFn`].
+    pub models: &'a ResolvedModelsConfig,
 }
 
 /// Post-output rate-limit reaction (production entry point).
@@ -427,8 +506,10 @@ pub fn react_to_outputs(
     params: &AccountReactionParams<'_>,
     blackout: &mut BlackoutState,
 ) -> AccountReaction {
+    // Capture run models in the gate closure — UsageGateFn stays (u8, &Path, u64).
+    let models = params.models;
     let usage_gate = |threshold: u8, tasks_dir: &Path, fallback_wait: u64| -> UsageCheckResult {
-        check_and_wait(threshold, tasks_dir, fallback_wait)
+        check_and_wait(threshold, tasks_dir, fallback_wait, models)
     };
     let reset_wait = |wait_secs: u64,
                       tasks_dir: &Path,
@@ -483,6 +564,7 @@ pub fn react_to_outputs_with_io_seams(
         primary_provider: _,
         blackout_fallback_secs: _,
         now_secs: _,
+        models: _,
     } = params;
 
     // Narrow rung-scoped phrasing (Fable/Opus/…): skip load_usage_info,
@@ -557,9 +639,10 @@ pub fn react_to_outputs_with_io_seams(
 ///
 /// Order (same for spillover and legacy after the spend check):
 /// 1. reset `in_progress` → `todo`
-/// 2. pure spend-stop → message → [`AccountReaction::Stop`] (no blackout)
-/// 3. spillover → blackout with resolved secs → Reroute / Proceed
-/// 4. legacy → `wait(secs)` → WaitedAndRetry / Stop
+/// 2. spend scan **before** prefer-rung decide — any spend + `api_secs` None
+///    → [`AccountReaction::StopSpend`] (mixed Fable+spend must not Wait 3600)
+/// 3. prefer-rung-scoped decide → spillover Blackout / legacy Wait
+/// 4. wait interrupted by `.stop` → [`AccountReaction::OperatorStopped`]
 ///
 /// The contract is pinned by the parity tests in `tests/reaction_parity.rs`.
 pub fn react_to_outputs_inner(
@@ -578,6 +661,26 @@ pub fn react_to_outputs_inner(
         return AccountReaction::None;
     };
 
+    // Always reset in_progress first so work isn't stuck if we StopSpend.
+    reset_in_progress_tasks(conn, params.run_id, params.prefix, "rate limit");
+
+    // Spend scan BEFORE prefer-rung-scoped decide_item (FR-010). Mixed wave
+    // [Fable switch-models, spend/credits] must StopSpend — prefer-rung alone
+    // would mask it as Wait 3600. Wrapper rung-scoped skip forces api_secs=None
+    // when any Fable item is present, so the scan fires in production.
+    if api_reset_secs.is_none()
+        && items.iter().any(|item| {
+            *item.outcome == IterationOutcome::RateLimit && is_spend_limit_message(item.output)
+        })
+    {
+        eprintln!(
+            "Usage/spend limit with no time-based reset from the API or CLI output.\n\
+             Raise credits: Claude Code /usage-credits (or admin usage settings).\n\
+             Stopping the loop (tasks left as todo)."
+        );
+        return AccountReaction::StopSpend;
+    }
+
     // Prefer a rung-scoped RateLimit for decide when any match — aligns with the
     // `any()` skip in `react_to_outputs_with_io_seams`. Mixed wave
     // [account hit-your-limit, Fable switch-models] must Wait(blackout_fallback_secs)
@@ -589,9 +692,6 @@ pub fn react_to_outputs_inner(
                 && is_rung_scoped_rate_limit_message(item.output)
         })
         .unwrap_or(first_rate_limited);
-
-    // Always reset in_progress first so work isn't stuck if we StopSpend.
-    reset_in_progress_tasks(conn, params.run_id, params.prefix, "rate limit");
 
     let output_secs = parse_reset_from_output(decide_item.output);
     let action = decide_account_rate_limit(
@@ -610,7 +710,7 @@ pub fn react_to_outputs_inner(
                  Raise credits: Claude Code /usage-credits (or admin usage settings).\n\
                  Stopping the loop (tasks left as todo)."
             );
-            AccountReaction::Stop
+            AccountReaction::StopSpend
         }
         RateLimitAction::Blackout { secs } => {
             // FEAT-008: ephemeral blackout; never touches runner_overrides.
@@ -629,7 +729,7 @@ pub fn react_to_outputs_inner(
             if wait(secs) {
                 AccountReaction::WaitedAndRetry
             } else {
-                AccountReaction::Stop
+                AccountReaction::OperatorStopped
             }
         }
     }
@@ -1076,7 +1176,12 @@ pub enum QuotaAccountAction {
     /// No account wait/stop/ask — proceed (possibly with rung exclusion).
     Proceed,
     /// Sleep `secs` (already capped at [`MAX_WAIT_SECS`] when in the middle band).
-    Wait { secs: u64 },
+    ///
+    /// `account_binding` is [`has_account_binding_wait`](apply_quota) at apply
+    /// time: session / weekly_all (or mixed with scoped) → `true` so the
+    /// preflight probe uses account remaining; scoped-only → `false` so the
+    /// probe looks at nonempty-rungs buckets (FR-009 / US-010).
+    Wait { secs: u64, account_binding: bool },
     /// Stop this PRD (`in_progress` → `todo`). Next-PRD inherit of unavailable is PR-3.
     Stop,
     /// Operator forbade downgrade; sleep up to `ttl_minutes` (stop-signal-aware)
@@ -1225,12 +1330,16 @@ pub fn apply_quota(
         account = QuotaAccountAction::Stop;
     } else if let Some(secs) = latest {
         if secs <= wait_within_secs {
-            account = QuotaAccountAction::Wait { secs };
+            account = QuotaAccountAction::Wait {
+                secs,
+                account_binding: has_account_binding_wait,
+            };
         } else if secs <= stop_beyond_secs || has_explicit_wait {
             // Middle band, or explicit onLow:wait beyond horizon: wait capped
             // (operator opted into a repark cycle instead of Stop/Proceed).
             account = QuotaAccountAction::Wait {
                 secs: secs.min(MAX_WAIT_SECS),
+                account_binding: has_account_binding_wait,
             };
         } else if has_account_binding_wait {
             // Account-binding (session / weekly_all) beyond horizon: every
@@ -1342,10 +1451,7 @@ fn explicit_on_low_for_bucket(
 }
 
 fn is_spend_kind(kind: &str) -> bool {
-    matches!(
-        kind,
-        "spend" | "dollars" | "credits" | "tokens" | "extra_usage"
-    )
+    matches!(kind, "spend" | "dollars" | "credits" | "tokens")
 }
 
 fn account_low_is_amount_only(low: &AccountLowInput, buckets: &[QuotaBucket]) -> bool {
@@ -1415,6 +1521,8 @@ pub struct QuotaPreflightParams<'a> {
     /// Account-binding remaining percent from UsageInfo (org fallback path).
     pub account_remaining: Option<f64>,
     pub account_reset_at: Option<&'a str>,
+    /// Run models for [`wait_probe_lifted`] scoped-only re-ingest (FR-009).
+    pub models: &'a ResolvedModelsConfig,
 }
 
 /// Inputs to [`run_account_quota_gate`]. Exhaustive destructure at the call
@@ -1557,6 +1665,7 @@ pub fn run_account_quota_gate_inner(
         buckets,
         account_remaining,
         account_reset_at,
+        models,
     });
 
     if horizon_stop && matches!(result, UsageCheckResult::HorizonStopped) {
@@ -1568,37 +1677,69 @@ pub fn run_account_quota_gate_inner(
     result
 }
 
-/// Production entry: build wait closure and run [`account_quota_preflight_inner`].
+/// How preflight executes Wait / Ask / org-fallback sleeps.
+///
+/// Production builds [`wait_probe_lifted`] **after** apply (using
+/// `Wait.account_binding`). Hermetic tests inject a plain [`WaitFn`] and skip
+/// the probe. Post-output [`WaitFn`] stays `Fn(u64) -> bool` unchanged.
+enum PreflightWaitMode<'a> {
+    Injected(WaitFn<'a>),
+    Production {
+        load: LoadUsageFn<'a>,
+        reset_wait: ResetWaitFn<'a>,
+    },
+}
+
+/// Production entry: evaluate/apply first, then build the wait probe from
+/// `Wait.account_binding` (FR-009). Does **not** close over
+/// [`usage_suggests_lifted`] before apply.
 pub fn account_quota_preflight(params: QuotaPreflightParams<'_>) -> UsageCheckResult {
     let threshold = params.threshold;
-    let tasks_dir = params.tasks_dir;
-    let wait = |secs: u64| -> bool {
-        let probe = || {
-            if let Some(info) = load_usage_info_with_threshold(threshold) {
-                if usage_suggests_lifted(&info, threshold, false) {
-                    return true;
-                }
-                if let Some(r) = info.reset_at.as_deref() {
-                    return estimate_reset_seconds(r) == Some(0);
-                }
-            }
-            false
+    let load = || load_usage_info_with_threshold(threshold);
+    let reset_wait =
+        |secs: u64, dir: &Path, _fallback: u64, probe: Option<&dyn Fn() -> bool>| -> bool {
+            wait_for_usage_reset(secs, dir, probe)
         };
-        wait_for_usage_reset(secs, tasks_dir, Some(&probe))
-    };
-    account_quota_preflight_inner(params, &wait)
+    account_quota_preflight_core(
+        params,
+        PreflightWaitMode::Production {
+            load: &load,
+            reset_wait: &reset_wait,
+        },
+    )
 }
 
 /// Hermetic core of the PR-2 quota preflight (evaluate → apply → proto-channel
 /// → optional account wait/stop/defer). Same buckets+policy ⇒ same decision
 /// for sequential and wave callers (exhaustive destructure, no `..`).
+///
+/// Injected [`WaitFn`] bypasses the production probe (tests control completion
+/// without OAuth / wall clock). Production probe wiring is covered by
+/// [`account_quota_preflight_with_io_seams`].
 pub fn account_quota_preflight_inner(
     params: QuotaPreflightParams<'_>,
     wait: WaitFn<'_>,
 ) -> UsageCheckResult {
+    account_quota_preflight_core(params, PreflightWaitMode::Injected(wait))
+}
+
+/// Production-path seams for hermetic probe tests (no wall clock, no live API).
+#[cfg(test)]
+pub(crate) fn account_quota_preflight_with_io_seams(
+    params: QuotaPreflightParams<'_>,
+    load: LoadUsageFn<'_>,
+    reset_wait: ResetWaitFn<'_>,
+) -> UsageCheckResult {
+    account_quota_preflight_core(params, PreflightWaitMode::Production { load, reset_wait })
+}
+
+fn account_quota_preflight_core(
+    params: QuotaPreflightParams<'_>,
+    wait_mode: PreflightWaitMode<'_>,
+) -> UsageCheckResult {
     let QuotaPreflightParams {
         threshold,
-        tasks_dir: _,
+        tasks_dir,
         fallback_wait,
         policy,
         tier_fallback,
@@ -1608,6 +1749,7 @@ pub fn account_quota_preflight_inner(
         buckets,
         account_remaining,
         account_reset_at,
+        models,
     } = params;
 
     // Env-disabled pre-gate: keep proto-channel snapshot; no evaluate/replace.
@@ -1628,8 +1770,16 @@ pub fn account_quota_preflight_inner(
         }
     };
 
+    let ctx = QuotaExecuteCtx {
+        threshold,
+        tasks_dir,
+        fallback_wait,
+        models,
+        wait_mode: &wait_mode,
+    };
+
     if let Some(applied) = applied {
-        return execute_quota_account_action(&applied.account, wait);
+        return execute_quota_account_action(&applied.account, &ctx);
     }
 
     // Org / no-buckets fallback: legacy remaining-percent gate.
@@ -1646,45 +1796,87 @@ pub fn account_quota_preflight_inner(
     if wait_secs == 0 {
         return UsageCheckResult::BelowThreshold;
     }
-    if wait(wait_secs) {
-        UsageCheckResult::WaitedAndReset
-    } else {
-        UsageCheckResult::StopSignaled
-    }
+    // Org-fallback keeps today's account-remaining probe (account_binding=true).
+    run_preflight_wait(wait_secs, /* account_binding */ true, &ctx)
 }
 
-fn execute_quota_account_action(action: &QuotaAccountAction, wait: WaitFn<'_>) -> UsageCheckResult {
+struct QuotaExecuteCtx<'a, 'm> {
+    threshold: u8,
+    tasks_dir: &'a Path,
+    fallback_wait: u64,
+    models: &'a ResolvedModelsConfig,
+    wait_mode: &'m PreflightWaitMode<'a>,
+}
+
+fn execute_quota_account_action(
+    action: &QuotaAccountAction,
+    ctx: &QuotaExecuteCtx<'_, '_>,
+) -> UsageCheckResult {
     match action {
         QuotaAccountAction::Proceed => UsageCheckResult::BelowThreshold,
-        QuotaAccountAction::Wait { secs } => {
+        QuotaAccountAction::Wait {
+            secs,
+            account_binding,
+        } => {
             // secs==0 is ready-now (past/now reset). Do NOT treat as unknown
             // and substitute fallback_wait (300s) — wait_for_usage_reset
             // already treats 0 as immediate resume.
             if *secs == 0 {
                 return UsageCheckResult::BelowThreshold;
             }
-            if wait(*secs) {
-                UsageCheckResult::WaitedAndReset
-            } else {
-                UsageCheckResult::StopSignaled
-            }
+            run_preflight_wait(*secs, *account_binding, ctx)
         }
         QuotaAccountAction::Stop => UsageCheckResult::HorizonStopped,
         QuotaAccountAction::Ask { ttl_minutes } => {
             // Config knob (askTtlMinutes): stop-signal-aware sleep up to TTL,
             // then continue. TTL 0 is Defer at apply time (no sleep). Clap
             // --use-other-models-ttl / mid-wait config re-eval stay PR-3.
+            // Ask keeps today's account remaining probe.
             let secs = ttl_minutes.saturating_mul(60);
             if secs == 0 {
                 return UsageCheckResult::Deferred;
             }
+            run_preflight_wait(secs, /* account_binding */ true, ctx)
+        }
+        QuotaAccountAction::Defer => UsageCheckResult::Deferred,
+    }
+}
+
+/// Run a preflight wait. Production builds [`wait_probe_lifted`] here — after
+/// apply — so scoped-only waits do not lift on week remaining.
+fn run_preflight_wait(
+    secs: u64,
+    account_binding: bool,
+    ctx: &QuotaExecuteCtx<'_, '_>,
+) -> UsageCheckResult {
+    match ctx.wait_mode {
+        PreflightWaitMode::Injected(wait) => {
             if wait(secs) {
                 UsageCheckResult::WaitedAndReset
             } else {
                 UsageCheckResult::StopSignaled
             }
         }
-        QuotaAccountAction::Defer => UsageCheckResult::Deferred,
+        PreflightWaitMode::Production { load, reset_wait } => {
+            let threshold = ctx.threshold;
+            let models = ctx.models;
+            let probe = || {
+                if let Some(info) = load() {
+                    if wait_probe_lifted(&info, threshold, account_binding, models) {
+                        return true;
+                    }
+                    if let Some(r) = info.reset_at.as_deref() {
+                        return estimate_reset_seconds(r) == Some(0);
+                    }
+                }
+                false
+            };
+            if reset_wait(secs, ctx.tasks_dir, ctx.fallback_wait, Some(&probe)) {
+                UsageCheckResult::WaitedAndReset
+            } else {
+                UsageCheckResult::StopSignaled
+            }
+        }
     }
 }
 
@@ -1738,8 +1930,9 @@ pub fn compute_remaining_work_snapshot(
         if model_col.as_ref().is_some_and(|m| !m.is_empty()) {
             has_forced = true;
         }
-        // Review-class heuristic (no task_type column): id tokens.
-        if id.contains("REVIEW") || id.contains("CODE-REVIEW") {
+        // Review-class SSoT (model.rs) — strips 8-hex claim prefix; excludes
+        // REFACTOR-REVIEW-*. Do not reimplement prefix stripping here.
+        if crate::loop_engine::model::is_frontier_class(&id) {
             has_review = true;
         }
         if let Some(r) = difficulty.as_deref().and_then(difficulty_rank_str) {
@@ -2041,11 +2234,15 @@ fn format_remaining_pct(remaining: f64) -> String {
 /// 1. `load_usage_info` (creds + refresh + OAuth/org usage API)
 /// 2. If remaining ≤ floor, wait for reset with API early-lift probe
 ///
+/// `models` rebuilds the remaining banner via [`remaining_banner_for_run_models`]
+/// when `oauth_json` is present (does not mutate fetch's builtin snapshot).
+///
 /// Returns the result of the check-and-wait cycle.
 pub(crate) fn check_and_wait(
     threshold: u8,
     tasks_dir: &Path,
     fallback_wait: u64,
+    models: &ResolvedModelsConfig,
 ) -> UsageCheckResult {
     // Pass live remaining-min into parse so reset_at uses the same floor as
     // the remaining compare below (not a hardcoded 8).
@@ -2058,7 +2255,7 @@ pub(crate) fn check_and_wait(
         }
     };
 
-    if let Some(banner) = usage.remaining_banner.as_deref() {
+    if let Some(banner) = remaining_banner_for_run_models(&usage, models, threshold, Utc::now()) {
         eprintln!("{banner}");
     } else {
         eprintln!(
@@ -2209,6 +2406,32 @@ mod tests {
     }
 
     // --- resolve / decide pure tests ---
+
+    #[test]
+    fn test_account_stop_wrapper_mappings_fr010() {
+        // Sequential: OperatorStopped = StopSignaled triple; StopSpend = HorizonStopped.
+        assert_eq!(
+            account_stop_sequential_mapping(&AccountReaction::OperatorStopped),
+            Some(AccountStopSequentialMapping {
+                operator_stopped: true
+            })
+        );
+        assert_eq!(
+            account_stop_sequential_mapping(&AccountReaction::StopSpend),
+            Some(AccountStopSequentialMapping {
+                operator_stopped: false
+            })
+        );
+        // Wave: both exit 0; known-bad was StopSpend → 130.
+        let spend = account_stop_wave_mapping(&AccountReaction::StopSpend).unwrap();
+        assert_eq!(spend.exit_code, 0);
+        assert!(!spend.was_stopped);
+        assert_eq!(spend.reason, "usage/spend limit");
+        let op = account_stop_wave_mapping(&AccountReaction::OperatorStopped).unwrap();
+        assert_eq!(op.exit_code, 0);
+        assert!(op.was_stopped);
+        assert_eq!(op.reason, "stop signal during rate-limit wait");
+    }
 
     #[test]
     fn test_resolve_wait_secs_api_wins_including_zero() {
@@ -2839,8 +3062,15 @@ mod tests {
             &work,
         );
         match applied.account {
-            QuotaAccountAction::Wait { secs } => {
+            QuotaAccountAction::Wait {
+                secs,
+                account_binding,
+            } => {
                 assert!(secs > 0 && secs <= 30 * 60 + 5, "secs={secs}");
+                assert!(
+                    !account_binding,
+                    "explicit scoped onLow:wait is not account-binding"
+                );
             }
             other => panic!("expected Wait for explicit scoped onLow wait, got {other:?}"),
         }
@@ -3071,6 +3301,7 @@ mod tests {
                 buckets: Some(std::slice::from_ref(&frontier)),
                 account_remaining: Some(76.0),
                 account_reset_at: None,
+                models: crate::loop_engine::model::builtin_resolved_models(),
             },
             &wait,
         );
@@ -3120,6 +3351,7 @@ mod tests {
                 buckets: Some(std::slice::from_ref(&frontier)),
                 account_remaining: Some(76.0),
                 account_reset_at: None,
+                models: crate::loop_engine::model::builtin_resolved_models(),
             },
             &wait,
         );
@@ -3169,6 +3401,7 @@ mod tests {
                 buckets: Some(std::slice::from_ref(&frontier)),
                 account_remaining: Some(76.0),
                 account_reset_at: None,
+                models: crate::loop_engine::model::builtin_resolved_models(),
             },
             &wait,
         );
@@ -3207,6 +3440,7 @@ mod tests {
                 buckets: Some(std::slice::from_ref(&week)),
                 account_remaining: Some(5.0),
                 account_reset_at: None,
+                models: crate::loop_engine::model::builtin_resolved_models(),
             },
             &wait,
         );
@@ -3248,6 +3482,7 @@ mod tests {
                 buckets: Some(std::slice::from_ref(&session)),
                 account_remaining: Some(5.0),
                 account_reset_at: None,
+                models: crate::loop_engine::model::builtin_resolved_models(),
             },
             &wait,
         );
@@ -3266,9 +3501,13 @@ mod tests {
         };
         let applied = apply_quota(&eval, &[session], &policy, Some(&factory_fb()), &work);
         match applied.account {
-            QuotaAccountAction::Wait { secs } => {
+            QuotaAccountAction::Wait {
+                secs,
+                account_binding,
+            } => {
                 assert!(secs <= MAX_WAIT_SECS);
                 assert!(secs > 2 * 3600);
+                assert!(account_binding, "session AccountLow is account-binding");
             }
             other => panic!("expected Wait, got {other:?}"),
         }
@@ -3287,11 +3526,48 @@ mod tests {
         };
         let applied = apply_quota(&eval, &[session], &policy, Some(&factory_fb()), &work);
         match applied.account {
-            QuotaAccountAction::Wait { secs } => {
+            QuotaAccountAction::Wait {
+                secs,
+                account_binding,
+            } => {
                 assert!(secs <= MAX_WAIT_SECS);
                 assert!(secs > 2 * 3600);
+                assert!(account_binding, "session AccountLow is account-binding");
             }
             other => panic!("expected capped Wait, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_mixed_session_and_scoped_wait_sets_account_binding_true() {
+        // Mixed session + scoped → account_binding true (probe account remaining;
+        // next apply re-parks scoped).
+        let session = pct_bucket("five_hour", "session", 5.0, 30 * 60, None);
+        let frontier = pct_bucket(
+            "weekly_scoped",
+            "weekly_scoped",
+            5.0,
+            30 * 60,
+            Some(vec![(Provider::Claude, CapabilityTier::Frontier)]),
+        );
+        let policy = UsagePolicy::default();
+        let buckets = [session, frontier];
+        let eval = evaluate_quota(&buckets, &policy, 8);
+        let work = RemainingWorkSnapshot {
+            other_rungs_runnable: false,
+            ..RemainingWorkSnapshot::default()
+        };
+        let applied = apply_quota(&eval, &buckets, &policy, Some(&factory_fb()), &work);
+        match applied.account {
+            QuotaAccountAction::Wait {
+                account_binding, ..
+            } => {
+                assert!(
+                    account_binding,
+                    "mixed session+scoped must probe account remaining"
+                );
+            }
+            other => panic!("expected Wait, got {other:?}"),
         }
     }
 
@@ -3358,7 +3634,13 @@ mod tests {
         };
         let applied = apply_quota(&eval, &[frontier], &policy, Some(&factory_fb()), &work);
         match applied.account {
-            QuotaAccountAction::Wait { secs } => assert_eq!(secs, MAX_WAIT_SECS),
+            QuotaAccountAction::Wait {
+                secs,
+                account_binding,
+            } => {
+                assert_eq!(secs, MAX_WAIT_SECS);
+                assert!(!account_binding, "scoped-only frontier wait");
+            }
             other => panic!("expected capped Wait, got {other:?}"),
         }
     }
@@ -3412,6 +3694,92 @@ mod tests {
     }
 
     #[test]
+    fn apply_spend_dollars_zero_stops_after_evaluate_account_low() {
+        let spend = QuotaBucket {
+            id: "spend".into(),
+            kind: "spend".into(),
+            label: String::new(),
+            measurements: vec![crate::loop_engine::quota::Measurement {
+                remaining: 0.0,
+                unit: crate::loop_engine::quota::MeasurementUnit::Dollars,
+            }],
+            resets_at: None,
+            severity: None,
+            is_active: None,
+            rungs: None,
+        };
+        let policy = UsagePolicy::default();
+        let eval = evaluate_quota(std::slice::from_ref(&spend), &policy, 8);
+        assert!(
+            matches!(eval.per_bucket[0].1, BucketEval::AccountLow { .. }),
+            "spend dollars 0 must AccountLow"
+        );
+        let work = RemainingWorkSnapshot::default();
+        let applied = apply_quota(&eval, &[spend], &policy, Some(&factory_fb()), &work);
+        assert_eq!(applied.account, QuotaAccountAction::Stop);
+    }
+
+    #[test]
+    fn apply_hand_built_extra_usage_account_low_still_stops_via_amount_only() {
+        // Discriminator: dropping extra_usage from is_spend_kind alone is not
+        // enough — account_low_is_amount_only still Stops. evaluate_one Ignore
+        // is the load-bearing fix (extra_usage dollars 0 never reaches apply).
+        let bucket = QuotaBucket {
+            id: "extra_usage".into(),
+            kind: "extra_usage".into(),
+            label: String::new(),
+            measurements: vec![crate::loop_engine::quota::Measurement {
+                remaining: 0.0,
+                unit: crate::loop_engine::quota::MeasurementUnit::Dollars,
+            }],
+            resets_at: None,
+            severity: None,
+            is_active: None,
+            rungs: None,
+        };
+        assert!(
+            !is_spend_kind("extra_usage"),
+            "extra_usage must be dropped from is_spend_kind"
+        );
+        let eval = QuotaEval {
+            per_bucket: vec![(
+                "extra_usage".into(),
+                BucketEval::AccountLow {
+                    remaining: 0.0,
+                    reset_secs: None,
+                    kind: "extra_usage".into(),
+                    low: true,
+                },
+            )],
+            unavailable: Vec::new(),
+            account_low: vec![AccountLowInput {
+                bucket_id: "extra_usage".into(),
+                remaining: 0.0,
+                reset_secs: None,
+                kind: "extra_usage".into(),
+                low: true,
+            }],
+        };
+        assert!(
+            account_low_is_amount_only(&eval.account_low[0], std::slice::from_ref(&bucket)),
+            "dollars-only extra_usage is amount-only"
+        );
+        let work = RemainingWorkSnapshot::default();
+        let applied = apply_quota(
+            &eval,
+            std::slice::from_ref(&bucket),
+            &UsagePolicy::default(),
+            Some(&factory_fb()),
+            &work,
+        );
+        assert_eq!(
+            applied.account,
+            QuotaAccountAction::Stop,
+            "hand-built AccountLow for extra_usage still Stops via amount-only"
+        );
+    }
+
+    #[test]
     fn apply_stop_beats_ask() {
         let frontier = pct_bucket(
             "weekly_scoped",
@@ -3431,6 +3799,94 @@ mod tests {
         // Forbade would ask, but nothing runnable + beyond horizon → Stop wins.
         let applied = apply_quota(&eval, &buckets, &policy, None, &work);
         assert_eq!(applied.account, QuotaAccountAction::Stop);
+    }
+
+    #[test]
+    fn production_scoped_only_wait_probe_does_not_lift_on_live_shaped_week() {
+        // US-010: production path passes Wait.account_binding=false into
+        // wait_probe_lifted after apply. live_shaped week 45% must NOT lift a
+        // scoped-only Fable wait (remaining 5%). No wall clock / live Anthropic.
+        use crate::loop_engine::usage::live_shaped_oauth_json;
+        use std::cell::RefCell;
+
+        let frontier = pct_bucket(
+            "weekly_scoped",
+            "weekly_scoped",
+            5.0,
+            6 * 3600, // middle band → capped Wait, scoped-only
+            Some(vec![(Provider::Claude, CapabilityTier::Frontier)]),
+        );
+        let policy = UsagePolicy::default();
+        let fb = factory_fb();
+        let work = RemainingWorkSnapshot {
+            other_rungs_runnable: false,
+            ..RemainingWorkSnapshot::default()
+        };
+        let eval = evaluate_quota(std::slice::from_ref(&frontier), &policy, 8);
+        let applied = apply_quota(
+            &eval,
+            std::slice::from_ref(&frontier),
+            &policy,
+            Some(&fb),
+            &work,
+        );
+        match &applied.account {
+            QuotaAccountAction::Wait {
+                account_binding: false,
+                ..
+            } => {}
+            other => panic!("expected scoped-only Wait, got {other:?}"),
+        }
+
+        let info = UsageInfo {
+            percentage: 45.0,
+            reset_at: None,
+            remaining_banner: None,
+            buckets: Vec::new(),
+            oauth_json: Some(live_shaped_oauth_json()),
+        };
+        let load_calls = RefCell::new(0u32);
+        let probe_lifted = RefCell::new(Vec::<bool>::new());
+        let load = || {
+            *load_calls.borrow_mut() += 1;
+            Some(info.clone())
+        };
+        let reset_wait =
+            |_secs: u64, _dir: &Path, _fb: u64, probe: Option<&dyn Fn() -> bool>| -> bool {
+                let lifted = probe.map(|p| p()).unwrap_or(false);
+                probe_lifted.borrow_mut().push(lifted);
+                // Complete without claiming early lift — we only assert probe.
+                true
+            };
+        let mut set = HashSet::new();
+        let result = account_quota_preflight_with_io_seams(
+            QuotaPreflightParams {
+                threshold: 8,
+                tasks_dir: Path::new("/tmp"),
+                fallback_wait: 300,
+                policy: &policy,
+                tier_fallback: Some(&fb),
+                execute_account_action: true,
+                unavailable_rungs: &mut set,
+                work: &work,
+                buckets: Some(std::slice::from_ref(&frontier)),
+                account_remaining: Some(45.0),
+                account_reset_at: None,
+                models: crate::loop_engine::model::builtin_resolved_models(),
+            },
+            &load,
+            &reset_wait,
+        );
+        assert_eq!(result, UsageCheckResult::WaitedAndReset);
+        assert!(
+            *load_calls.borrow() >= 1,
+            "production Wait must load usage for the probe"
+        );
+        assert!(
+            probe_lifted.borrow().iter().all(|v| !*v),
+            "scoped-only Wait + live_shaped week 45% must NOT lift (got {:?})",
+            probe_lifted.borrow()
+        );
     }
 
     #[test]
@@ -3455,7 +3911,10 @@ mod tests {
         );
         assert_eq!(
             applied.account,
-            QuotaAccountAction::Wait { secs: 0 },
+            QuotaAccountAction::Wait {
+                secs: 0,
+                account_binding: true,
+            },
             "past/now reset must apply as Wait {{ 0 }}"
         );
 
@@ -3478,6 +3937,7 @@ mod tests {
                 buckets: Some(std::slice::from_ref(&session)),
                 account_remaining: Some(5.0),
                 account_reset_at: None,
+                models: crate::loop_engine::model::builtin_resolved_models(),
             },
             &wait,
         );
@@ -3522,6 +3982,7 @@ mod tests {
                 buckets: Some(std::slice::from_ref(&session)),
                 account_remaining: Some(5.0),
                 account_reset_at: None,
+                models: crate::loop_engine::model::builtin_resolved_models(),
             },
             &wait,
         );
@@ -3562,6 +4023,7 @@ mod tests {
                 buckets: None,
                 account_remaining: Some(5.0),
                 account_reset_at: Some(past.as_str()),
+                models: crate::loop_engine::model::builtin_resolved_models(),
             },
             &wait,
         );
@@ -3609,6 +4071,7 @@ mod tests {
                 buckets: Some(std::slice::from_ref(&frontier)),
                 account_remaining: Some(76.0),
                 account_reset_at: None,
+                models: crate::loop_engine::model::builtin_resolved_models(),
             },
             &wait,
         );
@@ -3625,6 +4088,7 @@ mod tests {
                 buckets: Some(std::slice::from_ref(&frontier)),
                 account_remaining: Some(76.0),
                 account_reset_at: None,
+                models: crate::loop_engine::model::builtin_resolved_models(),
             },
             &wait,
         );
@@ -3666,6 +4130,7 @@ mod tests {
                 buckets: Some(std::slice::from_ref(&frontier)),
                 account_remaining: Some(76.0),
                 account_reset_at: None,
+                models: crate::loop_engine::model::builtin_resolved_models(),
             },
             &wait,
         );
@@ -3701,6 +4166,7 @@ mod tests {
                 buckets: None, // API fail
                 account_remaining: None,
                 account_reset_at: None,
+                models: crate::loop_engine::model::builtin_resolved_models(),
             },
             &wait,
         );
@@ -3740,6 +4206,7 @@ mod tests {
                 buckets: Some(std::slice::from_ref(&frontier)),
                 account_remaining: Some(76.0),
                 account_reset_at: None,
+                models: crate::loop_engine::model::builtin_resolved_models(),
             },
             &wait,
         );
@@ -3856,6 +4323,72 @@ mod tests {
         conn
     }
 
+    fn snapshot_conn_with_ids(ids: &[&str]) -> Connection {
+        let conn = Connection::open_in_memory().expect("in-memory");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE tasks (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'todo',
+                model TEXT,
+                difficulty TEXT,
+                archived_at TEXT
+            );
+            "#,
+        )
+        .expect("schema");
+        for id in ids {
+            conn.execute(
+                "INSERT INTO tasks (id, status, difficulty) VALUES (?1, 'todo', 'medium')",
+                rusqlite::params![id],
+            )
+            .expect("insert");
+        }
+        conn
+    }
+
+    #[test]
+    fn snapshot_has_review_via_is_frontier_class_only() {
+        let models = crate::loop_engine::model::builtin_resolved_models();
+        let empty_overrides = HashMap::new();
+        let unavailable: [(Provider, CapabilityTier); 0] = [];
+
+        let milestone = snapshot_conn_with_ids(&["MILESTONE-FINAL"]);
+        let work = compute_remaining_work_snapshot(
+            &milestone,
+            None,
+            models,
+            &unavailable,
+            &empty_overrides,
+        );
+        assert!(
+            work.has_review,
+            "MILESTONE-FINAL must set has_review via is_frontier_class"
+        );
+
+        let refactor = snapshot_conn_with_ids(&["REFACTOR-REVIEW-FINAL"]);
+        let work = compute_remaining_work_snapshot(
+            &refactor,
+            None,
+            models,
+            &unavailable,
+            &empty_overrides,
+        );
+        assert!(
+            !work.has_review,
+            "REFACTOR-REVIEW-FINAL must NOT set has_review (false-positive under contains REVIEW)"
+        );
+
+        let claimed = snapshot_conn_with_ids(&["8d71d1f7-CODE-REVIEW-1"]);
+        let work =
+            compute_remaining_work_snapshot(&claimed, None, models, &unavailable, &empty_overrides);
+        assert!(
+            work.has_review,
+            "claimed 8d71d1f7-CODE-REVIEW-1 must set has_review (prefix strip in is_frontier_class)"
+        );
+    }
+
     #[test]
     fn snapshot_without_pin_treats_claude_frontier_as_unavailable() {
         // Discriminator: sole high-difficulty task resolves to Claude frontier
@@ -3904,6 +4437,90 @@ mod tests {
             "Codex-pinned task must count as other-rung runnable when only Claude \
              frontier is unavailable; got {work:?}"
         );
+    }
+
+    /// FEAT-009 / AC4+AC5: live-shaped OAuth → frontier-only unavailable;
+    /// medium+high Claude todos → other_rungs_runnable; factory apply → Proceed.
+    /// With and without frontier→opus pin (FEAT-008 identity).
+    #[test]
+    fn live_shaped_snapshot_and_apply_proceed_with_and_without_pin() {
+        use crate::loop_engine::usage::{
+            ingest_oauth_value, live_shaped_oauth_json, models_with_frontier_pinned_to_standard,
+        };
+
+        fn mixed_seed() -> Connection {
+            let conn = Connection::open_in_memory().expect("in-memory");
+            conn.execute_batch(
+                r#"
+                CREATE TABLE tasks (
+                    id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'todo',
+                    model TEXT,
+                    difficulty TEXT,
+                    archived_at TEXT
+                );
+                INSERT INTO tasks (id, status, difficulty) VALUES
+                    ('t-frontier', 'todo', 'high'),
+                    ('t-standard', 'todo', 'medium');
+                "#,
+            )
+            .expect("seed");
+            conn
+        }
+
+        for (label, models) in [
+            (
+                "builtin",
+                crate::loop_engine::model::builtin_resolved_models().clone(),
+            ),
+            (
+                "frontier→opus pin",
+                models_with_frontier_pinned_to_standard(),
+            ),
+        ] {
+            let buckets = ingest_oauth_value(&live_shaped_oauth_json(), &models);
+            let policy = UsagePolicy::default();
+            let eval = evaluate_quota(&buckets, &policy, 8);
+            assert_eq!(
+                eval.unavailable,
+                vec![(Provider::Claude, CapabilityTier::Frontier)],
+                "{label}: evaluate unavailable must be frontier only; got {:?}",
+                eval.unavailable
+            );
+
+            let conn = mixed_seed();
+            let empty_overrides = HashMap::new();
+            let work = compute_remaining_work_snapshot(
+                &conn,
+                None,
+                &models,
+                &eval.unavailable,
+                &empty_overrides,
+            );
+            assert!(
+                work.other_rungs_runnable,
+                "{label}: medium/standard todo must keep other_rungs_runnable; got {work:?}"
+            );
+
+            let applied = apply_quota(&eval, &buckets, &policy, Some(&factory_fb()), &work);
+            assert_eq!(
+                applied.unavailable,
+                vec![(Provider::Claude, CapabilityTier::Frontier)],
+                "{label}: apply unavailable must stay frontier only; got {:?}",
+                applied.unavailable
+            );
+            assert_eq!(
+                applied.account,
+                QuotaAccountAction::Proceed,
+                "{label}: factory apply must Proceed (not Stop/HorizonStopped); got {:?}",
+                applied.account
+            );
+            assert!(
+                !matches!(applied.account, QuotaAccountAction::Stop),
+                "{label}: must not Stop"
+            );
+        }
     }
 
     // --- handle_rung_only_empty_selection (CODE-FIX-009) ---

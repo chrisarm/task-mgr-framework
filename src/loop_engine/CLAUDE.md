@@ -237,12 +237,13 @@ underscore are **not** word boundaries — otherwise hyphenated `OPUS_MODEL` /
 `/model` alone is not enough. Plain `reached your session limit` / `hit your
 limit · resets 4pm` stay ordinary RateLimit. Account-binding `reset_at` uses
 the live `usage_remaining_min` (remaining floor, default 8; old used≥92 ≡
-remaining≤8), not a hardcoded compile-time value. Because one Fable RateLimit
-sleeps the **whole wave** 3600s, the operator pin is **required** for
-parallel/wave until PR-3:
-`task-mgr models set-tier claude frontier <standard-model>` (e.g. opus).
-Sequential without the pin: that task waits 3600s (accepted; no auto-downgrade
-in PR-1).
+remaining≤8), not a hardcoded compile-time value. **Residual:** if a
+Fable-routed task actually spawns (`LOOP_USAGE_CHECK_ENABLED=false`, usage
+fetch fail, or explicit `tasks.model`), one Fable RateLimit still sleeps the
+**whole wave** 3600s. Pinning frontier off Fable
+(`task-mgr models set-tier claude frontier <standard-model>`) is **optional,
+not required**, after PRE-PR-3 extra-mark — see below. Automatic all-high /
+review / explicit-frontier clamp onto standard remains PR-3.
 
 **PR-2 quota contract (CONTRACT-001 / FEAT-005):** remaining 0–100 is the gate
 unit (`LOOP_USAGE_REMAINING_MIN` > `usagePolicy.remainingMinPercent` > 8).
@@ -276,6 +277,43 @@ calls `handle_rung_only_empty_selection` **before** stale-abort and never
 `handle_quota_deferral`. Explicit `onLow` wait/stop/ask on a scoped bucket
 emits `AccountLow` so apply can honor it.
 Full copy-paste lives under `## CONTRACT-001` in the progress log.
+
+**PRE-PR-3 (CONTRACT-002 / FEAT-008–FIX-012):**
+
+- **HUD-family extra-mark identity union:** after HUD maps to rung R, identity
+  set I = always `canonical_model_for_hud_tier(R)`
+  (`FABLE_MODEL`/`OPUS_MODEL`/`SONNET_MODEL`/`HAIKU_MODEL`) **plus**
+  `scope.model.id` when present; extra-mark every Claude rung whose
+  `exact_model_for` equals any I. **Not** `exact_model_for(mapped_rung)`;
+  **not** prefer-id; **not** a single `identity: &str`. Fable HUD +
+  frontier→opus pin → **frontier only** (must not extra-mark standard);
+  Opus HUD + pin including snapshot id → **standard and frontier**.
+  Unlabeled named `seven_day_*` → `rungs: None` (`ingest_named_sibling`
+  never `map_unlabeled_token`; `limits[]` unlabeled ids still map).
+  PR-3 walker must **not** reintroduce mapped-rung extra-mark. Full
+  copy-paste under `## CONTRACT-002` in `tasks/progress-a593d39e.txt`.
+- **Wait-driving probe after apply:** `Wait { secs, account_binding }`;
+  `wait_probe_lifted` runs **after** apply. Scoped-only waits must **not**
+  lift on week remaining alone. Post-output `WaitFn` stays `Fn(u64)` (do
+  not widen). Fable 3600 skip of probe untouched.
+  **Residual:** scoped-only lift is `.all()` over nonempty-rungs buckets;
+  an empty filtered set is vacuously `true` (org-only load / explicit
+  `onLow: wait` on unlabeled `seven_day_*` with no HUD scoped row).
+  Fail-closed would be "no nonempty-rungs buckets → do not lift."
+  Production HUD Wait always carries the Fable `limits[]` row.
+- **`AccountReaction::{OperatorStopped, StopSpend}`** (no single `Stop`):
+  sequential `Empty` + `operator_stopped` → exit **0** (not RateLimit /
+  exit 1); wave → exit **0** (`OperatorStopped` was_stopped true;
+  `StopSpend` was_stopped false, reason usage/spend — **not** 130).
+- **Hygiene:** `has_review = is_frontier_class` (not bare `id.contains("REVIEW")`);
+  `extra_usage` / promotional / `nimbus_quill` → **Ignore** at `evaluate_one`
+  before amount-exhausted AccountLow; `LOOP_USAGE_REMAINING_MIN` /
+  `remainingMinPercent` **> 100** hard-errors at loop/batch
+  `preflight_validate_and_probe`.
+- **Pin:** optional for mixed standard/medium (factory exclude unsticks).
+  All-high / review / explicit-frontier clamp onto standard is still **PR-3**.
+  Do **not** document `--use-other-models-ttl` / `set-usage-rule` /
+  `set-tier-fallback` / `models show` live remaining as shipped (PR-3).
 
 The per-task reactions (`resolve_task_execution`, `handle_overflow`) fold one
 call per slot. Each coordinator pairs a production entry point with a hermetic

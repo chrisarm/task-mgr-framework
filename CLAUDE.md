@@ -153,10 +153,16 @@ hard-errors at loop/batch `preflight_validate_and_probe` (names
 `LOOP_USAGE_REMAINING_MIN`); non-loop commands ignore it. Operator banners use
 `% left` (rung labels like `frontier`, never model ids).
 
-**PR-1 Fable pin (required for parallel/wave until PR-3):** one Fable RateLimit
-sleeps the whole wave 3600s — pin frontier off Fable with
-`task-mgr models set-tier claude frontier <standard-model>` (e.g. opus).
-Sequential without the pin: that task waits 3600s (accepted; no auto-downgrade).
+**Fable frontier pin (optional after PRE-PR-3):** after HUD-family extra-mark
+identity union (CONTRACT-002 / FEAT-008), pinning frontier off Fable is
+**optional, not required**, for mixed standard/medium work — factory
+`tierFallback` exclude unsticks the wave when frontier is unavailable.
+Optional recipe: `task-mgr models set-tier claude frontier <standard-model>`
+(e.g. opus). Automatic clamp of all-high / review / explicit-frontier onto
+standard is still **PR-3** (do not assume high/review runs on the pin target).
+**Residual:** if a Fable-routed task still spawns (e.g. `LOOP_USAGE_CHECK_ENABLED=false`,
+usage fetch fail, or explicit `tasks.model`), a Fable CLI RateLimit still sleeps
+the whole wave **3600s**.
 
 ## Deprecation policy
 

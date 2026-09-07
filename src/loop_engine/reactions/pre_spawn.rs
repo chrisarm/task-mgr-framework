@@ -459,4 +459,50 @@ mod tests {
         let excluded = compute_quota_excluded_ids(&ctx, &conn, None, models, &HashSet::new());
         assert!(excluded.is_empty());
     }
+
+    /// FEAT-009 / AC5: after live-shaped evaluate+replace, exclude high/frontier
+    /// ids and keep medium/standard — with and without frontier→opus pin.
+    #[test]
+    fn live_shaped_replace_excludes_frontier_not_standard_with_and_without_pin() {
+        use crate::loop_engine::quota::{UsagePolicy, evaluate_quota};
+        use crate::loop_engine::reactions::account::replace_unavailable_rungs;
+        use crate::loop_engine::usage::{
+            ingest_oauth_value, live_shaped_oauth_json, models_with_frontier_pinned_to_standard,
+        };
+
+        for (label, models) in [
+            ("builtin", builtin_resolved_models().clone()),
+            (
+                "frontier→opus pin",
+                models_with_frontier_pinned_to_standard(),
+            ),
+        ] {
+            let buckets = ingest_oauth_value(&live_shaped_oauth_json(), &models);
+            let eval = evaluate_quota(&buckets, &UsagePolicy::default(), 8);
+            assert_eq!(
+                eval.unavailable,
+                vec![(Provider::Claude, CapabilityTier::Frontier)],
+                "{label}: precondition frontier-only unavailable"
+            );
+
+            let mut ctx = IterationContext::new(3);
+            // Learning [5463]: replace-on-evaluate (not merge).
+            let applied = crate::loop_engine::reactions::account::QuotaApplyResult {
+                unavailable: eval.unavailable.clone(),
+                account: crate::loop_engine::reactions::account::QuotaAccountAction::Proceed,
+            };
+            replace_unavailable_rungs(&mut ctx.unavailable_rungs, &applied);
+
+            let conn = seed_conn();
+            let excluded = compute_quota_excluded_ids(&ctx, &conn, None, &models, &HashSet::new());
+            assert!(
+                excluded.contains("t-frontier"),
+                "{label}: high/frontier id must be excluded after replace; got {excluded:?}"
+            );
+            assert!(
+                !excluded.contains("t-standard"),
+                "{label}: medium/standard id must remain selectable; got {excluded:?}"
+            );
+        }
+    }
 }

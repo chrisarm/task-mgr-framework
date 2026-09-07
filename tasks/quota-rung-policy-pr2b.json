@@ -1,0 +1,788 @@
+{
+  "branchName": "feat/quota-rung-policy-pr2b",
+  "description": "PRE-PR-3 gate (2b) between PR-2 and PR-3 — not a fourth product PR. US-008–US-012 / FR-009–FR-011 / CONTRACT-002. HUD-family extra-mark identity union (always family constant plus snapshot id; Fable+pin → frontier only; Opus+snapshot+pin → standard and frontier). Unlabeled seven_day_* → rungs None; live-shaped evaluate+apply + snapshot/exclude. Wait { secs, account_binding } with wait_probe_lifted after apply; post-output WaitFn = Fn(u64) unchanged. AccountReaction OperatorStopped vs StopSpend (seq Empty mapping; wave exit 0). extra_usage Ignore at evaluate_one before amount-exhausted AccountLow; has_review = is_frontier_class; remaining-min > 100 at loop/batch preflight only; post-output banner via react_to_outputs closure over AccountReactionParams.models. Pin optional for mixed standard; all-high clamp still PR-3. Out of this JSON: --use-other-models-ttl, down-only walker, expiry map, inherit, account_quota_stopped, models set-usage-rule / set-tier-fallback.",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "No warnings in `cargo check` output",
+      "No warnings in `cargo clippy -- -D warnings` (per-iteration). `--all-targets` is REVIEW-001 only",
+      "`cargo fmt --check` passes",
+      "Scoped tests for touched modules pass",
+      "No unwrap() in production code paths",
+      "Sequential and wave paths stay parity-locked for account reactions (exhaustive destructure, shared coordinators)",
+      "quota.rs and engine.rs proto-channel keys contain no model-id literals (frontier/standard/cost-efficient/cheapest only)",
+      "HUD tokens (fable/opus/sonnet/haiku as API labels) live only in usage.rs",
+      "Post-output WaitFn stays Fn(u64); UsageGateFn stays (u8, &Path, u64)",
+      "No --use-other-models-ttl / FR-006 clamp / inherit / FR-008 CLI in this gate",
+      "No live Anthropic / real ~/.claude credentials in tests"
+    ],
+    "description": "These criteria apply to ALL implementation tasks"
+  },
+  "mergeStrategy": "Merge to main after REVIEW-001 passes. Squash commits optional.",
+  "prdFile": "prd-quota-rung-policy.md",
+  "priorityPhilosophy": {
+    "description": "Hierarchy of what matters most when implementing tasks",
+    "hierarchy": [
+      "1. PLAN — Anticipate edge cases before coding",
+      "2. PHASE 2 FOUNDATION — ~1 day now to save ~2+ weeks later (1:10+ ratio); we are pre-launch, foundations compound",
+      "3. FUNCTIONING CODE — Pragmatic, reliable, wired in per plan",
+      "4. CORRECTNESS — Compiles, type-checks, scoped tests pass deterministically",
+      "5. CODE QUALITY — Clean code, qualityDimensions satisfied, no warnings",
+      "6. POLISH — Docs, formatting, minor improvements"
+    ],
+    "principles": [
+      "Quality dimensions explicit — qualityDimensions on every task tells you what 'good' looks like",
+      "Phase 2 foundation — extra-mark identity union is the 1:10 that unblocks PR-3 clamp onto standard",
+      "Edge cases = test cases — every PRE-PR-3 known edge case must have a corresponding test",
+      "Scoped per-iteration tests, full suite at REVIEW-001 — REVIEW must leave the trunk green including pre-existing failures",
+      "Engine speaks capability rungs (frontier/standard/cost-efficient/cheapest), never model ids except the ingest adapter",
+      "A low frontier (HUD Current week (Fable)) bucket is not an account emergency — continue on standard",
+      "Do not pin until FEAT-008 extra-mark code is green; after this slice pin is optional, not required",
+      "Ship working code with tests to prove it; handle Option/Result explicitly; avoid unwrap() in production"
+    ]
+  },
+  "prohibitedOutcomes": [
+    "Extra-mark via exact_model_for(mapped_rung) after an operator pin (Fable HUD extra-marks standard)",
+    "Preferring scope.model.id over the family constant (kills Opus+pin extra-mark on snapshot ids)",
+    "A single extra_mark identity: &str of 'id or family constant' instead of an identity set union",
+    "Family-token-mapping unlabeled seven_day_opus / seven_day_sonnet onto standard / cost-efficient",
+    "Apply-only live-shaped fixture without snapshot/exclude tests (architect rev 5)",
+    "Widening post-output WaitFn or UsageGateFn (must stay Fn(u64) and (u8, &Path, u64))",
+    "Building usage_suggests_lifted before apply as the scoped Wait probe (landed account_quota_preflight known-bad)",
+    "Scoped-only Wait lifting on week 45% left / UsageInfo.percentage",
+    "Dropping extra_usage from is_spend_kind without Ignore at evaluate_one before amount-exhausted AccountLow",
+    "Sequential OperatorStopped mapped onto RateLimit + operator_stopped (does not set was_stopped)",
+    "Wave StopSpend or OperatorStopped as exit 130",
+    "has_review via id.contains(\"REVIEW\") (false-positive REFACTOR-REVIEW-FINAL; false-negative MILESTONE-FINAL)",
+    "remainingMinPercent / LOOP_USAGE_REMAINING_MIN > 100 silently accepted at loop/batch preflight",
+    "Documenting pin as required for parallel/wave after this slice (optional, not required; all-high clamp is PR-3)",
+    "HUD tokens (fable/opus/sonnet/haiku) outside usage.rs",
+    "quota.rs or engine.rs proto-channel keys containing fable / opus / claude-fable-5",
+    "Implementing --use-other-models-ttl, FR-006 expiry + down-only walker, inherit, account_quota_stopped, FR-008 set-usage-rule / set-tier-fallback, or models show live remaining",
+    "Reusing handle_quota_deferral for rung-only exhaustion",
+    "Collapsing dual Anthropic I/O predicates onto one flag",
+    "Undoing Fable CLI 3600 skip of usage_gate / probe_rate_limit_lifted",
+    "quota.rs importing runners, clap, or SQLite",
+    "Tests that require live Anthropic network or real ~/.claude credentials",
+    "Driving `loop run` / `batch run` (verify-task-mgr refuses; `loop run --help` is the safe probe)",
+    "Inventing a second verification harness",
+    "Manual edits to tasks/*.json for status (use task-mgr CLI / task-status tags)",
+    "unwrap() in production paths",
+    "Catch-all error handlers that swallow context",
+    "Editing tasks/quota-rung-policy-pr3.json or tasks/quota-rung-policy-PR-3-review.md"
+  ],
+  "project": "task-mgr",
+  "requires": [],
+  "reviewGuidelines": {
+    "priorityGuidelines": {
+      "critical": "1-10: Blocks further work, fix immediately",
+      "high": "11-20: Fix before phase completion",
+      "low": "51-99: Defer to hardening phase",
+      "medium": "21-50: Fix in current phase if time permits"
+    }
+  },
+  "taskPrefix": "a593d39e",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "Precise interface: extra_mark_rungs_matching(models, provider, identities: impl IntoIterator<Item = &str>) -> Vec<(Provider, CapabilityTier)> OR call once per member of I and union; canonical_model_for_hud_tier in usage.rs; ingest_named_sibling unlabeled → rungs: None; grep-verified against landed extra_mark_rungs (usage.rs:571) / ingest_named_sibling (usage.rs:352) / exact_model_for (model.rs:858) / FABLE_MODEL / OPUS_MODEL",
+        "Edge cases: Fable HUD + frontier→opus pin (no scope.model.id) → frontier not standard; Opus HUD + snapshot id + same pin → standard and frontier; Opus HUD no pin → standard only; unlabeled seven_day_opus/sonnet rungs None; live-shaped evaluate+apply unavailable {frontier} only, factory Proceed; HUD tokens only in usage.rs",
+        "Invariants: I is always family constant plus id when present; always include HUD primary; Claude rungs only (do not iterate Grok/Codex); string equality of exact_model_for against any I, not substring tier_of, not exact_model_for(mapped_rung); named siblings without scope.model never call map_unlabeled_token for rungs; limits[] unlabeled ids (id, no display_name) still use map_unlabeled_token",
+        "Known-bad discriminators: (1) extra-mark via exact_model_for(mapped_rung) so Fable HUD + pin marks standard; (2) prefer scope.model.id over the constant so Opus HUD id claude-opus-5-SNAPSHOT + pin fails to extra-mark frontier; (3) single identity: &str of 'id or family constant'; (4) family-token-map seven_day_opus onto standard; (5) apply-only live-shaped fixture without snapshot/exclude",
+        "Failure modes: missing family constant → Opus snapshot pin hole; missing snapshot id in I → only hurts if config stored the snapshot (still include it); unlabeled named sibling mapped → mixed work quota-emptied; HUD tokens copied into quota.rs/model.rs → REVIEW grep fails",
+        "Alternatives considered: (a) prefer snapshot id over constant — rejected (kills Opus+pin on SNAPSHOT ids); (b) extra-mark vs mapped rung's configured model — rejected (Fable HUD parks standard after the pin); (c) drop seven_day_* from ingest — rejected (no allow-list; kind still matches explicit onLow rules)",
+        "Downstream impact: FEAT-008 (identity union), FEAT-009 (unlabeled rungs None + live-shaped snapshot/exclude), FIX-010 (wait_probe_lifted uses buckets_for_run_models), FIX-012 remaining banner, PR-3 walker (must not reintroduce mapped-rung extra-mark; must not loop until this is green)",
+        "Contract text recorded: full copy-pasteable definition in the progress log under ## CONTRACT-002 so dependents can read it without re-exploration. Optional one-liner in src/loop_engine/CLAUDE.md — pin-recipe prose is DOCS-001"
+      ],
+      "dependsOn": [],
+      "description": "Design-only. Record in the progress log the stable CONTRACT-002 that FEAT-008/FEAT-009 implement and that PR-3 walker/TTL/inherit must not loop until green. Extra-mark is HUD-family identity UNION: after HUD maps display_name/id → rung R, identity set I = ALWAYS the built-in family constant for that HUD tier (FABLE_MODEL/OPUS_MODEL/SONNET_MODEL/HAIKU_MODEL via canonical_model_for_hud_tier in usage.rs, use from model.rs) PLUS scope.model.id when present. Extra-mark every defined Claude rung whose exact_model_for equals any I. Always include HUD primary. Do NOT prefer snapshot id over the constant. Not exact_model_for(mapped_rung) after operator pins. Helper takes an identity SET (call once per member of I and union) — not a single identity: &str of 'id or family constant.' Fable HUD + set-tier claude frontier <opus> → frontier ONLY. Opus HUD + same pin including id claude-opus-5-SNAPSHOT → standard AND frontier. Opus HUD, no pin → standard only. Unlabeled named siblings (seven_day_opus / seven_day_sonnet without scope.model): still ingested (no allow-list), kind may be weekly_scoped, rungs: None — must NOT family-token-map onto standard/cost-efficient. HUD tokens stay in usage.rs. Output remains (Provider, CapabilityTier). Downstream: FEAT-008, FEAT-009, FIX-010 (buckets_for_run_models), FIX-012 banner, PR-3 down-only walker (must not reintroduce mapped-rung extra-mark).",
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "Contract allows prefer-id or exact_model_for(mapped_rung)",
+          "expectedBehavior": "FEAT-008 Fable+pin inverse and Opus+snapshot fixtures cannot both pass; known-bad must fail the contract"
+        }
+      ],
+      "id": "CONTRACT-002",
+      "invariants": [
+        "Identity set I = always family constant plus scope.model.id when present",
+        "Unlabeled named siblings have rungs: None"
+      ],
+      "modifiesBehavior": false,
+      "notes": "Do not write production code or full test suites. Implementation SSoT is worktree feat-quota-rung-policy-pr2 / main dacccb3 (has quota.rs) — NOT the feat/quota-rung-policy-pr1 checkout. Relocate every consumer line number on that tree. Landed extra_mark_rungs (usage.rs:571) keys on exact_model_for(primary) — that is the hole. Landed ingest_named_sibling (usage.rs:369) calls map_unlabeled_token — that is the unlabeled hole. Sidecar tasks/quota-rung-policy-PR-3-review.md is superseded; do not author from it. Learning [5430]/[5409]: evaluate stays pure. Learning [5361]: do not re-fold scoped windows into an account wait. Learning [4481]: no model ids in engine state.",
+      "passes": false,
+      "priority": 1,
+      "qualityDimensions": [
+        "Contract unambiguous enough that FEAT-008 and FEAT-009 cannot disagree on identity set vs prefer-id vs mapped-rung extra-mark",
+        "Rung language only in the decision layer; HUD Fable→frontier and family constants live only in the ingest adapter",
+        "PR-3 walker can clamp onto standard after Fable-low because the proto-channel does not contain standard",
+        "Pin is harmful until FEAT-008 (code) is green, not until this progress-log contract exists; after FEAT-008 pin is optional, not required"
+      ],
+      "requiresHuman": false,
+      "taskType": "contract",
+      "title": "Define HUD-family extra-mark identity union + unlabeled named rungs: None",
+      "touchesFiles": [
+        "src/loop_engine/usage.rs",
+        "src/loop_engine/CLAUDE.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "After HUD maps display_name/id → rung R, identity set I = always the built-in family constant for that HUD tier plus scope.model.id when present. Always include HUD primary. Do not prefer snapshot id over the constant. Not exact_model_for(R) on the run config",
+        "pub(crate) extra_mark_rungs_matching(models, provider, identities: impl IntoIterator<Item = &str>) -> Vec<(Provider, CapabilityTier)> (or call once per member of I and union). Extra-mark every defined Claude rung where exact_model_for(provider, tier) equals any I. Do not iterate Grok/Codex",
+        "Fixture: frontier configured = opus, Fable 95% (no scope.model.id, display_name Fable / Current week (Fable)) → rungs contain frontier, NOT standard. Same under live-shaped Fable limits[] row with the pin",
+        "Fixture: frontier configured = opus, Opus 95% + id: \"claude-opus-5-SNAPSHOT\" → rungs contain standard AND frontier. Existing ingest_extra_mark_after_frontier_pin_marks_standard_and_frontier (Opus HUD, no id) still passes",
+        "Fixture: no pin, Opus 95% → standard only (ingest_hud_only_without_pin_leaves_frontier_unmarked_on_opus stays)",
+        "Production gate still re-ingests with run ResolvedModelsConfig: buckets_for_run_models and remaining_banner_for_run_models (WIRE-FIX-001 / CODE-FIX-007 tests still pass for Opus+pin). Discriminator: HUD-only / mapped-rung extra-mark after set-tier frontier=opus leaves Fable HUD marking standard",
+        "quota.rs / engine.rs still have no fable / opus / claude-fable-5 literals. HUD tokens only in usage.rs. canonical_model_for_hud_tier lives in usage.rs and uses FABLE_MODEL/OPUS_MODEL/SONNET_MODEL/HAIKU_MODEL from model.rs"
+      ],
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/loop_engine/usage.rs",
+            "impact": "BREAKS",
+            "line": 571,
+            "mitigation": "Replace with identity-set union (family constant plus snapshot id). Fable HUD + pin must mark frontier only",
+            "usage": "extra_mark_rungs keys on exact_model_for(provider, primary) then marks every defined rung sharing that string"
+          },
+          {
+            "file": "src/loop_engine/usage.rs",
+            "impact": "BREAKS",
+            "line": 544,
+            "mitigation": "Pass family constant plus model_id into the helper. Always include HUD primary",
+            "usage": "map_scope_to_rungs HUD path calls extra_mark_rungs(models, provider, tier) and drops model_id"
+          },
+          {
+            "file": "src/loop_engine/usage.rs",
+            "impact": "OK",
+            "line": 862,
+            "mitigation": "Keep WIRE-FIX-001; extra-mark identity flows through ingest_oauth_value",
+            "usage": "buckets_for_run_models re-ingests oauth_json with run ResolvedModelsConfig"
+          },
+          {
+            "file": "src/loop_engine/usage.rs",
+            "impact": "OK",
+            "line": 894,
+            "mitigation": "Keep CODE-FIX-007; Fable HUD under pin must label frontier not standard",
+            "usage": "remaining_banner_for_run_models rebuilds banner from run models"
+          }
+        ],
+        "semanticDistinctions": [
+          {
+            "context": "Extra-mark after pin, Fable HUD",
+            "currentBehavior": "Mapped-rung extra-mark parks standard",
+            "requiredBehavior": "Frontier only (HUD-family identity)"
+          },
+          {
+            "context": "Extra-mark after pin, Opus HUD including snapshot id",
+            "currentBehavior": "Marks standard+frontier only when id is omitted or equals OPUS_MODEL",
+            "requiredBehavior": "Standard and frontier even when id is claude-opus-5-SNAPSHOT"
+          }
+        ]
+      },
+      "dependsOn": [
+        "CONTRACT-002"
+      ],
+      "description": "PRE-PR-3 / US-008 / FR-003 steps 3. Replace landed extra_mark_rungs (usage.rs:571) which keys on exact_model_for(mapped_rung). After HUD maps display_name/id → rung R, build identity set I = always canonical_model_for_hud_tier(R) (FABLE_MODEL/OPUS_MODEL/SONNET_MODEL/HAIKU_MODEL) plus scope.model.id when present. Extra-mark every defined Claude rung whose exact_model_for equals any I (string equality, not substring tier_of, not model_for). Always include HUD primary. Do not iterate Grok/Codex. Helper takes identities: impl IntoIterator<Item = &str> (or call once per member and union) — not a single identity: &str. Do not prefer snapshot id over the constant. Production gate still re-ingests via buckets_for_run_models / remaining_banner_for_run_models with run ResolvedModelsConfig (WIRE-FIX-001 / CODE-FIX-007 stay). HUD tokens stay in hud_tier_from_label. Do not change parse_oauth_usage_json signature. Unlabeled named siblings are FEAT-009.",
+      "edgeCases": [
+        "Frontier remapped to standard's model (set-tier claude frontier <opus>): Fable HUD + pin → frontier only; Opus HUD + pin including snapshot id → standard and frontier; Opus HUD, no pin → standard only"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "extra_mark_rungs still uses exact_model_for(primary)",
+          "expectedBehavior": "Fable+pin inverse test fails — rungs contain standard"
+        },
+        {
+          "cause": "Prefer scope.model.id over FABLE_MODEL/OPUS_MODEL",
+          "expectedBehavior": "Opus HUD id claude-opus-5-SNAPSHOT + pin does not extra-mark frontier"
+        }
+      ],
+      "id": "FEAT-008",
+      "invariants": [
+        "I always contains the family constant; snapshot id is additional",
+        "Output is (Provider, CapabilityTier) never a model id"
+      ],
+      "modifiesBehavior": true,
+      "notes": "Implement against ## CONTRACT-002 in the progress log. Landed line numbers: extra_mark_rungs usage.rs:571; map_scope_to_rungs usage.rs:544; ingest_oauth_value usage.rs:318. Constants: FABLE_MODEL=claude-fable-5, OPUS_MODEL=claude-opus-5 (model.rs). Reuse models_with_frontier_pinned_to_standard() in usage.rs tests. Do not implement unlabeled named rungs: None (FEAT-009). Do not add models param to parse_oauth_usage_json. Learning [5475]: remaining banner uses run ResolvedModelsConfig. Learning [4481]: no model ids in quota.rs/engine.rs. Drive `.claude/skills/verify-task-mgr/SKILL.md` only as `$H capture loop-help -- loop run --help` (must NOT list --use-other-models-ttl); extra-mark is unit-proven. Compile/unit tests alone are not proof that help stayed clean — capture the help artifact.",
+      "passes": false,
+      "priority": 2,
+      "qualityDimensions": [
+        "Identity union, not prefer-id, not exact_model_for(mapped_rung)",
+        "Fable HUD + pin must not park standard — that is the 1:10 for PR-3 clamp",
+        "Opus HUD + snapshot id + pin still extra-marks frontier",
+        "Decision layer speaks rungs only; HUD tokens only in usage.rs",
+        "String equality of exact_model_for against I, not substring tier_of",
+        "No unwrap on JSON; skip malformed buckets",
+        "Usage fetch remains once per sequential iteration / once per wave — this task does not add a GET"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "HUD-family extra-mark identity union (Fable+pin frontier only)",
+      "touchesFiles": [
+        "src/loop_engine/usage.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "ingest_named_sibling does not call map_unlabeled_token to fill rungs. Unlabeled named keys → rungs: None. Discriminator: landed usage.rs:369–380 still maps seven_day_opus → standard",
+        "Keys are still walked (no window-name allow-list). kind may still be weekly_scoped for explicit onLow rules by kind. limits[] unlabeled ids (id, no display_name) still use map_unlabeled_token",
+        "ingest_live_fixture_emits_all_siblings_and_limits STOPS asserting opus→Standard / sonnet→CostEfficient rungs; asserts rungs.is_none() instead. seven_day_opus / seven_day_sonnet remain in the sibling walk",
+        "evaluate_quota(ingest(live_shaped_oauth_json()), default, 8).unavailable == {(Claude, Frontier)} only — with AND without the frontier→opus pin (depends on FEAT-008 identity). apply_quota factory → Proceed, not Stop / HorizonStopped",
+        "compute_remaining_work_snapshot of medium+high Claude todos (reuse snapshot_seed_conn / pre_spawn seed_conn pattern: t-frontier high + t-standard medium) → other_rungs_runnable: true; replace_unavailable_rungs then compute_quota_excluded_ids excludes high/frontier ids and does NOT exclude a medium/standard id — with AND without the pin. Apply-only fixture is not enough (architect rev 5)",
+        "Live seven_day_sonnet utilization 1.0 still Ignore (existing parse / evaluate unknown-kind tests stay). nimbus_quill stays Ignore"
+      ],
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/loop_engine/usage.rs",
+            "impact": "BREAKS",
+            "line": 352,
+            "mitigation": "rungs: None. Do not call map_unlabeled_token. Keep kind weekly_scoped for seven_day_*",
+            "usage": "ingest_named_sibling family-token-maps weekly_scoped / seven_day_* via map_unlabeled_token"
+          },
+          {
+            "file": "src/loop_engine/usage.rs",
+            "impact": "BREAKS",
+            "line": 2100,
+            "mitigation": "Assert rungs.is_none(); keep ids in the walk",
+            "usage": "ingest_live_fixture asserts seven_day_opus → Standard and seven_day_sonnet → CostEfficient"
+          },
+          {
+            "file": "src/loop_engine/reactions/account.rs",
+            "impact": "NEEDS_REVIEW",
+            "line": 1701,
+            "mitigation": "With unavailable {frontier} only, medium/standard todos keep other_rungs_runnable true — with and without pin",
+            "usage": "compute_remaining_work_snapshot treats tier ∈ unavailable_preview as not runnable"
+          },
+          {
+            "file": "src/loop_engine/reactions/pre_spawn.rs",
+            "impact": "NEEDS_REVIEW",
+            "line": 314,
+            "mitigation": "After replace, high/frontier excluded; medium/standard not excluded — with and without pin. Empty provider_blackouts is the production case",
+            "usage": "compute_quota_excluded_ids excludes todos whose resolved (provider, tier) is in proto-channel"
+          }
+        ],
+        "semanticDistinctions": [
+          {
+            "context": "seven_day_opus named key",
+            "currentBehavior": "Rung-unavailable Standard",
+            "requiredBehavior": "rungs: None; Ignore unless explicit rule"
+          },
+          {
+            "context": "limits[] unlabeled id with no display_name",
+            "currentBehavior": "map_unlabeled_token against configured model string",
+            "requiredBehavior": "Keep that path (FR-003 step 2) — named siblings are the only cut"
+          }
+        ]
+      },
+      "dependsOn": [
+        "CONTRACT-002",
+        "FEAT-008"
+      ],
+      "description": "PRE-PR-3 / US-009 / FR-003 step 4. ingest_named_sibling (usage.rs:352) currently family-token-maps seven_day_opus / seven_day_sonnet onto standard / cost-efficient via map_unlabeled_token. Stop calling map_unlabeled_token for named siblings without scope.model. Keys are still walked (no window-name allow-list). kind may still be weekly_scoped for explicit onLow rules. rungs: None. limits[] unlabeled ids (model id, no display_name) still use map_unlabeled_token. Canonical live_shaped_oauth_json() evaluate+apply → unavailable {(Claude, Frontier)} only, factory Proceed. Architect rev 5: apply-only is not enough — compute_remaining_work_snapshot of medium+high Claude todos → other_rungs_runnable true; compute_quota_excluded_ids after replace excludes high/frontier ids and does not exclude a medium/standard id — WITH and WITHOUT the frontier→opus pin. Promote live_shaped_oauth_json to pub(crate) so account.rs / pre_spawn.rs tests share the fixture.",
+      "edgeCases": [
+        "Named seven_day_opus / seven_day_sonnet in the JSON: still ingested, rungs None, must not family-token-map onto standard/cost-efficient; live-shaped evaluate+apply → unavailable {frontier} only, factory Proceed"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Keep map_unlabeled_token on seven_day_opus",
+          "expectedBehavior": "evaluate unavailable includes standard; medium todo excluded — snapshot/exclude tests fail"
+        },
+        {
+          "cause": "Apply-only live-shaped Proceed without exclude test",
+          "expectedBehavior": "Architect rev 5: mixed work may still be selected-out; exclude test must fail"
+        }
+      ],
+      "id": "FEAT-009",
+      "invariants": [
+        "Unlabeled named siblings never call map_unlabeled_token for rungs",
+        "Live-shaped unavailable is frontier only even after frontier→opus pin"
+      ],
+      "modifiesBehavior": true,
+      "notes": "Data: named sibling key seven_day_opus has no scope.model — do not call map_unlabeled_token. limits[] row uses limit[\"scope\"][\"model\"][\"display_name\"] / [\"id\"]. Promote live_shaped_oauth_json to pub(crate) (cfg(test) is OK) so account.rs snapshot tests and pre_spawn.rs exclude tests share it — do not copy the fixture. Reuse snapshot_seed_conn / pre_spawn seed_conn (t-frontier high, t-standard medium). Learning [5463]: proto-channel replace-on-evaluate. Learning [5457]: do not narrow snapshot to different-provider-only. Learning [5430]: evaluate stays pure. Drive verify-task-mgr `$H capture loop-help -- loop run --help` only; snapshot/exclude are unit-proven.",
+      "passes": false,
+      "priority": 3,
+      "qualityDimensions": [
+        "No window-name allow-list; unlabeled named siblings still ingest",
+        "rungs: None means evaluate does not mark standard/cost-efficient unavailable from vestigial keys",
+        "Live-shaped mixed work proceeds (factory exclude), proven at snapshot AND exclude, not apply-only",
+        "With the pin, Fable HUD still must not poison standard (FEAT-008 identity)",
+        "evaluate_quota stays pure; apply owns Proceed vs Stop",
+        "No unwrap on JSON"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Unlabeled seven_day_* rungs None + live-shaped snapshot/exclude",
+      "touchesFiles": [
+        "src/loop_engine/usage.rs",
+        "src/loop_engine/reactions/account.rs",
+        "src/loop_engine/reactions/pre_spawn.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Keep post-output WaitFn = Fn(u64) -> bool unchanged (account.rs:181). UsageGateFn stays (u8, &Path, u64) (account.rs:58). Fable CLI 3600 skip of usage_gate / probe_rate_limit_lifted untouched (learning 5366)",
+        "QuotaAccountAction::Wait { secs, account_binding } with account_binding = has_account_binding_wait (account.rs:1213). Mixed session+scoped = true (probe account remaining; next apply re-parks scoped). Exhaustive match of Wait at execute_quota_account_action (account.rs:1656) and all apply tests",
+        "Pure wait_probe_lifted(info, floor, account_binding, models) -> bool. Account-binding: usage_suggests_lifted (today). Scoped-only: buckets_for_run_models; lift iff every bucket with nonempty rungs has percent remaining > floor or is missing. No evaluate_quota. No extra GET beyond the existing probe load_usage_info_with_threshold. Prefer usage.rs next to usage_suggests_lifted / buckets_for_run_models",
+        "Production wrappers pass Wait.account_binding into wait_probe_lifted AFTER apply. Move probe construction out of account_quota_preflight (account.rs:1575–1588) into account_quota_preflight_inner / execute_quota_account_action after apply. Thread models onto QuotaPreflightParams (account.rs:1398; exhaustive destructure, all _inner tests). Ask / org-fallback waits keep today's account remaining probe",
+        "Hermetic wait_probe_lifted with UsageInfo { oauth_json: Some(live_shaped), percentage: 45, .. } is false for scoped-only. Same + scoped Fable remaining 50% may be true. No 30s wall clock, no live Anthropic",
+        "Production wrapper / _inner test: scoped-only Wait { account_binding: false } + UsageInfo { percentage: 45, oauth_json: live_shaped } must NOT lift. Keep post-output WaitFn as Fn(u64) (do not widen WaitFn / UsageGateFn)",
+        "Wait { secs: 0, .. } stays ready-now (CODE-FIX-004). .stop during the wait still returns StopSignaled / operator stop"
+      ],
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/loop_engine/reactions/account.rs",
+            "impact": "BREAKS",
+            "line": 1079,
+            "mitigation": "Add account_binding = has_account_binding_wait. Mixed session+scoped = true",
+            "usage": "QuotaAccountAction::Wait { secs: u64 } has no account_binding"
+          },
+          {
+            "file": "src/loop_engine/reactions/account.rs",
+            "impact": "BREAKS",
+            "line": 1572,
+            "mitigation": "Build wait_probe_lifted AFTER apply using Wait.account_binding. Known-bad: week 45% lifts scoped Wait",
+            "usage": "account_quota_preflight builds wait closure with usage_suggests_lifted BEFORE apply"
+          },
+          {
+            "file": "src/loop_engine/reactions/account.rs",
+            "impact": "BREAKS",
+            "line": 1656,
+            "mitigation": "Pass account_binding into wait_probe_lifted. Keep WaitFn as Fn(u64) for the sleep itself",
+            "usage": "execute_quota_account_action matches Wait { secs } and calls WaitFn(secs)"
+          },
+          {
+            "file": "src/loop_engine/reactions/account.rs",
+            "impact": "OK",
+            "line": 181,
+            "mitigation": "Do not change this type. Preflight probe is a different closure built after apply",
+            "usage": "WaitFn = Fn(u64) -> bool used by post-output react_to_outputs_inner"
+          }
+        ],
+        "semanticDistinctions": [
+          {
+            "context": "Scoped Wait + week 45% left",
+            "currentBehavior": "Probe lifts on UsageInfo.percentage",
+            "requiredBehavior": "Do not lift (wait-driving probe on nonempty-rungs buckets)"
+          },
+          {
+            "context": "Account-binding Wait + week 45% left",
+            "currentBehavior": "usage_suggests_lifted",
+            "requiredBehavior": "Keep usage_suggests_lifted"
+          },
+          {
+            "context": "Fable CLI 3600 post-output",
+            "currentBehavior": "No usage_gate, no probe",
+            "requiredBehavior": "Unchanged (WaitFn stays Fn(u64))"
+          }
+        ]
+      },
+      "dependsOn": [
+        "FEAT-008",
+        "FEAT-009"
+      ],
+      "description": "PRE-PR-3 / US-010 / FR-009. Keep post-output WaitFn = Fn(u64) -> bool UNCHANGED (Fable CLI 3600 skip untouched; UsageGateFn stays (u8, &Path, u64)). Preflight: QuotaAccountAction::Wait { secs, account_binding } with account_binding = has_account_binding_wait already computed at apply (account.rs:1213; mixed session+scoped = true: probe account remaining; next apply re-parks scoped). Pure wait_probe_lifted(info, floor, account_binding, models) built AFTER apply. Production account_quota_preflight_inner / execute_quota_account_action MUST pass Wait.account_binding into wait_probe_lifted after apply. Landed account_quota_preflight (account.rs:1572) still builds usage_suggests_lifted BEFORE apply — known-bad. Thread models onto QuotaPreflightParams (exhaustive; all _inner tests). RunAccountQuotaGateParams already has models (account.rs:1432) — thread through. Account-binding: usage_suggests_lifted. Scoped-only: buckets_for_run_models; lift iff every nonempty-rungs bucket remaining > floor or missing. No evaluate_quota. No extra GET. Ask / org-fallback waits keep today's account remaining probe. Wait { secs: 0, .. } stays ready-now (CODE-FIX-004). .stop during the wait still StopSignaled.",
+      "edgeCases": [
+        "Reset in 6h (5h-to-12h band), only frontier work left: scoped-only Wait must not lift on week 45% left; account-binding Wait may keep usage_suggests_lifted on UsageInfo.percentage; Fable CLI 3600 still skips probe; genuine scoped recovery (Fable HUD now 50% left) may lift"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "Leave usage_suggests_lifted closed over in account_quota_preflight before apply",
+          "expectedBehavior": "Scoped 6h Wait lifts on week 45% in ~30s; wrapper test must fail"
+        },
+        {
+          "cause": "Widen WaitFn to pass account_binding / models into post-output react_to_outputs",
+          "expectedBehavior": "Fable 3600 skip gains a usage probe — WaitFn type check / Fable skip tests fail"
+        }
+      ],
+      "id": "FIX-010",
+      "invariants": [
+        "Post-output WaitFn is Fn(u64)",
+        "Scoped-only probe never uses UsageInfo.percentage / usage_suggests_lifted"
+      ],
+      "modifiesBehavior": true,
+      "notes": "Landed known-bad: account_quota_preflight (account.rs:1575) closes usage_suggests_lifted before apply. has_account_binding_wait already exists at apply (account.rs:1213). QuotaPreflightParams (account.rs:1398) lacks models — RunAccountQuotaGateParams already has models (account.rs:1432); thread it. Reuse pub(crate) live_shaped_oauth_json from FEAT-009. Learning [5366]: Fable skip of usage_gate/probe. Learning [5469]: HorizonStopped ≠ StopSignaled. Learning [5376]/[5395]: no load_usage_info from tests without seams. Drive verify-task-mgr loop run --help only.",
+      "passes": false,
+      "priority": 4,
+      "qualityDimensions": [
+        "Scoped cap-and-repark is not undone by healthy week remaining",
+        "Post-output WaitFn / UsageGateFn unchanged — Fable 3600 skip must not gain a usage probe",
+        "wait_probe_lifted is pure; no evaluate_quota; no extra GET",
+        "Mixed session+scoped is account_binding true",
+        "Follow existing reaction coordinators: production entry + hermetic _inner + exhaustive param destructure (no `..`)",
+        "No 30s wall-clock tests; no live Anthropic"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Wait-driving probe after apply (scoped-only must not lift on week remaining)",
+      "touchesFiles": [
+        "src/loop_engine/usage.rs",
+        "src/loop_engine/reactions/account.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Split AccountReaction::{OperatorStopped, StopSpend}; delete Stop. Exhaustive match at iteration.rs:874 and wave_scheduler.rs:1101. react_to_outputs_inner (account.rs:606) StopSpend arm and wait-false arm emit the new variants. reaction_parity.rs AccountReaction::Stop asserts updated",
+        "OperatorStopped: same triple as pre-gate usage-wait .stop — sequential Empty + operator_stopped true → orchestrator exit 0 + was_stopped true (orchestrator.rs:714). Wave: was_stopped true, exit 0, reason \"stop signal during rate-limit wait\" (not 130). Not RateLimit + operator_stopped",
+        "StopSpend: sequential Empty + operator_stopped false + should_stop (HorizonStopped-shaped, not RateLimit _ exit 1). Wave: was_stopped false, exit 0, reason \"usage/spend limit\", not 130. --chain may still abort on !prd_complete (PR-3 inherit — do not implement account_quota_stopped)",
+        "Spend scan BEFORE prefer-rung-scoped decide_item: if any RateLimit item is_spend_limit_message and api_secs.is_none() → StopSpend. Mixed Fable+spend: wrapper skip forces api_secs = None so StopSpend wins. Mixed Fable + hit your limit · resets 4pm (non-spend): still prefer Fable Wait 3600, no Blackout",
+        "Wrapper parity test per path (known-bad: wave StopSpend → 130). Inner tests + tests/reaction_parity.rs. Learning [5150] parity auditor. Horizon/Deferred/StopSpend/rung-only empty are not operator stop"
+      ],
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/loop_engine/iteration.rs",
+            "impact": "BREAKS",
+            "line": 874,
+            "mitigation": "Exhaustive match. OperatorStopped → Empty + operator_stopped true (copy pre-gate StopSignaled triple at iteration.rs:149). StopSpend → Empty + operator_stopped false + should_stop (copy HorizonStopped at iteration.rs:166)",
+            "usage": "if reaction == AccountReaction::Stop → IterationOutcome::RateLimit, should_stop true, operator_stopped false"
+          },
+          {
+            "file": "src/loop_engine/wave_scheduler.rs",
+            "impact": "BREAKS",
+            "line": 1101,
+            "mitigation": "OperatorStopped: was_stopped true, exit 0, same reason. StopSpend: was_stopped false, exit 0, reason usage/spend limit",
+            "usage": "AccountReaction::Stop → terminal exit 130, was_stopped true, reason stop signal during rate-limit wait"
+          },
+          {
+            "file": "src/loop_engine/orchestrator.rs",
+            "impact": "OK if wrappers emit Empty",
+            "line": 714,
+            "mitigation": "Do not send RateLimit + should_stop for these reactions. Do not change orchestrator inherit (PR-3)",
+            "usage": "Empty + operator_stopped → exit 0 was_stopped; Empty → quota soft-stop exit 0; _ → exit 1"
+          },
+          {
+            "file": "src/loop_engine/reactions/account.rs",
+            "impact": "BREAKS",
+            "line": 585,
+            "mitigation": "Spend scan of ANY RateLimit item before prefer-rung-scoped",
+            "usage": "prefer-rung-scoped decide_item then decide_account_rate_limit on that item only"
+          },
+          {
+            "file": "tests/reaction_parity.rs",
+            "impact": "BREAKS",
+            "line": 579,
+            "mitigation": "Split asserts; add wrapper parity per path",
+            "usage": "AccountReaction::Stop asserts for .stop during wait and spend-stop"
+          }
+        ],
+        "semanticDistinctions": [
+          {
+            "context": ".stop during 3600",
+            "currentBehavior": "Seq RateLimit operator_stopped false (exit 1); wave exit 130 was_stopped true",
+            "requiredBehavior": "OperatorStopped: Empty + operator_stopped true; wave exit 0 was_stopped true"
+          },
+          {
+            "context": "StopSpend",
+            "currentBehavior": "Same Stop variant; wave looks like SIGINT",
+            "requiredBehavior": "Empty + operator_stopped false; wave exit 0 reason usage/spend limit"
+          }
+        ]
+      },
+      "dependsOn": [
+        "CONTRACT-002"
+      ],
+      "description": "PRE-PR-3 / US-011 / FR-010. Split AccountReaction::{OperatorStopped, StopSpend}; DELETE Stop. Exhaustive match at iteration.rs:874 (today == Stop, not a match) and wave_scheduler.rs:1101. OperatorStopped uses the pre-gate .stop triple (iteration.rs:149–164): sequential Empty + operator_stopped true → orchestrator (orchestrator.rs:714) exit 0 + was_stopped true. Wave: was_stopped true, exit 0 (NOT 130), reason \"stop signal during rate-limit wait\". NOT RateLimit + operator_stopped — that arm does not set was_stopped (orchestrator.rs:730 _ → exit 1). StopSpend: sequential Empty + operator_stopped false + should_stop (HorizonStopped-shaped, iteration.rs:166–183; orchestrator.rs:720 quota soft-stop exit 0). Wave: was_stopped false, exit 0, reason \"usage/spend limit\", not 130. --chain may still abort on !prd_complete (PR-3 inherit — document, do not implement). Spend scan BEFORE prefer-rung-scoped decide_item (account.rs:585): if ANY RateLimit item is_spend_limit_message and api_secs.is_none() → StopSpend. Mixed Fable+spend: wrapper skip forces api_secs = None so StopSpend wins. Mixed Fable + hit your limit · resets 4pm (non-spend): still prefer Fable Wait 3600, no Blackout. Update reaction_parity.rs AccountReaction::Stop asserts. Wrapper parity test per path (known-bad: wave StopSpend → 130).",
+      "edgeCases": [
+        ".stop during Fable 3600 vs StopSpend (seq/wave): OperatorStopped was_stopped=true exit 0; StopSpend was_stopped=false wave not exit 130; Horizon/Deferred/rung-only empty are not operator stop",
+        "Mixed wave: Fable RateLimit + spend/credits RateLimit → StopSpend wins (stop loop, no 3600, no Blackout). Fable still wins 3600 vs Blackout when no spend sibling"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "Map OperatorStopped onto RateLimit + operator_stopped",
+          "expectedBehavior": "orchestrator _ arm exit 1; was_stopped stays false — wrapper test must fail"
+        },
+        {
+          "cause": "Keep wave match Stop → exit 130 for StopSpend",
+          "expectedBehavior": "Credits-stop looks like SIGINT; known-bad wave StopSpend → 130 test must fail"
+        },
+        {
+          "cause": "Prefer-rung-scoped decide_item before spend scan",
+          "expectedBehavior": "Mixed Fable+spend Wait 3600; StopSpend-wins test must fail"
+        }
+      ],
+      "id": "FIX-011",
+      "invariants": [
+        "AccountReaction::Stop does not exist",
+        "OperatorStopped is Empty + operator_stopped true; StopSpend is Empty + operator_stopped false"
+      ],
+      "modifiesBehavior": true,
+      "notes": "Pre-gate triples to copy: StopSignaled → Empty/operator_stopped true (iteration.rs:149); HorizonStopped → Empty/operator_stopped false (iteration.rs:166). RateLimitAction::StopSpend already exists (account.rs:203) — this task splits the AccountReaction mapping, not RateLimitAction. Learning [5373]: wave exit 130 vs seq exit 1 is the bug this fixes. Learning [5469]: HorizonStopped ≠ StopSignaled. Learning [4126]/[4868]/[5075]: exhaustive destructure, once-per-wave, shared coordinators. Learning [5150]: parity auditor. Do not implement LoopResult.account_quota_stopped / batch --chain inherit (PR-3). Drive verify-task-mgr loop run --help only.",
+      "passes": false,
+      "priority": 5,
+      "qualityDimensions": [
+        "Seq and wave produce the same OperatorStopped vs StopSpend meaning for the same reaction",
+        "Exhaustive match (no == Stop leftover); exhaustive AccountReactionParams destructure stays (no `..`)",
+        "Wave StopSpend must not look like SIGINT (exit 130)",
+        "Prefer-rung-scoped must not skip sibling StopSpend",
+        "ui::* for operator lines; tracing for diagnostics",
+        "Do not implement batch --chain inherit / account_quota_stopped (PR-3)"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Split AccountReaction OperatorStopped vs StopSpend (seq Empty; wave exit 0)",
+      "touchesFiles": [
+        "src/loop_engine/reactions/account.rs",
+        "src/loop_engine/iteration.rs",
+        "src/loop_engine/wave_scheduler.rs",
+        "tests/reaction_parity.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "compute_remaining_work_snapshot sets has_review via is_frontier_class(&id) only (model.rs:240). Tests: MILESTONE-FINAL true, REFACTOR-REVIEW-FINAL false, claimed 8d71d1f7-CODE-REVIEW-1 true. Do not change prompt/core.rs contains(\"REVIEW\") in this slice. Do not reimplement prefix stripping",
+        "evaluate_one Ignores extra_usage / promotional / nimbus_quill BEFORE amount_exhausted AccountLow. Keep AccountLow at amount ≤ 0 only for spend / credits / dollars / tokens. Then drop extra_usage from is_spend_kind. Tests: extra_usage dollars 0 → Ignore; nimbus_quill dollars 0 → Ignore; spend dollars 0 → AccountLow + apply Stop. Discriminator: drop-from-is_spend_kind-only still Stops via account_low_is_amount_only",
+        "Reject LOOP_USAGE_REMAINING_MIN > 100 and usagePolicy.remainingMinPercent > 100 in preflight_validate_and_probe only (loop/batch), same chokepoint as LOOP_USAGE_THRESHOLD (project_config.rs:1065). Actionable error names LOOP_USAGE_REMAINING_MIN. Non-loop commands stay silent. u8 200 is the known-bad. Do not drive loop run to prove this — unit/preflight test only",
+        "Add models: &ResolvedModelsConfig to AccountReactionParams (exhaustive destructure at account.rs:473, iteration.rs:841, wave_scheduler.rs:1056, tests/reaction_parity.rs params()). check_and_wait gets run models via the react_to_outputs closure over params.models (remaining_banner_for_run_models when oauth_json is present) — not by widening WaitFn / UsageGateFn. Do not change fetch's builtin snapshot. Fable skip still does not call check_and_wait. Drive `.claude/skills/verify-task-mgr/SKILL.md`: `$H capture loop-help -- loop run --help` must NOT list --use-other-models-ttl; `$H capture models-show -- models show` is text-only and has no remaining percents"
+      ],
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/loop_engine/reactions/account.rs",
+            "impact": "BREAKS",
+            "line": 1742,
+            "mitigation": "has_review = is_frontier_class(&id) only",
+            "usage": "has_review = id.contains(\"REVIEW\") || id.contains(\"CODE-REVIEW\")"
+          },
+          {
+            "file": "src/loop_engine/quota.rs",
+            "impact": "BREAKS",
+            "line": 291,
+            "mitigation": "Ignore extra_usage/promotional/nimbus_quill BEFORE this arm",
+            "usage": "amount_exhausted && !rung_scoped → AccountLow (extra_usage dollars 0 hits this)"
+          },
+          {
+            "file": "src/loop_engine/reactions/account.rs",
+            "impact": "BREAKS",
+            "line": 1344,
+            "mitigation": "Drop extra_usage AFTER evaluate Ignore is in place",
+            "usage": "is_spend_kind includes extra_usage"
+          },
+          {
+            "file": "src/loop_engine/project_config.rs",
+            "impact": "BREAKS",
+            "line": 1062,
+            "mitigation": "Also reject remaining-min > 100 (env + usagePolicy.remainingMinPercent). Error names LOOP_USAGE_REMAINING_MIN",
+            "usage": "preflight_validate_and_probe hard-errors LOOP_USAGE_THRESHOLD only"
+          },
+          {
+            "file": "src/loop_engine/reactions/account.rs",
+            "impact": "BREAKS",
+            "line": 430,
+            "mitigation": "Close over params.models in react_to_outputs; remaining_banner_for_run_models when oauth_json present. Do not change UsageGateFn",
+            "usage": "usage_gate |threshold, tasks_dir, fallback_wait| check_and_wait(...) — no models; check_and_wait prints usage.remaining_banner (builtin snapshot)"
+          }
+        ],
+        "semanticDistinctions": [
+          {
+            "context": "has_review",
+            "currentBehavior": "substring REVIEW",
+            "requiredBehavior": "is_frontier_class"
+          },
+          {
+            "context": "Spend remaining low extra_usage $0",
+            "currentBehavior": "AccountLow then apply Stop",
+            "requiredBehavior": "Ignore at evaluate even at $0"
+          },
+          {
+            "context": "Post-output check_and_wait banner",
+            "currentBehavior": "builtin remaining_banner snapshot",
+            "requiredBehavior": "run ResolvedModelsConfig when oauth_json present"
+          }
+        ]
+      },
+      "dependsOn": [
+        "FIX-010",
+        "FIX-011"
+      ],
+      "description": "PRE-PR-3 / US-012 / FR-011. Four sites, one task (under 10 files). (1) compute_remaining_work_snapshot has_review via is_frontier_class(&id) only (account.rs:1742 today id.contains REVIEW). Tests: MILESTONE-FINAL true, REFACTOR-REVIEW-FINAL false, claimed 8d71d1f7-CODE-REVIEW-1 true. Do not change prompt/core.rs contains(REVIEW) in this slice. Do not reimplement prefix stripping. (2) evaluate_one Ignores extra_usage / promotional / nimbus_quill BEFORE amount_exhausted AccountLow (quota.rs:291). Keep AccountLow at amount ≤ 0 only for spend / credits / dollars / tokens. THEN drop extra_usage from is_spend_kind (account.rs:1344). Dropping the name alone still Stops via account_low_is_amount_only. Tests: extra_usage dollars 0 → Ignore; nimbus_quill dollars 0 → Ignore; spend dollars 0 → AccountLow + apply Stop. (3) Reject LOOP_USAGE_REMAINING_MIN > 100 and usagePolicy.remainingMinPercent > 100 in preflight_validate_and_probe ONLY (project_config.rs:1062; loop/batch), same chokepoint as LOOP_USAGE_THRESHOLD. Actionable error names LOOP_USAGE_REMAINING_MIN. Non-loop commands stay silent. u8 200 is the known-bad. (4) Add models: &ResolvedModelsConfig to AccountReactionParams (exhaustive destructure). check_and_wait gets run models via the react_to_outputs CLOSURE over AccountReactionParams.models (remaining_banner_for_run_models when oauth_json is present) — NOT by widening post-output WaitFn / UsageGateFn (landed UsageGateFn stays (u8, &Path, u64)). Do not change fetch's builtin snapshot. Fable skip still does not call check_and_wait.",
+      "edgeCases": [
+        "has_review via id.contains(REVIEW): false-positive REFACTOR-REVIEW-FINAL; false-negative MILESTONE-FINAL — PRE-PR-3 is_frontier_class only",
+        "nimbus_quill 0% remaining / extra_usage dollars ≤ 0: default ignore even at $0; spend/credits kinds still stop at amount ≤ 0",
+        "LOOP_USAGE_REMAINING_MIN=200 / remainingMinPercent > 100: preflight error naming LOOP_USAGE_REMAINING_MIN"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "Drop extra_usage from is_spend_kind only",
+          "expectedBehavior": "evaluate_one still emits AccountLow at dollars 0; apply Stops via account_low_is_amount_only — Ignore-at-evaluate test must fail"
+        },
+        {
+          "cause": "Widen UsageGateFn to pass models",
+          "expectedBehavior": "Post-output WaitFn/UsageGateFn contract broken; Fable skip / parity tests fail"
+        },
+        {
+          "cause": "Reject > 100 in LoopConfig.from_env or non-loop commands",
+          "expectedBehavior": "list/recall crash when LOOP_USAGE_REMAINING_MIN=200; chokepoint is preflight_validate_and_probe only"
+        }
+      ],
+      "id": "FIX-012",
+      "invariants": [
+        "UsageGateFn stays (u8, &Path, u64); WaitFn stays Fn(u64)",
+        "prompt/core.rs contains(REVIEW) is out of this slice"
+      ],
+      "modifiesBehavior": true,
+      "notes": "is_frontier_class is SSoT (model.rs:240) — REFACTOR-REVIEW-FINAL is already false there; MILESTONE-FINAL and 8d71d1f7-CODE-REVIEW-1 true. Learning [4955]: preflight_validate_and_probe is the shared loop/batch chokepoint. Learning [5475]: remaining banner uses run models. Learning [5430]: evaluate Ignore, not apply-only. Learning [4126]: exhaustive destructure when adding AccountReactionParams.models. Data: config[\"usagePolicy\"][\"remainingMinPercent\"]; extra_usage object sibling with dollars. Drive verify-task-mgr feature models-show (text; no remaining percents) and loop run --help. Do not drive loop run / batch run. Compile/unit tests alone are not proof that help stayed clean — capture the help artifact.",
+      "passes": false,
+      "priority": 6,
+      "qualityDimensions": [
+        "has_review is is_frontier_class — do not reimplement prefix stripping",
+        "extra_usage Ignore at evaluate before amount-exhausted AccountLow, then drop from is_spend_kind",
+        "remaining-min > 100 fail-fast at loop/batch preflight only; error names LOOP_USAGE_REMAINING_MIN",
+        "Post-output remaining banner uses run models via closure, not WaitFn widening",
+        "Exhaustive AccountReactionParams destructure (no `..`)",
+        "Fable skip still does not call check_and_wait",
+        "No unwrap in production"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Hygiene: is_frontier_class, extra_usage Ignore-at-evaluate, remaining-min bound, post-output banner",
+      "touchesFiles": [
+        "src/loop_engine/quota.rs",
+        "src/loop_engine/reactions/account.rs",
+        "src/loop_engine/project_config.rs",
+        "src/loop_engine/iteration.rs",
+        "src/loop_engine/wave_scheduler.rs",
+        "tests/reaction_parity.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "CLAUDE.md workflow / models section no longer says pin is required for parallel/wave. After PRE-PR-3: pin is optional, not required, for mixed standard/medium. Recipe models set-tier claude frontier <standard-model> is documented as optional. All-high / review clamp is still PR-3. Fable CLI 3600 residual if a Fable-routed task spawns is named",
+        "src/loop_engine/CLAUDE.md account-global section records: HUD-family extra-mark identity union (Fable+pin → frontier only; Opus+pin including snapshot id → standard and frontier); wait-driving probe after apply (scoped-only must not lift on week remaining; post-output WaitFn unchanged); AccountReaction OperatorStopped vs StopSpend (seq Empty; wave exit 0); has_review = is_frontier_class; extra_usage Ignore at evaluate; remaining-min > 100 at loop/batch preflight. Strike pin-required",
+        "Grok-only recipe is untouched. Do not invent models set-primary. Do not document --use-other-models-ttl / set-usage-rule / set-tier-fallback / models show live remaining as shipped",
+        "Drive `.claude/skills/verify-task-mgr/SKILL.md` feature models-show: `$H capture models-show -- models show` (text; primaryProvider / anchor; no remaining percents). `$H capture loop-help -- loop run --help` must NOT list --use-other-models-ttl. Do not drive loop run / batch run"
+      ],
+      "dependsOn": [
+        "FEAT-008",
+        "FEAT-009",
+        "FIX-010",
+        "FIX-011",
+        "FIX-012"
+      ],
+      "description": "PRE-PR-3 pin docs. Landed CLAUDE.md (workflow models section ~156) and src/loop_engine/CLAUDE.md (account-global ~240) still say PR-1 Fable pin is required for parallel/wave until PR-3. Strike that. Until CONTRACT-002 extra-mark (FEAT-008) the pin was harmful (Fable HUD extra-marked standard). After this slice: pin is OPTIONAL, not required, for mixed standard/medium work (factory exclude unsticks). Automatic clamp of all-high / review / explicit-frontier onto standard is still PR-3. Fable CLI RateLimit still sleeps the wave 3600s if a Fable-routed task actually spawns (LOOP_USAGE_CHECK_ENABLED=false, fetch fail, explicit tasks.model). Record extra-mark identity union, wait-driving probe, and AccountReaction split in the account-global section. Do not document --use-other-models-ttl / set-usage-rule / set-tier-fallback as shipped. Do not edit tasks/prd-quota-rung-policy.md (already folded). Do not rewrite historical change_logs.",
+      "edgeCases": [
+        "PR-1 / PR-2 without the standard pin: one Fable RateLimit sleeps the whole wave 3600s IF a Fable-routed task actually spawns. After PRE-PR-3: do not tell operators they must pin; factory exclude unsticks mixed standard; sequential Fable-routed task still waits 3600s (accepted)"
+      ],
+      "estimatedEffort": "low",
+      "id": "DOCS-001",
+      "modifiesBehavior": false,
+      "notes": "Landed pin-required: CLAUDE.md ~156; src/loop_engine/CLAUDE.md ~240. Parent PRD header already has the correct timeline — do not edit the PRD. Architect leftover 9: docs must not imply high/review runs on opus after PRE-PR-3. Learning [5301]: dual-predicate docs. Verification skill: .claude/skills/verify-task-mgr/SKILL.md — models-show + loop run --help only.",
+      "passes": false,
+      "priority": 12,
+      "qualityDimensions": [
+        "Pin optional for mixed standard/medium; all-high clamp still PR-3 — do not overclaim",
+        "Engine language is rungs, not model ids, except ingest",
+        "Grok-only recipe untouched",
+        "ui::* / tracing split unchanged"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Strike pin-required; pin is optional after extra-mark identity",
+      "touchesFiles": [
+        "CLAUDE.md",
+        "src/loop_engine/CLAUDE.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Progress log lists findings or `No issues found`",
+        "Confirm extra-mark identity union: Fable+pin → frontier not standard; Opus+snapshot+pin → standard and frontier; helper is an identity set not identity: &str; quota.rs/engine.rs have no fable/claude-fable-5 literals; HUD tokens only in usage.rs",
+        "Confirm unlabeled seven_day_* rungs None; live-shaped evaluate unavailable {frontier} only; snapshot other_rungs_runnable true; exclude high/frontier not medium/standard — with and without pin",
+        "Confirm Wait { secs, account_binding }; wait_probe_lifted after apply; scoped-only + week 45% does not lift; post-output WaitFn is Fn(u64); QuotaPreflightParams.models exhaustive",
+        "Confirm AccountReaction::{OperatorStopped, StopSpend} no Stop; seq Empty mapping; wave exit 0 not 130; spend scan before prefer-rung-scoped",
+        "Confirm has_review = is_frontier_class; extra_usage dollars 0 Ignore at evaluate then drop from is_spend_kind; remaining-min > 100 preflight names LOOP_USAGE_REMAINING_MIN; post-output banner via react_to_outputs closure not WaitFn widening",
+        "Confirm pin docs: optional not required; all-high clamp still PR-3; no --use-other-models-ttl / walker / inherit / FR-008 CLI",
+        "Any issues found spawn CODE-FIX / WIRE-FIX via `task-mgr add --stdin --depended-on-by REVIEW-001 --from-json tasks/quota-rung-policy-pr2b.json`"
+      ],
+      "dependsOn": [
+        "CONTRACT-002",
+        "FEAT-008",
+        "FEAT-009",
+        "FIX-010",
+        "FIX-011",
+        "FIX-012",
+        "DOCS-001"
+      ],
+      "description": "Review CONTRACT-002, FEAT-008, FEAT-009, FIX-010, FIX-011, FIX-012, DOCS-001. Language idioms, security, error handling, qualityDimensions, wiring, dual predicate, extra-mark identity union (not mapped-rung, not prefer-id), unlabeled rungs None, wait_probe_lifted after apply, WaitFn unchanged, OperatorStopped Empty mapping, extra_usage Ignore-at-evaluate, pin-optional docs. Spawn CODE-FIX / WIRE-FIX via task-mgr add --stdin --depended-on-by REVIEW-001 --from-json tasks/quota-rung-policy-pr2b.json. Do not implement PR-3 (TTL CLI, down-only walker, inherit, set-usage-rule).",
+      "estimatedEffort": "high",
+      "id": "CODE-REVIEW-1",
+      "modifiesBehavior": false,
+      "notes": "Do not implement in this task. Use rust-python-code-reviewer and loop-engine-parity-auditor if available. For each issue: echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001 --from-json tasks/quota-rung-policy-pr2b.json. If no issues, emit done with a one-line progress note. Learning [5297]/[5301] dual predicate; [5075] once-per-wave; [4126]/[5371] shared coordinators; [5373] seq/wave Stop mapping; [5469] HorizonStopped ≠ StopSignaled; [5150] parity auditor. touchesFiles capped at 10: omitted root CLAUDE.md (pin-docs still in src/loop_engine/CLAUDE.md + DOCS-001).",
+      "passes": false,
+      "priority": 13,
+      "qualityDimensions": [
+        "Wiring: identity set actually reaches ingest; wait_probe_lifted actually receives Wait.account_binding after apply; wrappers actually emit Empty for OperatorStopped/StopSpend",
+        "Parity lock not broken (seq and wave share the inner; exhaustive destructure)",
+        "Fable+pin does not park standard; unlabeled named keys do not quota-empty mixed work",
+        "No model-id engine state (fable only as HUD ingest in usage.rs)",
+        "Pin docs do not overclaim all-high clamp"
+      ],
+      "requiresHuman": false,
+      "taskType": "review",
+      "title": "Review PRE-PR-3 extra-mark, unlabeled, wait-probe, Stop split, hygiene, pin docs",
+      "touchesFiles": [
+        "src/loop_engine/usage.rs",
+        "src/loop_engine/quota.rs",
+        "src/loop_engine/reactions/account.rs",
+        "src/loop_engine/reactions/pre_spawn.rs",
+        "src/loop_engine/iteration.rs",
+        "src/loop_engine/wave_scheduler.rs",
+        "src/loop_engine/project_config.rs",
+        "src/loop_engine/engine.rs",
+        "tests/reaction_parity.rs",
+        "src/loop_engine/CLAUDE.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "All prior stories have passes: true (or spawned CODE-FIX/WIRE-FIX that this review depends on have landed)",
+        "Positive: Fable HUD + frontier→opus pin extra-marks frontier NOT standard; Opus HUD + snapshot id + pin extra-marks standard AND frontier; live-shaped evaluate unavailable {frontier} only; snapshot/exclude keep medium/standard selectable with and without pin",
+        "Positive: scoped-only Wait { account_binding: false } + live_shaped week 45% does not lift; OperatorStopped → seq Empty operator_stopped true / wave exit 0; StopSpend → seq Empty operator_stopped false / wave exit 0 not 130; extra_usage dollars 0 Ignore; remaining-min 200 preflight errors naming LOOP_USAGE_REMAINING_MIN; pin docs optional not required",
+        "Positive: FULL `cargo fmt --check && cargo check && cargo clippy --all-targets -- -D warnings && cargo test` all clean (no scope filter)",
+        "Negative: extra-mark is not exact_model_for(mapped_rung); WaitFn is still Fn(u64); UsageGateFn still (u8, &Path, u64); AccountReaction::Stop does not exist; quota.rs and engine.rs have no fable/claude-fable-5 literals; `loop run --help` does not list `--use-other-models-ttl`; no down-only walker; no set-usage-rule CLI; no inherit / account_quota_stopped",
+        "Docs: extra-mark identity union, wait-driving probe, OperatorStopped vs StopSpend, pin optional, LOOP_USAGE_REMAINING_MIN > 100, remaining-min bound are written. All-high clamp still named as PR-3",
+        "Drive `.claude/skills/verify-task-mgr/SKILL.md`: launch + sandbox + `loop run --help` + `models show`; do not drive `loop run` / `batch run`; do not hit live Anthropic. Extra-mark / probe / Stop mapping are unit/coordinator-proven. Compile/unit tests alone are not proof that help stayed clean — capture the help artifact",
+        "Pre-existing test failures fixed (or spawned as FIX-xxx with verifyCommand if >~12 unrelated)",
+        "If issues found: FIX-xxx via `task-mgr add --stdin --depended-on-by REVIEW-001 --from-json tasks/quota-rung-policy-pr2b.json`"
+      ],
+      "dependsOn": [
+        "CODE-REVIEW-1"
+      ],
+      "description": "REVIEW-001 is the milestone for this PRE-PR-3 gate (2b). Run the full unscoped quality gate and leave the repo green including pre-existing failures. Prove CONTRACT-002 extra-mark identity + unlabeled rungs None + wait-driving probe + AccountReaction split + hygiene + pin-optional docs. Drive verify-task-mgr via loop run --help and models show (the skill refuses loop run / batch run). Unit/coordinator tests are the proof of extra-mark / probe / Stop mapping. No live Anthropic. Do not implement PR-3. This gate is not a fourth product PR.",
+      "estimatedEffort": "high",
+      "id": "REVIEW-001",
+      "modifiesBehavior": false,
+      "notes": "Spawn fixes via task-mgr add --stdin --depended-on-by REVIEW-001 --from-json tasks/quota-rung-policy-pr2b.json. Verification skill: .claude/skills/verify-task-mgr/SKILL.md — refuses loop run / batch run; loop run --help is the safe probe; models is text-only. Do not invent a second harness. Learning [4753]: if cargo test fails with paths to a removed -slot-N worktree, touch tests/<binary>.rs and rebuild — not a code regression. Learning [5464]: REVIEW gate unit proofs + unscoped FMT/CHECK/CLIPPY/TEST. PRE-PR-3 appendix ship: Fable HUD + pin no longer parks standard; pin optional for mixed standard/medium; all-high/review clamp is still PR-3. Do not edit tasks/quota-rung-policy-pr3.json. touchesFiles capped at 10: omitted root CLAUDE.md (pin-docs still in src/loop_engine/CLAUDE.md + DOCS-001).",
+      "passes": false,
+      "priority": 99,
+      "qualityDimensions": [
+        "Full suite green including pre-existing",
+        "No unwrap in production",
+        "PRE-PR-3 ship table holds (extra-mark identity; unlabeled rungs None; scoped probe; Stop split; pin optional; no TTL CLI)",
+        "Verification skill named and followed; no live Anthropic"
+      ],
+      "requiresHuman": false,
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Final gate: full suite + PRE-PR-3 ship check",
+      "touchesFiles": [
+        "src/loop_engine/usage.rs",
+        "src/loop_engine/quota.rs",
+        "src/loop_engine/reactions/account.rs",
+        "src/loop_engine/reactions/pre_spawn.rs",
+        "src/loop_engine/iteration.rs",
+        "src/loop_engine/wave_scheduler.rs",
+        "src/loop_engine/project_config.rs",
+        "src/loop_engine/engine.rs",
+        "tests/reaction_parity.rs",
+        "src/loop_engine/CLAUDE.md"
+      ]
+    }
+  ],
+  "version": "1.0"
+}

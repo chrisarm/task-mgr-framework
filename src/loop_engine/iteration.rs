@@ -825,7 +825,7 @@ pub fn run_iteration(
     // home both execution paths share. The sequential path folds its one output
     // into a one-item slice; the wave path folds its N. `WaitedAndRetry` (or
     // `None`) falls through with the outcome still `RateLimit` (`run_loop` marks
-    // it non-counting); `Stop` returns early with `should_stop` and empty output.
+    // it non-counting); OperatorStopped / StopSpend return early as Empty.
     if outcome == IterationOutcome::RateLimit {
         ui::emit("Rate limit detected in output, running account reaction...");
         let reaction = {
@@ -857,6 +857,7 @@ pub fn run_iteration(
                 primary_provider: resolved_models.primary_provider,
                 blackout_fallback_secs: resolved_models.routing.spillover.blackout_fallback_secs,
                 now_secs: crate::loop_engine::engine::now_unix_secs(),
+                models: resolved_models,
             };
             reactions::account::react_to_outputs(
                 params.conn,
@@ -870,22 +871,50 @@ pub fn run_iteration(
         // which `run_loop` marks non-counting (budget give-back). The blackout
         // recorded on `ctx.provider_blackouts` reroutes spillover-eligible work
         // on the next iteration; the no-eligible deferral branch waits only if
-        // everything is quota-deferred. Only `Stop` exits early here.
-        if reaction == reactions::account::AccountReaction::Stop {
-            return Ok(IterationResult {
-                outcome: IterationOutcome::RateLimit,
-                task_id: Some(task_id),
-                files_modified: task_files,
-                should_stop: true,
-                operator_stopped: false,
-                output: String::new(),
-                effective_model: None,
-                effective_effort: None,
-                effective_runner: Some(effective_runner),
-                key_decisions_count: 0,
-                conversation: None,
-                shown_learning_ids: Vec::new(),
-            });
+        // everything is quota-deferred. OperatorStopped / StopSpend exit early
+        // as Empty (pre-gate StopSignaled / HorizonStopped triples) — never
+        // RateLimit + operator_stopped (orchestrator `_` → exit 1).
+        match reaction {
+            reactions::account::AccountReaction::OperatorStopped => {
+                let mapping = reactions::account::account_stop_sequential_mapping(&reaction)
+                    .expect("OperatorStopped maps");
+                return Ok(IterationResult {
+                    outcome: IterationOutcome::Empty,
+                    task_id: None,
+                    files_modified: vec![],
+                    should_stop: true,
+                    operator_stopped: mapping.operator_stopped,
+                    output: String::new(),
+                    effective_model: None,
+                    effective_effort: None,
+                    effective_runner: None,
+                    key_decisions_count: 0,
+                    conversation: None,
+                    shown_learning_ids: Vec::new(),
+                });
+            }
+            reactions::account::AccountReaction::StopSpend => {
+                let mapping = reactions::account::account_stop_sequential_mapping(&reaction)
+                    .expect("StopSpend maps");
+                return Ok(IterationResult {
+                    outcome: IterationOutcome::Empty,
+                    task_id: None,
+                    files_modified: vec![],
+                    should_stop: true,
+                    operator_stopped: mapping.operator_stopped,
+                    output: String::new(),
+                    effective_model: None,
+                    effective_effort: None,
+                    effective_runner: None,
+                    key_decisions_count: 0,
+                    conversation: None,
+                    shown_learning_ids: Vec::new(),
+                });
+            }
+            reactions::account::AccountReaction::None
+            | reactions::account::AccountReaction::WaitedAndRetry
+            | reactions::account::AccountReaction::RerouteAndRetry
+            | reactions::account::AccountReaction::ProceedWithSpillover => {}
         }
     }
 

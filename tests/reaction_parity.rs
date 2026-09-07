@@ -43,10 +43,11 @@ use task_mgr::db::migrations::run_migrations;
 use task_mgr::db::{create_schema, open_connection};
 use task_mgr::loop_engine::config::{IterationOutcome, PermissionMode};
 use task_mgr::loop_engine::engine::BlackoutState;
-use task_mgr::loop_engine::model::Provider;
+use task_mgr::loop_engine::model::{Provider, builtin_resolved_models};
 use task_mgr::loop_engine::reactions::account::{
-    AccountReaction, AccountReactionParams, OutputReactionItem, WaitFn, react_to_outputs_inner,
-    react_to_outputs_with_io_seams,
+    AccountReaction, AccountReactionParams, AccountStopSequentialMapping, AccountStopWaveMapping,
+    OutputReactionItem, WaitFn, account_stop_sequential_mapping, account_stop_wave_mapping,
+    react_to_outputs_inner, react_to_outputs_with_io_seams,
 };
 use task_mgr::loop_engine::usage::UsageInfo;
 
@@ -202,6 +203,7 @@ fn params<'a>(tasks_dir: &'a Path, fallback_wait: u64) -> AccountReactionParams<
         primary_provider: Provider::Claude,
         blackout_fallback_secs: 3600,
         now_secs: 0,
+        models: builtin_resolved_models(),
     }
 }
 
@@ -545,11 +547,12 @@ fn no_rate_limit_skips_load_usage_even_when_claude_io_allowed() {
 }
 
 // ---------------------------------------------------------------------------
-// AC: Stop — injected stop/signal during the wait → AccountReaction::Stop.
+// AC: OperatorStopped — injected stop/signal during the wait →
+// AccountReaction::OperatorStopped (FR-010 Stop split; was AccountReaction::Stop).
 // ---------------------------------------------------------------------------
 
 #[test]
-fn stop_signal_during_wait_returns_stop() {
+fn stop_signal_during_wait_returns_operator_stopped() {
     disable_llm_extraction();
     let (db_temp, mut conn) = setup_migrated_db();
     insert_run(&conn);
@@ -576,8 +579,8 @@ fn stop_signal_during_wait_returns_stop() {
     assert_eq!(spy.calls.get(), 1, "the wait must have been attempted once");
     assert_eq!(
         reaction,
-        AccountReaction::Stop,
-        "a wait interrupted by the .stop signal must return AccountReaction::Stop",
+        AccountReaction::OperatorStopped,
+        "a wait interrupted by the .stop signal must return AccountReaction::OperatorStopped",
     );
 }
 
@@ -1234,7 +1237,7 @@ fn pre_spawn_and_gate_harness_compiles_and_setup_works() {
 //   AC5  → known_bad_overflow_skipping_rung1_fails_the_downgrade_assertion (LIVE)
 // ===========================================================================
 
-use task_mgr::loop_engine::model::{builtin_resolved_models, escalate_below_ceiling, to_1m_model};
+use task_mgr::loop_engine::model::{escalate_below_ceiling, to_1m_model};
 use task_mgr::loop_engine::overflow::{OverflowEvent, RecoveryAction, sanitize_id_for_filename};
 use task_mgr::loop_engine::project_config::{ModelsConfig, ProjectConfig};
 use task_mgr::loop_engine::prompt::PromptResult;
@@ -3285,8 +3288,9 @@ fn claude_disabled_rate_limit_never_reaches_exploding_anthropic_seams() {
 
 // ---------------------------------------------------------------------------
 // AC (positive): a Claude-disabled loop's wait is still `.stop`-interruptible —
-// the reset wait reporting `false` maps to `Stop`, and the in_progress reset
-// has already been applied (so the operator's tasks are not stranded).
+// the reset wait reporting `false` maps to `OperatorStopped`, and the
+// in_progress reset has already been applied (so the operator's tasks are not
+// stranded).
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -3305,7 +3309,7 @@ fn claude_disabled_rate_limit_stop_signal_still_interrupts_wait() {
     let mut blackout = BlackoutState::default();
     let reaction = react_with_spy(&mut conn, &items, &p, &mut blackout, &spy);
 
-    assert_eq!(reaction, AccountReaction::Stop);
+    assert_eq!(reaction, AccountReaction::OperatorStopped);
     assert_eq!(spy.load_usage_calls.get(), 0);
     assert_eq!(spy.usage_gate_calls.get(), 0);
     assert_eq!(spy.probe_calls.get(), 0);
@@ -3787,6 +3791,8 @@ fn fable_rate_limit_wave_waits_once_3600_never_blackouts() {
 const ACCOUNT_HIT_YOUR_LIMIT_OUTPUT: &str =
     "Claude AI usage limit reached · hit your limit · resets 4pm (America/Los_Angeles)";
 
+const SPEND_LIMIT_OUTPUT: &str = "You've hit your individual spend limit · run /usage-credits";
+
 #[test]
 fn mixed_wave_prefers_rung_scoped_rate_limit_over_leading_account_hit() {
     disable_llm_extraction();
@@ -3837,6 +3843,203 @@ fn mixed_wave_prefers_rung_scoped_rate_limit_over_leading_account_hit() {
     );
     assert_eq!(task_status(&conn, "RP-ACCT-0").as_deref(), Some("todo"));
     assert_eq!(task_status(&conn, "RP-FABLE-1").as_deref(), Some("todo"));
+}
+
+// ---------------------------------------------------------------------------
+// FR-010 / FIX-011: Mixed wave Fable + spend — spend scan BEFORE prefer-rung
+// decide. Without the scan, prefer-rung would Wait 3600 and mask StopSpend.
+// Wrapper skip forces api_secs=None when any Fable item is present.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn mixed_wave_fable_plus_spend_returns_stop_spend_not_wait_3600() {
+    disable_llm_extraction();
+    let (db_temp, mut conn) = setup_migrated_db();
+    insert_run(&conn);
+    insert_in_progress_task(&conn, "RP-SPEND-0");
+    insert_in_progress_task(&conn, "RP-FABLE-1");
+
+    let rate = IterationOutcome::RateLimit;
+    let items = [
+        OutputReactionItem {
+            task_id: Some("RP-SPEND-0"),
+            outcome: &rate,
+            output: SPEND_LIMIT_OUTPUT,
+        },
+        OutputReactionItem {
+            task_id: Some("RP-FABLE-1"),
+            outcome: &rate,
+            output: FABLE_RATE_LIMIT_OUTPUT,
+        },
+    ];
+    let mut p = params(db_temp.path(), 300);
+    p.spillover_enabled = true;
+    p.blackout_fallback_secs = 3600;
+    p.now_secs = 1_000;
+    let mut blackout = BlackoutState::default();
+    let spy = WaitSpy::completing();
+    let wait = spy.closure();
+    // api_secs None mirrors production wrapper skip when any item is rung-scoped.
+    let reaction =
+        react_to_outputs_inner(&mut conn, &items, &p, &mut blackout, None, &wait as WaitFn);
+
+    assert_eq!(
+        reaction,
+        AccountReaction::StopSpend,
+        "spend sibling must win over prefer-rung Wait 3600"
+    );
+    assert_eq!(spy.calls.get(), 0, "StopSpend must not Wait");
+    assert!(
+        blackout.active(1_000).is_empty(),
+        "StopSpend must not record provider_blackouts"
+    );
+    assert_eq!(task_status(&conn, "RP-SPEND-0").as_deref(), Some("todo"));
+    assert_eq!(task_status(&conn, "RP-FABLE-1").as_deref(), Some("todo"));
+}
+
+#[test]
+fn mixed_wave_fable_plus_hit_your_limit_still_waits_3600_no_blackout() {
+    disable_llm_extraction();
+    let (db_temp, mut conn) = setup_migrated_db();
+    insert_run(&conn);
+    insert_in_progress_task(&conn, "RP-ACCT-0");
+    insert_in_progress_task(&conn, "RP-FABLE-1");
+
+    let rate = IterationOutcome::RateLimit;
+    // Non-spend account hit first + Fable — prefer-rung still Wait 3600.
+    let items = [
+        OutputReactionItem {
+            task_id: Some("RP-ACCT-0"),
+            outcome: &rate,
+            output: ACCOUNT_HIT_YOUR_LIMIT_OUTPUT,
+        },
+        OutputReactionItem {
+            task_id: Some("RP-FABLE-1"),
+            outcome: &rate,
+            output: FABLE_RATE_LIMIT_OUTPUT,
+        },
+    ];
+    let mut p = params(db_temp.path(), 300);
+    p.spillover_enabled = true;
+    p.blackout_fallback_secs = 3600;
+    p.now_secs = 1_000;
+    let mut blackout = BlackoutState::default();
+    let spy = WaitSpy::completing();
+    let wait = spy.closure();
+    let reaction = react_to_outputs_inner(
+        &mut conn,
+        &items,
+        &p,
+        &mut blackout,
+        None, // wrapper skip shape
+        &wait as WaitFn,
+    );
+
+    assert_eq!(reaction, AccountReaction::WaitedAndRetry);
+    assert_eq!(spy.last_secs.get(), Some(3600));
+    assert!(
+        blackout.active(1_000).is_empty(),
+        "non-spend account hit + Fable must not Blackout"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// FR-010 wrapper parity: sequential Empty triples + wave exit 0 (known-bad:
+// wave StopSpend → 130). Horizon/Deferred/StopSpend are not operator stop.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn account_stop_wrapper_parity_operator_stopped_and_stop_spend() {
+    let op = AccountReaction::OperatorStopped;
+    let spend = AccountReaction::StopSpend;
+
+    assert_eq!(
+        account_stop_sequential_mapping(&op),
+        Some(AccountStopSequentialMapping {
+            operator_stopped: true
+        }),
+        "OperatorStopped → Empty + operator_stopped true (StopSignaled triple)"
+    );
+    assert_eq!(
+        account_stop_sequential_mapping(&spend),
+        Some(AccountStopSequentialMapping {
+            operator_stopped: false
+        }),
+        "StopSpend → Empty + operator_stopped false (HorizonStopped-shaped)"
+    );
+
+    let wave_op = account_stop_wave_mapping(&op).expect("OperatorStopped wave map");
+    assert_eq!(
+        wave_op,
+        AccountStopWaveMapping {
+            exit_code: 0,
+            reason: "stop signal during rate-limit wait",
+            was_stopped: true,
+        }
+    );
+    assert_ne!(
+        wave_op.exit_code, 130,
+        "OperatorStopped must not be exit 130"
+    );
+
+    let wave_spend = account_stop_wave_mapping(&spend).expect("StopSpend wave map");
+    assert_eq!(
+        wave_spend,
+        AccountStopWaveMapping {
+            exit_code: 0,
+            reason: "usage/spend limit",
+            was_stopped: false,
+        },
+        "known-bad: wave StopSpend used to be exit 130 + was_stopped true"
+    );
+    assert_ne!(
+        wave_spend.exit_code, 130,
+        "known-bad lock: wave StopSpend must not be exit 130"
+    );
+    assert!(
+        !wave_spend.was_stopped,
+        "StopSpend is not an operator stop (Horizon/Deferred/rung-only empty neither)"
+    );
+
+    // Non-stop reactions have no stop mapping.
+    for r in [
+        AccountReaction::None,
+        AccountReaction::WaitedAndRetry,
+        AccountReaction::RerouteAndRetry,
+        AccountReaction::ProceedWithSpillover,
+    ] {
+        assert_eq!(account_stop_sequential_mapping(&r), None);
+        assert_eq!(account_stop_wave_mapping(&r), None);
+    }
+}
+
+#[test]
+fn pure_spend_limit_returns_stop_spend() {
+    disable_llm_extraction();
+    let (db_temp, mut conn) = setup_migrated_db();
+    insert_run(&conn);
+    insert_in_progress_task(&conn, "RP-SPEND-0");
+
+    let rate = IterationOutcome::RateLimit;
+    let items = [OutputReactionItem {
+        task_id: Some("RP-SPEND-0"),
+        outcome: &rate,
+        output: SPEND_LIMIT_OUTPUT,
+    }];
+    let spy = WaitSpy::completing();
+    let wait = spy.closure();
+    let reaction = react_to_outputs_inner(
+        &mut conn,
+        &items,
+        &params(db_temp.path(), 300),
+        &mut BlackoutState::default(),
+        None,
+        &wait as WaitFn,
+    );
+
+    assert_eq!(reaction, AccountReaction::StopSpend);
+    assert_eq!(spy.calls.get(), 0);
+    assert_eq!(task_status(&conn, "RP-SPEND-0").as_deref(), Some("todo"));
 }
 
 // ---------------------------------------------------------------------------
@@ -4068,7 +4271,7 @@ fn model_id_in_session_rate_limit_stdout_still_blackouts_not_3600() {
 fn account_quota_preflight_inner_same_decision_both_shapes() {
     use std::collections::HashSet;
     use std::path::Path;
-    use task_mgr::loop_engine::model::{CapabilityTier, Provider};
+    use task_mgr::loop_engine::model::{CapabilityTier, Provider, builtin_resolved_models};
     use task_mgr::loop_engine::project_config::TierFallback;
     use task_mgr::loop_engine::quota::{Measurement, MeasurementUnit, QuotaBucket, UsagePolicy};
     use task_mgr::loop_engine::reactions::account::{
@@ -4103,6 +4306,7 @@ fn account_quota_preflight_inner_same_decision_both_shapes() {
     let mut set_seq = HashSet::new();
     let mut set_wave = HashSet::new();
     let wait = |_secs: u64| true;
+    let models = builtin_resolved_models();
 
     let seq = account_quota_preflight_inner(
         QuotaPreflightParams {
@@ -4117,6 +4321,7 @@ fn account_quota_preflight_inner_same_decision_both_shapes() {
             buckets: Some(std::slice::from_ref(&frontier)),
             account_remaining: Some(76.0),
             account_reset_at: None,
+            models,
         },
         &wait as WaitFn,
     );
@@ -4133,6 +4338,7 @@ fn account_quota_preflight_inner_same_decision_both_shapes() {
             buckets: Some(std::slice::from_ref(&frontier)),
             account_remaining: Some(76.0),
             account_reset_at: None,
+            models,
         },
         &wait as WaitFn,
     );

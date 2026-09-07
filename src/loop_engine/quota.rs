@@ -288,8 +288,18 @@ fn evaluate_one(
             low: true,
         };
     }
+    // Ignore promotional / extra / unknown amount buckets BEFORE amount_exhausted
+    // AccountLow. Dropping them from apply's is_spend_kind alone is not enough —
+    // account_low_is_amount_only would still Stop. AccountLow at amount ≤ 0 is
+    // reserved for spend / credits / dollars / tokens only.
+    if matches!(
+        bucket.kind.as_str(),
+        "extra_usage" | "promotional" | "nimbus_quill"
+    ) {
+        return BucketEval::Ignore;
+    }
     if amount_exhausted && !rung_scoped {
-        // Spend / dollars / credits exhausted → account-low input (apply stops).
+        // Spend / dollars / credits / tokens exhausted → account-low (apply stops).
         return BucketEval::AccountLow {
             remaining: remaining_value,
             reset_secs,
@@ -298,7 +308,7 @@ fn evaluate_one(
         };
     }
 
-    // Unknown kind (nimbus_quill, promotional, …) with no rungs → ignore.
+    // Unknown kind with no rungs → ignore.
     BucketEval::Ignore
 }
 
@@ -605,6 +615,55 @@ mod tests {
             }
             other => panic!("expected AccountLow for exhausted spend, got {other:?}"),
         }
+    }
+
+    fn dollars_bucket(id: &str, kind: &str, remaining: f64) -> QuotaBucket {
+        QuotaBucket {
+            id: id.into(),
+            kind: kind.into(),
+            label: String::new(),
+            measurements: vec![Measurement {
+                remaining,
+                unit: MeasurementUnit::Dollars,
+            }],
+            resets_at: None,
+            severity: None,
+            is_active: None,
+            rungs: None,
+        }
+    }
+
+    #[test]
+    fn evaluate_extra_usage_dollars_zero_is_ignore() {
+        let eval = evaluate_quota(
+            &[dollars_bucket("extra_usage", "extra_usage", 0.0)],
+            &UsagePolicy::default(),
+            8,
+        );
+        assert_eq!(eval.per_bucket[0].1, BucketEval::Ignore);
+        assert!(eval.account_low.is_empty());
+    }
+
+    #[test]
+    fn evaluate_nimbus_quill_dollars_zero_is_ignore() {
+        let eval = evaluate_quota(
+            &[dollars_bucket("nimbus_quill", "nimbus_quill", 0.0)],
+            &UsagePolicy::default(),
+            8,
+        );
+        assert_eq!(eval.per_bucket[0].1, BucketEval::Ignore);
+        assert!(eval.account_low.is_empty());
+    }
+
+    #[test]
+    fn evaluate_promotional_dollars_zero_is_ignore() {
+        let eval = evaluate_quota(
+            &[dollars_bucket("promotional", "promotional", 0.0)],
+            &UsagePolicy::default(),
+            8,
+        );
+        assert_eq!(eval.per_bucket[0].1, BucketEval::Ignore);
+        assert!(eval.account_low.is_empty());
     }
 
     #[test]
