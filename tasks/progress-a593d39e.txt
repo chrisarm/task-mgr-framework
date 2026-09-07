@@ -282,3 +282,11 @@ Wait-driving probe after apply (FR-009 / US-010):
 Verify: cargo fmt, clippy -D warnings, 154 account+usage tests,
 help /tmp/fix010-gate/loop-help.txt (no --use-other-models-ttl).
 
+
+## 2026-09-07 17:21:01 UTC - Iteration 4
+- Task: a593d39e-FIX-010
+- Model: grok-4.5
+- Effort: high
+- Outcome: NoEligibleTasks
+- Files: src/loop_engine/usage.rs, src/loop_engine/reactions/account.rs
+---
