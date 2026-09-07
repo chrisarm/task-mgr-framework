@@ -58,3 +58,22 @@ pre-gate OAuth when `LOOP_USAGE_CHECK_ENABLED=false`.
 - Wait banners print `% left`, not `% used`.
 
 ---
+
+## Quota buckets, remaining headroom, and capability-rung policy (PRE-PR-3 / 2b)
+
+**Branch**: `feat/quota-rung-policy-pr2b`
+**PRD**: `tasks/prd-quota-rung-policy.md`
+
+### What shipped
+
+HUD extra-mark is an identity **union** (family constant plus snapshot id): Fable HUD + frontier→opus pin marks **frontier only**, so mixed standard work continues. Unlabeled `seven_day_*` siblings ingest with `rungs: None`. Preflight waits probe after apply (`Wait { secs, account_binding }`); post-output `WaitFn` stays `Fn(u64)`. Operator `.stop` vs spend/horizon stop are `OperatorStopped` vs `StopSpend` (sequential Empty mapping; both wave paths exit 0). `extra_usage` is Ignore at evaluate, not AccountLow. Pin is optional after extra-mark.
+
+### Why it matters
+
+The PR-2 extra-mark hole parked standard from a Fable HUD row when operators pinned frontier off Fable. After this gate the pin is optional; factory exclude already unsticks mixed work. All-high / review clamp remains PR-3. A Fable-routed spawn still 3600s-sleeps the wave.
+
+### Breaking changes
+
+None for operators. Sequential operator-stop is Empty + `operator_stopped` (exit 0), not RateLimit. Wave StopSpend is exit 0, not 130.
+
+---
