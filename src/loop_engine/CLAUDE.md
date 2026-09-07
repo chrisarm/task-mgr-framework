@@ -277,6 +277,14 @@ calls `handle_rung_only_empty_selection` **before** stale-abort and never
 emits `AccountLow` so apply can honor it.
 Full copy-paste lives under `## CONTRACT-001` in the progress log.
 
+**PRE-PR-3 extra-mark (CONTRACT-002):** HUD-family identity **union** — after HUD
+maps to rung R, identity set I = always `canonical_model_for_hud_tier(R)`
+(`FABLE_MODEL`/`OPUS_MODEL`/`SONNET_MODEL`/`HAIKU_MODEL`) **plus** `scope.model.id`
+when present; extra-mark every Claude rung whose `exact_model_for` equals any I
+(not `exact_model_for(mapped_rung)`). Unlabeled named `seven_day_*` → `rungs: None`.
+Full copy-paste under `## CONTRACT-002` in `tasks/progress-a593d39e.txt`. Pin-recipe
+prose is DOCS-001.
+
 The per-task reactions (`resolve_task_execution`, `handle_overflow`) fold one
 call per slot. Each coordinator pairs a production entry point with a hermetic
 `_inner` core that takes the side-effecting step (wait / review) as an injected
