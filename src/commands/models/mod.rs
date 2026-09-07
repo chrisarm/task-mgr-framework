@@ -25,6 +25,6 @@ mod handlers;
 pub use handlers::{
     ListOpts, handle_init, handle_list, handle_route, handle_set_anchor, handle_set_effort,
     handle_set_enabled, handle_set_fallback, handle_set_tier, handle_set_tier_fallback,
-    handle_set_usage_rule, handle_show, handle_unroute, handle_unset_fallback,
-    handle_unset_tier, handle_unset_tier_fallback, write_default_block_with_anchor,
+    handle_set_usage_rule, handle_show, handle_unroute, handle_unset_fallback, handle_unset_tier,
+    handle_unset_tier_fallback, write_default_block_with_anchor,
 };

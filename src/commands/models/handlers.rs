@@ -575,10 +575,7 @@ pub fn handle_set_usage_rule(
 
     let mut rule = serde_json::Map::new();
     if let Some(k) = kind {
-        rule.insert(
-            "kind".to_string(),
-            serde_json::Value::String(k.to_string()),
-        );
+        rule.insert("kind".to_string(), serde_json::Value::String(k.to_string()));
     }
     if let Some(i) = id {
         rule.insert("id".to_string(), serde_json::Value::String(i.to_string()));
@@ -1736,7 +1733,8 @@ mod tests {
         assert!(msg.contains("CONFIG ERROR"), "{msg}");
         assert!(msg.contains("--kind") || msg.contains("--id"), "{msg}");
 
-        let err = handle_set_usage_rule(dir.path(), Some("weekly_scoped"), None, "nope").unwrap_err();
+        let err =
+            handle_set_usage_rule(dir.path(), Some("weekly_scoped"), None, "nope").unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("CONFIG ERROR"), "{msg}");
         assert!(msg.contains("wait"), "must name accepted set: {msg}");
@@ -1792,7 +1790,10 @@ mod tests {
         let err = handle_set_tier_fallback(dir.path(), "hiigh", true, false).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("CONFIG ERROR"), "{msg}");
-        assert!(msg.contains("low") && msg.contains("medium") && msg.contains("high"), "{msg}");
+        assert!(
+            msg.contains("low") && msg.contains("medium") && msg.contains("high"),
+            "{msg}"
+        );
     }
 
     #[test]
