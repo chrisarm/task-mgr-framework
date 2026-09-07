@@ -318,3 +318,21 @@ Split AccountReaction::Stop → OperatorStopped + StopSpend (delete Stop).
 - Outcome: NoEligibleTasks
 - Files: src/loop_engine/reactions/account.rs, src/loop_engine/iteration.rs, src/loop_engine/wave_scheduler.rs, tests/reaction_parity.rs
 ---
+---
+## 2026-09-07 - a593d39e-FIX-012
+
+Hygiene: is_frontier_class has_review; extra_usage Ignore-at-evaluate; remaining-min >100 preflight; AccountReactionParams.models + check_and_wait banner via react_to_outputs closure.
+
+- has_review via is_frontier_class(&id) only (MILESTONE-FINAL true, REFACTOR-REVIEW-FINAL false, claimed CODE-REVIEW-1 true)
+- evaluate_one Ignores extra_usage/promotional/nimbus_quill before amount_exhausted AccountLow; dropped extra_usage from is_spend_kind; spend dollars 0 → AccountLow+Stop
+- preflight_validate_and_probe rejects LOOP_USAGE_REMAINING_MIN / remainingMinPercent > 100 (known-bad u8 200)
+- models on AccountReactionParams; UsageGateFn unchanged; verify-task-mgr loop-help no --use-other-models-ttl; models-show text-only no remaining %
+
+
+## 2026-09-07 17:41:24 UTC - Iteration 6
+- Task: a593d39e-FIX-012
+- Model: grok-4.5
+- Effort: high
+- Outcome: NoEligibleTasks
+- Files: src/loop_engine/quota.rs, src/loop_engine/reactions/account.rs, src/loop_engine/project_config.rs, src/loop_engine/iteration.rs, src/loop_engine/wave_scheduler.rs, tests/reaction_parity.rs
+---

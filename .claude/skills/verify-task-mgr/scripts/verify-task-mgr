@@ -1,0 +1,438 @@
+#!/usr/bin/env bash
+# Isolated CLI harness for verifying task-mgr the way an operator uses it.
+# Invocation examples live in ../SKILL.md. This script never uses PATH's
+# task-mgr and never points --dir at the checkout's .task-mgr/.
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+SKILL_DIR=$(cd "$SCRIPT_DIR/.." && pwd)
+if REPO=$(git -C "$SKILL_DIR" rev-parse --show-toplevel 2>/dev/null); then
+  :
+else
+  REPO=$(cd "$SKILL_DIR/../../../.." && pwd)
+fi
+
+BIN_PATH_FILE="$SKILL_DIR/.bin-path"
+CURRENT_FILE="$SKILL_DIR/.current-run"
+ARTIFACTS_ROOT="$SKILL_DIR/artifacts"
+SAMPLE_PRD="$REPO/tests/fixtures/sample_prd.json"
+TMP_BASE="${TMPDIR:-/tmp}"
+TMP_BASE="${TMP_BASE%/}"
+
+die() {
+  echo "verify-task-mgr: $*" >&2
+  exit 2
+}
+
+info() {
+  echo "verify-task-mgr: $*" >&2
+}
+
+usage() {
+  cat <<'EOF'
+verify-task-mgr — isolated harness for the task-mgr CLI
+
+  launch                 Build the task-mgr binary in this checkout. Prints the path.
+  sandbox-new [--replace] [--id RUN_ID]
+                         Create an isolated project + HOME under /tmp.
+  doctor                 Read-only health check (binary, then sandbox if active).
+  cli -- <args>          Run the built binary against the active sandbox.
+  capture NAME -- <args> Same as cli, plus write stdout/stderr/exit under artifacts.
+  sql '<SQL>'            Run SQL against the sandbox tasks.db (python sqlite3).
+  snapshot-db NAME       Dump id|status|priority of all tasks into artifacts.
+  env-print              Print active sandbox variables.
+  cleanup                Remove the sandbox this run created. Keeps artifacts/.
+
+Never pass --dir yourself; the helper injects it. Never run loop run / batch run
+through this helper. Evidence lives in .claude/skills/verify-task-mgr/artifacts/<run-id>/.
+EOF
+}
+
+load_bin() {
+  if [[ -f "$BIN_PATH_FILE" ]]; then
+    VERIFY_TASK_MGR_BIN=$(cat "$BIN_PATH_FILE")
+  fi
+  if [[ -z "${VERIFY_TASK_MGR_BIN:-}" || ! -x "${VERIFY_TASK_MGR_BIN:-}" ]]; then
+    die "no built binary. Run: $0 launch"
+  fi
+}
+
+load_sandbox() {
+  [[ -f "$CURRENT_FILE" ]] || die "no active sandbox. Run: $0 sandbox-new"
+  # shellcheck disable=SC1090
+  source "$CURRENT_FILE"
+  [[ -n "${VERIFY_TASK_MGR_ROOT:-}" ]] || die "corrupt $CURRENT_FILE (missing ROOT)"
+  [[ -n "${VERIFY_TASK_MGR_DIR:-}" ]] || die "corrupt $CURRENT_FILE (missing DIR)"
+  [[ -n "${VERIFY_TASK_MGR_HOME:-}" ]] || die "corrupt $CURRENT_FILE (missing HOME)"
+  [[ -n "${VERIFY_TASK_MGR_EVIDENCE:-}" ]] || die "corrupt $CURRENT_FILE (missing EVIDENCE)"
+}
+
+sandbox_prefix() {
+  echo "${TMP_BASE}/task-mgr-verify-"
+}
+
+assert_isolated_paths() {
+  local root="$1" dir="$2" home="$3"
+  local prefix
+  prefix=$(sandbox_prefix)
+  case "$root" in
+    "$prefix"*) ;;
+    *) die "sandbox root $root is not under ${prefix}*" ;;
+  esac
+  case "$dir" in
+    "$root"/*) ;;
+    *) die "db dir $dir is not inside sandbox root $root" ;;
+  esac
+  case "$home" in
+    "$root"/*) ;;
+    *) die "HOME $home is not inside sandbox root $root" ;;
+  esac
+  if [[ -d "$REPO/.task-mgr" ]]; then
+    local repo_db
+    repo_db=$(cd "$REPO/.task-mgr" && pwd)
+    if [[ -d "$dir" ]]; then
+      local dir_real
+      dir_real=$(cd "$dir" && pwd)
+      if [[ "$dir_real" == "$repo_db" ]]; then
+        die "refusing to drive the checkout's .task-mgr ($repo_db)"
+      fi
+    fi
+  fi
+  if [[ -n "${HOME:-}" ]]; then
+    local real_home home_real
+    real_home=$(cd "$HOME" 2>/dev/null && pwd || echo "$HOME")
+    if [[ -d "$home" ]]; then
+      home_real=$(cd "$home" && pwd)
+      if [[ "$home_real" == "$real_home" ]]; then
+        die "refusing to use the operator's real HOME ($real_home)"
+      fi
+    fi
+  fi
+}
+
+assert_not_loop_run() {
+  local -a args=("$@")
+  local n=${#args[@]}
+  (( n > 0 )) || return 0
+  local i=0
+  # Skip leading global flags so ` --format json loop run` is still caught.
+  while (( i < n )); do
+    case "${args[$i]}" in
+      --dir|--format|-v|--verbose)
+        if [[ "${args[$i]}" == "-v" || "${args[$i]}" == "--verbose" ]]; then
+          i=$((i + 1))
+        else
+          i=$((i + 2))
+        fi
+        ;;
+      --)
+        i=$((i + 1))
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+  (( i < n )) || return 0
+  local cmd="${args[$i]}"
+  local sub="${args[$((i + 1))]:-}"
+  if [[ "$cmd" == "loop" || "$cmd" == "batch" ]]; then
+    local third="${args[$((i + 2))]:-}"
+    if [[ "$sub" == "-h" || "$sub" == "--help" ]]; then
+      return 0
+    fi
+    if [[ "$sub" == "run" ]]; then
+      if [[ "$third" == "-h" || "$third" == "--help" ]]; then
+        return 0
+      fi
+      die "refusing '$cmd run' (spawns agent CLIs and git worktrees). See SKILL.md."
+    fi
+    if [[ -n "$sub" && "$sub" != "init" ]]; then
+      die "refusing flat '$cmd $sub' (that is $cmd run). Use '$cmd init' only."
+    fi
+  fi
+}
+
+cmd_launch() {
+  [[ -f "$REPO/Cargo.toml" ]] || die "not a task-mgr checkout: $REPO"
+  info "building task-mgr in $REPO"
+  local json_log err_log
+  json_log=$(mktemp)
+  err_log=$(mktemp)
+  if ! (cd "$REPO" && cargo build --bin task-mgr --message-format=json >"$json_log" 2>"$err_log"); then
+    cat "$err_log" >&2
+    rm -f "$json_log" "$err_log"
+    die "cargo build --bin task-mgr failed"
+  fi
+  local bin
+  bin=$(python3 - "$json_log" <<'PY'
+import json, sys
+exe = ""
+with open(sys.argv[1]) as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if (
+            obj.get("reason") == "compiler-artifact"
+            and obj.get("target", {}).get("name") == "task-mgr"
+            and obj.get("executable")
+        ):
+            exe = obj["executable"]
+print(exe)
+PY
+)
+  rm -f "$json_log" "$err_log"
+  [[ -n "$bin" && -x "$bin" ]] || die "could not locate the built task-mgr executable"
+  printf '%s\n' "$bin" >"$BIN_PATH_FILE"
+  info "binary $bin"
+  "$bin" --version
+}
+
+cmd_sandbox_new() {
+  local replace=0 run_id=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --replace) replace=1; shift ;;
+      --id)
+        [[ $# -ge 2 ]] || die "--id requires a value"
+        run_id="$2"
+        shift 2
+        ;;
+      *) die "unknown sandbox-new argument: $1" ;;
+    esac
+  done
+  if [[ -f "$CURRENT_FILE" && $replace -ne 1 ]]; then
+    die "sandbox already active ($(grep VERIFY_TASK_MGR_RUN_ID "$CURRENT_FILE")). Pass --replace or run cleanup first."
+  fi
+  if [[ -f "$CURRENT_FILE" && $replace -eq 1 ]]; then
+    cmd_cleanup
+  fi
+  load_bin
+  [[ -f "$SAMPLE_PRD" ]] || die "missing fixture $SAMPLE_PRD"
+  if [[ -z "$run_id" ]]; then
+    run_id="$(date +%Y%m%dT%H%M%S)-$$"
+  fi
+  local root project dir home evidence prd
+  root="$(sandbox_prefix)${run_id}"
+  project="$root/project"
+  dir="$project/.task-mgr"
+  home="$root/home"
+  evidence="$ARTIFACTS_ROOT/$run_id"
+  prd="$project/tasks/sample_prd.json"
+  mkdir -p "$project/tasks" "$home" "$evidence"
+  cp "$SAMPLE_PRD" "$prd"
+  assert_isolated_paths "$root" "$dir" "$home"
+  cat >"$CURRENT_FILE" <<EOF
+VERIFY_TASK_MGR_REPO=$REPO
+VERIFY_TASK_MGR_BIN=$VERIFY_TASK_MGR_BIN
+VERIFY_TASK_MGR_RUN_ID=$run_id
+VERIFY_TASK_MGR_ROOT=$root
+VERIFY_TASK_MGR_PROJECT=$project
+VERIFY_TASK_MGR_DIR=$dir
+VERIFY_TASK_MGR_HOME=$home
+VERIFY_TASK_MGR_EVIDENCE=$evidence
+VERIFY_TASK_MGR_PRD=$prd
+EOF
+  cat >"$evidence/meta.txt" <<EOF
+run_id=$run_id
+repo=$REPO
+bin=$VERIFY_TASK_MGR_BIN
+root=$root
+project=$project
+dir=$dir
+home=$home
+prd=$prd
+created_at=$(date -Iseconds)
+EOF
+  info "sandbox $run_id"
+  info "  project $project"
+  info "  dir     $dir  (not created yet; init will create it)"
+  info "  home    $home"
+  info "  prd     $prd"
+  info "  evidence $evidence"
+  echo "$run_id"
+}
+
+cmd_doctor() {
+  load_bin
+  local version help_out
+  version=$("$VERIFY_TASK_MGR_BIN" --version)
+  help_out=$("$VERIFY_TASK_MGR_BIN" --help)
+  echo "binary: $VERIFY_TASK_MGR_BIN"
+  echo "version: $version"
+  case "$version" in
+    task-mgr\ *) ;;
+    *) die "unexpected --version output: $version" ;;
+  esac
+  case "$help_out" in
+    *"Commands:"*|*"COMMANDS:"*) ;;
+    *) die "--help did not list Commands" ;;
+  esac
+  echo "help: lists Commands"
+  if [[ ! -f "$CURRENT_FILE" ]]; then
+    echo "sandbox: none (binary-only doctor is OK before sandbox-new)"
+    return 0
+  fi
+  load_sandbox
+  load_bin
+  assert_isolated_paths "$VERIFY_TASK_MGR_ROOT" "$VERIFY_TASK_MGR_DIR" "$VERIFY_TASK_MGR_HOME"
+  echo "sandbox: $VERIFY_TASK_MGR_RUN_ID"
+  echo "dir: $VERIFY_TASK_MGR_DIR"
+  echo "home: $VERIFY_TASK_MGR_HOME"
+  echo "evidence: $VERIFY_TASK_MGR_EVIDENCE"
+  if [[ -f "$VERIFY_TASK_MGR_DIR/tasks.db" ]]; then
+    echo "db: present"
+    local doc_out
+    doc_out=$(run_cli --format json doctor) || die "task-mgr doctor failed against the sandbox"
+    echo "$doc_out"
+    printf '%s' "$doc_out" | python3 -c 'import json,sys; json.load(sys.stdin)'
+    echo "doctor-json: valid"
+  else
+    echo "db: absent (run init before driving commands that need a database)"
+  fi
+  echo "isolation: ok"
+}
+
+run_cli() {
+  load_bin
+  assert_not_loop_run "$@"
+  load_sandbox
+  assert_isolated_paths "$VERIFY_TASK_MGR_ROOT" "$VERIFY_TASK_MGR_DIR" "$VERIFY_TASK_MGR_HOME"
+  env -u TASK_MGR_DIR -u TASK_MGR_USE_API -u XDG_CONFIG_HOME -u XDG_CACHE_HOME \
+    -u TASK_MGR_ACTIVE_PREFIX \
+    HOME="$VERIFY_TASK_MGR_HOME" \
+    "$VERIFY_TASK_MGR_BIN" --dir "$VERIFY_TASK_MGR_DIR" "$@"
+}
+
+cmd_cli() {
+  if [[ "${1:-}" == "--" ]]; then
+    shift
+  fi
+  run_cli "$@"
+}
+
+cmd_capture() {
+  local name="${1:-}"
+  shift || true
+  [[ -n "$name" ]] || die "capture requires NAME"
+  if [[ "${1:-}" == "--" ]]; then
+    shift
+  fi
+  load_sandbox
+  mkdir -p "$VERIFY_TASK_MGR_EVIDENCE"
+  local safe
+  safe=$(printf '%s' "$name" | tr -c 'A-Za-z0-9._-' '_')
+  local stdout_f stderr_f exit_f cmd_f
+  stdout_f="$VERIFY_TASK_MGR_EVIDENCE/${safe}.stdout.txt"
+  stderr_f="$VERIFY_TASK_MGR_EVIDENCE/${safe}.stderr.txt"
+  exit_f="$VERIFY_TASK_MGR_EVIDENCE/${safe}.exit.txt"
+  cmd_f="$VERIFY_TASK_MGR_EVIDENCE/${safe}.cmd.txt"
+  {
+    printf 'task-mgr --dir %s' "$VERIFY_TASK_MGR_DIR"
+    printf ' %q' "$@"
+    printf '\n'
+  } >"$cmd_f"
+  set +e
+  run_cli "$@" >"$stdout_f" 2>"$stderr_f"
+  local rc=$?
+  set -e
+  printf '%s\n' "$rc" >"$exit_f"
+  info "captured $safe exit=$rc -> $VERIFY_TASK_MGR_EVIDENCE/${safe}.*"
+  cat "$stdout_f"
+  if [[ -s "$stderr_f" ]]; then
+    cat "$stderr_f" >&2
+  fi
+  return "$rc"
+}
+
+cmd_sql() {
+  local query="${1:-}"
+  [[ -n "$query" ]] || die "sql requires a SQL string"
+  load_sandbox
+  [[ -f "$VERIFY_TASK_MGR_DIR/tasks.db" ]] || die "no tasks.db yet; run init first"
+  python3 - "$VERIFY_TASK_MGR_DIR/tasks.db" "$query" <<'PY'
+import sqlite3, sys
+db, query = sys.argv[1], sys.argv[2]
+con = sqlite3.connect(db)
+try:
+    cur = con.execute(query)
+    rows = cur.fetchall()
+except sqlite3.Error as e:
+    print(f"sql error: {e}", file=sys.stderr)
+    sys.exit(2)
+for row in rows:
+    print("|".join("" if v is None else str(v) for v in row))
+PY
+}
+
+cmd_snapshot_db() {
+  local name="${1:-db}"
+  load_sandbox
+  mkdir -p "$VERIFY_TASK_MGR_EVIDENCE"
+  local safe
+  safe=$(printf '%s' "$name" | tr -c 'A-Za-z0-9._-' '_')
+  local out="$VERIFY_TASK_MGR_EVIDENCE/${safe}.db.txt"
+  {
+    echo "# SELECT id, status, priority FROM tasks ORDER BY priority, id"
+    cmd_sql "SELECT id, status, priority FROM tasks ORDER BY priority, id"
+    echo
+    echo "# SELECT COUNT(*) FROM tasks"
+    cmd_sql "SELECT COUNT(*) FROM tasks"
+  } >"$out"
+  info "wrote $out"
+  cat "$out"
+}
+
+cmd_env_print() {
+  load_bin
+  if [[ -f "$CURRENT_FILE" ]]; then
+    cat "$CURRENT_FILE"
+  else
+    echo "VERIFY_TASK_MGR_BIN=$VERIFY_TASK_MGR_BIN"
+    echo "VERIFY_TASK_MGR_REPO=$REPO"
+    echo "sandbox: none"
+  fi
+}
+
+cmd_cleanup() {
+  if [[ ! -f "$CURRENT_FILE" ]]; then
+    info "no active sandbox"
+    return 0
+  fi
+  load_sandbox
+  local evidence="$VERIFY_TASK_MGR_EVIDENCE"
+  local root="$VERIFY_TASK_MGR_ROOT"
+  if [[ -d "$root" ]]; then
+    rm -rf "$root"
+    info "removed sandbox $root"
+  fi
+  rm -f "$CURRENT_FILE"
+  if [[ -d "$evidence" ]]; then
+    info "evidence kept at $evidence"
+  fi
+}
+
+main() {
+  local cmd="${1:-}"
+  shift || true
+  case "$cmd" in
+    ""|-h|--help|help) usage ;;
+    launch) cmd_launch "$@" ;;
+    sandbox-new) cmd_sandbox_new "$@" ;;
+    doctor) cmd_doctor "$@" ;;
+    cli) cmd_cli "$@" ;;
+    capture) cmd_capture "$@" ;;
+    sql) cmd_sql "$@" ;;
+    snapshot-db) cmd_snapshot_db "$@" ;;
+    env-print) cmd_env_print "$@" ;;
+    cleanup) cmd_cleanup "$@" ;;
+    *) die "unknown command: $cmd (try --help)" ;;
+  esac
+}
+
+main "$@"
