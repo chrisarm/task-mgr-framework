@@ -911,6 +911,11 @@ pub fn run_iteration(
                 });
             }
             reactions::account::AccountReaction::StopSpend => {
+                // CLI spend/credits RateLimit: account is out of credits.
+                // Apply-layer Stop already writes this via account_binding;
+                // post-output StopSpend must too so batch --chain aborts
+                // instead of seeding inherit when unavailable_rungs is non-empty.
+                ctx.account_quota_stopped = true;
                 let mapping = reactions::account::account_stop_sequential_mapping(&reaction)
                     .expect("StopSpend maps");
                 return Ok(IterationResult {

@@ -1117,10 +1117,29 @@ pub fn run_wave_iteration(
             }
             // FR-010 Stop split: OperatorStopped vs StopSpend. Known-bad was
             // every Stop → exit 130; both are now exit 0 via the shared mapping.
-            reactions::account::AccountReaction::OperatorStopped
-            | reactions::account::AccountReaction::StopSpend => {
+            // StopSpend must set account_quota_stopped so batch --chain aborts
+            // (CLI spend exits 0 / was_stopped false; without the flag a
+            // non-empty unavailable_rungs map would incorrectly seed inherit).
+            reactions::account::AccountReaction::OperatorStopped => {
                 let mapping = reactions::account::account_stop_wave_mapping(&reaction)
-                    .expect("OperatorStopped/StopSpend map");
+                    .expect("OperatorStopped maps");
+                return WaveOutcome {
+                    tasks_completed: agg.tasks_completed,
+                    iteration_consumed: true,
+                    terminal: Some(WaveTerminal {
+                        exit_code: mapping.exit_code,
+                        reason: mapping.reason.to_string(),
+                        run_status: None,
+                    }),
+                    was_stopped: mapping.was_stopped,
+                    failed_merges: Vec::new(),
+                    rate_limited_retry: false,
+                };
+            }
+            reactions::account::AccountReaction::StopSpend => {
+                ctx.account_quota_stopped = true;
+                let mapping = reactions::account::account_stop_wave_mapping(&reaction)
+                    .expect("StopSpend maps");
                 return WaveOutcome {
                     tasks_completed: agg.tasks_completed,
                     iteration_consumed: true,

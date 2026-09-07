@@ -468,8 +468,9 @@ pub struct IterationContext {
     /// `provider_blackouts` is empty (the production case).
     pub unavailable_rungs: UnavailableRungsMap,
     /// Set when a pre-gate horizon Stop was **account-binding** (session /
-    /// weekly_all). Copied onto [`LoopResult::account_quota_stopped`] so batch
-    /// `--chain` aborts; rung-scoped Stop leaves this `false` and inherits
+    /// weekly_all) **or** post-output CLI spend/credits StopSpend.
+    /// Copied onto [`LoopResult::account_quota_stopped`] so batch `--chain`
+    /// aborts; rung-scoped Stop leaves this `false` and inherits
     /// [`Self::unavailable_rungs`].
     pub account_quota_stopped: bool,
     /// The operator-resolved provider-first config (`models` + `routing`),
@@ -994,8 +995,9 @@ pub struct LoopResult {
     /// [`active_rungs`]. Empty by default.
     pub unavailable_rungs: UnavailableRungsMap,
     /// `true` when this run stopped on an **account-binding** quota horizon
-    /// (session / weekly_all). `false` for rung-scoped horizon Stop (next PRD
-    /// may continue and clamp from [`Self::unavailable_rungs`]). Default false.
+    /// (session / weekly_all) or CLI spend/credits StopSpend. `false` for
+    /// rung-scoped horizon Stop (next PRD may continue and clamp from
+    /// [`Self::unavailable_rungs`]). Default false.
     pub account_quota_stopped: bool,
 }
 
