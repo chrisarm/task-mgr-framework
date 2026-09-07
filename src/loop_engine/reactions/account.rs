@@ -2037,7 +2037,9 @@ fn execute_quota_account_action(
         QuotaAccountAction::Ask { ttl_minutes } => {
             execute_ask_ttl(*ttl_minutes, eval, buckets, unavailable_rungs, ctx)
         }
-        QuotaAccountAction::Defer => UsageCheckResult::Deferred,
+        QuotaAccountAction::Defer => UsageCheckResult::Deferred {
+            effective_ttl_minutes: 0,
+        },
     }
 }
 
@@ -2058,7 +2060,9 @@ fn execute_ask_ttl(
 ) -> UsageCheckResult {
     // Apply already maps TTL 0 → Defer; belt-and-suspenders for execute-only callers.
     if ttl_minutes == 0 {
-        return UsageCheckResult::Deferred;
+        return UsageCheckResult::Deferred {
+            effective_ttl_minutes: 0,
+        };
     }
 
     let initial_allows = tier_fallback_allows(ctx.initial_tier_fallback, ctx.work);
@@ -2095,7 +2099,9 @@ fn execute_ask_ttl(
 
     match outcome {
         AskWaitOutcome::Stopped => UsageCheckResult::StopSignaled,
-        AskWaitOutcome::Defer => UsageCheckResult::Deferred,
+        AskWaitOutcome::Defer => UsageCheckResult::Deferred {
+            effective_ttl_minutes: ttl_minutes,
+        },
         AskWaitOutcome::Continue => {
             // Operator allowed (or now allows) downgrade — place unavailable
             // rungs so selection continues on working rungs this iteration.
@@ -2145,6 +2151,22 @@ pub fn read_ask_policy_from_disk(db_dir: &Path) -> AskPolicySlice {
     AskPolicySlice {
         usage_policy: cfg.usage_policy,
         tier_fallback: cfg.routing.tier_fallback,
+    }
+}
+
+/// Operator-facing soft-stop banner for [`UsageCheckResult::Deferred`].
+///
+/// TTL 0 may name `askTtlMinutes=0` (no sleep). TTL > 0 must not claim TTL was
+/// 0 — name `--use-other-models-ttl` / effective minutes instead. Seq + wave
+/// both call this so the strings stay byte-identical.
+pub fn deferred_ask_stop_banner(effective_ttl_minutes: u64) -> String {
+    if effective_ttl_minutes == 0 {
+        "Quota ask deferred (tierFallback forbade downgrade; askTtlMinutes=0) — stopping"
+            .to_string()
+    } else {
+        format!(
+            "Quota ask deferred (tierFallback forbade downgrade after {effective_ttl_minutes}m --use-other-models-ttl) — stopping"
+        )
     }
 }
 
@@ -3768,11 +3790,54 @@ mod tests {
             },
             &wait,
         );
-        assert_eq!(result, UsageCheckResult::Deferred);
+        assert_eq!(
+            result,
+            UsageCheckResult::Deferred {
+                effective_ttl_minutes: 0
+            }
+        );
         assert!(
             waited.borrow().is_empty(),
             "askTtlMinutes 0 must not sleep (got {:?})",
             waited.borrow()
+        );
+    }
+
+    #[test]
+    fn deferred_ask_stop_banner_ttl0_names_ask_ttl_minutes_zero() {
+        let banner = deferred_ask_stop_banner(0);
+        assert!(
+            banner.contains("askTtlMinutes=0"),
+            "TTL 0 immediate defer may name askTtlMinutes=0: {banner}"
+        );
+        assert!(
+            !banner.contains("--use-other-models-ttl"),
+            "TTL 0 banner must not claim a CLI TTL wait: {banner}"
+        );
+        assert_eq!(
+            banner,
+            "Quota ask deferred (tierFallback forbade downgrade; askTtlMinutes=0) — stopping"
+        );
+    }
+
+    #[test]
+    fn deferred_ask_stop_banner_ttl15_names_cli_flag_not_zero() {
+        let banner = deferred_ask_stop_banner(15);
+        assert!(
+            !banner.contains("askTtlMinutes=0"),
+            "TTL>0 timeout must not claim askTtlMinutes=0: {banner}"
+        );
+        assert!(
+            banner.contains("--use-other-models-ttl"),
+            "TTL>0 banner should name --use-other-models-ttl: {banner}"
+        );
+        assert!(
+            banner.contains("15m"),
+            "TTL>0 banner should name effective minutes: {banner}"
+        );
+        assert_eq!(
+            banner,
+            "Quota ask deferred (tierFallback forbade downgrade after 15m --use-other-models-ttl) — stopping"
         );
     }
 
@@ -3822,7 +3887,12 @@ mod tests {
             },
             &wait,
         );
-        assert_eq!(result, UsageCheckResult::Deferred);
+        assert_eq!(
+            result,
+            UsageCheckResult::Deferred {
+                effective_ttl_minutes: 15
+            }
+        );
         assert_eq!(
             *waited.borrow(),
             vec![15 * 60],
@@ -3999,7 +4069,12 @@ mod tests {
             &wait,
         );
         // forbade + CLI 15 → Ask sleep then Deferred
-        assert_eq!(result, UsageCheckResult::Deferred);
+        assert_eq!(
+            result,
+            UsageCheckResult::Deferred {
+                effective_ttl_minutes: 15
+            }
+        );
         assert_eq!(*waited.borrow(), vec![900]);
     }
 

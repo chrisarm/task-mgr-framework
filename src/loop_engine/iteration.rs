@@ -185,10 +185,12 @@ pub fn run_iteration(
                     shown_learning_ids: Vec::new(),
                 });
             }
-            UsageCheckResult::Deferred => {
-                ui::emit(
-                    "Quota ask deferred (tierFallback forbade downgrade; askTtlMinutes=0) — stopping",
-                );
+            UsageCheckResult::Deferred {
+                effective_ttl_minutes,
+            } => {
+                ui::emit(&reactions::account::deferred_ask_stop_banner(
+                    effective_ttl_minutes,
+                ));
                 return Ok(IterationResult {
                     outcome: IterationOutcome::Empty,
                     task_id: None,

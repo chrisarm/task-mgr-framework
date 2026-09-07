@@ -139,10 +139,12 @@ pub(super) fn wave_preflight_check(
                     rate_limited_retry: false,
                 });
             }
-            UsageCheckResult::Deferred => {
-                ui::emit(
-                    "Quota ask deferred (tierFallback forbade downgrade; askTtlMinutes=0) — stopping",
-                );
+            UsageCheckResult::Deferred {
+                effective_ttl_minutes,
+            } => {
+                ui::emit(&reactions::account::deferred_ask_stop_banner(
+                    effective_ttl_minutes,
+                ));
                 return Some(WaveOutcome {
                     tasks_completed: 0,
                     iteration_consumed: false,

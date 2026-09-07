@@ -120,11 +120,14 @@ pub enum UsageCheckResult {
     Skipped,
     /// API call failed but we continue anyway (graceful degradation).
     ApiError(String),
-    /// Operator forbade tierFallback downgrade and ask TTL is 0 — no sleep,
-    /// no continue (soft-stop for this PRD). TTL > 0 sleeps via Ask then
-    /// continues ([`UsageCheckResult::WaitedAndReset`]) or
-    /// [`UsageCheckResult::StopSignaled`]. Must not set `was_stopped`.
-    Deferred,
+    /// Operator forbade tierFallback downgrade — soft-stop this PRD.
+    ///
+    /// `effective_ttl_minutes` is the Ask TTL that applied: `0` means immediate
+    /// defer (no sleep); `> 0` means the operator waited that many minutes
+    /// (CLI `--use-other-models-ttl` or config `askTtlMinutes`) before forbade
+    /// expiry deferred. Banner text must not claim TTL was 0 when it was not.
+    /// Must not set `was_stopped` (`.stop` mid-Ask is [`StopSignaled`] instead).
+    Deferred { effective_ttl_minutes: u64 },
 }
 
 /// Check the usage API and return current usage info.
@@ -1848,7 +1851,22 @@ mod tests {
             UsageCheckResult::HorizonStopped
         );
         assert_eq!(UsageCheckResult::Skipped, UsageCheckResult::Skipped);
-        assert_eq!(UsageCheckResult::Deferred, UsageCheckResult::Deferred);
+        assert_eq!(
+            UsageCheckResult::Deferred {
+                effective_ttl_minutes: 0
+            },
+            UsageCheckResult::Deferred {
+                effective_ttl_minutes: 0
+            }
+        );
+        assert_ne!(
+            UsageCheckResult::Deferred {
+                effective_ttl_minutes: 0
+            },
+            UsageCheckResult::Deferred {
+                effective_ttl_minutes: 15
+            }
+        );
     }
 
     #[test]
