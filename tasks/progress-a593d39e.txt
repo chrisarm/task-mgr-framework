@@ -310,3 +310,11 @@ Split AccountReaction::Stop → OperatorStopped + StopSpend (delete Stop).
 - Do NOT implement LoopResult.account_quota_stopped / batch --chain inherit (PR-3).
 - Verified: lib mapping + decide_spend; reaction_parity FIX-011 cases; cargo check;
   task-mgr loop run --help. Parity auditor: no StopSpend→130 / OperatorStopped→RateLimit hole.
+
+## 2026-09-07 17:32:28 UTC - Iteration 5
+- Task: a593d39e-FIX-011
+- Model: grok-4.5
+- Effort: high
+- Outcome: NoEligibleTasks
+- Files: src/loop_engine/reactions/account.rs, src/loop_engine/iteration.rs, src/loop_engine/wave_scheduler.rs, tests/reaction_parity.rs
+---
