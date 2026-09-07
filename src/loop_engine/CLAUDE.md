@@ -273,8 +273,11 @@ env ∧ Claude enabled; do not treat disabled as a replace-on-evaluate exception
 Spillover is never a working rung.
 Batch `--chain` inherits the expiry map onto the next PRD
 (`LoopResult.unavailable_rungs` → `inherited_unavailable_rungs`);
-account-binding horizon Stop sets `account_quota_stopped` and aborts the chain;
-rung-scoped Stop leaves it false so the next PRD may continue and clamp.
+account-binding horizon Stop **and** post-output `StopSpend` set
+`account_quota_stopped` and abort the chain (CLI spend/credits is exit 0 /
+`was_stopped` false — without the flag a non-empty expiry map would seed
+inherit). Rung-scoped Stop leaves the flag false so the next PRD may continue
+and clamp.
 Account-binding weekly-all beyond 12h **Stops** even if other Claude rungs look
 runnable (they share that bucket). Factory `includeForced: false` is not a
 global forbid when some todos have `tasks.model`. `Wait { 0 }` is ready-now,
@@ -327,10 +330,13 @@ Full copy-paste lives under `## CONTRACT-001` in the progress log.
   sleep). Override is resolved to `effective_ttl` **before** `ask_or_defer`
   (config 0 + CLI 15 → `Ask { 15 }`). Does not write `config.json`.
 - **Ask wait re-eval:** when effective TTL > 0, Ask sleeps stop-signal-aware and
-  re-reads `usagePolicy` + `routing.tierFallback` on the stop-check cadence.
-  Mid-wait flip forbade→allow continues early; timeout continues iff
-  `tier_fallback_allows`, else Deferred. `.stop` during Ask → `StopSignaled`.
-  Factory / allowing `tierFallback` never emits Ask (unavailable + Proceed).
+  re-reads `usagePolicy` + `routing.tierFallback` on the stop-check cadence,
+  then **re-runs evaluate/apply** on that slice (do not discard
+  `usagePolicy` / `let _ =`). Mid-wait `onLow: stop` → `HorizonStopped`
+  (not `StopSignaled` / `was_stopped`). Mid-wait flip forbade→allow continues
+  early; timeout continues iff `tier_fallback_allows`, else Deferred.
+  `.stop` during Ask → `StopSignaled`. Factory / allowing `tierFallback`
+  never emits Ask (unavailable + Proceed).
 - **Expiry map + `active_rungs`:** proto-channel is
   `UnavailableRungsMap = HashMap<(Provider, CapabilityTier), u64>` (unix
   expiry from bucket `resets_at`, else `now+3600`; synthetic CLI RateLimit
@@ -351,7 +357,12 @@ Full copy-paste lives under `## CONTRACT-001` in the progress log.
   may clamp down. A wait-loop is **not** an accepted substitute for that
   family-match defer.
 - **Next-PRD inherit:** batch `--chain` copies `LoopResult.unavailable_rungs`
-  forward; `account_quota_stopped` halts the chain on account-binding Stop.
+  forward. Abort when `account_quota_stopped` **or** non-zero exit **or**
+  incomplete + empty map. Incomplete + non-empty map + flag false continues
+  and seeds inherit (rung-scoped). `StopSpend` must set the flag in **both**
+  sequential (`iteration.rs`) and wave (`wave_scheduler.rs`) wrappers — apply
+  already does via `account_binding`. Tests must not encode chain-break as
+  `exit != 0 || !prd_complete`.
 - **Policy CLI:** `models set-usage-rule` / `set-tier-fallback` /
   `unset-tier-fallback` (writes JSON **null**, does not delete the key) /
   `models show` (offline: usagePolicy + tierFallback, no remaining %;

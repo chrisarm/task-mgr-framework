@@ -162,8 +162,10 @@ Overrides `usagePolicy.askTtlMinutes` for this run only (does not write
 config.json). `0` is allowed: omit the flag → use config (default 0); pass
 `--use-other-models-ttl 0` → `Some(0)` (defer immediately, no sleep) — omitted
 is not the same as `Some(0)`. When effective TTL > 0, Ask sleeps stop-signal-aware
-and re-evals `usagePolicy` + `routing.tierFallback` on the stop-check cadence;
-forbade continue → defer; allow → continue on working rungs.
+and re-evals `usagePolicy` + `routing.tierFallback` on the stop-check cadence
+(evaluate/apply, not eligibility-only); mid-wait `onLow: stop` is a horizon
+stop, not operator `.stop`; forbade continue → defer; allow → continue on
+working rungs.
 
 **Fable frontier pin (optional after PRE-PR-3 / PR-3 clamp):** after HUD-family
 extra-mark identity union (CONTRACT-002), pinning frontier off Fable is
