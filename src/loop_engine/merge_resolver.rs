@@ -449,6 +449,7 @@ impl<'a> MergeResolver for LlmMergeResolver<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::loop_engine::model::OPUS_MODEL;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     // --- build_resolver_prompt ---
@@ -648,7 +649,7 @@ mod tests {
             primary_provider: Provider::Grok,
             primary_model: Some("grok-build".into()),
             fallback_provider: Some(Provider::Claude),
-            fallback_model: Some("claude-opus-5".into()),
+            fallback_model: Some(OPUS_MODEL.into()),
             db_dir: None,
             tasks_dir: None,
             signal_flag: Some(signal_flag),
@@ -787,7 +788,7 @@ mod tests {
             },
             fallback: Some(crate::loop_engine::model::AuxiliaryLlmPlan {
                 provider: Provider::Claude,
-                model: Some("claude-opus-5"),
+                model: Some(OPUS_MODEL),
             }),
         };
         let r = LlmMergeResolver::from_plan(
@@ -801,7 +802,7 @@ mod tests {
         assert_eq!(r.primary_provider, Provider::Grok);
         assert_eq!(r.primary_model.as_deref(), Some("grok-build"));
         assert_eq!(r.fallback_provider, Some(Provider::Claude));
-        assert_eq!(r.fallback_model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(r.fallback_model.as_deref(), Some(OPUS_MODEL));
         assert_eq!(r.effort, "high");
         assert_eq!(r.timeout, Duration::from_secs(120));
     }
