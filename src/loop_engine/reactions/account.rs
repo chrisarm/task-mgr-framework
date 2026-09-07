@@ -7,7 +7,7 @@
 //! — fixing the strand-bug where the wave path had no call site and a
 //! rate-limited account never waited before the wave dispatched.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::thread;
 use std::time::Duration;
@@ -24,6 +24,7 @@ use crate::loop_engine::quota::{
     AccountLowInput, BucketEval, OnLowAction, QuotaBucket, QuotaEval, UsagePolicy, evaluate_quota,
 };
 use crate::loop_engine::recovery::probe_rate_limit_lifted;
+use crate::loop_engine::runner::RunnerKind;
 use crate::loop_engine::usage::{
     UsageCheckResult, UsageInfo, buckets_for_run_models, load_usage_info_with_threshold,
     usage_suggests_lifted,
@@ -1334,6 +1335,10 @@ pub struct RunAccountQuotaGateParams<'a> {
     pub task_prefix: Option<&'a str>,
     pub run_id: &'a str,
     pub unavailable_rungs: &'a mut HashSet<(Provider, CapabilityTier)>,
+    /// Permanent promote_once pins — same map consulted by
+    /// [`super::pre_spawn::compute_quota_excluded_ids`]. Snapshot must honor
+    /// these so pinned Grok/Codex work counts as other-rung runnable.
+    pub runner_overrides: &'a HashMap<String, RunnerKind>,
     pub models: &'a crate::loop_engine::model::ResolvedModelsConfig,
     pub policy: &'a UsagePolicy,
     pub tier_fallback: Option<&'a TierFallback>,
@@ -1360,6 +1365,7 @@ pub fn run_account_quota_gate(params: RunAccountQuotaGateParams<'_>) -> UsageChe
         task_prefix,
         run_id,
         unavailable_rungs,
+        runner_overrides,
         models,
         policy,
         tier_fallback,
@@ -1401,7 +1407,13 @@ pub fn run_account_quota_gate(params: RunAccountQuotaGateParams<'_>) -> UsageChe
 
     let (work, horizon_stop) = if let Some(buckets) = buckets {
         let eval = evaluate_quota(buckets, policy, threshold);
-        let work = compute_remaining_work_snapshot(conn, task_prefix, models, &eval.unavailable);
+        let work = compute_remaining_work_snapshot(
+            conn,
+            task_prefix,
+            models,
+            &eval.unavailable,
+            runner_overrides,
+        );
         let applied = apply_quota(&eval, buckets, policy, tier_fallback, &work);
         let horizon_stop = matches!(applied.account, QuotaAccountAction::Stop);
         (work, horizon_stop)
@@ -1550,11 +1562,17 @@ fn execute_quota_account_action(
 /// `unavailable_preview` is typically `evaluate_quota(...).unavailable`.
 /// Spillover is not treated as a working rung: resolution uses an empty
 /// blackout set so spillover reroute cannot invent runnable capacity.
+///
+/// Effective provider/tier matches [`super::pre_spawn::compute_quota_excluded_ids`]:
+/// a `runner_overrides` pin (promote_once) owns the provider; tier still comes
+/// from resolve with empty blackouts. Without this, pinned Grok/Codex work is
+/// miscounted as Claude and can spuriously horizon-Stop.
 pub fn compute_remaining_work_snapshot(
     conn: &Connection,
     task_prefix: Option<&str>,
     models: &crate::loop_engine::model::ResolvedModelsConfig,
     unavailable_preview: &[(Provider, CapabilityTier)],
+    runner_overrides: &HashMap<String, RunnerKind>,
 ) -> RemainingWorkSnapshot {
     let like_prefix = task_prefix.unwrap_or("");
     let mut stmt = match conn.prepare(
@@ -1605,7 +1623,13 @@ pub fn compute_remaining_work_snapshot(
                 provider_blackouts: &empty_blackouts,
             },
         );
-        if !unavailable.contains(&(plan.provider, plan.tier)) {
+        // Same effective-provider rule as compute_quota_excluded_ids: pin wins
+        // for provider; tier from resolve (empty blackouts — no spillover).
+        let (effective_provider, effective_tier) = match runner_overrides.get(&id) {
+            Some(kind) => (provider_of_runner(*kind), plan.tier),
+            None => (plan.provider, plan.tier),
+        };
+        if !unavailable.contains(&(effective_provider, effective_tier)) {
             other_rungs_runnable = true;
         }
     }
@@ -1622,6 +1646,15 @@ pub fn compute_remaining_work_snapshot(
         has_review,
         max_difficulty,
         has_forced,
+    }
+}
+
+/// `RunnerKind → Provider` identity (same mapping as pre_spawn / post_output).
+fn provider_of_runner(kind: RunnerKind) -> Provider {
+    match kind {
+        RunnerKind::Claude => Provider::Claude,
+        RunnerKind::Grok => Provider::Grok,
+        RunnerKind::Codex => Provider::Codex,
     }
 }
 
@@ -2913,5 +2946,77 @@ mod tests {
         );
         assert_eq!(result, UsageCheckResult::Skipped);
         assert!(set.contains(&(Provider::Claude, CapabilityTier::Frontier)));
+    }
+
+    // --- compute_remaining_work_snapshot honors runner_overrides pins ---
+
+    fn snapshot_seed_conn() -> Connection {
+        let conn = Connection::open_in_memory().expect("in-memory");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE tasks (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'todo',
+                model TEXT,
+                difficulty TEXT,
+                archived_at TEXT
+            );
+            INSERT INTO tasks (id, status, difficulty) VALUES
+                ('pinned-frontier', 'todo', 'high');
+            "#,
+        )
+        .expect("seed");
+        conn
+    }
+
+    #[test]
+    fn snapshot_without_pin_treats_claude_frontier_as_unavailable() {
+        // Discriminator: sole high-difficulty task resolves to Claude frontier
+        // under empty blackouts; with frontier unavailable and no pin,
+        // other_rungs_runnable must be false (would horizon-Stop).
+        let conn = snapshot_seed_conn();
+        let models = crate::loop_engine::model::builtin_resolved_models();
+        let unavailable = [(Provider::Claude, CapabilityTier::Frontier)];
+        let empty_overrides = HashMap::new();
+        let work =
+            compute_remaining_work_snapshot(&conn, None, models, &unavailable, &empty_overrides);
+        assert!(
+            !work.other_rungs_runnable,
+            "unpinned Claude frontier task must not count as other-rung runnable; got {work:?}"
+        );
+    }
+
+    #[test]
+    fn snapshot_with_grok_pin_counts_as_other_rungs_runnable() {
+        // Same sole frontier task, but promote_once pin to Grok: effective
+        // provider is Grok (tier still frontier). Claude frontier unavailable
+        // must NOT hide this runnable work (avoids spurious horizon Stop).
+        let conn = snapshot_seed_conn();
+        let models = crate::loop_engine::model::builtin_resolved_models();
+        let unavailable = [(Provider::Claude, CapabilityTier::Frontier)];
+        let mut overrides = HashMap::new();
+        overrides.insert("pinned-frontier".to_string(), RunnerKind::Grok);
+        let work = compute_remaining_work_snapshot(&conn, None, models, &unavailable, &overrides);
+        assert!(
+            work.other_rungs_runnable,
+            "Grok-pinned task must count as other-rung runnable when only Claude \
+             frontier is unavailable; got {work:?}"
+        );
+    }
+
+    #[test]
+    fn snapshot_with_codex_pin_counts_as_other_rungs_runnable() {
+        let conn = snapshot_seed_conn();
+        let models = crate::loop_engine::model::builtin_resolved_models();
+        let unavailable = [(Provider::Claude, CapabilityTier::Frontier)];
+        let mut overrides = HashMap::new();
+        overrides.insert("pinned-frontier".to_string(), RunnerKind::Codex);
+        let work = compute_remaining_work_snapshot(&conn, None, models, &unavailable, &overrides);
+        assert!(
+            work.other_rungs_runnable,
+            "Codex-pinned task must count as other-rung runnable when only Claude \
+             frontier is unavailable; got {work:?}"
+        );
     }
 }

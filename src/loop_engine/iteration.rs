@@ -133,6 +133,7 @@ pub fn run_iteration(
                 task_prefix: params.task_prefix,
                 run_id: params.run_id,
                 unavailable_rungs: &mut ctx.unavailable_rungs,
+                runner_overrides: &ctx.runner_overrides,
                 models: &ctx.resolved_models,
                 policy: &params.project_config.usage_policy,
                 tier_fallback: params.project_config.routing.tier_fallback.as_ref(),
