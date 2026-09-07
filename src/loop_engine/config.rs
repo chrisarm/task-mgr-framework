@@ -630,11 +630,13 @@ mod tests {
         assert_eq!(resolve_usage_remaining_min(None, 8), 8);
     }
 
-    static USAGE_REMAINING_ENV_MUTEX: Mutex<()> = Mutex::new(());
+    // Share CLAUDE_BINARY_MUTEX with project_config remaining-min preflight
+    // tests — a private mutex here races when both mutate LOOP_USAGE_*.
+    use crate::loop_engine::test_utils::CLAUDE_BINARY_MUTEX;
 
     #[test]
     fn test_from_env_usage_remaining_min_valid() {
-        let _guard = USAGE_REMAINING_ENV_MUTEX
+        let _guard = CLAUDE_BINARY_MUTEX
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::remove_var("LOOP_USAGE_THRESHOLD") };
@@ -646,7 +648,7 @@ mod tests {
 
     #[test]
     fn test_from_env_usage_remaining_min_invalid_ignored() {
-        let _guard = USAGE_REMAINING_ENV_MUTEX
+        let _guard = CLAUDE_BINARY_MUTEX
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::remove_var("LOOP_USAGE_THRESHOLD") };
@@ -661,7 +663,7 @@ mod tests {
 
     #[test]
     fn test_from_env_ignores_legacy_usage_threshold() {
-        let _guard = USAGE_REMAINING_ENV_MUTEX
+        let _guard = CLAUDE_BINARY_MUTEX
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::remove_var("LOOP_USAGE_REMAINING_MIN") };

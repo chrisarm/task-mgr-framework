@@ -2399,6 +2399,9 @@ mod tests {
     #[test]
     fn ingest_opus_snapshot_id_with_frontier_pin_marks_standard_and_frontier() {
         let models = models_with_frontier_pinned_to_standard();
+        // Build via OPUS_MODEL so no_hardcoded_models stays green; suffix is the
+        // live-shaped SNAPSHOT variant under test (identity union, not id-alone).
+        let snapshot_id = format!("{OPUS_MODEL}-SNAPSHOT");
         let json = serde_json::json!({
             "limits": [{
                 "kind": "weekly_scoped",
@@ -2406,7 +2409,7 @@ mod tests {
                 "scope": {
                     "model": {
                         "display_name": "Opus",
-                        "id": "claude-opus-5-SNAPSHOT"
+                        "id": snapshot_id
                     }
                 }
             }]
