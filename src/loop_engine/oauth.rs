@@ -20,6 +20,25 @@ const OAUTH_REFRESH_URL: &str = "https://console.anthropic.com/v1/oauth/token";
 /// Default buffer before expiry (in minutes) to trigger refresh.
 const DEFAULT_EXPIRY_BUFFER_MINUTES: u64 = 5;
 
+/// Connect + response budget for OAuth refresh. Matches usage.rs: without this,
+/// an expiring `~/.claude` token during unit tests can hang the suite on a
+/// wedged POST to console.anthropic.com (same class of failure as learning
+/// #5386 for the usage GET path).
+const OAUTH_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+const OAUTH_RECV_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn oauth_http_agent() -> &'static ureq::Agent {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::Agent::config_builder()
+            .timeout_connect(Some(OAUTH_CONNECT_TIMEOUT))
+            .timeout_recv_response(Some(OAUTH_RECV_TIMEOUT))
+            .timeout_recv_body(Some(OAUTH_RECV_TIMEOUT))
+            .build()
+            .into()
+    })
+}
+
 /// Credentials file content structure.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -100,7 +119,8 @@ pub fn is_token_expiring(creds: &Credentials, buffer_minutes: u64) -> bool {
 ///
 /// Returns sanitized error message on failure (never includes tokens).
 pub fn refresh_token(creds_path: &PathBuf, creds: &Credentials) -> Result<Credentials, String> {
-    let mut response = ureq::post(OAUTH_REFRESH_URL)
+    let mut response = oauth_http_agent()
+        .post(OAUTH_REFRESH_URL)
         .send_form([
             ("grant_type", "refresh_token"),
             ("refresh_token", creds.refresh_token.as_str()),

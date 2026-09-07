@@ -163,6 +163,11 @@ pub(crate) fn is_rate_limited(output: &str) -> bool {
         // Broader "hit your ... limit" — catches the original "hit your limit"
         // and the newer "hit your org's ... limit" / "hit your session limit".
         || output_lower.contains("hit your") && output_lower.contains("limit")
+        // Live CLI rung-scoped copy: "You've reached your Fable limit" (also
+        // plain "You've reached your session limit"). Classification may widen
+        // here; the narrow 3600 Wait override lives in
+        // `reactions::account::is_rung_scoped_rate_limit_message`.
+        || output_lower.contains("reached your") && output_lower.contains("limit")
 }
 
 /// Check if `text` reports a transient backend failure (FEAT-014).
@@ -893,6 +898,13 @@ mod tests {
         assert!(is_rate_limited(
             "You've hit your individual spend limit · run /usage-credits to raise it, or visit claude.ai/admin-settings/usage"
         ));
+        // PR-1 / FR-002: live Fable / rung-scoped sentence (no "hit your", no
+        // contiguous "usage limit") must classify as RateLimit, not Crash.
+        assert!(is_rate_limited(
+            "You've reached your Fable limit. To continue, switch models with /model."
+        ));
+        assert!(is_rate_limited("You've reached your Opus limit"));
+        assert!(is_rate_limited("You've reached your session limit"));
     }
 
     #[test]
@@ -900,6 +912,15 @@ mod tests {
         assert!(!is_rate_limited("normal output"));
         assert!(!is_rate_limited("task completed successfully"));
         assert!(!is_rate_limited(""));
+    }
+
+    #[test]
+    fn test_analyze_output_fable_limit_is_rate_limit_not_crash() {
+        let output = "You've reached your Fable limit. To continue, switch models with /model.";
+        assert_eq!(
+            analyze_output(output, 1, &test_dir()),
+            IterationOutcome::RateLimit
+        );
     }
 
     // ======================================================================

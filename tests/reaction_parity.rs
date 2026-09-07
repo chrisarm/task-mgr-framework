@@ -48,6 +48,7 @@ use task_mgr::loop_engine::reactions::account::{
     AccountReaction, AccountReactionParams, OutputReactionItem, WaitFn, react_to_outputs_inner,
     react_to_outputs_with_io_seams,
 };
+use task_mgr::loop_engine::usage::UsageInfo;
 
 // ---------------------------------------------------------------------------
 // Shared fixtures / setup helpers (reused by TEST-INIT-002/003/004)
@@ -497,6 +498,50 @@ fn no_rate_limit_returns_none_and_writes_nothing() {
         before,
         "no rate limit ⇒ ZERO DB writes (in_progress task must NOT be reset)",
     );
+}
+
+// ---------------------------------------------------------------------------
+// Production seam: no RateLimit must not call load_usage_info even when Claude
+// account I/O is allowed. Without this guard every wave/sequential completion
+// hits OAuth/usage whenever ~/.claude credentials exist.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn no_rate_limit_skips_load_usage_even_when_claude_io_allowed() {
+    disable_llm_extraction();
+    let (db_temp, mut conn) = setup_migrated_db();
+    insert_run(&conn);
+
+    let completed = IterationOutcome::Completed;
+    let items = [OutputReactionItem {
+        task_id: Some("RP-DONE-NL"),
+        outcome: &completed,
+        output: "<completed>RP-DONE-NL</completed>",
+    }];
+    let mut p = params(db_temp.path(), 300);
+    p.usage_enabled = true;
+    p.anthropic_account_io_allowed = true;
+
+    let boom_load = || -> Option<UsageInfo> {
+        panic!("load_usage_info reached with no RateLimit item in the slice");
+    };
+    let spy = IoSeamSpy::new();
+    let mut blackout = BlackoutState::default();
+    let reaction = react_to_outputs_with_io_seams(
+        &mut conn,
+        &items,
+        &p,
+        &mut blackout,
+        &spy.usage_gate(),
+        &spy.reset_wait(),
+        &spy.probe(),
+        &boom_load,
+    );
+
+    assert_eq!(reaction, AccountReaction::None);
+    assert_eq!(spy.usage_gate_calls.get(), 0);
+    assert_eq!(spy.probe_calls.get(), 0);
+    assert_eq!(spy.reset_wait_secs.get(), None);
 }
 
 // ---------------------------------------------------------------------------
@@ -2991,18 +3036,19 @@ fn completion_and_budget_harness_compiles_and_setup_works() {
 // These cases exercise the PRODUCTION entry shape
 // (`react_to_outputs_with_io_seams`, the seam-injected twin of
 // `react_to_outputs`) rather than the hermetic `react_to_outputs_inner`: the
-// skip decision lives in the production wait closure, so an inner-only test
-// could not observe it. The three side-effecting leaves the real wrapper binds
-// — `usage::check_and_wait` (OAuth + Anthropic usage GET),
-// `wait_for_usage_reset` (sleep + `.stop` poll), and
-// `recovery::probe_rate_limit_lifted` (spawns the Claude CLI) — are injected as
-// counting spies, so the suite stays hermetic: no credentials, no network, no
-// subprocess, no real sleep.
+// skip decision lives in the production wrapper, so an inner-only test could
+// not observe it. The four side-effecting leaves the real wrapper binds —
+// `usage::load_usage_info` (OAuth + Anthropic usage GET → api_secs),
+// `usage::check_and_wait` (usage gate), `wait_for_usage_reset` (sleep +
+// `.stop` poll), and `recovery::probe_rate_limit_lifted` (spawns the Claude
+// CLI) — are injected as counting spies, so the suite stays hermetic: no
+// credentials, no network, no subprocess, no real sleep.
 // ===========================================================================
 
-/// Counting spy for the three production I/O seams. `Cell`-based (the seams are
+/// Counting spy for the four production I/O seams. `Cell`-based (the seams are
 /// `Fn`, not `FnMut`) so `&self` closures can record invocations.
 struct IoSeamSpy {
+    load_usage_calls: Cell<u32>,
     usage_gate_calls: Cell<u32>,
     reset_wait_calls: Cell<u32>,
     probe_calls: Cell<u32>,
@@ -3020,8 +3066,10 @@ struct IoSeamSpy {
 
 impl IoSeamSpy {
     /// Reset wait completes; usage gate falls through; probe finds no lift.
+    /// `load_usage` returns `None` (hermetic — no banner, no api_secs).
     fn new() -> Self {
         Self {
+            load_usage_calls: Cell::new(0),
             usage_gate_calls: Cell::new(0),
             reset_wait_calls: Cell::new(0),
             probe_calls: Cell::new(0),
@@ -3041,6 +3089,13 @@ impl IoSeamSpy {
     fn reset_wait_stops(mut self) -> Self {
         self.reset_wait_completes = false;
         self
+    }
+
+    fn load_usage(&self) -> impl Fn() -> Option<UsageInfo> + '_ {
+        move || {
+            self.load_usage_calls.set(self.load_usage_calls.get() + 1);
+            None
+        }
     }
 
     fn usage_gate(&self) -> impl Fn(u8, &Path, u64) -> UsageCheckResult + '_ {
@@ -3080,6 +3135,26 @@ impl IoSeamSpy {
     }
 }
 
+/// Drive [`react_to_outputs_with_io_seams`] with all four [`IoSeamSpy`] seams.
+fn react_with_spy(
+    conn: &mut Connection,
+    items: &[OutputReactionItem<'_>],
+    params: &AccountReactionParams<'_>,
+    blackout: &mut BlackoutState,
+    spy: &IoSeamSpy,
+) -> AccountReaction {
+    react_to_outputs_with_io_seams(
+        conn,
+        items,
+        params,
+        blackout,
+        &spy.usage_gate(),
+        &spy.reset_wait(),
+        &spy.probe(),
+        &spy.load_usage(),
+    )
+}
+
 /// One rate-limited item whose output carries no parseable reset timestamp, so
 /// the wait-seconds fall back to `fallback_wait` (the `.stop` / fallback path
 /// the Claude-disabled loop is left with).
@@ -3115,16 +3190,13 @@ fn claude_disabled_rate_limit_does_zero_anthropic_io() {
 
     let spy = IoSeamSpy::new();
     let mut blackout = BlackoutState::default();
-    let reaction = react_to_outputs_with_io_seams(
-        &mut conn,
-        &items,
-        &p,
-        &mut blackout,
-        &spy.usage_gate(),
-        &spy.reset_wait(),
-        &spy.probe(),
-    );
+    let reaction = react_with_spy(&mut conn, &items, &p, &mut blackout, &spy);
 
+    assert_eq!(
+        spy.load_usage_calls.get(),
+        0,
+        "Claude disabled: load_usage_info must never run"
+    );
     assert_eq!(
         spy.usage_gate_calls.get(),
         0,
@@ -3180,6 +3252,9 @@ fn claude_disabled_rate_limit_never_reaches_exploding_anthropic_seams() {
     p.usage_enabled = true;
     p.anthropic_account_io_allowed = false;
 
+    let boom_load = || -> Option<UsageInfo> {
+        panic!("load_usage_info reached on a Claude-disabled loop");
+    };
     let boom_gate = |_: u8, _: &Path, _: u64| -> UsageCheckResult {
         panic!("Anthropic usage load reached on a Claude-disabled loop");
     };
@@ -3203,6 +3278,7 @@ fn claude_disabled_rate_limit_never_reaches_exploding_anthropic_seams() {
         &boom_gate,
         &reset_wait,
         &boom_probe,
+        &boom_load,
     );
     assert_eq!(reaction, AccountReaction::WaitedAndRetry);
 }
@@ -3227,17 +3303,10 @@ fn claude_disabled_rate_limit_stop_signal_still_interrupts_wait() {
 
     let spy = IoSeamSpy::new().reset_wait_stops();
     let mut blackout = BlackoutState::default();
-    let reaction = react_to_outputs_with_io_seams(
-        &mut conn,
-        &items,
-        &p,
-        &mut blackout,
-        &spy.usage_gate(),
-        &spy.reset_wait(),
-        &spy.probe(),
-    );
+    let reaction = react_with_spy(&mut conn, &items, &p, &mut blackout, &spy);
 
     assert_eq!(reaction, AccountReaction::Stop);
+    assert_eq!(spy.load_usage_calls.get(), 0);
     assert_eq!(spy.usage_gate_calls.get(), 0);
     assert_eq!(spy.probe_calls.get(), 0);
     assert_eq!(
@@ -3267,17 +3336,14 @@ fn claude_enabled_rate_limit_still_loads_usage_first() {
 
     let spy = IoSeamSpy::new().usage_gate_waits();
     let mut blackout = BlackoutState::default();
-    let reaction = react_to_outputs_with_io_seams(
-        &mut conn,
-        &items,
-        &p,
-        &mut blackout,
-        &spy.usage_gate(),
-        &spy.reset_wait(),
-        &spy.probe(),
-    );
+    let reaction = react_with_spy(&mut conn, &items, &p, &mut blackout, &spy);
 
-    assert_eq!(spy.usage_gate_calls.get(), 1, "usage load still runs");
+    assert_eq!(
+        spy.load_usage_calls.get(),
+        1,
+        "ordinary RateLimit still loads api_secs when Claude I/O is allowed"
+    );
+    assert_eq!(spy.usage_gate_calls.get(), 1, "usage gate still runs");
     assert_eq!(
         spy.reset_wait_calls.get(),
         0,
@@ -3312,16 +3378,14 @@ fn claude_enabled_with_usage_env_off_still_wires_the_early_lift_probe() {
 
     let spy = IoSeamSpy::new();
     let mut blackout = BlackoutState::default();
-    let reaction = react_to_outputs_with_io_seams(
-        &mut conn,
-        &items,
-        &p,
-        &mut blackout,
-        &spy.usage_gate(),
-        &spy.reset_wait(),
-        &spy.probe(),
-    );
+    let reaction = react_with_spy(&mut conn, &items, &p, &mut blackout, &spy);
 
+    assert_eq!(
+        spy.load_usage_calls.get(),
+        1,
+        "ordinary RateLimit still loads api_secs when Claude I/O is allowed \
+         (env switch does not suppress the post-output usage-API load)"
+    );
     assert_eq!(
         spy.usage_gate_calls.get(),
         0,
@@ -3403,8 +3467,9 @@ fn both_account_reaction_param_sites_key_anthropic_io_on_claude_enablement() {
 // ===========================================================================
 
 /// Run one truth-table cell through the production wrapper and report the
-/// observable Anthropic side effects: `(usage_gate_calls, probe_wired, probe_calls)`.
-fn post_output_io_cell(usage_enabled: bool, io_allowed: bool) -> (u32, Option<bool>, u32) {
+/// observable Anthropic side effects:
+/// `(load_usage_calls, usage_gate_calls, probe_wired, probe_calls)`.
+fn post_output_io_cell(usage_enabled: bool, io_allowed: bool) -> (u32, u32, Option<bool>, u32) {
     disable_llm_extraction();
     let (db_temp, mut conn) = setup_migrated_db();
     insert_run(&conn);
@@ -3418,16 +3483,9 @@ fn post_output_io_cell(usage_enabled: bool, io_allowed: bool) -> (u32, Option<bo
 
     let spy = IoSeamSpy::new();
     let mut blackout = BlackoutState::default();
-    react_to_outputs_with_io_seams(
-        &mut conn,
-        &items,
-        &p,
-        &mut blackout,
-        &spy.usage_gate(),
-        &spy.reset_wait(),
-        &spy.probe(),
-    );
+    react_with_spy(&mut conn, &items, &p, &mut blackout, &spy);
     (
+        spy.load_usage_calls.get(),
         spy.usage_gate_calls.get(),
         spy.reset_wait_probe_wired.get(),
         spy.probe_calls.get(),
@@ -3436,17 +3494,18 @@ fn post_output_io_cell(usage_enabled: bool, io_allowed: bool) -> (u32, Option<bo
 
 #[test]
 fn post_output_anthropic_io_matrix_over_env_and_claude() {
-    // (usage_enabled, io_allowed) => (usage_gate_calls, probe_wired, probe_calls)
+    // (usage_enabled, io_allowed) =>
+    // (load_usage_calls, usage_gate_calls, probe_wired, probe_calls)
     let cases = [
-        // Both on: the usage load runs, and the early-lift probe stays wired.
-        ((true, true), (1, Some(true), 1)),
+        // Both on: api_secs load + usage gate + early-lift probe.
+        ((true, true), (1, 1, Some(true), 1)),
         // Claude disabled: ZERO Anthropic I/O, even with the env switch on.
-        ((true, false), (0, Some(false), 0)),
-        // Env off, Claude on: the usage pre-load is suppressed but the Claude
-        // probe REMAINS reachable — the env switch is pre-iteration-only.
-        ((false, true), (0, Some(true), 1)),
+        ((true, false), (0, 0, Some(false), 0)),
+        // Env off, Claude on: usage-gate suppressed but api_secs load + Claude
+        // probe REMAIN — the env switch is pre-iteration-only for the gate.
+        ((false, true), (1, 0, Some(true), 1)),
         // Both off: same zero-I/O shape as Claude-disabled alone.
-        ((false, false), (0, Some(false), 0)),
+        ((false, false), (0, 0, Some(false), 0)),
     ];
     for ((usage_enabled, io_allowed), expected) in cases {
         assert_eq!(
@@ -3489,14 +3548,12 @@ fn claude_disabled_zero_anthropic_io_agrees_across_seq_and_wave_shapes() {
     seq_p.anthropic_account_io_allowed = false;
     let seq_spy = IoSeamSpy::new();
     let mut seq_blackout = BlackoutState::default();
-    let seq_reaction = react_to_outputs_with_io_seams(
+    let seq_reaction = react_with_spy(
         &mut seq_conn,
         &seq_items,
         &seq_p,
         &mut seq_blackout,
-        &seq_spy.usage_gate(),
-        &seq_spy.reset_wait(),
-        &seq_spy.probe(),
+        &seq_spy,
     );
 
     // Wave shape: two rate-limited slots plus one that completed this wave.
@@ -3519,14 +3576,12 @@ fn claude_disabled_zero_anthropic_io_agrees_across_seq_and_wave_shapes() {
     wave_p.anthropic_account_io_allowed = false;
     let wave_spy = IoSeamSpy::new();
     let mut wave_blackout = BlackoutState::default();
-    let wave_reaction = react_to_outputs_with_io_seams(
+    let wave_reaction = react_with_spy(
         &mut wave_conn,
         &wave_items,
         &wave_p,
         &mut wave_blackout,
-        &wave_spy.usage_gate(),
-        &wave_spy.reset_wait(),
-        &wave_spy.probe(),
+        &wave_spy,
     );
 
     assert_eq!(
@@ -3536,6 +3591,11 @@ fn claude_disabled_zero_anthropic_io_agrees_across_seq_and_wave_shapes() {
     assert_eq!(seq_reaction, AccountReaction::WaitedAndRetry);
 
     for (shape, spy) in [("sequential", &seq_spy), ("wave", &wave_spy)] {
+        assert_eq!(
+            spy.load_usage_calls.get(),
+            0,
+            "{shape}: Claude disabled ⇒ zero load_usage_info calls"
+        );
         assert_eq!(
             spy.usage_gate_calls.get(),
             0,
@@ -3636,12 +3696,365 @@ fn known_bad_collapsed_flag_drops_the_probe_on_env_off_claude_on() {
 
     // The production wrapper, on the SAME inputs, keeps the probe wired. This
     // inequality is the discriminator: the real assertions reject the collapse.
-    let (_, correct_probe_wired, correct_probe_calls) = post_output_io_cell(false, true);
+    let (_, _, correct_probe_wired, correct_probe_calls) = post_output_io_cell(false, true);
     assert_eq!(correct_probe_wired, Some(true));
     assert_eq!(correct_probe_calls, 1);
     assert_ne!(
         spy.reset_wait_probe_wired.get(),
         correct_probe_wired,
         "known-bad must diverge from the production wrapper on (env off, Claude on)"
+    );
+}
+
+// ===========================================================================
+// PR-1 / FR-002 — Fable/rung-scoped RateLimit: fixed 3600 Wait, no Blackout,
+// no usage_gate / early-lift probe (seq + wave share react_to_outputs_inner).
+// ===========================================================================
+
+const FABLE_RATE_LIMIT_OUTPUT: &str =
+    "You've reached your Fable limit. To continue, switch models with /model.";
+
+// ---------------------------------------------------------------------------
+// (g) Wave: one Fable RateLimit + two completions → exactly one 3600s wait,
+// no provider_blackouts.record (even with spillover_enabled).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fable_rate_limit_wave_waits_once_3600_never_blackouts() {
+    disable_llm_extraction();
+    let (db_temp, mut conn) = setup_migrated_db();
+    insert_run(&conn);
+    insert_in_progress_task(&conn, "RP-FABLE-0");
+    insert_done_task(&conn, "RP-DONE-1");
+    insert_done_task(&conn, "RP-DONE-2");
+
+    let rate = IterationOutcome::RateLimit;
+    let done = IterationOutcome::Completed;
+    let items = [
+        OutputReactionItem {
+            task_id: Some("RP-FABLE-0"),
+            outcome: &rate,
+            output: FABLE_RATE_LIMIT_OUTPUT,
+        },
+        OutputReactionItem {
+            task_id: Some("RP-DONE-1"),
+            outcome: &done,
+            output: "<completed>RP-DONE-1</completed>",
+        },
+        OutputReactionItem {
+            task_id: Some("RP-DONE-2"),
+            outcome: &done,
+            output: "<completed>RP-DONE-2</completed>",
+        },
+    ];
+    let mut p = params(db_temp.path(), 300);
+    p.spillover_enabled = true;
+    p.blackout_fallback_secs = 3600;
+    p.now_secs = 1_000;
+    let mut blackout = BlackoutState::default();
+    let spy = WaitSpy::completing();
+    let wait = spy.closure();
+    let reaction = react_to_outputs_inner(
+        &mut conn,
+        &items,
+        &p,
+        &mut blackout,
+        Some(6 * 24 * 3600), // populated api_secs must be ignored
+        &wait as WaitFn,
+    );
+
+    assert_eq!(reaction, AccountReaction::WaitedAndRetry);
+    assert_eq!(spy.calls.get(), 1, "exactly one wait for the whole wave");
+    assert_eq!(spy.last_secs.get(), Some(3600));
+    assert!(
+        blackout.active(1_000).is_empty(),
+        "rung-scoped phrasing must never record provider_blackouts even with spillover"
+    );
+    assert_eq!(
+        task_status(&conn, "RP-FABLE-0").as_deref(),
+        Some("todo"),
+        "rate-limited task still resets in_progress → todo"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// CODE-FIX-001: Mixed wave — non-Fable account RateLimit FIRST + Fable second
+// + spillover_enabled. Decide must prefer the rung-scoped item (Wait 3600),
+// never Blackout from the leading account hit. Without the prefer-rung-scoped
+// pick, first_rate_limited would Blackout while any() still skipped the probe.
+// ---------------------------------------------------------------------------
+
+const ACCOUNT_HIT_YOUR_LIMIT_OUTPUT: &str =
+    "Claude AI usage limit reached · hit your limit · resets 4pm (America/Los_Angeles)";
+
+#[test]
+fn mixed_wave_prefers_rung_scoped_rate_limit_over_leading_account_hit() {
+    disable_llm_extraction();
+    let (db_temp, mut conn) = setup_migrated_db();
+    insert_run(&conn);
+    insert_in_progress_task(&conn, "RP-ACCT-0");
+    insert_in_progress_task(&conn, "RP-FABLE-1");
+
+    let rate = IterationOutcome::RateLimit;
+    let items = [
+        OutputReactionItem {
+            task_id: Some("RP-ACCT-0"),
+            outcome: &rate,
+            output: ACCOUNT_HIT_YOUR_LIMIT_OUTPUT,
+        },
+        OutputReactionItem {
+            task_id: Some("RP-FABLE-1"),
+            outcome: &rate,
+            output: FABLE_RATE_LIMIT_OUTPUT,
+        },
+    ];
+    let mut p = params(db_temp.path(), 300);
+    p.spillover_enabled = true;
+    p.blackout_fallback_secs = 3600;
+    p.now_secs = 1_000;
+    let mut blackout = BlackoutState::default();
+    let spy = WaitSpy::completing();
+    let wait = spy.closure();
+    let reaction = react_to_outputs_inner(
+        &mut conn,
+        &items,
+        &p,
+        &mut blackout,
+        Some(7200), // would drive Blackout if decide used the leading account item
+        &wait as WaitFn,
+    );
+
+    assert_eq!(reaction, AccountReaction::WaitedAndRetry);
+    assert_eq!(spy.calls.get(), 1, "exactly one wait for the whole wave");
+    assert_eq!(
+        spy.last_secs.get(),
+        Some(3600),
+        "rung-scoped item must win decide → Wait(blackout_fallback_secs)"
+    );
+    assert!(
+        blackout.active(1_000).is_empty(),
+        "any Fable/rung-scoped RateLimit in the wave must never record provider_blackouts"
+    );
+    assert_eq!(task_status(&conn, "RP-ACCT-0").as_deref(), Some("todo"));
+    assert_eq!(task_status(&conn, "RP-FABLE-1").as_deref(), Some("todo"));
+}
+
+// ---------------------------------------------------------------------------
+// (d) Production wait closure: Fable phrasing must NOT call load_usage_info,
+// invoke usage_gate, or wire probe_rate_limit_lifted (sleep is stop-signal-
+// aware only). Hermetic with anthropic_account_io_allowed=true via the
+// load_usage seam — CI / developer machines with ~/.claude credentials must
+// never hit the network, and no Usage API reset banner can print.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fable_rate_limit_skips_usage_gate_and_probe() {
+    disable_llm_extraction();
+    let (db_temp, mut conn) = setup_migrated_db();
+    insert_run(&conn);
+    insert_in_progress_task(&conn, "RP-FABLE-0");
+
+    let rate = IterationOutcome::RateLimit;
+    let items = [OutputReactionItem {
+        task_id: Some("RP-FABLE-0"),
+        outcome: &rate,
+        output: FABLE_RATE_LIMIT_OUTPUT,
+    }];
+    let mut p = params(db_temp.path(), 300);
+    // Both flags ON — without the Fable skip, load_usage_info would hit
+    // OAuth/usage (and print a multi-hour banner), usage_gate would fire, and
+    // the 30s no -m probe could lift the wait.
+    p.usage_enabled = true;
+    p.anthropic_account_io_allowed = true;
+    p.blackout_fallback_secs = 3600;
+
+    // Exploding load seam: if the wrapper reintroduces the call, this test
+    // fails immediately instead of silently hitting live Anthropic.
+    let boom_load = || -> Option<UsageInfo> {
+        panic!("load_usage_info reached on rung-scoped Fable RateLimit");
+    };
+    let spy = IoSeamSpy::new();
+    let mut blackout = BlackoutState::default();
+    let reaction = react_to_outputs_with_io_seams(
+        &mut conn,
+        &items,
+        &p,
+        &mut blackout,
+        &spy.usage_gate(),
+        &spy.reset_wait(),
+        &spy.probe(),
+        &boom_load,
+    );
+
+    assert_eq!(reaction, AccountReaction::WaitedAndRetry);
+    assert_eq!(
+        spy.usage_gate_calls.get(),
+        0,
+        "Fable phrasing must not invoke usage_gate"
+    );
+    assert_eq!(
+        spy.reset_wait_probe_wired.get(),
+        Some(false),
+        "Fable phrasing must not wire probe_rate_limit_lifted"
+    );
+    assert_eq!(spy.probe_calls.get(), 0);
+    assert_eq!(spy.reset_wait_calls.get(), 1);
+    assert_eq!(
+        spy.reset_wait_secs.get(),
+        Some(3600),
+        "wait secs = blackout_fallback_secs"
+    );
+    assert!(blackout.active(0).is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// CODE-FIX-001 AC: mixed wave still skips usage_gate / probe when ANY item is
+// rung-scoped (leading account RateLimit must not re-enable Anthropic I/O).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn mixed_wave_rung_scoped_still_skips_usage_gate_and_probe() {
+    disable_llm_extraction();
+    let (db_temp, mut conn) = setup_migrated_db();
+    insert_run(&conn);
+    insert_in_progress_task(&conn, "RP-ACCT-0");
+    insert_in_progress_task(&conn, "RP-FABLE-1");
+
+    let rate = IterationOutcome::RateLimit;
+    let items = [
+        OutputReactionItem {
+            task_id: Some("RP-ACCT-0"),
+            outcome: &rate,
+            output: ACCOUNT_HIT_YOUR_LIMIT_OUTPUT,
+        },
+        OutputReactionItem {
+            task_id: Some("RP-FABLE-1"),
+            outcome: &rate,
+            output: FABLE_RATE_LIMIT_OUTPUT,
+        },
+    ];
+    let mut p = params(db_temp.path(), 300);
+    p.usage_enabled = true;
+    p.anthropic_account_io_allowed = true;
+    p.spillover_enabled = true;
+    p.blackout_fallback_secs = 3600;
+    p.now_secs = 1_000;
+
+    let boom_load = || -> Option<UsageInfo> {
+        panic!("load_usage_info reached when any RateLimit item is rung-scoped");
+    };
+    let spy = IoSeamSpy::new();
+    let mut blackout = BlackoutState::default();
+    let reaction = react_to_outputs_with_io_seams(
+        &mut conn,
+        &items,
+        &p,
+        &mut blackout,
+        &spy.usage_gate(),
+        &spy.reset_wait(),
+        &spy.probe(),
+        &boom_load,
+    );
+
+    assert_eq!(reaction, AccountReaction::WaitedAndRetry);
+    assert_eq!(spy.usage_gate_calls.get(), 0);
+    assert_eq!(spy.reset_wait_probe_wired.get(), Some(false));
+    assert_eq!(spy.probe_calls.get(), 0);
+    assert_eq!(spy.reset_wait_calls.get(), 1);
+    assert_eq!(spy.reset_wait_secs.get(), Some(3600));
+    assert!(
+        blackout.active(1_000).is_empty(),
+        "prefer-rung-scoped decide + any() skip must both hold on mixed waves"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (h) `/model` alone does not take the 3600 override — keeps api_secs path
+// (here: unparseable → fallback_wait) and may Blackout under spillover.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn slash_model_alone_does_not_take_3600_override() {
+    disable_llm_extraction();
+    let (db_temp, mut conn) = setup_migrated_db();
+    insert_run(&conn);
+    insert_in_progress_task(&conn, "RP-MODEL-0");
+
+    let rate = IterationOutcome::RateLimit;
+    let items = [OutputReactionItem {
+        task_id: Some("RP-MODEL-0"),
+        outcome: &rate,
+        output: "Try /model to pick another model",
+    }];
+    let mut p = params(db_temp.path(), 300);
+    p.spillover_enabled = true;
+    p.blackout_fallback_secs = 3600;
+    p.now_secs = 1_000;
+    let mut blackout = BlackoutState::default();
+    let spy = WaitSpy::completing();
+    let wait = spy.closure();
+    let reaction = react_to_outputs_inner(
+        &mut conn,
+        &items,
+        &p,
+        &mut blackout,
+        Some(7200),
+        &wait as WaitFn,
+    );
+
+    assert_eq!(reaction, AccountReaction::RerouteAndRetry);
+    assert_eq!(spy.calls.get(), 0, "spillover Blackout skips wait");
+    assert!(
+        blackout.active(1_000).contains(&Provider::Claude),
+        "/model alone may Blackout under spillover"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// CODE-FIX-004: hyphenated model ids (claude-opus-5 / claude-fable-5) in
+// ordinary session RateLimit stdout must NOT take Wait 3600 — hyphen is not
+// a word boundary. Spillover still Blackouts with api_secs / output_secs.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn model_id_in_session_rate_limit_stdout_still_blackouts_not_3600() {
+    disable_llm_extraction();
+    let (db_temp, mut conn) = setup_migrated_db();
+    insert_run(&conn);
+    insert_in_progress_task(&conn, "RP-HYPHEN-0");
+
+    // Realistic capture: model id in the banner + ordinary account RateLimit.
+    let output = "Running with claude-opus-5\nYou've hit your limit · resets 4pm";
+    let rate = IterationOutcome::RateLimit;
+    let items = [OutputReactionItem {
+        task_id: Some("RP-HYPHEN-0"),
+        outcome: &rate,
+        output,
+    }];
+    let mut p = params(db_temp.path(), 300);
+    p.spillover_enabled = true;
+    p.blackout_fallback_secs = 3600;
+    p.now_secs = 1_000;
+    let mut blackout = BlackoutState::default();
+    let spy = WaitSpy::completing();
+    let wait = spy.closure();
+    let reaction = react_to_outputs_inner(
+        &mut conn,
+        &items,
+        &p,
+        &mut blackout,
+        Some(7200), // api_secs must win for Blackout, not be ignored as 3600 Wait
+        &wait as WaitFn,
+    );
+
+    assert_eq!(
+        reaction,
+        AccountReaction::RerouteAndRetry,
+        "ordinary account RateLimit with model id in stdout must Blackout under spillover"
+    );
+    assert_eq!(spy.calls.get(), 0, "Blackout path must not Wait 3600");
+    assert!(
+        blackout.active(1_000).contains(&Provider::Claude),
+        "spillover Blackout must still record Claude when hyphenated model id is present"
     );
 }
