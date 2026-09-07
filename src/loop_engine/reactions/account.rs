@@ -25,7 +25,8 @@ use crate::loop_engine::quota::{
 };
 use crate::loop_engine::recovery::probe_rate_limit_lifted;
 use crate::loop_engine::usage::{
-    UsageCheckResult, UsageInfo, load_usage_info_with_threshold, usage_suggests_lifted,
+    UsageCheckResult, UsageInfo, buckets_for_run_models, load_usage_info_with_threshold,
+    usage_suggests_lifted,
 };
 use crate::loop_engine::{display, signals};
 
@@ -1368,8 +1369,14 @@ pub fn run_account_quota_gate(params: RunAccountQuotaGateParams<'_>) -> UsageChe
         execute_account_action,
     } = params;
     let usage = load_usage_info_with_threshold(threshold);
-    let (buckets, account_remaining, account_reset_at) = match &usage {
-        Some(info) => {
+    // Re-ingest OAuth HUD with the run's ResolvedModelsConfig so extra-mark
+    // sees pins (e.g. frontier→opus). Builtin snapshot on info.buckets alone
+    // would leave frontier selectable after an Opus HUD low (WIRE-FIX-001).
+    let run_buckets = usage
+        .as_ref()
+        .map(|info| buckets_for_run_models(info, models));
+    let (buckets, account_remaining, account_reset_at) = match (&usage, &run_buckets) {
+        (Some(info), Some(owned)) => {
             if let Some(banner) = info.remaining_banner.as_deref() {
                 eprintln!("{banner}");
             } else {
@@ -1380,16 +1387,16 @@ pub fn run_account_quota_gate(params: RunAccountQuotaGateParams<'_>) -> UsageChe
                 );
             }
             (
-                if info.buckets.is_empty() {
+                if owned.is_empty() {
                     None
                 } else {
-                    Some(info.buckets.as_slice())
+                    Some(owned.as_slice())
                 },
                 Some(info.percentage),
                 info.reset_at.as_deref(),
             )
         }
-        None => (None, None, None),
+        _ => (None, None, None),
     };
 
     let (work, horizon_stop) = if let Some(buckets) = buckets {

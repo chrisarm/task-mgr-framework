@@ -88,8 +88,15 @@ pub struct UsageInfo {
     /// Multi-bucket `% left` operator banner when OAuth HUD JSON was parsed.
     pub remaining_banner: Option<String>,
     /// Generic quota buckets from OAuth ingest (PR-2). Empty for org-endpoint
-    /// fallback or when ingest was not run. Feed to `evaluate_quota` / apply.
+    /// fallback or when ingest was not run. Prefer
+    /// [`buckets_for_run_models`] before evaluate/apply so extra-mark uses the
+    /// run's [`ResolvedModelsConfig`] (not a builtin snapshot from fetch).
     pub buckets: Vec<crate::loop_engine::quota::QuotaBucket>,
+    /// Raw OAuth HUD JSON when the OAuth endpoint succeeded. Lets
+    /// [`run_account_quota_gate`](crate::loop_engine::reactions::account::run_account_quota_gate)
+    /// re-ingest with `params.models` so a frontier→opus pin extra-marks both
+    /// rungs. `None` for org-endpoint fallback.
+    pub oauth_json: Option<serde_json::Value>,
 }
 
 /// Result of a usage check-and-wait cycle.
@@ -163,10 +170,12 @@ fn fetch_oauth_usage(access_token: &str, threshold: u8) -> Option<UsageInfo> {
 
     let mut info = parse_oauth_usage_json_with_threshold(&json, f64::from(threshold))?;
     info.remaining_banner = Some(format_oauth_remaining_banner(&json, threshold, Utc::now()));
-    // PR-2: ingest every window for evaluate/apply. Extra-mark uses the run's
-    // resolved models when the caller re-ingests; here builtin is correct for
-    // the threshold-only fetch path and matches format_oauth_remaining_banner.
+    // Builtin ingest is a display/default snapshot only (matches
+    // format_oauth_remaining_banner). Evaluate/apply MUST re-ingest via
+    // buckets_for_run_models with the run ResolvedModelsConfig so a
+    // frontier→opus pin extra-marks both rungs (WIRE-FIX-001).
     info.buckets = ingest_oauth_value(&json, builtin_resolved_models());
+    info.oauth_json = Some(json);
     Some(info)
 }
 
@@ -693,6 +702,7 @@ pub(crate) fn parse_oauth_usage_json_with_threshold(
         reset_at,
         remaining_banner: None,
         buckets: Vec::new(),
+        oauth_json: None,
     })
 }
 
@@ -823,13 +833,31 @@ fn parse_org_usage_json(json: &serde_json::Value) -> Option<UsageInfo> {
         reset_at,
         remaining_banner: None,
         buckets: Vec::new(),
+        oauth_json: None,
     })
+}
+
+/// Build evaluate/apply buckets using the run's resolved models.
+///
+/// When [`UsageInfo::oauth_json`] is present (OAuth path), re-ingests so
+/// extra-mark sees pinned ladders (`set-tier claude frontier=<opus>`). Falls
+/// back to the pre-built `buckets` snapshot (org path / hermetic fixtures).
+pub fn buckets_for_run_models(
+    info: &UsageInfo,
+    models: &ResolvedModelsConfig,
+) -> Vec<crate::loop_engine::quota::QuotaBucket> {
+    match &info.oauth_json {
+        Some(json) => ingest_oauth_value(json, models),
+        None => info.buckets.clone(),
+    }
 }
 
 /// Format the operator remaining banner from OAuth HUD JSON (hermetic).
 ///
 /// Shape: `session 76% left (3m) · week 45% left (5d 13h) · frontier 5% left (5d 13h) (floor 8%)`.
 /// Rung labels use capability-tier names (`frontier`), never model ids (`fable`).
+/// Label-only: uses builtin ladder; evaluate buckets must use
+/// [`buckets_for_run_models`] with the run config.
 pub fn format_oauth_remaining_banner(
     json: &serde_json::Value,
     remaining_min: u8,
@@ -980,6 +1008,7 @@ mod tests {
             reset_at: Some("2024-01-15T12:00:00Z".to_string()),
             remaining_banner: None,
             buckets: Vec::new(),
+            oauth_json: None,
         };
         assert!((info.percentage - 85.5).abs() < f64::EPSILON);
         assert_eq!(info.reset_at, Some("2024-01-15T12:00:00Z".to_string()));
@@ -1434,12 +1463,14 @@ mod tests {
             reset_at: None,
             remaining_banner: None,
             buckets: Vec::new(),
+            oauth_json: None,
         };
         let low = UsageInfo {
             percentage: 70.0,
             reset_at: None,
             remaining_banner: None,
             buckets: Vec::new(),
+            oauth_json: None,
         };
         assert!(usage_suggests_lifted(&lifted, 80, true));
         assert!(!usage_suggests_lifted(&low, 80, true));
@@ -1454,6 +1485,7 @@ mod tests {
             reset_at: None,
             remaining_banner: None,
             buckets: Vec::new(),
+            oauth_json: None,
         };
         assert!(info.reset_at.is_none());
     }
@@ -1604,6 +1636,7 @@ mod tests {
             reset_at: None,
             remaining_banner: None,
             buckets: Vec::new(),
+            oauth_json: None,
         };
         assert!((info.percentage).abs() < f64::EPSILON);
     }
@@ -1615,6 +1648,7 @@ mod tests {
             reset_at: Some("2025-01-01T00:00:00Z".to_string()),
             remaining_banner: None,
             buckets: Vec::new(),
+            oauth_json: None,
         };
         assert!((info.percentage - 100.0).abs() < f64::EPSILON);
     }
@@ -1627,6 +1661,7 @@ mod tests {
             reset_at: None,
             remaining_banner: None,
             buckets: Vec::new(),
+            oauth_json: None,
         };
         assert!((info.percentage - 105.3).abs() < f64::EPSILON);
     }
@@ -1638,6 +1673,7 @@ mod tests {
             reset_at: None,
             remaining_banner: None,
             buckets: Vec::new(),
+            oauth_json: None,
         };
         assert!((info.percentage - 91.999).abs() < f64::EPSILON);
     }
@@ -2086,5 +2122,75 @@ mod tests {
         // Compile-time guard: PR-1 fold must not grow a models param.
         let _f: fn(&serde_json::Value, f64) -> Option<UsageInfo> =
             parse_oauth_usage_json_with_threshold;
+    }
+
+    /// WIRE-FIX-001: production gate must re-ingest with run models. Simulates
+    /// fetch storing builtin buckets (standard-only on Opus HUD) plus raw JSON;
+    /// `buckets_for_run_models` under frontier=opus must extra-mark both rungs
+    /// so evaluate marks both unavailable. Hermetic — no live Anthropic.
+    #[test]
+    fn gate_buckets_for_run_models_extra_mark_under_frontier_opus_pin() {
+        use crate::loop_engine::quota::{UsagePolicy, evaluate_quota};
+
+        let pinned = models_with_frontier_pinned_to_standard();
+        let json = serde_json::json!({
+            "limits": [{
+                "kind": "weekly_scoped",
+                "percent": 95,
+                "severity": "critical",
+                "scope": { "model": { "display_name": "Opus" } }
+            }]
+        });
+
+        // What production fetch still stores under builtin (wrong for pins).
+        let builtin_buckets = ingest_oauth_value(&json, builtin_resolved_models());
+        let builtin_rungs = builtin_buckets
+            .first()
+            .and_then(|b| b.rungs.as_ref())
+            .expect("Opus HUD maps under builtin");
+        assert!(
+            builtin_rungs.contains(&(Provider::Claude, CapabilityTier::Standard)),
+            "precondition: HUD Opus → standard"
+        );
+        assert!(
+            !builtin_rungs.contains(&(Provider::Claude, CapabilityTier::Frontier)),
+            "precondition: builtin ladder must NOT extra-mark frontier (distinct Fable/Opus)"
+        );
+
+        let info = UsageInfo {
+            percentage: 100.0,
+            reset_at: None,
+            remaining_banner: None,
+            buckets: builtin_buckets,
+            oauth_json: Some(json),
+        };
+
+        let gate_buckets = buckets_for_run_models(&info, &pinned);
+        let rungs = gate_buckets
+            .first()
+            .and_then(|b| b.rungs.as_ref())
+            .expect("gate re-ingest must map Opus HUD");
+        assert!(
+            rungs.contains(&(Provider::Claude, CapabilityTier::Standard)),
+            "run models: Opus → standard; got {rungs:?}"
+        );
+        assert!(
+            rungs.contains(&(Provider::Claude, CapabilityTier::Frontier)),
+            "run models under frontier=opus pin must extra-mark frontier; got {rungs:?}"
+        );
+
+        let eval = evaluate_quota(&gate_buckets, &UsagePolicy::default(), 8);
+        assert!(
+            eval.unavailable
+                .contains(&(Provider::Claude, CapabilityTier::Standard)),
+            "evaluate must mark standard unavailable; got {:?}",
+            eval.unavailable
+        );
+        assert!(
+            eval.unavailable
+                .contains(&(Provider::Claude, CapabilityTier::Frontier)),
+            "evaluate must mark frontier unavailable after pin extra-mark; got {:?}",
+            eval.unavailable
+        );
     }
 }
