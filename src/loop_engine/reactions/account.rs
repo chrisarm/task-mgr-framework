@@ -224,8 +224,13 @@ pub(crate) fn decide_account_rate_limit(
     fallback_wait: u64,
     blackout_fallback_secs: u64,
 ) -> RateLimitAction {
-    // Pure spend/credits with no time-based reset: stop before blackout/wait.
-    if api_secs.is_none() && output_secs.is_none() && is_spend_limit_message(output) {
+    // Spend/credits: stop before blackout/wait when the Usage API did not
+    // supply a reset. Live CLI banners often embed `resets 3:40am` (session
+    // window) alongside spend/credits copy — that output_secs must NOT defeat
+    // StopSpend, or the loop parks until morning while the account is still
+    // spend-blocked (raising credits is the only recovery). api_secs still
+    // wins when present (account-binding reset from the usage API).
+    if api_secs.is_none() && is_spend_limit_message(output) {
         return RateLimitAction::StopSpend;
     }
 
@@ -412,15 +417,23 @@ pub fn react_to_outputs_with_io_seams(
     // hermetic inner — loading api_secs would still hit OAuth/usage and print
     // a multi-hour reset banner that decide then ignores; wiring the probe
     // would undo the 3600s Wait in ~30s (or used 55% < 92 → BelowThreshold).
+    //
+    // Also skip when the slice has no RateLimit at all — the inner early-returns
+    // AccountReaction::None, but a premature load_usage here would still hit
+    // live Anthropic on every wave/sequential completion when Claude is enabled
+    // and ~/.claude credentials exist (hung unit tests / false account I/O).
+    let has_rate_limit = items
+        .iter()
+        .any(|item| *item.outcome == IterationOutcome::RateLimit);
     let rung_scoped = items.iter().any(|item| {
         *item.outcome == IterationOutcome::RateLimit
             && is_rung_scoped_rate_limit_message(item.output)
     });
 
-    // Usage load only when Claude account I/O is allowed AND the RateLimit is
-    // not rung-scoped. Ordinary RateLimit still feeds decide's api_secs;
-    // rung-scoped Wait ignores api_secs (forced blackout_fallback_secs).
-    let api_secs = if !rung_scoped && anthropic_account_io_allowed {
+    // Usage load only when there is a RateLimit, Claude account I/O is allowed,
+    // AND it is not rung-scoped. Ordinary RateLimit still feeds decide's
+    // api_secs; rung-scoped Wait ignores api_secs (forced blackout_fallback_secs).
+    let api_secs = if has_rate_limit && !rung_scoped && anthropic_account_io_allowed {
         let usage = load_usage();
         let secs = usage
             .as_ref()
@@ -1311,6 +1324,29 @@ mod tests {
             3600,
         );
         assert_eq!(action, RateLimitAction::StopSpend);
+    }
+
+    #[test]
+    fn test_decide_spend_stop_ignores_embedded_session_reset_in_banner() {
+        // Live CLI: spend/credits banner also carries `resets 3:40am`. Parsing
+        // that into output_secs must not demote StopSpend into a multi-hour Wait
+        // (REVIEW-001 suite hang when a wave accidentally hit real Claude).
+        let output = "You've hit your individual spend limit · run /usage-credits \
+            to raise it, or visit claude.ai/admin-settings/usage · your session \
+            limit resets 3:40am (America/Los_Angeles)";
+        let output_secs = parse_reset_from_output(output);
+        assert!(
+            output_secs.is_some(),
+            "precondition: banner still yields a parsed session reset"
+        );
+        let action = decide_account_rate_limit(None, output_secs, output, false, 300, 3600);
+        assert_eq!(action, RateLimitAction::StopSpend);
+        let spillover = decide_account_rate_limit(None, output_secs, output, true, 300, 3600);
+        assert_eq!(
+            spillover,
+            RateLimitAction::StopSpend,
+            "spend+embedded reset must not Blackout under spillover either"
+        );
     }
 
     #[test]

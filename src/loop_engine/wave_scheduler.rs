@@ -2476,18 +2476,32 @@ mod tests {
         ///
         /// - `TASK_MGR_NO_EXTRACT_LEARNINGS=1` keeps post-slot auxiliary LLM
         ///   spawns from competing for `CLAUDE_BINARY` (post-FEAT-002).
+        /// - `CLAUDE_BINARY` + a PATH-shadow `claude` → the mock script, so a
+        ///   parallel test that clears `CLAUDE_BINARY` without the mutex still
+        ///   cannot reach the operator's real CLI (live spend-limit banners
+        ///   previously parked the suite until `resets 3:40am`).
         /// - `MOCK_CRASH_TASKS` is restored on drop so mixed-crash tests cannot
         ///   leak into siblings in the same binary.
         struct ComprehensiveWaveEnv {
             _no_extract: EnvGuard,
             _bin: EnvGuard,
+            _path: EnvGuard,
             _crash: EnvGuard,
+            /// Keeps the PATH-shadow directory (and `claude` symlink) alive.
+            _path_dir: tempfile::TempDir,
         }
 
         impl ComprehensiveWaveEnv {
             fn new(script: &std::path::Path, mock_crash_tasks: Option<&str>) -> Self {
                 let _no_extract = EnvGuard::set("TASK_MGR_NO_EXTRACT_LEARNINGS", "1");
                 let _bin = EnvGuard::set("CLAUDE_BINARY", script.to_str().unwrap());
+                let path_dir = tempfile::TempDir::new().expect("PATH shadow tempdir");
+                let shadow = path_dir.path().join("claude");
+                std::os::unix::fs::symlink(script, &shadow)
+                    .expect("symlink mock script as PATH-shadow claude");
+                let path_now = std::env::var("PATH").unwrap_or_default();
+                let shadowed = format!("{}:{path_now}", path_dir.path().display());
+                let _path = EnvGuard::set("PATH", &shadowed);
                 let _crash = match mock_crash_tasks {
                     Some(tasks) => EnvGuard::set("MOCK_CRASH_TASKS", tasks),
                     None => EnvGuard::remove("MOCK_CRASH_TASKS"),
@@ -2495,7 +2509,9 @@ mod tests {
                 Self {
                     _no_extract,
                     _bin,
+                    _path,
                     _crash,
+                    _path_dir: path_dir,
                 }
             }
         }

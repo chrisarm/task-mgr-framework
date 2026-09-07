@@ -501,6 +501,50 @@ fn no_rate_limit_returns_none_and_writes_nothing() {
 }
 
 // ---------------------------------------------------------------------------
+// Production seam: no RateLimit must not call load_usage_info even when Claude
+// account I/O is allowed. Without this guard every wave/sequential completion
+// hits OAuth/usage whenever ~/.claude credentials exist.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn no_rate_limit_skips_load_usage_even_when_claude_io_allowed() {
+    disable_llm_extraction();
+    let (db_temp, mut conn) = setup_migrated_db();
+    insert_run(&conn);
+
+    let completed = IterationOutcome::Completed;
+    let items = [OutputReactionItem {
+        task_id: Some("RP-DONE-NL"),
+        outcome: &completed,
+        output: "<completed>RP-DONE-NL</completed>",
+    }];
+    let mut p = params(db_temp.path(), 300);
+    p.usage_enabled = true;
+    p.anthropic_account_io_allowed = true;
+
+    let boom_load = || -> Option<UsageInfo> {
+        panic!("load_usage_info reached with no RateLimit item in the slice");
+    };
+    let spy = IoSeamSpy::new();
+    let mut blackout = BlackoutState::default();
+    let reaction = react_to_outputs_with_io_seams(
+        &mut conn,
+        &items,
+        &p,
+        &mut blackout,
+        &spy.usage_gate(),
+        &spy.reset_wait(),
+        &spy.probe(),
+        &boom_load,
+    );
+
+    assert_eq!(reaction, AccountReaction::None);
+    assert_eq!(spy.usage_gate_calls.get(), 0);
+    assert_eq!(spy.probe_calls.get(), 0);
+    assert_eq!(spy.reset_wait_secs.get(), None);
+}
+
+// ---------------------------------------------------------------------------
 // AC: Stop — injected stop/signal during the wait → AccountReaction::Stop.
 // ---------------------------------------------------------------------------
 

@@ -37,6 +37,24 @@ const ORG_USAGE_API_URL: &str = "https://api.anthropic.com/v1/organizations/usag
 /// `percentage`.
 const DEFAULT_USAGE_THRESHOLD: f64 = 92.0;
 
+/// Connect + response budget for usage GETs. Without this, a SYN hang to
+/// Anthropic (or a wedged path when `~/.claude` credentials exist during unit
+/// tests) can block a wave reaction for tens of minutes.
+const USAGE_API_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+const USAGE_API_RECV_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn usage_http_agent() -> &'static ureq::Agent {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::Agent::config_builder()
+            .timeout_connect(Some(USAGE_API_CONNECT_TIMEOUT))
+            .timeout_recv_response(Some(USAGE_API_RECV_TIMEOUT))
+            .timeout_recv_body(Some(USAGE_API_RECV_TIMEOUT))
+            .build()
+            .into()
+    })
+}
+
 /// Usage information returned from the API.
 #[derive(Debug, Clone)]
 pub struct UsageInfo {
@@ -91,7 +109,8 @@ pub fn check_usage_api(access_token: &str) -> Option<UsageInfo> {
 
 /// Fetch Claude Code OAuth usage (five_hour / seven_day / limits[]).
 fn fetch_oauth_usage(access_token: &str) -> Option<UsageInfo> {
-    let mut response = match ureq::get(OAUTH_USAGE_API_URL)
+    let mut response = match usage_http_agent()
+        .get(OAUTH_USAGE_API_URL)
         .header("Authorization", format!("Bearer {}", access_token))
         .header("anthropic-beta", OAUTH_USAGE_BETA)
         .header("User-Agent", oauth_usage_user_agent())
@@ -177,7 +196,8 @@ fn is_dotted_version(s: &str) -> bool {
 
 /// Fetch legacy org-level usage endpoint.
 fn fetch_org_usage(access_token: &str) -> Option<UsageInfo> {
-    let mut response = match ureq::get(ORG_USAGE_API_URL)
+    let mut response = match usage_http_agent()
+        .get(ORG_USAGE_API_URL)
         .header("Authorization", format!("Bearer {}", access_token))
         .header("Content-Type", "application/json")
         .call()
@@ -361,11 +381,14 @@ pub fn load_usage_info() -> Option<UsageInfo> {
     if super::oauth::is_token_expiring(&creds, 5) {
         match super::oauth::refresh_token(&path, &creds) {
             Ok(refreshed) => {
-                eprintln!("OAuth token refreshed for usage check");
+                crate::output::ui::emit_err("OAuth token refreshed for usage check");
                 creds = refreshed;
             }
             Err(e) => {
-                eprintln!("Warning: could not refresh token for usage check: {}", e);
+                crate::output::ui::emit_err(&format!(
+                    "Warning: could not refresh token for usage check: {}",
+                    e
+                ));
                 // Try with existing token anyway.
             }
         }
