@@ -3906,6 +3906,90 @@ mod tests {
         );
     }
 
+    /// FEAT-009 / AC4+AC5: live-shaped OAuth → frontier-only unavailable;
+    /// medium+high Claude todos → other_rungs_runnable; factory apply → Proceed.
+    /// With and without frontier→opus pin (FEAT-008 identity).
+    #[test]
+    fn live_shaped_snapshot_and_apply_proceed_with_and_without_pin() {
+        use crate::loop_engine::usage::{
+            ingest_oauth_value, live_shaped_oauth_json, models_with_frontier_pinned_to_standard,
+        };
+
+        fn mixed_seed() -> Connection {
+            let conn = Connection::open_in_memory().expect("in-memory");
+            conn.execute_batch(
+                r#"
+                CREATE TABLE tasks (
+                    id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'todo',
+                    model TEXT,
+                    difficulty TEXT,
+                    archived_at TEXT
+                );
+                INSERT INTO tasks (id, status, difficulty) VALUES
+                    ('t-frontier', 'todo', 'high'),
+                    ('t-standard', 'todo', 'medium');
+                "#,
+            )
+            .expect("seed");
+            conn
+        }
+
+        for (label, models) in [
+            (
+                "builtin",
+                crate::loop_engine::model::builtin_resolved_models().clone(),
+            ),
+            (
+                "frontier→opus pin",
+                models_with_frontier_pinned_to_standard(),
+            ),
+        ] {
+            let buckets = ingest_oauth_value(&live_shaped_oauth_json(), &models);
+            let policy = UsagePolicy::default();
+            let eval = evaluate_quota(&buckets, &policy, 8);
+            assert_eq!(
+                eval.unavailable,
+                vec![(Provider::Claude, CapabilityTier::Frontier)],
+                "{label}: evaluate unavailable must be frontier only; got {:?}",
+                eval.unavailable
+            );
+
+            let conn = mixed_seed();
+            let empty_overrides = HashMap::new();
+            let work = compute_remaining_work_snapshot(
+                &conn,
+                None,
+                &models,
+                &eval.unavailable,
+                &empty_overrides,
+            );
+            assert!(
+                work.other_rungs_runnable,
+                "{label}: medium/standard todo must keep other_rungs_runnable; got {work:?}"
+            );
+
+            let applied = apply_quota(&eval, &buckets, &policy, Some(&factory_fb()), &work);
+            assert_eq!(
+                applied.unavailable,
+                vec![(Provider::Claude, CapabilityTier::Frontier)],
+                "{label}: apply unavailable must stay frontier only; got {:?}",
+                applied.unavailable
+            );
+            assert_eq!(
+                applied.account,
+                QuotaAccountAction::Proceed,
+                "{label}: factory apply must Proceed (not Stop/HorizonStopped); got {:?}",
+                applied.account
+            );
+            assert!(
+                !matches!(applied.account, QuotaAccountAction::Stop),
+                "{label}: must not Stop"
+            );
+        }
+    }
+
     // --- handle_rung_only_empty_selection (CODE-FIX-009) ---
 
     fn rung_empty_seed_conn() -> Connection {

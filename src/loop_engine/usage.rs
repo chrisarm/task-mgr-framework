@@ -306,13 +306,16 @@ impl UsageWindow {
 /// rows (no usable measurement) are skipped without panicking.
 ///
 /// Rung mapping (Claude OAuth HUD only):
-/// 1. `scope.model.display_name` / `id` via HUD label table (case-insensitive
-///    prefix/token): Fable→frontier, Opus→standard, Sonnet→cost-efficient,
-///    Haiku→cheapest.
-/// 2. Else unlabeled ids: family token as substring of a *defined* configured
-///    model string (`exact_model_for`, no clamp).
-/// 3. After a HUD map to rung R, extra-mark every defined rung whose configured
-///    model string equals R's (string equality — not substring `tier_of`).
+/// 1. `limits[]` `scope.model.display_name` / `id` via HUD label table
+///    (case-insensitive prefix/token): Fable→frontier, Opus→standard,
+///    Sonnet→cost-efficient, Haiku→cheapest.
+/// 2. Else `limits[]` unlabeled ids (id, no display_name): family token as
+///    substring of a *defined* configured model string (`exact_model_for`).
+/// 3. After a HUD map to rung R, extra-mark every defined rung whose
+///    `exact_model_for` equals any member of identity set I (CONTRACT-002).
+/// 4. Named object siblings (`seven_day_opus`, …) have no `scope.model` →
+///    **`rungs: None`** (do **not** call `map_unlabeled_token`). Still walked;
+///    `kind` may be `weekly_scoped` for explicit onLow rules.
 ///
 /// Does **not** change [`parse_oauth_usage_json_with_threshold`] (PR-1 fold stays
 /// account-binding / threshold-only until FEAT-004).
@@ -330,7 +333,7 @@ pub fn ingest_oauth_value(
             if value.is_null() || !value.is_object() {
                 continue;
             }
-            if let Some(bucket) = ingest_named_sibling(key, value, models) {
+            if let Some(bucket) = ingest_named_sibling(key, value) {
                 out.push(bucket);
             }
         }
@@ -350,11 +353,7 @@ pub fn ingest_oauth_value(
     out
 }
 
-fn ingest_named_sibling(
-    key: &str,
-    value: &serde_json::Value,
-    models: &ResolvedModelsConfig,
-) -> Option<QuotaBucket> {
+fn ingest_named_sibling(key: &str, value: &serde_json::Value) -> Option<QuotaBucket> {
     let measurements = measurements_from_object(value)?;
     let kind = kind_for_named_key(key);
     let resets_at = value
@@ -367,20 +366,8 @@ fn ingest_named_sibling(
         .map(|s| s.to_string());
     let is_active = value.get("is_active").and_then(|v| v.as_bool());
 
-    // Named siblings rarely carry scope.model; map via id family token when
-    // the kind is rung-scoped (seven_day_*), else leave account-binding.
-    let rungs = if kind == "weekly_scoped" || looks_rung_scoped_key(key) {
-        let token = family_token_from_id(key);
-        let mapped = map_unlabeled_token(models, Provider::Claude, &token);
-        if mapped.is_empty() {
-            None
-        } else {
-            Some(mapped)
-        }
-    } else {
-        None
-    };
-
+    // Named siblings have no scope.model — never family-token-map onto a rung
+    // (FEAT-009 / CONTRACT-002). kind may still be weekly_scoped for onLow rules.
     Some(QuotaBucket {
         id: key.to_string(),
         kind,
@@ -389,7 +376,7 @@ fn ingest_named_sibling(
         resets_at,
         severity,
         is_active,
-        rungs,
+        rungs: None,
     })
 }
 
@@ -669,6 +656,104 @@ fn map_unlabeled_token(
 #[cfg(test)]
 pub(crate) fn parse_oauth_usage_json(json: &serde_json::Value) -> Option<UsageInfo> {
     parse_oauth_usage_json_with_threshold(json, DEFAULT_USAGE_REMAINING_MIN)
+}
+
+/// Live-shaped OAuth usage JSON shared by usage / account / pre_spawn tests
+/// (FEAT-009). Do not copy — import this fixture.
+#[cfg(test)]
+pub(crate) fn live_shaped_oauth_json() -> serde_json::Value {
+    serde_json::json!({
+        "five_hour": {
+            "utilization": 24.0,
+            "resets_at": "2026-09-07T06:00:00Z"
+        },
+        "seven_day": {
+            "utilization": 55.0,
+            "resets_at": "2026-09-12T19:00:00Z"
+        },
+        "seven_day_opus": {
+            "utilization": 100.0,
+            "resets_at": "2026-09-12T19:00:00Z"
+        },
+        "seven_day_sonnet": {
+            "utilization": 100.0,
+            "resets_at": "2026-09-12T19:00:00Z"
+        },
+        "nimbus_quill": {
+            "utilization": 100.0,
+            "resets_at": "2026-09-12T19:00:00Z"
+        },
+        "spend": {
+            "dollars": 12.5
+        },
+        "null_window": null,
+        "limits": [
+            {
+                "kind": "session",
+                "percent": 24,
+                "severity": "normal",
+                "resets_at": "2026-09-07T06:00:00Z",
+                "is_active": true
+            },
+            {
+                "kind": "weekly_all",
+                "percent": 55.0,
+                "severity": "normal",
+                "resets_at": "2026-09-12T19:00:00Z",
+                "is_active": false
+            },
+            {
+                "kind": "weekly_scoped",
+                "percent": 95,
+                "severity": "critical",
+                "is_active": true,
+                "resets_at": "2026-09-12T19:00:00Z",
+                "scope": {
+                    "model": { "display_name": "Fable" }
+                }
+            }
+        ]
+    })
+}
+
+/// Resolved models with Claude frontier pinned to the standard (Opus) model
+/// string — the PR-1 pin shape used by FEAT-008/009 identity fixtures.
+#[cfg(test)]
+pub(crate) fn models_with_frontier_pinned_to_standard() -> ResolvedModelsConfig {
+    use crate::loop_engine::model::{
+        FABLE_MODEL, HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL, resolve_models_config,
+    };
+    use crate::loop_engine::project_config::{ModelsConfig, ProviderConfig, RoutingConfig};
+    use std::collections::HashMap;
+
+    let mut providers = HashMap::new();
+    providers.insert(
+        Provider::Claude.as_str().to_string(),
+        ProviderConfig {
+            enabled: true,
+            tiers: [
+                (CapabilityTier::Cheapest, Some(HAIKU_MODEL)),
+                (CapabilityTier::CostEfficient, Some(SONNET_MODEL)),
+                (CapabilityTier::Standard, Some(OPUS_MODEL)),
+                // PR-1 pin: frontier shares the standard model string.
+                (CapabilityTier::Frontier, Some(OPUS_MODEL)),
+            ]
+            .into_iter()
+            .map(|(t, m)| (t.as_str().to_string(), m.map(str::to_string)))
+            .collect(),
+            effort: HashMap::new(),
+            fallback: None,
+            cli_binary: None,
+        },
+    );
+    // Keep FABLE_MODEL referenced so the pin contrast is explicit in review.
+    let _ = FABLE_MODEL;
+    let models = ModelsConfig {
+        primary_provider: Provider::Claude.as_str().to_string(),
+        anchor: CapabilityTier::Standard.as_str().to_string(),
+        providers,
+    };
+    resolve_models_config(&models, &RoutingConfig::default())
 }
 
 /// Parse the Claude Code OAuth usage JSON into [`UsageInfo`].
@@ -1986,98 +2071,6 @@ mod tests {
         )
     }
 
-    fn models_with_frontier_pinned_to_standard() -> ResolvedModelsConfig {
-        use crate::loop_engine::model::{
-            FABLE_MODEL, HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL, resolve_models_config,
-        };
-        use crate::loop_engine::project_config::{ModelsConfig, ProviderConfig, RoutingConfig};
-        use std::collections::HashMap;
-
-        let mut providers = HashMap::new();
-        providers.insert(
-            Provider::Claude.as_str().to_string(),
-            ProviderConfig {
-                enabled: true,
-                tiers: [
-                    (CapabilityTier::Cheapest, Some(HAIKU_MODEL)),
-                    (CapabilityTier::CostEfficient, Some(SONNET_MODEL)),
-                    (CapabilityTier::Standard, Some(OPUS_MODEL)),
-                    // PR-1 pin: frontier shares the standard model string.
-                    (CapabilityTier::Frontier, Some(OPUS_MODEL)),
-                ]
-                .into_iter()
-                .map(|(t, m)| (t.as_str().to_string(), m.map(str::to_string)))
-                .collect(),
-                effort: HashMap::new(),
-                fallback: None,
-                cli_binary: None,
-            },
-        );
-        // Keep FABLE_MODEL referenced so the pin contrast is explicit in review.
-        let _ = FABLE_MODEL;
-        let models = ModelsConfig {
-            primary_provider: Provider::Claude.as_str().to_string(),
-            anchor: CapabilityTier::Standard.as_str().to_string(),
-            providers,
-        };
-        resolve_models_config(&models, &RoutingConfig::default())
-    }
-
-    fn live_shaped_oauth_json() -> serde_json::Value {
-        serde_json::json!({
-            "five_hour": {
-                "utilization": 24.0,
-                "resets_at": "2026-09-07T06:00:00Z"
-            },
-            "seven_day": {
-                "utilization": 55.0,
-                "resets_at": "2026-09-12T19:00:00Z"
-            },
-            "seven_day_opus": {
-                "utilization": 100.0,
-                "resets_at": "2026-09-12T19:00:00Z"
-            },
-            "seven_day_sonnet": {
-                "utilization": 100.0,
-                "resets_at": "2026-09-12T19:00:00Z"
-            },
-            "nimbus_quill": {
-                "utilization": 100.0,
-                "resets_at": "2026-09-12T19:00:00Z"
-            },
-            "spend": {
-                "dollars": 12.5
-            },
-            "null_window": null,
-            "limits": [
-                {
-                    "kind": "session",
-                    "percent": 24,
-                    "severity": "normal",
-                    "resets_at": "2026-09-07T06:00:00Z",
-                    "is_active": true
-                },
-                {
-                    "kind": "weekly_all",
-                    "percent": 55.0,
-                    "severity": "normal",
-                    "resets_at": "2026-09-12T19:00:00Z",
-                    "is_active": false
-                },
-                {
-                    "kind": "weekly_scoped",
-                    "percent": 95,
-                    "severity": "critical",
-                    "is_active": true,
-                    "resets_at": "2026-09-12T19:00:00Z",
-                    "scope": {
-                        "model": { "display_name": "Fable" }
-                    }
-                }
-            ]
-        })
-    }
-
     fn bucket_by_id<'a>(buckets: &'a [QuotaBucket], id: &str) -> &'a QuotaBucket {
         buckets
             .iter()
@@ -2144,21 +2137,122 @@ mod tests {
         assert_eq!(fable.severity.as_deref(), Some("critical"));
         assert_eq!(fable.is_active, Some(true));
 
-        // Unlabeled seven_day_opus / sonnet via configured model substring.
+        // FEAT-009: unlabeled named siblings never family-token-map onto rungs.
         let opus = bucket_by_id(&buckets, "seven_day_opus");
         assert_eq!(opus.kind, "weekly_scoped");
-        assert_eq!(
-            opus.rungs.as_deref(),
-            Some(&[(Provider::Claude, CapabilityTier::Standard)][..])
+        assert!(
+            opus.rungs.is_none(),
+            "seven_day_opus must keep rungs: None (no map_unlabeled_token); got {:?}",
+            opus.rungs
         );
         let sonnet = bucket_by_id(&buckets, "seven_day_sonnet");
-        assert_eq!(
-            sonnet.rungs.as_deref(),
-            Some(&[(Provider::Claude, CapabilityTier::CostEfficient)][..])
+        assert_eq!(sonnet.kind, "weekly_scoped");
+        assert!(
+            sonnet.rungs.is_none(),
+            "seven_day_sonnet must keep rungs: None; got {:?}",
+            sonnet.rungs
         );
 
         // Unknown family → no rungs (evaluate ignores under default policy).
         assert!(bucket_by_id(&buckets, "nimbus_quill").rungs.is_none());
+    }
+
+    /// FEAT-009 / AC2: limits[] unlabeled id (no display_name) still uses
+    /// map_unlabeled_token — that path is limits-only, not named siblings.
+    #[test]
+    fn ingest_limits_unlabeled_id_still_maps_via_token() {
+        // Custom ladder: id has no HUD token (fable/opus/sonnet/haiku) so the
+        // unlabeled branch runs; family token "xyz" substring-matches standard.
+        use crate::loop_engine::model::resolve_models_config;
+        use crate::loop_engine::project_config::{ModelsConfig, ProviderConfig, RoutingConfig};
+        use std::collections::HashMap;
+
+        let mut providers = HashMap::new();
+        providers.insert(
+            Provider::Claude.as_str().to_string(),
+            ProviderConfig {
+                enabled: true,
+                tiers: [
+                    (CapabilityTier::Cheapest, Some("vendor-cheap")),
+                    (CapabilityTier::CostEfficient, Some("vendor-mid")),
+                    (CapabilityTier::Standard, Some("vendor-xyz-turbo")),
+                    (CapabilityTier::Frontier, Some("vendor-front")),
+                ]
+                .into_iter()
+                .map(|(t, m)| (t.as_str().to_string(), m.map(str::to_string)))
+                .collect(),
+                effort: HashMap::new(),
+                fallback: None,
+                cli_binary: None,
+            },
+        );
+        let models = resolve_models_config(
+            &ModelsConfig {
+                primary_provider: Provider::Claude.as_str().to_string(),
+                anchor: CapabilityTier::Standard.as_str().to_string(),
+                providers,
+            },
+            &RoutingConfig::default(),
+        );
+        let json = serde_json::json!({
+            "limits": [{
+                "kind": "weekly_scoped",
+                "percent": 95,
+                "scope": { "model": { "id": "row_xyz" } }
+            }]
+        });
+        let buckets = ingest_oauth_value(&json, &models);
+        let b = bucket_by_id(&buckets, "limits[0].weekly_scoped");
+        assert_eq!(
+            b.rungs.as_deref(),
+            Some(&[(Provider::Claude, CapabilityTier::Standard)][..]),
+            "limits[] id-only must still map via map_unlabeled_token; got {:?}",
+            b.rungs
+        );
+    }
+
+    /// FEAT-009 / AC4: live-shaped evaluate marks frontier only — with and
+    /// without the frontier→opus pin. Named seven_day_* stay Ignore.
+    #[test]
+    fn evaluate_live_shaped_unavailable_is_frontier_only_with_and_without_pin() {
+        use crate::loop_engine::quota::{BucketEval, UsagePolicy, evaluate_quota};
+
+        for (label, models) in [
+            ("builtin", builtin_models()),
+            (
+                "frontier→opus pin",
+                models_with_frontier_pinned_to_standard(),
+            ),
+        ] {
+            let buckets = ingest_oauth_value(&live_shaped_oauth_json(), &models);
+            let eval = evaluate_quota(&buckets, &UsagePolicy::default(), 8);
+            assert_eq!(
+                eval.unavailable,
+                vec![(Provider::Claude, CapabilityTier::Frontier)],
+                "{label}: unavailable must be frontier only; got {:?}",
+                eval.unavailable
+            );
+            let sonnet = eval
+                .per_bucket
+                .iter()
+                .find(|(id, _)| id == "seven_day_sonnet")
+                .expect("seven_day_sonnet walked");
+            assert_eq!(
+                sonnet.1,
+                BucketEval::Ignore,
+                "{label}: seven_day_sonnet (rungs:None) must Ignore even at 0% left"
+            );
+            let nimbus = eval
+                .per_bucket
+                .iter()
+                .find(|(id, _)| id == "nimbus_quill")
+                .expect("nimbus_quill walked");
+            assert_eq!(
+                nimbus.1,
+                BucketEval::Ignore,
+                "{label}: nimbus_quill must Ignore"
+            );
+        }
     }
 
     #[test]
