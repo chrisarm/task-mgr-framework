@@ -520,7 +520,13 @@
         "CODE-FIX-002",
         "CODE-FIX-003",
         "CODE-FIX-004",
-        "CODE-FIX-005"
+        "CODE-FIX-005",
+        "CODE-FIX-006",
+        "CODE-FIX-007",
+        "CODE-FIX-008",
+        "CODE-FIX-009",
+        "CODE-FIX-010",
+        "CODE-FIX-011"
       ],
       "description": "REVIEW-001 is the milestone for this PR-2 slice. Run the full unscoped quality gate and leave the repo green including pre-existing failures. Prove FR-003 + FR-004 remaining banners + horizon apply + proto-channel. Drive verify-task-mgr via `loop run --help` (the skill refuses `loop run` / `batch run`). Unit/coordinator tests are the proof of ingest + remaining + apply. No live Anthropic. Do not implement PR-3.",
       "estimatedEffort": "high",
@@ -560,7 +566,7 @@
       "description": "Post-loop review High 1. apply_quota merges session/weekly AccountLow into latest reset then uses work.other_rungs_runnable to Proceed on >12h. Weekly-all remaining 5% with a 6d reset then continues burning quota because compute_remaining_work_snapshot only subtracts eval.unavailable (scoped). Other Claude rungs share weekly_all and are not a working alternative. Decision: for account-binding AccountLow, reset >12h → Stop. Use other_rungs_runnable only for scoped unavailable, and only count a different provider.",
       "estimatedEffort": "medium",
       "id": "CODE-FIX-002",
-      "passes": true,
+      "passes": false,
       "priority": 0,
       "title": "Account-binding weekly-all >12h must Stop even if other rungs look runnable",
       "touchesFiles": [
@@ -577,7 +583,7 @@
       "description": "Post-loop review High 2. compute_remaining_work_snapshot sets has_forced if ANY todo/in_progress has tasks.model (overflow writes that column). tier_fallback_allows then returns false and apply Defers the whole PRD. Factory includeForced:false is the PR-3 per-task family-match defer, not an opt-out of the whole policy. Decision: do not treat has_forced && !include_forced as a global forbid. Leave forced-model tasks selectable (PR-3 walker); factory still marks eligible rungs unavailable and proceeds on standard.",
       "estimatedEffort": "medium",
       "id": "CODE-FIX-003",
-      "passes": true,
+      "passes": false,
       "priority": -1,
       "title": "Factory includeForced false must not globally forbid unavailable",
       "touchesFiles": [
@@ -593,7 +599,7 @@
       "description": "Post-loop review High 3. Evaluate emits reset_secs=0 for past/now timestamps. Apply maps secs<=60m to Wait { secs } including 0. Execute then substitutes fallback_wait (300s). wait_for_usage_reset already treats 0 as ready-now. Decision: pass 0 through; do not treat 0 as unknown.",
       "estimatedEffort": "low",
       "id": "CODE-FIX-004",
-      "passes": true,
+      "passes": false,
       "priority": -2,
       "title": "Pass Wait { 0 } through as ready-now, not fallback_wait 300s",
       "touchesFiles": [
@@ -611,13 +617,119 @@
       "description": "Post-loop review High 4. Dual predicate: pre-iteration OAuth is LOOP_USAGE_CHECK_ENABLED AND Claude enabled. Seq/wave call run_account_quota_gate whenever Claude is enabled; load_usage_info_with_threshold always runs; execute_account_action only skips wait/stop. Decision: skip the load when !usage_params.enabled (keep proto-channel snapshot). Do not document an exception. Post-output dual predicate unchanged.",
       "estimatedEffort": "medium",
       "id": "CODE-FIX-005",
-      "passes": true,
+      "passes": false,
       "priority": -3,
       "title": "Pre-iteration OAuth must honor LOOP_USAGE_CHECK_ENABLED",
       "touchesFiles": [
         "src/loop_engine/iteration.rs",
         "src/loop_engine/wave_orchestration.rs",
         "src/loop_engine/reactions/account.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "evaluate_quota with an explicit onLow wait on weekly_scoped emits wait input, not only Unavailable",
+        "apply honors that wait/stop/ask",
+        "heuristic path without an explicit rule still Unavailable for scoped low + factory tierFallback",
+        "No live Anthropic"
+      ],
+      "description": "Post-loop review Medium 1. evaluate_quota maps OnLowAction::Wait|Stop|Ask on rung-scoped buckets to BucketEval::Unavailable, so set-usage-rule --kind weekly_scoped --on-low wait|stop cannot fire. PRD: explicit onLow on a matching rule wins over the heuristic. Decision: evaluate must preserve explicit Wait/Stop/Ask on scoped buckets; apply must honor them (not only walk account_low). CLI for the rule is PR-3; the classifier must not drop the action.",
+      "estimatedEffort": "medium",
+      "id": "CODE-FIX-006",
+      "passes": true,
+      "priority": 0,
+      "title": "Explicit onLow wait/stop/ask on rung-scoped buckets must not collapse to Unavailable",
+      "touchesFiles": [
+        "src/loop_engine/quota.rs",
+        "src/loop_engine/reactions/account.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "After frontier remapped to standard model, Opus HUD remaining line labels frontier as well as standard",
+        "Builtin-only ingest is not used for the production banner",
+        "No live Anthropic"
+      ],
+      "description": "Post-loop review Medium 2. format_oauth_remaining_banner ingests with builtin_resolved_models so after set-tier claude frontier opus stderr still says standard 5% left not frontier. Decision: banner ingest uses the same run ResolvedModelsConfig as evaluate/apply (buckets_for_run_models).",
+      "estimatedEffort": "low",
+      "id": "CODE-FIX-007",
+      "passes": true,
+      "priority": -1,
+      "title": "Remaining banner must extra-mark with the run ResolvedModelsConfig",
+      "touchesFiles": [
+        "src/loop_engine/usage.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Horizon Stop does not print Stop signal during usage wait",
+        "was_stopped is false for quota horizon Stop (account-binding chain-stop is a separate explicit flag if needed)",
+        "Operator .stop during wait still StopSignaled / was_stopped true",
+        "No live Anthropic"
+      ],
+      "description": "Post-loop review Medium 3. QuotaAccountAction::Stop and .stop during wait both become UsageCheckResult::StopSignaled. Sequential Deferred/horizon Stop returns Empty + should_stop which sets was_stopped and exit_reason stop signal. batch --chain then skips remaining PRDs. Decision: distinguish horizon/account Stop from operator .stop. Account-binding Stop may stop the chain; Defer / rung-scoped stop-this-PRD must not set was_stopped.",
+      "estimatedEffort": "medium",
+      "id": "CODE-FIX-008",
+      "passes": true,
+      "priority": -2,
+      "title": "Horizon Stop must not be reported as a stop-file",
+      "touchesFiles": [
+        "src/loop_engine/iteration.rs",
+        "src/loop_engine/wave_orchestration.rs",
+        "src/loop_engine/orchestrator.rs",
+        "src/loop_engine/reactions/account.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Proceed + all todos excluded by unavailable rungs does not increment stale-abort",
+        "in_progress reset to todo",
+        "handle_quota_deferral is not called",
+        "No live Anthropic"
+      ],
+      "description": "Post-loop review Medium 4. They did not reuse handle_quota_deferral (good). If apply Proceeds and every todo is excluded, the queue falls through to stale-abort. Decision: when proto-channel exclusions empty the eligible set, treat as quota-empty (reset in_progress, do not stale-abort). Do not call handle_quota_deferral.",
+      "estimatedEffort": "medium",
+      "id": "CODE-FIX-009",
+      "passes": true,
+      "priority": -3,
+      "title": "Rung-only empty selection must not fall through to stale-abort",
+      "touchesFiles": [
+        "src/loop_engine/orchestrator.rs",
+        "src/loop_engine/wave_orchestration.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "askTtlMinutes 0: no sleep",
+        "askTtlMinutes 15: sleep up to 15m stop-signal-aware then continue or defer per eligibility",
+        "No live Anthropic"
+      ],
+      "description": "Post-loop review Medium 5. Apply emits Ask when TTL>0; execute always maps Ask to Deferred. Clap --use-other-models-ttl is PR-3; the config knob must be wired in PR-2. Decision: execute Ask with ttl>0 as a stop-signal-aware sleep up to askTtlMinutes then continue/defer per eligibility; ttl 0 stays no-sleep defer/continue. Re-evaluate config on the stop-check cadence if already specified.",
+      "estimatedEffort": "low",
+      "id": "CODE-FIX-010",
+      "passes": true,
+      "priority": -4,
+      "title": "usagePolicy.askTtlMinutes greater than 0 must wait, not always Deferred",
+      "touchesFiles": [
+        "src/loop_engine/reactions/account.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "src/loop_engine/CLAUDE.md reactions table #3 points at run_account_quota_gate",
+        "config.rs / reactions/mod.rs comments match",
+        "account_usage_gate remains for parity tests"
+      ],
+      "description": "Post-loop review Medium 6. CLAUDE.md reactions table and config.rs comments still name account_usage_gate as the pre-iteration path. Production seq/wave call run_account_quota_gate. Decision: update docs/comments; leave account_usage_gate as the parity-test helper.",
+      "estimatedEffort": "low",
+      "id": "CODE-FIX-011",
+      "passes": true,
+      "priority": -5,
+      "title": "Docs: pre-iteration path is run_account_quota_gate not account_usage_gate",
+      "touchesFiles": [
+        "src/loop_engine/CLAUDE.md",
+        "src/loop_engine/config.rs",
+        "src/loop_engine/reactions/mod.rs"
       ]
     }
   ],

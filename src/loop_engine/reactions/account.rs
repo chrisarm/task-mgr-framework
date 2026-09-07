@@ -3020,8 +3020,10 @@ mod tests {
             6 * 24 * 3600,
             Some(vec![(Provider::Claude, CapabilityTier::Frontier)]),
         );
-        let mut policy = UsagePolicy::default();
-        policy.ask_ttl_minutes = 15;
+        let policy = UsagePolicy {
+            ask_ttl_minutes: 15,
+            ..UsagePolicy::default()
+        };
         let eval = evaluate_quota(std::slice::from_ref(&frontier), &policy, 8);
         let work = RemainingWorkSnapshot {
             other_rungs_runnable: true,
@@ -3090,8 +3092,10 @@ mod tests {
             6 * 24 * 3600,
             Some(vec![(Provider::Claude, CapabilityTier::Frontier)]),
         );
-        let mut policy = UsagePolicy::default();
-        policy.ask_ttl_minutes = 15;
+        let policy = UsagePolicy {
+            ask_ttl_minutes: 15,
+            ..UsagePolicy::default()
+        };
         let work = RemainingWorkSnapshot {
             other_rungs_runnable: true,
             max_difficulty: Some("high"),
@@ -3137,8 +3141,10 @@ mod tests {
             6 * 24 * 3600,
             Some(vec![(Provider::Claude, CapabilityTier::Frontier)]),
         );
-        let mut policy = UsagePolicy::default();
-        policy.ask_ttl_minutes = 15;
+        let policy = UsagePolicy {
+            ask_ttl_minutes: 15,
+            ..UsagePolicy::default()
+        };
         let work = RemainingWorkSnapshot {
             other_rungs_runnable: true,
             max_difficulty: Some("high"),
@@ -3626,6 +3632,50 @@ mod tests {
         assert_eq!(set_a, set_b);
         assert!(set_a.contains(&(Provider::Claude, CapabilityTier::Frontier)));
         assert_eq!(a, UsageCheckResult::BelowThreshold);
+    }
+
+    #[test]
+    fn preflight_successful_evaluate_replaces_stale_proto_channel() {
+        // Replace-on-evaluate (not accumulate): a recovered rung must leave the set.
+        let frontier = pct_bucket(
+            "weekly_scoped",
+            "weekly_scoped",
+            5.0,
+            6 * 24 * 3600,
+            Some(vec![(Provider::Claude, CapabilityTier::Frontier)]),
+        );
+        let mut set = HashSet::from([(Provider::Claude, CapabilityTier::Standard)]);
+        let policy = UsagePolicy::default();
+        let fb = factory_fb();
+        let work = RemainingWorkSnapshot {
+            other_rungs_runnable: true,
+            max_difficulty: Some("high"),
+            ..RemainingWorkSnapshot::default()
+        };
+        let wait = |_secs: u64| true;
+        let result = account_quota_preflight_inner(
+            QuotaPreflightParams {
+                threshold: 8,
+                tasks_dir: Path::new("/tmp"),
+                fallback_wait: 300,
+                policy: &policy,
+                tier_fallback: Some(&fb),
+                execute_account_action: true,
+                unavailable_rungs: &mut set,
+                work: &work,
+                buckets: Some(std::slice::from_ref(&frontier)),
+                account_remaining: Some(76.0),
+                account_reset_at: None,
+            },
+            &wait,
+        );
+        assert_eq!(result, UsageCheckResult::BelowThreshold);
+        assert_eq!(
+            set,
+            HashSet::from([(Provider::Claude, CapabilityTier::Frontier)]),
+            "successful evaluate+apply must replace the proto-channel set \
+             (stale standard must not accumulate alongside frontier)"
+        );
     }
 
     #[test]
