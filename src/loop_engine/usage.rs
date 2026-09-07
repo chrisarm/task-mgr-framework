@@ -1819,7 +1819,7 @@ mod tests {
         let floor: u8 = 8;
         let remaining: f64 = 8.0;
         assert!(
-            !(remaining > f64::from(floor)),
+            remaining <= f64::from(floor),
             "remaining == floor must wait"
         );
     }
@@ -1839,7 +1839,7 @@ mod tests {
         let floor: u8 = 8;
         let remaining: f64 = 7.999;
         assert!(
-            !(remaining > f64::from(floor)),
+            remaining <= f64::from(floor),
             "remaining just below floor must wait"
         );
     }
@@ -1848,7 +1848,7 @@ mod tests {
     fn test_floor_zero_only_proceeds_when_positive() {
         let floor: u8 = 0;
         assert!(0.001 > f64::from(floor), "any positive remaining proceeds");
-        assert!(!(0.0 > f64::from(floor)), "remaining 0 at floor 0 waits");
+        assert!(0.0 <= f64::from(floor), "remaining 0 at floor 0 waits");
     }
 
     #[test]
@@ -1856,7 +1856,7 @@ mod tests {
         let floor: u8 = 255;
         let remaining: f64 = 100.0;
         assert!(
-            !(remaining > f64::from(floor)),
+            remaining <= f64::from(floor),
             "100% remaining cannot exceed u8::MAX floor"
         );
     }

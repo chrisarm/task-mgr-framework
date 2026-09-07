@@ -284,8 +284,8 @@ pub(crate) fn is_spend_limit_message(output: &str) -> bool {
 ///
 /// `/model` alone is **not** sufficient. Plain `You've reached your session
 /// limit` / account `hit your limit · resets 4pm` do **not** match — those
-/// keep api_secs / may Blackout. Model ids like `claude-opus-5` /
-/// `claude-fable-5` must **not** count as a token match.
+/// keep api_secs / may Blackout. Hyphenated configured model ids
+/// (`OPUS_MODEL` / `FABLE_MODEL`) must **not** count as a token match.
 pub(crate) fn is_rung_scoped_rate_limit_message(output: &str) -> bool {
     let lower = output.to_lowercase();
     if switch_models_on_rate_limit_line(&lower) {
@@ -332,7 +332,7 @@ fn reached_your_model_limit_phrase(lower: &str) -> bool {
 
 /// True at string start/end or when the adjacent char is whitespace.
 /// Hyphen and underscore are **not** word boundaries — otherwise
-/// `claude-opus-5` / `claude_fable_5` falsely match `opus`/`fable`.
+/// hyphenated / underscored configured model ids falsely match `opus`/`fable`.
 fn is_real_word_boundary(lower: &str, index: usize, before: bool) -> bool {
     if before {
         if index == 0 {
@@ -1974,6 +1974,7 @@ pub(crate) fn check_and_wait(
 mod tests {
     use super::*;
     use crate::loop_engine::STOP_FILE; // pub(crate) in loop_engine/mod.rs
+    use crate::loop_engine::model::{FABLE_MODEL, OPUS_MODEL};
     use tempfile::TempDir;
 
     // --- estimate_reset_seconds tests ---
@@ -2205,22 +2206,19 @@ mod tests {
         assert!(!is_rung_scoped_rate_limit_message(mixed));
         // Hyphen/underscore are NOT word boundaries — model ids in ordinary
         // session RateLimit stdout must not force Wait 3600.
+        let opus_banner = format!("model: {OPUS_MODEL}\nYou've hit your limit · resets 4pm");
         assert!(
-            !is_rung_scoped_rate_limit_message(
-                "model: claude-opus-5\nYou've hit your limit · resets 4pm"
-            ),
-            "claude-opus-5 must not match token opus"
+            !is_rung_scoped_rate_limit_message(&opus_banner),
+            "OPUS_MODEL must not match token opus"
         );
+        let fable_banner = format!("model: {FABLE_MODEL}\nYou've hit your limit · resets 4pm");
         assert!(
-            !is_rung_scoped_rate_limit_message(
-                "model: claude-fable-5\nYou've hit your limit · resets 4pm"
-            ),
-            "claude-fable-5 must not match token fable"
+            !is_rung_scoped_rate_limit_message(&fable_banner),
+            "FABLE_MODEL must not match token fable"
         );
+        let opus_later = format!("use {OPUS_MODEL} for this task; you hit a rate limit later");
         assert!(
-            !is_rung_scoped_rate_limit_message(
-                "use claude-opus-5 for this task; you hit a rate limit later"
-            ),
+            !is_rung_scoped_rate_limit_message(&opus_later),
             "hyphenated model id + later 'limit' must not match"
         );
         assert!(
@@ -2335,23 +2333,23 @@ mod tests {
 
     #[test]
     fn test_decide_model_id_plus_hit_your_limit_still_blackouts_under_spillover() {
-        // Full CLI stdout often embeds `claude-opus-5` / `claude-fable-5`
-        // alongside ordinary account RateLimit copy. Hyphen must not create a
-        // false rung-scoped Wait 3600; spillover still Blackouts.
-        let with_opus = "Running claude-opus-5\nYou've hit your limit · resets 4pm";
-        let action = decide_account_rate_limit(None, Some(500), with_opus, true, 300, 3600);
+        // Full CLI stdout often embeds OPUS_MODEL / FABLE_MODEL alongside
+        // ordinary account RateLimit copy. Hyphen must not create a false
+        // rung-scoped Wait 3600; spillover still Blackouts.
+        let with_opus = format!("Running {OPUS_MODEL}\nYou've hit your limit · resets 4pm");
+        let action = decide_account_rate_limit(None, Some(500), &with_opus, true, 300, 3600);
         assert_eq!(
             action,
             RateLimitAction::Blackout { secs: 500 },
             "model id + account hit-your-limit must use output_secs Blackout, not Wait 3600"
         );
 
-        let with_fable = "Running claude-fable-5\nYou've hit your limit · resets 4pm";
-        let action = decide_account_rate_limit(Some(7200), Some(500), with_fable, true, 300, 3600);
+        let with_fable = format!("Running {FABLE_MODEL}\nYou've hit your limit · resets 4pm");
+        let action = decide_account_rate_limit(Some(7200), Some(500), &with_fable, true, 300, 3600);
         assert_eq!(
             action,
             RateLimitAction::Blackout { secs: 7200 },
-            "claude-fable-5 + account copy must prefer api_secs Blackout, not Wait 3600"
+            "FABLE_MODEL + account copy must prefer api_secs Blackout, not Wait 3600"
         );
     }
 
@@ -2658,7 +2656,7 @@ mod tests {
             Some(vec![(Provider::Claude, CapabilityTier::Frontier)]),
         );
         let policy = UsagePolicy::default();
-        let eval = evaluate_quota(&[frontier.clone()], &policy, 8);
+        let eval = evaluate_quota(std::slice::from_ref(&frontier), &policy, 8);
         let work = RemainingWorkSnapshot {
             other_rungs_runnable: true,
             max_difficulty: Some("high"),
@@ -2682,7 +2680,7 @@ mod tests {
             Some(vec![(Provider::Claude, CapabilityTier::Frontier)]),
         );
         let policy = UsagePolicy::default(); // ask_ttl_minutes = 0
-        let eval = evaluate_quota(&[frontier.clone()], &policy, 8);
+        let eval = evaluate_quota(std::slice::from_ref(&frontier), &policy, 8);
         let work = RemainingWorkSnapshot {
             other_rungs_runnable: true,
             max_difficulty: Some("high"),
@@ -2697,7 +2695,7 @@ mod tests {
     fn apply_account_low_3h_waits_capped() {
         let session = pct_bucket("five_hour", "session", 5.0, 3 * 3600, None);
         let policy = UsagePolicy::default();
-        let eval = evaluate_quota(&[session.clone()], &policy, 8);
+        let eval = evaluate_quota(std::slice::from_ref(&session), &policy, 8);
         let work = RemainingWorkSnapshot {
             other_rungs_runnable: false,
             ..RemainingWorkSnapshot::default()
@@ -2722,7 +2720,7 @@ mod tests {
             Some(vec![(Provider::Claude, CapabilityTier::Frontier)]),
         );
         let policy = UsagePolicy::default();
-        let eval = evaluate_quota(&[frontier.clone()], &policy, 8);
+        let eval = evaluate_quota(std::slice::from_ref(&frontier), &policy, 8);
         let work = RemainingWorkSnapshot {
             other_rungs_runnable: false,
             ..RemainingWorkSnapshot::default()
@@ -2741,7 +2739,7 @@ mod tests {
             Some(vec![(Provider::Claude, CapabilityTier::Frontier)]),
         );
         let policy = UsagePolicy::default();
-        let eval = evaluate_quota(&[frontier.clone()], &policy, 8);
+        let eval = evaluate_quota(std::slice::from_ref(&frontier), &policy, 8);
         let work = RemainingWorkSnapshot {
             other_rungs_runnable: false,
             ..RemainingWorkSnapshot::default()
@@ -2785,7 +2783,7 @@ mod tests {
             rungs: None,
         };
         let policy = UsagePolicy::default();
-        let eval = evaluate_quota(&[spend.clone()], &policy, 8);
+        let eval = evaluate_quota(std::slice::from_ref(&spend), &policy, 8);
         // Amount > 0 is not amount_exhausted in evaluate → Ignore.
         assert!(eval.account_low.is_empty());
         let spent = QuotaBucket {
@@ -2795,7 +2793,7 @@ mod tests {
             }],
             ..spend
         };
-        let eval = evaluate_quota(&[spent.clone()], &policy, 8);
+        let eval = evaluate_quota(std::slice::from_ref(&spent), &policy, 8);
         let work = RemainingWorkSnapshot::default();
         let applied = apply_quota(&eval, &[spent], &policy, Some(&factory_fb()), &work);
         assert_eq!(applied.account, QuotaAccountAction::Stop);

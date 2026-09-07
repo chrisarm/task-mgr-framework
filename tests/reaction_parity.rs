@@ -4011,7 +4011,7 @@ fn slash_model_alone_does_not_take_3600_override() {
 }
 
 // ---------------------------------------------------------------------------
-// CODE-FIX-004: hyphenated model ids (claude-opus-5 / claude-fable-5) in
+// CODE-FIX-004: hyphenated configured model ids (OPUS_MODEL / FABLE_MODEL) in
 // ordinary session RateLimit stdout must NOT take Wait 3600 — hyphen is not
 // a word boundary. Spillover still Blackouts with api_secs / output_secs.
 // ---------------------------------------------------------------------------
@@ -4024,12 +4024,12 @@ fn model_id_in_session_rate_limit_stdout_still_blackouts_not_3600() {
     insert_in_progress_task(&conn, "RP-HYPHEN-0");
 
     // Realistic capture: model id in the banner + ordinary account RateLimit.
-    let output = "Running with claude-opus-5\nYou've hit your limit · resets 4pm";
+    let output = format!("Running with {OPUS_MODEL}\nYou've hit your limit · resets 4pm");
     let rate = IterationOutcome::RateLimit;
     let items = [OutputReactionItem {
         task_id: Some("RP-HYPHEN-0"),
         outcome: &rate,
-        output,
+        output: &output,
     }];
     let mut p = params(db_temp.path(), 300);
     p.spillover_enabled = true;

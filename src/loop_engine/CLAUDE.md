@@ -229,9 +229,10 @@ ignoring api_secs / output_secs, never `RateLimitAction::Blackout` /
 `usage_gate` and `probe_rate_limit_lifted` in the production wait closure.
 Match only: (1) live phrase `reached your (fable|opus|sonnet|haiku) limit`,
 (2) a **whitespace-bounded** model token followed by `limit` (hyphen /
-underscore are **not** word boundaries — otherwise `claude-opus-5` in ordinary
-session stdout false-triggers 3600), or (3) `switch models` on the **same
-line** as `reached`/`limit` (whole-capture `contains` matches docs/commentary).
+underscore are **not** word boundaries — otherwise hyphenated `OPUS_MODEL` /
+`FABLE_MODEL` ids in ordinary session stdout false-trigger 3600), or (3)
+`switch models` on the **same line** as `reached`/`limit` (whole-capture
+`contains` matches docs/commentary).
 `/model` alone is not enough. Plain `reached your session limit` / `hit your
 limit · resets 4pm` stay ordinary RateLimit. Account-binding `reset_at` uses
 the live `usage_remaining_min` (remaining floor, default 8; old used≥92 ≡
