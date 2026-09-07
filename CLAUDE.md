@@ -156,13 +156,23 @@ hard-errors at loop/batch `preflight_validate_and_probe` (names
 `LOOP_USAGE_REMAINING_MIN`); non-loop commands ignore it. Operator banners use
 `% left` (rung labels like `frontier`, never model ids).
 
-**Fable frontier pin (optional after PRE-PR-3):** after HUD-family extra-mark
-identity union (CONTRACT-002 / FEAT-008), pinning frontier off Fable is
+**Ask TTL override (PR-3 / FEAT-006):** `--use-other-models-ttl <minutes>` on
+`task-mgr loop run` and `task-mgr batch run` (nested + deprecated flat).
+Overrides `usagePolicy.askTtlMinutes` for this run only (does not write
+config.json). `0` is allowed: omit the flag → use config (default 0); pass
+`--use-other-models-ttl 0` → `Some(0)` (defer immediately, no sleep) — omitted
+is not the same as `Some(0)`. When effective TTL > 0, Ask sleeps stop-signal-aware
+and re-evals `usagePolicy` + `routing.tierFallback` on the stop-check cadence;
+forbade continue → defer; allow → continue on working rungs.
+
+**Fable frontier pin (optional after PRE-PR-3 / PR-3 clamp):** after HUD-family
+extra-mark identity union (CONTRACT-002), pinning frontier off Fable is
 **optional, not required**, for mixed standard/medium work — factory
-`tierFallback` exclude unsticks the wave when frontier is unavailable.
-Optional recipe: `task-mgr models set-tier claude frontier <standard-model>`
-(e.g. opus). Automatic clamp of all-high / review / explicit-frontier onto
-standard is still **PR-3** (do not assume high/review runs on the pin target).
+`tierFallback` exclude unsticks the wave when frontier is unavailable, and the
+PR-3 down-only walker clamps all-high / review / explicit-frontier onto a lower
+working rung when `tierFallback` allows (do not assume high/review keep running
+on the pin target — they clamp down). Optional recipe remains:
+`task-mgr models set-tier claude frontier <standard-model>` (e.g. opus).
 **Residual:** if a Fable-routed task still spawns (e.g. `LOOP_USAGE_CHECK_ENABLED=false`,
 usage fetch fail, or explicit `tasks.model`), a Fable CLI RateLimit still sleeps
 the whole wave **3600s**.
