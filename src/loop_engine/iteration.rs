@@ -122,19 +122,26 @@ pub fn run_iteration(
         );
     }
 
-    // Step 1.5: Pre-iteration usage gate (account-global). Routes through the
-    // converged `reactions::account::account_usage_gate` coordinator — the SAME
-    // gate the wave path folds once per wave (`wave_orchestration::wave_preflight_check`),
-    // so both paths agree on the GateDecision for a given usage state. The
-    // relocated `usage::check_and_wait` leaf is `#[deprecated]` and this file
-    // carries `#![deny(deprecated)]`, so a direct call here is a compile error.
-    if params.usage_params.enabled {
-        let check_result =
-            reactions::account::account_usage_gate(reactions::account::AccountUsageGateParams {
+    // Step 1.5: Pre-iteration quota gate (account-global). PR-2: evaluate+apply
+    // + proto-channel replace, shared with the wave path. Runs whenever Claude
+    // is enabled so LOOP_USAGE_CHECK_ENABLED=false still refreshes unavailable
+    // rungs; wait/stop/defer only when `usage_params.enabled`.
+    if ctx.resolved_models.is_provider_enabled(Provider::Claude) {
+        let check_result = reactions::account::run_account_quota_gate(
+            reactions::account::RunAccountQuotaGateParams {
+                conn: params.conn,
+                task_prefix: params.task_prefix,
+                run_id: params.run_id,
+                unavailable_rungs: &mut ctx.unavailable_rungs,
+                models: &ctx.resolved_models,
+                policy: &params.project_config.usage_policy,
+                tier_fallback: params.project_config.routing.tier_fallback.as_ref(),
                 threshold: params.usage_params.threshold,
                 tasks_dir: params.tasks_dir,
                 fallback_wait: params.usage_params.fallback_wait,
-            });
+                execute_account_action: params.usage_params.enabled,
+            },
+        );
         match check_result {
             UsageCheckResult::StopSignaled => {
                 ui::emit("Stop signal during usage wait, exiting");
@@ -152,10 +159,25 @@ pub fn run_iteration(
                     shown_learning_ids: Vec::new(),
                 });
             }
+            UsageCheckResult::Deferred => {
+                ui::emit(
+                    "Quota ask deferred (tierFallback forbade downgrade; askTtlMinutes=0) — stopping",
+                );
+                return Ok(IterationResult {
+                    outcome: IterationOutcome::Empty,
+                    task_id: None,
+                    files_modified: vec![],
+                    should_stop: true,
+                    output: String::new(),
+                    effective_model: None,
+                    effective_effort: None,
+                    effective_runner: None,
+                    key_decisions_count: 0,
+                    conversation: None,
+                    shown_learning_ids: Vec::new(),
+                });
+            }
             UsageCheckResult::ApiError(ref msg) => {
-                // Graceful-degradation diagnostic: the usage API failed but the
-                // loop continues. Channel B (matches usage.rs's own API-failure
-                // routing); stays visible on the console at WARN+.
                 tracing::warn!("usage API warning: {} (continuing)", msg);
             }
             _ => {} // BelowThreshold, WaitedAndReset, Skipped — proceed

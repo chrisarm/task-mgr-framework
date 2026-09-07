@@ -720,7 +720,7 @@ pub fn run_wave_iteration(
     mut params: WaveIterationParams<'_>,
     ctx: &mut IterationContext,
 ) -> WaveOutcome {
-    if let Some(outcome) = wave_preflight_check(&params, ctx) {
+    if let Some(outcome) = wave_preflight_check(&mut params, ctx) {
         return outcome;
     }
 

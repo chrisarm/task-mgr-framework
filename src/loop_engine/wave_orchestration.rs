@@ -44,7 +44,7 @@ use crate::output::ui;
 /// Returns `Some(WaveOutcome)` when the wave should bail out before doing
 /// any work, `None` when execution should proceed.
 pub(super) fn wave_preflight_check(
-    params: &WaveIterationParams<'_>,
+    params: &mut WaveIterationParams<'_>,
     ctx: &mut IterationContext,
 ) -> Option<WaveOutcome> {
     // Match sequential semantics so Ctrl+C and `.stop` files exit the loop
@@ -79,21 +79,29 @@ pub(super) fn wave_preflight_check(
         });
     }
 
-    // Pre-iteration usage gate (FEAT-003): account-global, so fire it EXACTLY
-    // once per wave (not once per slot — that would issue N redundant API/DB
-    // checks). The wave path previously LACKED this gate entirely: a
-    // rate-limited account never waited before a wave dispatched, stranding
-    // in-flight work. Routes through the SAME
-    // `reactions::account::account_usage_gate` coordinator the sequential path
-    // folds at `run_iteration` Step 1.5, so both paths agree on the
-    // GateDecision for a given usage state. Ordered after the stop check and
-    // before crash backoff to mirror the sequential Step ordering.
-    if params.usage_params.enabled {
-        match reactions::account::account_usage_gate(reactions::account::AccountUsageGateParams {
-            threshold: params.usage_params.threshold,
-            tasks_dir: params.tasks_dir,
-            fallback_wait: params.usage_params.fallback_wait,
-        }) {
+    // Pre-iteration quota gate (PR-2 / FEAT-005): account-global, EXACTLY once
+    // per wave. Same `run_account_quota_gate` as sequential Step 1.5 — evaluate
+    // + apply + proto-channel replace; wait/stop only when usage_params.enabled.
+    // Ordered after the stop check and before crash backoff.
+    if ctx
+        .resolved_models
+        .is_provider_enabled(crate::loop_engine::model::Provider::Claude)
+    {
+        match reactions::account::run_account_quota_gate(
+            reactions::account::RunAccountQuotaGateParams {
+                conn: params.conn,
+                task_prefix: params.task_prefix,
+                run_id: params.run_id,
+                unavailable_rungs: &mut ctx.unavailable_rungs,
+                models: &ctx.resolved_models,
+                policy: &params.project_config.usage_policy,
+                tier_fallback: params.project_config.routing.tier_fallback.as_ref(),
+                threshold: params.usage_params.threshold,
+                tasks_dir: params.tasks_dir,
+                fallback_wait: params.usage_params.fallback_wait,
+                execute_account_action: params.usage_params.enabled,
+            },
+        ) {
             UsageCheckResult::StopSignaled => {
                 ui::emit("Stop signal during usage wait, exiting");
                 return Some(WaveOutcome {
@@ -102,6 +110,23 @@ pub(super) fn wave_preflight_check(
                     terminal: Some(WaveTerminal {
                         exit_code: 0,
                         reason: "stop signal during usage wait".to_string(),
+                        run_status: None,
+                    }),
+                    was_stopped: true,
+                    failed_merges: Vec::new(),
+                    rate_limited_retry: false,
+                });
+            }
+            UsageCheckResult::Deferred => {
+                ui::emit(
+                    "Quota ask deferred (tierFallback forbade downgrade; askTtlMinutes=0) — stopping",
+                );
+                return Some(WaveOutcome {
+                    tasks_completed: 0,
+                    iteration_consumed: false,
+                    terminal: Some(WaveTerminal {
+                        exit_code: 0,
+                        reason: "quota ask deferred".to_string(),
                         run_status: None,
                     }),
                     was_stopped: true,

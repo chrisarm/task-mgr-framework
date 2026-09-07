@@ -7,6 +7,7 @@
 //! — fixing the strand-bug where the wave path had no call site and a
 //! rate-limited account never waited before the wave dispatched.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::thread;
 use std::time::Duration;
@@ -17,7 +18,11 @@ use rusqlite::Connection;
 use crate::lifecycle::TaskLifecycle;
 use crate::loop_engine::config::{IterationOutcome, PermissionMode};
 use crate::loop_engine::engine::BlackoutState;
-use crate::loop_engine::model::Provider;
+use crate::loop_engine::model::{CapabilityTier, Provider};
+use crate::loop_engine::project_config::TierFallback;
+use crate::loop_engine::quota::{
+    AccountLowInput, BucketEval, OnLowAction, QuotaBucket, QuotaEval, UsagePolicy, evaluate_quota,
+};
 use crate::loop_engine::recovery::probe_rate_limit_lifted;
 use crate::loop_engine::usage::{
     UsageCheckResult, UsageInfo, load_usage_info_with_threshold, usage_suggests_lifted,
@@ -965,7 +970,653 @@ pub fn react_to_transient_inner(
 // ---------------------------------------------------------------------------
 
 /// Maximum wait time for usage reset: 5 hours in seconds.
-const MAX_WAIT_SECS: u64 = 5 * 3600;
+///
+/// Reused by the PR-2 horizon middle band: reset in (waitIfResetWithinMinutes,
+/// stopIfResetBeyondHours] waits capped at this value (3h waits; 5h–12h is
+/// cap-and-repark).
+pub(crate) const MAX_WAIT_SECS: u64 = 5 * 3600;
+
+// ---------------------------------------------------------------------------
+// PR-2 / FEAT-005 — evaluate → apply (horizon + tierFallback)
+//
+// `evaluate_quota` is pure per-bucket facts (never ask). This layer resolves
+// ask / wait / stop / unavailable from remaining work + `routing.tierFallback`.
+// Seq and wave share this function (parity); callers must destructure results
+// exhaustively.
+// ---------------------------------------------------------------------------
+
+/// Snapshot of remaining runnable work for apply (not passed to evaluate).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RemainingWorkSnapshot {
+    /// At least one remaining task can run on a rung/provider outside the
+    /// evaluate-unavailable set. Spillover is never a working rung.
+    pub other_rungs_runnable: bool,
+    /// Remaining work includes review-class tasks.
+    pub has_review: bool,
+    /// Highest difficulty among remaining tasks: `"low"` / `"medium"` / `"high"`.
+    pub max_difficulty: Option<&'static str>,
+    /// Remaining work includes explicit `tasks.model` forced routes.
+    pub has_forced: bool,
+}
+
+/// Account-side action after apply (may coexist with unavailable rungs).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuotaAccountAction {
+    /// No account wait/stop/ask — proceed (possibly with rung exclusion).
+    Proceed,
+    /// Sleep `secs` (already capped at [`MAX_WAIT_SECS`] when in the middle band).
+    Wait { secs: u64 },
+    /// Stop this PRD (`in_progress` → `todo`). Next-PRD inherit of unavailable is PR-3.
+    Stop,
+    /// Operator forbade downgrade; ask (TTL > 0 would sleep — PR-3).
+    Ask,
+    /// Ask with TTL 0: no sleep, no continue (soft-stop for operator).
+    Defer,
+}
+
+/// Combined apply result. Account wait/stop can coexist with rung unavailable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuotaApplyResult {
+    /// Rungs to place on the proto-channel (factory / allowing tierFallback).
+    pub unavailable: Vec<(Provider, CapabilityTier)>,
+    pub account: QuotaAccountAction,
+}
+
+/// Whether factory/allowing `tierFallback` permits auto-unavailable for `work`.
+///
+/// `None` (explicit JSON null) → forbade. Narrower `maxDifficulty`,
+/// `includeReview: false` with review work, or `includeForced: false` with
+/// forced work → forbade.
+pub fn tier_fallback_allows(fb: Option<&TierFallback>, work: &RemainingWorkSnapshot) -> bool {
+    let Some(fb) = fb else {
+        return false;
+    };
+    if work.has_review && !fb.include_review {
+        return false;
+    }
+    if work.has_forced && !fb.include_forced {
+        return false;
+    }
+    let fb_rank = difficulty_rank_str(&fb.max_difficulty).unwrap_or(0);
+    let work_rank = work
+        .max_difficulty
+        .and_then(difficulty_rank_str)
+        .unwrap_or(0);
+    work_rank <= fb_rank
+}
+
+fn difficulty_rank_str(d: &str) -> Option<usize> {
+    match d.trim().to_ascii_lowercase().as_str() {
+        "low" => Some(0),
+        "medium" => Some(1),
+        "high" => Some(2),
+        _ => None,
+    }
+}
+
+/// Pure apply: resolve ask/wait/stop/unavailable from evaluate outputs.
+///
+/// Does **not** perform I/O, sleep, or proto-channel mutation — callers replace
+/// `IterationContext.unavailable_rungs` on successful evaluate and execute
+/// [`QuotaAccountAction`].
+pub fn apply_quota(
+    eval: &QuotaEval,
+    buckets: &[QuotaBucket],
+    policy: &UsagePolicy,
+    tier_fallback: Option<&TierFallback>,
+    work: &RemainingWorkSnapshot,
+) -> QuotaApplyResult {
+    let allows = tier_fallback_allows(tier_fallback, work);
+
+    let mut unavailable: Vec<(Provider, CapabilityTier)> = Vec::new();
+    let mut pending_ask = false;
+    let mut scoped_wait_resets: Vec<u64> = Vec::new();
+
+    if !eval.unavailable.is_empty() {
+        if allows {
+            for rung in &eval.unavailable {
+                if !unavailable.contains(rung) {
+                    unavailable.push(*rung);
+                }
+            }
+            // Only-frontier-left: still may need wait/stop from scoped resets.
+            if !work.other_rungs_runnable {
+                scoped_wait_resets.extend(reset_secs_for_unavailable(eval, buckets));
+            }
+        } else if work.other_rungs_runnable {
+            pending_ask = true;
+        } else {
+            // Forbade + nothing else runnable → horizon wait/stop, not ask.
+            scoped_wait_resets.extend(reset_secs_for_unavailable(eval, buckets));
+        }
+    }
+
+    let mut explicit_stop = false;
+    let mut explicit_wait: Vec<u64> = Vec::new();
+    let mut explicit_ask = false;
+    let mut spend_stop = false;
+    let mut account_wait_resets: Vec<u64> = Vec::new();
+
+    for low in &eval.account_low {
+        if let Some(action) = explicit_on_low_for_bucket(policy, &low.bucket_id, buckets) {
+            match action {
+                OnLowAction::Stop => explicit_stop = true,
+                OnLowAction::Wait => {
+                    if let Some(secs) = low.reset_secs {
+                        explicit_wait.push(secs);
+                    }
+                }
+                OnLowAction::Ask => explicit_ask = true,
+                OnLowAction::Ignore | OnLowAction::Unavailable => {}
+            }
+            continue;
+        }
+
+        // Spend / amount buckets: stop only when remainingAmount ≤ 0.
+        if is_spend_kind(&low.kind) || account_low_is_amount_only(low, buckets) {
+            if low.remaining <= 0.0 {
+                spend_stop = true;
+            }
+            continue;
+        }
+
+        if let Some(secs) = low.reset_secs {
+            account_wait_resets.push(secs);
+        } else {
+            // Unknown reset → treat as beyond horizon when low.
+            account_wait_resets.push(policy.stop_if_reset_beyond_hours.saturating_mul(3600) + 1);
+        }
+    }
+
+    // Merge wait candidates; among multiple low wait buckets use the LATEST reset.
+    let mut wait_resets = account_wait_resets;
+    wait_resets.extend(scoped_wait_resets);
+    wait_resets.extend(explicit_wait);
+    let latest = wait_resets.iter().copied().max();
+
+    let wait_within_secs = policy.wait_if_reset_within_minutes.saturating_mul(60);
+    let stop_beyond_secs = policy.stop_if_reset_beyond_hours.saturating_mul(3600);
+
+    let mut account = QuotaAccountAction::Proceed;
+
+    if spend_stop || explicit_stop {
+        account = QuotaAccountAction::Stop;
+    } else if let Some(secs) = latest {
+        if secs <= wait_within_secs {
+            account = QuotaAccountAction::Wait { secs };
+        } else if secs <= stop_beyond_secs {
+            account = QuotaAccountAction::Wait {
+                secs: secs.min(MAX_WAIT_SECS),
+            };
+        } else {
+            // Beyond horizon: stop only when nothing else can run.
+            // other_rungs_runnable ignores spillover (caller's responsibility).
+            let runnable_after_exclude = work.other_rungs_runnable;
+            if !runnable_after_exclude {
+                account = QuotaAccountAction::Stop;
+            } else if pending_ask || explicit_ask {
+                account = ask_or_defer(policy.ask_ttl_minutes);
+            } else {
+                // Account low beyond horizon but other work remains — do not
+                // 5h-cap-loop; proceed with exclusions only.
+                account = QuotaAccountAction::Proceed;
+            }
+        }
+    } else if pending_ask || explicit_ask {
+        account = ask_or_defer(policy.ask_ttl_minutes);
+    }
+
+    // stop beats ask
+    if matches!(account, QuotaAccountAction::Ask | QuotaAccountAction::Defer)
+        && (spend_stop || explicit_stop)
+    {
+        account = QuotaAccountAction::Stop;
+    }
+    if matches!(account, QuotaAccountAction::Ask | QuotaAccountAction::Defer)
+        && matches!(latest, Some(secs) if secs > stop_beyond_secs)
+        && !work.other_rungs_runnable
+    {
+        account = QuotaAccountAction::Stop;
+    }
+
+    QuotaApplyResult {
+        unavailable,
+        account,
+    }
+}
+
+fn ask_or_defer(ask_ttl_minutes: u64) -> QuotaAccountAction {
+    if ask_ttl_minutes == 0 {
+        QuotaAccountAction::Defer
+    } else {
+        QuotaAccountAction::Ask
+    }
+}
+
+fn reset_secs_for_unavailable(eval: &QuotaEval, buckets: &[QuotaBucket]) -> Vec<u64> {
+    let mut out = Vec::new();
+    for (id, beval) in &eval.per_bucket {
+        if !matches!(beval, BucketEval::Unavailable { .. }) {
+            continue;
+        }
+        if let Some(bucket) = buckets.iter().find(|b| b.id == *id)
+            && let Some(secs) = parse_bucket_reset_secs(bucket)
+        {
+            out.push(secs);
+        }
+    }
+    out
+}
+
+fn parse_bucket_reset_secs(bucket: &QuotaBucket) -> Option<u64> {
+    let raw = bucket.resets_at.as_deref()?;
+    let ts = chrono::DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .or_else(|| {
+            chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M:%S")
+                .ok()
+                .map(|dt| dt.and_utc())
+        })?;
+    let delta = ts.signed_duration_since(chrono::Utc::now()).num_seconds();
+    Some(if delta <= 0 { 0 } else { delta as u64 })
+}
+
+fn explicit_on_low_for_bucket(
+    policy: &UsagePolicy,
+    bucket_id: &str,
+    buckets: &[QuotaBucket],
+) -> Option<OnLowAction> {
+    let bucket = buckets.iter().find(|b| b.id == bucket_id)?;
+    policy.rules.iter().find_map(|rule| {
+        let kind_ok = rule.kind.as_ref().is_none_or(|k| k == &bucket.kind);
+        let id_ok = rule.id.as_ref().is_none_or(|i| i == &bucket.id);
+        if kind_ok && id_ok {
+            // when predicates: only severity opt-in (same as evaluate).
+            if let Some(when) = rule.when.as_ref() {
+                if let Some(want) = when.get("severity").and_then(|v| v.as_str()) {
+                    if bucket.severity.as_deref() != Some(want) {
+                        return None;
+                    }
+                } else {
+                    return None;
+                }
+            }
+            Some(rule.on_low)
+        } else {
+            None
+        }
+    })
+}
+
+fn is_spend_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "spend" | "dollars" | "credits" | "tokens" | "extra_usage"
+    )
+}
+
+fn account_low_is_amount_only(low: &AccountLowInput, buckets: &[QuotaBucket]) -> bool {
+    let Some(bucket) = buckets.iter().find(|b| b.id == low.bucket_id) else {
+        return false;
+    };
+    let has_percent = bucket
+        .measurements
+        .iter()
+        .any(|m| matches!(m.unit, crate::loop_engine::quota::MeasurementUnit::Percent));
+    !has_percent
+        && bucket.measurements.iter().any(|m| {
+            matches!(
+                m.unit,
+                crate::loop_engine::quota::MeasurementUnit::Dollars
+                    | crate::loop_engine::quota::MeasurementUnit::Credits
+                    | crate::loop_engine::quota::MeasurementUnit::Tokens
+            )
+        })
+}
+
+/// Evaluate buckets and apply horizon / tierFallback. Pure besides the
+/// `now`-dependent reset math inside evaluate/apply.
+pub fn evaluate_and_apply_quota(
+    buckets: &[QuotaBucket],
+    policy: &UsagePolicy,
+    remaining_min: u8,
+    tier_fallback: Option<&TierFallback>,
+    work: &RemainingWorkSnapshot,
+) -> (QuotaEval, QuotaApplyResult) {
+    let eval = evaluate_quota(buckets, policy, remaining_min);
+    let applied = apply_quota(&eval, buckets, policy, tier_fallback, work);
+    (eval, applied)
+}
+
+/// Replace `unavailable_rungs` from an apply result (successful evaluate path).
+///
+/// Call only after a successful usage/evaluate cycle. On API failure the caller
+/// must **not** invoke this — keep the previous snapshot.
+pub fn replace_unavailable_rungs(
+    unavailable_rungs: &mut HashSet<(Provider, CapabilityTier)>,
+    applied: &QuotaApplyResult,
+) {
+    unavailable_rungs.clear();
+    unavailable_rungs.extend(applied.unavailable.iter().copied());
+}
+
+/// Inputs to [`account_quota_preflight`] / [`account_quota_preflight_inner`].
+/// Destructured exhaustively (no `..`) — seq/wave parity lock.
+pub struct QuotaPreflightParams<'a> {
+    /// Remaining-percent floor (0–100).
+    pub threshold: u8,
+    pub tasks_dir: &'a Path,
+    pub fallback_wait: u64,
+    pub policy: &'a UsagePolicy,
+    pub tier_fallback: Option<&'a TierFallback>,
+    /// When false (`LOOP_USAGE_CHECK_ENABLED=false`): still evaluate + replace
+    /// proto-channel on success, but do not sleep/stop on account actions.
+    pub execute_account_action: bool,
+    pub unavailable_rungs: &'a mut HashSet<(Provider, CapabilityTier)>,
+    /// Preview of remaining work used by apply (caller computes from DB +
+    /// evaluate.unavailable, or passes a hermetic fixture).
+    pub work: &'a RemainingWorkSnapshot,
+    /// Injected buckets when `Some`. `None` means API/credentials failed —
+    /// keep the proto-channel snapshot.
+    pub buckets: Option<&'a [QuotaBucket]>,
+    /// Account-binding remaining percent from UsageInfo (org fallback path).
+    pub account_remaining: Option<f64>,
+    pub account_reset_at: Option<&'a str>,
+}
+
+/// Inputs to [`run_account_quota_gate`]. Exhaustive destructure at the call
+/// site is not required (this is the production loader wrapper); the inner
+/// [`account_quota_preflight_inner`] carries the parity lock.
+pub struct RunAccountQuotaGateParams<'a> {
+    pub conn: &'a mut Connection,
+    pub task_prefix: Option<&'a str>,
+    pub run_id: &'a str,
+    pub unavailable_rungs: &'a mut HashSet<(Provider, CapabilityTier)>,
+    pub models: &'a crate::loop_engine::model::ResolvedModelsConfig,
+    pub policy: &'a UsagePolicy,
+    pub tier_fallback: Option<&'a TierFallback>,
+    pub threshold: u8,
+    pub tasks_dir: &'a Path,
+    pub fallback_wait: u64,
+    /// When false (`LOOP_USAGE_CHECK_ENABLED=false`): still refresh
+    /// proto-channel on success, but do not sleep/stop/defer.
+    pub execute_account_action: bool,
+}
+
+/// Load usage, evaluate+apply, refresh proto-channel, optionally wait/stop.
+///
+/// Shared by sequential (`iteration.rs`) and wave (`wave_orchestration.rs`)
+/// so both paths produce the same decision for the same buckets+policy.
+/// When `execute_account_action` is false the proto-channel is still replaced
+/// on a successful load/evaluate (LOOP_USAGE_CHECK_ENABLED=false case).
+///
+/// On [`QuotaAccountAction::Stop`], resets `in_progress` → `todo` under
+/// `task_prefix` before returning [`UsageCheckResult::StopSignaled`].
+pub fn run_account_quota_gate(params: RunAccountQuotaGateParams<'_>) -> UsageCheckResult {
+    let RunAccountQuotaGateParams {
+        conn,
+        task_prefix,
+        run_id,
+        unavailable_rungs,
+        models,
+        policy,
+        tier_fallback,
+        threshold,
+        tasks_dir,
+        fallback_wait,
+        execute_account_action,
+    } = params;
+    let usage = load_usage_info_with_threshold(threshold);
+    let (buckets, account_remaining, account_reset_at) = match &usage {
+        Some(info) => {
+            if let Some(banner) = info.remaining_banner.as_deref() {
+                eprintln!("{banner}");
+            } else {
+                eprintln!(
+                    "{}% left (floor {}%)",
+                    format_remaining_pct(info.percentage),
+                    threshold
+                );
+            }
+            (
+                if info.buckets.is_empty() {
+                    None
+                } else {
+                    Some(info.buckets.as_slice())
+                },
+                Some(info.percentage),
+                info.reset_at.as_deref(),
+            )
+        }
+        None => (None, None, None),
+    };
+
+    let (work, horizon_stop) = if let Some(buckets) = buckets {
+        let eval = evaluate_quota(buckets, policy, threshold);
+        let work = compute_remaining_work_snapshot(conn, task_prefix, models, &eval.unavailable);
+        let applied = apply_quota(&eval, buckets, policy, tier_fallback, &work);
+        let horizon_stop = matches!(applied.account, QuotaAccountAction::Stop);
+        (work, horizon_stop)
+    } else {
+        // No buckets (API fail or org-only): assume other work can run so we
+        // do not spuriously Stop; keep proto-channel snapshot.
+        (
+            RemainingWorkSnapshot {
+                other_rungs_runnable: true,
+                ..RemainingWorkSnapshot::default()
+            },
+            false,
+        )
+    };
+
+    let result = account_quota_preflight(QuotaPreflightParams {
+        threshold,
+        tasks_dir,
+        fallback_wait,
+        policy,
+        tier_fallback,
+        execute_account_action,
+        unavailable_rungs,
+        work: &work,
+        buckets,
+        account_remaining,
+        account_reset_at,
+    });
+
+    if horizon_stop && execute_account_action && matches!(result, UsageCheckResult::StopSignaled) {
+        // Horizon Stop: park in_progress back to todo for this PRD.
+        let prefix = task_prefix.unwrap_or("");
+        reset_in_progress_tasks(conn, run_id, prefix, "quota horizon stop");
+    }
+
+    result
+}
+
+/// Production entry: build wait closure and run [`account_quota_preflight_inner`].
+pub fn account_quota_preflight(params: QuotaPreflightParams<'_>) -> UsageCheckResult {
+    let threshold = params.threshold;
+    let tasks_dir = params.tasks_dir;
+    let wait = |secs: u64| -> bool {
+        let probe = || {
+            if let Some(info) = load_usage_info_with_threshold(threshold) {
+                if usage_suggests_lifted(&info, threshold, false) {
+                    return true;
+                }
+                if let Some(r) = info.reset_at.as_deref() {
+                    return estimate_reset_seconds(r) == Some(0);
+                }
+            }
+            false
+        };
+        wait_for_usage_reset(secs, tasks_dir, Some(&probe))
+    };
+    account_quota_preflight_inner(params, &wait)
+}
+
+/// Hermetic core of the PR-2 quota preflight (evaluate → apply → proto-channel
+/// → optional account wait/stop/defer). Same buckets+policy ⇒ same decision
+/// for sequential and wave callers (exhaustive destructure, no `..`).
+pub fn account_quota_preflight_inner(
+    params: QuotaPreflightParams<'_>,
+    wait: WaitFn<'_>,
+) -> UsageCheckResult {
+    let QuotaPreflightParams {
+        threshold,
+        tasks_dir: _,
+        fallback_wait,
+        policy,
+        tier_fallback,
+        execute_account_action,
+        unavailable_rungs,
+        work,
+        buckets,
+        account_remaining,
+        account_reset_at,
+    } = params;
+
+    let applied = match buckets {
+        Some(buckets) => {
+            let (_eval, applied) =
+                evaluate_and_apply_quota(buckets, policy, threshold, tier_fallback, work);
+            replace_unavailable_rungs(unavailable_rungs, &applied);
+            Some(applied)
+        }
+        None => {
+            // API fail — keep snapshot; do not clear.
+            None
+        }
+    };
+
+    if !execute_account_action {
+        // Proto-channel may have been refreshed above; skip wait/stop/defer.
+        return UsageCheckResult::Skipped;
+    }
+
+    if let Some(applied) = applied {
+        return execute_quota_account_action(&applied.account, fallback_wait, wait);
+    }
+
+    // Org / no-buckets fallback: legacy remaining-percent gate.
+    let Some(remaining) = account_remaining else {
+        return UsageCheckResult::Skipped;
+    };
+    if remaining > f64::from(threshold) {
+        return UsageCheckResult::BelowThreshold;
+    }
+    let wait_secs = account_reset_at
+        .and_then(estimate_reset_seconds)
+        .unwrap_or(fallback_wait);
+    if wait(wait_secs) {
+        UsageCheckResult::WaitedAndReset
+    } else {
+        UsageCheckResult::StopSignaled
+    }
+}
+
+fn execute_quota_account_action(
+    action: &QuotaAccountAction,
+    fallback_wait: u64,
+    wait: WaitFn<'_>,
+) -> UsageCheckResult {
+    match action {
+        QuotaAccountAction::Proceed => UsageCheckResult::BelowThreshold,
+        QuotaAccountAction::Wait { secs } => {
+            let secs = if *secs == 0 { fallback_wait } else { *secs };
+            if wait(secs) {
+                UsageCheckResult::WaitedAndReset
+            } else {
+                UsageCheckResult::StopSignaled
+            }
+        }
+        QuotaAccountAction::Stop => UsageCheckResult::StopSignaled,
+        QuotaAccountAction::Ask => {
+            // PR-3 would TTL-sleep; PR-2 factory default TTL is 0 → Defer.
+            UsageCheckResult::Deferred
+        }
+        QuotaAccountAction::Defer => UsageCheckResult::Deferred,
+    }
+}
+
+/// Build a [`RemainingWorkSnapshot`] from todo rows under `task_prefix`.
+///
+/// `unavailable_preview` is typically `evaluate_quota(...).unavailable`.
+/// Spillover is not treated as a working rung: resolution uses an empty
+/// blackout set so spillover reroute cannot invent runnable capacity.
+pub fn compute_remaining_work_snapshot(
+    conn: &Connection,
+    task_prefix: Option<&str>,
+    models: &crate::loop_engine::model::ResolvedModelsConfig,
+    unavailable_preview: &[(Provider, CapabilityTier)],
+) -> RemainingWorkSnapshot {
+    let like_prefix = task_prefix.unwrap_or("");
+    let mut stmt = match conn.prepare(
+        "SELECT id, model, difficulty FROM tasks \
+         WHERE status IN ('todo', 'in_progress') AND id LIKE ?1 || '%' \
+           AND archived_at IS NULL",
+    ) {
+        Ok(s) => s,
+        Err(_) => return RemainingWorkSnapshot::default(),
+    };
+    let rows = match stmt.query_map(rusqlite::params![like_prefix], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+        ))
+    }) {
+        Ok(r) => r,
+        Err(_) => return RemainingWorkSnapshot::default(),
+    };
+
+    let empty_blackouts = HashSet::new();
+    let unavailable: HashSet<(Provider, CapabilityTier)> =
+        unavailable_preview.iter().copied().collect();
+
+    let mut other_rungs_runnable = false;
+    let mut has_review = false;
+    let mut has_forced = false;
+    let mut max_rank: Option<usize> = None;
+
+    for (id, model_col, difficulty) in rows.flatten() {
+        if model_col.as_ref().is_some_and(|m| !m.is_empty()) {
+            has_forced = true;
+        }
+        // Review-class heuristic (no task_type column): id tokens.
+        if id.contains("REVIEW") || id.contains("CODE-REVIEW") {
+            has_review = true;
+        }
+        if let Some(r) = difficulty.as_deref().and_then(difficulty_rank_str) {
+            max_rank = Some(max_rank.map_or(r, |m| m.max(r)));
+        }
+        let plan = crate::loop_engine::model::resolve_execution_plan(
+            &crate::loop_engine::model::PlanContext {
+                task_id: &id,
+                task_model: model_col.as_deref(),
+                difficulty: difficulty.as_deref(),
+                models,
+                provider_blackouts: &empty_blackouts,
+            },
+        );
+        if !unavailable.contains(&(plan.provider, plan.tier)) {
+            other_rungs_runnable = true;
+        }
+    }
+
+    let max_difficulty = match max_rank {
+        Some(0) => Some("low"),
+        Some(1) => Some("medium"),
+        Some(2) => Some("high"),
+        _ => None,
+    };
+
+    RemainingWorkSnapshot {
+        other_rungs_runnable,
+        has_review,
+        max_difficulty,
+        has_forced,
+    }
+}
 
 /// Production wait-loop intervals.
 const PROD_TIMING: WaitTiming = WaitTiming {
@@ -1921,5 +2572,339 @@ mod tests {
         assert_eq!(parse_time_token("25:00"), None);
         assert_eq!(parse_time_token("12:60pm"), None);
         assert_eq!(parse_time_token("13pm"), None); // 13pm is invalid
+    }
+
+    // --- PR-2 apply_quota / horizon / tierFallback ---
+
+    fn pct_bucket(
+        id: &str,
+        kind: &str,
+        remaining: f64,
+        reset_in_secs: i64,
+        rungs: Option<Vec<(Provider, CapabilityTier)>>,
+    ) -> QuotaBucket {
+        let resets_at =
+            (chrono::Utc::now() + chrono::Duration::seconds(reset_in_secs)).to_rfc3339();
+        QuotaBucket {
+            id: id.into(),
+            kind: kind.into(),
+            label: String::new(),
+            measurements: vec![crate::loop_engine::quota::Measurement {
+                remaining,
+                unit: crate::loop_engine::quota::MeasurementUnit::Percent,
+            }],
+            resets_at: Some(resets_at),
+            severity: None,
+            is_active: None,
+            rungs,
+        }
+    }
+
+    fn factory_fb() -> TierFallback {
+        TierFallback {
+            max_difficulty: "high".into(),
+            include_review: true,
+            include_forced: false,
+        }
+    }
+
+    #[test]
+    fn apply_factory_rung_low_other_runnable_is_unavailable_not_ask() {
+        let frontier = pct_bucket(
+            "weekly_scoped",
+            "weekly_scoped",
+            5.0,
+            6 * 24 * 3600,
+            Some(vec![(Provider::Claude, CapabilityTier::Frontier)]),
+        );
+        let policy = UsagePolicy::default();
+        let eval = evaluate_quota(&[frontier.clone()], &policy, 8);
+        let work = RemainingWorkSnapshot {
+            other_rungs_runnable: true,
+            max_difficulty: Some("high"),
+            ..RemainingWorkSnapshot::default()
+        };
+        let applied = apply_quota(&eval, &[frontier], &policy, Some(&factory_fb()), &work);
+        assert_eq!(
+            applied.unavailable,
+            vec![(Provider::Claude, CapabilityTier::Frontier)]
+        );
+        assert_eq!(applied.account, QuotaAccountAction::Proceed);
+    }
+
+    #[test]
+    fn apply_forbade_null_tier_fallback_defers_when_other_runnable() {
+        let frontier = pct_bucket(
+            "weekly_scoped",
+            "weekly_scoped",
+            5.0,
+            6 * 24 * 3600,
+            Some(vec![(Provider::Claude, CapabilityTier::Frontier)]),
+        );
+        let policy = UsagePolicy::default(); // ask_ttl_minutes = 0
+        let eval = evaluate_quota(&[frontier.clone()], &policy, 8);
+        let work = RemainingWorkSnapshot {
+            other_rungs_runnable: true,
+            max_difficulty: Some("high"),
+            ..RemainingWorkSnapshot::default()
+        };
+        let applied = apply_quota(&eval, &[frontier], &policy, None, &work);
+        assert!(applied.unavailable.is_empty());
+        assert_eq!(applied.account, QuotaAccountAction::Defer);
+    }
+
+    #[test]
+    fn apply_account_low_3h_waits_capped() {
+        let session = pct_bucket("five_hour", "session", 5.0, 3 * 3600, None);
+        let policy = UsagePolicy::default();
+        let eval = evaluate_quota(&[session.clone()], &policy, 8);
+        let work = RemainingWorkSnapshot {
+            other_rungs_runnable: false,
+            ..RemainingWorkSnapshot::default()
+        };
+        let applied = apply_quota(&eval, &[session], &policy, Some(&factory_fb()), &work);
+        match applied.account {
+            QuotaAccountAction::Wait { secs } => {
+                assert!(secs <= MAX_WAIT_SECS);
+                assert!(secs > 2 * 3600);
+            }
+            other => panic!("expected Wait, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_only_frontier_6d_no_fallback_stops() {
+        let frontier = pct_bucket(
+            "weekly_scoped",
+            "weekly_scoped",
+            5.0,
+            6 * 24 * 3600,
+            Some(vec![(Provider::Claude, CapabilityTier::Frontier)]),
+        );
+        let policy = UsagePolicy::default();
+        let eval = evaluate_quota(&[frontier.clone()], &policy, 8);
+        let work = RemainingWorkSnapshot {
+            other_rungs_runnable: false,
+            ..RemainingWorkSnapshot::default()
+        };
+        let applied = apply_quota(&eval, &[frontier], &policy, Some(&factory_fb()), &work);
+        assert_eq!(applied.account, QuotaAccountAction::Stop);
+    }
+
+    #[test]
+    fn apply_only_frontier_6h_cap_and_repark_not_stop() {
+        let frontier = pct_bucket(
+            "weekly_scoped",
+            "weekly_scoped",
+            5.0,
+            6 * 3600,
+            Some(vec![(Provider::Claude, CapabilityTier::Frontier)]),
+        );
+        let policy = UsagePolicy::default();
+        let eval = evaluate_quota(&[frontier.clone()], &policy, 8);
+        let work = RemainingWorkSnapshot {
+            other_rungs_runnable: false,
+            ..RemainingWorkSnapshot::default()
+        };
+        let applied = apply_quota(&eval, &[frontier], &policy, Some(&factory_fb()), &work);
+        match applied.account {
+            QuotaAccountAction::Wait { secs } => assert_eq!(secs, MAX_WAIT_SECS),
+            other => panic!("expected capped Wait, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_latest_reset_among_multiple_wait_buckets() {
+        let session = pct_bucket("five_hour", "session", 5.0, 2 * 3600, None);
+        let week = pct_bucket("seven_day", "weekly_all", 5.0, 6 * 24 * 3600, None);
+        let policy = UsagePolicy::default();
+        let buckets = [session, week];
+        let eval = evaluate_quota(&buckets, &policy, 8);
+        let work = RemainingWorkSnapshot {
+            other_rungs_runnable: false,
+            ..RemainingWorkSnapshot::default()
+        };
+        let applied = apply_quota(&eval, &buckets, &policy, Some(&factory_fb()), &work);
+        // Latest is weekly 6d → beyond 12h + nothing runnable → Stop (not 2h wait).
+        assert_eq!(applied.account, QuotaAccountAction::Stop);
+    }
+
+    #[test]
+    fn apply_spend_stops_only_at_zero_not_percent_floor() {
+        let spend = QuotaBucket {
+            id: "credits".into(),
+            kind: "credits".into(),
+            label: String::new(),
+            measurements: vec![crate::loop_engine::quota::Measurement {
+                remaining: 8.0, // 8 credits left — must NOT halt
+                unit: crate::loop_engine::quota::MeasurementUnit::Credits,
+            }],
+            resets_at: None,
+            severity: None,
+            is_active: None,
+            rungs: None,
+        };
+        let policy = UsagePolicy::default();
+        let eval = evaluate_quota(&[spend.clone()], &policy, 8);
+        // Amount > 0 is not amount_exhausted in evaluate → Ignore.
+        assert!(eval.account_low.is_empty());
+        let spent = QuotaBucket {
+            measurements: vec![crate::loop_engine::quota::Measurement {
+                remaining: 0.0,
+                unit: crate::loop_engine::quota::MeasurementUnit::Credits,
+            }],
+            ..spend
+        };
+        let eval = evaluate_quota(&[spent.clone()], &policy, 8);
+        let work = RemainingWorkSnapshot::default();
+        let applied = apply_quota(&eval, &[spent], &policy, Some(&factory_fb()), &work);
+        assert_eq!(applied.account, QuotaAccountAction::Stop);
+    }
+
+    #[test]
+    fn apply_stop_beats_ask() {
+        let frontier = pct_bucket(
+            "weekly_scoped",
+            "weekly_scoped",
+            5.0,
+            6 * 24 * 3600,
+            Some(vec![(Provider::Claude, CapabilityTier::Frontier)]),
+        );
+        let session = pct_bucket("five_hour", "session", 5.0, 6 * 24 * 3600, None);
+        let policy = UsagePolicy::default();
+        let buckets = [frontier, session];
+        let eval = evaluate_quota(&buckets, &policy, 8);
+        let work = RemainingWorkSnapshot {
+            other_rungs_runnable: false,
+            ..RemainingWorkSnapshot::default()
+        };
+        // Forbade would ask, but nothing runnable + beyond horizon → Stop wins.
+        let applied = apply_quota(&eval, &buckets, &policy, None, &work);
+        assert_eq!(applied.account, QuotaAccountAction::Stop);
+    }
+
+    #[test]
+    fn preflight_inner_parity_same_buckets_same_decision() {
+        let frontier = pct_bucket(
+            "weekly_scoped",
+            "weekly_scoped",
+            5.0,
+            6 * 24 * 3600,
+            Some(vec![(Provider::Claude, CapabilityTier::Frontier)]),
+        );
+        let policy = UsagePolicy::default();
+        let fb = factory_fb();
+        let work = RemainingWorkSnapshot {
+            other_rungs_runnable: true,
+            max_difficulty: Some("high"),
+            ..RemainingWorkSnapshot::default()
+        };
+        let mut set_a = HashSet::new();
+        let mut set_b = HashSet::new();
+        let wait = |_secs: u64| true;
+        let a = account_quota_preflight_inner(
+            QuotaPreflightParams {
+                threshold: 8,
+                tasks_dir: Path::new("/tmp"),
+                fallback_wait: 300,
+                policy: &policy,
+                tier_fallback: Some(&fb),
+                execute_account_action: true,
+                unavailable_rungs: &mut set_a,
+                work: &work,
+                buckets: Some(std::slice::from_ref(&frontier)),
+                account_remaining: Some(76.0),
+                account_reset_at: None,
+            },
+            &wait,
+        );
+        let b = account_quota_preflight_inner(
+            QuotaPreflightParams {
+                threshold: 8,
+                tasks_dir: Path::new("/tmp"),
+                fallback_wait: 300,
+                policy: &policy,
+                tier_fallback: Some(&fb),
+                execute_account_action: true,
+                unavailable_rungs: &mut set_b,
+                work: &work,
+                buckets: Some(std::slice::from_ref(&frontier)),
+                account_remaining: Some(76.0),
+                account_reset_at: None,
+            },
+            &wait,
+        );
+        assert_eq!(a, b);
+        assert_eq!(set_a, set_b);
+        assert!(set_a.contains(&(Provider::Claude, CapabilityTier::Frontier)));
+        assert_eq!(a, UsageCheckResult::BelowThreshold);
+    }
+
+    #[test]
+    fn preflight_keeps_snapshot_on_api_fail() {
+        let mut set = HashSet::from([(Provider::Claude, CapabilityTier::Frontier)]);
+        let policy = UsagePolicy::default();
+        let fb = factory_fb();
+        let work = RemainingWorkSnapshot {
+            other_rungs_runnable: true,
+            ..RemainingWorkSnapshot::default()
+        };
+        let wait = |_secs: u64| true;
+        let result = account_quota_preflight_inner(
+            QuotaPreflightParams {
+                threshold: 8,
+                tasks_dir: Path::new("/tmp"),
+                fallback_wait: 300,
+                policy: &policy,
+                tier_fallback: Some(&fb),
+                execute_account_action: true,
+                unavailable_rungs: &mut set,
+                work: &work,
+                buckets: None, // API fail
+                account_remaining: None,
+                account_reset_at: None,
+            },
+            &wait,
+        );
+        assert_eq!(result, UsageCheckResult::Skipped);
+        assert!(set.contains(&(Provider::Claude, CapabilityTier::Frontier)));
+    }
+
+    #[test]
+    fn preflight_disabled_still_replaces_proto_channel() {
+        let frontier = pct_bucket(
+            "weekly_scoped",
+            "weekly_scoped",
+            5.0,
+            3600,
+            Some(vec![(Provider::Claude, CapabilityTier::Frontier)]),
+        );
+        let mut set = HashSet::new();
+        let policy = UsagePolicy::default();
+        let fb = factory_fb();
+        let work = RemainingWorkSnapshot {
+            other_rungs_runnable: true,
+            max_difficulty: Some("high"),
+            ..RemainingWorkSnapshot::default()
+        };
+        let wait = |_secs: u64| true;
+        let result = account_quota_preflight_inner(
+            QuotaPreflightParams {
+                threshold: 8,
+                tasks_dir: Path::new("/tmp"),
+                fallback_wait: 300,
+                policy: &policy,
+                tier_fallback: Some(&fb),
+                execute_account_action: false, // LOOP_USAGE_CHECK_ENABLED=false
+                unavailable_rungs: &mut set,
+                work: &work,
+                buckets: Some(std::slice::from_ref(&frontier)),
+                account_remaining: Some(76.0),
+                account_reset_at: None,
+            },
+            &wait,
+        );
+        assert_eq!(result, UsageCheckResult::Skipped);
+        assert!(set.contains(&(Provider::Claude, CapabilityTier::Frontier)));
     }
 }

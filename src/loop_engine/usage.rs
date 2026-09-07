@@ -87,6 +87,9 @@ pub struct UsageInfo {
     pub reset_at: Option<String>,
     /// Multi-bucket `% left` operator banner when OAuth HUD JSON was parsed.
     pub remaining_banner: Option<String>,
+    /// Generic quota buckets from OAuth ingest (PR-2). Empty for org-endpoint
+    /// fallback or when ingest was not run. Feed to `evaluate_quota` / apply.
+    pub buckets: Vec<crate::loop_engine::quota::QuotaBucket>,
 }
 
 /// Result of a usage check-and-wait cycle.
@@ -102,6 +105,9 @@ pub enum UsageCheckResult {
     Skipped,
     /// API call failed but we continue anyway (graceful degradation).
     ApiError(String),
+    /// PR-2: operator forbade tierFallback downgrade and ask TTL is 0 — no
+    /// sleep, no continue (soft-stop for operator intervention).
+    Deferred,
 }
 
 /// Check the usage API and return current usage info.
@@ -157,6 +163,10 @@ fn fetch_oauth_usage(access_token: &str, threshold: u8) -> Option<UsageInfo> {
 
     let mut info = parse_oauth_usage_json_with_threshold(&json, f64::from(threshold))?;
     info.remaining_banner = Some(format_oauth_remaining_banner(&json, threshold, Utc::now()));
+    // PR-2: ingest every window for evaluate/apply. Extra-mark uses the run's
+    // resolved models when the caller re-ingests; here builtin is correct for
+    // the threshold-only fetch path and matches format_oauth_remaining_banner.
+    info.buckets = ingest_oauth_value(&json, builtin_resolved_models());
     Some(info)
 }
 
@@ -682,6 +692,7 @@ pub(crate) fn parse_oauth_usage_json_with_threshold(
         percentage,
         reset_at,
         remaining_banner: None,
+        buckets: Vec::new(),
     })
 }
 
@@ -811,6 +822,7 @@ fn parse_org_usage_json(json: &serde_json::Value) -> Option<UsageInfo> {
         percentage,
         reset_at,
         remaining_banner: None,
+        buckets: Vec::new(),
     })
 }
 
@@ -967,6 +979,7 @@ mod tests {
             percentage: 85.5,
             reset_at: Some("2024-01-15T12:00:00Z".to_string()),
             remaining_banner: None,
+            buckets: Vec::new(),
         };
         assert!((info.percentage - 85.5).abs() < f64::EPSILON);
         assert_eq!(info.reset_at, Some("2024-01-15T12:00:00Z".to_string()));
@@ -1420,11 +1433,13 @@ mod tests {
             percentage: 90.0,
             reset_at: None,
             remaining_banner: None,
+            buckets: Vec::new(),
         };
         let low = UsageInfo {
             percentage: 70.0,
             reset_at: None,
             remaining_banner: None,
+            buckets: Vec::new(),
         };
         assert!(usage_suggests_lifted(&lifted, 80, true));
         assert!(!usage_suggests_lifted(&low, 80, true));
@@ -1438,6 +1453,7 @@ mod tests {
             percentage: 50.0,
             reset_at: None,
             remaining_banner: None,
+            buckets: Vec::new(),
         };
         assert!(info.reset_at.is_none());
     }
@@ -1526,6 +1542,7 @@ mod tests {
             UsageCheckResult::StopSignaled
         );
         assert_eq!(UsageCheckResult::Skipped, UsageCheckResult::Skipped);
+        assert_eq!(UsageCheckResult::Deferred, UsageCheckResult::Deferred);
     }
 
     #[test]
@@ -1586,6 +1603,7 @@ mod tests {
             percentage: 0.0,
             reset_at: None,
             remaining_banner: None,
+            buckets: Vec::new(),
         };
         assert!((info.percentage).abs() < f64::EPSILON);
     }
@@ -1596,6 +1614,7 @@ mod tests {
             percentage: 100.0,
             reset_at: Some("2025-01-01T00:00:00Z".to_string()),
             remaining_banner: None,
+            buckets: Vec::new(),
         };
         assert!((info.percentage - 100.0).abs() < f64::EPSILON);
     }
@@ -1607,6 +1626,7 @@ mod tests {
             percentage: 105.3,
             reset_at: None,
             remaining_banner: None,
+            buckets: Vec::new(),
         };
         assert!((info.percentage - 105.3).abs() < f64::EPSILON);
     }
@@ -1617,6 +1637,7 @@ mod tests {
             percentage: 91.999,
             reset_at: None,
             remaining_banner: None,
+            buckets: Vec::new(),
         };
         assert!((info.percentage - 91.999).abs() < f64::EPSILON);
     }

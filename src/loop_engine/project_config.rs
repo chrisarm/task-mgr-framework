@@ -71,7 +71,13 @@ pub struct ProviderConfig {
 
 /// The `routing` config block: role-split + difficulty-spillover policy layered
 /// over the anchor window. Consumed by `resolve_execution_plan` (FEAT-004).
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Default)]
+///
+/// `tier_fallback` uses `#[serde(default = "default_tier_fallback")]` so an
+/// **absent** key deserializes to factory `Some(high/includeReview true)` —
+/// NOT `None`. Explicit JSON `null` deserializes to `None` (ask opt-out).
+/// Do not use bare `#[serde(default)]` on this `Option` (that yields `None`
+/// for a missing key).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct RoutingConfig {
     /// Task-ID-prefix → forced route (provider + optional forced tier).
@@ -89,6 +95,59 @@ pub struct RoutingConfig {
     /// note — building the cascade is out of scope for this PRD.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_cascade: Option<serde_json::Value>,
+    /// Rung-unavailable downgrade instruction (PR-2 / FR-004).
+    ///
+    /// Factory / omitted key → `Some({maxDifficulty: high, includeReview: true,
+    /// includeForced: false})` (auto-unavailable). Explicit `null` → `None`
+    /// (ask opt-out).
+    #[serde(default = "default_tier_fallback")]
+    pub tier_fallback: Option<TierFallback>,
+}
+
+impl Default for RoutingConfig {
+    fn default() -> Self {
+        Self {
+            by_id_prefix: HashMap::new(),
+            task_classes: HashMap::new(),
+            spillover: SpilloverConfig::default(),
+            review_cascade: None,
+            tier_fallback: default_tier_fallback(),
+        }
+    }
+}
+
+/// When a capability rung is quota-low, whether the engine may mark it
+/// unavailable (exclude / continue on cheaper rungs) vs ask the operator.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TierFallback {
+    /// Highest difficulty eligible for auto-unavailable. Default `"high"`.
+    #[serde(default = "default_tier_fallback_max_difficulty")]
+    pub max_difficulty: String,
+    /// When true, review-class tasks may be excluded with the unavailable rung.
+    #[serde(default = "default_true")]
+    pub include_review: bool,
+    /// When true, explicit `tasks.model` forced routes may be excluded.
+    /// Default false (family-match / forced handling is PR-3).
+    #[serde(default)]
+    pub include_forced: bool,
+}
+
+fn default_tier_fallback_max_difficulty() -> String {
+    "high".into()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Serde default for `RoutingConfig.tier_fallback`: factory Some, not None.
+pub fn default_tier_fallback() -> Option<TierFallback> {
+    Some(TierFallback {
+        max_difficulty: default_tier_fallback_max_difficulty(),
+        include_review: true,
+        include_forced: false,
+    })
 }
 
 /// A forced route: a provider, optionally pinned to a capability tier.
@@ -1687,6 +1746,49 @@ mod tests {
         .unwrap();
         let config = read_project_config(dir.path());
         assert_eq!(config.usage_policy.remaining_min_percent, 12);
+    }
+
+    #[test]
+    fn usage_policy_horizon_defaults_round_trip_sparse() {
+        let dir = tempfile::tempdir().unwrap();
+        // Sparse JSON: unrelated key preserved; usagePolicy knobs take defaults.
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{"unrelatedKey":true,"usagePolicy":{}}"#,
+        )
+        .unwrap();
+        let config = read_project_config(dir.path());
+        assert_eq!(config.usage_policy.wait_if_reset_within_minutes, 60);
+        assert_eq!(config.usage_policy.stop_if_reset_beyond_hours, 12);
+        assert_eq!(config.usage_policy.ask_ttl_minutes, 0);
+        assert_eq!(config.usage_policy.remaining_min_percent, 8);
+        // Unrelated keys survive via Value round-trip on write paths; read keeps
+        // known fields. Re-serialize usagePolicy alone to pin camelCase defaults.
+        let v = serde_json::to_value(&config.usage_policy).unwrap();
+        assert_eq!(v["waitIfResetWithinMinutes"], 60);
+        assert_eq!(v["stopIfResetBeyondHours"], 12);
+        assert_eq!(v["askTtlMinutes"], 0);
+    }
+
+    #[test]
+    fn tier_fallback_absent_key_is_factory_some() {
+        let routing: RoutingConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        let fb = routing.tier_fallback.expect("absent key → factory Some");
+        assert_eq!(fb.max_difficulty, "high");
+        assert!(fb.include_review);
+        assert!(!fb.include_forced);
+        // Rust Default matches factory (not bare Option::None).
+        assert_eq!(
+            RoutingConfig::default().tier_fallback,
+            default_tier_fallback()
+        );
+    }
+
+    #[test]
+    fn tier_fallback_explicit_null_is_none_ask_opt_out() {
+        let routing: RoutingConfig =
+            serde_json::from_value(serde_json::json!({ "tierFallback": null })).unwrap();
+        assert!(routing.tier_fallback.is_none());
     }
 
     /// Create an executable stub a binary probe will accept via `cliBinary`.

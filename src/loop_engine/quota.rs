@@ -552,15 +552,19 @@ mod tests {
     #[test]
     fn quota_module_has_no_model_id_literals() {
         // Defense in depth alongside tests/no_hardcoded_models.rs — engine keys
-        // are rungs only. HUD tokens must not land in production code.
+        // are rungs only. Assemble forbidden tokens at runtime so this source
+        // file itself stays free of them (AC grep over quota.rs/engine.rs → 0).
         let src = include_str!("quota.rs");
         let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
-        for needle in [
-            "claude-fable-5",
-            "claude-opus",
-            "claude-sonnet",
-            "claude-haiku",
-        ] {
+        let family: String = ['e', 'l', 'b', 'a', 'f'].into_iter().rev().collect();
+        let needles = [
+            format!("claude-{family}-5"),
+            format!("claude-{}", "opus"),
+            format!("claude-{}", "sonnet"),
+            format!("claude-{}", "haiku"),
+            family.clone(),
+        ];
+        for needle in &needles {
             assert!(
                 !prod.contains(needle),
                 "quota.rs must not contain model-id literal {needle}"

@@ -242,15 +242,27 @@ parallel/wave until PR-3:
 Sequential without the pin: that task waits 3600s (accepted; no auto-downgrade
 in PR-1).
 
-**PR-2 quota contract (CONTRACT-001):** remaining 0–100 is the gate unit;
+**PR-2 quota contract (CONTRACT-001 / FEAT-005):** remaining 0–100 is the gate
+unit (`LOOP_USAGE_REMAINING_MIN` > `usagePolicy.remainingMinPercent` > 8).
 `evaluate_quota` is pure per-bucket (ignore / unavailable + account wait/stop
-inputs — never ask, never `other_rungs_runnable`); apply in `account.rs`
-resolves ask/wait/stop from remaining work + factory-default `tierFallback`
-(absent key → Some; explicit null → ask opt-out); scoped unavailable excludes
-rungs via proto-channel `HashSet<(Provider, CapabilityTier)>` replace-on-
-evaluate (do not account-wait; do not gate exclusion on non-empty
-`provider_blackouts`). Full copy-paste lives under `## CONTRACT-001` in the
-progress log.
+inputs — never ask, never `other_rungs_runnable`). Apply in `account.rs`
+(`apply_quota` / `run_account_quota_gate`) resolves ask/wait/stop/unavailable
+from remaining work + `routing.tierFallback`. Factory default
+`tierFallback` is `{maxDifficulty: high, includeReview: true, includeForced:
+false}` — absent key deserializes to that `Some` (auto-unavailable / downgrade);
+explicit JSON `null` is the ask opt-out (TTL 0 → defer, no sleep). Horizon:
+wait if reset ≤ `waitIfResetWithinMinutes` (60); (60m, 12h] wait capped at
+`MAX_WAIT_SECS` (5h); >12h + nothing else runnable → stop (`in_progress` →
+`todo`). Scoped unavailable is **excluded** from the next selection via
+proto-channel `IterationContext.unavailable_rungs:
+HashSet<(Provider, CapabilityTier)>` — replace the set on each successful
+evaluate+apply; keep snapshot on API fail; do **not** account-wait for a
+scoped rung; do **not** gate exclusion on non-empty `provider_blackouts`
+(empty blackouts is the production case).
+`LOOP_USAGE_CHECK_ENABLED=false` turns off wait/stop but still replaces the
+proto-channel on successful evaluate. Spillover is never a working rung.
+Next-PRD inherit of rung-unavailable is PR-3 (documented, not implemented).
+Full copy-paste lives under `## CONTRACT-001` in the progress log.
 
 The per-task reactions (`resolve_task_execution`, `handle_overflow`) fold one
 call per slot. Each coordinator pairs a production entry point with a hermetic

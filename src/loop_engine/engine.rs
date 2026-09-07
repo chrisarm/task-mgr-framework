@@ -446,6 +446,15 @@ pub struct IterationContext {
     /// [`BlackoutState::active`]), the quota-deferral wait, and the
     /// excluded-id computation. See [`BlackoutState`] for the three rules.
     pub provider_blackouts: BlackoutState,
+    /// PR-2 proto-channel: rungs marked unavailable by quota apply (sibling of
+    /// [`BlackoutState`], never written into `provider_blackouts` /
+    /// `runner_overrides`). Main-thread only (learning 1810).
+    ///
+    /// Replace the entire set on each **successful** evaluate+apply. Keep the
+    /// snapshot on API fail (do not clear). No expiry in PR-2 (TTL is PR-3).
+    /// Consulted by [`reactions::pre_spawn::compute_quota_excluded_ids`] even
+    /// when `provider_blackouts` is empty (the production case).
+    pub unavailable_rungs: std::collections::HashSet<(model::Provider, model::CapabilityTier)>,
     /// The operator-resolved provider-first config (`models` + `routing`),
     /// built ONCE per run in `run_loop` from `ProjectConfig` and threaded to the
     /// per-task recovery paths that resolve Claude tier ladders — consecutive-
@@ -483,6 +492,7 @@ impl IterationContext {
             overflow_original_task_model: std::collections::HashMap::new(),
             transient_backend_attempts: 0,
             provider_blackouts: BlackoutState::default(),
+            unavailable_rungs: std::collections::HashSet::new(),
             resolved_models: model::builtin_resolved_models().clone(),
         }
     }

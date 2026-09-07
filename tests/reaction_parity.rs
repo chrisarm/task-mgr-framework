@@ -4058,3 +4058,90 @@ fn model_id_in_session_rate_limit_stdout_still_blackouts_not_3600() {
         "spillover Blackout must still record Claude when hyphenated model id is present"
     );
 }
+
+// ---------------------------------------------------------------------------
+// FEAT-005: account_quota_preflight_inner parity — same buckets+policy ⇒ same
+// decision on sequential vs wave shapes (exhaustive QuotaPreflightParams).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn account_quota_preflight_inner_same_decision_both_shapes() {
+    use std::collections::HashSet;
+    use std::path::Path;
+    use task_mgr::loop_engine::model::{CapabilityTier, Provider};
+    use task_mgr::loop_engine::project_config::TierFallback;
+    use task_mgr::loop_engine::quota::{Measurement, MeasurementUnit, QuotaBucket, UsagePolicy};
+    use task_mgr::loop_engine::reactions::account::{
+        QuotaPreflightParams, RemainingWorkSnapshot, WaitFn, account_quota_preflight_inner,
+    };
+
+    let resets_at = (chrono::Utc::now() + chrono::Duration::hours(6)).to_rfc3339();
+    let frontier = QuotaBucket {
+        id: "weekly_scoped".into(),
+        kind: "weekly_scoped".into(),
+        label: String::new(),
+        measurements: vec![Measurement {
+            remaining: 5.0,
+            unit: MeasurementUnit::Percent,
+        }],
+        resets_at: Some(resets_at),
+        severity: None,
+        is_active: None,
+        rungs: Some(vec![(Provider::Claude, CapabilityTier::Frontier)]),
+    };
+    let policy = UsagePolicy::default();
+    let fb = TierFallback {
+        max_difficulty: "high".into(),
+        include_review: true,
+        include_forced: false,
+    };
+    let work = RemainingWorkSnapshot {
+        other_rungs_runnable: true,
+        max_difficulty: Some("high"),
+        ..RemainingWorkSnapshot::default()
+    };
+    let mut set_seq = HashSet::new();
+    let mut set_wave = HashSet::new();
+    let wait = |_secs: u64| true;
+
+    let seq = account_quota_preflight_inner(
+        QuotaPreflightParams {
+            threshold: 8,
+            tasks_dir: Path::new("/tmp"),
+            fallback_wait: 300,
+            policy: &policy,
+            tier_fallback: Some(&fb),
+            execute_account_action: true,
+            unavailable_rungs: &mut set_seq,
+            work: &work,
+            buckets: Some(std::slice::from_ref(&frontier)),
+            account_remaining: Some(76.0),
+            account_reset_at: None,
+        },
+        &wait as WaitFn,
+    );
+    let wave = account_quota_preflight_inner(
+        QuotaPreflightParams {
+            threshold: 8,
+            tasks_dir: Path::new("/tmp"),
+            fallback_wait: 300,
+            policy: &policy,
+            tier_fallback: Some(&fb),
+            execute_account_action: true,
+            unavailable_rungs: &mut set_wave,
+            work: &work,
+            buckets: Some(std::slice::from_ref(&frontier)),
+            account_remaining: Some(76.0),
+            account_reset_at: None,
+        },
+        &wait as WaitFn,
+    );
+
+    assert_eq!(
+        seq, wave,
+        "same buckets+policy ⇒ same QuotaPreflight decision on both shapes"
+    );
+    assert_eq!(set_seq, set_wave);
+    assert!(set_seq.contains(&(Provider::Claude, CapabilityTier::Frontier)));
+    assert_eq!(seq, UsageCheckResult::BelowThreshold);
+}
