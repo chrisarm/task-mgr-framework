@@ -220,6 +220,22 @@ only `anthropic_account_io_allowed`. When Claude is disabled, neither
 `check_and_wait` nor `probe_rate_limit_lifted` runs; wait falls back to
 output-parsed / `fallback_wait` (no separate `api_reset_secs` field — the usage
 API reset path is unreachable).
+
+**PR-1 Fable/rung-scoped CLI RateLimit** (`You've reached your Fable limit…
+switch models with /model.`): classified as `RateLimit` (not Crash). A
+**narrow** predicate (model token `fable|opus|sonnet|haiku` followed by
+`limit`, OR co-occurrence with `switch models` — `/model` alone is not enough)
+forces `Wait { blackout_fallback_secs }` (default 3600), ignoring api_secs /
+output_secs, never `RateLimitAction::Blackout` / `provider_blackouts.record`
+(even when spillover is on), and skips both `usage_gate` and
+`probe_rate_limit_lifted` in the production wait closure. Plain
+`reached your … limit` / account `hit your limit · resets 4pm` stay ordinary
+RateLimit. Because one Fable RateLimit sleeps the **whole wave** 3600s, the
+operator pin is **required** for parallel/wave until PR-3:
+`task-mgr models set-tier claude frontier <standard-model>` (e.g. opus).
+Sequential without the pin: that task waits 3600s (accepted; no auto-downgrade
+in PR-1).
+
 The per-task reactions (`resolve_task_execution`, `handle_overflow`) fold one
 call per slot. Each coordinator pairs a production entry point with a hermetic
 `_inner` core that takes the side-effecting step (wait / review) as an injected

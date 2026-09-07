@@ -3645,3 +3645,174 @@ fn known_bad_collapsed_flag_drops_the_probe_on_env_off_claude_on() {
         "known-bad must diverge from the production wrapper on (env off, Claude on)"
     );
 }
+
+// ===========================================================================
+// PR-1 / FR-002 — Fable/rung-scoped RateLimit: fixed 3600 Wait, no Blackout,
+// no usage_gate / early-lift probe (seq + wave share react_to_outputs_inner).
+// ===========================================================================
+
+const FABLE_RATE_LIMIT_OUTPUT: &str =
+    "You've reached your Fable limit. To continue, switch models with /model.";
+
+// ---------------------------------------------------------------------------
+// (g) Wave: one Fable RateLimit + two completions → exactly one 3600s wait,
+// no provider_blackouts.record (even with spillover_enabled).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fable_rate_limit_wave_waits_once_3600_never_blackouts() {
+    disable_llm_extraction();
+    let (db_temp, mut conn) = setup_migrated_db();
+    insert_run(&conn);
+    insert_in_progress_task(&conn, "RP-FABLE-0");
+    insert_done_task(&conn, "RP-DONE-1");
+    insert_done_task(&conn, "RP-DONE-2");
+
+    let rate = IterationOutcome::RateLimit;
+    let done = IterationOutcome::Completed;
+    let items = [
+        OutputReactionItem {
+            task_id: Some("RP-FABLE-0"),
+            outcome: &rate,
+            output: FABLE_RATE_LIMIT_OUTPUT,
+        },
+        OutputReactionItem {
+            task_id: Some("RP-DONE-1"),
+            outcome: &done,
+            output: "<completed>RP-DONE-1</completed>",
+        },
+        OutputReactionItem {
+            task_id: Some("RP-DONE-2"),
+            outcome: &done,
+            output: "<completed>RP-DONE-2</completed>",
+        },
+    ];
+    let mut p = params(db_temp.path(), 300);
+    p.spillover_enabled = true;
+    p.blackout_fallback_secs = 3600;
+    p.now_secs = 1_000;
+    let mut blackout = BlackoutState::default();
+    let spy = WaitSpy::completing();
+    let wait = spy.closure();
+    let reaction = react_to_outputs_inner(
+        &mut conn,
+        &items,
+        &p,
+        &mut blackout,
+        Some(6 * 24 * 3600), // populated api_secs must be ignored
+        &wait as WaitFn,
+    );
+
+    assert_eq!(reaction, AccountReaction::WaitedAndRetry);
+    assert_eq!(spy.calls.get(), 1, "exactly one wait for the whole wave");
+    assert_eq!(spy.last_secs.get(), Some(3600));
+    assert!(
+        blackout.active(1_000).is_empty(),
+        "rung-scoped phrasing must never record provider_blackouts even with spillover"
+    );
+    assert_eq!(
+        task_status(&conn, "RP-FABLE-0").as_deref(),
+        Some("todo"),
+        "rate-limited task still resets in_progress → todo"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (d) Production wait closure: Fable phrasing must NOT invoke usage_gate or
+// wire probe_rate_limit_lifted (sleep is stop-signal-aware only).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fable_rate_limit_skips_usage_gate_and_probe() {
+    disable_llm_extraction();
+    let (db_temp, mut conn) = setup_migrated_db();
+    insert_run(&conn);
+    insert_in_progress_task(&conn, "RP-FABLE-0");
+
+    let rate = IterationOutcome::RateLimit;
+    let items = [OutputReactionItem {
+        task_id: Some("RP-FABLE-0"),
+        outcome: &rate,
+        output: FABLE_RATE_LIMIT_OUTPUT,
+    }];
+    let mut p = params(db_temp.path(), 300);
+    // Both flags ON — without the Fable skip, usage_gate would fire and the
+    // probe would be wired (and the 30s no -m probe could lift the wait).
+    p.usage_enabled = true;
+    p.anthropic_account_io_allowed = true;
+    p.blackout_fallback_secs = 3600;
+
+    let spy = IoSeamSpy::new();
+    let mut blackout = BlackoutState::default();
+    let reaction = react_to_outputs_with_io_seams(
+        &mut conn,
+        &items,
+        &p,
+        &mut blackout,
+        &spy.usage_gate(),
+        &spy.reset_wait(),
+        &spy.probe(),
+    );
+
+    assert_eq!(reaction, AccountReaction::WaitedAndRetry);
+    assert_eq!(
+        spy.usage_gate_calls.get(),
+        0,
+        "Fable phrasing must not invoke usage_gate"
+    );
+    assert_eq!(
+        spy.reset_wait_probe_wired.get(),
+        Some(false),
+        "Fable phrasing must not wire probe_rate_limit_lifted"
+    );
+    assert_eq!(spy.probe_calls.get(), 0);
+    assert_eq!(spy.reset_wait_calls.get(), 1);
+    assert_eq!(
+        spy.reset_wait_secs.get(),
+        Some(3600),
+        "wait secs = blackout_fallback_secs"
+    );
+    assert!(blackout.active(0).is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// (h) `/model` alone does not take the 3600 override — keeps api_secs path
+// (here: unparseable → fallback_wait) and may Blackout under spillover.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn slash_model_alone_does_not_take_3600_override() {
+    disable_llm_extraction();
+    let (db_temp, mut conn) = setup_migrated_db();
+    insert_run(&conn);
+    insert_in_progress_task(&conn, "RP-MODEL-0");
+
+    let rate = IterationOutcome::RateLimit;
+    let items = [OutputReactionItem {
+        task_id: Some("RP-MODEL-0"),
+        outcome: &rate,
+        output: "Try /model to pick another model",
+    }];
+    let mut p = params(db_temp.path(), 300);
+    p.spillover_enabled = true;
+    p.blackout_fallback_secs = 3600;
+    p.now_secs = 1_000;
+    let mut blackout = BlackoutState::default();
+    let spy = WaitSpy::completing();
+    let wait = spy.closure();
+    let reaction = react_to_outputs_inner(
+        &mut conn,
+        &items,
+        &p,
+        &mut blackout,
+        Some(7200),
+        &wait as WaitFn,
+    );
+
+    assert_eq!(reaction, AccountReaction::RerouteAndRetry);
+    assert_eq!(spy.calls.get(), 0, "spillover Blackout skips wait");
+    assert!(
+        blackout.active(1_000).contains(&Provider::Claude),
+        "/model alone may Blackout under spillover"
+    );
+}

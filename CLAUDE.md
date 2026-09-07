@@ -146,6 +146,11 @@ disabling the Claude provider zeroes **all** Anthropic account I/O (load + probe
 See [`src/loop_engine/CLAUDE.md`](src/loop_engine/CLAUDE.md) "Account-global
 reactions".
 
+**PR-1 Fable pin (required for parallel/wave until PR-3):** one Fable RateLimit
+sleeps the whole wave 3600s — pin frontier off Fable with
+`task-mgr models set-tier claude frontier <standard-model>` (e.g. opus).
+Sequential without the pin: that task waits 3600s (accepted; no auto-downgrade).
+
 ## Deprecation policy
 
 `task-mgr init --from-json <prd>` is a **permanent shim** — it will not be removed. Operators who use it today (scripts, docs, muscle memory) can continue to do so indefinitely. The shim prints a one-line stderr notice and dispatches to `task-mgr loop init` (N=1) or `task-mgr batch init` (N>1) after running `init_project`, so the DB state is byte-for-byte identical to the canonical path.

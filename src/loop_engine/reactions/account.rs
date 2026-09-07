@@ -221,6 +221,16 @@ pub(crate) fn decide_account_rate_limit(
         return RateLimitAction::StopSpend;
     }
 
+    // PR-1 / FR-002: rung-scoped CLI (Fable/Opus/…) → fixed Wait via
+    // `blackout_fallback_secs` (default 3600). Ignores api_secs / output_secs,
+    // never Blackout (spillover is not a working rung for this phrasing), never
+    // falls through to usage_fallback_wait (300s).
+    if is_rung_scoped_rate_limit_message(output) {
+        return RateLimitAction::Wait {
+            secs: blackout_fallback_secs,
+        };
+    }
+
     if spillover_enabled {
         let secs = resolve_wait_secs(api_secs, output_secs, blackout_fallback_secs);
         return RateLimitAction::Blackout { secs };
@@ -237,6 +247,45 @@ pub(crate) fn is_spend_limit_message(output: &str) -> bool {
         || lower.contains("usage-credits")
         || lower.contains("admin-settings/usage")
         || (lower.contains("usage credits") && lower.contains("limit"))
+}
+
+/// PR-1 / FR-002: narrow Fable/rung-scoped CLI phrasing that takes the fixed
+/// `blackout_fallback_secs` Wait (default 3600) and skips usage_gate + early-lift
+/// probe.
+///
+/// True when a capability-rung model token (`fable|opus|sonnet|haiku`) is
+/// followed by `limit` within a short window, OR the output co-occurs with
+/// `switch models`. `/model` alone is **not** sufficient. Plain
+/// `You've reached your session limit` / account `hit your limit · resets 4pm`
+/// do **not** match — those keep api_secs / may Blackout.
+pub(crate) fn is_rung_scoped_rate_limit_message(output: &str) -> bool {
+    let lower = output.to_lowercase();
+    if lower.contains("switch models") {
+        return true;
+    }
+    model_token_followed_by_limit(&lower)
+}
+
+/// Word-bounded model token followed by `limit` within 64 bytes of the token.
+fn model_token_followed_by_limit(lower: &str) -> bool {
+    const TOKENS: &[&str] = &["fable", "opus", "sonnet", "haiku"];
+    for token in TOKENS {
+        let mut from = 0;
+        while let Some(rel) = lower[from..].find(token) {
+            let start = from + rel;
+            let end = start + token.len();
+            let before_ok = start == 0 || !lower.as_bytes()[start - 1].is_ascii_alphanumeric();
+            let after_ok = end >= lower.len() || !lower.as_bytes()[end].is_ascii_alphanumeric();
+            if before_ok && after_ok {
+                let window_end = (end + 64).min(lower.len());
+                if lower[end..window_end].contains("limit") {
+                    return true;
+                }
+            }
+            from = start + 1;
+        }
+    }
+    false
 }
 
 /// Inputs to [`react_to_outputs`] / [`react_to_outputs_inner`]. Destructured
@@ -344,8 +393,20 @@ pub fn react_to_outputs_with_io_seams(
         now_secs: _,
     } = params;
 
+    // Narrow rung-scoped phrasing (Fable/Opus/…): skip usage_gate + early-lift
+    // probe in the production wait closure. The skip cannot live only in the
+    // hermetic inner — this wrapper always loads api_secs and wires the probe
+    // today, and either would undo the 3600s Wait (used 55% < 92 →
+    // BelowThreshold, or the 30s no `-m` probe lifts).
+    let rung_scoped = items.iter().any(|item| {
+        *item.outcome == IterationOutcome::RateLimit
+            && is_rung_scoped_rate_limit_message(item.output)
+    });
+
     // Usage load only when Claude account I/O is allowed (skip Anthropic when
     // Claude is disabled). Feeds decide_account_rate_limit's api_secs.
+    // Rung-scoped Wait ignores api_secs, but loading is harmless and keeps the
+    // dual Anthropic I/O predicates intact for ordinary RateLimit.
     let api_secs = if anthropic_account_io_allowed {
         let usage = load_usage_info();
         let secs = usage
@@ -369,7 +430,8 @@ pub fn react_to_outputs_with_io_seams(
 
     let wait = |wait_secs: u64| -> bool {
         // Optional usage-gate first when both Claude allow-flag and env enablement.
-        if anthropic_account_io_allowed && usage_enabled {
+        // Rung-scoped phrasing skips this leg (and the early-lift probe below).
+        if !rung_scoped && anthropic_account_io_allowed && usage_enabled {
             match usage_gate(threshold, tasks_dir, fallback_wait) {
                 UsageCheckResult::StopSignaled => return false,
                 UsageCheckResult::WaitedAndReset => return true,
@@ -381,7 +443,7 @@ pub fn react_to_outputs_with_io_seams(
         // assert `probe_rate_limit` is invoked when wired.
         let probe = || probe_rate_limit(permission_mode);
         let probe_arg: Option<&dyn Fn() -> bool> =
-            anthropic_account_io_allowed.then_some(&probe as &dyn Fn() -> bool);
+            (!rung_scoped && anthropic_account_io_allowed).then_some(&probe as &dyn Fn() -> bool);
         reset_wait(wait_secs, tasks_dir, fallback_wait, probe_arg)
     };
 
@@ -1269,6 +1331,127 @@ mod tests {
         ));
     }
 
+    // --- PR-1 / FR-002 rung-scoped RateLimit Wait override ---
+
+    const FABLE_CLI: &str =
+        "You've reached your Fable limit. To continue, switch models with /model.";
+    const SIX_DAYS_SECS: u64 = 6 * 24 * 3600;
+
+    #[test]
+    fn test_rung_scoped_predicate_narrow() {
+        assert!(is_rung_scoped_rate_limit_message(FABLE_CLI));
+        assert!(is_rung_scoped_rate_limit_message(
+            "You've reached your Opus limit"
+        ));
+        assert!(is_rung_scoped_rate_limit_message(
+            "You've reached your Sonnet limit"
+        ));
+        assert!(is_rung_scoped_rate_limit_message(
+            "Please switch models to continue"
+        ));
+        // Plain session / account copy — ordinary RateLimit, no 3600 override.
+        assert!(!is_rung_scoped_rate_limit_message(
+            "You've reached your session limit"
+        ));
+        assert!(!is_rung_scoped_rate_limit_message(
+            "You've hit your limit · resets 4pm"
+        ));
+        // `/model` alone is not sufficient (no model token, no "switch models").
+        assert!(!is_rung_scoped_rate_limit_message(
+            "Try /model to pick another model"
+        ));
+    }
+
+    #[test]
+    fn test_decide_fable_ignores_api_secs_waits_blackout_fallback() {
+        // (b) api_secs must be populated — None is not sufficient to prove ignore.
+        let action =
+            decide_account_rate_limit(Some(SIX_DAYS_SECS), Some(500), FABLE_CLI, false, 300, 3600);
+        assert_eq!(
+            action,
+            RateLimitAction::Wait { secs: 3600 },
+            "Fable phrasing must Wait blackout_fallback_secs, ignoring api/output secs \
+             and never falling through to usage_fallback_wait 300"
+        );
+    }
+
+    #[test]
+    fn test_decide_fable_spillover_still_waits_never_blackout() {
+        // (c) spillover_enabled must not Blackout on rung-scoped phrasing.
+        let action =
+            decide_account_rate_limit(Some(SIX_DAYS_SECS), None, FABLE_CLI, true, 300, 3600);
+        assert_eq!(action, RateLimitAction::Wait { secs: 3600 });
+    }
+
+    #[test]
+    fn test_decide_opus_limit_also_takes_3600_override() {
+        // Override is not contains("fable") only.
+        let action = decide_account_rate_limit(
+            Some(SIX_DAYS_SECS),
+            None,
+            "You've reached your Opus limit",
+            false,
+            300,
+            3600,
+        );
+        assert_eq!(action, RateLimitAction::Wait { secs: 3600 });
+    }
+
+    #[test]
+    fn test_decide_plain_session_limit_keeps_api_secs() {
+        // (f) plain reached-your-limit without model token / switch models.
+        let action = decide_account_rate_limit(
+            Some(7200),
+            None,
+            "You've reached your session limit",
+            false,
+            300,
+            3600,
+        );
+        assert_eq!(action, RateLimitAction::Wait { secs: 7200 });
+    }
+
+    #[test]
+    fn test_decide_plain_session_limit_spillover_may_blackout() {
+        let action = decide_account_rate_limit(
+            Some(7200),
+            None,
+            "You've reached your session limit",
+            true,
+            300,
+            3600,
+        );
+        assert_eq!(action, RateLimitAction::Blackout { secs: 7200 });
+    }
+
+    #[test]
+    fn test_decide_hit_your_limit_resets_4pm_no_3600_override() {
+        // (e) account copy must not take the rung-scoped override.
+        let action = decide_account_rate_limit(
+            None,
+            Some(500),
+            "You've hit your limit · resets 4pm",
+            false,
+            300,
+            3600,
+        );
+        assert_eq!(action, RateLimitAction::Wait { secs: 500 });
+    }
+
+    #[test]
+    fn test_decide_slash_model_alone_no_3600_override() {
+        // (h) `/model` alone keeps api_secs / may Blackout.
+        let action = decide_account_rate_limit(
+            Some(7200),
+            None,
+            "Try /model to pick another model",
+            true,
+            300,
+            3600,
+        );
+        assert_eq!(action, RateLimitAction::Blackout { secs: 7200 });
+    }
+
     // --- wait_for_usage_reset tests ---
 
     #[test]
@@ -1404,6 +1587,16 @@ mod tests {
     fn test_parse_reset_from_output_no_match() {
         let output = "Some random output without reset info";
         assert!(parse_reset_from_output(output).is_none());
+    }
+
+    #[test]
+    fn test_parse_reset_from_output_sep_month_token_stays_none() {
+        // PR-1: do NOT add dated month-name parsing. Fable 3600 comes from the
+        // phrasing override, not from parsing a weekly reset out of CLI text.
+        assert!(
+            parse_reset_from_output("You've reached your Fable limit · resets Sep 12, 12:59am")
+                .is_none()
+        );
     }
 
     #[test]
