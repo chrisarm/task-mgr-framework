@@ -1172,13 +1172,19 @@ pub fn apply_quota(
     let mut spend_stop = false;
     let mut account_wait_resets: Vec<u64> = Vec::new();
 
+    let mut has_explicit_wait = false;
     for low in &eval.account_low {
         if let Some(action) = explicit_on_low_for_bucket(policy, &low.bucket_id, buckets) {
             match action {
                 OnLowAction::Stop => explicit_stop = true,
                 OnLowAction::Wait => {
+                    has_explicit_wait = true;
                     if let Some(secs) = low.reset_secs {
                         explicit_wait.push(secs);
+                    } else {
+                        // Unknown reset: still honor wait via capped repark.
+                        explicit_wait
+                            .push(policy.stop_if_reset_beyond_hours.saturating_mul(3600) + 1);
                     }
                 }
                 OnLowAction::Ask => explicit_ask = true,
@@ -1220,7 +1226,9 @@ pub fn apply_quota(
     } else if let Some(secs) = latest {
         if secs <= wait_within_secs {
             account = QuotaAccountAction::Wait { secs };
-        } else if secs <= stop_beyond_secs {
+        } else if secs <= stop_beyond_secs || has_explicit_wait {
+            // Middle band, or explicit onLow:wait beyond horizon: wait capped
+            // (operator opted into a repark cycle instead of Stop/Proceed).
             account = QuotaAccountAction::Wait {
                 secs: secs.min(MAX_WAIT_SECS),
             };
@@ -2791,6 +2799,126 @@ mod tests {
             vec![(Provider::Claude, CapabilityTier::Frontier)]
         );
         assert_eq!(applied.account, QuotaAccountAction::Proceed);
+    }
+
+    #[test]
+    fn apply_explicit_wait_on_weekly_scoped_honors_wait() {
+        // CODE-FIX-006: set-usage-rule --kind weekly_scoped --on-low wait.
+        let frontier = pct_bucket(
+            "weekly_scoped",
+            "weekly_scoped",
+            5.0,
+            30 * 60, // within waitIfResetWithinMinutes
+            Some(vec![(Provider::Claude, CapabilityTier::Frontier)]),
+        );
+        let policy = UsagePolicy {
+            rules: vec![crate::loop_engine::quota::UsageRule {
+                kind: Some("weekly_scoped".into()),
+                id: None,
+                when: None,
+                on_low: OnLowAction::Wait,
+            }],
+            ..UsagePolicy::default()
+        };
+        let eval = evaluate_quota(std::slice::from_ref(&frontier), &policy, 8);
+        assert!(
+            !eval.account_low.is_empty(),
+            "evaluate must emit wait input for explicit scoped wait"
+        );
+        assert!(eval.unavailable.is_empty());
+        let work = RemainingWorkSnapshot {
+            other_rungs_runnable: true,
+            max_difficulty: Some("high"),
+            ..RemainingWorkSnapshot::default()
+        };
+        let applied = apply_quota(
+            &eval,
+            std::slice::from_ref(&frontier),
+            &policy,
+            Some(&factory_fb()),
+            &work,
+        );
+        match applied.account {
+            QuotaAccountAction::Wait { secs } => {
+                assert!(secs > 0 && secs <= 30 * 60 + 5, "secs={secs}");
+            }
+            other => panic!("expected Wait for explicit scoped onLow wait, got {other:?}"),
+        }
+        assert!(
+            applied.unavailable.is_empty(),
+            "explicit wait is account action, not auto-unavailable"
+        );
+    }
+
+    #[test]
+    fn apply_explicit_stop_on_weekly_scoped_honors_stop() {
+        let frontier = pct_bucket(
+            "weekly_scoped",
+            "weekly_scoped",
+            5.0,
+            30 * 60,
+            Some(vec![(Provider::Claude, CapabilityTier::Frontier)]),
+        );
+        let policy = UsagePolicy {
+            rules: vec![crate::loop_engine::quota::UsageRule {
+                kind: Some("weekly_scoped".into()),
+                id: None,
+                when: None,
+                on_low: OnLowAction::Stop,
+            }],
+            ..UsagePolicy::default()
+        };
+        let eval = evaluate_quota(std::slice::from_ref(&frontier), &policy, 8);
+        let work = RemainingWorkSnapshot {
+            other_rungs_runnable: true,
+            max_difficulty: Some("high"),
+            ..RemainingWorkSnapshot::default()
+        };
+        let applied = apply_quota(
+            &eval,
+            std::slice::from_ref(&frontier),
+            &policy,
+            Some(&factory_fb()),
+            &work,
+        );
+        assert_eq!(applied.account, QuotaAccountAction::Stop);
+    }
+
+    #[test]
+    fn apply_explicit_ask_on_weekly_scoped_honors_ask() {
+        let frontier = pct_bucket(
+            "weekly_scoped",
+            "weekly_scoped",
+            5.0,
+            6 * 24 * 3600,
+            Some(vec![(Provider::Claude, CapabilityTier::Frontier)]),
+        );
+        let policy = UsagePolicy {
+            ask_ttl_minutes: 15,
+            rules: vec![crate::loop_engine::quota::UsageRule {
+                kind: Some("weekly_scoped".into()),
+                id: None,
+                when: None,
+                on_low: OnLowAction::Ask,
+            }],
+            ..UsagePolicy::default()
+        };
+        let eval = evaluate_quota(std::slice::from_ref(&frontier), &policy, 8);
+        let work = RemainingWorkSnapshot {
+            other_rungs_runnable: true,
+            max_difficulty: Some("high"),
+            ..RemainingWorkSnapshot::default()
+        };
+        // Factory tierFallback would otherwise auto-unavailable; explicit ask wins.
+        let applied = apply_quota(
+            &eval,
+            std::slice::from_ref(&frontier),
+            &policy,
+            Some(&factory_fb()),
+            &work,
+        );
+        assert!(applied.unavailable.is_empty());
+        assert_eq!(applied.account, QuotaAccountAction::Ask { ttl_minutes: 15 });
     }
 
     #[test]

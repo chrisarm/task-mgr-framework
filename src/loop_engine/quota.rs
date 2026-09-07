@@ -125,11 +125,13 @@ pub enum BucketEval {
     /// Remaining above floor (and no matching opt-in when), or explicit onLow: ignore,
     /// or unknown/non-actionable bucket (e.g. nimbus_quill default).
     Ignore,
-    /// Rung-scoped low (or explicit onLow: unavailable). Rungs to mark unavailable.
+    /// Rung-scoped low under the heuristic (or explicit onLow: unavailable).
+    /// Rungs to mark unavailable. Explicit wait|stop|ask do **not** collapse here.
     Unavailable {
         rungs: Vec<(Provider, CapabilityTier)>,
     },
-    /// Account-binding (or amount-exhausted spend) low → wait/stop **inputs**.
+    /// Wait/stop/ask **inputs** (account-binding, amount-exhausted spend, or
+    /// explicit onLow wait|stop|ask on any bucket including weekly_scoped).
     /// Apply resolves Wait vs Stop vs Ask. Evaluate does not emit Ask.
     AccountLow {
         remaining: f64,
@@ -259,22 +261,15 @@ fn evaluate_one(
                 // Explicit unavailable on a non-rung bucket: no rungs to mark.
                 return BucketEval::Ignore;
             }
-            // wait | stop | ask → emit inputs only (never Ask action).
+            // Explicit wait|stop|ask wins over the scoped→Unavailable heuristic.
+            // Emit AccountLow so apply can honor the action (never Ask here).
             OnLowAction::Wait | OnLowAction::Stop | OnLowAction::Ask => {
-                if rung_scoped {
-                    return BucketEval::Unavailable {
-                        rungs: bucket.rungs.clone().unwrap_or_default(),
-                    };
-                }
-                if account_binding || amount_exhausted {
-                    return BucketEval::AccountLow {
-                        remaining: remaining_value,
-                        reset_secs,
-                        kind: bucket.kind.clone(),
-                        low: true,
-                    };
-                }
-                return BucketEval::Ignore;
+                return BucketEval::AccountLow {
+                    remaining: remaining_value,
+                    reset_secs,
+                    kind: bucket.kind.clone(),
+                    low: true,
+                };
             }
         }
     }
@@ -496,6 +491,75 @@ mod tests {
         let eval = evaluate_quota(&buckets, &policy, 8);
         assert_eq!(eval.per_bucket[0].1, BucketEval::Ignore);
         assert!(eval.unavailable.is_empty());
+    }
+
+    #[test]
+    fn evaluate_explicit_on_low_wait_on_weekly_scoped_emits_account_low() {
+        // CODE-FIX-006: explicit wait must not collapse to Unavailable-only.
+        let policy = UsagePolicy {
+            rules: vec![UsageRule {
+                kind: Some("weekly_scoped".into()),
+                id: None,
+                when: None,
+                on_low: OnLowAction::Wait,
+            }],
+            ..UsagePolicy::default()
+        };
+        let buckets = [percent_bucket(
+            "limits[2].weekly_scoped",
+            "weekly_scoped",
+            5.0,
+            Some(vec![(Provider::Claude, CapabilityTier::Frontier)]),
+        )];
+        let eval = evaluate_quota(&buckets, &policy, 8);
+        match &eval.per_bucket[0].1 {
+            BucketEval::AccountLow {
+                remaining,
+                kind,
+                low,
+                reset_secs,
+            } => {
+                assert!((*remaining - 5.0).abs() < f64::EPSILON);
+                assert_eq!(kind, "weekly_scoped");
+                assert!(*low);
+                assert!(reset_secs.is_some_and(|s| s > 0));
+            }
+            other => panic!("expected AccountLow wait input, got {other:?}"),
+        }
+        assert_eq!(eval.account_low.len(), 1);
+        assert!(
+            eval.unavailable.is_empty(),
+            "explicit wait must not mark rungs unavailable (apply honors wait)"
+        );
+    }
+
+    #[test]
+    fn evaluate_explicit_on_low_stop_and_ask_on_scoped_emit_account_low() {
+        for action in [OnLowAction::Stop, OnLowAction::Ask] {
+            let policy = UsagePolicy {
+                rules: vec![UsageRule {
+                    kind: Some("weekly_scoped".into()),
+                    id: None,
+                    when: None,
+                    on_low: action,
+                }],
+                ..UsagePolicy::default()
+            };
+            let buckets = [percent_bucket(
+                "scoped",
+                "weekly_scoped",
+                0.0,
+                Some(vec![(Provider::Claude, CapabilityTier::Frontier)]),
+            )];
+            let eval = evaluate_quota(&buckets, &policy, 8);
+            assert!(
+                matches!(eval.per_bucket[0].1, BucketEval::AccountLow { .. }),
+                "{action:?} on scoped must emit AccountLow, got {:?}",
+                eval.per_bucket[0].1
+            );
+            assert_eq!(eval.account_low.len(), 1);
+            assert!(eval.unavailable.is_empty());
+        }
     }
 
     #[test]
