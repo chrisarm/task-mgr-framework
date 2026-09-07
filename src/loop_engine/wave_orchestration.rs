@@ -104,6 +104,7 @@ pub(super) fn wave_preflight_check(
                 fallback_wait: params.usage_params.fallback_wait,
                 ask_ttl_override: params.usage_params.ask_ttl_override,
                 execute_account_action: params.usage_params.enabled,
+                account_quota_stopped: &mut ctx.account_quota_stopped,
             },
         ) {
             UsageCheckResult::StopSignaled => {
@@ -242,6 +243,7 @@ pub(super) fn handle_no_eligible_tasks(
         &ctx.resolved_models,
         &ctx.provider_blackouts,
         now,
+        params.project_config.routing.tier_fallback.as_ref(),
     ) {
         reactions::account::RungOnlyEmpty::Inactive => {}
         reactions::account::RungOnlyEmpty::Exhausted => {

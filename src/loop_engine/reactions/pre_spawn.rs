@@ -30,9 +30,10 @@ use std::collections::{HashMap, HashSet};
 use rusqlite::Connection;
 
 use crate::loop_engine::engine::{
-    EffectiveRunnerInput, IterationContext, resolve_effective_runner,
+    EffectiveRunnerInput, IterationContext, active_rungs, now_unix_secs, resolve_effective_runner,
 };
 use crate::loop_engine::model::{self, Provider, ResolvedModelsConfig};
+use crate::loop_engine::project_config::TierFallback;
 use crate::loop_engine::recovery::normalize_baseline;
 use crate::loop_engine::runner::RunnerKind;
 
@@ -317,9 +318,11 @@ pub fn compute_quota_excluded_ids(
     task_prefix: Option<&str>,
     models: &ResolvedModelsConfig,
     active_blackouts: &HashSet<Provider>,
+    tier_fallback: Option<&TierFallback>,
 ) -> HashSet<String> {
+    let active_unavailable = active_rungs(&ctx.unavailable_rungs, now_unix_secs());
     // Do NOT early-return on empty blackouts — proto-channel may still exclude.
-    if active_blackouts.is_empty() && ctx.unavailable_rungs.is_empty() {
+    if active_blackouts.is_empty() && active_unavailable.is_empty() {
         return HashSet::new();
     }
 
@@ -364,6 +367,8 @@ pub fn compute_quota_excluded_ids(
                     difficulty: difficulty.as_deref(),
                     models,
                     provider_blackouts: active_blackouts,
+                    unavailable_rungs: &active_unavailable,
+                    tier_fallback,
                 })
                 .tier;
                 (provider, tier)
@@ -375,16 +380,30 @@ pub fn compute_quota_excluded_ids(
                     difficulty: difficulty.as_deref(),
                     models,
                     provider_blackouts: active_blackouts,
+                    unavailable_rungs: &active_unavailable,
+                    tier_fallback,
                 });
                 (plan.provider, plan.tier)
             }
         };
         let (effective_provider, effective_tier) = plan;
+        // Post-clamp resolve: if clamp moved off the blacked rung, the task
+        // stays selectable. Explicit + includeForced=false stays on the blacked
+        // tier → exclude (per-task defer).
         if active_blackouts.contains(&effective_provider)
-            || ctx
-                .unavailable_rungs
-                .contains(&(effective_provider, effective_tier))
+            || active_unavailable.contains(&(effective_provider, effective_tier))
         {
+            if model_col.as_ref().is_some_and(|m| !m.trim().is_empty())
+                && tier_fallback.is_some_and(|fb| !fb.include_forced)
+                && active_unavailable.contains(&(effective_provider, effective_tier))
+            {
+                eprintln!(
+                    "Deferring {} — rung {} unavailable and includeForced=false \
+                     (--include-forced / set-tier-fallback includeForced)",
+                    id,
+                    effective_tier.as_str()
+                );
+            }
             excluded.insert(id);
         }
     }
@@ -436,10 +455,11 @@ mod tests {
         let conn = seed_conn();
         let mut ctx = IterationContext::new(3);
         ctx.unavailable_rungs
-            .insert((Provider::Claude, CapabilityTier::Frontier));
+            .insert((Provider::Claude, CapabilityTier::Frontier), u64::MAX);
         let models = builtin_resolved_models();
         let empty_blackouts = HashSet::new();
-        let excluded = compute_quota_excluded_ids(&ctx, &conn, None, models, &empty_blackouts);
+        let excluded =
+            compute_quota_excluded_ids(&ctx, &conn, None, models, &empty_blackouts, None);
         assert!(
             excluded.contains("t-frontier"),
             "frontier-rung todo must be excluded when proto-channel marks frontier unavailable \
@@ -456,7 +476,7 @@ mod tests {
         let conn = seed_conn();
         let ctx = IterationContext::new(3);
         let models = builtin_resolved_models();
-        let excluded = compute_quota_excluded_ids(&ctx, &conn, None, models, &HashSet::new());
+        let excluded = compute_quota_excluded_ids(&ctx, &conn, None, models, &HashSet::new(), None);
         assert!(excluded.is_empty());
     }
 
@@ -488,13 +508,19 @@ mod tests {
             let mut ctx = IterationContext::new(3);
             // Learning [5463]: replace-on-evaluate (not merge).
             let applied = crate::loop_engine::reactions::account::QuotaApplyResult {
-                unavailable: eval.unavailable.clone(),
+                unavailable: eval
+                    .unavailable
+                    .iter()
+                    .copied()
+                    .map(|k| (k, u64::MAX))
+                    .collect(),
                 account: crate::loop_engine::reactions::account::QuotaAccountAction::Proceed,
             };
             replace_unavailable_rungs(&mut ctx.unavailable_rungs, &applied);
 
             let conn = seed_conn();
-            let excluded = compute_quota_excluded_ids(&ctx, &conn, None, &models, &HashSet::new());
+            let excluded =
+                compute_quota_excluded_ids(&ctx, &conn, None, &models, &HashSet::new(), None);
             assert!(
                 excluded.contains("t-frontier"),
                 "{label}: high/frontier id must be excluded after replace; got {excluded:?}"

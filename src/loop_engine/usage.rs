@@ -503,13 +503,16 @@ fn looks_rung_scoped_key(key: &str) -> bool {
     key.starts_with("seven_day_")
 }
 
-fn family_token_from_id(id: &str) -> String {
+pub(crate) fn family_token_from_id(id: &str) -> String {
     id.rsplit('_').next().unwrap_or(id).to_ascii_lowercase()
 }
 
 /// HUD label table: case-insensitive prefix/token → capability tier.
-/// Tokens live only in this ingest adapter — never in `quota.rs`.
-fn hud_tier_from_label(label: &str) -> Option<CapabilityTier> {
+/// Tokens live only in this ingest adapter — never in `quota.rs` / walker keys.
+///
+/// `pub(crate)` so resolve-time family-match of off-ladder `tasks.model`
+/// (FEAT-007) reuses the same table — do not duplicate Fable→frontier elsewhere.
+pub(crate) fn hud_tier_from_label(label: &str) -> Option<CapabilityTier> {
     let lower = label.to_ascii_lowercase();
     let tokens: Vec<&str> = lower
         .split(|c: char| !c.is_ascii_alphanumeric())
@@ -624,7 +627,7 @@ where
     out
 }
 
-fn map_unlabeled_token(
+pub(crate) fn map_unlabeled_token(
     models: &ResolvedModelsConfig,
     provider: Provider,
     token: &str,

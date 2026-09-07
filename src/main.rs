@@ -1242,6 +1242,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                         batch_sibling_prds: vec![],
                         chain_base: None,
                         prefix_mode: task_mgr::commands::init::PrefixMode::Auto,
+                        inherited_unavailable_rungs: Default::default(),
                     };
 
                     let rt = tokio::runtime::Builder::new_current_thread()

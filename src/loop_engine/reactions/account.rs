@@ -17,7 +17,7 @@ use rusqlite::Connection;
 
 use crate::lifecycle::TaskLifecycle;
 use crate::loop_engine::config::{IterationOutcome, PermissionMode};
-use crate::loop_engine::engine::BlackoutState;
+use crate::loop_engine::engine::{BlackoutState, UnavailableRungsMap, active_rungs, now_unix_secs};
 use crate::loop_engine::model::{CapabilityTier, Provider, ResolvedModelsConfig};
 use crate::loop_engine::project_config::TierFallback;
 use crate::loop_engine::quota::{
@@ -344,6 +344,27 @@ pub(crate) fn is_spend_limit_message(output: &str) -> bool {
         || (lower.contains("usage credits") && lower.contains("limit"))
 }
 
+/// Write synthetic proto-channel expiry for a rung-scoped CLI RateLimit.
+///
+/// Maps HUD family tokens in `output` via `hud_tier_from_label` (ingest adapter
+/// reuse — never stores `fable` as a key). Default expiry = `now + secs`
+/// (typically 3600). Extends an existing expiry, never shortens.
+fn record_synthetic_rung_unavailable(
+    unavailable_rungs: &mut UnavailableRungsMap,
+    output: &str,
+    now_secs: u64,
+    secs: u64,
+) {
+    let tier =
+        crate::loop_engine::usage::hud_tier_from_label(output).unwrap_or(CapabilityTier::Frontier);
+    let expiry = now_secs.saturating_add(secs);
+    let key = (Provider::Claude, tier);
+    unavailable_rungs
+        .entry(key)
+        .and_modify(|e| *e = (*e).max(expiry))
+        .or_insert(expiry);
+}
+
 /// PR-1 / FR-002: narrow Fable/rung-scoped CLI phrasing that takes the fixed
 /// `blackout_fallback_secs` Wait (default 3600) and skips usage_gate + early-lift
 /// probe.
@@ -505,6 +526,7 @@ pub fn react_to_outputs(
     items: &[OutputReactionItem<'_>],
     params: &AccountReactionParams<'_>,
     blackout: &mut BlackoutState,
+    unavailable_rungs: &mut UnavailableRungsMap,
 ) -> AccountReaction {
     // Capture run models in the gate closure — UsageGateFn stays (u8, &Path, u64).
     let models = params.models;
@@ -528,6 +550,7 @@ pub fn react_to_outputs(
         items,
         params,
         blackout,
+        unavailable_rungs,
         &usage_gate,
         &reset_wait,
         &probe,
@@ -545,6 +568,7 @@ pub fn react_to_outputs_with_io_seams(
     items: &[OutputReactionItem<'_>],
     params: &AccountReactionParams<'_>,
     blackout: &mut BlackoutState,
+    unavailable_rungs: &mut UnavailableRungsMap,
     usage_gate: UsageGateFn<'_>,
     reset_wait: ResetWaitFn<'_>,
     probe_rate_limit: RateLimitProbeFn<'_>,
@@ -628,7 +652,15 @@ pub fn react_to_outputs_with_io_seams(
         reset_wait(wait_secs, tasks_dir, fallback_wait, probe_arg)
     };
 
-    react_to_outputs_inner(conn, items, params, blackout, api_secs, &wait)
+    react_to_outputs_inner(
+        conn,
+        items,
+        params,
+        blackout,
+        unavailable_rungs,
+        api_secs,
+        &wait,
+    )
 }
 
 /// Hermetic core of the post-output rate-limit reaction.
@@ -650,6 +682,7 @@ pub fn react_to_outputs_inner(
     items: &[OutputReactionItem<'_>],
     params: &AccountReactionParams<'_>,
     blackout: &mut BlackoutState,
+    unavailable_rungs: &mut UnavailableRungsMap,
     api_reset_secs: Option<u64>,
     wait: WaitFn<'_>,
 ) -> AccountReaction {
@@ -725,6 +758,17 @@ pub fn react_to_outputs_inner(
             }
         }
         RateLimitAction::Wait { secs } => {
+            // PR-3: synthetic CLI rung-scoped RateLimit also writes proto-channel
+            // expiry (default 3600) even when spillover is unconfigured — never
+            // provider_blackouts.record for rungs.
+            if is_rung_scoped_rate_limit_message(decide_item.output) {
+                record_synthetic_rung_unavailable(
+                    unavailable_rungs,
+                    decide_item.output,
+                    params.now_secs,
+                    secs,
+                );
+            }
             // Fire wait EXACTLY once for the whole wave.
             if wait(secs) {
                 AccountReaction::WaitedAndRetry
@@ -857,16 +901,19 @@ pub enum RungOnlyEmpty {
 ///
 /// Called **before** [`handle_quota_deferral`] by both no-eligible paths so the
 /// blackout wait helper is never invoked for this case.
+#[allow(clippy::too_many_arguments)] // parity with blackout deferral inputs + tierFallback
 pub fn handle_rung_only_empty_selection(
     conn: &mut Connection,
     task_prefix: Option<&str>,
-    unavailable_rungs: &HashSet<(Provider, CapabilityTier)>,
+    unavailable_rungs: &UnavailableRungsMap,
     runner_overrides: &HashMap<String, RunnerKind>,
     models: &ResolvedModelsConfig,
     blackout: &BlackoutState,
     now_secs: u64,
+    tier_fallback: Option<&TierFallback>,
 ) -> RungOnlyEmpty {
-    if unavailable_rungs.is_empty() {
+    let active = active_rungs(unavailable_rungs, now_secs);
+    if active.is_empty() {
         return RungOnlyEmpty::Inactive;
     }
     // Active provider blackout owns the empty selection — deferral waits.
@@ -876,9 +923,15 @@ pub fn handle_rung_only_empty_selection(
     if count_todo_tasks(conn, task_prefix) == 0 {
         return RungOnlyEmpty::Inactive;
     }
-    let preview: Vec<(Provider, CapabilityTier)> = unavailable_rungs.iter().copied().collect();
-    let work =
-        compute_remaining_work_snapshot(conn, task_prefix, models, &preview, runner_overrides);
+    let preview: Vec<(Provider, CapabilityTier)> = active.iter().copied().collect();
+    let work = compute_remaining_work_snapshot(
+        conn,
+        task_prefix,
+        models,
+        &preview,
+        runner_overrides,
+        tier_fallback,
+    );
     if work.other_rungs_runnable {
         // Some todo/in_progress still lands on an available rung — not
         // rung-only exhaustion (soft-deps / recover / stale own that case).
@@ -1182,8 +1235,12 @@ pub enum QuotaAccountAction {
     /// preflight probe uses account remaining; scoped-only → `false` so the
     /// probe looks at nonempty-rungs buckets (FR-009 / US-010).
     Wait { secs: u64, account_binding: bool },
-    /// Stop this PRD (`in_progress` → `todo`). Next-PRD inherit of unavailable is PR-3.
-    Stop,
+    /// Stop this PRD (`in_progress` → `todo`).
+    ///
+    /// `account_binding: true` → session / weekly_all (or mixed) horizon Stop —
+    /// batch `--chain` must abort. `false` → rung-scoped only — next PRD may
+    /// inherit the proto-channel expiry map and clamp.
+    Stop { account_binding: bool },
     /// Ask path: sleep up to `ttl_minutes` (stop-signal-aware), re-eval
     /// `usagePolicy` + `tierFallback` on the stop-check cadence, then continue
     /// iff `tier_fallback_allows` (else Deferred). Only emitted when
@@ -1196,8 +1253,9 @@ pub enum QuotaAccountAction {
 /// Combined apply result. Account wait/stop can coexist with rung unavailable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuotaApplyResult {
-    /// Rungs to place on the proto-channel (factory / allowing tierFallback).
-    pub unavailable: Vec<(Provider, CapabilityTier)>,
+    /// Rungs to place on the proto-channel (factory / allowing tierFallback),
+    /// keyed to unix-epoch expiry (from bucket `resets_at`, else now+3600).
+    pub unavailable: UnavailableRungsMap,
     pub account: QuotaAccountAction,
 }
 
@@ -1276,17 +1334,20 @@ pub fn apply_quota_with_ask_ttl(
     ask_ttl_minutes: u64,
 ) -> QuotaApplyResult {
     let allows = tier_fallback_allows(tier_fallback, work);
+    let now = now_unix_secs();
 
-    let mut unavailable: Vec<(Provider, CapabilityTier)> = Vec::new();
+    let mut unavailable: UnavailableRungsMap = HashMap::new();
     let mut pending_ask = false;
     let mut scoped_wait_resets: Vec<u64> = Vec::new();
 
     if !eval.unavailable.is_empty() {
         if allows {
             for rung in &eval.unavailable {
-                if !unavailable.contains(rung) {
-                    unavailable.push(*rung);
-                }
+                let expiry = expiry_unix_for_rung(*rung, eval, buckets, now);
+                unavailable
+                    .entry(*rung)
+                    .and_modify(|e| *e = (*e).max(expiry))
+                    .or_insert(expiry);
             }
             // Only-frontier-left: still may need wait/stop from scoped resets.
             if !work.other_rungs_runnable {
@@ -1356,7 +1417,10 @@ pub fn apply_quota_with_ask_ttl(
     let mut account = QuotaAccountAction::Proceed;
 
     if spend_stop || explicit_stop {
-        account = QuotaAccountAction::Stop;
+        // Spend / explicit onLow:stop are account-level stops.
+        account = QuotaAccountAction::Stop {
+            account_binding: true,
+        };
     } else if let Some(secs) = latest {
         if secs <= wait_within_secs {
             account = QuotaAccountAction::Wait {
@@ -1374,11 +1438,15 @@ pub fn apply_quota_with_ask_ttl(
             // Account-binding (session / weekly_all) beyond horizon: every
             // Claude rung shares that bucket, so other_rungs_runnable is not a
             // working alternative — Stop (do not keep burning quota).
-            account = QuotaAccountAction::Stop;
+            account = QuotaAccountAction::Stop {
+                account_binding: true,
+            };
         } else if !work.other_rungs_runnable {
             // Scoped-only beyond horizon and nothing else can run → Stop.
             // other_rungs_runnable ignores spillover (caller's responsibility).
-            account = QuotaAccountAction::Stop;
+            account = QuotaAccountAction::Stop {
+                account_binding: false,
+            };
         } else if pending_ask || explicit_ask {
             account = ask_or_defer(ask_ttl_minutes);
         } else {
@@ -1396,7 +1464,9 @@ pub fn apply_quota_with_ask_ttl(
         QuotaAccountAction::Ask { .. } | QuotaAccountAction::Defer
     ) && (spend_stop || explicit_stop)
     {
-        account = QuotaAccountAction::Stop;
+        account = QuotaAccountAction::Stop {
+            account_binding: true,
+        };
     }
     if matches!(
         account,
@@ -1404,13 +1474,56 @@ pub fn apply_quota_with_ask_ttl(
     ) && matches!(latest, Some(secs) if secs > stop_beyond_secs)
         && !work.other_rungs_runnable
     {
-        account = QuotaAccountAction::Stop;
+        account = QuotaAccountAction::Stop {
+            account_binding: has_account_binding_wait,
+        };
     }
 
     QuotaApplyResult {
         unavailable,
         account,
     }
+}
+
+/// Absolute unix expiry for a proto-channel rung: latest matching unavailable
+/// bucket `resets_at`, else `now + 3600` (synthetic / unknown reset).
+fn expiry_unix_for_rung(
+    rung: (Provider, CapabilityTier),
+    eval: &QuotaEval,
+    buckets: &[QuotaBucket],
+    now: u64,
+) -> u64 {
+    let mut best: Option<u64> = None;
+    for (id, beval) in &eval.per_bucket {
+        let BucketEval::Unavailable { rungs } = beval else {
+            continue;
+        };
+        if !rungs.contains(&rung) {
+            continue;
+        }
+        let Some(bucket) = buckets.iter().find(|b| b.id == *id) else {
+            continue;
+        };
+        if let Some(abs) = parse_bucket_reset_unix(bucket) {
+            best = Some(best.map_or(abs, |b| b.max(abs)));
+        }
+    }
+    best.unwrap_or_else(|| now.saturating_add(3600))
+}
+
+fn parse_bucket_reset_unix(bucket: &QuotaBucket) -> Option<u64> {
+    let raw = bucket.resets_at.as_deref()?;
+    let ts = chrono::DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .or_else(|| {
+            chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M:%S")
+                .ok()
+                .map(|dt| dt.and_utc())
+        })?;
+    // chrono 0.4: timestamp() is i64 seconds since epoch.
+    let secs = ts.timestamp();
+    if secs < 0 { None } else { Some(secs as u64) }
 }
 
 fn ask_or_defer(ask_ttl_minutes: u64) -> QuotaAccountAction {
@@ -1525,13 +1638,13 @@ pub fn evaluate_and_apply_quota(
 /// Replace `unavailable_rungs` from an apply result (successful evaluate path).
 ///
 /// Call only after a successful usage/evaluate cycle. On API failure the caller
-/// must **not** invoke this — keep the previous snapshot.
+/// must **not** invoke this — keep the previous snapshot (including expiries).
 pub fn replace_unavailable_rungs(
-    unavailable_rungs: &mut HashSet<(Provider, CapabilityTier)>,
+    unavailable_rungs: &mut UnavailableRungsMap,
     applied: &QuotaApplyResult,
 ) {
     unavailable_rungs.clear();
-    unavailable_rungs.extend(applied.unavailable.iter().copied());
+    unavailable_rungs.extend(applied.unavailable.iter().map(|(k, v)| (*k, *v)));
 }
 
 /// Inputs to [`account_quota_preflight`] / [`account_quota_preflight_inner`].
@@ -1551,7 +1664,7 @@ pub struct QuotaPreflightParams<'a> {
     /// When false (`LOOP_USAGE_CHECK_ENABLED=false`): skip evaluate/replace/
     /// wait/stop and keep the proto-channel snapshot.
     pub execute_account_action: bool,
-    pub unavailable_rungs: &'a mut HashSet<(Provider, CapabilityTier)>,
+    pub unavailable_rungs: &'a mut UnavailableRungsMap,
     /// Preview of remaining work used by apply (caller computes from DB +
     /// evaluate.unavailable, or passes a hermetic fixture).
     pub work: &'a RemainingWorkSnapshot,
@@ -1582,7 +1695,7 @@ pub struct RunAccountQuotaGateParams<'a> {
     pub conn: &'a mut Connection,
     pub task_prefix: Option<&'a str>,
     pub run_id: &'a str,
-    pub unavailable_rungs: &'a mut HashSet<(Provider, CapabilityTier)>,
+    pub unavailable_rungs: &'a mut UnavailableRungsMap,
     /// Permanent promote_once pins — same map consulted by
     /// [`super::pre_spawn::compute_quota_excluded_ids`]. Snapshot must honor
     /// these so pinned Grok/Codex work counts as other-rung runnable.
@@ -1599,6 +1712,9 @@ pub struct RunAccountQuotaGateParams<'a> {
     /// When false (`LOOP_USAGE_CHECK_ENABLED=false`): skip OAuth/usage load,
     /// keep the proto-channel snapshot, and do not sleep/stop/defer.
     pub execute_account_action: bool,
+    /// Written `true` when apply emits account-binding [`QuotaAccountAction::Stop`].
+    /// Rung-scoped Stop leaves this unchanged/`false` so batch inherit can continue.
+    pub account_quota_stopped: &'a mut bool,
 }
 
 /// Load usage, evaluate+apply, refresh proto-channel, optionally wait/stop.
@@ -1640,6 +1756,7 @@ pub fn run_account_quota_gate_inner(
         fallback_wait,
         ask_ttl_override,
         execute_account_action,
+        account_quota_stopped,
     } = params;
 
     // Dual predicate (pre-iteration): env off ⇒ no load_usage_info / OAuth GET.
@@ -1693,10 +1810,14 @@ pub fn run_account_quota_gate_inner(
             models,
             &eval.unavailable,
             runner_overrides,
+            tier_fallback,
         );
         let applied =
             apply_quota_with_ask_ttl(&eval, buckets, policy, tier_fallback, &work, effective_ttl);
-        let horizon_stop = matches!(applied.account, QuotaAccountAction::Stop);
+        if let QuotaAccountAction::Stop { account_binding } = applied.account {
+            *account_quota_stopped = account_binding;
+        }
+        let horizon_stop = matches!(applied.account, QuotaAccountAction::Stop { .. });
         (work, horizon_stop)
     } else {
         // No buckets (API fail or org-only): assume other work can run so we
@@ -1895,7 +2016,7 @@ fn execute_quota_account_action(
     action: &QuotaAccountAction,
     eval: &QuotaEval,
     buckets: &[QuotaBucket],
-    unavailable_rungs: &mut HashSet<(Provider, CapabilityTier)>,
+    unavailable_rungs: &mut UnavailableRungsMap,
     ctx: &QuotaExecuteCtx<'_, '_>,
 ) -> UsageCheckResult {
     match action {
@@ -1912,7 +2033,7 @@ fn execute_quota_account_action(
             }
             run_preflight_wait(*secs, *account_binding, ctx)
         }
-        QuotaAccountAction::Stop => UsageCheckResult::HorizonStopped,
+        QuotaAccountAction::Stop { .. } => UsageCheckResult::HorizonStopped,
         QuotaAccountAction::Ask { ttl_minutes } => {
             execute_ask_ttl(*ttl_minutes, eval, buckets, unavailable_rungs, ctx)
         }
@@ -1932,7 +2053,7 @@ fn execute_ask_ttl(
     ttl_minutes: u64,
     eval: &QuotaEval,
     buckets: &[QuotaBucket],
-    unavailable_rungs: &mut HashSet<(Provider, CapabilityTier)>,
+    unavailable_rungs: &mut UnavailableRungsMap,
     ctx: &QuotaExecuteCtx<'_, '_>,
 ) -> UsageCheckResult {
     // Apply already maps TTL 0 → Defer; belt-and-suspenders for execute-only callers.
@@ -1978,8 +2099,13 @@ fn execute_ask_ttl(
         AskWaitOutcome::Continue => {
             // Operator allowed (or now allows) downgrade — place unavailable
             // rungs so selection continues on working rungs this iteration.
+            let now = now_unix_secs();
             for rung in &eval.unavailable {
-                unavailable_rungs.insert(*rung);
+                let expiry = expiry_unix_for_rung(*rung, eval, buckets, now);
+                unavailable_rungs
+                    .entry(*rung)
+                    .and_modify(|e| *e = (*e).max(expiry))
+                    .or_insert(expiry);
             }
             UsageCheckResult::WaitedAndReset
         }
@@ -2215,6 +2341,7 @@ pub fn compute_remaining_work_snapshot(
     models: &crate::loop_engine::model::ResolvedModelsConfig,
     unavailable_preview: &[(Provider, CapabilityTier)],
     runner_overrides: &HashMap<String, RunnerKind>,
+    tier_fallback: Option<&TierFallback>,
 ) -> RemainingWorkSnapshot {
     let like_prefix = task_prefix.unwrap_or("");
     let mut stmt = match conn.prepare(
@@ -2257,6 +2384,9 @@ pub fn compute_remaining_work_snapshot(
         if let Some(r) = difficulty.as_deref().and_then(difficulty_rank_str) {
             max_rank = Some(max_rank.map_or(r, |m| m.max(r)));
         }
+        // Resolve WITH unavailable + tierFallback so post-resolve clamp counts
+        // clamp-eligible frontier work as runnable (factory + only-frontier-left
+        // → Proceed, not HorizonStopped).
         let plan = crate::loop_engine::model::resolve_execution_plan(
             &crate::loop_engine::model::PlanContext {
                 task_id: &id,
@@ -2264,10 +2394,12 @@ pub fn compute_remaining_work_snapshot(
                 difficulty: difficulty.as_deref(),
                 models,
                 provider_blackouts: &empty_blackouts,
+                unavailable_rungs: &unavailable,
+                tier_fallback,
             },
         );
         // Same effective-provider rule as compute_quota_excluded_ids: pin wins
-        // for provider; tier from resolve (empty blackouts — no spillover).
+        // for provider; tier from post-clamp resolve (empty blackouts — no spillover).
         let (effective_provider, effective_tier) = match runner_overrides.get(&id) {
             Some(kind) => (provider_of_runner(*kind), plan.tier),
             None => (plan.provider, plan.tier),
@@ -3336,10 +3468,12 @@ mod tests {
             ..RemainingWorkSnapshot::default()
         };
         let applied = apply_quota(&eval, &[frontier], &policy, Some(&factory_fb()), &work);
-        assert_eq!(
-            applied.unavailable,
-            vec![(Provider::Claude, CapabilityTier::Frontier)]
+        assert!(
+            applied
+                .unavailable
+                .contains_key(&(Provider::Claude, CapabilityTier::Frontier))
         );
+        assert_eq!(applied.unavailable.len(), 1);
         assert_eq!(applied.account, QuotaAccountAction::Proceed);
     }
 
@@ -3430,7 +3564,12 @@ mod tests {
             Some(&factory_fb()),
             &work,
         );
-        assert_eq!(applied.account, QuotaAccountAction::Stop);
+        assert_eq!(
+            applied.account,
+            QuotaAccountAction::Stop {
+                account_binding: true
+            }
+        );
     }
 
     #[test]
@@ -3500,10 +3639,12 @@ mod tests {
             "factory defaults must still allow unavailable when has_forced"
         );
         let applied = apply_quota(&eval, &[frontier], &policy, Some(&fb), &work);
-        assert_eq!(
-            applied.unavailable,
-            vec![(Provider::Claude, CapabilityTier::Frontier)]
+        assert!(
+            applied
+                .unavailable
+                .contains_key(&(Provider::Claude, CapabilityTier::Frontier))
         );
+        assert_eq!(applied.unavailable.len(), 1);
         assert_eq!(
             applied.account,
             QuotaAccountAction::Proceed,
@@ -3606,7 +3747,7 @@ mod tests {
             waited.borrow_mut().push(secs);
             true
         };
-        let mut set = HashSet::new();
+        let mut set = HashMap::new();
         let result = account_quota_preflight_inner(
             QuotaPreflightParams {
                 threshold: 8,
@@ -3660,7 +3801,7 @@ mod tests {
             waited.borrow_mut().push(secs);
             true
         };
-        let mut set = HashSet::new();
+        let mut set = HashMap::new();
         let result = account_quota_preflight_inner(
             QuotaPreflightParams {
                 threshold: 8,
@@ -3724,7 +3865,7 @@ mod tests {
             waited.borrow_mut().push(secs);
             true
         };
-        let mut set = HashSet::new();
+        let mut set = HashMap::new();
         let result = account_quota_preflight_inner(
             QuotaPreflightParams {
                 threshold: 8,
@@ -3808,7 +3949,7 @@ mod tests {
         assert!(
             applied
                 .unavailable
-                .contains(&(Provider::Claude, CapabilityTier::Frontier))
+                .contains_key(&(Provider::Claude, CapabilityTier::Frontier))
         );
     }
 
@@ -3836,7 +3977,7 @@ mod tests {
             waited.borrow_mut().push(secs);
             true
         };
-        let mut set = HashSet::new();
+        let mut set = HashMap::new();
         let result = account_quota_preflight_inner(
             QuotaPreflightParams {
                 threshold: 8,
@@ -3957,7 +4098,7 @@ mod tests {
             waited.borrow_mut().push(secs);
             false // stop signal during TTL wait
         };
-        let mut set = HashSet::new();
+        let mut set = HashMap::new();
         let result = account_quota_preflight_inner(
             QuotaPreflightParams {
                 threshold: 8,
@@ -3999,7 +4140,7 @@ mod tests {
             waited.borrow_mut().push(secs);
             true
         };
-        let mut set = HashSet::new();
+        let mut set = HashMap::new();
         let result = account_quota_preflight_inner(
             QuotaPreflightParams {
                 threshold: 8,
@@ -4044,7 +4185,7 @@ mod tests {
             waited.borrow_mut().push(secs);
             false // .stop during wait
         };
-        let mut set = HashSet::new();
+        let mut set = HashMap::new();
         let result = account_quota_preflight_inner(
             QuotaPreflightParams {
                 threshold: 8,
@@ -4167,7 +4308,9 @@ mod tests {
             let applied = apply_quota(&eval, &[week], &policy, Some(&factory_fb()), &work);
             assert_eq!(
                 applied.account,
-                QuotaAccountAction::Stop,
+                QuotaAccountAction::Stop {
+                    account_binding: true
+                },
                 "weekly_all remaining {remaining} @ 6d must Stop, not Proceed"
             );
             assert!(
@@ -4193,7 +4336,12 @@ mod tests {
             ..RemainingWorkSnapshot::default()
         };
         let applied = apply_quota(&eval, &[frontier], &policy, Some(&factory_fb()), &work);
-        assert_eq!(applied.account, QuotaAccountAction::Stop);
+        assert_eq!(
+            applied.account,
+            QuotaAccountAction::Stop {
+                account_binding: false
+            }
+        );
     }
 
     #[test]
@@ -4237,7 +4385,12 @@ mod tests {
         };
         let applied = apply_quota(&eval, &buckets, &policy, Some(&factory_fb()), &work);
         // Latest is weekly 6d → beyond 12h + nothing runnable → Stop (not 2h wait).
-        assert_eq!(applied.account, QuotaAccountAction::Stop);
+        assert_eq!(
+            applied.account,
+            QuotaAccountAction::Stop {
+                account_binding: true
+            }
+        );
     }
 
     #[test]
@@ -4269,7 +4422,12 @@ mod tests {
         let eval = evaluate_quota(std::slice::from_ref(&spent), &policy, 8);
         let work = RemainingWorkSnapshot::default();
         let applied = apply_quota(&eval, &[spent], &policy, Some(&factory_fb()), &work);
-        assert_eq!(applied.account, QuotaAccountAction::Stop);
+        assert_eq!(
+            applied.account,
+            QuotaAccountAction::Stop {
+                account_binding: true
+            }
+        );
     }
 
     #[test]
@@ -4295,7 +4453,12 @@ mod tests {
         );
         let work = RemainingWorkSnapshot::default();
         let applied = apply_quota(&eval, &[spend], &policy, Some(&factory_fb()), &work);
-        assert_eq!(applied.account, QuotaAccountAction::Stop);
+        assert_eq!(
+            applied.account,
+            QuotaAccountAction::Stop {
+                account_binding: true
+            }
+        );
     }
 
     #[test]
@@ -4353,7 +4516,9 @@ mod tests {
         );
         assert_eq!(
             applied.account,
-            QuotaAccountAction::Stop,
+            QuotaAccountAction::Stop {
+                account_binding: true
+            },
             "hand-built AccountLow for extra_usage still Stops via amount-only"
         );
     }
@@ -4377,7 +4542,12 @@ mod tests {
         };
         // Forbade would ask, but nothing runnable + beyond horizon → Stop wins.
         let applied = apply_quota(&eval, &buckets, &policy, None, &work);
-        assert_eq!(applied.account, QuotaAccountAction::Stop);
+        assert_eq!(
+            applied.account,
+            QuotaAccountAction::Stop {
+                account_binding: true
+            }
+        );
     }
 
     #[test]
@@ -4437,7 +4607,7 @@ mod tests {
                 // Complete without claiming early lift — we only assert probe.
                 true
             };
-        let mut set = HashSet::new();
+        let mut set = HashMap::new();
         let result = account_quota_preflight_with_io_seams(
             QuotaPreflightParams {
                 threshold: 8,
@@ -4505,7 +4675,7 @@ mod tests {
             waited.borrow_mut().push(secs);
             true
         };
-        let mut set = HashSet::new();
+        let mut set = HashMap::new();
         let result = account_quota_preflight_inner(
             QuotaPreflightParams {
                 threshold: 8,
@@ -4553,7 +4723,7 @@ mod tests {
             waited.borrow_mut().push(secs);
             true
         };
-        let mut set = HashSet::new();
+        let mut set = HashMap::new();
         let result = account_quota_preflight_inner(
             QuotaPreflightParams {
                 threshold: 8,
@@ -4596,7 +4766,7 @@ mod tests {
             waited.borrow_mut().push(secs);
             true
         };
-        let mut set = HashSet::new();
+        let mut set = HashMap::new();
         let past = (chrono::Utc::now() - chrono::Duration::seconds(30)).to_rfc3339();
         let result = account_quota_preflight_inner(
             QuotaPreflightParams {
@@ -4646,8 +4816,8 @@ mod tests {
             max_difficulty: Some("high"),
             ..RemainingWorkSnapshot::default()
         };
-        let mut set_a = HashSet::new();
-        let mut set_b = HashSet::new();
+        let mut set_a = HashMap::new();
+        let mut set_b = HashMap::new();
         let wait = |_secs: u64| true;
         let a = account_quota_preflight_inner(
             QuotaPreflightParams {
@@ -4691,7 +4861,7 @@ mod tests {
         );
         assert_eq!(a, b);
         assert_eq!(set_a, set_b);
-        assert!(set_a.contains(&(Provider::Claude, CapabilityTier::Frontier)));
+        assert!(set_a.contains_key(&(Provider::Claude, CapabilityTier::Frontier)));
         assert_eq!(a, UsageCheckResult::BelowThreshold);
     }
 
@@ -4705,7 +4875,7 @@ mod tests {
             6 * 24 * 3600,
             Some(vec![(Provider::Claude, CapabilityTier::Frontier)]),
         );
-        let mut set = HashSet::from([(Provider::Claude, CapabilityTier::Standard)]);
+        let mut set = HashMap::from([((Provider::Claude, CapabilityTier::Standard), u64::MAX)]);
         let policy = UsagePolicy::default();
         let fb = factory_fb();
         let work = RemainingWorkSnapshot {
@@ -4735,17 +4905,26 @@ mod tests {
             &wait,
         );
         assert_eq!(result, UsageCheckResult::BelowThreshold);
+        assert!(
+            set.contains_key(&(Provider::Claude, CapabilityTier::Frontier)),
+            "successful evaluate+apply must replace the proto-channel set              (stale standard must not accumulate alongside frontier); got {set:?}"
+        );
+        assert!(
+            !set.contains_key(&(Provider::Claude, CapabilityTier::Standard)),
+            "stale standard must not accumulate; got {set:?}"
+        );
         assert_eq!(
-            set,
-            HashSet::from([(Provider::Claude, CapabilityTier::Frontier)]),
-            "successful evaluate+apply must replace the proto-channel set \
-             (stale standard must not accumulate alongside frontier)"
+            set.len(),
+            1,
+            "proto-channel must be exactly frontier; got {set:?}"
         );
     }
 
     #[test]
     fn preflight_keeps_snapshot_on_api_fail() {
-        let mut set = HashSet::from([(Provider::Claude, CapabilityTier::Frontier)]);
+        // (h) API fail keeps snapshot including expiry.
+        let expiry = 1_700_000_000u64 + 86_400;
+        let mut set = HashMap::from([((Provider::Claude, CapabilityTier::Frontier), expiry)]);
         let policy = UsagePolicy::default();
         let fb = factory_fb();
         let work = RemainingWorkSnapshot {
@@ -4774,7 +4953,106 @@ mod tests {
             &wait,
         );
         assert_eq!(result, UsageCheckResult::Skipped);
-        assert!(set.contains(&(Provider::Claude, CapabilityTier::Frontier)));
+        assert_eq!(
+            set.get(&(Provider::Claude, CapabilityTier::Frontier)),
+            Some(&expiry),
+            "API fail must keep prior expiry unchanged; got {set:?}"
+        );
+    }
+
+    #[test]
+    fn synthetic_cli_rung_scoped_writes_3600_expiry() {
+        // (g) Synthetic CLI rung-scoped RateLimit → expiry = now + 3600
+        // even when spillover is unconfigured.
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE tasks (
+                id TEXT PRIMARY KEY, status TEXT NOT NULL DEFAULT 'todo',
+                started_at TEXT, archived_at TEXT
+             );",
+        )
+        .unwrap();
+        let models = crate::loop_engine::model::builtin_resolved_models();
+        let now = 1_700_000_000u64;
+        let params = AccountReactionParams {
+            threshold: 8,
+            usage_enabled: false,
+            anthropic_account_io_allowed: true,
+            tasks_dir: Path::new("/tmp"),
+            fallback_wait: 300,
+            prefix: "",
+            run_id: "run",
+            permission_mode: &PermissionMode::Dangerous,
+            spillover_enabled: false, // unconfigured spillover
+            primary_provider: Provider::Claude,
+            blackout_fallback_secs: 3600,
+            now_secs: now,
+            models,
+        };
+        let mut blackout = BlackoutState::default();
+        let mut unavailable = HashMap::new();
+        let outcome = IterationOutcome::RateLimit;
+        let items = [OutputReactionItem {
+            task_id: None,
+            outcome: &outcome,
+            output: "You've reached your Fable limit · switch models",
+        }];
+        let wait = |_secs: u64| true;
+        let reaction = react_to_outputs_inner(
+            &mut conn,
+            &items,
+            &params,
+            &mut blackout,
+            &mut unavailable,
+            None,
+            &wait,
+        );
+        assert_eq!(reaction, AccountReaction::WaitedAndRetry);
+        assert_eq!(
+            unavailable.get(&(Provider::Claude, CapabilityTier::Frontier)),
+            Some(&(now + 3600)),
+            "synthetic Fable RateLimit must write frontier expiry now+3600; got {unavailable:?}"
+        );
+        assert!(
+            !blackout.any_active(now),
+            "rung-scoped must not write provider_blackouts"
+        );
+    }
+
+    #[test]
+    fn next_prd_inherit_map_clamps_via_active_rungs() {
+        // (e) Next PRD inherits expiry map → resolve clamps instead of stopping.
+        use crate::loop_engine::engine::{UnavailableRungsMap, active_rungs};
+        use crate::loop_engine::model::{
+            CapabilityTier, PlanContext, Provider, builtin_resolved_models, resolve_execution_plan,
+        };
+        use crate::loop_engine::project_config::default_tier_fallback;
+
+        let now = 1_700_000_000u64;
+        // Prior PRD left frontier unavailable with future expiry.
+        let mut inherited: UnavailableRungsMap = HashMap::new();
+        inherited.insert((Provider::Claude, CapabilityTier::Frontier), now + 86_400);
+        // Receiver filters with active_rungs.
+        let active = active_rungs(&inherited, now);
+        assert!(active.contains(&(Provider::Claude, CapabilityTier::Frontier)));
+
+        let models = builtin_resolved_models();
+        let empty_blackouts = HashSet::new();
+        let fb = default_tier_fallback().unwrap();
+        let plan = resolve_execution_plan(&PlanContext {
+            task_id: "FEAT-PRD2",
+            task_model: None,
+            difficulty: Some("high"),
+            models,
+            provider_blackouts: &empty_blackouts,
+            unavailable_rungs: &active,
+            tier_fallback: Some(&fb),
+        });
+        assert_eq!(
+            plan.tier,
+            CapabilityTier::Standard,
+            "inherited frontier blackout must clamp PRD-2 high work onto standard"
+        );
     }
 
     #[test]
@@ -4787,7 +5065,7 @@ mod tests {
             Some(vec![(Provider::Claude, CapabilityTier::Frontier)]),
         );
         // Pre-existing snapshot must survive LOOP_USAGE_CHECK_ENABLED=false.
-        let mut set = HashSet::from([(Provider::Claude, CapabilityTier::Standard)]);
+        let mut set = HashMap::from([((Provider::Claude, CapabilityTier::Standard), u64::MAX)]);
         let policy = UsagePolicy::default();
         let fb = factory_fb();
         let work = RemainingWorkSnapshot {
@@ -4817,10 +5095,14 @@ mod tests {
             &wait,
         );
         assert_eq!(result, UsageCheckResult::Skipped);
+        assert!(
+            set.contains_key(&(Provider::Claude, CapabilityTier::Standard)),
+            "disabled preflight must keep snapshot (no replace from buckets); got {set:?}"
+        );
         assert_eq!(
-            set,
-            HashSet::from([(Provider::Claude, CapabilityTier::Standard)]),
-            "disabled preflight must keep snapshot (no replace from buckets)"
+            set.len(),
+            1,
+            "disabled snapshot must stay standard-only; got {set:?}"
         );
     }
 
@@ -4833,12 +5115,13 @@ mod tests {
             load_calls.set(load_calls.get() + 1);
             None
         };
-        let mut set = HashSet::from([(Provider::Claude, CapabilityTier::Frontier)]);
+        let mut set = HashMap::from([((Provider::Claude, CapabilityTier::Frontier), u64::MAX)]);
         let mut conn = Connection::open_in_memory().expect("in-memory");
         let models = crate::loop_engine::model::builtin_resolved_models();
         let policy = UsagePolicy::default();
         let fb = factory_fb();
         let overrides = HashMap::new();
+        let mut account_quota_stopped = false;
         let result = run_account_quota_gate_inner(
             RunAccountQuotaGateParams {
                 conn: &mut conn,
@@ -4855,6 +5138,7 @@ mod tests {
                 fallback_wait: 300,
                 ask_ttl_override: None,
                 execute_account_action: false,
+                account_quota_stopped: &mut account_quota_stopped,
             },
             &load,
         );
@@ -4865,7 +5149,7 @@ mod tests {
             "disabled gate must not call load_usage_info"
         );
         assert!(
-            set.contains(&(Provider::Claude, CapabilityTier::Frontier)),
+            set.contains_key(&(Provider::Claude, CapabilityTier::Frontier)),
             "disabled gate must keep proto-channel snapshot"
         );
     }
@@ -4878,12 +5162,13 @@ mod tests {
             load_calls.set(load_calls.get() + 1);
             None
         };
-        let mut set = HashSet::new();
+        let mut set = HashMap::new();
         let mut conn = Connection::open_in_memory().expect("in-memory");
         let models = crate::loop_engine::model::builtin_resolved_models();
         let policy = UsagePolicy::default();
         let fb = factory_fb();
         let overrides = HashMap::new();
+        let mut account_quota_stopped = false;
         let result = run_account_quota_gate_inner(
             RunAccountQuotaGateParams {
                 conn: &mut conn,
@@ -4900,6 +5185,7 @@ mod tests {
                 fallback_wait: 300,
                 ask_ttl_override: None,
                 execute_account_action: true,
+                account_quota_stopped: &mut account_quota_stopped,
             },
             &load,
         );
@@ -4971,6 +5257,7 @@ mod tests {
             models,
             &unavailable,
             &empty_overrides,
+            None,
         );
         assert!(
             work.has_review,
@@ -4984,6 +5271,7 @@ mod tests {
             models,
             &unavailable,
             &empty_overrides,
+            None,
         );
         assert!(
             !work.has_review,
@@ -4991,8 +5279,14 @@ mod tests {
         );
 
         let claimed = snapshot_conn_with_ids(&["8d71d1f7-CODE-REVIEW-1"]);
-        let work =
-            compute_remaining_work_snapshot(&claimed, None, models, &unavailable, &empty_overrides);
+        let work = compute_remaining_work_snapshot(
+            &claimed,
+            None,
+            models,
+            &unavailable,
+            &empty_overrides,
+            None,
+        );
         assert!(
             work.has_review,
             "claimed 8d71d1f7-CODE-REVIEW-1 must set has_review (prefix strip in is_frontier_class)"
@@ -5008,11 +5302,41 @@ mod tests {
         let models = crate::loop_engine::model::builtin_resolved_models();
         let unavailable = [(Provider::Claude, CapabilityTier::Frontier)];
         let empty_overrides = HashMap::new();
-        let work =
-            compute_remaining_work_snapshot(&conn, None, models, &unavailable, &empty_overrides);
+        let work = compute_remaining_work_snapshot(
+            &conn,
+            None,
+            models,
+            &unavailable,
+            &empty_overrides,
+            None,
+        );
         assert!(
             !work.other_rungs_runnable,
             "unpinned Claude frontier task must not count as other-rung runnable; got {work:?}"
+        );
+    }
+
+    #[test]
+    fn snapshot_factory_clamp_counts_only_frontier_as_runnable() {
+        // FR-006 snapshot AC: factory tierFallback + only-frontier-left →
+        // post-clamp resolve lands on standard → other_rungs_runnable true
+        // (Proceed + clamp, not HorizonStopped).
+        let conn = snapshot_seed_conn();
+        let models = crate::loop_engine::model::builtin_resolved_models();
+        let unavailable = [(Provider::Claude, CapabilityTier::Frontier)];
+        let empty_overrides = HashMap::new();
+        let fb = factory_fb();
+        let work = compute_remaining_work_snapshot(
+            &conn,
+            None,
+            models,
+            &unavailable,
+            &empty_overrides,
+            Some(&fb),
+        );
+        assert!(
+            work.other_rungs_runnable,
+            "factory clamp must count frontier-only todos as runnable on standard; got {work:?}"
         );
     }
 
@@ -5026,7 +5350,8 @@ mod tests {
         let unavailable = [(Provider::Claude, CapabilityTier::Frontier)];
         let mut overrides = HashMap::new();
         overrides.insert("pinned-frontier".to_string(), RunnerKind::Grok);
-        let work = compute_remaining_work_snapshot(&conn, None, models, &unavailable, &overrides);
+        let work =
+            compute_remaining_work_snapshot(&conn, None, models, &unavailable, &overrides, None);
         assert!(
             work.other_rungs_runnable,
             "Grok-pinned task must count as other-rung runnable when only Claude \
@@ -5041,7 +5366,8 @@ mod tests {
         let unavailable = [(Provider::Claude, CapabilityTier::Frontier)];
         let mut overrides = HashMap::new();
         overrides.insert("pinned-frontier".to_string(), RunnerKind::Codex);
-        let work = compute_remaining_work_snapshot(&conn, None, models, &unavailable, &overrides);
+        let work =
+            compute_remaining_work_snapshot(&conn, None, models, &unavailable, &overrides, None);
         assert!(
             work.other_rungs_runnable,
             "Codex-pinned task must count as other-rung runnable when only Claude \
@@ -5107,6 +5433,7 @@ mod tests {
                 &models,
                 &eval.unavailable,
                 &empty_overrides,
+                None,
             );
             assert!(
                 work.other_rungs_runnable,
@@ -5114,9 +5441,16 @@ mod tests {
             );
 
             let applied = apply_quota(&eval, &buckets, &policy, Some(&factory_fb()), &work);
+            assert!(
+                applied
+                    .unavailable
+                    .contains_key(&(Provider::Claude, CapabilityTier::Frontier)),
+                "{label}: apply unavailable must stay frontier only; got {:?}",
+                applied.unavailable
+            );
             assert_eq!(
-                applied.unavailable,
-                vec![(Provider::Claude, CapabilityTier::Frontier)],
+                applied.unavailable.len(),
+                1,
                 "{label}: apply unavailable must stay frontier only; got {:?}",
                 applied.unavailable
             );
@@ -5127,7 +5461,7 @@ mod tests {
                 applied.account
             );
             assert!(
-                !matches!(applied.account, QuotaAccountAction::Stop),
+                !matches!(applied.account, QuotaAccountAction::Stop { .. }),
                 "{label}: must not Stop"
             );
         }
@@ -5169,7 +5503,7 @@ mod tests {
         )
         .expect("seed");
         let models = crate::loop_engine::model::builtin_resolved_models();
-        let unavailable = HashSet::from([(Provider::Claude, CapabilityTier::Frontier)]);
+        let unavailable = HashMap::from([((Provider::Claude, CapabilityTier::Frontier), u64::MAX)]);
         let overrides = HashMap::new();
         let blackout = BlackoutState::default();
         let now = 1_700_000_000u64;
@@ -5194,6 +5528,7 @@ mod tests {
             models,
             &blackout,
             now,
+            None,
         );
         assert_eq!(verdict, RungOnlyEmpty::Exhausted);
         let status: String = conn
@@ -5218,7 +5553,7 @@ mod tests {
         )
         .expect("seed");
         let models = crate::loop_engine::model::builtin_resolved_models();
-        let unavailable = HashSet::from([(Provider::Claude, CapabilityTier::Frontier)]);
+        let unavailable = HashMap::from([((Provider::Claude, CapabilityTier::Frontier), u64::MAX)]);
         let overrides = HashMap::new();
         let blackout = BlackoutState::default();
         let verdict = handle_rung_only_empty_selection(
@@ -5229,6 +5564,7 @@ mod tests {
             models,
             &blackout,
             1_700_000_000,
+            None,
         );
         assert_eq!(
             verdict,
@@ -5247,7 +5583,7 @@ mod tests {
         )
         .expect("seed");
         let models = crate::loop_engine::model::builtin_resolved_models();
-        let unavailable = HashSet::from([(Provider::Claude, CapabilityTier::Frontier)]);
+        let unavailable = HashMap::from([((Provider::Claude, CapabilityTier::Frontier), u64::MAX)]);
         let overrides = HashMap::new();
         let mut blackout = BlackoutState::default();
         let now = 1_700_000_000u64;
@@ -5260,6 +5596,7 @@ mod tests {
             models,
             &blackout,
             now,
+            None,
         );
         assert_eq!(verdict, RungOnlyEmpty::Inactive);
     }
@@ -5272,7 +5609,7 @@ mod tests {
         )
         .expect("seed");
         let models = crate::loop_engine::model::builtin_resolved_models();
-        let unavailable = HashSet::new();
+        let unavailable = HashMap::new();
         let overrides = HashMap::new();
         let blackout = BlackoutState::default();
         let verdict = handle_rung_only_empty_selection(
@@ -5283,6 +5620,7 @@ mod tests {
             models,
             &blackout,
             1_700_000_000,
+            None,
         );
         assert_eq!(verdict, RungOnlyEmpty::Inactive);
     }

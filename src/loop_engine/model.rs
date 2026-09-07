@@ -34,7 +34,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::loop_engine::project_config::{
-    ModelsConfig, RouteSpec, RoutingConfig, SpilloverConfig, TaskClassRoute,
+    ModelsConfig, RouteSpec, RoutingConfig, SpilloverConfig, TaskClassRoute, TierFallback,
 };
 
 /// Well-known model identifiers.
@@ -959,6 +959,93 @@ pub struct PlanContext<'a> {
     /// Providers under a quota blackout this pass. Spillover-eligible default
     /// tasks reroute off these; explicit/byIdPrefix/class-forced routes do not.
     pub provider_blackouts: &'a HashSet<Provider>,
+    /// Active proto-channel rungs (`active_rungs` adapter output). Empty → no
+    /// post-resolve clamp. Never store model ids here.
+    pub unavailable_rungs: &'a HashSet<(Provider, CapabilityTier)>,
+    /// `routing.tierFallback` for this pass. `None` (JSON null / unset) forbids
+    /// downgrade clamp. `includeForced` is per-task at resolve time.
+    pub tier_fallback: Option<&'a TierFallback>,
+}
+
+/// First defined non-blacked **lower** rung on `provider`'s ladder, walking
+/// [`CapabilityTier::ALL`] descending from just below `start_tier`.
+///
+/// Uses [`ResolvedModelsConfig::exact_model_for`] only — MUST NOT call
+/// [`ResolvedModelsConfig::model_for`] (bidirectional nearest-defined can walk
+/// UP onto a blacked frontier). Sparse ladder with every lower rung undefined
+/// or blacked → `None` (defer), never up.
+pub fn down_only_available_tier(
+    models: &ResolvedModelsConfig,
+    provider: Provider,
+    start_tier: CapabilityTier,
+    blacked: &HashSet<(Provider, CapabilityTier)>,
+) -> Option<CapabilityTier> {
+    // Walk ALL descending (Frontier → Cheapest). Skip >= start, skip undefined,
+    // skip blacked. First remaining defined non-blacked LOWER rung wins.
+    for &tier in CapabilityTier::ALL.iter().rev() {
+        if tier >= start_tier {
+            continue;
+        }
+        if models.exact_model_for(provider, tier).is_none() {
+            continue;
+        }
+        if blacked.contains(&(provider, tier)) {
+            continue;
+        }
+        return Some(tier);
+    }
+    None
+}
+
+/// Family-match an explicit off-ladder `tasks.model` string onto a capability
+/// rung via the HUD ingest adapter (no substring `tier_of`, no duplicated
+/// Fable→frontier table in this module).
+pub(crate) fn family_tier_for_explicit_model(
+    models: &ResolvedModelsConfig,
+    provider: Provider,
+    model: &str,
+) -> Option<CapabilityTier> {
+    use crate::loop_engine::usage::{
+        family_token_from_id, hud_tier_from_label, map_unlabeled_token,
+    };
+
+    if let Some(tier) = hud_tier_from_label(model) {
+        return Some(tier);
+    }
+    // Fall back to unlabeled family-token substring against configured models
+    // (same path as limits[] ingest) — still no substring tier_of.
+    let token = family_token_from_id(model);
+    let mapped = map_unlabeled_token(models, provider, &token);
+    mapped.first().map(|(_, t)| *t)
+}
+
+/// Whether post-resolve blackout clamp is allowed for this task under
+/// `tierFallback`. Explicit `tasks.model` respects `includeForced` per-task;
+/// review respects `includeReview`; `None` fb forbids all clamp.
+fn task_may_clamp_for_blackout(
+    fb: Option<&TierFallback>,
+    task_id: &str,
+    difficulty: Option<&str>,
+    is_explicit_model: bool,
+) -> bool {
+    let Some(fb) = fb else {
+        return false;
+    };
+    if is_explicit_model && !fb.include_forced {
+        return false;
+    }
+    if is_frontier_class(task_id) && !fb.include_review {
+        return false;
+    }
+    let Some(max_rank) = difficulty_rank(Some(fb.max_difficulty.as_str())) else {
+        return false;
+    };
+    match difficulty_rank(difficulty) {
+        Some(rank) => rank <= max_rank,
+        // Unranked difficulty: treat as eligible at the low end (matches
+        // spillover's absent-difficulty handling).
+        None => true,
+    }
 }
 
 /// The FR-003 six-rung resolution chain as a single pure function. Both prompt
@@ -991,39 +1078,90 @@ pub fn resolve_execution_plan(plan: &PlanContext<'_>) -> ExecutionPlan {
     let models = plan.models;
     let routing = &models.routing;
 
+    // Track whether EXPLICIT_MODEL fired — includeForced is per-task for that
+    // path only (byIdPrefix / class force still clamp under factory defaults).
+    let mut explicit_model = false;
+
     // Rung EXPLICIT_MODEL.
-    if let Some(m) = normalize(plan.task_model) {
+    let mut resolved = if let Some(m) = normalize(plan.task_model) {
+        explicit_model = true;
         let provider = provider_for_model(Some(m));
+        // Config exact-match first; off-ladder → family-match HUD adapter
+        // (not substring tier_of). Anchor window is last-resort for effort/
+        // display when family-match also misses.
         let tier = models
             .tier_of(provider, m)
+            .or_else(|| family_tier_for_explicit_model(models, provider, m))
             .unwrap_or_else(|| anchored_tier(models.anchor, plan.difficulty));
-        return ExecutionPlan {
+        ExecutionPlan {
             provider,
             model: Some(m.to_string()),
             tier,
             effort: models
                 .effort_for(provider, plan.difficulty)
                 .map(str::to_string),
-        };
-    }
+        }
+    } else if let Some((provider, tier)) = byidprefix_route(models, plan.task_id, plan.difficulty) {
+        // Rung BY_ID_PREFIX — a forced route beats class / blackout / anchor.
+        finalize_plan(models, provider, tier, plan.difficulty)
+    } else {
+        // Rung TASK_CLASS — when the class produces a forced provider and/or tier,
+        // it beats the blackout reroute and the anchor window.
+        let class = classify_task(plan.task_id, routing);
+        if let Some((provider, tier)) = class_route(models, class, plan.difficulty) {
+            finalize_plan(models, provider, tier, plan.difficulty)
+        } else {
+            // Default path: primary provider on the anchor window, eligible for the
+            // QUOTA_BLACKOUT reroute.
+            let tier = anchored_tier(models.anchor, plan.difficulty);
+            let provider = reroute_for_blackout(models, models.primary_provider, plan, class);
+            finalize_plan(models, provider, tier, plan.difficulty)
+        }
+    };
 
-    // Rung BY_ID_PREFIX — a forced route beats class / blackout / anchor.
-    if let Some((provider, tier)) = byidprefix_route(models, plan.task_id, plan.difficulty) {
-        return finalize_plan(models, provider, tier, plan.difficulty);
-    }
+    // Post-resolve clamp AFTER all six rungs including EXPLICIT_MODEL (FR-006).
+    // Down-only walker; never model_for. Rewrites plan.model via exact_model_for.
+    apply_rung_blackout_clamp(plan, &mut resolved, explicit_model);
+    resolved
+}
 
-    // Rung TASK_CLASS — when the class produces a forced provider and/or tier,
-    // it beats the blackout reroute and the anchor window.
-    let class = classify_task(plan.task_id, routing);
-    if let Some((provider, tier)) = class_route(models, class, plan.difficulty) {
-        return finalize_plan(models, provider, tier, plan.difficulty);
+/// Clamp `plan` down off an active proto-channel blackout when `tierFallback`
+/// allows. No-op when the resolved rung is not blacked, clamp is forbidden, or
+/// no lower defined rung exists (caller defers via exclusion / empty selection).
+fn apply_rung_blackout_clamp(
+    ctx: &PlanContext<'_>,
+    plan: &mut ExecutionPlan,
+    explicit_model: bool,
+) {
+    if ctx.unavailable_rungs.is_empty() {
+        return;
     }
-
-    // Default path: primary provider on the anchor window, eligible for the
-    // QUOTA_BLACKOUT reroute.
-    let tier = anchored_tier(models.anchor, plan.difficulty);
-    let provider = reroute_for_blackout(models, models.primary_provider, plan, class);
-    finalize_plan(models, provider, tier, plan.difficulty)
+    if !ctx.unavailable_rungs.contains(&(plan.provider, plan.tier)) {
+        return;
+    }
+    if !task_may_clamp_for_blackout(
+        ctx.tier_fallback,
+        ctx.task_id,
+        ctx.difficulty,
+        explicit_model,
+    ) {
+        return;
+    }
+    let Some(lower) =
+        down_only_available_tier(ctx.models, plan.provider, plan.tier, ctx.unavailable_rungs)
+    else {
+        return;
+    };
+    // exact_model_for only — walker already required the rung to be defined.
+    let Some(model) = ctx.models.exact_model_for(plan.provider, lower) else {
+        return;
+    };
+    plan.tier = lower;
+    plan.model = Some(model.to_string());
+    plan.effort = ctx
+        .models
+        .effort_for(plan.provider, ctx.difficulty)
+        .map(str::to_string);
 }
 
 /// Resolve `(provider, tier)` for a `routing.byIdPrefix` match, or `None`.
@@ -2465,12 +2603,35 @@ mod tests {
         difficulty: Option<&str>,
         blackouts: &HashSet<Provider>,
     ) -> ExecutionPlan {
+        let empty_rungs = HashSet::new();
         resolve_execution_plan(&PlanContext {
             task_id: id,
             task_model,
             difficulty,
             models,
             provider_blackouts: blackouts,
+            unavailable_rungs: &empty_rungs,
+            tier_fallback: None,
+        })
+    }
+
+    fn plan_with_unavailable(
+        models: &ResolvedModelsConfig,
+        id: &str,
+        task_model: Option<&str>,
+        difficulty: Option<&str>,
+        blackouts: &HashSet<Provider>,
+        unavailable: &HashSet<(Provider, CapabilityTier)>,
+        tier_fallback: Option<&TierFallback>,
+    ) -> ExecutionPlan {
+        resolve_execution_plan(&PlanContext {
+            task_id: id,
+            task_model,
+            difficulty,
+            models,
+            provider_blackouts: blackouts,
+            unavailable_rungs: unavailable,
+            tier_fallback,
         })
     }
 
@@ -2682,5 +2843,151 @@ mod tests {
             Some("low"),
             &spill_off
         ));
+    }
+
+    // ============ FEAT-007: down-only walker + family-match clamp ============
+
+    fn factory_tier_fallback() -> TierFallback {
+        crate::loop_engine::project_config::default_tier_fallback().expect("factory Some")
+    }
+
+    #[test]
+    fn down_only_frontier_blacked_lands_on_standard_not_up() {
+        // (a) frontier blacked → standard (defined lower), never up.
+        let models = builtin_resolved_models();
+        let mut blacked = HashSet::new();
+        blacked.insert((Provider::Claude, CapabilityTier::Frontier));
+        let landed =
+            down_only_available_tier(models, Provider::Claude, CapabilityTier::Frontier, &blacked);
+        assert_eq!(landed, Some(CapabilityTier::Standard));
+    }
+
+    #[test]
+    fn down_only_sparse_ladder_standard_blacked_returns_none_never_up() {
+        // (b) grok standard-only + standard blacked → None (never invent frontier).
+        // Discriminator: model_for(Grok, Cheapest) would walk UP to standard;
+        // the walker must not call model_for.
+        let models = builtin_resolved_models();
+        assert!(
+            models
+                .exact_model_for(Provider::Grok, CapabilityTier::Frontier)
+                .is_none(),
+            "precondition: grok has no frontier rung"
+        );
+        // model_for WOULD walk up onto standard from an undefined cheaper rung:
+        assert_eq!(
+            models.model_for(Provider::Grok, CapabilityTier::Cheapest),
+            models.exact_model_for(Provider::Grok, CapabilityTier::Standard),
+            "precondition: model_for walks UP onto standard — walker must not use it"
+        );
+        let mut blacked = HashSet::new();
+        blacked.insert((Provider::Grok, CapabilityTier::Standard));
+        let landed =
+            down_only_available_tier(models, Provider::Grok, CapabilityTier::Standard, &blacked);
+        assert_eq!(
+            landed, None,
+            "sparse ladder with only blacked standard must defer, never walk up"
+        );
+    }
+
+    #[test]
+    fn post_resolve_clamp_frontier_blacked_rewrites_to_standard() {
+        let models = builtin_resolved_models();
+        let empty_blackouts = HashSet::new();
+        let mut unavailable = HashSet::new();
+        unavailable.insert((Provider::Claude, CapabilityTier::Frontier));
+        let fb = factory_tier_fallback();
+        let plan = plan_with_unavailable(
+            models,
+            "FEAT-001",
+            None,
+            Some("high"),
+            &empty_blackouts,
+            &unavailable,
+            Some(&fb),
+        );
+        assert_eq!(plan.tier, CapabilityTier::Standard);
+        assert_eq!(plan.model.as_deref(), Some(OPUS_MODEL));
+    }
+
+    #[test]
+    fn off_ladder_explicit_family_match_defers_when_include_forced_false() {
+        // (c) claude-fable-5-1 is off-ladder (tier_of None) but family-maps to
+        // frontier; includeForced=false → no clamp (defer via exclusion).
+        let models = builtin_resolved_models();
+        let off_ladder = "claude-fable-5-1";
+        assert!(
+            models.tier_of(Provider::Claude, off_ladder).is_none(),
+            "precondition: off-ladder model has tier_of None"
+        );
+        assert_eq!(
+            family_tier_for_explicit_model(models, Provider::Claude, off_ladder),
+            Some(CapabilityTier::Frontier)
+        );
+        let empty_blackouts = HashSet::new();
+        let mut unavailable = HashSet::new();
+        unavailable.insert((Provider::Claude, CapabilityTier::Frontier));
+        let fb = TierFallback {
+            max_difficulty: "high".into(),
+            include_review: true,
+            include_forced: false,
+        };
+        let plan = plan_with_unavailable(
+            models,
+            "FEAT-PIN",
+            Some(off_ladder),
+            Some("high"),
+            &empty_blackouts,
+            &unavailable,
+            Some(&fb),
+        );
+        // No clamp: still frontier family tier + original model string.
+        assert_eq!(plan.tier, CapabilityTier::Frontier);
+        assert_eq!(plan.model.as_deref(), Some(off_ladder));
+    }
+
+    #[test]
+    fn off_ladder_explicit_include_forced_true_clamps_to_standard() {
+        // (d) includeForced=true may clamp off-ladder explicit pins.
+        let models = builtin_resolved_models();
+        let off_ladder = "claude-fable-5-1";
+        let empty_blackouts = HashSet::new();
+        let mut unavailable = HashSet::new();
+        unavailable.insert((Provider::Claude, CapabilityTier::Frontier));
+        let fb = TierFallback {
+            max_difficulty: "high".into(),
+            include_review: true,
+            include_forced: true,
+        };
+        let plan = plan_with_unavailable(
+            models,
+            "FEAT-PIN",
+            Some(off_ladder),
+            Some("high"),
+            &empty_blackouts,
+            &unavailable,
+            Some(&fb),
+        );
+        assert_eq!(plan.tier, CapabilityTier::Standard);
+        assert_eq!(plan.model.as_deref(), Some(OPUS_MODEL));
+    }
+
+    #[test]
+    fn forbade_tier_fallback_null_does_not_clamp() {
+        let models = builtin_resolved_models();
+        let empty_blackouts = HashSet::new();
+        let mut unavailable = HashSet::new();
+        unavailable.insert((Provider::Claude, CapabilityTier::Frontier));
+        let plan = plan_with_unavailable(
+            models,
+            "FEAT-001",
+            None,
+            Some("high"),
+            &empty_blackouts,
+            &unavailable,
+            None, // JSON null / unset-tier-fallback
+        );
+        assert_eq!(plan.tier, CapabilityTier::Frontier);
+        assert_eq!(plan.model.as_deref(), Some(FABLE_MODEL));
     }
 }

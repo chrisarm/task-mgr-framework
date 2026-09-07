@@ -145,6 +145,7 @@ pub fn run_iteration(
                 fallback_wait: params.usage_params.fallback_wait,
                 ask_ttl_override: params.usage_params.ask_ttl_override,
                 execute_account_action: params.usage_params.enabled,
+                account_quota_stopped: &mut ctx.account_quota_stopped,
             },
         );
         match check_result {
@@ -282,6 +283,7 @@ pub fn run_iteration(
             params.task_prefix,
             resolved_models,
             &active_blackouts,
+            params.project_config.routing.tier_fallback.as_ref(),
         )
     };
 
@@ -304,6 +306,11 @@ pub fn run_iteration(
         models_config: &params.project_config.models,
         routing_config: &params.project_config.routing,
         provider_blackouts: active_blackouts.clone(),
+        unavailable_rungs: crate::loop_engine::engine::active_rungs(
+            &ctx.unavailable_rungs,
+            crate::loop_engine::engine::now_unix_secs(),
+        ),
+        tier_fallback: params.project_config.routing.tier_fallback.as_ref(),
         excluded_ids: excluded_ids.clone(),
     });
 
@@ -385,6 +392,11 @@ pub fn run_iteration(
                     models_config: &params.project_config.models,
                     routing_config: &params.project_config.routing,
                     provider_blackouts: active_blackouts.clone(),
+                    unavailable_rungs: crate::loop_engine::engine::active_rungs(
+                        &ctx.unavailable_rungs,
+                        crate::loop_engine::engine::now_unix_secs(),
+                    ),
+                    tier_fallback: params.project_config.routing.tier_fallback.as_ref(),
                     excluded_ids: excluded_ids.clone(),
                 });
                 match retry_attempt {
@@ -866,6 +878,7 @@ pub fn run_iteration(
                 &items,
                 &account_params,
                 &mut ctx.provider_blackouts,
+                &mut ctx.unavailable_rungs,
             )
         };
         // `RerouteAndRetry` / `ProceedWithSpillover` (FEAT-008) and

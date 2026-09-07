@@ -1107,6 +1107,7 @@ mod tests {
             was_stopped: false,
             tasks_completed: 5,
             prd_complete: true,
+            ..Default::default()
         }
     }
 

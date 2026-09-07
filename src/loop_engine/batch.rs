@@ -590,6 +590,9 @@ pub async fn run_batch(
     // Chain tracking: advances to loop_result.branch_name after each successful PRD.
     // Starts as None so the first PRD branches from HEAD.
     let mut chain_base: Option<String> = None;
+    // Proto-channel expiry map inherited across PRDs when `--chain` continues
+    // after a rung-scoped horizon stop (never for account-binding Stop).
+    let mut inherited_unavailable_rungs = engine::UnavailableRungsMap::new();
 
     // Step 5: Run each PRD sequentially
     let mut results = Vec::with_capacity(pairs.len());
@@ -657,6 +660,7 @@ pub async fn run_batch(
             batch_sibling_prds: sibling_prds,
             chain_base: chain_base_snapshot.clone(),
             prefix_mode,
+            inherited_unavailable_rungs: inherited_unavailable_rungs.clone(),
         };
 
         let loop_result = engine::run_loop(run_config).await;
@@ -706,20 +710,26 @@ pub async fn run_batch(
             cleanup_ctx.cleanup(wt_path, exit_code, result_branch_name.as_deref());
         }
 
-        // Chain stop-on-incomplete: skip all remaining PRDs when this PRD either
-        // failed (non-zero exit) OR did not complete (active work still queued at
-        // loop end — an ambiguous exit 0 from an exhausted iteration budget or
-        // deadline). Downstream PRDs would build on a broken or incomplete state,
-        // so we abort immediately. Only `chain=true` enters this path.
-        if chain && (exit_code != 0 || !loop_result.prd_complete) {
-            ui::emit("Chain stopped: PRD did not complete, skipping remaining PRDs");
-            push_remaining_skipped(&mut results, &pairs, i + 1, &mut skipped);
-            break;
-        }
-
-        // Advance chain: next PRD branches from this PRD's branch (using LoopResult,
-        // not pre-read from JSON — avoids mismatch if DB normalizes the branch name).
+        // Chain stop-on-incomplete / inherit:
+        // - account-binding Stop (`account_quota_stopped`) aborts the chain
+        // - non-zero exit aborts
+        // - incomplete PRD with empty proto-channel (Ask/Deferred/budget) aborts
+        // - incomplete PRD with non-empty unavailable_rungs continues and seeds
+        //   the next PRD (rung-scoped horizon inherit)
         if chain {
+            if loop_result.account_quota_stopped || exit_code != 0 {
+                ui::emit("Chain stopped: PRD did not complete, skipping remaining PRDs");
+                push_remaining_skipped(&mut results, &pairs, i + 1, &mut skipped);
+                break;
+            }
+            if !loop_result.prd_complete && loop_result.unavailable_rungs.is_empty() {
+                ui::emit("Chain stopped: PRD did not complete, skipping remaining PRDs");
+                push_remaining_skipped(&mut results, &pairs, i + 1, &mut skipped);
+                break;
+            }
+            // Advance chain: next PRD branches from this PRD's branch and inherits
+            // the proto-channel expiry map (using LoopResult, not pre-read JSON).
+            inherited_unavailable_rungs = loop_result.unavailable_rungs;
             chain_base = result_branch_name;
         }
     }
@@ -748,6 +758,8 @@ pub async fn run_batch(
             worktree_path: target.worktree_path.clone(),
             branch_name: target.branch_name.clone(),
             tasks_completed: target.tasks_completed,
+            unavailable_rungs: Default::default(),
+            account_quota_stopped: false,
             prd_complete: true,
         };
         let launcher = auto_review::ProcessLauncher;
