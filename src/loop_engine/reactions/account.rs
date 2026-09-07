@@ -1849,10 +1849,16 @@ pub fn run_account_quota_gate_inner(
         ask_policy_reeval: None,
     });
 
-    if horizon_stop && matches!(result, UsageCheckResult::HorizonStopped) {
-        // Horizon Stop: park in_progress back to todo for this PRD.
+    if matches!(result, UsageCheckResult::HorizonStopped) {
+        // Horizon Stop (initial apply or mid-Ask usagePolicy Stop): park
+        // in_progress back to todo for this PRD.
         let prefix = task_prefix.unwrap_or("");
         reset_in_progress_tasks(conn, run_id, prefix, "quota horizon stop");
+        if !horizon_stop {
+            // Ask-wait re-eval emitted Stop (explicit onLow) — account-binding.
+            // Initial apply already wrote the flag when horizon_stop was true.
+            *account_quota_stopped = true;
+        }
     }
 
     result
@@ -2046,9 +2052,10 @@ fn execute_quota_account_action(
 /// Ask-path TTL execute (FR-005 / US-005).
 ///
 /// - TTL 0: Deferred, no sleep (learning 5468). Discriminator: do not call wait.
-/// - TTL > 0: stop-check cadence re-reads usagePolicy + tierFallback; mid-wait
-///   flip from forbade→allow continues early; timeout continues iff
-///   `tier_fallback_allows`, else Deferred. `.stop` → StopSignaled (chain halt).
+/// - TTL > 0: stop-check cadence re-reads usagePolicy + tierFallback and
+///   re-runs evaluate/apply; mid-wait `onLow: stop` → HorizonStopped (not
+///   `.stop`); forbade→allow / Proceed continues early; timeout continues iff
+///   `tier_fallback_allows`, else Deferred. Operator `.stop` → StopSignaled.
 /// - Timeout / early-allow continue marks eval.unavailable onto the proto-channel
 ///   (apply left it empty while forbade).
 fn execute_ask_ttl(
@@ -2076,29 +2083,26 @@ fn execute_ask_ttl(
 
     let outcome = match ctx.wait_mode {
         PreflightWaitMode::Injected(wait) => {
-            // Hermetic: one stop-aware wait call records secs; eligibility
-            // decides Continue vs Defer after completion (mid-wait re-eval
-            // uses wait_for_ask_ttl_inner via Production / direct tests).
+            // Hermetic: one stop-aware wait call records secs; post-wait
+            // re-eval (when a seam is present) decides Continue / Defer /
+            // HorizonStop. Cadenced mid-wait re-eval uses wait_for_ask_ttl_inner
+            // via Production / direct tests — WaitFn stays Fn(u64).
             let secs = ttl_minutes.saturating_mul(60);
             if !wait(secs) {
                 AskWaitOutcome::Stopped
             } else {
-                let allows = current_ask_allows(ctx, initial_allows);
-                if allows {
-                    AskWaitOutcome::Continue
-                } else {
-                    AskWaitOutcome::Defer
-                }
+                current_ask_wait_outcome(ctx, buckets, ttl_minutes, initial_allows)
             }
         }
         PreflightWaitMode::Production { .. } => {
             let secs = ttl_minutes.saturating_mul(60);
-            wait_for_ask_ttl(secs, ctx, initial_allows)
+            wait_for_ask_ttl(secs, ctx, buckets, ttl_minutes, initial_allows)
         }
     };
 
     match outcome {
         AskWaitOutcome::Stopped => UsageCheckResult::StopSignaled,
+        AskWaitOutcome::HorizonStop => UsageCheckResult::HorizonStopped,
         AskWaitOutcome::Defer => UsageCheckResult::Deferred {
             effective_ttl_minutes: ttl_minutes,
         },
@@ -2122,19 +2126,103 @@ fn execute_ask_ttl(
 pub(crate) enum AskWaitOutcome {
     Continue,
     Defer,
+    /// Operator `.stop` during Ask wait — chain halt.
     Stopped,
+    /// Mid-wait re-eval apply emitted [`QuotaAccountAction::Stop`] (e.g.
+    /// explicit `onLow: stop`). Not an operator stop — no `was_stopped`.
+    HorizonStop,
 }
 
-fn current_ask_allows(ctx: &QuotaExecuteCtx<'_, '_>, initial_allows: bool) -> bool {
+/// Post-Injected-wait decision: re-run evaluate/apply on the re-eval seam when
+/// present; otherwise keep the apply-time `tier_fallback_allows` decision.
+fn current_ask_wait_outcome(
+    ctx: &QuotaExecuteCtx<'_, '_>,
+    buckets: &[QuotaBucket],
+    ask_ttl_minutes: u64,
+    initial_allows: bool,
+) -> AskWaitOutcome {
     match ctx.ask_policy_reeval {
         Some(reeval) => {
             let slice = reeval();
-            tier_fallback_allows(slice.tier_fallback.as_ref(), ctx.work)
+            ask_wait_tick_from_slice(&slice, buckets, ctx.work, ask_ttl_minutes, initial_allows)
+                .into_outcome_at_deadline()
         }
         // Hermetic Injected path without a re-eval seam: keep the apply-time
         // decision. Production Ask always goes through wait_for_ask_ttl which
         // re-reads usagePolicy + tierFallback from disk on each stop-check.
-        None => initial_allows,
+        None => {
+            if initial_allows {
+                AskWaitOutcome::Continue
+            } else {
+                AskWaitOutcome::Defer
+            }
+        }
+    }
+}
+
+/// One stop-check tick decision from a re-read policy slice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AskWaitTick {
+    HorizonStop,
+    Continue,
+    KeepWaiting { allows: bool },
+}
+
+impl AskWaitTick {
+    fn into_outcome_at_deadline(self) -> AskWaitOutcome {
+        match self {
+            AskWaitTick::HorizonStop => AskWaitOutcome::HorizonStop,
+            AskWaitTick::Continue => AskWaitOutcome::Continue,
+            AskWaitTick::KeepWaiting { allows } => {
+                if allows {
+                    AskWaitOutcome::Continue
+                } else {
+                    AskWaitOutcome::Defer
+                }
+            }
+        }
+    }
+}
+
+/// Re-run evaluate + apply on the re-read `usagePolicy` + `tierFallback`.
+///
+/// Mid-wait explicit `onLow: stop` → [`AskWaitTick::HorizonStop`]. Factory /
+/// allowing Proceed → Continue early. Ask/Defer/Wait keep waiting; forbade→allow
+/// while still on the Ask path also Continues early (parity with prior
+/// `tier_fallback_allows` flip).
+fn ask_wait_tick_from_slice(
+    slice: &AskPolicySlice,
+    buckets: &[QuotaBucket],
+    work: &RemainingWorkSnapshot,
+    ask_ttl_minutes: u64,
+    initial_allows: bool,
+) -> AskWaitTick {
+    let floor = slice.usage_policy.remaining_min_percent;
+    let eval = evaluate_quota(buckets, &slice.usage_policy, floor);
+    // CLI `--use-other-models-ttl` already resolved into `ask_ttl_minutes` at
+    // Ask emit time; keep that effective TTL on re-apply so config 0 + CLI 15
+    // cannot flip to Defer mid-wait via a stale askTtlMinutes re-read alone.
+    let applied = apply_quota_with_ask_ttl(
+        &eval,
+        buckets,
+        &slice.usage_policy,
+        slice.tier_fallback.as_ref(),
+        work,
+        ask_ttl_minutes,
+    );
+    match applied.account {
+        QuotaAccountAction::Stop { .. } => AskWaitTick::HorizonStop,
+        QuotaAccountAction::Proceed => AskWaitTick::Continue,
+        QuotaAccountAction::Ask { .. }
+        | QuotaAccountAction::Defer
+        | QuotaAccountAction::Wait { .. } => {
+            let allows = tier_fallback_allows(slice.tier_fallback.as_ref(), work);
+            if allows && !initial_allows {
+                AskWaitTick::Continue
+            } else {
+                AskWaitTick::KeepWaiting { allows }
+            }
+        }
     }
 }
 
@@ -2248,6 +2336,8 @@ fn bucket_remaining_percent(bucket: &QuotaBucket) -> Option<f64> {
 fn wait_for_ask_ttl(
     ttl_secs: u64,
     ctx: &QuotaExecuteCtx<'_, '_>,
+    buckets: &[QuotaBucket],
+    ask_ttl_minutes: u64,
     initial_allows: bool,
 ) -> AskWaitOutcome {
     wait_for_ask_ttl_inner(
@@ -2257,11 +2347,18 @@ fn wait_for_ask_ttl(
         thread::sleep,
         || read_ask_policy_slice(ctx),
         ctx.work,
+        buckets,
+        ask_ttl_minutes,
         initial_allows,
     )
 }
 
 /// Injectable Ask wait (hermetic tests pass tiny timing + virtual sleep).
+///
+/// Each stop-check re-reads `usagePolicy` + `tierFallback` and re-runs
+/// evaluate/apply so a mid-wait usage rule (e.g. `onLow: stop`) is honored
+/// without requiring operator `.stop`.
+#[allow(clippy::too_many_arguments)] // injectable seams + re-eval inputs; packing relocates noise
 pub(crate) fn wait_for_ask_ttl_inner(
     ttl_secs: u64,
     tasks_dir: &Path,
@@ -2269,6 +2366,8 @@ pub(crate) fn wait_for_ask_ttl_inner(
     sleep: impl Fn(Duration),
     reeval: impl Fn() -> AskPolicySlice,
     work: &RemainingWorkSnapshot,
+    buckets: &[QuotaBucket],
+    ask_ttl_minutes: u64,
     initial_allows: bool,
 ) -> AskWaitOutcome {
     if ttl_secs == 0 {
@@ -2285,16 +2384,18 @@ pub(crate) fn wait_for_ask_ttl_inner(
         }
 
         let slice = reeval();
-        // Re-read usagePolicy + tierFallback each stop-check (AC); eligibility
-        // uses tierFallback. usagePolicy is intentionally loaded for parity with
-        // the config-slice contract even when unused for the continue decision.
-        let _ = &slice.usage_policy;
-        let allows_now = tier_fallback_allows(slice.tier_fallback.as_ref(), work);
-        last_allows = allows_now;
-        // Mid-wait: forbade → allow must continue without requiring .stop.
-        if allows_now && !initial_allows {
-            eprintln!("  Ask policy now allows tierFallback; continuing on working rungs...");
-            return AskWaitOutcome::Continue;
+        match ask_wait_tick_from_slice(&slice, buckets, work, ask_ttl_minutes, initial_allows) {
+            AskWaitTick::HorizonStop => {
+                eprintln!("  Ask policy now Stop (usagePolicy); horizon soft-stop...");
+                return AskWaitOutcome::HorizonStop;
+            }
+            AskWaitTick::Continue => {
+                eprintln!("  Ask policy now allows continuing on working rungs...");
+                return AskWaitOutcome::Continue;
+            }
+            AskWaitTick::KeepWaiting { allows } => {
+                last_allows = allows;
+            }
         }
 
         let sleep_time = remaining.min(timing.stop_check_secs).max(1);
@@ -4081,6 +4182,13 @@ mod tests {
     #[test]
     fn ask_wait_mid_flip_to_allow_continues_early() {
         use std::cell::Cell;
+        let frontier = pct_bucket(
+            "weekly_scoped",
+            "weekly_scoped",
+            5.0,
+            6 * 24 * 3600,
+            Some(vec![(Provider::Claude, CapabilityTier::Frontier)]),
+        );
         let work = RemainingWorkSnapshot {
             other_rungs_runnable: true,
             max_difficulty: Some("high"),
@@ -4113,6 +4221,8 @@ mod tests {
                 }
             },
             &work,
+            std::slice::from_ref(&frontier),
+            /* ask_ttl_minutes */ 15,
             /* initial_allows */ false,
         );
         assert_eq!(outcome, AskWaitOutcome::Continue);
@@ -4123,7 +4233,84 @@ mod tests {
     }
 
     #[test]
+    fn ask_wait_mid_on_low_stop_horizon_stops_without_operator_stop() {
+        // CODE-FIX-006: mid-wait usagePolicy onLow:stop must apply on the next
+        // stop-check — HorizonStop, not StopSignaled / was_stopped.
+        use std::cell::Cell;
+        let frontier = pct_bucket(
+            "weekly_scoped",
+            "weekly_scoped",
+            5.0,
+            6 * 24 * 3600,
+            Some(vec![(Provider::Claude, CapabilityTier::Frontier)]),
+        );
+        let work = RemainingWorkSnapshot {
+            other_rungs_runnable: true,
+            max_difficulty: Some("high"),
+            ..RemainingWorkSnapshot::default()
+        };
+        let ticks = Cell::new(0u32);
+        let timing = WaitTiming {
+            stop_check_secs: 1,
+            probe_secs: 30,
+            status_secs: 60,
+        };
+        let outcome = wait_for_ask_ttl_inner(
+            15 * 60,
+            Path::new("/tmp"),
+            timing,
+            |_| {},
+            || {
+                let n = ticks.get();
+                ticks.set(n + 1);
+                if n == 0 {
+                    // Still asking (forbade / opt-out).
+                    AskPolicySlice {
+                        usage_policy: UsagePolicy {
+                            ask_ttl_minutes: 15,
+                            ..UsagePolicy::default()
+                        },
+                        tier_fallback: None,
+                    }
+                } else {
+                    // Operator wrote onLow:stop during the wait.
+                    AskPolicySlice {
+                        usage_policy: UsagePolicy {
+                            ask_ttl_minutes: 15,
+                            rules: vec![crate::loop_engine::quota::UsageRule {
+                                kind: Some("weekly_scoped".into()),
+                                id: None,
+                                when: None,
+                                on_low: OnLowAction::Stop,
+                            }],
+                            ..UsagePolicy::default()
+                        },
+                        tier_fallback: None,
+                    }
+                }
+            },
+            &work,
+            std::slice::from_ref(&frontier),
+            15,
+            false,
+        );
+        assert_eq!(outcome, AskWaitOutcome::HorizonStop);
+        assert_ne!(outcome, AskWaitOutcome::Stopped);
+        assert!(
+            ticks.get() >= 2,
+            "must re-eval usagePolicy on stop-check before HorizonStop"
+        );
+    }
+
+    #[test]
     fn ask_wait_timeout_forbade_defers() {
+        let frontier = pct_bucket(
+            "weekly_scoped",
+            "weekly_scoped",
+            5.0,
+            6 * 24 * 3600,
+            Some(vec![(Provider::Claude, CapabilityTier::Frontier)]),
+        );
         let work = RemainingWorkSnapshot {
             other_rungs_runnable: true,
             max_difficulty: Some("high"),
@@ -4144,9 +4331,76 @@ mod tests {
                 tier_fallback: None,
             },
             &work,
+            std::slice::from_ref(&frontier),
+            15,
             false,
         );
         assert_eq!(outcome, AskWaitOutcome::Defer);
+    }
+
+    #[test]
+    fn execute_ask_ttl_mid_on_low_stop_returns_horizon_stopped() {
+        // Injected WaitFn + re-eval seam: after the wait, onLow:stop → HorizonStopped
+        // (not StopSignaled). WaitFn stays Fn(u64).
+        use std::cell::RefCell;
+        let frontier = pct_bucket(
+            "weekly_scoped",
+            "weekly_scoped",
+            5.0,
+            6 * 24 * 3600,
+            Some(vec![(Provider::Claude, CapabilityTier::Frontier)]),
+        );
+        let policy = UsagePolicy {
+            ask_ttl_minutes: 15,
+            ..UsagePolicy::default()
+        };
+        let work = RemainingWorkSnapshot {
+            other_rungs_runnable: true,
+            max_difficulty: Some("high"),
+            ..RemainingWorkSnapshot::default()
+        };
+        let waited = RefCell::new(Vec::<u64>::new());
+        let wait = |secs: u64| {
+            waited.borrow_mut().push(secs);
+            true
+        };
+        let reeval = || AskPolicySlice {
+            usage_policy: UsagePolicy {
+                ask_ttl_minutes: 15,
+                rules: vec![crate::loop_engine::quota::UsageRule {
+                    kind: Some("weekly_scoped".into()),
+                    id: None,
+                    when: None,
+                    on_low: OnLowAction::Stop,
+                }],
+                ..UsagePolicy::default()
+            },
+            tier_fallback: None,
+        };
+        let mut set = HashMap::new();
+        let result = account_quota_preflight_inner(
+            QuotaPreflightParams {
+                threshold: 8,
+                tasks_dir: Path::new("/tmp"),
+                db_dir: Path::new("/tmp"),
+                fallback_wait: 300,
+                ask_ttl_override: None,
+                policy: &policy,
+                tier_fallback: None, // ask opt-out → Ask {15}
+                execute_account_action: true,
+                unavailable_rungs: &mut set,
+                work: &work,
+                buckets: Some(std::slice::from_ref(&frontier)),
+                account_remaining: Some(76.0),
+                account_reset_at: None,
+                models: crate::loop_engine::model::builtin_resolved_models(),
+                ask_policy_reeval: Some(&reeval),
+            },
+            &wait,
+        );
+        assert_eq!(result, UsageCheckResult::HorizonStopped);
+        assert_ne!(result, UsageCheckResult::StopSignaled);
+        assert_eq!(*waited.borrow(), vec![900]);
     }
 
     #[test]
