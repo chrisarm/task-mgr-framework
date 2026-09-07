@@ -848,6 +848,16 @@ impl ResolvedModelsConfig {
     pub fn is_provider_enabled(&self, provider: Provider) -> bool {
         self.providers.get(&provider).is_some_and(|p| p.enabled)
     }
+
+    /// Exact configured model for a *defined* rung — no sparse-ladder clamp.
+    ///
+    /// Returns `None` when the provider is absent, the tier key is undefined, or
+    /// the rung is defined as JSON `null` (route with no model flag). Quota
+    /// ingest extra-mark uses this so an undefined frontier cannot inherit the
+    /// standard model via [`Self::model_for`] clamping (PR-1 pin hole).
+    pub fn exact_model_for(&self, provider: Provider, tier: CapabilityTier) -> Option<&str> {
+        self.providers.get(&provider)?.tiers.get(&tier)?.as_deref()
+    }
 }
 
 // ============================================================================

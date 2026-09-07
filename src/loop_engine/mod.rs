@@ -33,6 +33,7 @@ pub mod project_config;
 pub mod prompt;
 pub mod prompt_sections;
 pub(crate) mod protected_state;
+pub mod quota;
 pub mod reactions;
 pub(crate) mod recovery;
 pub mod runner;

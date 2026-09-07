@@ -15,6 +15,9 @@
 //! It returns per-window utilization + `resets_at` for the 5-hour session and
 //! weekly buckets. The older org usage endpoint is kept as a fallback.
 
+use crate::loop_engine::model::{CapabilityTier, Provider, ResolvedModelsConfig};
+use crate::loop_engine::quota::{Measurement, MeasurementUnit, QuotaBucket};
+
 /// Claude Code OAuth usage endpoint (matches `/usage` HUD).
 const OAUTH_USAGE_API_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 
@@ -240,6 +243,309 @@ struct UsageWindow {
     /// Named `five_hour` or `limits[]` kind `session` — preferred when no
     /// account-binding window is ≥ the live gate threshold.
     is_session: bool,
+}
+
+/// Ingest every OAuth usage object sibling and `limits[]` row into generic
+/// [`QuotaBucket`]s (PR-2 / FR-003).
+///
+/// Walks **all** object siblings with `utilization` or `dollars` — no
+/// window-name allow-list. Null / non-object siblings are skipped. Malformed
+/// rows (no usable measurement) are skipped without panicking.
+///
+/// Rung mapping (Claude OAuth HUD only):
+/// 1. `scope.model.display_name` / `id` via HUD label table (case-insensitive
+///    prefix/token): Fable→frontier, Opus→standard, Sonnet→cost-efficient,
+///    Haiku→cheapest.
+/// 2. Else unlabeled ids: family token as substring of a *defined* configured
+///    model string (`exact_model_for`, no clamp).
+/// 3. After a HUD map to rung R, extra-mark every defined rung whose configured
+///    model string equals R's (string equality — not substring `tier_of`).
+///
+/// Does **not** change [`parse_oauth_usage_json_with_threshold`] (PR-1 fold stays
+/// account-binding / threshold-only until FEAT-004).
+pub fn ingest_oauth_value(
+    json: &serde_json::Value,
+    models: &ResolvedModelsConfig,
+) -> Vec<QuotaBucket> {
+    let mut out = Vec::new();
+
+    if let Some(obj) = json.as_object() {
+        for (key, value) in obj {
+            if key == "limits" {
+                continue;
+            }
+            if value.is_null() || !value.is_object() {
+                continue;
+            }
+            if let Some(bucket) = ingest_named_sibling(key, value, models) {
+                out.push(bucket);
+            }
+        }
+    }
+
+    if let Some(limits) = json.get("limits").and_then(|v| v.as_array()) {
+        for (idx, limit) in limits.iter().enumerate() {
+            if limit.is_null() || !limit.is_object() {
+                continue;
+            }
+            if let Some(bucket) = ingest_limits_row(idx, limit, models) {
+                out.push(bucket);
+            }
+        }
+    }
+
+    out
+}
+
+fn ingest_named_sibling(
+    key: &str,
+    value: &serde_json::Value,
+    models: &ResolvedModelsConfig,
+) -> Option<QuotaBucket> {
+    let measurements = measurements_from_object(value)?;
+    let kind = kind_for_named_key(key);
+    let resets_at = value
+        .get("resets_at")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let severity = value
+        .get("severity")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let is_active = value.get("is_active").and_then(|v| v.as_bool());
+
+    // Named siblings rarely carry scope.model; map via id family token when
+    // the kind is rung-scoped (seven_day_*), else leave account-binding.
+    let rungs = if kind == "weekly_scoped" || looks_rung_scoped_key(key) {
+        let token = family_token_from_id(key);
+        let mapped = map_unlabeled_token(models, Provider::Claude, &token);
+        if mapped.is_empty() {
+            None
+        } else {
+            Some(mapped)
+        }
+    } else {
+        None
+    };
+
+    Some(QuotaBucket {
+        id: key.to_string(),
+        kind,
+        label: String::new(),
+        measurements,
+        resets_at,
+        severity,
+        is_active,
+        rungs,
+    })
+}
+
+fn ingest_limits_row(
+    idx: usize,
+    limit: &serde_json::Value,
+    models: &ResolvedModelsConfig,
+) -> Option<QuotaBucket> {
+    let kind = limit
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let measurements = measurements_from_limit(limit)?;
+    let resets_at = limit
+        .get("resets_at")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let severity = limit
+        .get("severity")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let is_active = limit.get("is_active").and_then(|v| v.as_bool());
+
+    let model_obj = limit.get("scope").and_then(|s| s.get("model"));
+    let display_name = model_obj
+        .and_then(|m| m.get("display_name"))
+        .and_then(|v| v.as_str());
+    let model_id = model_obj.and_then(|m| m.get("id")).and_then(|v| v.as_str());
+
+    let label = display_name.unwrap_or("").to_string();
+    let id = if kind.is_empty() {
+        format!("limits[{idx}]")
+    } else {
+        format!("limits[{idx}].{kind}")
+    };
+
+    let rungs = map_scope_to_rungs(models, Provider::Claude, display_name, model_id);
+
+    Some(QuotaBucket {
+        id,
+        kind: if kind.is_empty() {
+            "unknown".into()
+        } else {
+            kind
+        },
+        label,
+        measurements,
+        resets_at,
+        severity,
+        is_active,
+        rungs,
+    })
+}
+
+fn measurements_from_object(value: &serde_json::Value) -> Option<Vec<Measurement>> {
+    let mut out = Vec::new();
+    if let Some(util) = value.get("utilization").and_then(json_number_as_f64) {
+        out.push(Measurement {
+            remaining: (100.0 - util).clamp(0.0, 100.0),
+            unit: MeasurementUnit::Percent,
+        });
+    }
+    if let Some(dollars) = value.get("dollars").and_then(json_number_as_f64) {
+        out.push(Measurement {
+            remaining: dollars,
+            unit: MeasurementUnit::Dollars,
+        });
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+fn measurements_from_limit(limit: &serde_json::Value) -> Option<Vec<Measurement>> {
+    let mut out = Vec::new();
+    if let Some(percent) = limit.get("percent").and_then(json_number_as_f64) {
+        out.push(Measurement {
+            remaining: (100.0 - percent).clamp(0.0, 100.0),
+            unit: MeasurementUnit::Percent,
+        });
+    } else if let Some(util) = limit.get("utilization").and_then(json_number_as_f64) {
+        out.push(Measurement {
+            remaining: (100.0 - util).clamp(0.0, 100.0),
+            unit: MeasurementUnit::Percent,
+        });
+    }
+    if let Some(dollars) = limit.get("dollars").and_then(json_number_as_f64) {
+        out.push(Measurement {
+            remaining: dollars,
+            unit: MeasurementUnit::Dollars,
+        });
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+fn json_number_as_f64(v: &serde_json::Value) -> Option<f64> {
+    v.as_f64()
+        .or_else(|| v.as_u64().map(|u| u as f64))
+        .or_else(|| v.as_i64().map(|i| i as f64))
+}
+
+fn kind_for_named_key(key: &str) -> String {
+    match key {
+        "five_hour" => "session".into(),
+        "seven_day" => "weekly_all".into(),
+        _ if looks_rung_scoped_key(key) => "weekly_scoped".into(),
+        _ => key.to_string(),
+    }
+}
+
+fn looks_rung_scoped_key(key: &str) -> bool {
+    key.starts_with("seven_day_")
+}
+
+fn family_token_from_id(id: &str) -> String {
+    id.rsplit('_').next().unwrap_or(id).to_ascii_lowercase()
+}
+
+/// HUD label table: case-insensitive prefix/token → capability tier.
+/// Tokens live only in this ingest adapter — never in `quota.rs`.
+fn hud_tier_from_label(label: &str) -> Option<CapabilityTier> {
+    let lower = label.to_ascii_lowercase();
+    let tokens: Vec<&str> = lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    let hit = |needle: &str| tokens.contains(&needle) || lower.starts_with(needle);
+    if hit("fable") {
+        Some(CapabilityTier::Frontier)
+    } else if hit("opus") {
+        Some(CapabilityTier::Standard)
+    } else if hit("sonnet") {
+        Some(CapabilityTier::CostEfficient)
+    } else if hit("haiku") {
+        Some(CapabilityTier::Cheapest)
+    } else {
+        None
+    }
+}
+
+fn map_scope_to_rungs(
+    models: &ResolvedModelsConfig,
+    provider: Provider,
+    display_name: Option<&str>,
+    model_id: Option<&str>,
+) -> Option<Vec<(Provider, CapabilityTier)>> {
+    if let Some(name) = display_name
+        && let Some(tier) = hud_tier_from_label(name)
+    {
+        return Some(extra_mark_rungs(models, provider, tier));
+    }
+    if let Some(id) = model_id {
+        if let Some(tier) = hud_tier_from_label(id) {
+            return Some(extra_mark_rungs(models, provider, tier));
+        }
+        // Unlabeled id: family-token substring against configured model strings.
+        let token = family_token_from_id(id);
+        let mapped = map_unlabeled_token(models, provider, &token);
+        if !mapped.is_empty() {
+            return Some(mapped);
+        }
+    }
+    None
+}
+
+/// After HUD maps to rung R, also mark every defined rung whose configured
+/// model string equals R's (exact string equality, no clamp / no tier_of).
+fn extra_mark_rungs(
+    models: &ResolvedModelsConfig,
+    provider: Provider,
+    primary: CapabilityTier,
+) -> Vec<(Provider, CapabilityTier)> {
+    let mut out = vec![(provider, primary)];
+    let Some(primary_model) = models.exact_model_for(provider, primary) else {
+        return out;
+    };
+    for tier in CapabilityTier::ALL {
+        if tier == primary {
+            continue;
+        }
+        if models.exact_model_for(provider, tier) == Some(primary_model) {
+            out.push((provider, tier));
+        }
+    }
+    out.sort_by_key(|(_, t)| *t);
+    out.dedup();
+    out
+}
+
+fn map_unlabeled_token(
+    models: &ResolvedModelsConfig,
+    provider: Provider,
+    token: &str,
+) -> Vec<(Provider, CapabilityTier)> {
+    if token.is_empty() {
+        return Vec::new();
+    }
+    let token_l = token.to_ascii_lowercase();
+    let mut out = Vec::new();
+    for tier in CapabilityTier::ALL {
+        if let Some(model) = models.exact_model_for(provider, tier)
+            && model.to_ascii_lowercase().contains(&token_l)
+        {
+            out.push((provider, tier));
+        }
+    }
+    out.sort_by_key(|(_, t)| *t);
+    out.dedup();
+    out
 }
 
 /// Parse the Claude Code OAuth usage JSON into [`UsageInfo`] using the default
@@ -1252,5 +1558,268 @@ mod tests {
             usage_pct < f64::from(threshold),
             "100% usage should be below u8::MAX threshold"
         );
+    }
+
+    // --- ingest_oauth_value (PR-2 / FEAT-003) ---
+
+    fn builtin_models() -> ResolvedModelsConfig {
+        use crate::loop_engine::project_config::{ModelsConfig, RoutingConfig};
+        crate::loop_engine::model::resolve_models_config(
+            &ModelsConfig::builtin_default(),
+            &RoutingConfig::default(),
+        )
+    }
+
+    fn models_with_frontier_pinned_to_standard() -> ResolvedModelsConfig {
+        use crate::loop_engine::model::{
+            FABLE_MODEL, HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL, resolve_models_config,
+        };
+        use crate::loop_engine::project_config::{ModelsConfig, ProviderConfig, RoutingConfig};
+        use std::collections::HashMap;
+
+        let mut providers = HashMap::new();
+        providers.insert(
+            Provider::Claude.as_str().to_string(),
+            ProviderConfig {
+                enabled: true,
+                tiers: [
+                    (CapabilityTier::Cheapest, Some(HAIKU_MODEL)),
+                    (CapabilityTier::CostEfficient, Some(SONNET_MODEL)),
+                    (CapabilityTier::Standard, Some(OPUS_MODEL)),
+                    // PR-1 pin: frontier shares the standard model string.
+                    (CapabilityTier::Frontier, Some(OPUS_MODEL)),
+                ]
+                .into_iter()
+                .map(|(t, m)| (t.as_str().to_string(), m.map(str::to_string)))
+                .collect(),
+                effort: HashMap::new(),
+                fallback: None,
+                cli_binary: None,
+            },
+        );
+        // Keep FABLE_MODEL referenced so the pin contrast is explicit in review.
+        let _ = FABLE_MODEL;
+        let models = ModelsConfig {
+            primary_provider: Provider::Claude.as_str().to_string(),
+            anchor: CapabilityTier::Standard.as_str().to_string(),
+            providers,
+        };
+        resolve_models_config(&models, &RoutingConfig::default())
+    }
+
+    fn live_shaped_oauth_json() -> serde_json::Value {
+        serde_json::json!({
+            "five_hour": {
+                "utilization": 24.0,
+                "resets_at": "2026-09-07T06:00:00Z"
+            },
+            "seven_day": {
+                "utilization": 55.0,
+                "resets_at": "2026-09-12T19:00:00Z"
+            },
+            "seven_day_opus": {
+                "utilization": 100.0,
+                "resets_at": "2026-09-12T19:00:00Z"
+            },
+            "seven_day_sonnet": {
+                "utilization": 100.0,
+                "resets_at": "2026-09-12T19:00:00Z"
+            },
+            "nimbus_quill": {
+                "utilization": 100.0,
+                "resets_at": "2026-09-12T19:00:00Z"
+            },
+            "spend": {
+                "dollars": 12.5
+            },
+            "null_window": null,
+            "limits": [
+                {
+                    "kind": "session",
+                    "percent": 24,
+                    "severity": "normal",
+                    "resets_at": "2026-09-07T06:00:00Z",
+                    "is_active": true
+                },
+                {
+                    "kind": "weekly_all",
+                    "percent": 55.0,
+                    "severity": "normal",
+                    "resets_at": "2026-09-12T19:00:00Z",
+                    "is_active": false
+                },
+                {
+                    "kind": "weekly_scoped",
+                    "percent": 95,
+                    "severity": "critical",
+                    "is_active": true,
+                    "resets_at": "2026-09-12T19:00:00Z",
+                    "scope": {
+                        "model": { "display_name": "Fable" }
+                    }
+                }
+            ]
+        })
+    }
+
+    fn bucket_by_id<'a>(buckets: &'a [QuotaBucket], id: &str) -> &'a QuotaBucket {
+        buckets
+            .iter()
+            .find(|b| b.id == id)
+            .unwrap_or_else(|| panic!("missing bucket id {id}"))
+    }
+
+    fn percent_of(bucket: &QuotaBucket) -> f64 {
+        bucket
+            .measurements
+            .iter()
+            .find(|m| m.unit == MeasurementUnit::Percent)
+            .map(|m| m.remaining)
+            .expect("percent measurement")
+    }
+
+    #[test]
+    fn ingest_live_fixture_emits_all_siblings_and_limits() {
+        let models = builtin_models();
+        let buckets = ingest_oauth_value(&live_shaped_oauth_json(), &models);
+
+        let ids: Vec<&str> = buckets.iter().map(|b| b.id.as_str()).collect();
+        for expected in [
+            "five_hour",
+            "seven_day",
+            "seven_day_opus",
+            "seven_day_sonnet",
+            "nimbus_quill",
+            "spend",
+            "limits[0].session",
+            "limits[1].weekly_all",
+            "limits[2].weekly_scoped",
+        ] {
+            assert!(ids.contains(&expected), "expected {expected} in {ids:?}");
+        }
+        assert!(
+            !ids.iter().any(|id| id.contains("null_window")),
+            "null siblings must skip"
+        );
+
+        assert!((percent_of(bucket_by_id(&buckets, "five_hour")) - 76.0).abs() < f64::EPSILON);
+        assert!((percent_of(bucket_by_id(&buckets, "seven_day")) - 45.0).abs() < f64::EPSILON);
+        assert!(
+            (percent_of(bucket_by_id(&buckets, "limits[2].weekly_scoped")) - 5.0).abs()
+                < f64::EPSILON
+        );
+
+        let spend = bucket_by_id(&buckets, "spend");
+        assert_eq!(spend.kind, "spend");
+        assert!(spend.measurements.iter().any(
+            |m| m.unit == MeasurementUnit::Dollars && (m.remaining - 12.5).abs() < f64::EPSILON
+        ));
+
+        // Account-binding named windows have no rungs.
+        assert!(bucket_by_id(&buckets, "five_hour").rungs.is_none());
+        assert!(bucket_by_id(&buckets, "seven_day").rungs.is_none());
+
+        // Fable HUD → frontier only under default ladder (no pin).
+        let fable = bucket_by_id(&buckets, "limits[2].weekly_scoped");
+        assert_eq!(
+            fable.rungs.as_deref(),
+            Some(&[(Provider::Claude, CapabilityTier::Frontier)][..])
+        );
+        assert_eq!(fable.severity.as_deref(), Some("critical"));
+        assert_eq!(fable.is_active, Some(true));
+
+        // Unlabeled seven_day_opus / sonnet via configured model substring.
+        let opus = bucket_by_id(&buckets, "seven_day_opus");
+        assert_eq!(opus.kind, "weekly_scoped");
+        assert_eq!(
+            opus.rungs.as_deref(),
+            Some(&[(Provider::Claude, CapabilityTier::Standard)][..])
+        );
+        let sonnet = bucket_by_id(&buckets, "seven_day_sonnet");
+        assert_eq!(
+            sonnet.rungs.as_deref(),
+            Some(&[(Provider::Claude, CapabilityTier::CostEfficient)][..])
+        );
+
+        // Unknown family → no rungs (evaluate ignores under default policy).
+        assert!(bucket_by_id(&buckets, "nimbus_quill").rungs.is_none());
+    }
+
+    #[test]
+    fn ingest_extra_mark_after_frontier_pin_marks_standard_and_frontier() {
+        let models = models_with_frontier_pinned_to_standard();
+        let json = serde_json::json!({
+            "limits": [{
+                "kind": "weekly_scoped",
+                "percent": 95,
+                "scope": { "model": { "display_name": "Opus" } }
+            }]
+        });
+        let buckets = ingest_oauth_value(&json, &models);
+        let b = bucket_by_id(&buckets, "limits[0].weekly_scoped");
+        let rungs = b.rungs.as_ref().expect("Opus HUD must map rungs");
+        assert!(
+            rungs.contains(&(Provider::Claude, CapabilityTier::Standard)),
+            "HUD Opus → standard; got {rungs:?}"
+        );
+        assert!(
+            rungs.contains(&(Provider::Claude, CapabilityTier::Frontier)),
+            "extra-mark must also mark frontier when it shares the standard model string; got {rungs:?}"
+        );
+    }
+
+    #[test]
+    fn ingest_hud_only_without_pin_leaves_frontier_unmarked_on_opus() {
+        let models = builtin_models();
+        let json = serde_json::json!({
+            "limits": [{
+                "kind": "weekly_scoped",
+                "percent": 95,
+                "scope": { "model": { "display_name": "Current week (Opus)" } }
+            }]
+        });
+        let buckets = ingest_oauth_value(&json, &models);
+        let b = bucket_by_id(&buckets, "limits[0].weekly_scoped");
+        assert_eq!(
+            b.rungs.as_deref(),
+            Some(&[(Provider::Claude, CapabilityTier::Standard)][..]),
+            "HUD-only Opus must NOT mark frontier without the pin"
+        );
+    }
+
+    #[test]
+    fn ingest_skips_malformed_and_accepts_u64_or_f64_percent() {
+        let models = builtin_models();
+        let json = serde_json::json!({
+            "five_hour": { "utilization": 10.0 },
+            "broken": { "nope": true },
+            "limits": [
+                { "kind": "session", "percent": 10 },
+                { "kind": "weekly_all", "percent": 20.5 },
+                { "kind": "weekly_scoped" },
+                null
+            ]
+        });
+        let buckets = ingest_oauth_value(&json, &models);
+        let ids: Vec<&str> = buckets.iter().map(|b| b.id.as_str()).collect();
+        assert!(ids.contains(&"five_hour"));
+        assert!(ids.contains(&"limits[0].session"));
+        assert!(ids.contains(&"limits[1].weekly_all"));
+        assert!(!ids.contains(&"broken"));
+        assert!(!ids.iter().any(|id| id.contains("weekly_scoped")));
+        assert!(
+            (percent_of(bucket_by_id(&buckets, "limits[0].session")) - 90.0).abs() < f64::EPSILON
+        );
+        assert!(
+            (percent_of(bucket_by_id(&buckets, "limits[1].weekly_all")) - 79.5).abs()
+                < f64::EPSILON
+        );
+    }
+
+    #[test]
+    fn parse_oauth_usage_json_signature_stays_threshold_only() {
+        // Compile-time guard: PR-1 fold must not grow a models param.
+        let _f: fn(&serde_json::Value, f64) -> Option<UsageInfo> =
+            parse_oauth_usage_json_with_threshold;
     }
 }
