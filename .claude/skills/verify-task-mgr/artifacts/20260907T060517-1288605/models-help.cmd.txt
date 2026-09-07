@@ -1,1 +1,0 @@
-task-mgr --dir /tmp/task-mgr-verify-20260907T060517-1288605/project/.task-mgr models --help
