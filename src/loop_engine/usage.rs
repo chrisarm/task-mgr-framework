@@ -31,20 +31,30 @@ const OAUTH_USAGE_USER_AGENT_FALLBACK: &str = "claude-code/unknown";
 /// Legacy org-level usage endpoint (API-key / org accounts).
 const ORG_USAGE_API_URL: &str = "https://api.anthropic.com/v1/organizations/usage";
 
+/// Default used-percent threshold for selecting `reset_at` among account-binding
+/// windows. Matches `LoopConfig::usage_threshold` default (92). `load_usage_info`
+/// has no live threshold; `check_and_wait` still applies the configured value to
+/// `percentage`.
+const DEFAULT_USAGE_THRESHOLD: f64 = 92.0;
+
 /// Usage information returned from the API.
 #[derive(Debug, Clone)]
 pub struct UsageInfo {
-    /// Current usage as a percentage (0.0 - 100.0).
+    /// Current usage as a percentage (0.0 - 100.0) of **used** quota.
     ///
-    /// For the OAuth endpoint: **max** utilization across known time windows
-    /// (session five-hour, weekly, `limits[]`) so the pre-iteration gate
-    /// fires when *any* window is near capacity.
+    /// For the OAuth endpoint: **max used** across account-binding windows only
+    /// (named `five_hour` / `seven_day`, plus `limits[]` with `kind` `session`
+    /// or `weekly_all`). Rung-scoped windows (`seven_day_opus` /
+    /// `seven_day_sonnet`, `limits[].kind = weekly_scoped`) are omitted so a
+    /// frontier-only bucket cannot park the account gate.
     pub percentage: f64,
     /// ISO 8601 reset timestamp for waiting, if available.
     ///
-    /// For the OAuth endpoint: soonest `resets_at` among **exhausted** windows
-    /// (util ≥ 100 or severity critical); if none exhausted, prefer
-    /// `five_hour.resets_at`, else soonest any window.
+    /// For the OAuth endpoint: **latest** `resets_at` among account-binding
+    /// windows whose used percent is ≥ [`DEFAULT_USAGE_THRESHOLD`] (92); if
+    /// none are gate-relevant, prefer the session window (`five_hour` or
+    /// `limits[]` kind `session`), else any account-binding reset. Not the
+    /// soonest exhausted / severity-critical timestamp across all windows.
     pub reset_at: Option<String>,
 }
 
@@ -193,34 +203,35 @@ fn fetch_org_usage(access_token: &str) -> Option<UsageInfo> {
     parse_org_usage_json(&json)
 }
 
-/// One utilization window extracted from the OAuth usage payload.
+/// One account-binding utilization window from the OAuth usage payload.
 struct UsageWindow {
     util: f64,
     reset: Option<String>,
-    /// util ≥ 100, or `limits[].severity == "critical"`, or percent ≥ 100.
-    exhausted: bool,
-    /// Named `five_hour` bucket (session) — preferred when nothing is exhausted.
-    is_five_hour: bool,
+    /// Named `five_hour` or `limits[]` kind `session` — preferred when no
+    /// account-binding window is ≥ [`DEFAULT_USAGE_THRESHOLD`].
+    is_session: bool,
 }
 
 /// Parse the Claude Code OAuth usage JSON into [`UsageInfo`].
 ///
-/// Hybrid semantics (plan v2):
-/// - **percentage** = max utilization across all known time windows
-/// - **reset_at** = soonest among *exhausted* windows; if none, prefer
-///   `five_hour.resets_at`; else soonest any
+/// Account-binding fold (PR-1 / FR-001):
+/// - **percentage** = max **used** (0–100) across account-binding windows only:
+///   named `five_hour` / `seven_day`, plus `limits[]` with `kind` `session` or
+///   `weekly_all`. Named `seven_day_opus` / `seven_day_sonnet` and
+///   `limits[]` kinds `weekly_scoped` / `extra_usage` / `promotional` are
+///   skipped. `severity` / `is_active` are display hints and do not enter the
+///   fold.
+/// - **reset_at** = latest among those windows with used ≥
+///   [`DEFAULT_USAGE_THRESHOLD`] (92); if none, prefer session; else any
+///   account-binding reset. Gate-relevant means used ≥ threshold — not
+///   util ≥ 100 or `severity=critical`.
 ///
 /// Pure / unit-testable — no I/O.
 pub(crate) fn parse_oauth_usage_json(json: &serde_json::Value) -> Option<UsageInfo> {
     let mut windows: Vec<UsageWindow> = Vec::new();
 
-    // Named buckets Claude Code exposes.
-    for key in [
-        "five_hour",
-        "seven_day",
-        "seven_day_opus",
-        "seven_day_sonnet",
-    ] {
+    // Account-binding named buckets only (not seven_day_opus / seven_day_sonnet).
+    for key in ["five_hour", "seven_day"] {
         if let Some(bucket) = json.get(key)
             && let Some(util) = bucket_utilization(bucket)
         {
@@ -231,15 +242,18 @@ pub(crate) fn parse_oauth_usage_json(json: &serde_json::Value) -> Option<UsageIn
             windows.push(UsageWindow {
                 util,
                 reset,
-                exhausted: util >= 100.0,
-                is_five_hour: key == "five_hour",
+                is_session: key == "five_hour",
             });
         }
     }
 
-    // Structured limits array (severity / percent / kind).
+    // Structured limits: only session / weekly_all (skip weekly_scoped etc.).
     if let Some(limits) = json.get("limits").and_then(|v| v.as_array()) {
         for limit in limits {
+            let kind = limit.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+            if kind != "session" && kind != "weekly_all" {
+                continue;
+            }
             let percent = limit.get("percent").and_then(|v| v.as_f64()).or_else(|| {
                 limit
                     .get("percent")
@@ -253,15 +267,10 @@ pub(crate) fn parse_oauth_usage_json(json: &serde_json::Value) -> Option<UsageIn
                 .get("resets_at")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
-            let critical = limit
-                .get("severity")
-                .and_then(|v| v.as_str())
-                .is_some_and(|s| s.eq_ignore_ascii_case("critical"));
             windows.push(UsageWindow {
                 util: p,
                 reset,
-                exhausted: p >= 100.0 || critical,
-                is_five_hour: false,
+                is_session: kind == "session",
             });
         }
     }
@@ -273,14 +282,19 @@ pub(crate) fn parse_oauth_usage_json(json: &serde_json::Value) -> Option<UsageIn
 
     let percentage = windows.iter().map(|w| w.util).fold(0.0_f64, f64::max);
 
-    let reset_at = soonest_reset(windows.iter().filter(|w| w.exhausted).map(|w| &w.reset))
-        .or_else(|| {
-            windows
-                .iter()
-                .find(|w| w.is_five_hour)
-                .and_then(|w| w.reset.clone())
-        })
-        .or_else(|| soonest_reset(windows.iter().map(|w| &w.reset)));
+    let reset_at = latest_reset(
+        windows
+            .iter()
+            .filter(|w| w.util >= DEFAULT_USAGE_THRESHOLD)
+            .map(|w| &w.reset),
+    )
+    .or_else(|| {
+        windows
+            .iter()
+            .find(|w| w.is_session)
+            .and_then(|w| w.reset.clone())
+    })
+    .or_else(|| soonest_reset(windows.iter().map(|w| &w.reset)));
 
     Some(UsageInfo {
         percentage,
@@ -295,22 +309,40 @@ fn bucket_utilization(bucket: &serde_json::Value) -> Option<f64> {
     bucket.get("utilization")?.as_f64()
 }
 
+fn parse_reset_timestamp(reset: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(reset)
+        .ok()
+        .map(|dt| dt.timestamp())
+        .or_else(|| {
+            chrono::NaiveDateTime::parse_from_str(reset, "%Y-%m-%dT%H:%M:%S")
+                .ok()
+                .map(|dt| dt.and_utc().timestamp())
+        })
+}
+
 /// Pick the chronologically soonest ISO-8601 reset timestamp from an iterator
 /// of optional strings. Invalid / unparseable timestamps are skipped.
 fn soonest_reset<'a>(resets: impl Iterator<Item = &'a Option<String>>) -> Option<String> {
     let mut best: Option<(i64, String)> = None;
     for reset in resets.flatten() {
-        let ts = chrono::DateTime::parse_from_rfc3339(reset)
-            .ok()
-            .map(|dt| dt.timestamp())
-            .or_else(|| {
-                chrono::NaiveDateTime::parse_from_str(reset, "%Y-%m-%dT%H:%M:%S")
-                    .ok()
-                    .map(|dt| dt.and_utc().timestamp())
-            });
-        if let Some(ts) = ts {
+        if let Some(ts) = parse_reset_timestamp(reset) {
             match &best {
                 Some((best_ts, _)) if ts >= *best_ts => {}
+                _ => best = Some((ts, reset.clone())),
+            }
+        }
+    }
+    best.map(|(_, s)| s)
+}
+
+/// Pick the chronologically latest ISO-8601 reset timestamp (for gate-relevant
+/// account-binding windows). Invalid / unparseable timestamps are skipped.
+fn latest_reset<'a>(resets: impl Iterator<Item = &'a Option<String>>) -> Option<String> {
+    let mut best: Option<(i64, String)> = None;
+    for reset in resets.flatten() {
+        if let Some(ts) = parse_reset_timestamp(reset) {
+            match &best {
+                Some((best_ts, _)) if ts <= *best_ts => {}
                 _ => best = Some((ts, reset.clone())),
             }
         }
@@ -570,6 +602,234 @@ mod tests {
             Some("2026-08-06T01:00:00Z"),
             "when nothing exhausted, prefer five_hour.resets_at"
         );
+    }
+
+    #[test]
+    fn test_parse_oauth_usage_live_fixture_ignores_scoped_and_named_rungs() {
+        // Production-shaped HUD: session 24%, weekly-all 55%, Fable weekly_scoped
+        // 95% critical + named opus/sonnet 100. Account fold must be max(24,55)=55
+        // with session reset — 55 < default threshold 92 ⇒ BelowThreshold.
+        let json = serde_json::json!({
+            "five_hour": {
+                "utilization": 24.0,
+                "resets_at": "2026-09-07T06:00:00Z"
+            },
+            "seven_day": {
+                "utilization": 55.0,
+                "resets_at": "2026-09-12T19:00:00Z"
+            },
+            "seven_day_opus": {
+                "utilization": 100.0,
+                "resets_at": "2026-09-12T19:00:00Z"
+            },
+            "seven_day_sonnet": {
+                "utilization": 100.0,
+                "resets_at": "2026-09-12T19:00:00Z"
+            },
+            "limits": [
+                {
+                    "kind": "session",
+                    "percent": 24,
+                    "severity": "normal",
+                    "resets_at": "2026-09-07T06:00:00Z",
+                    "is_active": true
+                },
+                {
+                    "kind": "weekly_all",
+                    "percent": 55,
+                    "severity": "normal",
+                    "resets_at": "2026-09-12T19:00:00Z",
+                    "is_active": false
+                },
+                {
+                    "kind": "weekly_scoped",
+                    "percent": 95,
+                    "severity": "critical",
+                    "is_active": true,
+                    "resets_at": "2026-09-12T19:00:00Z",
+                    "scope": {
+                        "model": { "display_name": "Fable" }
+                    }
+                }
+            ]
+        });
+        let info = parse_oauth_usage_json(&json).expect("live fixture must parse");
+        assert!(
+            (info.percentage - 55.0).abs() < f64::EPSILON,
+            "account-binding max used is weekly-all 55, not Fable 95; got {}",
+            info.percentage
+        );
+        assert_eq!(
+            info.reset_at.as_deref(),
+            Some("2026-09-07T06:00:00Z"),
+            "nothing ≥ 92 → prefer session reset, not weekly Fable"
+        );
+        assert!(
+            info.percentage < DEFAULT_USAGE_THRESHOLD,
+            "55 < 92 implies check_and_wait would return BelowThreshold"
+        );
+    }
+
+    #[test]
+    fn test_parse_oauth_usage_weekly_all_100_still_gates() {
+        // Inverse of the live fixture: narrowing must not disable the real weekly gate.
+        let json = serde_json::json!({
+            "five_hour": {
+                "utilization": 20.0,
+                "resets_at": "2026-09-07T06:00:00Z"
+            },
+            "seven_day": {
+                "utilization": 100.0,
+                "resets_at": "2026-09-12T19:00:00Z"
+            },
+            "limits": [
+                {
+                    "kind": "session",
+                    "percent": 20,
+                    "severity": "normal",
+                    "resets_at": "2026-09-07T06:00:00Z",
+                    "is_active": true
+                },
+                {
+                    "kind": "weekly_all",
+                    "percent": 100,
+                    "severity": "critical",
+                    "resets_at": "2026-09-12T19:00:00Z",
+                    "is_active": true
+                }
+            ]
+        });
+        let info = parse_oauth_usage_json(&json).expect("must parse");
+        assert!((info.percentage - 100.0).abs() < f64::EPSILON);
+        assert_eq!(
+            info.reset_at.as_deref(),
+            Some("2026-09-12T19:00:00Z"),
+            "weekly_all 100 ≥ 92 → reset_at is weekly, not session"
+        );
+    }
+
+    #[test]
+    fn test_parse_oauth_usage_latest_among_gate_relevant() {
+        // Several account-binding windows ≥ 92 → latest timestamp, not soonest.
+        let json = serde_json::json!({
+            "five_hour": {
+                "utilization": 95.0,
+                "resets_at": "2026-09-07T08:00:00Z"
+            },
+            "seven_day": {
+                "utilization": 93.0,
+                "resets_at": "2026-09-13T19:00:00Z"
+            }
+        });
+        let info = parse_oauth_usage_json(&json).expect("must parse");
+        assert!((info.percentage - 95.0).abs() < f64::EPSILON);
+        assert_eq!(
+            info.reset_at.as_deref(),
+            Some("2026-09-13T19:00:00Z"),
+            "latest among ≥92 must win over soonest session reset"
+        );
+    }
+
+    #[test]
+    fn test_parse_oauth_usage_band_95_50_uses_weekly_reset() {
+        // Known-bad for exhausted=≥100: percentage would wait but reset_at would
+        // stay session. Gate-relevant (≥92) must pick weekly.
+        let json = serde_json::json!({
+            "five_hour": {
+                "utilization": 50.0,
+                "resets_at": "2026-09-07T06:00:00Z"
+            },
+            "seven_day": {
+                "utilization": 95.0,
+                "resets_at": "2026-09-12T19:00:00Z"
+            },
+            "limits": [
+                {
+                    "kind": "session",
+                    "percent": 50,
+                    "severity": "normal",
+                    "resets_at": "2026-09-07T06:00:00Z",
+                    "is_active": true
+                },
+                {
+                    "kind": "weekly_all",
+                    "percent": 95.0,
+                    "severity": "normal",
+                    "resets_at": "2026-09-12T19:00:00Z",
+                    "is_active": false
+                }
+            ]
+        });
+        let info = parse_oauth_usage_json(&json).expect("must parse");
+        assert!((info.percentage - 95.0).abs() < f64::EPSILON);
+        assert_eq!(
+            info.reset_at.as_deref(),
+            Some("2026-09-12T19:00:00Z"),
+            "95 ≥ 92 weekly must win; exhausted=≥100 would wrongly keep session"
+        );
+    }
+
+    #[test]
+    fn test_parse_oauth_usage_scoped_critical_does_not_exhaust() {
+        // severity=critical + is_active on weekly_scoped must not enter fold.
+        let json = serde_json::json!({
+            "five_hour": {
+                "utilization": 10.0,
+                "resets_at": "2026-09-07T06:00:00Z"
+            },
+            "seven_day": {
+                "utilization": 30.0,
+                "resets_at": "2026-09-12T19:00:00Z"
+            },
+            "limits": [
+                {
+                    "kind": "weekly_scoped",
+                    "percent": 99,
+                    "severity": "critical",
+                    "is_active": true,
+                    "resets_at": "2026-09-12T19:00:00Z",
+                    "scope": {
+                        "model": { "display_name": "Fable" }
+                    }
+                }
+            ]
+        });
+        let info = parse_oauth_usage_json(&json).expect("must parse");
+        assert!((info.percentage - 30.0).abs() < f64::EPSILON);
+        assert_eq!(
+            info.reset_at.as_deref(),
+            Some("2026-09-07T06:00:00Z"),
+            "scoped critical must not set reset_at or raise percentage"
+        );
+    }
+
+    #[test]
+    fn test_parse_oauth_usage_named_opus_sonnet_dropped() {
+        let json = serde_json::json!({
+            "five_hour": {
+                "utilization": 40.0,
+                "resets_at": "2026-09-07T06:00:00Z"
+            },
+            "seven_day": {
+                "utilization": 40.0,
+                "resets_at": "2026-09-12T19:00:00Z"
+            },
+            "seven_day_opus": {
+                "utilization": 100.0,
+                "resets_at": "2026-09-12T19:00:00Z"
+            },
+            "seven_day_sonnet": {
+                "utilization": 100.0,
+                "resets_at": "2026-09-12T19:00:00Z"
+            }
+        });
+        let info = parse_oauth_usage_json(&json).expect("must parse");
+        assert!(
+            (info.percentage - 40.0).abs() < f64::EPSILON,
+            "named opus/sonnet at 100 must not raise percentage; got {}",
+            info.percentage
+        );
+        assert_eq!(info.reset_at.as_deref(), Some("2026-09-07T06:00:00Z"));
     }
 
     #[test]
