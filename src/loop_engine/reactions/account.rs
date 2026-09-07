@@ -1534,7 +1534,7 @@ pub fn account_quota_preflight_inner(
     };
 
     if let Some(applied) = applied {
-        return execute_quota_account_action(&applied.account, fallback_wait, wait);
+        return execute_quota_account_action(&applied.account, wait);
     }
 
     // Org / no-buckets fallback: legacy remaining-percent gate.
@@ -1544,9 +1544,13 @@ pub fn account_quota_preflight_inner(
     if remaining > f64::from(threshold) {
         return UsageCheckResult::BelowThreshold;
     }
+    // None = unknown → fallback_wait; Some(0) = ready now (pass through).
     let wait_secs = account_reset_at
         .and_then(estimate_reset_seconds)
         .unwrap_or(fallback_wait);
+    if wait_secs == 0 {
+        return UsageCheckResult::BelowThreshold;
+    }
     if wait(wait_secs) {
         UsageCheckResult::WaitedAndReset
     } else {
@@ -1554,16 +1558,17 @@ pub fn account_quota_preflight_inner(
     }
 }
 
-fn execute_quota_account_action(
-    action: &QuotaAccountAction,
-    fallback_wait: u64,
-    wait: WaitFn<'_>,
-) -> UsageCheckResult {
+fn execute_quota_account_action(action: &QuotaAccountAction, wait: WaitFn<'_>) -> UsageCheckResult {
     match action {
         QuotaAccountAction::Proceed => UsageCheckResult::BelowThreshold,
         QuotaAccountAction::Wait { secs } => {
-            let secs = if *secs == 0 { fallback_wait } else { *secs };
-            if wait(secs) {
+            // secs==0 is ready-now (past/now reset). Do NOT treat as unknown
+            // and substitute fallback_wait (300s) — wait_for_usage_reset
+            // already treats 0 as immediate resume.
+            if *secs == 0 {
+                return UsageCheckResult::BelowThreshold;
+            }
+            if wait(*secs) {
                 UsageCheckResult::WaitedAndReset
             } else {
                 UsageCheckResult::StopSignaled
@@ -2840,6 +2845,144 @@ mod tests {
         // Forbade would ask, but nothing runnable + beyond horizon → Stop wins.
         let applied = apply_quota(&eval, &buckets, &policy, None, &work);
         assert_eq!(applied.account, QuotaAccountAction::Stop);
+    }
+
+    #[test]
+    fn execute_wait_zero_is_ready_now_not_fallback_300() {
+        // Evaluate emits reset_secs=0 for past/now; apply maps to Wait { 0 };
+        // execute must NOT substitute fallback_wait (300).
+        use std::cell::RefCell;
+        let session = pct_bucket("five_hour", "session", 5.0, -5, None);
+        let policy = UsagePolicy::default();
+        let fb = factory_fb();
+        let work = RemainingWorkSnapshot {
+            other_rungs_runnable: false,
+            ..RemainingWorkSnapshot::default()
+        };
+        let eval = evaluate_quota(std::slice::from_ref(&session), &policy, 8);
+        let applied = apply_quota(&eval, &[session.clone()], &policy, Some(&fb), &work);
+        assert_eq!(
+            applied.account,
+            QuotaAccountAction::Wait { secs: 0 },
+            "past/now reset must apply as Wait {{ 0 }}"
+        );
+
+        let waited = RefCell::new(Vec::<u64>::new());
+        let wait = |secs: u64| {
+            waited.borrow_mut().push(secs);
+            true
+        };
+        let mut set = HashSet::new();
+        let result = account_quota_preflight_inner(
+            QuotaPreflightParams {
+                threshold: 8,
+                tasks_dir: Path::new("/tmp"),
+                fallback_wait: 300,
+                policy: &policy,
+                tier_fallback: Some(&fb),
+                execute_account_action: true,
+                unavailable_rungs: &mut set,
+                work: &work,
+                buckets: Some(std::slice::from_ref(&session)),
+                account_remaining: Some(5.0),
+                account_reset_at: None,
+            },
+            &wait,
+        );
+        assert_eq!(
+            result,
+            UsageCheckResult::BelowThreshold,
+            "Wait {{ 0 }} must be ready-now / BelowThreshold, not a 300s sleep"
+        );
+        assert!(
+            waited.borrow().is_empty(),
+            "ready-now must not invoke wait (got {:?})",
+            waited.borrow()
+        );
+    }
+
+    #[test]
+    fn execute_wait_positive_secs_still_sleeps() {
+        use std::cell::RefCell;
+        let session = pct_bucket("five_hour", "session", 5.0, 120, None);
+        let policy = UsagePolicy::default();
+        let fb = factory_fb();
+        let work = RemainingWorkSnapshot {
+            other_rungs_runnable: false,
+            ..RemainingWorkSnapshot::default()
+        };
+        let waited = RefCell::new(Vec::<u64>::new());
+        let wait = |secs: u64| {
+            waited.borrow_mut().push(secs);
+            true
+        };
+        let mut set = HashSet::new();
+        let result = account_quota_preflight_inner(
+            QuotaPreflightParams {
+                threshold: 8,
+                tasks_dir: Path::new("/tmp"),
+                fallback_wait: 300,
+                policy: &policy,
+                tier_fallback: Some(&fb),
+                execute_account_action: true,
+                unavailable_rungs: &mut set,
+                work: &work,
+                buckets: Some(std::slice::from_ref(&session)),
+                account_remaining: Some(5.0),
+                account_reset_at: None,
+            },
+            &wait,
+        );
+        assert_eq!(result, UsageCheckResult::WaitedAndReset);
+        let calls = waited.borrow();
+        assert_eq!(calls.len(), 1, "positive Wait must invoke wait once");
+        assert!(
+            (100..=140).contains(&calls[0]),
+            "expected ~120s wait, got {}",
+            calls[0]
+        );
+    }
+
+    #[test]
+    fn org_fallback_reset_zero_is_ready_now_not_fallback_300() {
+        // buckets=None falls through to legacy remaining gate; past reset → 0.
+        use std::cell::RefCell;
+        let policy = UsagePolicy::default();
+        let fb = factory_fb();
+        let work = RemainingWorkSnapshot::default();
+        let waited = RefCell::new(Vec::<u64>::new());
+        let wait = |secs: u64| {
+            waited.borrow_mut().push(secs);
+            true
+        };
+        let mut set = HashSet::new();
+        let past = (chrono::Utc::now() - chrono::Duration::seconds(30)).to_rfc3339();
+        let result = account_quota_preflight_inner(
+            QuotaPreflightParams {
+                threshold: 8,
+                tasks_dir: Path::new("/tmp"),
+                fallback_wait: 300,
+                policy: &policy,
+                tier_fallback: Some(&fb),
+                execute_account_action: true,
+                unavailable_rungs: &mut set,
+                work: &work,
+                buckets: None,
+                account_remaining: Some(5.0),
+                account_reset_at: Some(past.as_str()),
+            },
+            &wait,
+        );
+        assert_eq!(
+            result,
+            UsageCheckResult::BelowThreshold,
+            "past reset must be ready-now, not fallback_wait 300"
+        );
+        assert!(
+            waited.borrow().is_empty(),
+            "ready-now must not invoke wait (got {:?})",
+            waited.borrow()
+        );
     }
 
     #[test]
