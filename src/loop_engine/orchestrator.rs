@@ -687,11 +687,17 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                     exit_code = 130;
                     exit_reason = "signal received".to_string();
                 }
-                IterationOutcome::Empty => {
-                    // Stop signal file or other empty exit
+                IterationOutcome::Empty if result.operator_stopped => {
+                    // Operator `.stop` file (including mid-usage-wait).
                     exit_code = 0;
                     exit_reason = "stop signal".to_string();
                     was_stopped = true;
+                }
+                IterationOutcome::Empty => {
+                    // Quota soft-stop (horizon Stop / Deferred): end this PRD
+                    // without the operator-stop / batch-chain was_stopped flag.
+                    exit_code = 0;
+                    exit_reason = "quota soft-stop".to_string();
                 }
                 IterationOutcome::PromptOverflow => {
                     exit_code = 3;

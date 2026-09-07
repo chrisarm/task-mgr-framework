@@ -1378,7 +1378,7 @@ pub struct RunAccountQuotaGateParams<'a> {
 /// env ∧ Claude enabled (`UsageParams.enabled`).
 ///
 /// On [`QuotaAccountAction::Stop`], resets `in_progress` → `todo` under
-/// `task_prefix` before returning [`UsageCheckResult::StopSignaled`].
+/// `task_prefix` before returning [`UsageCheckResult::HorizonStopped`].
 pub fn run_account_quota_gate(params: RunAccountQuotaGateParams<'_>) -> UsageCheckResult {
     let threshold = params.threshold;
     let load = || load_usage_info_with_threshold(threshold);
@@ -1482,7 +1482,7 @@ pub fn run_account_quota_gate_inner(
         account_reset_at,
     });
 
-    if horizon_stop && matches!(result, UsageCheckResult::StopSignaled) {
+    if horizon_stop && matches!(result, UsageCheckResult::HorizonStopped) {
         // Horizon Stop: park in_progress back to todo for this PRD.
         let prefix = task_prefix.unwrap_or("");
         reset_in_progress_tasks(conn, run_id, prefix, "quota horizon stop");
@@ -1592,7 +1592,7 @@ fn execute_quota_account_action(action: &QuotaAccountAction, wait: WaitFn<'_>) -
                 UsageCheckResult::StopSignaled
             }
         }
-        QuotaAccountAction::Stop => UsageCheckResult::StopSignaled,
+        QuotaAccountAction::Stop => UsageCheckResult::HorizonStopped,
         QuotaAccountAction::Ask { ttl_minutes } => {
             // Config knob (askTtlMinutes): stop-signal-aware sleep up to TTL,
             // then continue. TTL 0 is Defer at apply time (no sleep). Clap
@@ -2971,6 +2971,85 @@ mod tests {
         );
         assert_eq!(result, UsageCheckResult::StopSignaled);
         assert_eq!(*waited.borrow(), vec![900]);
+    }
+
+    #[test]
+    fn execute_horizon_stop_returns_horizon_stopped_not_stop_signaled() {
+        // QuotaAccountAction::Stop must not collapse into StopSignaled — that
+        // would print the operator .stop banner and set was_stopped (batch
+        // chain halt). Horizon soft-stop is a distinct UsageCheckResult.
+        use std::cell::RefCell;
+        let week = pct_bucket("seven_day", "weekly_all", 5.0, 6 * 24 * 3600, None);
+        let policy = UsagePolicy::default();
+        let work = RemainingWorkSnapshot {
+            other_rungs_runnable: false,
+            ..RemainingWorkSnapshot::default()
+        };
+        let waited = RefCell::new(Vec::<u64>::new());
+        let wait = |secs: u64| {
+            waited.borrow_mut().push(secs);
+            true
+        };
+        let mut set = HashSet::new();
+        let result = account_quota_preflight_inner(
+            QuotaPreflightParams {
+                threshold: 8,
+                tasks_dir: Path::new("/tmp"),
+                fallback_wait: 300,
+                policy: &policy,
+                tier_fallback: Some(&factory_fb()),
+                execute_account_action: true,
+                unavailable_rungs: &mut set,
+                work: &work,
+                buckets: Some(std::slice::from_ref(&week)),
+                account_remaining: Some(5.0),
+                account_reset_at: None,
+            },
+            &wait,
+        );
+        assert_eq!(result, UsageCheckResult::HorizonStopped);
+        assert_ne!(result, UsageCheckResult::StopSignaled);
+        assert!(
+            waited.borrow().is_empty(),
+            "horizon Stop must not sleep (got {:?})",
+            waited.borrow()
+        );
+    }
+
+    #[test]
+    fn execute_wait_interrupted_by_stop_still_stop_signaled() {
+        // Operator .stop during an account Wait remains StopSignaled.
+        use std::cell::RefCell;
+        let session = pct_bucket("five_hour", "session", 5.0, 30 * 60, None);
+        let policy = UsagePolicy::default();
+        let work = RemainingWorkSnapshot {
+            other_rungs_runnable: false,
+            ..RemainingWorkSnapshot::default()
+        };
+        let waited = RefCell::new(Vec::<u64>::new());
+        let wait = |secs: u64| {
+            waited.borrow_mut().push(secs);
+            false // .stop during wait
+        };
+        let mut set = HashSet::new();
+        let result = account_quota_preflight_inner(
+            QuotaPreflightParams {
+                threshold: 8,
+                tasks_dir: Path::new("/tmp"),
+                fallback_wait: 300,
+                policy: &policy,
+                tier_fallback: Some(&factory_fb()),
+                execute_account_action: true,
+                unavailable_rungs: &mut set,
+                work: &work,
+                buckets: Some(std::slice::from_ref(&session)),
+                account_remaining: Some(5.0),
+                account_reset_at: None,
+            },
+            &wait,
+        );
+        assert_eq!(result, UsageCheckResult::StopSignaled);
+        assert!(!waited.borrow().is_empty());
     }
 
     #[test]

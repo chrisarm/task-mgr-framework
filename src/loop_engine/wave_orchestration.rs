@@ -119,6 +119,23 @@ pub(super) fn wave_preflight_check(
                     rate_limited_retry: false,
                 });
             }
+            UsageCheckResult::HorizonStopped => {
+                ui::emit(
+                    "Quota horizon stop — reset beyond horizon and no other rung can run; stopping this PRD",
+                );
+                return Some(WaveOutcome {
+                    tasks_completed: 0,
+                    iteration_consumed: false,
+                    terminal: Some(WaveTerminal {
+                        exit_code: 0,
+                        reason: "quota horizon stop".to_string(),
+                        run_status: None,
+                    }),
+                    was_stopped: false,
+                    failed_merges: Vec::new(),
+                    rate_limited_retry: false,
+                });
+            }
             UsageCheckResult::Deferred => {
                 ui::emit(
                     "Quota ask deferred (tierFallback forbade downgrade; askTtlMinutes=0) — stopping",
@@ -131,7 +148,7 @@ pub(super) fn wave_preflight_check(
                         reason: "quota ask deferred".to_string(),
                         run_status: None,
                     }),
-                    was_stopped: true,
+                    was_stopped: false,
                     failed_merges: Vec::new(),
                     rate_limited_retry: false,
                 });

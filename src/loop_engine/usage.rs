@@ -106,15 +106,23 @@ pub enum UsageCheckResult {
     BelowThreshold,
     /// Waited for reset successfully, now below threshold.
     WaitedAndReset,
-    /// Wait was interrupted by .stop signal.
+    /// Wait was interrupted by an operator `.stop` signal.
+    /// Call sites set `was_stopped` / `operator_stopped` so batch `--chain`
+    /// treats this as an intentional operator halt.
     StopSignaled,
+    /// Quota horizon Stop (`QuotaAccountAction::Stop`): reset is beyond the
+    /// horizon and no other rung can run. Soft-stops this PRD without the
+    /// operator-stop banner or `was_stopped` (chain may still halt via
+    /// incomplete/`prd_complete`, not via the stop-file gate).
+    HorizonStopped,
     /// Usage check was skipped (disabled or no credentials).
     Skipped,
     /// API call failed but we continue anyway (graceful degradation).
     ApiError(String),
     /// Operator forbade tierFallback downgrade and ask TTL is 0 — no sleep,
-    /// no continue (soft-stop for operator intervention). TTL > 0 sleeps via
-    /// Ask then continues ([`UsageCheckResult::WaitedAndReset`]) or stops.
+    /// no continue (soft-stop for this PRD). TTL > 0 sleeps via Ask then
+    /// continues ([`UsageCheckResult::WaitedAndReset`]) or
+    /// [`UsageCheckResult::StopSignaled`]. Must not set `was_stopped`.
     Deferred,
 }
 
@@ -1574,6 +1582,10 @@ mod tests {
             UsageCheckResult::StopSignaled,
             UsageCheckResult::StopSignaled
         );
+        assert_eq!(
+            UsageCheckResult::HorizonStopped,
+            UsageCheckResult::HorizonStopped
+        );
         assert_eq!(UsageCheckResult::Skipped, UsageCheckResult::Skipped);
         assert_eq!(UsageCheckResult::Deferred, UsageCheckResult::Deferred);
     }
@@ -1611,6 +1623,10 @@ mod tests {
             UsageCheckResult::WaitedAndReset
         );
         assert_ne!(UsageCheckResult::Skipped, UsageCheckResult::StopSignaled);
+        assert_ne!(
+            UsageCheckResult::StopSignaled,
+            UsageCheckResult::HorizonStopped
+        );
         assert_ne!(
             UsageCheckResult::BelowThreshold,
             UsageCheckResult::ApiError("test".to_string())

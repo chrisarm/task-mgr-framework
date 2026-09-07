@@ -195,6 +195,10 @@ pub struct IterationResult {
     pub files_modified: Vec<String>,
     /// Whether the loop should stop after this iteration
     pub should_stop: bool,
+    /// True when the stop was an operator `.stop` file (including mid-wait).
+    /// False for quota horizon Stop / Deferred soft-stops that end this PRD
+    /// without meaning "operator halt the batch chain" (`LoopResult.was_stopped`).
+    pub operator_stopped: bool,
     /// Claude's stdout output (for output-based completion detection)
     pub output: String,
     /// Effective model used for this iteration (post-crash-escalation).
@@ -1396,6 +1400,7 @@ mod tests {
             task_id: Some("FEAT-001".to_string()),
             files_modified: vec!["src/lib.rs".to_string()],
             should_stop: false,
+            operator_stopped: false,
             output: String::new(),
             effective_model: None,
             effective_effort: None,

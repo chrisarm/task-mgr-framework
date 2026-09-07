@@ -85,6 +85,7 @@ pub fn run_iteration(
             task_id: None,
             files_modified: vec![],
             should_stop: true,
+            operator_stopped: false,
             output: String::new(),
             effective_model: None,
             effective_effort: None,
@@ -103,6 +104,7 @@ pub fn run_iteration(
             task_id: None,
             files_modified: vec![],
             should_stop: true,
+            operator_stopped: true,
             output: String::new(),
             effective_model: None,
             effective_effort: None,
@@ -151,6 +153,26 @@ pub fn run_iteration(
                     task_id: None,
                     files_modified: vec![],
                     should_stop: true,
+                    operator_stopped: true,
+                    output: String::new(),
+                    effective_model: None,
+                    effective_effort: None,
+                    effective_runner: None,
+                    key_decisions_count: 0,
+                    conversation: None,
+                    shown_learning_ids: Vec::new(),
+                });
+            }
+            UsageCheckResult::HorizonStopped => {
+                ui::emit(
+                    "Quota horizon stop — reset beyond horizon and no other rung can run; stopping this PRD",
+                );
+                return Ok(IterationResult {
+                    outcome: IterationOutcome::Empty,
+                    task_id: None,
+                    files_modified: vec![],
+                    should_stop: true,
+                    operator_stopped: false,
                     output: String::new(),
                     effective_model: None,
                     effective_effort: None,
@@ -169,6 +191,7 @@ pub fn run_iteration(
                     task_id: None,
                     files_modified: vec![],
                     should_stop: true,
+                    operator_stopped: false,
                     output: String::new(),
                     effective_model: None,
                     effective_effort: None,
@@ -181,7 +204,8 @@ pub fn run_iteration(
             UsageCheckResult::ApiError(ref msg) => {
                 tracing::warn!("usage API warning: {} (continuing)", msg);
             }
-            _ => {} // BelowThreshold, WaitedAndReset, Skipped — proceed
+            // BelowThreshold, WaitedAndReset, Skipped — proceed
+            _ => {}
         }
     }
 
@@ -202,6 +226,7 @@ pub fn run_iteration(
             task_id: None,
             files_modified: vec![],
             should_stop: true,
+            operator_stopped: false,
             output: String::new(),
             effective_model: None,
             effective_effort: None,
@@ -303,6 +328,7 @@ pub fn run_iteration(
                     task_id: None,
                     files_modified: vec![],
                     should_stop: true,
+                    operator_stopped: false,
                     output: String::new(),
                     effective_model: None,
                     effective_effort: None,
@@ -371,6 +397,7 @@ pub fn run_iteration(
                             task_id: None,
                             files_modified: vec![],
                             should_stop: false,
+                            operator_stopped: false,
                             output: String::new(),
                             effective_model: None,
                             effective_effort: None,
@@ -399,6 +426,7 @@ pub fn run_iteration(
                     task_id: None,
                     files_modified: vec![],
                     should_stop: false,
+                    operator_stopped: false,
                     output: String::new(),
                     effective_model: None,
                     effective_effort: None,
@@ -612,6 +640,7 @@ pub fn run_iteration(
                 task_id: Some(task_id),
                 files_modified: task_files,
                 should_stop: false,
+                operator_stopped: false,
                 output: hint,
                 effective_model,
                 effective_effort: effort.clone(),
@@ -631,6 +660,7 @@ pub fn run_iteration(
                 task_id: Some(task_id),
                 files_modified: task_files,
                 should_stop: false,
+                operator_stopped: false,
                 output: hint,
                 effective_model,
                 effective_effort: effort.clone(),
@@ -658,6 +688,7 @@ pub fn run_iteration(
                 task_id: Some(task_id),
                 files_modified: task_files,
                 should_stop: false,
+                operator_stopped: false,
                 output: String::new(),
                 effective_model,
                 effective_effort: effort.clone(),
@@ -740,6 +771,7 @@ pub fn run_iteration(
             task_id: Some(task_id),
             files_modified: task_files,
             should_stop: false,
+            operator_stopped: false,
             output: claude_result.output,
             effective_model,
             effective_effort: effort.clone(),
@@ -771,6 +803,7 @@ pub fn run_iteration(
             task_id: Some(task_id),
             files_modified: task_files,
             should_stop: true,
+            operator_stopped: false,
             output: claude_result.output,
             effective_model: None,
             effective_effort: None,
@@ -844,6 +877,7 @@ pub fn run_iteration(
                 task_id: Some(task_id),
                 files_modified: task_files,
                 should_stop: true,
+                operator_stopped: false,
                 output: String::new(),
                 effective_model: None,
                 effective_effort: None,
@@ -939,6 +973,7 @@ pub fn run_iteration(
         task_id: Some(task_id),
         files_modified: task_files,
         should_stop,
+        operator_stopped: false,
         output: claude_output,
         effective_model,
         effective_effort: effort.clone(),
