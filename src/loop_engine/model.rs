@@ -946,6 +946,10 @@ pub fn classify_task(id: &str, _routing: &RoutingConfig) -> TaskClass {
 /// `provider_blackouts` set is derived per pass and NEVER stored (FEAT-008
 /// populates it from account-level quota signals; FEAT-004 callers pass an
 /// empty set).
+///
+/// `Copy` so callers can pass `&PlanContext` while consumers destructure by
+/// value (exhaustive, no `..`) without `&Option<_>` match-ergonomics noise.
+#[derive(Clone, Copy)]
 pub struct PlanContext<'a> {
     /// Task ID, used for `byIdPrefix` routing and classification.
     pub task_id: &'a str,
@@ -1075,7 +1079,18 @@ fn task_may_clamp_for_blackout(
 ///
 /// NEVER writes `tasks.model` — pure, no I/O, no DB.
 pub fn resolve_execution_plan(plan: &PlanContext<'_>) -> ExecutionPlan {
-    let models = plan.models;
+    // Exhaustive destructure (no `..`) — adding a PlanContext field fails
+    // compile until this consumer accounts for it (parity with
+    // AccountUsageGateParams / QuotaPreflightParams).
+    let PlanContext {
+        task_id,
+        task_model,
+        difficulty,
+        models,
+        provider_blackouts: _,
+        unavailable_rungs: _,
+        tier_fallback: _,
+    } = *plan;
     let routing = &models.routing;
 
     // Track whether EXPLICIT_MODEL fired — includeForced is per-task for that
@@ -1083,7 +1098,7 @@ pub fn resolve_execution_plan(plan: &PlanContext<'_>) -> ExecutionPlan {
     let mut explicit_model = false;
 
     // Rung EXPLICIT_MODEL.
-    let mut resolved = if let Some(m) = normalize(plan.task_model) {
+    let mut resolved = if let Some(m) = normalize(task_model) {
         explicit_model = true;
         let provider = provider_for_model(Some(m));
         // Config exact-match first; off-ladder → family-match HUD adapter
@@ -1092,30 +1107,28 @@ pub fn resolve_execution_plan(plan: &PlanContext<'_>) -> ExecutionPlan {
         let tier = models
             .tier_of(provider, m)
             .or_else(|| family_tier_for_explicit_model(models, provider, m))
-            .unwrap_or_else(|| anchored_tier(models.anchor, plan.difficulty));
+            .unwrap_or_else(|| anchored_tier(models.anchor, difficulty));
         ExecutionPlan {
             provider,
             model: Some(m.to_string()),
             tier,
-            effort: models
-                .effort_for(provider, plan.difficulty)
-                .map(str::to_string),
+            effort: models.effort_for(provider, difficulty).map(str::to_string),
         }
-    } else if let Some((provider, tier)) = byidprefix_route(models, plan.task_id, plan.difficulty) {
+    } else if let Some((provider, tier)) = byidprefix_route(models, task_id, difficulty) {
         // Rung BY_ID_PREFIX — a forced route beats class / blackout / anchor.
-        finalize_plan(models, provider, tier, plan.difficulty)
+        finalize_plan(models, provider, tier, difficulty)
     } else {
         // Rung TASK_CLASS — when the class produces a forced provider and/or tier,
         // it beats the blackout reroute and the anchor window.
-        let class = classify_task(plan.task_id, routing);
-        if let Some((provider, tier)) = class_route(models, class, plan.difficulty) {
-            finalize_plan(models, provider, tier, plan.difficulty)
+        let class = classify_task(task_id, routing);
+        if let Some((provider, tier)) = class_route(models, class, difficulty) {
+            finalize_plan(models, provider, tier, difficulty)
         } else {
             // Default path: primary provider on the anchor window, eligible for the
             // QUOTA_BLACKOUT reroute.
-            let tier = anchored_tier(models.anchor, plan.difficulty);
+            let tier = anchored_tier(models.anchor, difficulty);
             let provider = reroute_for_blackout(models, models.primary_provider, plan, class);
-            finalize_plan(models, provider, tier, plan.difficulty)
+            finalize_plan(models, provider, tier, difficulty)
         }
     };
 
@@ -1133,34 +1146,38 @@ fn apply_rung_blackout_clamp(
     plan: &mut ExecutionPlan,
     explicit_model: bool,
 ) {
-    if ctx.unavailable_rungs.is_empty() {
+    // Exhaustive destructure (no `..`) — clamp consumer must see every new field.
+    let PlanContext {
+        task_id,
+        task_model: _,
+        difficulty,
+        models,
+        provider_blackouts: _,
+        unavailable_rungs,
+        tier_fallback,
+    } = *ctx;
+
+    if unavailable_rungs.is_empty() {
         return;
     }
-    if !ctx.unavailable_rungs.contains(&(plan.provider, plan.tier)) {
+    if !unavailable_rungs.contains(&(plan.provider, plan.tier)) {
         return;
     }
-    if !task_may_clamp_for_blackout(
-        ctx.tier_fallback,
-        ctx.task_id,
-        ctx.difficulty,
-        explicit_model,
-    ) {
+    if !task_may_clamp_for_blackout(tier_fallback, task_id, difficulty, explicit_model) {
         return;
     }
-    let Some(lower) =
-        down_only_available_tier(ctx.models, plan.provider, plan.tier, ctx.unavailable_rungs)
+    let Some(lower) = down_only_available_tier(models, plan.provider, plan.tier, unavailable_rungs)
     else {
         return;
     };
     // exact_model_for only — walker already required the rung to be defined.
-    let Some(model) = ctx.models.exact_model_for(plan.provider, lower) else {
+    let Some(model) = models.exact_model_for(plan.provider, lower) else {
         return;
     };
     plan.tier = lower;
     plan.model = Some(model.to_string());
-    plan.effort = ctx
-        .models
-        .effort_for(plan.provider, ctx.difficulty)
+    plan.effort = models
+        .effort_for(plan.provider, difficulty)
         .map(str::to_string);
 }
 
