@@ -920,6 +920,15 @@ file is literally called `init` or `run`.
             default_value_t = false
         )]
         auto_review: bool,
+
+        /// Minutes to wait on Ask for operator policy before continue/defer.
+        ///
+        /// Overrides `usagePolicy.askTtlMinutes` for this run only (does not
+        /// write config.json). `0` is allowed and means defer immediately with
+        /// no sleep. Flag omitted → use config (default 0). Present `0` is
+        /// `Some(0)`, not omitted.
+        #[arg(long = "use-other-models-ttl", value_name = "MINUTES")]
+        use_other_models_ttl: Option<u64>,
     },
 
     /// Show status dashboard for PRD projects
@@ -1034,6 +1043,15 @@ your PRD file is literally called `init` or `run`.
             default_value_t = false
         )]
         auto_review: bool,
+
+        /// Minutes to wait on Ask for operator policy before continue/defer.
+        ///
+        /// Overrides `usagePolicy.askTtlMinutes` for this run only (does not
+        /// write config.json). `0` is allowed and means defer immediately with
+        /// no sleep. Flag omitted → use config (default 0). Present `0` is
+        /// `Some(0)`, not omitted.
+        #[arg(long = "use-other-models-ttl", value_name = "MINUTES")]
+        use_other_models_ttl: Option<u64>,
     },
 
     /// Import learnings from a progress.json or learnings JSON file
@@ -1407,6 +1425,15 @@ pub enum LoopCommand {
             default_value_t = false
         )]
         auto_review: bool,
+
+        /// Minutes to wait on Ask for operator policy before continue/defer.
+        ///
+        /// Overrides `usagePolicy.askTtlMinutes` for this run only (does not
+        /// write config.json). `0` is allowed and means defer immediately with
+        /// no sleep. Flag omitted → use config (default 0). Present `0` is
+        /// `Some(0)`, not omitted.
+        #[arg(long = "use-other-models-ttl", value_name = "MINUTES")]
+        use_other_models_ttl: Option<u64>,
     },
 }
 
@@ -1500,6 +1527,15 @@ pub enum BatchCommand {
             default_value_t = false
         )]
         auto_review: bool,
+
+        /// Minutes to wait on Ask for operator policy before continue/defer.
+        ///
+        /// Overrides `usagePolicy.askTtlMinutes` for this run only (does not
+        /// write config.json). `0` is allowed and means defer immediately with
+        /// no sleep. Flag omitted → use config (default 0). Present `0` is
+        /// `Some(0)`, not omitted.
+        #[arg(long = "use-other-models-ttl", value_name = "MINUTES")]
+        use_other_models_ttl: Option<u64>,
     },
 }
 
@@ -1561,6 +1597,7 @@ pub fn resolve_loop_command(
     parallel: usize,
     no_auto_review: bool,
     auto_review: bool,
+    use_other_models_ttl: Option<u64>,
 ) -> LoopResolve {
     if let Some(child) = cmd {
         return LoopResolve::Nested(child);
@@ -1578,6 +1615,7 @@ pub fn resolve_loop_command(
             parallel,
             no_auto_review,
             auto_review,
+            use_other_models_ttl,
         });
     }
     LoopResolve::PrintHelp
@@ -1598,6 +1636,7 @@ pub fn resolve_batch_command(
     parallel: usize,
     no_auto_review: bool,
     auto_review: bool,
+    use_other_models_ttl: Option<u64>,
 ) -> BatchResolve {
     if let Some(child) = cmd {
         return BatchResolve::Nested(child);
@@ -1612,6 +1651,7 @@ pub fn resolve_batch_command(
             parallel,
             no_auto_review,
             auto_review,
+            use_other_models_ttl,
         });
     }
     BatchResolve::PrintHelp

@@ -1007,6 +1007,7 @@ pub(crate) fn initialize_loop(
         enabled: usage_check_enabled,
         threshold: remaining_min,
         fallback_wait: run_config.config.usage_fallback_wait,
+        ask_ttl_override: run_config.config.use_other_models_ttl,
     };
 
     Ok(LoopInitContext {

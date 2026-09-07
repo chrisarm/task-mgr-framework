@@ -100,7 +100,9 @@ pub(super) fn wave_preflight_check(
                 tier_fallback: params.project_config.routing.tier_fallback.as_ref(),
                 threshold: params.usage_params.threshold,
                 tasks_dir: params.tasks_dir,
+                db_dir: params.db_dir,
                 fallback_wait: params.usage_params.fallback_wait,
+                ask_ttl_override: params.usage_params.ask_ttl_override,
                 execute_account_action: params.usage_params.enabled,
             },
         ) {

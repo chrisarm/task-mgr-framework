@@ -89,6 +89,14 @@ pub struct LoopConfig {
     /// Set via `--parallel N` CLI flag or `LOOP_PARALLEL` env var. Set to 1
     /// to force sequential execution. Values outside 1-3 are rejected.
     pub parallel_slots: usize,
+    /// CLI `--use-other-models-ttl <minutes>` override for Ask wait.
+    ///
+    /// `None` = omitted (use `usagePolicy.askTtlMinutes`, default 0).
+    /// `Some(0)` is present zero — not omitted — and forces Ask-path Defer
+    /// with no sleep. Overrides config for this run only; never writes
+    /// `config.json`. Threaded into `UsageParams.ask_ttl_override` at startup
+    /// so `effective_ttl` reaches `ask_or_defer` before apply.
+    pub use_other_models_ttl: Option<u64>,
 }
 
 impl Default for LoopConfig {
@@ -108,6 +116,7 @@ impl Default for LoopConfig {
             external_git_scan_depth: 50,
             cleanup_worktree: false,
             parallel_slots: 2,
+            use_other_models_ttl: None,
         }
     }
 }
@@ -160,6 +169,8 @@ impl LoopConfig {
             parallel_slots: parse_env::<usize>("LOOP_PARALLEL")
                 .filter(|&n| (1..=3).contains(&n))
                 .unwrap_or(defaults.parallel_slots),
+            // CLI-only: never read from env (flag omitted → None).
+            use_other_models_ttl: defaults.use_other_models_ttl,
         }
     }
 }
@@ -996,12 +1007,17 @@ mod tests {
 
     #[test]
     fn test_from_env_cli_only_fields_always_default() {
-        // yes_mode, hours, verbose, use_worktrees are CLI-only, never read from env
+        // yes_mode, hours, verbose, use_worktrees, use_other_models_ttl are
+        // CLI-only — never read from env.
         let config = LoopConfig::from_env();
         assert!(!config.yes_mode);
         assert!(config.hours.is_none());
         assert!(!config.verbose);
         assert!(config.use_worktrees); // defaults to true
+        assert!(
+            config.use_other_models_ttl.is_none(),
+            "use_other_models_ttl is CLI-only; omitted flag → None"
+        );
     }
 
     #[test]
@@ -1495,6 +1511,7 @@ mod tests {
             external_git_scan_depth: _,
             cleanup_worktree: _,
             parallel_slots: _,
+            use_other_models_ttl: _,
         } = config;
         // Exhaustive destructure compiles only if LoopConfig has exactly these fields.
     }

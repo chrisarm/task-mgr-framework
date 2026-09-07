@@ -1628,6 +1628,7 @@ mod tests {
             enabled: false,
             threshold: 8,
             fallback_wait: 300,
+            ask_ttl_override: None,
         };
 
     #[allow(clippy::too_many_arguments)]

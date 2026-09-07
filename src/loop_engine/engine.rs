@@ -103,6 +103,11 @@ pub struct UsageParams {
     pub threshold: u8,
     /// Fallback wait time in seconds when no reset time is available.
     pub fallback_wait: u64,
+    /// CLI `--use-other-models-ttl` override (`None` = use config
+    /// `askTtlMinutes`). Must reach `ask_or_defer` via
+    /// `effective_ttl = ask_ttl_override.unwrap_or(policy.ask_ttl_minutes)`
+    /// **before** apply — LoopConfig + execute-only is the known-bad.
+    pub ask_ttl_override: Option<u64>,
 }
 
 impl UsageParams {
@@ -112,6 +117,7 @@ impl UsageParams {
             enabled: false,
             threshold: 8,
             fallback_wait: 300,
+            ask_ttl_override: None,
         }
     }
 }

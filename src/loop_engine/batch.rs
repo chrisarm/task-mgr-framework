@@ -496,6 +496,7 @@ pub async fn run_batch(
     parallel_slots: usize,
     cli_force_on: bool,
     cli_force_off: bool,
+    use_other_models_ttl: Option<u64>,
 ) -> BatchResult {
     // Cached once at the top of run_batch — matches the run-level config caching
     // convention (CLAUDE.md): mid-loop edits to .task-mgr/config.json do NOT take
@@ -627,6 +628,7 @@ pub async fn run_batch(
         // CLI parallel value overrides whatever LoopConfig::from_env resolved
         // (mirrors loop's behavior: explicit flag > env var > default).
         config.parallel_slots = parallel_slots;
+        config.use_other_models_ttl = use_other_models_ttl;
         if let Some(max_iter) = max_iterations {
             config.max_iterations = max_iter;
         }

@@ -2298,6 +2298,7 @@ fn test_loop_with_prd_file_and_yes() {
             parallel,
             no_auto_review,
             auto_review,
+            use_other_models_ttl: _,
         } => {
             // Flat-form deprecated shim: cmd is None, fields populate the parent
             assert!(cmd.is_none(), "flat form should not produce a nested cmd");
@@ -2730,6 +2731,7 @@ fn test_loop_flat_form_dispatch_synthesizes_run() {
         parallel,
         no_auto_review,
         auto_review,
+        use_other_models_ttl,
     } = cli.command
     else {
         panic!("Expected Loop command");
@@ -2747,6 +2749,7 @@ fn test_loop_flat_form_dispatch_synthesizes_run() {
         parallel,
         no_auto_review,
         auto_review,
+        use_other_models_ttl,
     );
     match resolved {
         LoopResolve::Flat(LoopCommand::Run {
@@ -2782,6 +2785,7 @@ fn test_loop_run_canonical_no_deprecation_marker() {
         parallel,
         no_auto_review,
         auto_review,
+        use_other_models_ttl,
     } = cli.command
     else {
         panic!("Expected Loop command");
@@ -2799,6 +2803,7 @@ fn test_loop_run_canonical_no_deprecation_marker() {
         parallel,
         no_auto_review,
         auto_review,
+        use_other_models_ttl,
     );
     assert!(
         matches!(resolved, LoopResolve::Nested(LoopCommand::Run { .. })),
@@ -2823,6 +2828,7 @@ fn test_loop_no_args_resolves_to_print_help() {
         parallel,
         no_auto_review,
         auto_review,
+        use_other_models_ttl,
     } = cli.command
     else {
         panic!("Expected Loop command");
@@ -2840,6 +2846,7 @@ fn test_loop_no_args_resolves_to_print_help() {
         parallel,
         no_auto_review,
         auto_review,
+        use_other_models_ttl,
     );
     assert!(matches!(resolved, LoopResolve::PrintHelp));
 }
@@ -2964,6 +2971,7 @@ fn test_batch_flat_form_dispatch_synthesizes_run() {
         parallel,
         no_auto_review,
         auto_review,
+        use_other_models_ttl,
     } = cli.command
     else {
         panic!("Expected Batch command");
@@ -2978,6 +2986,7 @@ fn test_batch_flat_form_dispatch_synthesizes_run() {
         parallel,
         no_auto_review,
         auto_review,
+        use_other_models_ttl,
     );
     match resolved {
         BatchResolve::Flat(BatchCommand::Run {
@@ -3009,6 +3018,7 @@ fn test_batch_run_canonical_no_deprecation_marker() {
         parallel,
         no_auto_review,
         auto_review,
+        use_other_models_ttl,
     } = cli.command
     else {
         panic!("Expected Batch command");
@@ -3023,6 +3033,7 @@ fn test_batch_run_canonical_no_deprecation_marker() {
         parallel,
         no_auto_review,
         auto_review,
+        use_other_models_ttl,
     );
     assert!(
         matches!(resolved, BatchResolve::Nested(BatchCommand::Run { .. })),
@@ -3043,6 +3054,7 @@ fn test_batch_no_args_resolves_to_print_help() {
         parallel,
         no_auto_review,
         auto_review,
+        use_other_models_ttl,
     } = cli.command
     else {
         panic!("Expected Batch command");
@@ -3057,6 +3069,7 @@ fn test_batch_no_args_resolves_to_print_help() {
         parallel,
         no_auto_review,
         auto_review,
+        use_other_models_ttl,
     );
     assert!(matches!(resolved, BatchResolve::PrintHelp));
 }
@@ -3699,6 +3712,7 @@ fn test_loop_flat_form_auto_review_threaded() {
         parallel,
         no_auto_review,
         auto_review,
+        use_other_models_ttl,
     } = cli.command
     else {
         panic!("Expected Loop command");
@@ -3716,6 +3730,7 @@ fn test_loop_flat_form_auto_review_threaded() {
         parallel,
         no_auto_review,
         auto_review,
+        use_other_models_ttl,
     );
     match resolved {
         LoopResolve::Flat(LoopCommand::Run {
@@ -3727,5 +3742,142 @@ fn test_loop_flat_form_auto_review_threaded() {
             assert!(!no_auto_review);
         }
         other => panic!("expected LoopResolve::Flat(Run), got {:?}", other),
+    }
+}
+
+#[test]
+fn test_loop_run_use_other_models_ttl_15() {
+    let cli = Cli::parse_from([
+        "task-mgr",
+        "loop",
+        "run",
+        "tasks/foo.json",
+        "--use-other-models-ttl",
+        "15",
+    ]);
+    match cli.command {
+        Commands::Loop {
+            cmd:
+                Some(LoopCommand::Run {
+                    use_other_models_ttl: Some(15),
+                    ..
+                }),
+            ..
+        } => {}
+        other => panic!("expected loop run --use-other-models-ttl 15, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_loop_run_use_other_models_ttl_zero_is_some() {
+    let cli = Cli::parse_from([
+        "task-mgr",
+        "loop",
+        "run",
+        "tasks/foo.json",
+        "--use-other-models-ttl",
+        "0",
+    ]);
+    match cli.command {
+        Commands::Loop {
+            cmd:
+                Some(LoopCommand::Run {
+                    use_other_models_ttl: Some(0),
+                    ..
+                }),
+            ..
+        } => {}
+        other => panic!("expected Some(0), not omitted; got {other:?}"),
+    }
+}
+
+#[test]
+fn test_loop_run_use_other_models_ttl_omitted_is_none() {
+    let cli = Cli::parse_from(["task-mgr", "loop", "run", "tasks/foo.json"]);
+    match cli.command {
+        Commands::Loop {
+            cmd:
+                Some(LoopCommand::Run {
+                    use_other_models_ttl: None,
+                    ..
+                }),
+            ..
+        } => {}
+        other => panic!("expected omitted → None; got {other:?}"),
+    }
+}
+
+#[test]
+fn test_batch_run_use_other_models_ttl_15() {
+    let cli = Cli::parse_from([
+        "task-mgr",
+        "batch",
+        "run",
+        "tasks/*.json",
+        "--use-other-models-ttl",
+        "15",
+    ]);
+    match cli.command {
+        Commands::Batch {
+            cmd:
+                Some(BatchCommand::Run {
+                    use_other_models_ttl: Some(15),
+                    ..
+                }),
+            ..
+        } => {}
+        other => panic!("expected batch run --use-other-models-ttl 15, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_loop_flat_use_other_models_ttl_threads_through_resolve() {
+    let cli = Cli::parse_from([
+        "task-mgr",
+        "loop",
+        "tasks/foo.json",
+        "--use-other-models-ttl",
+        "0",
+    ]);
+    let Commands::Loop {
+        cmd,
+        prd_file,
+        prompt_file,
+        yes,
+        hours,
+        verbose,
+        no_worktree,
+        external_repo,
+        cleanup_worktree,
+        parallel,
+        no_auto_review,
+        auto_review,
+        use_other_models_ttl,
+    } = cli.command
+    else {
+        panic!("Expected Loop");
+    };
+    assert_eq!(use_other_models_ttl, Some(0));
+    let resolved = resolve_loop_command(
+        cmd,
+        prd_file,
+        prompt_file,
+        yes,
+        hours,
+        verbose,
+        no_worktree,
+        external_repo,
+        cleanup_worktree,
+        parallel,
+        no_auto_review,
+        auto_review,
+        use_other_models_ttl,
+    );
+    match resolved {
+        LoopResolve::Flat(LoopCommand::Run {
+            use_other_models_ttl: Some(0),
+            ..
+        }) => {}
+        other => panic!("flat resolve must thread Some(0); got {other:?}"),
     }
 }

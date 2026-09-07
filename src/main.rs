@@ -1121,6 +1121,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
             parallel,
             no_auto_review,
             auto_review,
+            use_other_models_ttl,
         } => {
             // Resolve nested-vs-flat into a canonical LoopCommand via the
             // shared helper. Flat-form synthesizes Run and emits a one-line
@@ -1138,6 +1139,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                 parallel,
                 no_auto_review,
                 auto_review,
+                use_other_models_ttl,
             ) {
                 LoopResolve::Nested(child) => child,
                 LoopResolve::Flat(child) => {
@@ -1198,6 +1200,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                     parallel,
                     no_auto_review,
                     auto_review,
+                    use_other_models_ttl,
                 } => {
                     let project_root = get_project_root()?;
 
@@ -1208,6 +1211,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                     config.use_worktrees = !no_worktree;
                     config.cleanup_worktree = cleanup_worktree;
                     config.parallel_slots = parallel;
+                    config.use_other_models_ttl = use_other_models_ttl;
 
                     // Auto-review hook needs the PRD path after run_loop consumes
                     // run_config; clone before the move.
@@ -1298,6 +1302,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
             parallel,
             no_auto_review,
             auto_review,
+            use_other_models_ttl,
         } => {
             // Resolve nested-vs-flat into a canonical BatchCommand via the
             // shared helper. Flat-form (cmd: None, !patterns.is_empty()) is
@@ -1312,6 +1317,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                 parallel,
                 no_auto_review,
                 auto_review,
+                use_other_models_ttl,
             ) {
                 BatchResolve::Nested(child) => child,
                 BatchResolve::Flat(child) => {
@@ -1375,6 +1381,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                     parallel,
                     no_auto_review,
                     auto_review,
+                    use_other_models_ttl,
                 } => {
                     let project_root = get_project_root()?;
 
@@ -1401,6 +1408,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                             parallel,
                             auto_review,
                             no_auto_review,
+                            use_other_models_ttl,
                         )
                         .await
                     });

@@ -1184,10 +1184,12 @@ pub enum QuotaAccountAction {
     Wait { secs: u64, account_binding: bool },
     /// Stop this PRD (`in_progress` → `todo`). Next-PRD inherit of unavailable is PR-3.
     Stop,
-    /// Operator forbade downgrade; sleep up to `ttl_minutes` (stop-signal-aware)
-    /// then continue. Only emitted when `ask_ttl_minutes > 0`.
+    /// Ask path: sleep up to `ttl_minutes` (stop-signal-aware), re-eval
+    /// `usagePolicy` + `tierFallback` on the stop-check cadence, then continue
+    /// iff `tier_fallback_allows` (else Deferred). Only emitted when
+    /// effective TTL > 0. Factory/allowing never emits Ask.
     Ask { ttl_minutes: u64 },
-    /// Ask with TTL 0: no sleep, no continue (soft-stop for operator).
+    /// Ask with effective TTL 0: no sleep, no continue (soft-stop for operator).
     Defer,
 }
 
@@ -1239,12 +1241,39 @@ fn difficulty_rank_str(d: &str) -> Option<usize> {
 /// Does **not** perform I/O, sleep, or proto-channel mutation — callers replace
 /// `IterationContext.unavailable_rungs` on successful evaluate and execute
 /// [`QuotaAccountAction`].
+///
+/// Uses `policy.ask_ttl_minutes` for Ask/Defer. Prefer
+/// [`apply_quota_with_ask_ttl`] when a CLI `--use-other-models-ttl` override
+/// must reach `ask_or_defer` (config 0 + CLI 15 → `Ask { 15 }`).
 pub fn apply_quota(
     eval: &QuotaEval,
     buckets: &[QuotaBucket],
     policy: &UsagePolicy,
     tier_fallback: Option<&TierFallback>,
     work: &RemainingWorkSnapshot,
+) -> QuotaApplyResult {
+    apply_quota_with_ask_ttl(
+        eval,
+        buckets,
+        policy,
+        tier_fallback,
+        work,
+        policy.ask_ttl_minutes,
+    )
+}
+
+/// Like [`apply_quota`], but takes an already-resolved Ask TTL.
+///
+/// `ask_ttl_minutes` must be `cli.unwrap_or(policy.ask_ttl_minutes)` computed
+/// **before** this call — swapping TTL only inside execute is the known-bad
+/// (config `askTtlMinutes: 0` + CLI 15 would still Defer at apply).
+pub fn apply_quota_with_ask_ttl(
+    eval: &QuotaEval,
+    buckets: &[QuotaBucket],
+    policy: &UsagePolicy,
+    tier_fallback: Option<&TierFallback>,
+    work: &RemainingWorkSnapshot,
+    ask_ttl_minutes: u64,
 ) -> QuotaApplyResult {
     let allows = tier_fallback_allows(tier_fallback, work);
 
@@ -1351,14 +1380,14 @@ pub fn apply_quota(
             // other_rungs_runnable ignores spillover (caller's responsibility).
             account = QuotaAccountAction::Stop;
         } else if pending_ask || explicit_ask {
-            account = ask_or_defer(policy.ask_ttl_minutes);
+            account = ask_or_defer(ask_ttl_minutes);
         } else {
             // Scoped unavailable beyond horizon; other work remains → Proceed
             // with exclusions only (factory / allowing tierFallback).
             account = QuotaAccountAction::Proceed;
         }
     } else if pending_ask || explicit_ask {
-        account = ask_or_defer(policy.ask_ttl_minutes);
+        account = ask_or_defer(ask_ttl_minutes);
     }
 
     // stop beats ask
@@ -1475,15 +1504,21 @@ fn account_low_is_amount_only(low: &AccountLowInput, buckets: &[QuotaBucket]) ->
 
 /// Evaluate buckets and apply horizon / tierFallback. Pure besides the
 /// `now`-dependent reset math inside evaluate/apply.
+///
+/// `ask_ttl_override` is the CLI `--use-other-models-ttl` (`None` = config).
+/// Effective TTL is resolved **before** `ask_or_defer`.
 pub fn evaluate_and_apply_quota(
     buckets: &[QuotaBucket],
     policy: &UsagePolicy,
     remaining_min: u8,
     tier_fallback: Option<&TierFallback>,
     work: &RemainingWorkSnapshot,
+    ask_ttl_override: Option<u64>,
 ) -> (QuotaEval, QuotaApplyResult) {
     let eval = evaluate_quota(buckets, policy, remaining_min);
-    let applied = apply_quota(&eval, buckets, policy, tier_fallback, work);
+    let effective_ttl = ask_ttl_override.unwrap_or(policy.ask_ttl_minutes);
+    let applied =
+        apply_quota_with_ask_ttl(&eval, buckets, policy, tier_fallback, work, effective_ttl);
     (eval, applied)
 }
 
@@ -1505,9 +1540,14 @@ pub struct QuotaPreflightParams<'a> {
     /// Remaining-percent floor (0–100).
     pub threshold: u8,
     pub tasks_dir: &'a Path,
+    /// Database dir (`.task-mgr`) — Ask wait re-reads `usagePolicy` +
+    /// `routing.tierFallback` from `config.json` here on the stop-check cadence.
+    pub db_dir: &'a Path,
     pub fallback_wait: u64,
     pub policy: &'a UsagePolicy,
     pub tier_fallback: Option<&'a TierFallback>,
+    /// CLI `--use-other-models-ttl` (`None` = use `policy.ask_ttl_minutes`).
+    pub ask_ttl_override: Option<u64>,
     /// When false (`LOOP_USAGE_CHECK_ENABLED=false`): skip evaluate/replace/
     /// wait/stop and keep the proto-channel snapshot.
     pub execute_account_action: bool,
@@ -1523,6 +1563,16 @@ pub struct QuotaPreflightParams<'a> {
     pub account_reset_at: Option<&'a str>,
     /// Run models for [`wait_probe_lifted`] scoped-only re-ingest (FR-009).
     pub models: &'a ResolvedModelsConfig,
+    /// Optional Ask-policy re-read seam (tests). `None` → read from `db_dir`
+    /// on each stop-check tick during Ask wait.
+    pub ask_policy_reeval: Option<&'a dyn Fn() -> AskPolicySlice>,
+}
+
+/// Narrow config slice re-read during Ask wait (not a whole-run ProjectConfig reload).
+#[derive(Debug, Clone)]
+pub struct AskPolicySlice {
+    pub usage_policy: UsagePolicy,
+    pub tier_fallback: Option<TierFallback>,
 }
 
 /// Inputs to [`run_account_quota_gate`]. Exhaustive destructure at the call
@@ -1542,7 +1592,10 @@ pub struct RunAccountQuotaGateParams<'a> {
     pub tier_fallback: Option<&'a TierFallback>,
     pub threshold: u8,
     pub tasks_dir: &'a Path,
+    pub db_dir: &'a Path,
     pub fallback_wait: u64,
+    /// CLI `--use-other-models-ttl` (`None` = use `policy.ask_ttl_minutes`).
+    pub ask_ttl_override: Option<u64>,
     /// When false (`LOOP_USAGE_CHECK_ENABLED=false`): skip OAuth/usage load,
     /// keep the proto-channel snapshot, and do not sleep/stop/defer.
     pub execute_account_action: bool,
@@ -1583,7 +1636,9 @@ pub fn run_account_quota_gate_inner(
         tier_fallback,
         threshold,
         tasks_dir,
+        db_dir,
         fallback_wait,
+        ask_ttl_override,
         execute_account_action,
     } = params;
 
@@ -1629,6 +1684,7 @@ pub fn run_account_quota_gate_inner(
         _ => (None, None, None),
     };
 
+    let effective_ttl = ask_ttl_override.unwrap_or(policy.ask_ttl_minutes);
     let (work, horizon_stop) = if let Some(buckets) = buckets {
         let eval = evaluate_quota(buckets, policy, threshold);
         let work = compute_remaining_work_snapshot(
@@ -1638,7 +1694,8 @@ pub fn run_account_quota_gate_inner(
             &eval.unavailable,
             runner_overrides,
         );
-        let applied = apply_quota(&eval, buckets, policy, tier_fallback, &work);
+        let applied =
+            apply_quota_with_ask_ttl(&eval, buckets, policy, tier_fallback, &work, effective_ttl);
         let horizon_stop = matches!(applied.account, QuotaAccountAction::Stop);
         (work, horizon_stop)
     } else {
@@ -1656,9 +1713,11 @@ pub fn run_account_quota_gate_inner(
     let result = account_quota_preflight(QuotaPreflightParams {
         threshold,
         tasks_dir,
+        db_dir,
         fallback_wait,
         policy,
         tier_fallback,
+        ask_ttl_override,
         execute_account_action,
         unavailable_rungs,
         work: &work,
@@ -1666,6 +1725,7 @@ pub fn run_account_quota_gate_inner(
         account_remaining,
         account_reset_at,
         models,
+        ask_policy_reeval: None,
     });
 
     if horizon_stop && matches!(result, UsageCheckResult::HorizonStopped) {
@@ -1740,9 +1800,11 @@ fn account_quota_preflight_core(
     let QuotaPreflightParams {
         threshold,
         tasks_dir,
+        db_dir,
         fallback_wait,
         policy,
         tier_fallback,
+        ask_ttl_override,
         execute_account_action,
         unavailable_rungs,
         work,
@@ -1750,6 +1812,7 @@ fn account_quota_preflight_core(
         account_remaining,
         account_reset_at,
         models,
+        ask_policy_reeval,
     } = params;
 
     // Env-disabled pre-gate: keep proto-channel snapshot; no evaluate/replace.
@@ -1757,12 +1820,18 @@ fn account_quota_preflight_core(
         return UsageCheckResult::Skipped;
     }
 
-    let applied = match buckets {
+    let applied_and_eval = match buckets {
         Some(buckets) => {
-            let (_eval, applied) =
-                evaluate_and_apply_quota(buckets, policy, threshold, tier_fallback, work);
+            let (eval, applied) = evaluate_and_apply_quota(
+                buckets,
+                policy,
+                threshold,
+                tier_fallback,
+                work,
+                ask_ttl_override,
+            );
             replace_unavailable_rungs(unavailable_rungs, &applied);
-            Some(applied)
+            Some((eval, applied, buckets))
         }
         None => {
             // API fail — keep snapshot; do not clear.
@@ -1773,13 +1842,23 @@ fn account_quota_preflight_core(
     let ctx = QuotaExecuteCtx {
         threshold,
         tasks_dir,
+        db_dir,
         fallback_wait,
         models,
         wait_mode: &wait_mode,
+        work,
+        initial_tier_fallback: tier_fallback,
+        ask_policy_reeval,
     };
 
-    if let Some(applied) = applied {
-        return execute_quota_account_action(&applied.account, &ctx);
+    if let Some((eval, applied, buckets)) = applied_and_eval {
+        return execute_quota_account_action(
+            &applied.account,
+            &eval,
+            buckets,
+            unavailable_rungs,
+            &ctx,
+        );
     }
 
     // Org / no-buckets fallback: legacy remaining-percent gate.
@@ -1803,13 +1882,20 @@ fn account_quota_preflight_core(
 struct QuotaExecuteCtx<'a, 'm> {
     threshold: u8,
     tasks_dir: &'a Path,
+    db_dir: &'a Path,
     fallback_wait: u64,
     models: &'a ResolvedModelsConfig,
     wait_mode: &'m PreflightWaitMode<'a>,
+    work: &'a RemainingWorkSnapshot,
+    initial_tier_fallback: Option<&'a TierFallback>,
+    ask_policy_reeval: Option<&'a dyn Fn() -> AskPolicySlice>,
 }
 
 fn execute_quota_account_action(
     action: &QuotaAccountAction,
+    eval: &QuotaEval,
+    buckets: &[QuotaBucket],
+    unavailable_rungs: &mut HashSet<(Provider, CapabilityTier)>,
     ctx: &QuotaExecuteCtx<'_, '_>,
 ) -> UsageCheckResult {
     match action {
@@ -1828,17 +1914,250 @@ fn execute_quota_account_action(
         }
         QuotaAccountAction::Stop => UsageCheckResult::HorizonStopped,
         QuotaAccountAction::Ask { ttl_minutes } => {
-            // Config knob (askTtlMinutes): stop-signal-aware sleep up to TTL,
-            // then continue. TTL 0 is Defer at apply time (no sleep). Clap
-            // --use-other-models-ttl / mid-wait config re-eval stay PR-3.
-            // Ask keeps today's account remaining probe.
-            let secs = ttl_minutes.saturating_mul(60);
-            if secs == 0 {
-                return UsageCheckResult::Deferred;
-            }
-            run_preflight_wait(secs, /* account_binding */ true, ctx)
+            execute_ask_ttl(*ttl_minutes, eval, buckets, unavailable_rungs, ctx)
         }
         QuotaAccountAction::Defer => UsageCheckResult::Deferred,
+    }
+}
+
+/// Ask-path TTL execute (FR-005 / US-005).
+///
+/// - TTL 0: Deferred, no sleep (learning 5468). Discriminator: do not call wait.
+/// - TTL > 0: stop-check cadence re-reads usagePolicy + tierFallback; mid-wait
+///   flip from forbade→allow continues early; timeout continues iff
+///   `tier_fallback_allows`, else Deferred. `.stop` → StopSignaled (chain halt).
+/// - Timeout / early-allow continue marks eval.unavailable onto the proto-channel
+///   (apply left it empty while forbade).
+fn execute_ask_ttl(
+    ttl_minutes: u64,
+    eval: &QuotaEval,
+    buckets: &[QuotaBucket],
+    unavailable_rungs: &mut HashSet<(Provider, CapabilityTier)>,
+    ctx: &QuotaExecuteCtx<'_, '_>,
+) -> UsageCheckResult {
+    // Apply already maps TTL 0 → Defer; belt-and-suspenders for execute-only callers.
+    if ttl_minutes == 0 {
+        return UsageCheckResult::Deferred;
+    }
+
+    let initial_allows = tier_fallback_allows(ctx.initial_tier_fallback, ctx.work);
+    emit_ask_banner(
+        ttl_minutes,
+        eval,
+        buckets,
+        initial_allows,
+        ctx.initial_tier_fallback,
+    );
+
+    let outcome = match ctx.wait_mode {
+        PreflightWaitMode::Injected(wait) => {
+            // Hermetic: one stop-aware wait call records secs; eligibility
+            // decides Continue vs Defer after completion (mid-wait re-eval
+            // uses wait_for_ask_ttl_inner via Production / direct tests).
+            let secs = ttl_minutes.saturating_mul(60);
+            if !wait(secs) {
+                AskWaitOutcome::Stopped
+            } else {
+                let allows = current_ask_allows(ctx, initial_allows);
+                if allows {
+                    AskWaitOutcome::Continue
+                } else {
+                    AskWaitOutcome::Defer
+                }
+            }
+        }
+        PreflightWaitMode::Production { .. } => {
+            let secs = ttl_minutes.saturating_mul(60);
+            wait_for_ask_ttl(secs, ctx, initial_allows)
+        }
+    };
+
+    match outcome {
+        AskWaitOutcome::Stopped => UsageCheckResult::StopSignaled,
+        AskWaitOutcome::Defer => UsageCheckResult::Deferred,
+        AskWaitOutcome::Continue => {
+            // Operator allowed (or now allows) downgrade — place unavailable
+            // rungs so selection continues on working rungs this iteration.
+            for rung in &eval.unavailable {
+                unavailable_rungs.insert(*rung);
+            }
+            UsageCheckResult::WaitedAndReset
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AskWaitOutcome {
+    Continue,
+    Defer,
+    Stopped,
+}
+
+fn current_ask_allows(ctx: &QuotaExecuteCtx<'_, '_>, initial_allows: bool) -> bool {
+    match ctx.ask_policy_reeval {
+        Some(reeval) => {
+            let slice = reeval();
+            tier_fallback_allows(slice.tier_fallback.as_ref(), ctx.work)
+        }
+        // Hermetic Injected path without a re-eval seam: keep the apply-time
+        // decision. Production Ask always goes through wait_for_ask_ttl which
+        // re-reads usagePolicy + tierFallback from disk on each stop-check.
+        None => initial_allows,
+    }
+}
+
+fn read_ask_policy_slice(ctx: &QuotaExecuteCtx<'_, '_>) -> AskPolicySlice {
+    if let Some(reeval) = ctx.ask_policy_reeval {
+        return reeval();
+    }
+    read_ask_policy_from_disk(ctx.db_dir)
+}
+
+/// Re-read only `usagePolicy` + `routing.tierFallback` (not a whole-run config reload).
+pub fn read_ask_policy_from_disk(db_dir: &Path) -> AskPolicySlice {
+    let cfg = crate::loop_engine::project_config::read_project_config(db_dir);
+    AskPolicySlice {
+        usage_policy: cfg.usage_policy,
+        tier_fallback: cfg.routing.tier_fallback,
+    }
+}
+
+fn emit_ask_banner(
+    ttl_minutes: u64,
+    eval: &QuotaEval,
+    buckets: &[QuotaBucket],
+    allows: bool,
+    tier_fallback: Option<&TierFallback>,
+) {
+    let (rung_label, remaining_pct) = ask_banner_rung_remaining(eval, buckets);
+    let outcome = if allows {
+        format!(
+            "then continuing on {continue_rung}",
+            continue_rung = ask_continue_rung_label(rung_label)
+        )
+    } else {
+        let reason = if tier_fallback.is_none() {
+            "unset-tier-fallback forbids"
+        } else {
+            "set-tier-fallback forbids"
+        };
+        format!("then deferring ({reason})")
+    };
+    eprintln!(
+        "ask: {rung_label} {remaining}% left; other rungs available; waiting {ttl_minutes}m for policy (--use-other-models-ttl), {outcome}",
+        remaining = remaining_pct,
+    );
+}
+
+fn ask_banner_rung_remaining(eval: &QuotaEval, buckets: &[QuotaBucket]) -> (&'static str, String) {
+    // Prefer the first unavailable Claude rung's bucket remaining.
+    for (provider, tier) in &eval.unavailable {
+        if *provider != Provider::Claude {
+            continue;
+        }
+        let label = tier_rung_label(*tier);
+        for (id, beval) in &eval.per_bucket {
+            if let BucketEval::Unavailable { .. } = beval
+                && let Some(bucket) = buckets.iter().find(|b| b.id == *id)
+                && let Some(pct) = bucket_remaining_percent(bucket)
+            {
+                return (label, format_remaining_pct(pct));
+            }
+        }
+        return (label, "?".to_string());
+    }
+    ("frontier", "?".to_string())
+}
+
+fn ask_continue_rung_label(low_rung: &str) -> &'static str {
+    match low_rung {
+        "frontier" => "standard",
+        "standard" => "cost-efficient",
+        "cost-efficient" => "cheapest",
+        _ => "standard",
+    }
+}
+
+fn tier_rung_label(tier: CapabilityTier) -> &'static str {
+    match tier {
+        CapabilityTier::Frontier => "frontier",
+        CapabilityTier::Standard => "standard",
+        CapabilityTier::CostEfficient => "cost-efficient",
+        CapabilityTier::Cheapest => "cheapest",
+    }
+}
+
+fn bucket_remaining_percent(bucket: &QuotaBucket) -> Option<f64> {
+    bucket.measurements.iter().find_map(|m| {
+        if m.unit == crate::loop_engine::quota::MeasurementUnit::Percent {
+            Some(m.remaining)
+        } else {
+            None
+        }
+    })
+}
+
+fn wait_for_ask_ttl(
+    ttl_secs: u64,
+    ctx: &QuotaExecuteCtx<'_, '_>,
+    initial_allows: bool,
+) -> AskWaitOutcome {
+    wait_for_ask_ttl_inner(
+        ttl_secs,
+        ctx.tasks_dir,
+        PROD_TIMING,
+        thread::sleep,
+        || read_ask_policy_slice(ctx),
+        ctx.work,
+        initial_allows,
+    )
+}
+
+/// Injectable Ask wait (hermetic tests pass tiny timing + virtual sleep).
+pub(crate) fn wait_for_ask_ttl_inner(
+    ttl_secs: u64,
+    tasks_dir: &Path,
+    timing: WaitTiming,
+    sleep: impl Fn(Duration),
+    reeval: impl Fn() -> AskPolicySlice,
+    work: &RemainingWorkSnapshot,
+    initial_allows: bool,
+) -> AskWaitOutcome {
+    if ttl_secs == 0 {
+        return AskWaitOutcome::Defer;
+    }
+
+    let mut remaining = ttl_secs.min(MAX_WAIT_SECS);
+    let mut last_allows = initial_allows;
+
+    while remaining > 0 {
+        if signals::check_stop_signal(tasks_dir, None) {
+            eprintln!("Stop signal detected during ask wait. Exiting wait.");
+            return AskWaitOutcome::Stopped;
+        }
+
+        let slice = reeval();
+        // Re-read usagePolicy + tierFallback each stop-check (AC); eligibility
+        // uses tierFallback. usagePolicy is intentionally loaded for parity with
+        // the config-slice contract even when unused for the continue decision.
+        let _ = &slice.usage_policy;
+        let allows_now = tier_fallback_allows(slice.tier_fallback.as_ref(), work);
+        last_allows = allows_now;
+        // Mid-wait: forbade → allow must continue without requiring .stop.
+        if allows_now && !initial_allows {
+            eprintln!("  Ask policy now allows tierFallback; continuing on working rungs...");
+            return AskWaitOutcome::Continue;
+        }
+
+        let sleep_time = remaining.min(timing.stop_check_secs).max(1);
+        sleep(Duration::from_secs(sleep_time));
+        remaining = remaining.saturating_sub(sleep_time);
+    }
+
+    if last_allows {
+        AskWaitOutcome::Continue
+    } else {
+        AskWaitOutcome::Defer
     }
 }
 
@@ -3292,7 +3611,9 @@ mod tests {
             QuotaPreflightParams {
                 threshold: 8,
                 tasks_dir: Path::new("/tmp"),
+                db_dir: Path::new("/tmp"),
                 fallback_wait: 300,
+                ask_ttl_override: None,
                 policy: &policy,
                 tier_fallback: None, // ask opt-out
                 execute_account_action: true,
@@ -3302,6 +3623,7 @@ mod tests {
                 account_remaining: Some(76.0),
                 account_reset_at: None,
                 models: crate::loop_engine::model::builtin_resolved_models(),
+                ask_policy_reeval: None,
             },
             &wait,
         );
@@ -3314,7 +3636,8 @@ mod tests {
     }
 
     #[test]
-    fn execute_ask_ttl_15_sleeps_900s_then_continues() {
+    fn execute_ask_ttl_15_forbade_sleeps_900s_then_defers() {
+        // PR-3: forbade tierFallback + TTL expiry → Deferred (not continue).
         use std::cell::RefCell;
         let frontier = pct_bucket(
             "weekly_scoped",
@@ -3342,9 +3665,11 @@ mod tests {
             QuotaPreflightParams {
                 threshold: 8,
                 tasks_dir: Path::new("/tmp"),
+                db_dir: Path::new("/tmp"),
                 fallback_wait: 300,
+                ask_ttl_override: None,
                 policy: &policy,
-                tier_fallback: None, // ask opt-out
+                tier_fallback: None, // ask opt-out / forbade
                 execute_account_action: true,
                 unavailable_rungs: &mut set,
                 work: &work,
@@ -3352,15 +3677,260 @@ mod tests {
                 account_remaining: Some(76.0),
                 account_reset_at: None,
                 models: crate::loop_engine::model::builtin_resolved_models(),
+                ask_policy_reeval: None,
             },
             &wait,
         );
-        assert_eq!(result, UsageCheckResult::WaitedAndReset);
+        assert_eq!(result, UsageCheckResult::Deferred);
         assert_eq!(
             *waited.borrow(),
             vec![15 * 60],
             "askTtlMinutes 15 must sleep exactly 900s stop-signal-aware"
         );
+        assert!(
+            set.is_empty(),
+            "forbade defer must not place unavailable rungs"
+        );
+    }
+
+    #[test]
+    fn execute_ask_ttl_15_allowing_sleeps_900s_then_continues() {
+        // Explicit onLow:ask with allowing tierFallback → Continue after TTL.
+        use std::cell::RefCell;
+        let frontier = pct_bucket(
+            "weekly_scoped",
+            "weekly_scoped",
+            5.0,
+            6 * 24 * 3600,
+            Some(vec![(Provider::Claude, CapabilityTier::Frontier)]),
+        );
+        let policy = UsagePolicy {
+            ask_ttl_minutes: 15,
+            rules: vec![crate::loop_engine::quota::UsageRule {
+                kind: Some("weekly_scoped".into()),
+                id: None,
+                on_low: OnLowAction::Ask,
+                when: None,
+            }],
+            ..UsagePolicy::default()
+        };
+        let work = RemainingWorkSnapshot {
+            other_rungs_runnable: true,
+            max_difficulty: Some("high"),
+            ..RemainingWorkSnapshot::default()
+        };
+        let waited = RefCell::new(Vec::<u64>::new());
+        let wait = |secs: u64| {
+            waited.borrow_mut().push(secs);
+            true
+        };
+        let mut set = HashSet::new();
+        let result = account_quota_preflight_inner(
+            QuotaPreflightParams {
+                threshold: 8,
+                tasks_dir: Path::new("/tmp"),
+                db_dir: Path::new("/tmp"),
+                fallback_wait: 300,
+                ask_ttl_override: None,
+                policy: &policy,
+                tier_fallback: Some(&factory_fb()),
+                execute_account_action: true,
+                unavailable_rungs: &mut set,
+                work: &work,
+                buckets: Some(std::slice::from_ref(&frontier)),
+                account_remaining: Some(76.0),
+                account_reset_at: None,
+                models: crate::loop_engine::model::builtin_resolved_models(),
+                ask_policy_reeval: None,
+            },
+            &wait,
+        );
+        assert_eq!(result, UsageCheckResult::WaitedAndReset);
+        assert_eq!(*waited.borrow(), vec![15 * 60]);
+        // Explicit onLow:ask evaluates as account_low (not Unavailable), so
+        // continue does not need to place rungs — selection stays open.
+        let _ = set;
+    }
+
+    #[test]
+    fn apply_config_ask_ttl_0_plus_cli_15_emits_ask_not_defer() {
+        // Known-bad if effective_ttl only swapped in execute: still Defer.
+        let frontier = pct_bucket(
+            "weekly_scoped",
+            "weekly_scoped",
+            5.0,
+            6 * 24 * 3600,
+            Some(vec![(Provider::Claude, CapabilityTier::Frontier)]),
+        );
+        let policy = UsagePolicy {
+            ask_ttl_minutes: 0,
+            ..UsagePolicy::default()
+        };
+        let work = RemainingWorkSnapshot {
+            other_rungs_runnable: true,
+            max_difficulty: Some("high"),
+            ..RemainingWorkSnapshot::default()
+        };
+        let eval = evaluate_quota(&[frontier.clone()], &policy, 8);
+        let applied = apply_quota_with_ask_ttl(
+            &eval,
+            &[frontier],
+            &policy,
+            None,
+            &work,
+            15, // CLI --use-other-models-ttl 15
+        );
+        assert_eq!(applied.account, QuotaAccountAction::Ask { ttl_minutes: 15 });
+    }
+
+    #[test]
+    fn apply_cli_ttl_does_not_convert_factory_into_ask() {
+        let frontier = pct_bucket(
+            "weekly_scoped",
+            "weekly_scoped",
+            5.0,
+            6 * 24 * 3600,
+            Some(vec![(Provider::Claude, CapabilityTier::Frontier)]),
+        );
+        let policy = UsagePolicy {
+            ask_ttl_minutes: 0,
+            ..UsagePolicy::default()
+        };
+        let work = RemainingWorkSnapshot {
+            other_rungs_runnable: true,
+            max_difficulty: Some("high"),
+            ..RemainingWorkSnapshot::default()
+        };
+        let eval = evaluate_quota(&[frontier.clone()], &policy, 8);
+        let applied =
+            apply_quota_with_ask_ttl(&eval, &[frontier], &policy, Some(&factory_fb()), &work, 15);
+        assert_eq!(applied.account, QuotaAccountAction::Proceed);
+        assert!(
+            applied
+                .unavailable
+                .contains(&(Provider::Claude, CapabilityTier::Frontier))
+        );
+    }
+
+    #[test]
+    fn execute_cli_ttl_15_overrides_config_0_ask_path() {
+        use std::cell::RefCell;
+        let frontier = pct_bucket(
+            "weekly_scoped",
+            "weekly_scoped",
+            5.0,
+            6 * 24 * 3600,
+            Some(vec![(Provider::Claude, CapabilityTier::Frontier)]),
+        );
+        let policy = UsagePolicy {
+            ask_ttl_minutes: 0, // config alone would Defer
+            ..UsagePolicy::default()
+        };
+        let work = RemainingWorkSnapshot {
+            other_rungs_runnable: true,
+            max_difficulty: Some("high"),
+            ..RemainingWorkSnapshot::default()
+        };
+        let waited = RefCell::new(Vec::<u64>::new());
+        let wait = |secs: u64| {
+            waited.borrow_mut().push(secs);
+            true
+        };
+        let mut set = HashSet::new();
+        let result = account_quota_preflight_inner(
+            QuotaPreflightParams {
+                threshold: 8,
+                tasks_dir: Path::new("/tmp"),
+                db_dir: Path::new("/tmp"),
+                fallback_wait: 300,
+                ask_ttl_override: Some(15),
+                policy: &policy,
+                tier_fallback: None,
+                execute_account_action: true,
+                unavailable_rungs: &mut set,
+                work: &work,
+                buckets: Some(std::slice::from_ref(&frontier)),
+                account_remaining: Some(76.0),
+                account_reset_at: None,
+                models: crate::loop_engine::model::builtin_resolved_models(),
+                ask_policy_reeval: None,
+            },
+            &wait,
+        );
+        // forbade + CLI 15 → Ask sleep then Deferred
+        assert_eq!(result, UsageCheckResult::Deferred);
+        assert_eq!(*waited.borrow(), vec![900]);
+    }
+
+    #[test]
+    fn ask_wait_mid_flip_to_allow_continues_early() {
+        use std::cell::Cell;
+        let work = RemainingWorkSnapshot {
+            other_rungs_runnable: true,
+            max_difficulty: Some("high"),
+            ..RemainingWorkSnapshot::default()
+        };
+        let ticks = Cell::new(0u32);
+        let timing = WaitTiming {
+            stop_check_secs: 1,
+            probe_secs: 30,
+            status_secs: 60,
+        };
+        let outcome = wait_for_ask_ttl_inner(
+            15 * 60,
+            Path::new("/tmp"),
+            timing,
+            |_| {},
+            || {
+                let n = ticks.get();
+                ticks.set(n + 1);
+                if n == 0 {
+                    AskPolicySlice {
+                        usage_policy: UsagePolicy::default(),
+                        tier_fallback: None,
+                    }
+                } else {
+                    AskPolicySlice {
+                        usage_policy: UsagePolicy::default(),
+                        tier_fallback: Some(factory_fb()),
+                    }
+                }
+            },
+            &work,
+            /* initial_allows */ false,
+        );
+        assert_eq!(outcome, AskWaitOutcome::Continue);
+        assert!(
+            ticks.get() >= 2,
+            "must re-eval on stop-check before early continue"
+        );
+    }
+
+    #[test]
+    fn ask_wait_timeout_forbade_defers() {
+        let work = RemainingWorkSnapshot {
+            other_rungs_runnable: true,
+            max_difficulty: Some("high"),
+            ..RemainingWorkSnapshot::default()
+        };
+        let timing = WaitTiming {
+            stop_check_secs: 5,
+            probe_secs: 30,
+            status_secs: 60,
+        };
+        let outcome = wait_for_ask_ttl_inner(
+            10,
+            Path::new("/tmp"),
+            timing,
+            |_| {},
+            || AskPolicySlice {
+                usage_policy: UsagePolicy::default(),
+                tier_fallback: None,
+            },
+            &work,
+            false,
+        );
+        assert_eq!(outcome, AskWaitOutcome::Defer);
     }
 
     #[test]
@@ -3392,7 +3962,9 @@ mod tests {
             QuotaPreflightParams {
                 threshold: 8,
                 tasks_dir: Path::new("/tmp"),
+                db_dir: Path::new("/tmp"),
                 fallback_wait: 300,
+                ask_ttl_override: None,
                 policy: &policy,
                 tier_fallback: None,
                 execute_account_action: true,
@@ -3402,6 +3974,7 @@ mod tests {
                 account_remaining: Some(76.0),
                 account_reset_at: None,
                 models: crate::loop_engine::model::builtin_resolved_models(),
+                ask_policy_reeval: None,
             },
             &wait,
         );
@@ -3431,7 +4004,9 @@ mod tests {
             QuotaPreflightParams {
                 threshold: 8,
                 tasks_dir: Path::new("/tmp"),
+                db_dir: Path::new("/tmp"),
                 fallback_wait: 300,
+                ask_ttl_override: None,
                 policy: &policy,
                 tier_fallback: Some(&factory_fb()),
                 execute_account_action: true,
@@ -3441,6 +4016,7 @@ mod tests {
                 account_remaining: Some(5.0),
                 account_reset_at: None,
                 models: crate::loop_engine::model::builtin_resolved_models(),
+                ask_policy_reeval: None,
             },
             &wait,
         );
@@ -3473,7 +4049,9 @@ mod tests {
             QuotaPreflightParams {
                 threshold: 8,
                 tasks_dir: Path::new("/tmp"),
+                db_dir: Path::new("/tmp"),
                 fallback_wait: 300,
+                ask_ttl_override: None,
                 policy: &policy,
                 tier_fallback: Some(&factory_fb()),
                 execute_account_action: true,
@@ -3483,6 +4061,7 @@ mod tests {
                 account_remaining: Some(5.0),
                 account_reset_at: None,
                 models: crate::loop_engine::model::builtin_resolved_models(),
+                ask_policy_reeval: None,
             },
             &wait,
         );
@@ -3863,7 +4442,9 @@ mod tests {
             QuotaPreflightParams {
                 threshold: 8,
                 tasks_dir: Path::new("/tmp"),
+                db_dir: Path::new("/tmp"),
                 fallback_wait: 300,
+                ask_ttl_override: None,
                 policy: &policy,
                 tier_fallback: Some(&fb),
                 execute_account_action: true,
@@ -3873,6 +4454,7 @@ mod tests {
                 account_remaining: Some(45.0),
                 account_reset_at: None,
                 models: crate::loop_engine::model::builtin_resolved_models(),
+                ask_policy_reeval: None,
             },
             &load,
             &reset_wait,
@@ -3928,7 +4510,9 @@ mod tests {
             QuotaPreflightParams {
                 threshold: 8,
                 tasks_dir: Path::new("/tmp"),
+                db_dir: Path::new("/tmp"),
                 fallback_wait: 300,
+                ask_ttl_override: None,
                 policy: &policy,
                 tier_fallback: Some(&fb),
                 execute_account_action: true,
@@ -3938,6 +4522,7 @@ mod tests {
                 account_remaining: Some(5.0),
                 account_reset_at: None,
                 models: crate::loop_engine::model::builtin_resolved_models(),
+                ask_policy_reeval: None,
             },
             &wait,
         );
@@ -3973,7 +4558,9 @@ mod tests {
             QuotaPreflightParams {
                 threshold: 8,
                 tasks_dir: Path::new("/tmp"),
+                db_dir: Path::new("/tmp"),
                 fallback_wait: 300,
+                ask_ttl_override: None,
                 policy: &policy,
                 tier_fallback: Some(&fb),
                 execute_account_action: true,
@@ -3983,6 +4570,7 @@ mod tests {
                 account_remaining: Some(5.0),
                 account_reset_at: None,
                 models: crate::loop_engine::model::builtin_resolved_models(),
+                ask_policy_reeval: None,
             },
             &wait,
         );
@@ -4014,7 +4602,9 @@ mod tests {
             QuotaPreflightParams {
                 threshold: 8,
                 tasks_dir: Path::new("/tmp"),
+                db_dir: Path::new("/tmp"),
                 fallback_wait: 300,
+                ask_ttl_override: None,
                 policy: &policy,
                 tier_fallback: Some(&fb),
                 execute_account_action: true,
@@ -4024,6 +4614,7 @@ mod tests {
                 account_remaining: Some(5.0),
                 account_reset_at: Some(past.as_str()),
                 models: crate::loop_engine::model::builtin_resolved_models(),
+                ask_policy_reeval: None,
             },
             &wait,
         );
@@ -4062,7 +4653,9 @@ mod tests {
             QuotaPreflightParams {
                 threshold: 8,
                 tasks_dir: Path::new("/tmp"),
+                db_dir: Path::new("/tmp"),
                 fallback_wait: 300,
+                ask_ttl_override: None,
                 policy: &policy,
                 tier_fallback: Some(&fb),
                 execute_account_action: true,
@@ -4072,6 +4665,7 @@ mod tests {
                 account_remaining: Some(76.0),
                 account_reset_at: None,
                 models: crate::loop_engine::model::builtin_resolved_models(),
+                ask_policy_reeval: None,
             },
             &wait,
         );
@@ -4079,7 +4673,9 @@ mod tests {
             QuotaPreflightParams {
                 threshold: 8,
                 tasks_dir: Path::new("/tmp"),
+                db_dir: Path::new("/tmp"),
                 fallback_wait: 300,
+                ask_ttl_override: None,
                 policy: &policy,
                 tier_fallback: Some(&fb),
                 execute_account_action: true,
@@ -4089,6 +4685,7 @@ mod tests {
                 account_remaining: Some(76.0),
                 account_reset_at: None,
                 models: crate::loop_engine::model::builtin_resolved_models(),
+                ask_policy_reeval: None,
             },
             &wait,
         );
@@ -4121,7 +4718,9 @@ mod tests {
             QuotaPreflightParams {
                 threshold: 8,
                 tasks_dir: Path::new("/tmp"),
+                db_dir: Path::new("/tmp"),
                 fallback_wait: 300,
+                ask_ttl_override: None,
                 policy: &policy,
                 tier_fallback: Some(&fb),
                 execute_account_action: true,
@@ -4131,6 +4730,7 @@ mod tests {
                 account_remaining: Some(76.0),
                 account_reset_at: None,
                 models: crate::loop_engine::model::builtin_resolved_models(),
+                ask_policy_reeval: None,
             },
             &wait,
         );
@@ -4157,7 +4757,9 @@ mod tests {
             QuotaPreflightParams {
                 threshold: 8,
                 tasks_dir: Path::new("/tmp"),
+                db_dir: Path::new("/tmp"),
                 fallback_wait: 300,
+                ask_ttl_override: None,
                 policy: &policy,
                 tier_fallback: Some(&fb),
                 execute_account_action: true,
@@ -4167,6 +4769,7 @@ mod tests {
                 account_remaining: None,
                 account_reset_at: None,
                 models: crate::loop_engine::model::builtin_resolved_models(),
+                ask_policy_reeval: None,
             },
             &wait,
         );
@@ -4197,7 +4800,9 @@ mod tests {
             QuotaPreflightParams {
                 threshold: 8,
                 tasks_dir: Path::new("/tmp"),
+                db_dir: Path::new("/tmp"),
                 fallback_wait: 300,
+                ask_ttl_override: None,
                 policy: &policy,
                 tier_fallback: Some(&fb),
                 execute_account_action: false, // LOOP_USAGE_CHECK_ENABLED=false
@@ -4207,6 +4812,7 @@ mod tests {
                 account_remaining: Some(76.0),
                 account_reset_at: None,
                 models: crate::loop_engine::model::builtin_resolved_models(),
+                ask_policy_reeval: None,
             },
             &wait,
         );
@@ -4245,7 +4851,9 @@ mod tests {
                 tier_fallback: Some(&fb),
                 threshold: 8,
                 tasks_dir: Path::new("/tmp"),
+                db_dir: Path::new("/tmp"),
                 fallback_wait: 300,
+                ask_ttl_override: None,
                 execute_account_action: false,
             },
             &load,
@@ -4288,7 +4896,9 @@ mod tests {
                 tier_fallback: Some(&fb),
                 threshold: 8,
                 tasks_dir: Path::new("/tmp"),
+                db_dir: Path::new("/tmp"),
                 fallback_wait: 300,
+                ask_ttl_override: None,
                 execute_account_action: true,
             },
             &load,
