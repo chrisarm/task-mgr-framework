@@ -920,6 +920,15 @@ file is literally called `init` or `run`.
             default_value_t = false
         )]
         auto_review: bool,
+
+        /// Minutes to wait on Ask for operator policy before continue/defer.
+        ///
+        /// Overrides `usagePolicy.askTtlMinutes` for this run only (does not
+        /// write config.json). `0` is allowed and means defer immediately with
+        /// no sleep. Flag omitted → use config (default 0). Present `0` is
+        /// `Some(0)`, not omitted.
+        #[arg(long = "use-other-models-ttl", value_name = "MINUTES")]
+        use_other_models_ttl: Option<u64>,
     },
 
     /// Show status dashboard for PRD projects
@@ -1034,6 +1043,15 @@ your PRD file is literally called `init` or `run`.
             default_value_t = false
         )]
         auto_review: bool,
+
+        /// Minutes to wait on Ask for operator policy before continue/defer.
+        ///
+        /// Overrides `usagePolicy.askTtlMinutes` for this run only (does not
+        /// write config.json). `0` is allowed and means defer immediately with
+        /// no sleep. Flag omitted → use config (default 0). Present `0` is
+        /// `Some(0)`, not omitted.
+        #[arg(long = "use-other-models-ttl", value_name = "MINUTES")]
+        use_other_models_ttl: Option<u64>,
     },
 
     /// Import learnings from a progress.json or learnings JSON file
@@ -1407,6 +1425,15 @@ pub enum LoopCommand {
             default_value_t = false
         )]
         auto_review: bool,
+
+        /// Minutes to wait on Ask for operator policy before continue/defer.
+        ///
+        /// Overrides `usagePolicy.askTtlMinutes` for this run only (does not
+        /// write config.json). `0` is allowed and means defer immediately with
+        /// no sleep. Flag omitted → use config (default 0). Present `0` is
+        /// `Some(0)`, not omitted.
+        #[arg(long = "use-other-models-ttl", value_name = "MINUTES")]
+        use_other_models_ttl: Option<u64>,
     },
 }
 
@@ -1500,6 +1527,15 @@ pub enum BatchCommand {
             default_value_t = false
         )]
         auto_review: bool,
+
+        /// Minutes to wait on Ask for operator policy before continue/defer.
+        ///
+        /// Overrides `usagePolicy.askTtlMinutes` for this run only (does not
+        /// write config.json). `0` is allowed and means defer immediately with
+        /// no sleep. Flag omitted → use config (default 0). Present `0` is
+        /// `Some(0)`, not omitted.
+        #[arg(long = "use-other-models-ttl", value_name = "MINUTES")]
+        use_other_models_ttl: Option<u64>,
     },
 }
 
@@ -1561,6 +1597,7 @@ pub fn resolve_loop_command(
     parallel: usize,
     no_auto_review: bool,
     auto_review: bool,
+    use_other_models_ttl: Option<u64>,
 ) -> LoopResolve {
     if let Some(child) = cmd {
         return LoopResolve::Nested(child);
@@ -1578,6 +1615,7 @@ pub fn resolve_loop_command(
             parallel,
             no_auto_review,
             auto_review,
+            use_other_models_ttl,
         });
     }
     LoopResolve::PrintHelp
@@ -1598,6 +1636,7 @@ pub fn resolve_batch_command(
     parallel: usize,
     no_auto_review: bool,
     auto_review: bool,
+    use_other_models_ttl: Option<u64>,
 ) -> BatchResolve {
     if let Some(child) = cmd {
         return BatchResolve::Nested(child);
@@ -1612,6 +1651,7 @@ pub fn resolve_batch_command(
             parallel,
             no_auto_review,
             auto_review,
+            use_other_models_ttl,
         });
     }
     BatchResolve::PrintHelp
@@ -1754,6 +1794,65 @@ EXAMPLES:
         /// Task-ID prefix to unroute
         prefix: String,
     },
+
+    /// Append or replace a usagePolicy.rules entry (per-bucket onLow)
+    #[command(
+        name = "set-usage-rule",
+        after_help = "\
+EXAMPLES:
+    task-mgr models set-usage-rule --kind weekly_scoped --on-low unavailable
+    task-mgr models set-usage-rule --id seven_day_fable --on-low ask
+    task-mgr models set-usage-rule --kind weekly_scoped --id seven_day --on-low wait
+"
+    )]
+    SetUsageRule {
+        /// Bucket kind matcher (e.g. weekly_scoped). At least one of --kind / --id required.
+        #[arg(long)]
+        kind: Option<String>,
+        /// Bucket id matcher. At least one of --kind / --id required.
+        #[arg(long)]
+        id: Option<String>,
+        /// Action when the matched bucket is low: wait | unavailable | stop | ask | ignore
+        #[arg(long = "on-low")]
+        on_low: String,
+    },
+
+    /// Set routing.tierFallback (maxDifficulty + include flags)
+    #[command(
+        name = "set-tier-fallback",
+        after_help = "\
+EXAMPLES:
+    task-mgr models set-tier-fallback high
+    task-mgr models set-tier-fallback medium --include-review --include-forced
+    task-mgr models set-tier-fallback high --include-review=false
+"
+    )]
+    SetTierFallback {
+        /// Highest difficulty eligible for auto-unavailable: low | medium | high
+        difficulty: String,
+        /// Include review-class tasks (default true). Pass false to opt out.
+        #[arg(
+            long = "include-review",
+            num_args = 0..=1,
+            default_value = "true",
+            default_missing_value = "true",
+            action = clap::ArgAction::Set
+        )]
+        include_review: bool,
+        /// Include explicit tasks.model forced routes (default false). Bare flag = true.
+        #[arg(
+            long = "include-forced",
+            num_args = 0..=1,
+            default_value = "false",
+            default_missing_value = "true",
+            action = clap::ArgAction::Set
+        )]
+        include_forced: bool,
+    },
+
+    /// Clear routing.tierFallback to JSON null (ask opt-out; does NOT delete the key)
+    #[command(name = "unset-tier-fallback")]
+    UnsetTierFallback,
 }
 
 /// Decisions subcommand actions

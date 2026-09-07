@@ -624,6 +624,7 @@ fn edge_case_3_legacy_keys_hard_error_at_loop_warn_on_nonloop() {
 /// run — exactly the known-bad this test catches.
 #[test]
 fn blackout_reroute_leaves_runner_overrides_untouched() {
+    let empty_unavailable = std::collections::HashSet::new();
     // Production-shaped models config (FR-001 JSON): Claude primary + Grok
     // enabled, anchor standard, spillover up to `high`.
     let models: ModelsConfig = serde_json::from_value(serde_json::json!({
@@ -668,6 +669,8 @@ fn blackout_reroute_leaves_runner_overrides_untouched() {
         difficulty: Some("medium"),
         models: &resolved,
         provider_blackouts: &active,
+        unavailable_rungs: &empty_unavailable,
+        tier_fallback: None,
     });
 
     // The reroute moved the task OFF the blacked-out provider...
@@ -701,6 +704,7 @@ fn blackout_reroute_leaves_runner_overrides_untouched() {
 /// `handle_quota_deferral_inner` both no-eligible handlers share.
 #[test]
 fn blackout_medium_reroutes_while_frontier_review_defers_zero_stale() {
+    let empty_unavailable = std::collections::HashSet::new();
     // Production-shaped FR-001 config: Claude primary (full ladder) + Grok
     // enabled, anchor=standard, spillover up to `high`.
     let models: ModelsConfig = serde_json::from_value(serde_json::json!({
@@ -756,6 +760,8 @@ fn blackout_medium_reroutes_while_frontier_review_defers_zero_stale() {
         difficulty: Some("medium"),
         models: &resolved,
         provider_blackouts: &active,
+        unavailable_rungs: &empty_unavailable,
+        tier_fallback: None,
     });
     assert_eq!(
         medium.provider,
@@ -776,6 +782,8 @@ fn blackout_medium_reroutes_while_frontier_review_defers_zero_stale() {
         difficulty: Some("high"),
         models: &resolved,
         provider_blackouts: &active,
+        unavailable_rungs: &empty_unavailable,
+        tier_fallback: None,
     });
     assert_eq!(
         review.provider,

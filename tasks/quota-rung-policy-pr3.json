@@ -1,0 +1,587 @@
+{
+  "branchName": "feat/quota-rung-policy-pr3",
+  "description": "PR-3 only (FR-005 + FR-006 + FR-008 / US-005 + US-006 + US-007). Build on landed PR-2 (evaluate/apply, remaining-percent, proto-channel HashSet exclude, factory tierFallback, askTtlMinutes sleep, HorizonStopped vs operator_stopped, handle_rung_only_empty_selection) — do not reimplement those. Ship: --use-other-models-ttl on loop/batch run (0 allowed, overrides askTtlMinutes for this run, re-evaluate config on stop-check cadence); rung blackout expiry + down-only walker in resolve_execution_plan (never model_for); family-match explicit tasks.model at resolve; includeForced per-task; long-horizon stop-this-PRD + next PRD inherits unavailable (batch/process-local); never handle_quota_deferral for rungs; models set-usage-rule / set-tier-fallback / unset; models show policy with remaining numbers only behind the list --remote live-fetch gate.",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "No warnings in `cargo check` output",
+      "No warnings in `cargo clippy -- -D warnings` (per-iteration). `--all-targets` is REVIEW-001 only",
+      "`cargo fmt --check` passes",
+      "Scoped tests for touched modules pass",
+      "No unwrap() in production code paths",
+      "Sequential and wave paths stay parity-locked for account reactions (exhaustive destructure, shared coordinators)",
+      "Engine keys are (Provider, CapabilityTier) only — no fable / opus / claude-fable-5 in quota.rs, engine.rs proto-channel, or walker state",
+      "Do not reimplement PR-2 evaluate/apply, remaining-percent, proto-channel replace-on-evaluate, factory tierFallback serde, askTtlMinutes sleep, HorizonStopped, or handle_rung_only_empty_selection — extend them",
+      "No live Anthropic / real ~/.claude credentials in unit tests; verify-task-mgr must not pass --remote or set TASK_MGR_USE_API"
+    ],
+    "description": "These criteria apply to ALL implementation tasks"
+  },
+  "mergeStrategy": "Merge to main after REVIEW-001 passes. Squash commits optional.",
+  "prdFile": "prd-quota-rung-policy.md",
+  "priorityPhilosophy": {
+    "description": "Hierarchy of what matters most when implementing tasks",
+    "hierarchy": [
+      "1. PLAN — Anticipate edge cases before coding",
+      "2. PHASE 2 FOUNDATION — ~1 day now to save ~2+ weeks later (1:10+ ratio); we are pre-launch, foundations compound",
+      "3. FUNCTIONING CODE — Pragmatic, reliable, wired in per plan",
+      "4. CORRECTNESS — Compiles, type-checks, scoped tests pass deterministically",
+      "5. CODE QUALITY — Clean code, qualityDimensions satisfied, no warnings",
+      "6. POLISH — Docs, formatting, minor improvements"
+    ],
+    "principles": [
+      "Quality dimensions explicit — qualityDimensions on every task tells you what 'good' looks like",
+      "Phase 2 foundation — down-only walker + expiry map over a Fable-only special case; CLI flag over a hardcoded TTL",
+      "Edge cases = test cases — every PR-3 known edge case must have a corresponding test",
+      "Scoped per-iteration tests, full suite at REVIEW-001 — REVIEW must leave the trunk green including pre-existing failures",
+      "Engine speaks capability rungs (frontier/standard/cost-efficient/cheapest), never model ids except the ingest adapter",
+      "Factory default IS the pin-3 downgrade instruction; ask is the opt-out; TTL expiry continues only if the same eligibility as tierFallback would accept the task",
+      "Ship working code with tests to prove it; handle Option/Result explicitly; avoid unwrap() in production"
+    ]
+  },
+  "prohibitedOutcomes": [
+    "Reimplementing PR-2 evaluate_quota/apply_quota, remaining-percent rename, proto-channel HashSet exclude, factory tierFallback serde, askTtlMinutes sleep (CODE-FIX-010), HorizonStopped vs operator_stopped (CODE-FIX-008), or handle_rung_only_empty_selection (CODE-FIX-009)",
+    "Calling ResolvedModelsConfig::model_for for blackout clamp (bidirectional; can walk UP onto a blacked frontier)",
+    "Storing fable / opus / claude-fable-5 in quota.rs, IterationContext, walker keys, or LoopResult inherit",
+    "Reusing handle_quota_deferral for rung-only exhaustion (stale-abort, learning 3927 / 5088 / 5474)",
+    "Documenting a wait loop as accepted for explicit off-ladder tasks.model (family-match at resolve; defer if unavailable and includeForced=false)",
+    "Treating includeForced:false as a global forbid of factory unavailable (CODE-FIX-003 already forbids that; PR-3 is per-task family-match defer)",
+    "TTL 0 sleeping; TTL > 0 as a deaf fixed sleep that ignores a mid-wait config write",
+    "Computing effective_ttl only inside execute_quota_account_action so config askTtlMinutes 0 + --use-other-models-ttl 15 still Defer",
+    "Converting factory/allowing unavailable+Proceed into Ask because a CLI TTL is set",
+    "Treating expired expiry-map keys as active HashSet members (must use active_rungs(&map, now))",
+    "Ask-continue on TTL expiry when the operator forbade downgrade (unset/null tierFallback, narrower maxDifficulty, includeReview false) — must defer",
+    "Ask timeout setting was_stopped / stopping batch --chain; operator .stop during ask must still stop the chain",
+    "Rung-scoped long-horizon stop not inheriting unavailable into the next PRD (next PRD re-stops instead of clamping to standard)",
+    "Account-binding stop failing to stop the chain",
+    "Printing remaining numbers from models show without the same live-fetch gate as models list --remote",
+    "unset-tier-fallback deleting the key (serde then yields factory Some). Unset MUST write JSON null (ask opt-out)",
+    "Spillover counting as a working rung for rung-scoped decisions",
+    "quota.rs importing runners, clap, or SQLite; model.rs parsing OAuth JSON",
+    "New DB columns; persisting last-fetched buckets or rung blackouts",
+    "Collapsing dual Anthropic I/O predicates onto one flag",
+    "Tests that require live Anthropic network or real ~/.claude credentials",
+    "Driving `loop run` / `batch run` (verify-task-mgr refuses; `loop run --help` / `batch run --help` / `models` text are the safe probes)",
+    "Inventing a second verification harness",
+    "Manual edits to tasks/*.json for status (use task-mgr CLI / task-status tags)",
+    "unwrap() in production paths",
+    "Catch-all error handlers that swallow context"
+  ],
+  "project": "task-mgr",
+  "requires": [],
+  "reviewGuidelines": {
+    "priorityGuidelines": {
+      "critical": "1-10: Blocks further work, fix immediately",
+      "high": "11-20: Fix before phase completion",
+      "low": "51-99: Defer to hardening phase",
+      "medium": "21-50: Fix in current phase if time permits"
+    }
+  },
+  "taskPrefix": "5d58149d",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "`task-mgr loop run … --use-other-models-ttl <minutes>` and `task-mgr batch run … --use-other-models-ttl <minutes>` accept minutes including 0. Wire the flag on LoopCommand::Run, BatchCommand::Run, AND the deprecated flat parent forms (Commands::Loop / Commands::Batch) plus resolve_loop_command / resolve_batch_command. Omitted flag → None (use config usagePolicy.askTtlMinutes, default 0). Present `0` is Some(0), not omitted",
+        "Compute `effective_ttl = cli.unwrap_or(policy.ask_ttl_minutes)` **before** apply / `ask_or_defer` (not only inside `execute_quota_account_action`). Flag overrides config for this run only; does not write config.json. LoopConfig field is Option<u64> (None = config). Exhaustive LoopConfig destructure in config.rs tests must add the field. Thread through main.rs loop/batch dispatch and run_batch. Keep CODE-FIX-010 sleep. Known-bad: config `askTtlMinutes: 0` + `--use-other-models-ttl 15` still Defer because apply already called `ask_or_defer(0)` — that fixture must emit `Ask { 15 }`",
+        "Ask/Defer is the opt-out path (JSON null / unset-tier-fallback, narrower maxDifficulty, includeReview false) or explicit onLow ask only. Factory/allowing tierFallback stays unavailable+Proceed (continue-via-unavailable, already PR-2) — CLI TTL must not convert factory into Ask. On the Ask path, ask-continue uses the same eligibility as tierFallback; if the operator forbade downgrade, TTL expiry defers, it does not continue",
+        "Ask-path TTL 0: no sleep (learning 5468); Defer. Discriminator: sleeping 0s via wait() is still a sleep — return Deferred without calling wait. Factory + TTL 0 is not this path (continue-via-unavailable)",
+        "Ask-path TTL > 0: re-evaluate config (usagePolicy + routing.tierFallback only — not a whole-run ProjectConfig reload) on the stop-check cadence (WaitTiming.stop_check_secs, same loop as wait_for_usage_reset_inner). Not a deaf fixed sleep. On timeout: same eligibility rule (continue if allowed, else defer). A mid-wait config write that sets/allows tierFallback must be picked up on the next stop-check without requiring .stop",
+        "Ask that times out does not stop batch --chain (was_stopped stays false; do not return StopSignaled). Ask still waiting when the operator .stop's does stop the chain (StopSignaled, exit 130). HorizonStopped remains the quota-stop sibling (CODE-FIX-008) — do not collapse Ask-timeout into it",
+        "Distinct stderr names continue vs defer, using rung labels not model ids, and names the exact flag: `ask: frontier 5% left; other rungs available; waiting 15m for policy (--use-other-models-ttl), then continuing on standard` OR `… then deferring (tierFallback forbids)` (name unset-tier-fallback / set-tier-fallback as appropriate). ui::* or historical stderr wait-banner style; not tracing",
+        "Drive `.claude/skills/verify-task-mgr/SKILL.md` after the language gate: `$H launch && $H sandbox-new && $H doctor`; `$H capture loop-run-help -- loop run --help` AND `$H capture batch-run-help -- batch run --help` both list `--use-other-models-ttl` and mention 0 is allowed. Never drive `loop run` / `batch run`. Evidence in VERIFY_TASK_MGR_EVIDENCE. Compile/unit tests alone are not proof the flag is on the operator surface"
+      ],
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/loop_engine/reactions/account.rs",
+            "impact": "BREAKS",
+            "line": 1673,
+            "mitigation": "Compute effective_ttl = cli.unwrap_or(policy.ask_ttl_minutes) BEFORE apply/ask_or_defer. Keep CODE-FIX-010 sleep. Do not only swap ttl inside execute_quota_account_action. Re-read usagePolicy+tierFallback on stop-check when TTL>0. Timeout: continue iff tier_fallback_allows, else Deferred. .stop during ask → StopSignaled",
+            "usage": "ask_or_defer(policy.ask_ttl_minutes) runs at apply; config 0 emits Defer before execute. QuotaAccountAction::Ask { ttl_minutes } then sleeps ttl*60 (CODE-FIX-010)"
+          },
+          {
+            "file": "src/cli/commands.rs",
+            "impact": "BREAKS",
+            "line": 1358,
+            "mitigation": "Add --use-other-models-ttl Option<u64> on LoopCommand::Run, BatchCommand::Run, Commands::Loop, Commands::Batch; thread through resolve_loop_command / resolve_batch_command. 0 is Some(0)",
+            "usage": "Loop/batch run clap bags have no TTL flag"
+          },
+          {
+            "file": "src/loop_engine/batch.rs",
+            "impact": "BREAKS",
+            "line": 487,
+            "mitigation": "Accept the Option<u64> and pass into each PRD's LoopConfig. Ask-timeout must not set was_stopped. Comment about mid-loop config.json not taking effect has a documented exception: Ask wait re-reads usagePolicy+tierFallback on stop-check only",
+            "usage": "run_batch caches ProjectConfig once; mid-loop config edits do not take effect"
+          },
+          {
+            "file": "src/loop_engine/config.rs",
+            "impact": "BREAKS",
+            "line": 1490,
+            "mitigation": "Add use_other_models_ttl: Option<u64> to LoopConfig + Default + from_env (leave None; CLI-only) + exhaustive destructure test",
+            "usage": "test_loop_config_has_no_permission_mode_field exhaustively destructures LoopConfig"
+          }
+        ],
+        "semanticDistinctions": [
+          {
+            "context": "Factory/allowing tierFallback + any TTL (including CLI 15)",
+            "currentBehavior": "apply emits unavailable+Proceed (continue-via-unavailable). Ask/Defer is not this path",
+            "requiredBehavior": "Keep unavailable+Proceed. CLI TTL must not convert factory into Ask. Ask/Defer is opt-out (JSON null / unset-tier-fallback / narrower maxDifficulty / includeReview false) or explicit onLow ask only"
+          },
+          {
+            "context": "Ask path (opt-out / explicit onLow ask), config askTtlMinutes 0, CLI --use-other-models-ttl 15",
+            "currentBehavior": "ask_or_defer(policy.ask_ttl_minutes=0) emits Defer at apply; swapping ttl in execute never sees Ask",
+            "requiredBehavior": "effective_ttl = cli.unwrap_or(policy.ask_ttl_minutes) before apply → Ask { 15 }; CODE-FIX-010 sleep 900s"
+          },
+          {
+            "context": "Ask TTL 15, operator forbade downgrade, no human",
+            "currentBehavior": "Sleep 900s then WaitedAndReset (continue)",
+            "requiredBehavior": "Re-eval on stop-check; on timeout defer (tierFallback forbids). Distinct stderr"
+          },
+          {
+            "context": "Ask timeout vs operator .stop vs horizon Stop",
+            "currentBehavior": "Ask wait false → StopSignaled (stops batch chain)",
+            "requiredBehavior": "Timeout → not was_stopped, chain continues. .stop during ask → StopSignaled, chain stops. HorizonStopped stays the quota-stop sibling (CODE-FIX-008)"
+          }
+        ]
+      },
+      "dependsOn": [],
+      "description": "PR-3 / US-005 + FR-005. Add --use-other-models-ttl <minutes> (0 allowed) on loop run and batch run. Compute effective_ttl = cli.unwrap_or(policy.ask_ttl_minutes) BEFORE apply/ask_or_defer so config 0 + CLI 15 emits Ask { 15 }, not Defer. Keep CODE-FIX-010 sleep; do not only swap ttl in execute. Factory/allowing stays continue-via-unavailable (not Ask). Ask/Defer is opt-out / explicit onLow ask only. TTL > 0 re-evaluates usagePolicy + routing.tierFallback on the stop-check cadence. Continue vs defer uses the same eligibility as tierFallback; if the operator forbade, TTL expiry defers. Distinct stderr. Ask-timeout does not stop batch --chain; operator .stop during ask does.",
+      "edgeCases": [
+        "Factory/allowing tierFallback + any TTL (config or CLI 15) → unavailable+Proceed (continue-via-unavailable); not Ask",
+        "Ask path (opt-out / explicit onLow ask), config askTtlMinutes 0 + --use-other-models-ttl 15 → Ask { 15 }, not Defer",
+        "Ask path, --use-other-models-ttl 0 overrides config askTtlMinutes 15 → Defer, no sleep",
+        "Ask path TTL 0, operator explicit JSON null / unset-tier-fallback → no sleep; defer (do not continue)",
+        "Ask path TTL 15, no human, operator forbade → re-evaluate on stop-check; on timeout defer; stderr names tierFallback forbids",
+        "Human writes set-tier-fallback mid-Ask-wait → next stop-check uses it (no .stop required)",
+        "Operator .stop during ask wait → StopSignaled, batch --chain stops",
+        "Ask timeout → was_stopped false; batch --chain continues"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "effective_ttl applied only inside execute_quota_account_action after ask_or_defer(policy.ask_ttl_minutes)",
+          "expectedBehavior": "config askTtlMinutes 0 + --use-other-models-ttl 15 still Defer; Ask { 15 } fixture must fail"
+        },
+        {
+          "cause": "Omitted flag and --use-other-models-ttl 0 both become None",
+          "expectedBehavior": "Config TTL 15 would still sleep; Some(0) vs None test must fail"
+        },
+        {
+          "cause": "Deaf sleep that ignores a mid-wait config write",
+          "expectedBehavior": "Human set-tier-fallback during 15m wait is ignored until next iteration; stop-check re-eval test must fail"
+        },
+        {
+          "cause": "TTL expiry continues when operator forbade downgrade",
+          "expectedBehavior": "Frontier-out + explicit-null + TTL 0/15 continues on standard; eligibility test must fail"
+        },
+        {
+          "cause": "Ask timeout returns StopSignaled / was_stopped true",
+          "expectedBehavior": "batch --chain skips remaining PRDs; timeout-must-not-stop-chain test must fail"
+        },
+        {
+          "cause": "Flag only on nested `loop run` and not on `batch run` / flat parent / resolve_*",
+          "expectedBehavior": "verify-task-mgr batch-run-help capture misses the flag"
+        }
+      ],
+      "id": "FEAT-006",
+      "invariants": [
+        "effective_ttl = cli.unwrap_or(policy.ask_ttl_minutes) is computed before apply/ask_or_defer",
+        "CLI Some(minutes) including 0 overrides config; omitted uses config askTtlMinutes default 0",
+        "Factory/allowing never enters Ask (continue-via-unavailable); Ask/Defer is opt-out / explicit onLow ask only",
+        "Ask-continue eligibility is identical to tier_fallback_allows",
+        "Ask-path TTL 0 never calls wait(); TTL > 0 is stop-check-aware and re-reads usagePolicy+tierFallback"
+      ],
+      "modifiesBehavior": true,
+      "notes": "Implement against landed PR-2 Ask execute (account.rs QuotaAccountAction::Ask). Do not rewrite CODE-FIX-010 sleep. Compute effective_ttl = cli.unwrap_or(policy.ask_ttl_minutes) BEFORE apply/ask_or_defer — do not only swap ttl in execute_quota_account_action. Factory/allowing is continue-via-unavailable (not Ask). Ask/Defer is opt-out / explicit onLow ask only. Re-eval: on each WaitTiming.stop_check_secs tick during Ask wait, re-read project config usagePolicy + routing.tierFallback only (batch.rs 'config cached once' still holds for everything else). Learning [5467]/[5468] hermetic Ask TTL tests: 0 no-sleep, 15→900s, stop mid-wait — extend them for CLI override (config 0 + CLI 15 → Ask { 15 }) + re-eval + forbid-defer. Learning [5427] Deferred for ask/defer. Learning [4126]/[4868] exhaustive destructure. Learning [5075] once-per-wave. Do not implement the down-only walker (FEAT-007) or models set-usage-rule (FEAT-008). Drive verify-task-mgr SKILL.md via `$H capture loop-run-help -- loop run --help` and `$H capture batch-run-help -- batch run --help` (capture names, not feature files). Never loop run. Known-bad: config 0 + CLI 15 still Defer; treating 0 as omitted; WaitedAndReset after forbade TTL; StopSignaled on timeout.",
+      "passes": true,
+      "priority": 2,
+      "qualityDimensions": [
+        "Frontier-low is not an account emergency — continue on standard when eligibility allows",
+        "Ask is the opt-out; factory default is auto-downgrade; TTL expiry defers if the operator forbade",
+        "TTL 0 must not sleep",
+        "ui::* (or historical stderr wait-banner) for operator lines; tracing for diagnostics; rung labels not model names",
+        "Follow existing reaction coordinators: production entry + hermetic _inner + exhaustive param destructure (no `..`)",
+        "Dual predicates unchanged",
+        "No unwrap in production",
+        "Drive verify-task-mgr; compile/unit tests alone are not proof of the clap surface"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Wire --use-other-models-ttl on loop/batch run with stop-check re-eval",
+      "touchesFiles": [
+        "src/cli/commands.rs",
+        "src/main.rs",
+        "src/loop_engine/config.rs",
+        "src/loop_engine/reactions/account.rs",
+        "src/loop_engine/batch.rs",
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Rung blackout is ephemeral `(Provider, CapabilityTier) → expiry` on IterationContext (upgrade the PR-2 HashSet; never persist; never touch runner_overrides / provider_blackouts). Replace-from-decision on successful evaluate (same replace rule as PR-2); keep snapshot on API fail. Provide `active_rungs(&map, now) -> HashSet<(Provider, CapabilityTier)>` so expired keys are not treated as active; existing HashSet callers (compute_quota_excluded_ids, handle_rung_only_empty_selection, PlanContext) stay HashSet via the adapter — do not add iteration.rs / orchestrator.rs / wave_orchestration.rs / wave_scheduler.rs / reaction_parity.rs / model_selection_engine_edges.rs to this task. Synthetic CLI rung-scoped RateLimit writes expiry = 3600 even when spillover is unconfigured. Engine never stores `fable`",
+        "Eligible tasks clamp DOWN defined rungs skipping unavailable ones via a NEW helper in model.rs. Must NOT call ResolvedModelsConfig::model_for (bidirectional nearest-defined can walk UP onto a blacked frontier). Use exact_model_for / defined-rung walk only. Sparse ladder (e.g. grok standard-only, standard blacked) returns None → defer, never up to an undefined/blacked frontier. Factory default maxDifficulty high + includeReview true + includeForced false → automatic clamp for eligible tasks (reviews included)",
+        "Post-resolve clamp after ALL six rungs of resolve_execution_plan, including EXPLICIT_MODEL. PlanContext carries unavailable_rungs (+ now). Both prompt builders (sequential.rs + slot.rs) and compute_quota_excluded_ids pass the set. Overflow skip: handle_overflow escalate / to_1m targets whose rung is blacked are skipped",
+        "Off-ladder explicit tasks.model: family-match the ingest adapter (usage.rs hud_tier_from_label / family token — pub(crate) reuse, do not duplicate HUD tokens in model.rs or quota.rs) against the explicit tasks.model STRING at resolve time. Example: claude-fable-5-1 is off-ladder (tier_of None) but family-maps to frontier; if frontier is unavailable and includeForced=false, DEFER. includeForced=true may clamp. Do not document a wait loop as accepted. Do not use substring tier_of",
+        "If the operator forbids downgrade (JSON null / unset-tier-fallback, narrower maxDifficulty, includeReview false) there is no clamp; ask/TTL expiry defers. includeForced false is PER-TASK (leave forced-model tasks selectable or defer that task) — do not globally forbid factory unavailable (CODE-FIX-003). Deferral stderr names the exact flag (`--include-review`, `--include-forced`, `unset-tier-fallback` / `set-tier-fallback`). Rung labels not model ids",
+        "Next PRD inherits the expiry map batch/process-local (LoopResult field → next IterationContext; not SQLite, not runner_overrides). Receiver filters with `active_rungs(&map, now)` so expired keys are not active",
+        "Rung-only empty selection still goes through handle_rung_only_empty_selection (CODE-FIX-009). Must not fall through handle_quota_deferral. grep -n \"claude-fable-5\\|fable\" src/loop_engine/quota.rs src/loop_engine/engine.rs src/loop_engine/model.rs walker → 0 (HUD tokens stay in usage.rs ingest adapter)",
+        "Unit tests (hermetic, no live Anthropic): (a) down-only from frontier-blacked lands on standard, not up; (b) model_for would-walk-up fixture fails if walker calls it; (c) off-ladder explicit family-match defers when includeForced=false; (d) includeForced=true clamps; (e) next-PRD inherit applies the expiry map so PRD-2 clamps instead of stopping; (f) inherited expired keys are not active (`active_rungs` filters by now); (g) synthetic CLI 3600 expiry; (h) API fail keeps snapshot including expiry"
+      ],
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/loop_engine/model.rs",
+            "impact": "BREAKS",
+            "line": 980,
+            "mitigation": "After the six rungs return (provider, tier), if that pair is blacked and the task may fallback under tierFallback eligibility, walk down defined rungs via the new helper. EXPLICIT_MODEL included. Off-ladder tasks.model family-matched here. Do not call model_for",
+            "usage": "resolve_execution_plan six-rung chain; EXPLICIT_MODEL uses tier_of (None for off-ladder) then anchored_tier — medium difficulty would dispatch to Fable every cycle"
+          },
+          {
+            "file": "src/loop_engine/reactions/pre_spawn.rs",
+            "impact": "BREAKS",
+            "line": 314,
+            "mitigation": "compute_quota_excluded_ids must consult expiry-aware unavailable_rungs AND post-clamp resolve so family-matched explicit pins defer. Empty provider_blackouts remains the production case",
+            "usage": "Excluded ids from proto-channel HashSet; no expiry; no family-match of tasks.model"
+          },
+          {
+            "file": "src/loop_engine/reactions/post_output.rs",
+            "impact": "BREAKS",
+            "line": 89,
+            "mitigation": "Skip overflow escalate/to_1m targets whose rung is blacked. Do not use model_for to pick the skip target",
+            "usage": "handle_overflow uses model_for(target_provider, tier) for escalate targets"
+          },
+          {
+            "file": "src/loop_engine/batch.rs",
+            "impact": "BREAKS",
+            "line": 664,
+            "mitigation": "Carry the expiry map on LoopResult into the next PRD's IterationContext. Receiver uses active_rungs(&map, now)",
+            "usage": "no inherit of proto-channel today; next PRD starts empty"
+          },
+          {
+            "file": "src/loop_engine/reactions/account.rs",
+            "impact": "OK if not reused",
+            "line": 675,
+            "mitigation": "Keep handle_rung_only_empty_selection as the sibling. Falling through handle_quota_deferral trips stale-abort",
+            "usage": "handle_quota_deferral waits provider blackouts then clears"
+          }
+        ],
+        "semanticDistinctions": [
+          {
+            "context": "Factory tierFallback, frontier unavailable, medium implementation task",
+            "currentBehavior": "Excluded from selection (PR-2 proto-channel) but resolve_execution_plan still returns frontier if selected; no clamp; explicit off-ladder pin redispatches",
+            "requiredBehavior": "Clamp down to standard via down-only walker; explicit off-ladder family-match defers unless includeForced"
+          },
+          {
+            "context": "Review class (built-in frontier force), factory includeReview true",
+            "currentBehavior": "Excluded if frontier unavailable (proto-channel)",
+            "requiredBehavior": "Clamp down (factory includeReview true). Operator includeReview false → defer that review, name --include-review"
+          },
+          {
+            "context": "Rung-scoped stop this PRD, next PRD in batch",
+            "currentBehavior": "Next PRD starts with empty proto-channel and may stop again on the same frontier-only queue",
+            "requiredBehavior": "Inherit unavailable so the next PRD clamps to standard. Account-binding stop still stops the chain"
+          }
+        ]
+      },
+      "dependsOn": [
+        "FEAT-006"
+      ],
+      "description": "PR-3 / US-006 + FR-006. Upgrade the PR-2 proto-channel HashSet to an expiry map keyed on (Provider, CapabilityTier). Expose active_rungs(&map, now) -> HashSet so existing HashSet callers do not treat expired keys as active (do not add iteration.rs / orchestrator.rs / wave_orchestration.rs / wave_scheduler.rs / reaction_parity.rs / model_selection_engine_edges.rs). After resolve_execution_plan's six rungs, clamp DOWN via a new walker (must not call model_for). Family-match the ingest adapter against explicit tasks.model at resolve time; defer if that family is unavailable and includeForced=false. includeForced is per-task. Next PRD inherits the expiry map (batch/process-local). Overflow skips blacked rungs. Never handle_quota_deferral. Do not reimplement apply_quota / exclude-from-selection / handle_rung_only_empty_selection.",
+      "edgeCases": [
+        "Explicit tasks.model on an off-ladder frontier id (claude-fable-5-1): family-match at resolve; defer if unavailable and includeForced=false; no accepted wait loop",
+        "Frontier remapped to standard's model (PR-1 pin): extra-mark already marks both (PR-2); clamp still walks down from either",
+        "Reset in 6d, only frontier work left, no fallback → stop this PRD; next PRD inherits unavailable and clamps to standard instead of stopping again",
+        "Account-binding weekly-all remaining 0, reset 6d → stop the chain even if inherit exists (CODE-FIX-002)",
+        "Usage API 429 → keep last rung-blackout snapshot including expiry; do not clear",
+        "Synthetic Fable CLI RateLimit → frontier unavailable expiry 3600 even when spillover is off; still no provider_blackouts.record",
+        "includeForced false + one tasks.model todo + standard work remaining → factory still unavailable+Proceed; the forced task defers per-task (not a global forbid)",
+        "Sparse grok ladder (only standard defined), standard blacked, walker from standard → None (defer), never up",
+        "LOOP_USAGE_CHECK_ENABLED=false → pre-gate off; snapshot kept (CODE-FIX-005); first Fable CLI hit still RateLimit then 3600 synthetic expiry"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "Clamp calls model_for, which walks UP onto blacked frontier from a cheaper defined rung",
+          "expectedBehavior": "Frontier-blacked + cheapest-defined fixture dispatches to frontier; down-only test must fail"
+        },
+        {
+          "cause": "Off-ladder explicit pin skipped because tier_of is None; medium difficulty redispatches to Fable every cycle",
+          "expectedBehavior": "Family-match defer test must fail. Documenting wait-loop as accepted is a prohibited outcome"
+        },
+        {
+          "cause": "Next PRD starts with empty unavailable_rungs after rung-scoped HorizonStopped",
+          "expectedBehavior": "Next PRD stops again instead of clamping to standard; inherit test must fail"
+        },
+        {
+          "cause": "Empty selection falls through handle_quota_deferral",
+          "expectedBehavior": "stale-abort (learning 3927/5088/5474); handle_rung_only_empty_selection must run"
+        },
+        {
+          "cause": "includeForced false globally forbids factory unavailable (regression of CODE-FIX-003)",
+          "expectedBehavior": "Any tasks.model in the queue Defers the whole PRD; factory+has_forced Proceed test must fail"
+        }
+      ],
+      "id": "FEAT-007",
+      "invariants": [
+        "Blackout keys are (Provider, CapabilityTier) with expiry; never model ids; never persisted; active_rungs filters expired keys before HashSet callers",
+        "Down-only walker never calls model_for and never walks up",
+        "Off-ladder explicit tasks.model is family-matched at resolve; defer if unavailable and includeForced=false",
+        "Rung-only empty selection uses handle_rung_only_empty_selection, never handle_quota_deferral"
+      ],
+      "modifiesBehavior": true,
+      "notes": "Build on PR-2 proto-channel + apply + handle_rung_only_empty_selection. Upgrade HashSet to expiry map; replace_unavailable_rungs writes expiry (API resets_at or 3600 for synthetic CLI). Adapter: active_rungs(&HashMap<(Provider, CapabilityTier), u64>, now) -> HashSet of keys with expiry > now. HashSet callers keep their type via the adapter — do not add iteration.rs, orchestrator.rs, wave_orchestration.rs, wave_scheduler.rs, reaction_parity.rs, or model_selection_engine_edges.rs (would exceed 10 touchesFiles). Walker: (provider, start_tier, blacked: &HashSet from active_rungs) -> Option<CapabilityTier> first defined non-blacked LOWER rung. Walk CapabilityTier::ALL descending, skip >= start, skip exact_model_for None, skip blacked. Must not call model_for. Learning [4998]/[5010] two independent clamps — this is a third, down-only. Learning [5027] six-rung comments stay; add a post-resolve clamp comment after TIER_TO_MODEL / EXPLICIT_MODEL. Learning [5414] exact_model_for not model_for. Learning [5120] tier_of stays exact-match. Learning [5431] proto-channel sibling of BlackoutState. Learning [5472]/[5474] rung-only sibling. Learning [1810] main-thread only. Learning [4481] no model ids in engine state. HUD family-match: pub(crate) reuse usage.rs hud_tier_from_label / map_unlabeled_token; do not copy Fable→frontier into model.rs. Sequential and slot BOTH construct PlanContext — missing one is a seq/wave split. Overflow: skip blacked rungs (FR-006). Do not implement set-usage-rule (FEAT-008). Do not restate HorizonStopped. Known-bad: model_for clamp; wait-loop for off-ladder pins; persist expiry in SQLite; treating expired map keys as active HashSet members.",
+      "passes": true,
+      "priority": 10,
+      "qualityDimensions": [
+        "Frontier-low continues on standard (and cheaper rungs) via down-only clamp, not an account wait",
+        "Engine language is capability rungs; ingest adapter is the only HUD Fable→frontier map; family-match of tasks.model reuses that adapter",
+        "model_for is bidirectional nearest-defined — forbidden for blackout clamp",
+        "includeForced is per-task; factory unavailable still fires when other work remains",
+        "Next PRD inherits rung-unavailable (process-local); account-binding stop still stops the chain",
+        "Follow existing reaction coordinators: production entry + hermetic _inner + exhaustive param destructure (no `..`)",
+        "ui::* for deferral lines; rung labels and exact CLI flag names",
+        "No unwrap in production; no new DB columns"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Rung blackout expiry, down-only walker, family-match explicit pins, next-PRD inherit",
+      "touchesFiles": [
+        "src/loop_engine/model.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/usage.rs",
+        "src/loop_engine/reactions/account.rs",
+        "src/loop_engine/reactions/pre_spawn.rs",
+        "src/loop_engine/reactions/post_output.rs",
+        "src/loop_engine/prompt/sequential.rs",
+        "src/loop_engine/prompt/slot.rs",
+        "src/loop_engine/batch.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "`task-mgr models set-usage-rule --kind weekly_scoped --on-low wait|unavailable|stop|ask|ignore` (also `--id`). Appends/replaces a usagePolicy.rules entry. Invalid on-low / missing kind-and-id is a config error naming the accepted set. Sparse serde_json::Value round-trip via the existing set_json_path / validate_and_write chokepoint; unrelated keys (additionalAllowedTools, embeddingModel, …) preserved. reject_legacy_project_config on mutating verbs",
+        "`task-mgr models set-tier-fallback <low|medium|high> [--include-review] [--include-forced]` writes routing.tierFallback (maxDifficulty + flags; omitted flags keep struct defaults includeReview true / includeForced false). `task-mgr models unset-tier-fallback` writes JSON `null` (ask opt-out / serde None) — it must NOT delete the key (absent key deserializes to factory Some). Difficulty typo is a config error naming low|medium|high",
+        "`models show` always prints policy from config (usagePolicy remainingMinPercent / waitIfResetWithinMinutes / stopIfResetBeyondHours / askTtlMinutes / rules; routing.tierFallback or `(unset)` for JSON null / factory note for omitted). Remaining NUMBERS (76% left, 5% left, live buckets) only with the same live-fetch gate as `models list --remote` (ANTHROPIC_API_KEY + TASK_MGR_USE_API=1 via check_opt_in). Offline show must not print remaining percents. Do not call load_usage_info from show without that gate. Silent fallback when not opted in (same as list --remote), not a hard error",
+        "Drive `.claude/skills/verify-task-mgr/SKILL.md` feature models-routing: extend `.claude/skills/verify-task-mgr/features/models-routing.md` with sub-features for set-usage-rule, set-tier-fallback, unset-tier-fallback, and show-policy (offline). Recipe: init + models init + set-usage-rule + set-tier-fallback + show (policy lines present, no remaining percents) + unset-tier-fallback + show (`(unset)` / null). `$H capture models-help -- models --help` lists the new verbs. Never `loop run` / `batch run`. Never `--remote`. Evidence captured. Compile/unit tests alone are not proof",
+        "Unit tests in tests/models_command.rs (and/or handlers.rs #[cfg(test)]): sparse preserve; set-usage-rule writes camelCase onLow; unset-tier-fallback file contains `\"tierFallback\": null`; set-tier-fallback high include-review include-forced round-trips; typo errors; show_to without opt-in has no `% left`. Update src/commands/models/mod.rs exports + main.rs match + CLAUDE.md models section (outside TASK_MGR markers) listing the new verbs"
+      ],
+      "dependsOn": [
+        "FEAT-006",
+        "FEAT-007"
+      ],
+      "description": "PR-3 / US-007 + FR-008. Operator CLI for per-bucket onLow and tierFallback without hand-editing JSON. models show prints policy from config always; remaining numbers only behind the same live-fetch gate as models list --remote. Sparse Value round-trip. unset-tier-fallback writes JSON null (ask opt-out), not key deletion (that would restore factory Some). Do not reimplement evaluate/apply — this only writes the config those layers already read.",
+      "edgeCases": [
+        "unset-tier-fallback writes JSON null (ask opt-out), not key absence (factory Some)",
+        "models show offline: policy printed, no remaining percents, no OAuth GET",
+        "models show with TASK_MGR_USE_API=1 + key: remaining numbers allowed (unit-test the gate; verify-task-mgr must NOT enable it)",
+        "Unrelated config keys survive set-usage-rule / set-tier-fallback",
+        "Typo --on-low waitt / maxDifficulty medio → config error naming accepted set",
+        "set-usage-rule --kind weekly_scoped --on-low wait is now honored by PR-2 CODE-FIX-006 evaluate (do not re-fix the classifier)"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "unset-tier-fallback deletes routing.tierFallback so serde default yields factory Some",
+          "expectedBehavior": "Operator thinks they opted out of auto-downgrade but clamp still fires; null-vs-absent test must fail"
+        },
+        {
+          "cause": "models show prints remaining percents from a hermetic/stale parse without the live-fetch gate",
+          "expectedBehavior": "Offline show contains `76% left`; live-fetch-gate test must fail"
+        },
+        {
+          "cause": "Mutating verb clobbers unrelated keys or skips reject_legacy_project_config",
+          "expectedBehavior": "Sparse-preserve / legacy-hard-error tests (existing models_command.rs patterns) must fail"
+        }
+      ],
+      "id": "FEAT-008",
+      "invariants": [
+        "All writes round-trip serde_json::Value; unrelated keys preserved",
+        "unset-tier-fallback = JSON null (None / ask opt-out); absent key remains factory Some",
+        "Remaining numbers on models show require the same opt-in as list --remote"
+      ],
+      "modifiesBehavior": false,
+      "notes": "Copy handle_set_tier / handle_set_fallback patterns (reject_legacy, parse, set_json_path, validate_and_write, ui::emit_data). New handlers: handle_set_usage_rule, handle_set_tier_fallback, handle_unset_tier_fallback. Export from commands/models/mod.rs; match in main.rs ModelsAction. Flag names: --kind, --id, --on-low, --include-review, --include-forced. Learning [4901] models handler workflow. Do not drive models list --remote or loop run. Feature map: models-routing — add the new sub-features; do not invent a second harness. CLAUDE.md models section (non-TASK_MGR block) lists the verbs; the enhance-managed command table will pick up clap descriptions on the next enhance. Known-bad: remaining percents on offline show; unset deleting the key.",
+      "passes": true,
+      "priority": 11,
+      "qualityDimensions": [
+        "Sparse JSON round-trip; unrelated keys survive",
+        "Policy print is config-only; remaining numbers are live-fetch-gated like list --remote",
+        "unset-tier-fallback is the pin-3 ask opt-out (JSON null), not a factory reset",
+        "ui::* for acks; config errors name the accepted set",
+        "No live Anthropic in default verify-task-mgr recipes",
+        "Drive verify-task-mgr feature models-routing; compile/unit tests alone are not proof"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "models set-usage-rule / set-tier-fallback / unset and show policy",
+      "touchesFiles": [
+        "src/cli/commands.rs",
+        "src/main.rs",
+        "src/commands/models/handlers.rs",
+        "src/commands/models/mod.rs",
+        "tests/models_command.rs",
+        "CLAUDE.md",
+        ".claude/skills/verify-task-mgr/features/models-routing.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Progress log lists findings or `No issues found`",
+        "Confirm --use-other-models-ttl on loop run AND batch run help (0 allowed); omitted vs Some(0); effective_ttl before apply (config 0 + CLI 15 → Ask { 15 }, not Defer); factory stays unavailable+Proceed; Ask re-eval on stop-check; forbade → defer; timeout does not was_stopped; .stop during ask does",
+        "Confirm down-only walker never calls model_for; post-resolve clamp after all six rungs including EXPLICIT_MODEL; family-match explicit tasks.model defers when includeForced=false; no wait-loop documented as accepted",
+        "Confirm expiry map replace-on-evaluate / keep on API fail; synthetic CLI 3600; next-PRD inherit; account-binding stop still stops the chain; handle_rung_only_empty_selection not handle_quota_deferral",
+        "Confirm set-usage-rule / set-tier-fallback / unset-tier-fallback (JSON null not key delete); models show policy offline has no remaining percents; sparse keys preserved",
+        "Confirm AccountUsageGateParams / Ask execute / PlanContext exhaustive destructure (no `..`); seq/wave both construct PlanContext with unavailable_rungs; grep quota.rs engine.rs walker have no fable/claude-fable-5",
+        "Any issues found spawn CODE-FIX / WIRE-FIX via `task-mgr add --stdin --depended-on-by REVIEW-001 --from-json tasks/quota-rung-policy-pr3.json`"
+      ],
+      "dependsOn": [
+        "FEAT-006",
+        "FEAT-007",
+        "FEAT-008"
+      ],
+      "description": "Review FEAT-006, FEAT-007, FEAT-008 only. Language idioms, security, error handling, qualityDimensions, wiring, dual predicate, down-only walker, family-match, TTL re-eval, models live-fetch gate, seq/wave parity. Spawn CODE-FIX / WIRE-FIX via task-mgr add --stdin --depended-on-by REVIEW-001 --from-json tasks/quota-rung-policy-pr3.json. Do not reimplement PR-2. Do not expand into remaining-percent / ingest / evaluate_quota.",
+      "estimatedEffort": "high",
+      "id": "CODE-REVIEW-1",
+      "modifiesBehavior": false,
+      "notes": "Do not implement in this task. Use rust-python-code-reviewer and loop-engine-parity-auditor if available. For each issue: echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001 --from-json tasks/quota-rung-policy-pr3.json. If no issues, emit done with a one-line progress note. Learning [5297]/[5301] dual predicate; [5075] once-per-wave; [4126]/[5371] shared coordinators; [3927]/[5088]/[5474] no handle_quota_deferral; [4998] do not call model_for for clamp; [5150] parity auditor.",
+      "passes": false,
+      "priority": 13,
+      "qualityDimensions": [
+        "Wiring: effective_ttl reaches ask_or_defer before apply (config 0 + CLI 15 is Ask { 15 }); walker actually runs after EXPLICIT_MODEL; inherit actually seeds the next PRD via active_rungs; models verbs actually write the keys apply/resolve read",
+        "Parity lock not broken (seq and wave share the inner; both prompt builders pass PlanContext)",
+        "Down-only not model_for; family-match not substring tier_of; unset writes null; remaining numbers live-fetch-gated",
+        "No model-id engine state (fable only as HUD ingest in usage.rs)"
+      ],
+      "requiresHuman": false,
+      "taskType": "review",
+      "title": "Review PR-3 TTL CLI, down-only clamp, family-match, policy CLI",
+      "touchesFiles": [
+        "src/cli/commands.rs",
+        "src/loop_engine/model.rs",
+        "src/loop_engine/reactions/account.rs",
+        "src/loop_engine/engine.rs",
+        "src/commands/models/handlers.rs",
+        "src/loop_engine/batch.rs",
+        "src/loop_engine/CLAUDE.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "All prior stories have passes: true (or spawned CODE-FIX/WIRE-FIX that this review depends on have landed)",
+        "Positive: loop run --help and batch run --help list --use-other-models-ttl (0 allowed) via verify-task-mgr captures; factory clamp frontier→standard; off-ladder explicit family-match defers; next-PRD inherit; set-usage-rule / set-tier-fallback / unset-null; models show policy without remaining percents offline",
+        "Positive: FULL `cargo fmt --check && cargo check && cargo clippy --all-targets -- -D warnings && cargo test` all clean (no scope filter)",
+        "Negative: walker does not call model_for; quota.rs/engine.rs/model.rs walker have no fable/claude-fable-5 literals; handle_quota_deferral not used for rungs; remaining numbers absent from offline models show; no live Anthropic in tests",
+        "Docs: src/loop_engine/CLAUDE.md records expiry map, down-only walker, family-match at resolve, ask TTL CLI + stop-check re-eval, next-PRD inherit, unset-tier-fallback = JSON null. CLAUDE.md models section lists --use-other-models-ttl, set-usage-rule, set-tier-fallback. PR-1 pin is no longer required for parallel/wave once clamp exists — strike or reword that recipe",
+        "Drive `.claude/skills/verify-task-mgr/SKILL.md`: launch + sandbox + loop run --help + batch run --help + models-routing (show / set-usage-rule / set-tier-fallback / unset / show-2). Do not drive `loop run` / `batch run`. Do not hit live Anthropic. Compile/unit tests alone are not proof of the clap/models surface — capture artifacts",
+        "Pre-existing test failures fixed (or spawned as FIX-xxx with verifyCommand if >~12 unrelated)",
+        "If issues found: FIX-xxx via `task-mgr add --stdin --depended-on-by REVIEW-001 --from-json tasks/quota-rung-policy-pr3.json`"
+      ],
+      "dependsOn": [
+        "CODE-REVIEW-1",
+        "CODE-FIX-001",
+        "CODE-FIX-002",
+        "CODE-FIX-003",
+        "CODE-FIX-004"
+      ],
+      "description": "REVIEW-001 is the milestone for this PR-3 slice. Run the full unscoped quality gate and leave the repo green including pre-existing failures. Prove FR-005 TTL CLI + FR-006 clamp/inherit + FR-008 policy CLI. Drive verify-task-mgr via loop run --help / batch run --help / models text (the skill refuses loop run / batch run). Unit/coordinator tests are the proof of walker + family-match + inherit. No live Anthropic. Do not reimplement PR-2.",
+      "estimatedEffort": "high",
+      "id": "REVIEW-001",
+      "modifiesBehavior": false,
+      "notes": "Spawn fixes via task-mgr add --stdin --depended-on-by REVIEW-001 --from-json tasks/quota-rung-policy-pr3.json. Verification skill: .claude/skills/verify-task-mgr/SKILL.md — refuses loop run / batch run. Feature map file: models-routing only. Help probes are capture names (`$H capture loop-run-help -- loop run --help`, `$H capture batch-run-help -- batch run --help`), not feature files — do not add features/loop-run-help.md. Do not invent a second harness. Learning [4753]: if cargo test fails with paths to a removed -slot-N worktree, touch tests/<binary>.rs and rebuild — not a code regression. PR-3 appendix ship: automatic frontier→standard; long-horizon exit; next PRD inherits. After this PR the PR-1 pin is no longer required for parallel/wave.",
+      "passes": false,
+      "priority": 99,
+      "qualityDimensions": [
+        "Full suite green including pre-existing",
+        "No unwrap in production",
+        "PR-3 ship table holds (TTL CLI; down-only clamp; family-match defer; inherit; policy CLI; remaining numbers live-fetch-gated)",
+        "Verification skill named and followed; no live Anthropic"
+      ],
+      "requiresHuman": false,
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Final gate: full suite + PR-3 ship check",
+      "touchesFiles": [
+        "src/loop_engine/model.rs",
+        "src/loop_engine/reactions/account.rs",
+        "src/loop_engine/engine.rs",
+        "src/commands/models/handlers.rs",
+        "src/cli/commands.rs",
+        "src/loop_engine/CLAUDE.md",
+        "CLAUDE.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "cargo test --test reaction_parity --no-run compiles cleanly",
+        "QuotaPreflightParams constructions include db_dir, ask_ttl_override, ask_policy_reeval",
+        "react_to_outputs_inner / with_io_seams call sites pass unavailable_rungs and match current seam arities",
+        "Proto-channel fixtures use UnavailableRungsMap + active_rungs where needed (not raw HashSet-as-map)",
+        "Existing parity assertions for account gate / rate-limit / rung-only empty still pass for seq vs wave"
+      ],
+      "description": "tests/reaction_parity.rs does not compile after FEAT-006/007: react_to_outputs_inner now takes unavailable_rungs (7 args; call sites still pass 6); react_to_outputs_with_io_seams arity/closure mismatches; QuotaPreflightParams missing db_dir, ask_ttl_override, ask_policy_reeval; proto-channel still typed as HashSet vs UnavailableRungsMap. cargo test --test reaction_parity --no-run fails with 41 errors. Production seq/wave paths are wired; the dual-path parity harness that would catch the next divergence does not build. Update call sites and fixtures; re-assert seq/wave same decision for preflight / rate-limit / rung-only. Learning [5150] parity auditor; [4126]/[5371] shared coordinators.",
+      "estimatedEffort": "medium",
+      "id": "CODE-FIX-001",
+      "passes": false,
+      "priority": 0,
+      "title": "Repair reaction_parity for PR-3 UnavailableRungsMap + Ask TTL params",
+      "touchesFiles": [
+        "tests/reaction_parity.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "TTL 0 immediate Defer banner may still mention askTtlMinutes=0 / no sleep",
+        "Ask TTL>0 timeout Defer does NOT claim askTtlMinutes=0; names --use-other-models-ttl or effective minutes when available",
+        "was_stopped stays false on Ask timeout; .stop during Ask still StopSignaled",
+        "seq + wave banners updated together (parity)",
+        "Unit or string-pin test covers both Deferred variants"
+      ],
+      "description": "iteration.rs and wave_orchestration.rs hardcode askTtlMinutes=0 on every UsageCheckResult::Deferred. After --use-other-models-ttl 15 (or config askTtlMinutes>0) times out with forbade tierFallback, the operator waited N minutes but the stop banner claims TTL was 0. Keep was_stopped=false / soft-stop semantics; fix the message only. Prefer naming --use-other-models-ttl / effective minutes, or omit the false askTtlMinutes=0 clause. Update seq + wave together.",
+      "estimatedEffort": "low",
+      "id": "CODE-FIX-002",
+      "passes": false,
+      "priority": -1,
+      "title": "Honest Deferred banner for Ask TTL timeout vs TTL 0",
+      "touchesFiles": [
+        "src/loop_engine/iteration.rs",
+        "src/loop_engine/wave_orchestration.rs",
+        "src/loop_engine/reactions/account.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "loop_engine/CLAUDE.md records expiry map + active_rungs, down-only walker (no model_for), family-match at resolve via usage.rs adapter, ask TTL CLI + stop-check re-eval, next-PRD inherit, unset-tier-fallback=JSON null",
+        "Strike not-implemented / Do not document as shipped (PR-3) lines and HashSet-only proto-channel wording",
+        "Root CLAUDE.md documents --use-other-models-ttl on loop run / batch run (0 allowed; omitted vs Some(0)) and strikes still PR-3 clamp wording",
+        "No claim that wait-loop is an accepted substitute for family-match defer"
+      ],
+      "description": "src/loop_engine/CLAUDE.md still describes pre-PR-3 world: proto-channel as HashSet, Next-PRD inherit documented-not-implemented, Do not document --use-other-models-ttl/set-usage-rule/set-tier-fallback as shipped. Root CLAUDE.md still says automatic clamp remains PR-3 and omits --use-other-models-ttl (models set-usage-rule/set-tier-fallback verbs are listed). Update both to match shipped FEAT-006/007/008 so REVIEW-001 and future loops are not misled.",
+      "estimatedEffort": "low",
+      "id": "CODE-FIX-003",
+      "passes": false,
+      "priority": -2,
+      "title": "Document shipped PR-3 ask TTL, expiry map, down-only clamp in CLAUDE.md",
+      "touchesFiles": [
+        "src/loop_engine/CLAUDE.md",
+        "CLAUDE.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "resolve_execution_plan and/or apply_rung_blackout_clamp destructure PlanContext exhaustively (no ..)",
+        "Adding a new PlanContext field fails compile until consumers account for it",
+        "Existing down-only / family-match / resolve unit tests still pass",
+        "No behavior change to clamp or six-rung resolution"
+      ],
+      "description": "CODE-REVIEW-1 AC requires PlanContext exhaustive destructure (no ..), matching AccountUsageGateParams / QuotaPreflightParams. Construction sites list all fields, but resolve_execution_plan and apply_rung_blackout_clamp use dotted field access — a new PlanContext field would not force a compile break at the clamp consumer. Destructure PlanContext at the top of resolve_execution_plan and/or apply_rung_blackout_clamp so adding a field is a compile error. Behavior-neutral.",
+      "estimatedEffort": "low",
+      "id": "CODE-FIX-004",
+      "passes": false,
+      "priority": -3,
+      "title": "Exhaustive PlanContext destructure in resolve/clamp",
+      "touchesFiles": [
+        "src/loop_engine/model.rs"
+      ]
+    }
+  ],
+  "version": "1.0"
+}

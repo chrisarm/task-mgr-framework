@@ -284,6 +284,10 @@ fn build_shared_slot_params(
 fn build_slot_prompt_params<'a>(
     params: &'a WaveIterationParams<'a>,
     provider_blackouts: &std::collections::HashSet<crate::loop_engine::model::Provider>,
+    unavailable_rungs: std::collections::HashSet<(
+        crate::loop_engine::model::Provider,
+        crate::loop_engine::model::CapabilityTier,
+    )>,
 ) -> prompt::slot::SlotPromptParams<'a> {
     prompt::slot::SlotPromptParams {
         project_root: params.source_root.to_path_buf(),
@@ -296,6 +300,8 @@ fn build_slot_prompt_params<'a>(
         // FEAT-008: the active quota blackouts, so each slot's spawn-time plan
         // reroutes spillover-eligible work consistently with `excluded_ids`.
         provider_blackouts: provider_blackouts.clone(),
+        unavailable_rungs,
+        tier_fallback: params.project_config.routing.tier_fallback.as_ref(),
     }
 }
 
@@ -793,6 +799,7 @@ pub fn run_wave_iteration(
             params.task_prefix,
             resolved_models,
             &active_blackouts,
+            params.project_config.routing.tier_fallback.as_ref(),
         )
     };
     let result = match select_parallel_group_excluding(
@@ -833,7 +840,14 @@ pub fn run_wave_iteration(
 
     let n_slots = group.len();
     let slot_paths: &[PathBuf] = &params.slot_worktree_paths[..n_slots];
-    let slot_prompt_params = build_slot_prompt_params(&params, &active_blackouts);
+    let slot_prompt_params = build_slot_prompt_params(
+        &params,
+        &active_blackouts,
+        crate::loop_engine::engine::active_rungs(
+            &ctx.unavailable_rungs,
+            crate::loop_engine::engine::now_unix_secs(),
+        ),
+    );
     let mut slot_contexts =
         build_slot_contexts(params.conn, group, slot_paths, &slot_prompt_params);
     // FEAT-002: resolve the pre-spawn execution plan per slot on the main
@@ -1079,6 +1093,7 @@ pub fn run_wave_iteration(
             &rate_limit_items,
             &account_params,
             &mut ctx.provider_blackouts,
+            &mut ctx.unavailable_rungs,
         );
         match reaction {
             reactions::account::AccountReaction::None => {}
@@ -1102,10 +1117,29 @@ pub fn run_wave_iteration(
             }
             // FR-010 Stop split: OperatorStopped vs StopSpend. Known-bad was
             // every Stop → exit 130; both are now exit 0 via the shared mapping.
-            reactions::account::AccountReaction::OperatorStopped
-            | reactions::account::AccountReaction::StopSpend => {
+            // StopSpend must set account_quota_stopped so batch --chain aborts
+            // (CLI spend exits 0 / was_stopped false; without the flag a
+            // non-empty unavailable_rungs map would incorrectly seed inherit).
+            reactions::account::AccountReaction::OperatorStopped => {
                 let mapping = reactions::account::account_stop_wave_mapping(&reaction)
-                    .expect("OperatorStopped/StopSpend map");
+                    .expect("OperatorStopped maps");
+                return WaveOutcome {
+                    tasks_completed: agg.tasks_completed,
+                    iteration_consumed: true,
+                    terminal: Some(WaveTerminal {
+                        exit_code: mapping.exit_code,
+                        reason: mapping.reason.to_string(),
+                        run_status: None,
+                    }),
+                    was_stopped: mapping.was_stopped,
+                    failed_merges: Vec::new(),
+                    rate_limited_retry: false,
+                };
+            }
+            reactions::account::AccountReaction::StopSpend => {
+                ctx.account_quota_stopped = true;
+                let mapping = reactions::account::account_stop_wave_mapping(&reaction)
+                    .expect("StopSpend maps");
                 return WaveOutcome {
                     tasks_completed: agg.tasks_completed,
                     iteration_consumed: true,
@@ -1628,6 +1662,7 @@ mod tests {
             enabled: false,
             threshold: 8,
             fallback_wait: 300,
+            ask_ttl_override: None,
         };
 
     #[allow(clippy::too_many_arguments)]
@@ -2196,11 +2231,18 @@ mod tests {
         let signal = SignalFlag::new();
         let mut ctx = IterationContext::new(5);
         // Proto-channel: frontier unavailable, empty provider_blackouts.
-        ctx.unavailable_rungs.insert((
-            crate::loop_engine::model::Provider::Claude,
-            crate::loop_engine::model::CapabilityTier::Frontier,
-        ));
-        let project_cfg = crate::loop_engine::project_config::ProjectConfig::default();
+        ctx.unavailable_rungs.insert(
+            (
+                crate::loop_engine::model::Provider::Claude,
+                crate::loop_engine::model::CapabilityTier::Frontier,
+            ),
+            u64::MAX,
+        );
+        // Forbade clamp (JSON null tierFallback) so frontier-only work cannot
+        // walk down — this is the CODE-FIX-009 Exhausted path. Factory
+        // tierFallback would clamp high→standard and select the task (FR-006).
+        let mut project_cfg = crate::loop_engine::project_config::ProjectConfig::default();
+        project_cfg.routing.tier_fallback = None;
         let prd_implicit: Vec<String> = Vec::new();
         let outcome = run_wave_iteration(
             make_wave_params(
@@ -2464,6 +2506,8 @@ mod tests {
             models_config: crate::loop_engine::project_config::default_models_config(),
             routing_config: crate::loop_engine::project_config::default_routing_config(),
             provider_blackouts: Default::default(),
+            unavailable_rungs: Default::default(),
+            tier_fallback: None,
         };
         let slot_paths = vec![tmp.path().to_path_buf()];
         let slots = build_slot_contexts(&conn, vec![scored], &slot_paths, &prompt_params);

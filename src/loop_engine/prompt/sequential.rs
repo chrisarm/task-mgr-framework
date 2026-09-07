@@ -385,6 +385,14 @@ pub struct BuildPromptParams<'a> {
     /// so a spillover-eligible task reroutes off a blacked-out provider at spawn
     /// time, consistent with `excluded_ids`. Empty (the default) → no reroute.
     pub provider_blackouts: std::collections::HashSet<crate::loop_engine::model::Provider>,
+    /// Active proto-channel rungs (`active_rungs` output). Fed to
+    /// `resolve_execution_plan` for post-resolve down-only clamp. Empty → no clamp.
+    pub unavailable_rungs: std::collections::HashSet<(
+        crate::loop_engine::model::Provider,
+        crate::loop_engine::model::CapabilityTier,
+    )>,
+    /// `routing.tierFallback` for clamp eligibility (`includeForced` per-task).
+    pub tier_fallback: Option<&'a crate::loop_engine::project_config::TierFallback>,
     /// FEAT-008: todo task ids that are quota-deferred this iteration
     /// (`reactions::pre_spawn::compute_quota_excluded_ids`). Threaded into
     /// selection via `next::next_excluding` so a doomed task is never picked;
@@ -440,6 +448,8 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
             models: &resolved_models,
             // FEAT-008: reroute off any blacked-out provider at spawn time.
             provider_blackouts: &params.provider_blackouts,
+            unavailable_rungs: &params.unavailable_rungs,
+            tier_fallback: params.tier_fallback,
         },
     );
     let resolved_model = plan.model.clone();
@@ -859,6 +869,8 @@ mod tests {
             models_config: crate::loop_engine::project_config::default_models_config(),
             routing_config: crate::loop_engine::project_config::default_routing_config(),
             provider_blackouts: Default::default(),
+            unavailable_rungs: Default::default(),
+            tier_fallback: None,
             excluded_ids: Default::default(),
         }
     }
@@ -1074,6 +1086,8 @@ mod tests {
             models_config: crate::loop_engine::project_config::default_models_config(),
             routing_config: crate::loop_engine::project_config::default_routing_config(),
             provider_blackouts: Default::default(),
+            unavailable_rungs: Default::default(),
+            tier_fallback: None,
             excluded_ids: Default::default(),
         };
 
@@ -1447,6 +1461,8 @@ pub enum ApiError {
             models_config: crate::loop_engine::project_config::default_models_config(),
             routing_config: crate::loop_engine::project_config::default_routing_config(),
             provider_blackouts: Default::default(),
+            unavailable_rungs: Default::default(),
+            tier_fallback: None,
             excluded_ids: Default::default(),
         };
 
@@ -1569,6 +1585,8 @@ pub enum ApiError {
             models_config: crate::loop_engine::project_config::default_models_config(),
             routing_config: crate::loop_engine::project_config::default_routing_config(),
             provider_blackouts: Default::default(),
+            unavailable_rungs: Default::default(),
+            tier_fallback: None,
             excluded_ids: Default::default(),
         };
 
@@ -1620,6 +1638,8 @@ pub enum ApiError {
             models_config: crate::loop_engine::project_config::default_models_config(),
             routing_config: crate::loop_engine::project_config::default_routing_config(),
             provider_blackouts: Default::default(),
+            unavailable_rungs: Default::default(),
+            tier_fallback: None,
             excluded_ids: Default::default(),
         };
 
@@ -2155,6 +2175,8 @@ pub enum ApiError {
             models_config: crate::loop_engine::project_config::default_models_config(),
             routing_config: crate::loop_engine::project_config::default_routing_config(),
             provider_blackouts: Default::default(),
+            unavailable_rungs: Default::default(),
+            tier_fallback: None,
             excluded_ids: Default::default(),
         };
 
@@ -2212,6 +2234,8 @@ pub enum ApiError {
             models_config: crate::loop_engine::project_config::default_models_config(),
             routing_config: crate::loop_engine::project_config::default_routing_config(),
             provider_blackouts: Default::default(),
+            unavailable_rungs: Default::default(),
+            tier_fallback: None,
             excluded_ids: Default::default(),
         };
 
@@ -2261,6 +2285,8 @@ pub enum ApiError {
             models_config: crate::loop_engine::project_config::default_models_config(),
             routing_config: crate::loop_engine::project_config::default_routing_config(),
             provider_blackouts: Default::default(),
+            unavailable_rungs: Default::default(),
+            tier_fallback: None,
             excluded_ids: Default::default(),
         };
 
@@ -3238,6 +3264,8 @@ pub enum ApiError {
             models_config: crate::loop_engine::project_config::default_models_config(),
             routing_config: crate::loop_engine::project_config::default_routing_config(),
             provider_blackouts: Default::default(),
+            unavailable_rungs: Default::default(),
+            tier_fallback: None,
             excluded_ids: Default::default(),
         };
 
@@ -3331,6 +3359,8 @@ pub enum ApiError {
             models_config: crate::loop_engine::project_config::default_models_config(),
             routing_config: crate::loop_engine::project_config::default_routing_config(),
             provider_blackouts: Default::default(),
+            unavailable_rungs: Default::default(),
+            tier_fallback: None,
             excluded_ids: Default::default(),
         };
 
@@ -3484,6 +3514,8 @@ pub enum ApiError {
             models_config: crate::loop_engine::project_config::default_models_config(),
             routing_config: crate::loop_engine::project_config::default_routing_config(),
             provider_blackouts: Default::default(),
+            unavailable_rungs: Default::default(),
+            tier_fallback: None,
             excluded_ids: Default::default(),
         };
 
@@ -3611,6 +3643,8 @@ pub enum ApiError {
             models_config: crate::loop_engine::project_config::default_models_config(),
             routing_config: crate::loop_engine::project_config::default_routing_config(),
             provider_blackouts: Default::default(),
+            unavailable_rungs: Default::default(),
+            tier_fallback: None,
             excluded_ids: Default::default(),
         };
 

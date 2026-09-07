@@ -42,7 +42,7 @@ use tempfile::TempDir;
 use task_mgr::db::migrations::run_migrations;
 use task_mgr::db::{create_schema, open_connection};
 use task_mgr::loop_engine::config::{IterationOutcome, PermissionMode};
-use task_mgr::loop_engine::engine::BlackoutState;
+use task_mgr::loop_engine::engine::{BlackoutState, UnavailableRungsMap};
 use task_mgr::loop_engine::model::{Provider, builtin_resolved_models};
 use task_mgr::loop_engine::reactions::account::{
     AccountReaction, AccountReactionParams, AccountStopSequentialMapping, AccountStopWaveMapping,
@@ -248,6 +248,7 @@ fn wait_once_fires_wait_exactly_once_for_multi_rate_limit_wave() {
         &items,
         &params(db_temp.path(), 600),
         &mut BlackoutState::default(),
+        &mut UnavailableRungsMap::new(),
         None, // api_reset_secs — hermetic; production loads via load_usage_info
         &wait as WaitFn,
     );
@@ -299,6 +300,7 @@ fn mixed_wave_resets_only_rate_limited_task_and_preserves_completed() {
         &items,
         &params(db_temp.path(), 600),
         &mut BlackoutState::default(),
+        &mut UnavailableRungsMap::new(),
         None, // api_reset_secs — hermetic; production loads via load_usage_info
         &wait as WaitFn,
     );
@@ -351,6 +353,7 @@ fn rate_limit_output_does_not_trigger_completions_or_learnings() {
         &items,
         &params(db_temp.path(), 600),
         &mut BlackoutState::default(),
+        &mut UnavailableRungsMap::new(),
         None, // api_reset_secs — hermetic; production loads via load_usage_info
         &wait as WaitFn,
     );
@@ -398,6 +401,7 @@ fn parse_fail_falls_back_to_fallback_wait_and_both_shapes_agree() {
         &seq_items,
         &params(seq_temp.path(), FALLBACK),
         &mut BlackoutState::default(),
+        &mut UnavailableRungsMap::new(),
         None,
         &seq_wait as WaitFn,
     );
@@ -427,6 +431,7 @@ fn parse_fail_falls_back_to_fallback_wait_and_both_shapes_agree() {
         &wave_items,
         &params(wave_temp.path(), FALLBACK),
         &mut BlackoutState::default(),
+        &mut UnavailableRungsMap::new(),
         None,
         &wave_wait as WaitFn,
     );
@@ -481,6 +486,7 @@ fn no_rate_limit_returns_none_and_writes_nothing() {
         &items,
         &params(db_temp.path(), 600),
         &mut BlackoutState::default(),
+        &mut UnavailableRungsMap::new(),
         None, // api_reset_secs — hermetic; production loads via load_usage_info
         &wait as WaitFn,
     );
@@ -534,6 +540,7 @@ fn no_rate_limit_skips_load_usage_even_when_claude_io_allowed() {
         &items,
         &p,
         &mut blackout,
+        &mut UnavailableRungsMap::new(),
         &spy.usage_gate(),
         &spy.reset_wait(),
         &spy.probe(),
@@ -572,6 +579,7 @@ fn stop_signal_during_wait_returns_operator_stopped() {
         &items,
         &params(db_temp.path(), 600),
         &mut BlackoutState::default(),
+        &mut UnavailableRungsMap::new(),
         None, // api_reset_secs — hermetic; production loads via load_usage_info
         &wait as WaitFn,
     );
@@ -619,6 +627,7 @@ fn reroute_and_retry_records_blackout_and_skips_wait_both_shapes() {
         &seq_items,
         &seq_params,
         &mut seq_blackout,
+        &mut UnavailableRungsMap::new(),
         None,
         &seq_wait as WaitFn,
     );
@@ -674,6 +683,7 @@ fn reroute_and_retry_records_blackout_and_skips_wait_both_shapes() {
         &wave_items,
         &wave_params,
         &mut wave_blackout,
+        &mut UnavailableRungsMap::new(),
         None,
         &wave_wait as WaitFn,
     );
@@ -3151,6 +3161,7 @@ fn react_with_spy(
         items,
         params,
         blackout,
+        &mut UnavailableRungsMap::new(),
         &spy.usage_gate(),
         &spy.reset_wait(),
         &spy.probe(),
@@ -3278,6 +3289,7 @@ fn claude_disabled_rate_limit_never_reaches_exploding_anthropic_seams() {
         &items,
         &p,
         &mut blackout,
+        &mut UnavailableRungsMap::new(),
         &boom_gate,
         &reset_wait,
         &boom_probe,
@@ -3686,7 +3698,15 @@ fn known_bad_collapsed_flag_drops_the_probe_on_env_off_claude_on() {
     let spy = IoSeamSpy::new();
     let wait = collapsed_single_flag_wait(&p, &spy);
     let mut blackout = BlackoutState::default();
-    let reaction = react_to_outputs_inner(&mut conn, &items, &p, &mut blackout, None, &wait);
+    let reaction = react_to_outputs_inner(
+        &mut conn,
+        &items,
+        &p,
+        &mut blackout,
+        &mut UnavailableRungsMap::new(),
+        None,
+        &wait,
+    );
 
     // Same coarse reaction as the correct implementation — which is exactly why
     // asserting only on `AccountReaction` would let the collapse through.
@@ -3763,6 +3783,7 @@ fn fable_rate_limit_wave_waits_once_3600_never_blackouts() {
         &items,
         &p,
         &mut blackout,
+        &mut UnavailableRungsMap::new(),
         Some(6 * 24 * 3600), // populated api_secs must be ignored
         &wait as WaitFn,
     );
@@ -3826,6 +3847,7 @@ fn mixed_wave_prefers_rung_scoped_rate_limit_over_leading_account_hit() {
         &items,
         &p,
         &mut blackout,
+        &mut UnavailableRungsMap::new(),
         Some(7200), // would drive Blackout if decide used the leading account item
         &wait as WaitFn,
     );
@@ -3880,8 +3902,15 @@ fn mixed_wave_fable_plus_spend_returns_stop_spend_not_wait_3600() {
     let spy = WaitSpy::completing();
     let wait = spy.closure();
     // api_secs None mirrors production wrapper skip when any item is rung-scoped.
-    let reaction =
-        react_to_outputs_inner(&mut conn, &items, &p, &mut blackout, None, &wait as WaitFn);
+    let reaction = react_to_outputs_inner(
+        &mut conn,
+        &items,
+        &p,
+        &mut blackout,
+        &mut UnavailableRungsMap::new(),
+        None,
+        &wait as WaitFn,
+    );
 
     assert_eq!(
         reaction,
@@ -3931,6 +3960,7 @@ fn mixed_wave_fable_plus_hit_your_limit_still_waits_3600_no_blackout() {
         &items,
         &p,
         &mut blackout,
+        &mut UnavailableRungsMap::new(),
         None, // wrapper skip shape
         &wait as WaitFn,
     );
@@ -4033,6 +4063,7 @@ fn pure_spend_limit_returns_stop_spend() {
         &items,
         &params(db_temp.path(), 300),
         &mut BlackoutState::default(),
+        &mut UnavailableRungsMap::new(),
         None,
         &wait as WaitFn,
     );
@@ -4083,6 +4114,7 @@ fn fable_rate_limit_skips_usage_gate_and_probe() {
         &items,
         &p,
         &mut blackout,
+        &mut UnavailableRungsMap::new(),
         &spy.usage_gate(),
         &spy.reset_wait(),
         &spy.probe(),
@@ -4153,6 +4185,7 @@ fn mixed_wave_rung_scoped_still_skips_usage_gate_and_probe() {
         &items,
         &p,
         &mut blackout,
+        &mut UnavailableRungsMap::new(),
         &spy.usage_gate(),
         &spy.reset_wait(),
         &spy.probe(),
@@ -4201,6 +4234,7 @@ fn slash_model_alone_does_not_take_3600_override() {
         &items,
         &p,
         &mut blackout,
+        &mut UnavailableRungsMap::new(),
         Some(7200),
         &wait as WaitFn,
     );
@@ -4246,6 +4280,7 @@ fn model_id_in_session_rate_limit_stdout_still_blackouts_not_3600() {
         &items,
         &p,
         &mut blackout,
+        &mut UnavailableRungsMap::new(),
         Some(7200), // api_secs must win for Blackout, not be ignored as 3600 Wait
         &wait as WaitFn,
     );
@@ -4269,8 +4304,8 @@ fn model_id_in_session_rate_limit_stdout_still_blackouts_not_3600() {
 
 #[test]
 fn account_quota_preflight_inner_same_decision_both_shapes() {
-    use std::collections::HashSet;
     use std::path::Path;
+    use task_mgr::loop_engine::engine::{UnavailableRungsMap, active_rungs, now_unix_secs};
     use task_mgr::loop_engine::model::{CapabilityTier, Provider, builtin_resolved_models};
     use task_mgr::loop_engine::project_config::TierFallback;
     use task_mgr::loop_engine::quota::{Measurement, MeasurementUnit, QuotaBucket, UsagePolicy};
@@ -4303,8 +4338,8 @@ fn account_quota_preflight_inner_same_decision_both_shapes() {
         max_difficulty: Some("high"),
         ..RemainingWorkSnapshot::default()
     };
-    let mut set_seq = HashSet::new();
-    let mut set_wave = HashSet::new();
+    let mut set_seq = UnavailableRungsMap::new();
+    let mut set_wave = UnavailableRungsMap::new();
     let wait = |_secs: u64| true;
     let models = builtin_resolved_models();
 
@@ -4312,7 +4347,9 @@ fn account_quota_preflight_inner_same_decision_both_shapes() {
         QuotaPreflightParams {
             threshold: 8,
             tasks_dir: Path::new("/tmp"),
+            db_dir: Path::new("/tmp"),
             fallback_wait: 300,
+            ask_ttl_override: None,
             policy: &policy,
             tier_fallback: Some(&fb),
             execute_account_action: true,
@@ -4322,6 +4359,7 @@ fn account_quota_preflight_inner_same_decision_both_shapes() {
             account_remaining: Some(76.0),
             account_reset_at: None,
             models,
+            ask_policy_reeval: None,
         },
         &wait as WaitFn,
     );
@@ -4329,7 +4367,9 @@ fn account_quota_preflight_inner_same_decision_both_shapes() {
         QuotaPreflightParams {
             threshold: 8,
             tasks_dir: Path::new("/tmp"),
+            db_dir: Path::new("/tmp"),
             fallback_wait: 300,
+            ask_ttl_override: None,
             policy: &policy,
             tier_fallback: Some(&fb),
             execute_account_action: true,
@@ -4339,6 +4379,7 @@ fn account_quota_preflight_inner_same_decision_both_shapes() {
             account_remaining: Some(76.0),
             account_reset_at: None,
             models,
+            ask_policy_reeval: None,
         },
         &wait as WaitFn,
     );
@@ -4348,6 +4389,10 @@ fn account_quota_preflight_inner_same_decision_both_shapes() {
         "same buckets+policy ⇒ same QuotaPreflight decision on both shapes"
     );
     assert_eq!(set_seq, set_wave);
-    assert!(set_seq.contains(&(Provider::Claude, CapabilityTier::Frontier)));
+    assert!(
+        active_rungs(&set_seq, now_unix_secs())
+            .contains(&(Provider::Claude, CapabilityTier::Frontier)),
+        "proto-channel must mark frontier unavailable via active_rungs"
+    );
     assert_eq!(seq, UsageCheckResult::BelowThreshold);
 }

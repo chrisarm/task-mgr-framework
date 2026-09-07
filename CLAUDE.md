@@ -74,7 +74,7 @@ at preflight.
 task-mgr models list                     # offline — built-in model IDs + per-provider tier/effort tables + anchor
 task-mgr models list --remote            # live /v1/models (Anthropic; requires ANTHROPIC_API_KEY + TASK_MGR_USE_API=1)
 task-mgr models list --refresh           # bust cache before fetch
-task-mgr models show                     # resolved models/routing table, anchor window, blackout note, codex route-only note, empty states
+task-mgr models show                     # resolved models/routing + usagePolicy + tierFallback; remaining % only with list --remote opt-in
 task-mgr models init [--force-replace-legacy] [--dry-run]  # write default models+routing block (migration deletes old keys)
 task-mgr models set-anchor <tier>        # cheapest|cost-efficient|standard|frontier
 task-mgr models enable|disable <provider>   # claude|grok|codex (claude defaults enabled)
@@ -85,6 +85,9 @@ task-mgr models set-fallback <provider> [target-provider]   # tier-preserving ru
 task-mgr models unset-fallback <provider>
 task-mgr models route <prefix> [--provider <p>] [--tier <t>]   # byIdPrefix forcing
 task-mgr models unroute <prefix>
+task-mgr models set-usage-rule --kind <k>|--id <id> --on-low wait|unavailable|stop|ask|ignore
+task-mgr models set-tier-fallback <low|medium|high> [--include-review[=true|false]] [--include-forced]
+task-mgr models unset-tier-fallback      # writes JSON null (ask opt-out); does NOT delete the key
 ```
 
 `models show` prints the full merged routing table, the anchor-derived
@@ -153,13 +156,25 @@ hard-errors at loop/batch `preflight_validate_and_probe` (names
 `LOOP_USAGE_REMAINING_MIN`); non-loop commands ignore it. Operator banners use
 `% left` (rung labels like `frontier`, never model ids).
 
-**Fable frontier pin (optional after PRE-PR-3):** after HUD-family extra-mark
-identity union (CONTRACT-002 / FEAT-008), pinning frontier off Fable is
+**Ask TTL override (PR-3 / FEAT-006):** `--use-other-models-ttl <minutes>` on
+`task-mgr loop run` and `task-mgr batch run` (nested + deprecated flat).
+Overrides `usagePolicy.askTtlMinutes` for this run only (does not write
+config.json). `0` is allowed: omit the flag → use config (default 0); pass
+`--use-other-models-ttl 0` → `Some(0)` (defer immediately, no sleep) — omitted
+is not the same as `Some(0)`. When effective TTL > 0, Ask sleeps stop-signal-aware
+and re-evals `usagePolicy` + `routing.tierFallback` on the stop-check cadence
+(evaluate/apply, not eligibility-only); mid-wait `onLow: stop` is a horizon
+stop, not operator `.stop`; forbade continue → defer; allow → continue on
+working rungs.
+
+**Fable frontier pin (optional after PRE-PR-3 / PR-3 clamp):** after HUD-family
+extra-mark identity union (CONTRACT-002), pinning frontier off Fable is
 **optional, not required**, for mixed standard/medium work — factory
-`tierFallback` exclude unsticks the wave when frontier is unavailable.
-Optional recipe: `task-mgr models set-tier claude frontier <standard-model>`
-(e.g. opus). Automatic clamp of all-high / review / explicit-frontier onto
-standard is still **PR-3** (do not assume high/review runs on the pin target).
+`tierFallback` exclude unsticks the wave when frontier is unavailable, and the
+PR-3 down-only walker clamps all-high / review / explicit-frontier onto a lower
+working rung when `tierFallback` allows (do not assume high/review keep running
+on the pin target — they clamp down). Optional recipe remains:
+`task-mgr models set-tier claude frontier <standard-model>` (e.g. opus).
 **Residual:** if a Fable-routed task still spawns (e.g. `LOOP_USAGE_CHECK_ENABLED=false`,
 usage fetch fail, or explicit `tasks.model`), a Fable CLI RateLimit still sleeps
 the whole wave **3600s**.

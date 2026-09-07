@@ -242,8 +242,9 @@ Fable-routed task actually spawns (`LOOP_USAGE_CHECK_ENABLED=false`, usage
 fetch fail, or explicit `tasks.model`), one Fable RateLimit still sleeps the
 **whole wave** 3600s. Pinning frontier off Fable
 (`task-mgr models set-tier claude frontier <standard-model>`) is **optional,
-not required**, after PRE-PR-3 extra-mark — see below. Automatic all-high /
-review / explicit-frontier clamp onto standard remains PR-3.
+not required**, after PRE-PR-3 extra-mark — see below. All-high / review /
+explicit-frontier work clamps **down** onto a working rung via the PR-3
+down-only walker (FEAT-007) when `tierFallback` allows.
 
 **PR-2 quota contract (CONTRACT-001 / FEAT-005):** remaining 0–100 is the gate
 unit (`LOOP_USAGE_REMAINING_MIN` > `usagePolicy.remainingMinPercent` > 8).
@@ -253,21 +254,30 @@ inputs — never ask, never `other_rungs_runnable`). Apply in `account.rs`
 from remaining work + `routing.tierFallback`. Factory default
 `tierFallback` is `{maxDifficulty: high, includeReview: true, includeForced:
 false}` — absent key deserializes to that `Some` (auto-unavailable / downgrade);
-explicit JSON `null` is the ask opt-out (`askTtlMinutes` 0 → defer, no sleep;
-TTL > 0 → stop-signal-aware sleep then continue). Horizon:
+explicit JSON `null` (`models unset-tier-fallback`) is the ask opt-out
+(`askTtlMinutes` 0 → defer, no sleep; TTL > 0 → stop-signal-aware sleep then
+continue only if policy still allows). Horizon:
 wait if reset ≤ `waitIfResetWithinMinutes` (60); (60m, 12h] wait capped at
 `MAX_WAIT_SECS` (5h); >12h + nothing else runnable → stop (`in_progress` →
 `todo`). Scoped unavailable is **excluded** from the next selection via
-proto-channel `IterationContext.unavailable_rungs:
-HashSet<(Provider, CapabilityTier)>` — replace the set on each successful
-evaluate+apply; keep snapshot on API fail; do **not** account-wait for a
-scoped rung; do **not** gate exclusion on non-empty `provider_blackouts`
-(empty blackouts is the production case).
+proto-channel `IterationContext.unavailable_rungs: UnavailableRungsMap`
+(`HashMap<(Provider, CapabilityTier), unix_expiry>`) — replace the map on
+each successful evaluate+apply; keep snapshot on API fail; filter live keys
+with `active_rungs(&map, now)` before exclusion / clamp / empty-selection
+(never treat every map key as live). Do **not** account-wait for a scoped
+rung; do **not** gate exclusion on non-empty `provider_blackouts` (empty
+blackouts is the production case).
 `LOOP_USAGE_CHECK_ENABLED=false` skips the pre-gate load entirely (no OAuth /
 `load_usage_info`) and keeps the proto-channel snapshot — dual predicate is
 env ∧ Claude enabled; do not treat disabled as a replace-on-evaluate exception.
 Spillover is never a working rung.
-Next-PRD inherit of rung-unavailable is PR-3 (documented, not implemented).
+Batch `--chain` inherits the expiry map onto the next PRD
+(`LoopResult.unavailable_rungs` → `inherited_unavailable_rungs`);
+account-binding horizon Stop **and** post-output `StopSpend` set
+`account_quota_stopped` and abort the chain (CLI spend/credits is exit 0 /
+`was_stopped` false — without the flag a non-empty expiry map would seed
+inherit). Rung-scoped Stop leaves the flag false so the next PRD may continue
+and clamp.
 Account-binding weekly-all beyond 12h **Stops** even if other Claude rungs look
 runnable (they share that bucket). Factory `includeForced: false` is not a
 global forbid when some todos have `tasks.model`. `Wait { 0 }` is ready-now,
@@ -290,8 +300,8 @@ Full copy-paste lives under `## CONTRACT-001` in the progress log.
   Opus HUD + pin including snapshot id → **standard and frontier**.
   Unlabeled named `seven_day_*` → `rungs: None` (`ingest_named_sibling`
   never `map_unlabeled_token`; `limits[]` unlabeled ids still map).
-  PR-3 walker must **not** reintroduce mapped-rung extra-mark. Full
-  copy-paste under `## CONTRACT-002` in `tasks/progress-a593d39e.txt`.
+  The PR-3 down-only walker must **not** reintroduce mapped-rung extra-mark.
+  Full copy-paste under `## CONTRACT-002` in `tasks/progress-a593d39e.txt`.
 - **Wait-driving probe after apply:** `Wait { secs, account_binding }`;
   `wait_probe_lifted` runs **after** apply. Scoped-only waits must **not**
   lift on week remaining alone. Post-output `WaitFn` stays `Fn(u64)` (do
@@ -311,9 +321,53 @@ Full copy-paste lives under `## CONTRACT-001` in the progress log.
   `remainingMinPercent` **> 100** hard-errors at loop/batch
   `preflight_validate_and_probe`.
 - **Pin:** optional for mixed standard/medium (factory exclude unsticks).
-  All-high / review / explicit-frontier clamp onto standard is still **PR-3**.
-  Do **not** document `--use-other-models-ttl` / `set-usage-rule` /
-  `set-tier-fallback` / `models show` live remaining as shipped (PR-3).
+
+**PR-3 (FEAT-006 / FEAT-007 / FEAT-008) — shipped:**
+
+- **Ask TTL CLI:** `--use-other-models-ttl <minutes>` on `loop run` / `batch run`
+  (nested + deprecated flat). `0` is allowed. Omitted → `None` (use
+  `usagePolicy.askTtlMinutes`); present `0` → `Some(0)` (defer immediately, no
+  sleep). Override is resolved to `effective_ttl` **before** `ask_or_defer`
+  (config 0 + CLI 15 → `Ask { 15 }`). Does not write `config.json`.
+- **Ask wait re-eval:** when effective TTL > 0, Ask sleeps stop-signal-aware and
+  re-reads `usagePolicy` + `routing.tierFallback` on the stop-check cadence,
+  then **re-runs evaluate/apply** on that slice (do not discard
+  `usagePolicy` / `let _ =`). Mid-wait `onLow: stop` → `HorizonStopped`
+  (not `StopSignaled` / `was_stopped`). Mid-wait flip forbade→allow continues
+  early; timeout continues iff `tier_fallback_allows`, else Deferred.
+  `.stop` during Ask → `StopSignaled`. Factory / allowing `tierFallback`
+  never emits Ask (unavailable + Proceed).
+- **Expiry map + `active_rungs`:** proto-channel is
+  `UnavailableRungsMap = HashMap<(Provider, CapabilityTier), u64>` (unix
+  expiry from bucket `resets_at`, else `now+3600`; synthetic CLI RateLimit
+  also stamps 3600). Replace-on-successful-evaluate / keep-on-API-fail
+  unchanged. Readers (`PlanContext`, exclusion, empty-selection, overflow)
+  consume `active_rungs` only — not the raw map.
+- **Down-only clamp (no `model_for`):** after the six-rung
+  `resolve_execution_plan` chain (including EXPLICIT_MODEL),
+  `apply_rung_blackout_clamp` walks **lower** defined non-blacked rungs via
+  `down_only_available_tier` + `exact_model_for` only. Never calls
+  `model_for` (bidirectional nearest-defined can walk UP onto a blacked
+  frontier). No lower rung → leave plan unchanged; selection excludes /
+  empty-handles the task (defer). `None` tierFallback forbids all clamp.
+- **Family-match at resolve:** off-ladder explicit `tasks.model` maps to a
+  capability rung via `usage.rs` (`hud_tier_from_label` /
+  `family_token_from_id` / `map_unlabeled_token`) — not substring `tier_of`.
+  `includeForced` is per-task: false → no clamp (defer via exclusion); true →
+  may clamp down. A wait-loop is **not** an accepted substitute for that
+  family-match defer.
+- **Next-PRD inherit:** batch `--chain` copies `LoopResult.unavailable_rungs`
+  forward. Abort when `account_quota_stopped` **or** non-zero exit **or**
+  incomplete + empty map. Incomplete + non-empty map + flag false continues
+  and seeds inherit (rung-scoped). `StopSpend` must set the flag in **both**
+  sequential (`iteration.rs`) and wave (`wave_scheduler.rs`) wrappers — apply
+  already does via `account_binding`. Tests must not encode chain-break as
+  `exit != 0 || !prd_complete`.
+- **Policy CLI:** `models set-usage-rule` / `set-tier-fallback` /
+  `unset-tier-fallback` (writes JSON **null**, does not delete the key) /
+  `models show` (offline: usagePolicy + tierFallback, no remaining %;
+  remaining numbers only behind `list --remote` live-fetch).
+- **Overflow:** escalate / to_1m skips active blacked rungs.
 
 The per-task reactions (`resolve_task_execution`, `handle_overflow`) fold one
 call per slot. Each coordinator pairs a production entry point with a hermetic

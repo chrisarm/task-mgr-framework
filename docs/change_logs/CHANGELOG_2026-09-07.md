@@ -77,3 +77,23 @@ The PR-2 extra-mark hole parked standard from a Fable HUD row when operators pin
 None for operators. Sequential operator-stop is Empty + `operator_stopped` (exit 0), not RateLimit. Wave StopSpend is exit 0, not 130.
 
 ---
+
+## Quota buckets, remaining headroom, and capability-rung policy (PR-3)
+
+**Branch**: `feat/quota-rung-policy-pr3`
+**PRD**: `tasks/prd-quota-rung-policy.md`
+
+### What shipped
+
+`--use-other-models-ttl` on `loop run` / `batch run` (`Some(0)` ≠ omitted; TTL 0 defers with no sleep). Ask wait re-runs evaluate/apply on each stop-check so mid-wait `onLow: stop` is a horizon stop, not operator `.stop`. Proto-channel expiry map + down-only clamp at all three sites (exclude / spawn / overflow); walker uses `exact_model_for` only. Factory + only-frontier-left is Proceed + clamp. `models set-usage-rule` / `set-tier-fallback` / JSON-null unset. Batch `--chain` aborts on `account_quota_stopped` even when the expiry map is non-empty (`StopSpend` sets the flag in both seq and wave wrappers).
+
+### Why it matters
+
+Frontier-low continues on standard without a `set-tier` pin: factory marks frontier unavailable and the walker clamps all-high / review onto a working rung. A credits/spend stop no longer lets `--chain` inherit into the next PRD just because some rungs were already blacked.
+
+### Breaking changes
+
+- `--use-other-models-ttl 0` is explicit defer (not “use config”). Omit the flag to keep `usagePolicy.askTtlMinutes`.
+- `models unset-tier-fallback` writes JSON `null` (ask opt-out); it does not delete the key.
+
+---

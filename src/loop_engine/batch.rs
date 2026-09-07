@@ -496,6 +496,7 @@ pub async fn run_batch(
     parallel_slots: usize,
     cli_force_on: bool,
     cli_force_off: bool,
+    use_other_models_ttl: Option<u64>,
 ) -> BatchResult {
     // Cached once at the top of run_batch — matches the run-level config caching
     // convention (CLAUDE.md): mid-loop edits to .task-mgr/config.json do NOT take
@@ -589,6 +590,9 @@ pub async fn run_batch(
     // Chain tracking: advances to loop_result.branch_name after each successful PRD.
     // Starts as None so the first PRD branches from HEAD.
     let mut chain_base: Option<String> = None;
+    // Proto-channel expiry map inherited across PRDs when `--chain` continues
+    // after a rung-scoped horizon stop (never for account-binding Stop).
+    let mut inherited_unavailable_rungs = engine::UnavailableRungsMap::new();
 
     // Step 5: Run each PRD sequentially
     let mut results = Vec::with_capacity(pairs.len());
@@ -627,6 +631,7 @@ pub async fn run_batch(
         // CLI parallel value overrides whatever LoopConfig::from_env resolved
         // (mirrors loop's behavior: explicit flag > env var > default).
         config.parallel_slots = parallel_slots;
+        config.use_other_models_ttl = use_other_models_ttl;
         if let Some(max_iter) = max_iterations {
             config.max_iterations = max_iter;
         }
@@ -655,6 +660,7 @@ pub async fn run_batch(
             batch_sibling_prds: sibling_prds,
             chain_base: chain_base_snapshot.clone(),
             prefix_mode,
+            inherited_unavailable_rungs: inherited_unavailable_rungs.clone(),
         };
 
         let loop_result = engine::run_loop(run_config).await;
@@ -704,20 +710,26 @@ pub async fn run_batch(
             cleanup_ctx.cleanup(wt_path, exit_code, result_branch_name.as_deref());
         }
 
-        // Chain stop-on-incomplete: skip all remaining PRDs when this PRD either
-        // failed (non-zero exit) OR did not complete (active work still queued at
-        // loop end — an ambiguous exit 0 from an exhausted iteration budget or
-        // deadline). Downstream PRDs would build on a broken or incomplete state,
-        // so we abort immediately. Only `chain=true` enters this path.
-        if chain && (exit_code != 0 || !loop_result.prd_complete) {
-            ui::emit("Chain stopped: PRD did not complete, skipping remaining PRDs");
-            push_remaining_skipped(&mut results, &pairs, i + 1, &mut skipped);
-            break;
-        }
-
-        // Advance chain: next PRD branches from this PRD's branch (using LoopResult,
-        // not pre-read from JSON — avoids mismatch if DB normalizes the branch name).
+        // Chain stop-on-incomplete / inherit:
+        // - account-binding Stop (`account_quota_stopped`) aborts the chain
+        // - non-zero exit aborts
+        // - incomplete PRD with empty proto-channel (Ask/Deferred/budget) aborts
+        // - incomplete PRD with non-empty unavailable_rungs continues and seeds
+        //   the next PRD (rung-scoped horizon inherit)
         if chain {
+            if loop_result.account_quota_stopped || exit_code != 0 {
+                ui::emit("Chain stopped: PRD did not complete, skipping remaining PRDs");
+                push_remaining_skipped(&mut results, &pairs, i + 1, &mut skipped);
+                break;
+            }
+            if !loop_result.prd_complete && loop_result.unavailable_rungs.is_empty() {
+                ui::emit("Chain stopped: PRD did not complete, skipping remaining PRDs");
+                push_remaining_skipped(&mut results, &pairs, i + 1, &mut skipped);
+                break;
+            }
+            // Advance chain: next PRD branches from this PRD's branch and inherits
+            // the proto-channel expiry map (using LoopResult, not pre-read JSON).
+            inherited_unavailable_rungs = loop_result.unavailable_rungs;
             chain_base = result_branch_name;
         }
     }
@@ -746,6 +758,8 @@ pub async fn run_batch(
             worktree_path: target.worktree_path.clone(),
             branch_name: target.branch_name.clone(),
             tasks_completed: target.tasks_completed,
+            unavailable_rungs: Default::default(),
+            account_quota_stopped: false,
             prd_complete: true,
         };
         let launcher = auto_review::ProcessLauncher;
@@ -1252,13 +1266,26 @@ mod tests {
         );
     }
 
-    /// The exact chain-break predicate from `run_batch` (batch.rs ~709):
-    /// `chain && (exit_code != 0 || !prd_complete)`. Mirroring it in one place
-    /// keeps the tests below honest — they exercise the real boolean, not a
-    /// re-derived approximation. A drift between this and the production gate
-    /// surfaces as a failing assertion in the tests that consume it.
-    fn chain_break(chain: bool, exit_code: i32, prd_complete: bool) -> bool {
-        chain && (exit_code != 0 || !prd_complete)
+    /// Production chain discriminator from `run_batch` (~719-732).
+    /// Aborts when: account-binding/StopSpend (`account_quota_stopped`),
+    /// non-zero exit, or incomplete PRD with empty proto-channel.
+    /// Incomplete + non-empty `unavailable_rungs` + `account_quota_stopped`
+    /// false continues and seeds inherit (rung-scoped) — do **not** collapse
+    /// this back to `!prd_complete` alone (that never seeds after rung Stop).
+    fn chain_should_abort(
+        chain: bool,
+        exit_code: i32,
+        prd_complete: bool,
+        account_quota_stopped: bool,
+        unavailable_rungs_empty: bool,
+    ) -> bool {
+        if !chain {
+            return false;
+        }
+        if account_quota_stopped || exit_code != 0 {
+            return true;
+        }
+        !prd_complete && unavailable_rungs_empty
     }
 
     #[test]
@@ -1266,10 +1293,11 @@ mod tests {
         // Verify that when chain=true and a PRD fails, remaining PRDs are skipped.
         // We test the PrdRunResult structure that would be produced, not the async runner.
         //
-        // This covers the exit_code=1 chain failure case. The incomplete-PRD skip
-        // invariants (chain=true, exit_code=0, prd_complete=false → downstream
-        // skipped) are documented and asserted in `test_chain_stops_on_incomplete_prd`;
-        // the chain=false regression guard is `test_chain_false_incomplete_does_not_skip`.
+        // This covers the exit_code=1 chain failure case. Incomplete-PRD /
+        // StopSpend / rung-scoped inherit invariants live in
+        // `test_chain_stops_on_incomplete_prd_empty_map`,
+        // `test_chain_aborts_on_account_quota_stopped_despite_nonempty_map`,
+        // and `test_chain_continues_and_seeds_on_rung_scoped_incomplete`.
         //
         // Simulate what run_batch would produce for 3 PRDs where PRD[1] fails:
         let results = [
@@ -1317,18 +1345,14 @@ mod tests {
     }
 
     #[test]
-    fn test_chain_stops_on_incomplete_prd() {
-        // Layer 2: chain=true and the PRD exhausted its iteration budget/deadline
-        // with active work still queued → exit_code=0 but prd_complete=false.
-        // The chain gate must break and the remaining PRDs must be skipped, even
-        // though the exit code alone (0) would have let the chain advance.
+    fn test_chain_stops_on_incomplete_prd_empty_map() {
+        // Incomplete PRD with empty proto-channel (Ask/Deferred/budget) → abort.
+        // Non-empty map + account_quota_stopped false is the inherit path (below).
         assert!(
-            chain_break(true, 0, false),
-            "chain must break on incomplete PRD despite exit_code=0"
+            chain_should_abort(true, 0, false, false, true),
+            "chain must break on incomplete PRD with empty unavailable_rungs"
         );
 
-        // Drive the real skip helper from index 1 onward, exactly as run_batch
-        // does after a chain break at PRD[0].
         let pairs = vec![
             (PathBuf::from("phase-1.json"), PathBuf::from("p1.md")),
             (PathBuf::from("phase-2.json"), PathBuf::from("p2.md")),
@@ -1352,10 +1376,133 @@ mod tests {
         );
     }
 
-    /// Integration-style sequence: mirrors `run_batch`'s per-PRD chain gate and
-    /// `push_remaining_skipped` after each PRD — first PRD completes and advances
-    /// `chain_base`, second PRD is incomplete (`exit_code=0`, `prd_complete=false`),
-    /// third PRD is never run.
+    /// StopSpend / account-binding: exit 0, incomplete, non-empty map, but
+    /// `account_quota_stopped` true → abort (do not seed inherit).
+    #[test]
+    fn test_chain_aborts_on_account_quota_stopped_despite_nonempty_map() {
+        assert!(
+            chain_should_abort(true, 0, false, true, false),
+            "StopSpend/account-binding must abort even when unavailable_rungs is non-empty"
+        );
+
+        let pairs = vec![
+            (PathBuf::from("phase-1.json"), PathBuf::from("p1.md")),
+            (PathBuf::from("phase-2.json"), PathBuf::from("p2.md")),
+            (PathBuf::from("phase-3.json"), PathBuf::from("p3.md")),
+        ];
+        let mut results = vec![PrdRunResult {
+            prd_file: pairs[0].0.clone(),
+            exit_code: 0,
+            ..Default::default()
+        }];
+        let mut skipped = 0usize;
+        // Mirror production: abort → push_remaining_skipped, no inherit seed.
+        push_remaining_skipped(&mut results, &pairs, 1, &mut skipped);
+        assert_eq!(skipped, 2);
+        assert!(results[1].skipped && results[2].skipped);
+    }
+
+    /// Rung-scoped horizon: exit 0, incomplete, non-empty map,
+    /// `account_quota_stopped` false → continue and seed inherit.
+    #[test]
+    fn test_chain_continues_and_seeds_on_rung_scoped_incomplete() {
+        assert!(
+            !chain_should_abort(true, 0, false, false, false),
+            "rung-scoped incomplete must continue when unavailable_rungs is non-empty"
+        );
+
+        let pairs = vec![
+            (PathBuf::from("phase-1.json"), PathBuf::from("p1.md")),
+            (PathBuf::from("phase-2.json"), PathBuf::from("p2.md")),
+            (PathBuf::from("phase-3.json"), PathBuf::from("p3.md")),
+        ];
+
+        let mut results = Vec::new();
+        let mut chain_base: Option<String> = None;
+        let mut inherited = engine::UnavailableRungsMap::new();
+        let mut skipped = 0usize;
+        let mut seeded_after_prd1 = false;
+
+        // Seed map as if PRD-1 left frontier unavailable (factory / synthetic).
+        let frontier_key = (
+            crate::loop_engine::model::Provider::Claude,
+            crate::loop_engine::model::CapabilityTier::Frontier,
+        );
+        let mut prd1_map = engine::UnavailableRungsMap::new();
+        prd1_map.insert(frontier_key, 9_999_999);
+
+        for (i, (prd_file, _)) in pairs.iter().enumerate() {
+            let (exit_code, prd_complete, account_quota_stopped, map, branch_name) = match i {
+                0 => (
+                    0,
+                    false,
+                    false,
+                    prd1_map.clone(),
+                    Some("feat/phase-1".to_string()),
+                ),
+                1 => (
+                    0,
+                    true,
+                    false,
+                    engine::UnavailableRungsMap::new(),
+                    Some("feat/phase-2".to_string()),
+                ),
+                2 => (
+                    0,
+                    true,
+                    false,
+                    engine::UnavailableRungsMap::new(),
+                    Some("feat/phase-3".to_string()),
+                ),
+                _ => unreachable!(),
+            };
+
+            // Downstream PRDs observe the map seeded by the prior advance
+            // (production: LoopRunConfig.inherited_unavailable_rungs).
+            if i == 1 {
+                assert!(
+                    inherited.contains_key(&frontier_key),
+                    "PRD-2 must be seeded with PRD-1's unavailable_rungs before it runs"
+                );
+                seeded_after_prd1 = true;
+            }
+
+            results.push(PrdRunResult {
+                prd_file: prd_file.clone(),
+                exit_code,
+                branch_name: branch_name.clone(),
+                chain_base: chain_base.clone(),
+                ..Default::default()
+            });
+
+            if chain_should_abort(
+                true,
+                exit_code,
+                prd_complete,
+                account_quota_stopped,
+                map.is_empty(),
+            ) {
+                push_remaining_skipped(&mut results, &pairs, i + 1, &mut skipped);
+                break;
+            }
+
+            inherited = map;
+            chain_base = branch_name;
+        }
+
+        assert!(seeded_after_prd1, "inherit seed must be observed by PRD-2");
+        assert_eq!(skipped, 0, "rung-scoped must not skip remaining PRDs");
+        assert_eq!(results.len(), 3);
+        assert!(!results[0].skipped && !results[1].skipped && !results[2].skipped);
+        assert_eq!(
+            results[1].chain_base.as_deref(),
+            Some("feat/phase-1"),
+            "second PRD branches from first PRD's tip"
+        );
+    }
+
+    /// Integration-style sequence: first PRD completes; second is incomplete
+    /// with empty map → abort; third never runs.
     #[test]
     fn test_chain_sequence_stops_after_incomplete_second_prd() {
         let pairs = vec![
@@ -1369,9 +1516,9 @@ mod tests {
         let mut skipped = 0usize;
 
         for (i, (prd_file, _)) in pairs.iter().enumerate() {
-            let (exit_code, prd_complete, branch_name) = match i {
-                0 => (0, true, Some("feat/phase-1".to_string())),
-                1 => (0, false, Some("feat/phase-2".to_string())),
+            let (exit_code, prd_complete, map_empty, branch_name) = match i {
+                0 => (0, true, true, Some("feat/phase-1".to_string())),
+                1 => (0, false, true, Some("feat/phase-2".to_string())),
                 _ => unreachable!("third PRD must be skipped before iteration"),
             };
 
@@ -1383,7 +1530,7 @@ mod tests {
                 ..Default::default()
             });
 
-            if chain_break(true, exit_code, prd_complete) {
+            if chain_should_abort(true, exit_code, prd_complete, false, map_empty) {
                 push_remaining_skipped(&mut results, &pairs, i + 1, &mut skipped);
                 break;
             }
@@ -1407,19 +1554,20 @@ mod tests {
     #[test]
     fn test_chain_false_incomplete_does_not_skip() {
         // Regression guard for the `if chain &&` wrapping: when chain=false, NO
-        // incomplete signal — neither a non-zero exit nor prd_complete=false —
-        // may break the batch. Both would-be break signals must be inert.
+        // signal — exit, incomplete, or account_quota_stopped — may break.
         assert!(
-            !chain_break(false, 1, true),
+            !chain_should_abort(false, 1, true, false, true),
             "chain=false must not break on exit_code=1"
         );
         assert!(
-            !chain_break(false, 0, false),
+            !chain_should_abort(false, 0, false, false, true),
             "chain=false must not break on prd_complete=false"
         );
+        assert!(
+            !chain_should_abort(false, 0, false, true, false),
+            "chain=false must not break on account_quota_stopped"
+        );
 
-        // With chain=false the runner never calls push_remaining_skipped, so a
-        // downstream PRD that actually ran keeps skipped=false.
         let downstream = PrdRunResult {
             prd_file: PathBuf::from("phase-2.json"),
             exit_code: 0,

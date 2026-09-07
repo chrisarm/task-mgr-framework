@@ -121,6 +121,9 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
     let start_time = Instant::now();
     let inter_iteration_delay = Duration::from_secs(run_config.config.iteration_delay_secs);
     let mut ctx = IterationContext::new(run_config.config.max_crashes as u32);
+    // Seed proto-channel from a prior PRD's LoopResult (batch --chain inherit).
+    // Empty for standalone runs. Readers filter with `active_rungs`.
+    ctx.unavailable_rungs = run_config.inherited_unavailable_rungs.clone();
     // Thread the operator-resolved provider-first config into the recovery
     // paths (consecutive-failure + crash escalation). Without this they walk
     // `builtin_resolved_models()` and an operator who remapped Claude tiers gets
@@ -621,6 +624,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                 &ctx.resolved_models,
                 &ctx.provider_blackouts,
                 now,
+                project_config.routing.tier_fallback.as_ref(),
             ) {
                 reactions::account::RungOnlyEmpty::Inactive => {}
                 reactions::account::RungOnlyEmpty::Exhausted => {
@@ -880,6 +884,8 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
         was_stopped,
         tasks_completed,
         prd_complete,
+        unavailable_rungs: ctx.unavailable_rungs.clone(),
+        account_quota_stopped: ctx.account_quota_stopped,
     }
 }
 

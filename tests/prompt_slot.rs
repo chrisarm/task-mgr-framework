@@ -84,6 +84,8 @@ fn make_params(project_root: PathBuf, base_prompt_path: PathBuf) -> SlotPromptPa
         models_config: task_mgr::loop_engine::project_config::default_models_config(),
         routing_config: task_mgr::loop_engine::project_config::default_routing_config(),
         provider_blackouts: Default::default(),
+        unavailable_rungs: Default::default(),
+        tier_fallback: None,
     }
 }
 
@@ -388,6 +390,8 @@ fn build_prompt_renders_steering_and_session_guidance_when_set() {
         models_config: task_mgr::loop_engine::project_config::default_models_config(),
         routing_config: task_mgr::loop_engine::project_config::default_routing_config(),
         provider_blackouts: Default::default(),
+        unavailable_rungs: Default::default(),
+        tier_fallback: None,
     };
     let bundle = build_prompt(&conn, &task, &params);
 
@@ -588,6 +592,8 @@ fn build_prompt_oversize_drops_trimmable_sections_and_caps_total_budget() {
         models_config: task_mgr::loop_engine::project_config::default_models_config(),
         routing_config: task_mgr::loop_engine::project_config::default_routing_config(),
         provider_blackouts: Default::default(),
+        unavailable_rungs: Default::default(),
+        tier_fallback: None,
     };
     let bundle = build_prompt(&conn, &task, &params);
 
@@ -673,6 +679,8 @@ fn build_prompt_clears_shown_learning_ids_when_learnings_dropped() {
         models_config: task_mgr::loop_engine::project_config::default_models_config(),
         routing_config: task_mgr::loop_engine::project_config::default_routing_config(),
         provider_blackouts: Default::default(),
+        unavailable_rungs: Default::default(),
+        tier_fallback: None,
     };
     let bundle = build_prompt(&conn, &task, &params);
 
@@ -724,6 +732,8 @@ fn build_prompt_critical_only_oversize_returns_sentinel_bundle() {
         models_config: task_mgr::loop_engine::project_config::default_models_config(),
         routing_config: task_mgr::loop_engine::project_config::default_routing_config(),
         provider_blackouts: Default::default(),
+        unavailable_rungs: Default::default(),
+        tier_fallback: None,
     };
     let bundle = build_prompt(&conn, &task, &params);
 
@@ -789,6 +799,8 @@ fn wave_slot_resolves_via_anchor_window() {
         models_config: task_mgr::loop_engine::project_config::default_models_config(),
         routing_config: task_mgr::loop_engine::project_config::default_routing_config(),
         provider_blackouts: Default::default(),
+        unavailable_rungs: Default::default(),
+        tier_fallback: None,
     };
     let bundle = build_prompt(&conn, &task, &params);
 
@@ -831,6 +843,8 @@ fn wave_slot_anchor_window_resolves_without_any_default() {
         models_config: task_mgr::loop_engine::project_config::default_models_config(),
         routing_config: task_mgr::loop_engine::project_config::default_routing_config(),
         provider_blackouts: Default::default(),
+        unavailable_rungs: Default::default(),
+        tier_fallback: None,
     };
     let bundle = build_prompt(&conn, &task, &params);
 

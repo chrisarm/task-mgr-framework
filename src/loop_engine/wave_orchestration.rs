@@ -100,8 +100,11 @@ pub(super) fn wave_preflight_check(
                 tier_fallback: params.project_config.routing.tier_fallback.as_ref(),
                 threshold: params.usage_params.threshold,
                 tasks_dir: params.tasks_dir,
+                db_dir: params.db_dir,
                 fallback_wait: params.usage_params.fallback_wait,
+                ask_ttl_override: params.usage_params.ask_ttl_override,
                 execute_account_action: params.usage_params.enabled,
+                account_quota_stopped: &mut ctx.account_quota_stopped,
             },
         ) {
             UsageCheckResult::StopSignaled => {
@@ -136,10 +139,12 @@ pub(super) fn wave_preflight_check(
                     rate_limited_retry: false,
                 });
             }
-            UsageCheckResult::Deferred => {
-                ui::emit(
-                    "Quota ask deferred (tierFallback forbade downgrade; askTtlMinutes=0) — stopping",
-                );
+            UsageCheckResult::Deferred {
+                effective_ttl_minutes,
+            } => {
+                ui::emit(&reactions::account::deferred_ask_stop_banner(
+                    effective_ttl_minutes,
+                ));
                 return Some(WaveOutcome {
                     tasks_completed: 0,
                     iteration_consumed: false,
@@ -240,6 +245,7 @@ pub(super) fn handle_no_eligible_tasks(
         &ctx.resolved_models,
         &ctx.provider_blackouts,
         now,
+        params.project_config.routing.tier_fallback.as_ref(),
     ) {
         reactions::account::RungOnlyEmpty::Inactive => {}
         reactions::account::RungOnlyEmpty::Exhausted => {
