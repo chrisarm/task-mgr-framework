@@ -29,3 +29,32 @@ None for operators. `UsageInfo.percentage` is still used 0–100 (remaining
 rename is PR-2). Old `LOOP_USAGE_THRESHOLD` still applies in PR-1.
 
 ---
+
+## Quota buckets, remaining headroom, and capability-rung policy (PR-2)
+
+**Branch**: `feat/quota-rung-policy-pr2`
+**PRD**: `tasks/prd-quota-rung-policy.md`
+
+### What shipped
+
+Operators and the gate now speak **remaining percent left** (`usage_remaining_min`
+default 8; `LOOP_USAGE_REMAINING_MIN`; old `LOOP_USAGE_THRESHOLD` is a preflight
+error). Generic `QuotaBucket` ingest extra-marks rungs by configured model
+string. Horizon: wait ≤1h, 1h–12h capped at 5h, weekly-all >12h **stops** this
+PRD. Factory `tierFallback` auto-marks frontier unavailable and continues on
+standard; `includeForced: false` does not park the whole run. Remaining banners
+use the run's model pin.
+
+### Why it matters
+
+Frontier weekly-out no longer waits the account. Standard work proceeds. A 6-day
+weekly-all outage stops instead of 5h-cap-looping. Dual predicate still skips
+pre-gate OAuth when `LOOP_USAGE_CHECK_ENABLED=false`.
+
+### Breaking changes
+
+- `LOOP_USAGE_THRESHOLD` (used-percent) is a hard preflight error. Use
+  `LOOP_USAGE_REMAINING_MIN` (default 8).
+- Wait banners print `% left`, not `% used`.
+
+---

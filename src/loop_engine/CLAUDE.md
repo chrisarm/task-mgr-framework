@@ -267,6 +267,14 @@ scoped rung; do **not** gate exclusion on non-empty `provider_blackouts`
 env ∧ Claude enabled; do not treat disabled as a replace-on-evaluate exception.
 Spillover is never a working rung.
 Next-PRD inherit of rung-unavailable is PR-3 (documented, not implemented).
+Account-binding weekly-all beyond 12h **Stops** even if other Claude rungs look
+runnable (they share that bucket). Factory `includeForced: false` is not a
+global forbid when some todos have `tasks.model`. `Wait { 0 }` is ready-now,
+not `fallback_wait` 300s. Horizon Stop is `HorizonStopped` /
+`operator_stopped: false` (not a `.stop` file). Rung-only empty selection
+calls `handle_rung_only_empty_selection` **before** stale-abort and never
+`handle_quota_deferral`. Explicit `onLow` wait/stop/ask on a scoped bucket
+emits `AccountLow` so apply can honor it.
 Full copy-paste lives under `## CONTRACT-001` in the progress log.
 
 The per-task reactions (`resolve_task_execution`, `handle_overflow`) fold one
