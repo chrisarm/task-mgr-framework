@@ -110,7 +110,7 @@
       ],
       "modifiesBehavior": false,
       "notes": "Do not write production code or full test suites. Engine language is capability rungs; model ids stay in the ingest adapter. Factory default tierFallback IS the pin-3 instruction; ask is the opt-out. Learning [4126]/[5075]/[4868]: seq+wave share account reactions, exhaustive destructure. Learning [3927]/[5088]: do not reuse handle_quota_deferral for rungs. Learning [5361]: PR-1 account-binding fold stays; this contract adds buckets alongside, does not re-fold scoped windows into UsageInfo used-percent (FEAT-004 flips that field to remaining).",
-      "passes": true,
+      "passes": false,
       "priority": 1,
       "qualityDimensions": [
         "Contract unambiguous enough that FEAT-003 and FEAT-005 cannot disagree on evaluate vs apply or horizon vs explicit onLow",
@@ -173,7 +173,7 @@
       ],
       "modifiesBehavior": false,
       "notes": "Implement against ## CONTRACT-001 in the progress log. Ingest entry is ingest_oauth_value — do not change parse_oauth_usage_json's signature for extra-mark (that fold stays account-binding / threshold-only until FEAT-004). Data: json.get(\"five_hour\")?.get(\"utilization\")?.as_f64(); remaining = (100.0 - util).clamp(0.0, 100.0); limit[\"kind\"]; limit[\"scope\"][\"model\"][\"display_name\"]; limit[\"percent\"] u64 or f64. Extra-mark: after HUD maps display_name to rung R, for each defined rung T if model_for(provider, T) == model_for(provider, R) { mark T }. Do not call substring tier_of. Do not implement apply/horizon/proto-channel (FEAT-005). Do not invert UsageInfo.percentage yet (FEAT-004). Learning [5361] PR-1 fold stays until FEAT-004. Learning [4481] no model ids in generated artifacts. Known-bad: HUD-only map after frontier pin; extra-mark via contains(\"opus\"); stuffing models into parse_oauth_usage_json.",
-      "passes": true,
+      "passes": false,
       "priority": 2,
       "qualityDimensions": [
         "Generic ingest, no allow-list of window names",
@@ -287,7 +287,7 @@
       ],
       "modifiesBehavior": true,
       "notes": "Touches config.rs, startup.rs, usage.rs, account.rs, engine.rs UsageParams, project_config remainingMinPercent, display.rs days band, CLAUDE.md env names. Learning [5398]: remaining-min must be the live value, not a hardcoded 8, when selecting reset among low wait buckets (FEAT-005 uses the same live floor). Learning [5297]/[5301] dual predicate unchanged. Learning [5362] was used≥92 — this task is the invert (remaining≤8). Learning [4955] preflight_validate_and_probe is the shared loop/batch chokepoint for LOOP_USAGE_THRESHOLD. Data: config[\"usagePolicy\"][\"remainingMinPercent\"]; remaining = (100.0 - util).clamp(0.0, 100.0); account remaining = min of account-binding remaining. Known-bad: storing remaining 45 while compare is still used>=92. Do not implement horizon/ask/proto-channel (FEAT-005).",
-      "passes": true,
+      "passes": false,
       "priority": 3,
       "qualityDimensions": [
         "One remaining unit 0–100, never 0.08",
@@ -431,7 +431,7 @@
       ],
       "modifiesBehavior": true,
       "notes": "Implement CONTRACT-001 horizon table in apply, not in evaluate. MAX_WAIT_SECS is already 5*3600 in account.rs — reuse it. Thread proto-channel through iteration.rs + wave_scheduler.rs the same way excluded_ids already flow; prompt/sequential.rs and prompt/slot.rs already consume excluded_ids — extend compute_quota_excluded_ids rather than adding a second channel into the prompts. Empty provider_blackouts is the production case: drop or bypass the `if active_blackouts.is_empty() { return HashSet::new(); }` early-return so proto-channel exclusion still runs. serde: Option<TierFallback> with #[serde(default = \"default_tier_fallback\")]; default_tier_fallback returns Some(high/includeReview true/includeForced false); explicit null → None → ask. Learning [5075]/[4866]/[4138]/[5371] once-per-wave shared coordinators. Learning [3927]/[5088] new sibling, never handle_quota_deferral. Learning [1810]/[4373] IterationContext is main-thread-only. Learning [5087] BlackoutState stays the provider channel — this HashSet is a sibling. Learning [4868] exhaustive destructure. Out of scope: --use-other-models-ttl clap, TTL>0 re-evaluate on stop-check, resolve_execution_plan down-only walker, family-match of explicit tasks.model, models set-usage-rule / set-tier-fallback. Do not document a wait loop as accepted for off-ladder tasks.model. Known-bad: Wait { 3600 } on scoped unavailable while standard work remains; skip-wait hot-loop; evaluate returning ask; gating exclusion on non-empty provider_blackouts; absent tierFallback key → None.",
-      "passes": true,
+      "passes": false,
       "priority": 10,
       "qualityDimensions": [
         "Frontier-low is not an account emergency — continue on standard (unavailable, not account wait)",
@@ -517,8 +517,10 @@
       ],
       "dependsOn": [
         "CODE-REVIEW-1",
-        "WIRE-FIX-001",
-        "CODE-FIX-001"
+        "CODE-FIX-002",
+        "CODE-FIX-003",
+        "CODE-FIX-004",
+        "CODE-FIX-005"
       ],
       "description": "REVIEW-001 is the milestone for this PR-2 slice. Run the full unscoped quality gate and leave the repo green including pre-existing failures. Prove FR-003 + FR-004 remaining banners + horizon apply + proto-channel. Drive verify-task-mgr via `loop run --help` (the skill refuses `loop run` / `batch run`). Unit/coordinator tests are the proof of ingest + remaining + apply. No live Anthropic. Do not implement PR-3.",
       "estimatedEffort": "high",
@@ -550,35 +552,71 @@
     },
     {
       "acceptanceCriteria": [
-        "run_account_quota_gate / load path builds QuotaBucket rungs via ingest_oauth_value with the run ResolvedModelsConfig (params.models / ctx.resolved_models), not builtin_resolved_models alone",
-        "After set-tier claude frontier=<standard-model> (Opus HUD), production buckets mark standard AND frontier so evaluate marks both unavailable",
-        "Unit/wiring test fails if gate buckets come from builtin under a frontier=opus pin; hermetic (no live Anthropic)",
-        "parse_oauth_usage_json signature stays threshold-only; no models param on that fold"
+        "weekly_all remaining 5 (or 0), reset 6d, other_rungs_runnable true → QuotaAccountAction::Stop not Proceed",
+        "Session-only AccountLow with reset 3h still Wait capped at MAX_WAIT_SECS",
+        "Scoped frontier-low with factory tierFallback still Unavailable/Proceed when standard work exists",
+        "No live Anthropic"
       ],
-      "description": "FEAT-003 extra-mark unit test passes when pinned models are passed to ingest_oauth_value, but production check_usage_api / load_usage_info_with_threshold always calls ingest_oauth_value(&json, builtin_resolved_models()) (usage.rs ~169). run_account_quota_gate then evaluates info.buckets without re-ingesting with params.models (comment at 166-168 claims caller re-ingests; it does not). After PR-1 pin frontier→opus, Opus HUD low only marks standard under builtin ladder — frontier todos stay selectable (skip-wait hot-loop / CONTRACT known-bad #5). Fix: thread ResolvedModelsConfig into OAuth bucket construction (extend load_usage_info* / fetch, or keep raw JSON on UsageInfo and ingest inside run_account_quota_gate with params.models). format_oauth_remaining_banner may keep builtin for label-only display if buckets for evaluate are correctly re-ingested.",
+      "description": "Post-loop review High 1. apply_quota merges session/weekly AccountLow into latest reset then uses work.other_rungs_runnable to Proceed on >12h. Weekly-all remaining 5% with a 6d reset then continues burning quota because compute_remaining_work_snapshot only subtracts eval.unavailable (scoped). Other Claude rungs share weekly_all and are not a working alternative. Decision: for account-binding AccountLow, reset >12h → Stop. Use other_rungs_runnable only for scoped unavailable, and only count a different provider.",
       "estimatedEffort": "medium",
-      "id": "WIRE-FIX-001",
-      "passes": false,
-      "priority": 20,
-      "title": "Production OAuth ingest must use run ResolvedModelsConfig for extra-mark",
+      "id": "CODE-FIX-002",
+      "passes": true,
+      "priority": 0,
+      "title": "Account-binding weekly-all >12h must Stop even if other rungs look runnable",
       "touchesFiles": [
-        "src/loop_engine/usage.rs",
         "src/loop_engine/reactions/account.rs"
       ]
     },
     {
       "acceptanceCriteria": [
-        "compute_remaining_work_snapshot uses the same effective provider as compute_quota_excluded_ids for pinned runner_overrides tasks (promote_once), still with empty provider_blackouts so spillover never invents capacity",
-        "Pinned Grok/Codex work is counted as other_rungs_runnable when Claude frontier is unavailable, avoiding spurious horizon Stop",
-        "Hermetic unit test covers pin present vs absent; seq/wave still share the helper (no path split)"
+        "Factory tierFallback + snapshot with one non-empty tasks.model + frontier 5% + standard todos → unavailable+Proceed, not Defer",
+        "Operator copy must not claim tierFallback forbade downgrade on factory defaults",
+        "includeReview false still defers review-class when that is the only remaining work",
+        "No live Anthropic"
       ],
-      "description": "Parity audit: compute_remaining_work_snapshot (account.rs ~1547-1603) always resolve_execution_plan with empty blackouts and never consults IterationContext.runner_overrides, while compute_quota_excluded_ids honors pins. Underestimate runnable work → spurious horizon Stop when a promoted Grok/Codex task could run; overestimate → Proceed+exclude leaving only pinned-unavailable tasks → empty selection without blackout wait. Thread runner_overrides (or &IterationContext) into the snapshot using the same effective provider/tier plan as exclusion.",
+      "description": "Post-loop review High 2. compute_remaining_work_snapshot sets has_forced if ANY todo/in_progress has tasks.model (overflow writes that column). tier_fallback_allows then returns false and apply Defers the whole PRD. Factory includeForced:false is the PR-3 per-task family-match defer, not an opt-out of the whole policy. Decision: do not treat has_forced && !include_forced as a global forbid. Leave forced-model tasks selectable (PR-3 walker); factory still marks eligible rungs unavailable and proceeds on standard.",
       "estimatedEffort": "medium",
-      "id": "CODE-FIX-001",
-      "passes": false,
-      "priority": 19,
-      "title": "compute_remaining_work_snapshot must honor runner_overrides pins",
+      "id": "CODE-FIX-003",
+      "passes": true,
+      "priority": -1,
+      "title": "Factory includeForced false must not globally forbid unavailable",
       "touchesFiles": [
+        "src/loop_engine/reactions/account.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Wait { secs: 0 } → UsageCheckResult::BelowThreshold / ready-now, not 300s",
+        "Positive wait secs still sleep",
+        "No live Anthropic"
+      ],
+      "description": "Post-loop review High 3. Evaluate emits reset_secs=0 for past/now timestamps. Apply maps secs<=60m to Wait { secs } including 0. Execute then substitutes fallback_wait (300s). wait_for_usage_reset already treats 0 as ready-now. Decision: pass 0 through; do not treat 0 as unknown.",
+      "estimatedEffort": "low",
+      "id": "CODE-FIX-004",
+      "passes": true,
+      "priority": -2,
+      "title": "Pass Wait { 0 } through as ready-now, not fallback_wait 300s",
+      "touchesFiles": [
+        "src/loop_engine/reactions/account.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "LOOP_USAGE_CHECK_ENABLED=false + Claude enabled → no load_usage_info / OAuth GET at pre-gate (spy)",
+        "Claude disabled still skips Anthropic I/O",
+        "Post-output RateLimit path unchanged vs dual-predicate table",
+        "Proto-channel snapshot kept when load is skipped",
+        "No live Anthropic"
+      ],
+      "description": "Post-loop review High 4. Dual predicate: pre-iteration OAuth is LOOP_USAGE_CHECK_ENABLED AND Claude enabled. Seq/wave call run_account_quota_gate whenever Claude is enabled; load_usage_info_with_threshold always runs; execute_account_action only skips wait/stop. Decision: skip the load when !usage_params.enabled (keep proto-channel snapshot). Do not document an exception. Post-output dual predicate unchanged.",
+      "estimatedEffort": "medium",
+      "id": "CODE-FIX-005",
+      "passes": true,
+      "priority": -3,
+      "title": "Pre-iteration OAuth must honor LOOP_USAGE_CHECK_ENABLED",
+      "touchesFiles": [
+        "src/loop_engine/iteration.rs",
+        "src/loop_engine/wave_orchestration.rs",
         "src/loop_engine/reactions/account.rs"
       ]
     }

@@ -2988,7 +2988,13 @@ mod tests {
             ..RemainingWorkSnapshot::default()
         };
         let eval = evaluate_quota(std::slice::from_ref(&session), &policy, 8);
-        let applied = apply_quota(&eval, &[session.clone()], &policy, Some(&fb), &work);
+        let applied = apply_quota(
+            &eval,
+            std::slice::from_ref(&session),
+            &policy,
+            Some(&fb),
+            &work,
+        );
         assert_eq!(
             applied.account,
             QuotaAccountAction::Wait { secs: 0 },

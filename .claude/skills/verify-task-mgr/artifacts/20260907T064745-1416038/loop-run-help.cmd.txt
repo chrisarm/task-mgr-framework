@@ -1,0 +1,1 @@
+task-mgr --dir /tmp/task-mgr-verify-20260907T064745-1416038/project/.task-mgr loop run --help
