@@ -75,6 +75,7 @@
       "medium": "21-50: Fix in current phase if time permits"
     }
   },
+  "taskPrefix": "5d58149d",
   "userStories": [
     {
       "acceptanceCriteria": [
@@ -190,7 +191,7 @@
       ],
       "modifiesBehavior": true,
       "notes": "Implement against landed PR-2 Ask execute (account.rs QuotaAccountAction::Ask). Do not rewrite CODE-FIX-010 sleep. Compute effective_ttl = cli.unwrap_or(policy.ask_ttl_minutes) BEFORE apply/ask_or_defer — do not only swap ttl in execute_quota_account_action. Factory/allowing is continue-via-unavailable (not Ask). Ask/Defer is opt-out / explicit onLow ask only. Re-eval: on each WaitTiming.stop_check_secs tick during Ask wait, re-read project config usagePolicy + routing.tierFallback only (batch.rs 'config cached once' still holds for everything else). Learning [5467]/[5468] hermetic Ask TTL tests: 0 no-sleep, 15→900s, stop mid-wait — extend them for CLI override (config 0 + CLI 15 → Ask { 15 }) + re-eval + forbid-defer. Learning [5427] Deferred for ask/defer. Learning [4126]/[4868] exhaustive destructure. Learning [5075] once-per-wave. Do not implement the down-only walker (FEAT-007) or models set-usage-rule (FEAT-008). Drive verify-task-mgr SKILL.md via `$H capture loop-run-help -- loop run --help` and `$H capture batch-run-help -- batch run --help` (capture names, not feature files). Never loop run. Known-bad: config 0 + CLI 15 still Defer; treating 0 as omitted; WaitedAndReset after forbade TTL; StopSignaled on timeout.",
-      "passes": false,
+      "passes": true,
       "priority": 2,
       "qualityDimensions": [
         "Frontier-low is not an account emergency — continue on standard when eligibility allows",
@@ -328,7 +329,7 @@
       ],
       "modifiesBehavior": true,
       "notes": "Build on PR-2 proto-channel + apply + handle_rung_only_empty_selection. Upgrade HashSet to expiry map; replace_unavailable_rungs writes expiry (API resets_at or 3600 for synthetic CLI). Adapter: active_rungs(&HashMap<(Provider, CapabilityTier), u64>, now) -> HashSet of keys with expiry > now. HashSet callers keep their type via the adapter — do not add iteration.rs, orchestrator.rs, wave_orchestration.rs, wave_scheduler.rs, reaction_parity.rs, or model_selection_engine_edges.rs (would exceed 10 touchesFiles). Walker: (provider, start_tier, blacked: &HashSet from active_rungs) -> Option<CapabilityTier> first defined non-blacked LOWER rung. Walk CapabilityTier::ALL descending, skip >= start, skip exact_model_for None, skip blacked. Must not call model_for. Learning [4998]/[5010] two independent clamps — this is a third, down-only. Learning [5027] six-rung comments stay; add a post-resolve clamp comment after TIER_TO_MODEL / EXPLICIT_MODEL. Learning [5414] exact_model_for not model_for. Learning [5120] tier_of stays exact-match. Learning [5431] proto-channel sibling of BlackoutState. Learning [5472]/[5474] rung-only sibling. Learning [1810] main-thread only. Learning [4481] no model ids in engine state. HUD family-match: pub(crate) reuse usage.rs hud_tier_from_label / map_unlabeled_token; do not copy Fable→frontier into model.rs. Sequential and slot BOTH construct PlanContext — missing one is a seq/wave split. Overflow: skip blacked rungs (FR-006). Do not implement set-usage-rule (FEAT-008). Do not restate HorizonStopped. Known-bad: model_for clamp; wait-loop for off-ladder pins; persist expiry in SQLite; treating expired map keys as active HashSet members.",
-      "passes": false,
+      "passes": true,
       "priority": 10,
       "qualityDimensions": [
         "Frontier-low continues on standard (and cheaper rungs) via down-only clamp, not an account wait",
@@ -399,7 +400,7 @@
       ],
       "modifiesBehavior": false,
       "notes": "Copy handle_set_tier / handle_set_fallback patterns (reject_legacy, parse, set_json_path, validate_and_write, ui::emit_data). New handlers: handle_set_usage_rule, handle_set_tier_fallback, handle_unset_tier_fallback. Export from commands/models/mod.rs; match in main.rs ModelsAction. Flag names: --kind, --id, --on-low, --include-review, --include-forced. Learning [4901] models handler workflow. Do not drive models list --remote or loop run. Feature map: models-routing — add the new sub-features; do not invent a second harness. CLAUDE.md models section (non-TASK_MGR block) lists the verbs; the enhance-managed command table will pick up clap descriptions on the next enhance. Known-bad: remaining percents on offline show; unset deleting the key.",
-      "passes": false,
+      "passes": true,
       "priority": 11,
       "qualityDimensions": [
         "Sparse JSON round-trip; unrelated keys survive",
@@ -475,7 +476,11 @@
         "If issues found: FIX-xxx via `task-mgr add --stdin --depended-on-by REVIEW-001 --from-json tasks/quota-rung-policy-pr3.json`"
       ],
       "dependsOn": [
-        "CODE-REVIEW-1"
+        "CODE-REVIEW-1",
+        "CODE-FIX-001",
+        "CODE-FIX-002",
+        "CODE-FIX-003",
+        "CODE-FIX-004"
       ],
       "description": "REVIEW-001 is the milestone for this PR-3 slice. Run the full unscoped quality gate and leave the repo green including pre-existing failures. Prove FR-005 TTL CLI + FR-006 clamp/inherit + FR-008 policy CLI. Drive verify-task-mgr via loop run --help / batch run --help / models text (the skill refuses loop run / batch run). Unit/coordinator tests are the proof of walker + family-match + inherit. No live Anthropic. Do not reimplement PR-2.",
       "estimatedEffort": "high",
@@ -502,6 +507,79 @@
         "src/cli/commands.rs",
         "src/loop_engine/CLAUDE.md",
         "CLAUDE.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "cargo test --test reaction_parity --no-run compiles cleanly",
+        "QuotaPreflightParams constructions include db_dir, ask_ttl_override, ask_policy_reeval",
+        "react_to_outputs_inner / with_io_seams call sites pass unavailable_rungs and match current seam arities",
+        "Proto-channel fixtures use UnavailableRungsMap + active_rungs where needed (not raw HashSet-as-map)",
+        "Existing parity assertions for account gate / rate-limit / rung-only empty still pass for seq vs wave"
+      ],
+      "description": "tests/reaction_parity.rs does not compile after FEAT-006/007: react_to_outputs_inner now takes unavailable_rungs (7 args; call sites still pass 6); react_to_outputs_with_io_seams arity/closure mismatches; QuotaPreflightParams missing db_dir, ask_ttl_override, ask_policy_reeval; proto-channel still typed as HashSet vs UnavailableRungsMap. cargo test --test reaction_parity --no-run fails with 41 errors. Production seq/wave paths are wired; the dual-path parity harness that would catch the next divergence does not build. Update call sites and fixtures; re-assert seq/wave same decision for preflight / rate-limit / rung-only. Learning [5150] parity auditor; [4126]/[5371] shared coordinators.",
+      "estimatedEffort": "medium",
+      "id": "CODE-FIX-001",
+      "passes": false,
+      "priority": 0,
+      "title": "Repair reaction_parity for PR-3 UnavailableRungsMap + Ask TTL params",
+      "touchesFiles": [
+        "tests/reaction_parity.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "TTL 0 immediate Defer banner may still mention askTtlMinutes=0 / no sleep",
+        "Ask TTL>0 timeout Defer does NOT claim askTtlMinutes=0; names --use-other-models-ttl or effective minutes when available",
+        "was_stopped stays false on Ask timeout; .stop during Ask still StopSignaled",
+        "seq + wave banners updated together (parity)",
+        "Unit or string-pin test covers both Deferred variants"
+      ],
+      "description": "iteration.rs and wave_orchestration.rs hardcode askTtlMinutes=0 on every UsageCheckResult::Deferred. After --use-other-models-ttl 15 (or config askTtlMinutes>0) times out with forbade tierFallback, the operator waited N minutes but the stop banner claims TTL was 0. Keep was_stopped=false / soft-stop semantics; fix the message only. Prefer naming --use-other-models-ttl / effective minutes, or omit the false askTtlMinutes=0 clause. Update seq + wave together.",
+      "estimatedEffort": "low",
+      "id": "CODE-FIX-002",
+      "passes": false,
+      "priority": -1,
+      "title": "Honest Deferred banner for Ask TTL timeout vs TTL 0",
+      "touchesFiles": [
+        "src/loop_engine/iteration.rs",
+        "src/loop_engine/wave_orchestration.rs",
+        "src/loop_engine/reactions/account.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "loop_engine/CLAUDE.md records expiry map + active_rungs, down-only walker (no model_for), family-match at resolve via usage.rs adapter, ask TTL CLI + stop-check re-eval, next-PRD inherit, unset-tier-fallback=JSON null",
+        "Strike not-implemented / Do not document as shipped (PR-3) lines and HashSet-only proto-channel wording",
+        "Root CLAUDE.md documents --use-other-models-ttl on loop run / batch run (0 allowed; omitted vs Some(0)) and strikes still PR-3 clamp wording",
+        "No claim that wait-loop is an accepted substitute for family-match defer"
+      ],
+      "description": "src/loop_engine/CLAUDE.md still describes pre-PR-3 world: proto-channel as HashSet, Next-PRD inherit documented-not-implemented, Do not document --use-other-models-ttl/set-usage-rule/set-tier-fallback as shipped. Root CLAUDE.md still says automatic clamp remains PR-3 and omits --use-other-models-ttl (models set-usage-rule/set-tier-fallback verbs are listed). Update both to match shipped FEAT-006/007/008 so REVIEW-001 and future loops are not misled.",
+      "estimatedEffort": "low",
+      "id": "CODE-FIX-003",
+      "passes": false,
+      "priority": -2,
+      "title": "Document shipped PR-3 ask TTL, expiry map, down-only clamp in CLAUDE.md",
+      "touchesFiles": [
+        "src/loop_engine/CLAUDE.md",
+        "CLAUDE.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "resolve_execution_plan and/or apply_rung_blackout_clamp destructure PlanContext exhaustively (no ..)",
+        "Adding a new PlanContext field fails compile until consumers account for it",
+        "Existing down-only / family-match / resolve unit tests still pass",
+        "No behavior change to clamp or six-rung resolution"
+      ],
+      "description": "CODE-REVIEW-1 AC requires PlanContext exhaustive destructure (no ..), matching AccountUsageGateParams / QuotaPreflightParams. Construction sites list all fields, but resolve_execution_plan and apply_rung_blackout_clamp use dotted field access — a new PlanContext field would not force a compile break at the clamp consumer. Destructure PlanContext at the top of resolve_execution_plan and/or apply_rung_blackout_clamp so adding a field is a compile error. Behavior-neutral.",
+      "estimatedEffort": "low",
+      "id": "CODE-FIX-004",
+      "passes": false,
+      "priority": -3,
+      "title": "Exhaustive PlanContext destructure in resolve/clamp",
+      "touchesFiles": [
+        "src/loop_engine/model.rs"
       ]
     }
   ],
