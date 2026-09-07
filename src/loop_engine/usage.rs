@@ -947,6 +947,42 @@ pub fn usage_suggests_lifted(info: &UsageInfo, threshold: u8, post_limit: bool) 
     info.percentage > f64::from(threshold)
 }
 
+/// Preflight Wait early-lift probe (FR-009 / US-010). Pure — no GET.
+///
+/// - `account_binding == true` (session / weekly_all / mixed): same as
+///   [`usage_suggests_lifted`] on account remaining.
+/// - `account_binding == false` (scoped-only): re-ingest via
+///   [`buckets_for_run_models`]; lift iff **every** bucket with nonempty
+///   `rungs` has percent remaining `> floor`, or has no percent measurement
+///   (missing → treat as ok). Does **not** call `evaluate_quota`.
+///
+/// Built **after** apply so the probe matches `Wait.account_binding`. Post-output
+/// `WaitFn` stays `Fn(u64) -> bool` and does not use this helper.
+pub fn wait_probe_lifted(
+    info: &UsageInfo,
+    floor: u8,
+    account_binding: bool,
+    models: &ResolvedModelsConfig,
+) -> bool {
+    if account_binding {
+        return usage_suggests_lifted(info, floor, false);
+    }
+    let floor_f = f64::from(floor);
+    buckets_for_run_models(info, models)
+        .iter()
+        .filter(|b| b.rungs.as_ref().is_some_and(|r| !r.is_empty()))
+        .all(|b| {
+            match b
+                .measurements
+                .iter()
+                .find(|m| m.unit == MeasurementUnit::Percent)
+            {
+                Some(m) => m.remaining > floor_f,
+                None => true,
+            }
+        })
+}
+
 /// Parse the legacy org usage JSON.
 fn parse_org_usage_json(json: &serde_json::Value) -> Option<UsageInfo> {
     // Org endpoint historically reported **used** percent; invert to remaining.
@@ -1668,6 +1704,45 @@ mod tests {
         assert!(!usage_suggests_lifted(&low, 80, true));
         assert!(usage_suggests_lifted(&lifted, 80, false));
         assert!(!usage_suggests_lifted(&low, 80, false));
+    }
+
+    #[test]
+    fn wait_probe_lifted_scoped_only_false_on_live_shaped_week_45() {
+        // live_shaped: week/account 45% left, Fable scoped remaining 5% ≤ floor 8.
+        // Scoped-only must NOT lift on healthy week remaining (US-010).
+        let info = UsageInfo {
+            percentage: 45.0,
+            reset_at: None,
+            remaining_banner: None,
+            buckets: Vec::new(),
+            oauth_json: Some(live_shaped_oauth_json()),
+        };
+        let models = builtin_models();
+        assert!(
+            !wait_probe_lifted(&info, 8, false, &models),
+            "scoped-only probe must ignore week 45% and see Fable 5%"
+        );
+        // Account-binding still uses account remaining (45 > 8 → lifted).
+        assert!(wait_probe_lifted(&info, 8, true, &models));
+    }
+
+    #[test]
+    fn wait_probe_lifted_scoped_only_true_when_fable_remaining_above_floor() {
+        // Same live_shaped skeleton but Fable limits[] percent used=50 → remaining 50.
+        let mut json = live_shaped_oauth_json();
+        json["limits"][2]["percent"] = serde_json::json!(50);
+        let info = UsageInfo {
+            percentage: 45.0,
+            reset_at: None,
+            remaining_banner: None,
+            buckets: Vec::new(),
+            oauth_json: Some(json),
+        };
+        let models = builtin_models();
+        assert!(
+            wait_probe_lifted(&info, 8, false, &models),
+            "scoped Fable remaining 50% > floor 8 may lift"
+        );
     }
 
     #[test]
