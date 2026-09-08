@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-09-08
+
+### Fixed
+- Honest terminal closes stay classified: loop-exit and overflow rungs 1–3
+  reclaim only `in_progress` rows. Merge-fail reopens `in_progress`/`done` so
+  premature `:done` is retried; `blocked`/`skipped`/`irrelevant` are not reset
+  to todo. `handle_task_failure` skips the consecutive-failure ladder when the
+  row is already terminal.
+
 ## [0.3.2] - 2026-09-08
 
 ### Added
