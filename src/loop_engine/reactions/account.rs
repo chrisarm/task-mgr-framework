@@ -1577,11 +1577,8 @@ fn explicit_on_low_for_bucket(
         if kind_ok && id_ok {
             // when predicates: only severity opt-in (same as evaluate).
             if let Some(when) = rule.when.as_ref() {
-                if let Some(want) = when.get("severity").and_then(|v| v.as_str()) {
-                    if bucket.severity.as_deref() != Some(want) {
-                        return None;
-                    }
-                } else {
+                let want = when.get("severity").and_then(|v| v.as_str())?;
+                if bucket.severity.as_deref() != Some(want) {
                     return None;
                 }
             }

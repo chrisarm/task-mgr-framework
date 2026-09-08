@@ -221,8 +221,10 @@ pub fn blob_to_embedding(blob: &[u8]) -> Vec<f32> {
         "BLOB length {} is not a multiple of 4",
         blob.len()
     );
-    blob.chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+    blob.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect()
 }
 
