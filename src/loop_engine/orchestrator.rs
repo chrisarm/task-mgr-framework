@@ -121,6 +121,9 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
     let start_time = Instant::now();
     let inter_iteration_delay = Duration::from_secs(run_config.config.iteration_delay_secs);
     let mut ctx = IterationContext::new(run_config.config.max_crashes as u32);
+    // Seed proto-channel from a prior PRD's LoopResult (batch --chain inherit).
+    // Empty for standalone runs. Readers filter with `active_rungs`.
+    ctx.unavailable_rungs = run_config.inherited_unavailable_rungs.clone();
     // Thread the operator-resolved provider-first config into the recovery
     // paths (consecutive-failure + crash escalation). Without this they walk
     // `builtin_resolved_models()` and an operator who remapped Claude tiers gets
@@ -607,14 +610,39 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
 
         // Track consecutive stale iterations and abort if stuck
         if matches!(result.outcome, IterationOutcome::NoEligibleTasks) {
-            // FEAT-008 deferral-first — ordered BEFORE drained classification
+            // (0a) Rung-only empty — BEFORE blackout deferral, in parity with
+            // the wave path. Proceed + proto-channel exclusions can empty the
+            // eligible set with no provider blackout; that is quota-empty
+            // (reset in_progress, soft-stop), NOT stale and NOT
+            // `handle_quota_deferral` (learning 3927 / 5088).
+            let now = crate::loop_engine::engine::now_unix_secs();
+            match reactions::account::handle_rung_only_empty_selection(
+                &mut conn,
+                task_prefix.as_deref(),
+                &ctx.unavailable_rungs,
+                &ctx.runner_overrides,
+                &ctx.resolved_models,
+                &ctx.provider_blackouts,
+                now,
+                project_config.routing.tier_fallback.as_ref(),
+            ) {
+                reactions::account::RungOnlyEmpty::Inactive => {}
+                reactions::account::RungOnlyEmpty::Exhausted => {
+                    ui::emit(
+                        "All remaining todos are on unavailable rungs — quota empty, soft-stopping",
+                    );
+                    exit_code = 0;
+                    exit_reason = "quota soft-stop".to_string();
+                    break;
+                }
+            }
+            // (0b) FEAT-008 deferral-first — ordered BEFORE drained classification
             // and the stale tracker, in parity with the wave path's
             // `handle_no_eligible_tasks`. When a provider blackout is active and
             // todo work remains, the empty selection is quota-DEFERRAL, not a
             // stale or drained queue: wait for the reset (reusing
             // `wait_for_usage_reset`), clear the blackout, and retry WITHOUT
             // marking the stale tracker (learning 3927).
-            let now = crate::loop_engine::engine::now_unix_secs();
             match reactions::account::handle_quota_deferral(
                 &conn,
                 task_prefix.as_deref(),
@@ -687,11 +715,17 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                     exit_code = 130;
                     exit_reason = "signal received".to_string();
                 }
-                IterationOutcome::Empty => {
-                    // Stop signal file or other empty exit
+                IterationOutcome::Empty if result.operator_stopped => {
+                    // Operator `.stop` file (including mid-usage-wait).
                     exit_code = 0;
                     exit_reason = "stop signal".to_string();
                     was_stopped = true;
+                }
+                IterationOutcome::Empty => {
+                    // Quota soft-stop (horizon Stop / Deferred): end this PRD
+                    // without the operator-stop / batch-chain was_stopped flag.
+                    exit_code = 0;
+                    exit_reason = "quota soft-stop".to_string();
                 }
                 IterationOutcome::PromptOverflow => {
                     exit_code = 3;
@@ -850,6 +884,8 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
         was_stopped,
         tasks_completed,
         prd_complete,
+        unavailable_rungs: ctx.unavailable_rungs.clone(),
+        account_quota_stopped: ctx.account_quota_stopped,
     }
 }
 

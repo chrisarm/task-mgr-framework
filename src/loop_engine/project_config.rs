@@ -8,6 +8,7 @@ use crate::loop_engine::model::{
     CODEX_EFFORT_FOR_DIFFICULTY, CapabilityTier, GROK_DEFAULT_TIER_MODELS,
     GROK_EFFORT_FOR_DIFFICULTY, Provider, ResolvedModelsConfig, parse_config_provider,
 };
+use crate::loop_engine::quota::UsagePolicy;
 
 // ============================================================================
 // Provider-first model config (FR-001): the `models` + `routing` blocks
@@ -70,7 +71,13 @@ pub struct ProviderConfig {
 
 /// The `routing` config block: role-split + difficulty-spillover policy layered
 /// over the anchor window. Consumed by `resolve_execution_plan` (FEAT-004).
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Default)]
+///
+/// `tier_fallback` uses `#[serde(default = "default_tier_fallback")]` so an
+/// **absent** key deserializes to factory `Some(high/includeReview true)` —
+/// NOT `None`. Explicit JSON `null` deserializes to `None` (ask opt-out).
+/// Do not use bare `#[serde(default)]` on this `Option` (that yields `None`
+/// for a missing key).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct RoutingConfig {
     /// Task-ID-prefix → forced route (provider + optional forced tier).
@@ -88,6 +95,59 @@ pub struct RoutingConfig {
     /// note — building the cascade is out of scope for this PRD.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_cascade: Option<serde_json::Value>,
+    /// Rung-unavailable downgrade instruction (PR-2 / FR-004).
+    ///
+    /// Factory / omitted key → `Some({maxDifficulty: high, includeReview: true,
+    /// includeForced: false})` (auto-unavailable). Explicit `null` → `None`
+    /// (ask opt-out).
+    #[serde(default = "default_tier_fallback")]
+    pub tier_fallback: Option<TierFallback>,
+}
+
+impl Default for RoutingConfig {
+    fn default() -> Self {
+        Self {
+            by_id_prefix: HashMap::new(),
+            task_classes: HashMap::new(),
+            spillover: SpilloverConfig::default(),
+            review_cascade: None,
+            tier_fallback: default_tier_fallback(),
+        }
+    }
+}
+
+/// When a capability rung is quota-low, whether the engine may mark it
+/// unavailable (exclude / continue on cheaper rungs) vs ask the operator.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TierFallback {
+    /// Highest difficulty eligible for auto-unavailable. Default `"high"`.
+    #[serde(default = "default_tier_fallback_max_difficulty")]
+    pub max_difficulty: String,
+    /// When true, review-class tasks may be excluded with the unavailable rung.
+    #[serde(default = "default_true")]
+    pub include_review: bool,
+    /// When true, explicit `tasks.model` forced routes may be excluded.
+    /// Default false (family-match / forced handling is PR-3).
+    #[serde(default)]
+    pub include_forced: bool,
+}
+
+fn default_tier_fallback_max_difficulty() -> String {
+    "high".into()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Serde default for `RoutingConfig.tier_fallback`: factory Some, not None.
+pub fn default_tier_fallback() -> Option<TierFallback> {
+    Some(TierFallback {
+        max_difficulty: default_tier_fallback_max_difficulty(),
+        include_review: true,
+        include_forced: false,
+    })
 }
 
 /// A forced route: a provider, optionally pinned to a capability tier.
@@ -790,6 +850,11 @@ pub struct ProjectConfig {
     /// (NOT serde-derived) so absent → the empty default.
     #[serde(skip)]
     pub routing: RoutingConfig,
+
+    /// Operator usage / quota policy (remaining floor + horizon knobs + rules).
+    /// JSON key `usagePolicy`. Default remaining floor is **8**.
+    #[serde(default)]
+    pub usage_policy: UsagePolicy,
 }
 
 impl Default for ProjectConfig {
@@ -816,6 +881,7 @@ impl Default for ProjectConfig {
             auto_review_mode: default_auto_review_mode(),
             models: ModelsConfig::builtin_default(),
             routing: RoutingConfig::default(),
+            usage_policy: UsagePolicy::default(),
         }
     }
 }
@@ -994,6 +1060,42 @@ fn is_executable_path(path: &std::path::Path) -> bool {
 /// mirrors `loop run`'s fail-before-iteration-1 contract and avoids burning N
 /// partial runs on a uniformly-broken environment.
 pub fn preflight_validate_and_probe(db_dir: &Path, cfg: &ProjectConfig) -> TaskMgrResult<()> {
+    // 0. Legacy used-percent env hard-break (PR-2 / FR-004). Non-loop commands
+    // never call this chokepoint, so list/recall keep working when the var is set.
+    if std::env::var_os("LOOP_USAGE_THRESHOLD").is_some() {
+        return Err(TaskMgrError::InvalidConfig {
+            field: "LOOP_USAGE_THRESHOLD".to_string(),
+            message: "LOOP_USAGE_THRESHOLD is removed; use LOOP_USAGE_REMAINING_MIN \
+                      (remaining-percent floor, default 8) or usagePolicy.remainingMinPercent"
+                .to_string(),
+        });
+    }
+
+    // 0b. Remaining-percent floor must be 0–100 (env or config). Same loop/batch
+    // chokepoint as LOOP_USAGE_THRESHOLD — non-loop commands stay silent.
+    if let Ok(raw) = std::env::var("LOOP_USAGE_REMAINING_MIN")
+        && let Ok(v) = raw.parse::<u16>()
+        && v > 100
+    {
+        return Err(TaskMgrError::InvalidConfig {
+            field: "LOOP_USAGE_REMAINING_MIN".to_string(),
+            message: format!(
+                "LOOP_USAGE_REMAINING_MIN must be 0–100 (got {v}); \
+                 remaining-percent floor cannot exceed 100"
+            ),
+        });
+    }
+    if cfg.usage_policy.remaining_min_percent > 100 {
+        return Err(TaskMgrError::InvalidConfig {
+            field: "LOOP_USAGE_REMAINING_MIN".to_string(),
+            message: format!(
+                "LOOP_USAGE_REMAINING_MIN / usagePolicy.remainingMinPercent must be 0–100 \
+                 (got {}); remaining-percent floor cannot exceed 100",
+                cfg.usage_policy.remaining_min_percent
+            ),
+        });
+    }
+
     // 1. Hard break: legacy keys are fatal at the loop/batch entry.
     reject_legacy_model_config(db_dir)?;
 
@@ -1634,6 +1736,138 @@ mod tests {
     }
 
     // ---- preflight_validate_and_probe tests (FR-002 hard break) ----
+
+    #[test]
+    fn test_preflight_hard_errors_on_legacy_loop_usage_threshold_env() {
+        // PR-2 / FR-004: LOOP_USAGE_THRESHOLD must not be silently ignored.
+        let _guard = CLAUDE_BINARY_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _legacy = EnvGuard::set("LOOP_USAGE_THRESHOLD", "92");
+        let _remaining = EnvGuard::remove("LOOP_USAGE_REMAINING_MIN");
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.json"), "{}").unwrap();
+        let cfg = read_project_config(dir.path());
+        let err = preflight_validate_and_probe(dir.path(), &cfg)
+            .expect_err("LOOP_USAGE_THRESHOLD must hard-error at loop/batch preflight");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("LOOP_USAGE_REMAINING_MIN"),
+            "error must name the new env: {msg}"
+        );
+        assert!(
+            msg.contains("LOOP_USAGE_THRESHOLD"),
+            "error must name the legacy env: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_preflight_rejects_loop_usage_remaining_min_above_100() {
+        // Known-bad: u8 200 (>100) must hard-error at loop/batch preflight only.
+        let _guard = CLAUDE_BINARY_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _legacy = EnvGuard::remove("LOOP_USAGE_THRESHOLD");
+        let _remaining = EnvGuard::set("LOOP_USAGE_REMAINING_MIN", "200");
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.json"), "{}").unwrap();
+        let cfg = read_project_config(dir.path());
+        let err = preflight_validate_and_probe(dir.path(), &cfg)
+            .expect_err("LOOP_USAGE_REMAINING_MIN=200 must hard-error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("LOOP_USAGE_REMAINING_MIN"),
+            "error must name LOOP_USAGE_REMAINING_MIN: {msg}"
+        );
+        assert!(
+            msg.contains("200") || msg.contains("100"),
+            "error must be actionable about the bound: {msg}"
+        );
+        // Non-loop path stays silent: read_project_config must not error.
+        let _ = read_project_config(dir.path());
+    }
+
+    #[test]
+    fn test_preflight_rejects_usage_policy_remaining_min_percent_above_100() {
+        let _guard = CLAUDE_BINARY_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _legacy = EnvGuard::remove("LOOP_USAGE_THRESHOLD");
+        let _remaining = EnvGuard::remove("LOOP_USAGE_REMAINING_MIN");
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{"usagePolicy":{"remainingMinPercent":200}}"#,
+        )
+        .unwrap();
+        let cfg = read_project_config(dir.path());
+        assert_eq!(
+            cfg.usage_policy.remaining_min_percent, 200,
+            "serde must accept u8 200 so preflight is the chokepoint"
+        );
+        let err = preflight_validate_and_probe(dir.path(), &cfg)
+            .expect_err("remainingMinPercent=200 must hard-error at preflight");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("LOOP_USAGE_REMAINING_MIN"),
+            "error must name LOOP_USAGE_REMAINING_MIN: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_usage_policy_remaining_min_deserializes() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{"usagePolicy":{"remainingMinPercent":12}}"#,
+        )
+        .unwrap();
+        let config = read_project_config(dir.path());
+        assert_eq!(config.usage_policy.remaining_min_percent, 12);
+    }
+
+    #[test]
+    fn usage_policy_horizon_defaults_round_trip_sparse() {
+        let dir = tempfile::tempdir().unwrap();
+        // Sparse JSON: unrelated key preserved; usagePolicy knobs take defaults.
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{"unrelatedKey":true,"usagePolicy":{}}"#,
+        )
+        .unwrap();
+        let config = read_project_config(dir.path());
+        assert_eq!(config.usage_policy.wait_if_reset_within_minutes, 60);
+        assert_eq!(config.usage_policy.stop_if_reset_beyond_hours, 12);
+        assert_eq!(config.usage_policy.ask_ttl_minutes, 0);
+        assert_eq!(config.usage_policy.remaining_min_percent, 8);
+        // Unrelated keys survive via Value round-trip on write paths; read keeps
+        // known fields. Re-serialize usagePolicy alone to pin camelCase defaults.
+        let v = serde_json::to_value(&config.usage_policy).unwrap();
+        assert_eq!(v["waitIfResetWithinMinutes"], 60);
+        assert_eq!(v["stopIfResetBeyondHours"], 12);
+        assert_eq!(v["askTtlMinutes"], 0);
+    }
+
+    #[test]
+    fn tier_fallback_absent_key_is_factory_some() {
+        let routing: RoutingConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        let fb = routing.tier_fallback.expect("absent key → factory Some");
+        assert_eq!(fb.max_difficulty, "high");
+        assert!(fb.include_review);
+        assert!(!fb.include_forced);
+        // Rust Default matches factory (not bare Option::None).
+        assert_eq!(
+            RoutingConfig::default().tier_fallback,
+            default_tier_fallback()
+        );
+    }
+
+    #[test]
+    fn tier_fallback_explicit_null_is_none_ask_opt_out() {
+        let routing: RoutingConfig =
+            serde_json::from_value(serde_json::json!({ "tierFallback": null })).unwrap();
+        assert!(routing.tier_fallback.is_none());
+    }
 
     /// Create an executable stub a binary probe will accept via `cliBinary`.
     fn make_executable_stub(dir: &Path, name: &str) -> std::path::PathBuf {

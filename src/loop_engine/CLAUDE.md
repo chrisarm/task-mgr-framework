@@ -197,16 +197,17 @@ Two mechanisms keep a reaction from being copy-pasted back into one path:
 | # | Coordinator | Module | Sequential call site | Wave call site | Relocated leaf (`#[deprecated]` shim) |
 |---|---|---|---|---|---|
 | #2 | `pre_spawn::resolve_task_execution` | `pre_spawn` | `iteration.rs:387` | `wave_scheduler.rs:1058` (per slot) | `recovery::{check_override_invalidation, check_crash_escalation}` |
-| #3 | `account::account_usage_gate` | `account` | `iteration.rs:130` | `wave_scheduler.rs:249` (once/wave) | `usage::check_and_wait` |
+| #3 | `account::run_account_quota_gate` | `account` | `iteration.rs:130` | `wave_orchestration.rs:91` (once/wave) | (parity helper: `account_usage_gate`) |
 | #5 | `post_output::handle_overflow` | `post_output` | `iteration.rs:755` | `slot.rs:535` (per slot) | `overflow::handle_prompt_too_long` |
 | #6 | `account::react_to_outputs` | `account` | `iteration.rs:703` | `wave_scheduler.rs:1170` (once/wave) | `usage::{parse_reset_from_output, wait_for_usage_reset}` |
 | #10 | `post_completion::react_to_completions` | `post_completion` | `orchestrator.rs:1207` | `wave_scheduler.rs:1482` | `orchestrator::trigger_human_reviews` |
 | #13 | `account_iteration_budget` | `reactions` (mod) | `orchestrator.rs:1312` | `orchestrator.rs:1027` | (inline `iteration -= 1` / `saturating_sub`) |
 | — | `account::react_to_transient` (FEAT-014) | `account` | `orchestrator.rs:1282` | `wave_scheduler.rs:1236` | (new; no pre-existing leaf) |
 
-Account-global reactions (`account_usage_gate`, `react_to_outputs`,
+Account-global reactions (`run_account_quota_gate`, `react_to_outputs`,
 `react_to_transient`) fire **exactly once per wave**, never once per
 rate-limited slot — they reflect shared API-account state, not per-task state.
+(`account_usage_gate` remains as the hermetic parity-test helper.)
 Anthropic account I/O uses a dual-predicate contract: `claude_provider_enabled`
 is resolved only through
 `resolve_models_config(&project_config.models, &project_config.routing).is_provider_enabled(Provider::Claude)`;
@@ -220,6 +221,154 @@ only `anthropic_account_io_allowed`. When Claude is disabled, neither
 `check_and_wait` nor `probe_rate_limit_lifted` runs; wait falls back to
 output-parsed / `fallback_wait` (no separate `api_reset_secs` field — the usage
 API reset path is unreachable).
+
+**PR-1 Fable/rung-scoped CLI RateLimit** (`You've reached your Fable limit…
+switch models with /model.`): classified as `RateLimit` (not Crash). A
+**narrow** predicate forces `Wait { blackout_fallback_secs }` (default 3600),
+ignoring api_secs / output_secs, never `RateLimitAction::Blackout` /
+`provider_blackouts.record` (even when spillover is on), and skips both
+`usage_gate` and `probe_rate_limit_lifted` in the production wait closure.
+Match only: (1) live phrase `reached your (fable|opus|sonnet|haiku) limit`,
+(2) a **whitespace-bounded** model token followed by `limit` (hyphen /
+underscore are **not** word boundaries — otherwise hyphenated `OPUS_MODEL` /
+`FABLE_MODEL` ids in ordinary session stdout false-trigger 3600), or (3)
+`switch models` on the **same line** as `reached`/`limit` (whole-capture
+`contains` matches docs/commentary).
+`/model` alone is not enough. Plain `reached your session limit` / `hit your
+limit · resets 4pm` stay ordinary RateLimit. Account-binding `reset_at` uses
+the live `usage_remaining_min` (remaining floor, default 8; old used≥92 ≡
+remaining≤8), not a hardcoded compile-time value. **Residual:** if a
+Fable-routed task actually spawns (`LOOP_USAGE_CHECK_ENABLED=false`, usage
+fetch fail, or explicit `tasks.model`), one Fable RateLimit still sleeps the
+**whole wave** 3600s. Pinning frontier off Fable
+(`task-mgr models set-tier claude frontier <standard-model>`) is **optional,
+not required**, after PRE-PR-3 extra-mark — see below. All-high / review /
+explicit-frontier work clamps **down** onto a working rung via the PR-3
+down-only walker (FEAT-007) when `tierFallback` allows.
+
+**PR-2 quota contract (CONTRACT-001 / FEAT-005):** remaining 0–100 is the gate
+unit (`LOOP_USAGE_REMAINING_MIN` > `usagePolicy.remainingMinPercent` > 8).
+`evaluate_quota` is pure per-bucket (ignore / unavailable + account wait/stop
+inputs — never ask, never `other_rungs_runnable`). Apply in `account.rs`
+(`apply_quota` / `run_account_quota_gate`) resolves ask/wait/stop/unavailable
+from remaining work + `routing.tierFallback`. Factory default
+`tierFallback` is `{maxDifficulty: high, includeReview: true, includeForced:
+false}` — absent key deserializes to that `Some` (auto-unavailable / downgrade);
+explicit JSON `null` (`models unset-tier-fallback`) is the ask opt-out
+(`askTtlMinutes` 0 → defer, no sleep; TTL > 0 → stop-signal-aware sleep then
+continue only if policy still allows). Horizon:
+wait if reset ≤ `waitIfResetWithinMinutes` (60); (60m, 12h] wait capped at
+`MAX_WAIT_SECS` (5h); >12h + nothing else runnable → stop (`in_progress` →
+`todo`). Scoped unavailable is **excluded** from the next selection via
+proto-channel `IterationContext.unavailable_rungs: UnavailableRungsMap`
+(`HashMap<(Provider, CapabilityTier), unix_expiry>`) — replace the map on
+each successful evaluate+apply; keep snapshot on API fail; filter live keys
+with `active_rungs(&map, now)` before exclusion / clamp / empty-selection
+(never treat every map key as live). Do **not** account-wait for a scoped
+rung; do **not** gate exclusion on non-empty `provider_blackouts` (empty
+blackouts is the production case).
+`LOOP_USAGE_CHECK_ENABLED=false` skips the pre-gate load entirely (no OAuth /
+`load_usage_info`) and keeps the proto-channel snapshot — dual predicate is
+env ∧ Claude enabled; do not treat disabled as a replace-on-evaluate exception.
+Spillover is never a working rung.
+Batch `--chain` inherits the expiry map onto the next PRD
+(`LoopResult.unavailable_rungs` → `inherited_unavailable_rungs`);
+account-binding horizon Stop **and** post-output `StopSpend` set
+`account_quota_stopped` and abort the chain (CLI spend/credits is exit 0 /
+`was_stopped` false — without the flag a non-empty expiry map would seed
+inherit). Rung-scoped Stop leaves the flag false so the next PRD may continue
+and clamp.
+Account-binding weekly-all beyond 12h **Stops** even if other Claude rungs look
+runnable (they share that bucket). Factory `includeForced: false` is not a
+global forbid when some todos have `tasks.model`. `Wait { 0 }` is ready-now,
+not `fallback_wait` 300s. Horizon Stop is `HorizonStopped` /
+`operator_stopped: false` (not a `.stop` file). Rung-only empty selection
+calls `handle_rung_only_empty_selection` **before** stale-abort and never
+`handle_quota_deferral`. Explicit `onLow` wait/stop/ask on a scoped bucket
+emits `AccountLow` so apply can honor it.
+Full copy-paste lives under `## CONTRACT-001` in the progress log.
+
+**PRE-PR-3 (CONTRACT-002 / FEAT-008–FIX-012):**
+
+- **HUD-family extra-mark identity union:** after HUD maps to rung R, identity
+  set I = always `canonical_model_for_hud_tier(R)`
+  (`FABLE_MODEL`/`OPUS_MODEL`/`SONNET_MODEL`/`HAIKU_MODEL`) **plus**
+  `scope.model.id` when present; extra-mark every Claude rung whose
+  `exact_model_for` equals any I. **Not** `exact_model_for(mapped_rung)`;
+  **not** prefer-id; **not** a single `identity: &str`. Fable HUD +
+  frontier→opus pin → **frontier only** (must not extra-mark standard);
+  Opus HUD + pin including snapshot id → **standard and frontier**.
+  Unlabeled named `seven_day_*` → `rungs: None` (`ingest_named_sibling`
+  never `map_unlabeled_token`; `limits[]` unlabeled ids still map).
+  The PR-3 down-only walker must **not** reintroduce mapped-rung extra-mark.
+  Full copy-paste under `## CONTRACT-002` in `tasks/progress-a593d39e.txt`.
+- **Wait-driving probe after apply:** `Wait { secs, account_binding }`;
+  `wait_probe_lifted` runs **after** apply. Scoped-only waits must **not**
+  lift on week remaining alone. Post-output `WaitFn` stays `Fn(u64)` (do
+  not widen). Fable 3600 skip of probe untouched.
+  **Residual:** scoped-only lift is `.all()` over nonempty-rungs buckets;
+  an empty filtered set is vacuously `true` (org-only load / explicit
+  `onLow: wait` on unlabeled `seven_day_*` with no HUD scoped row).
+  Fail-closed would be "no nonempty-rungs buckets → do not lift."
+  Production HUD Wait always carries the Fable `limits[]` row.
+- **`AccountReaction::{OperatorStopped, StopSpend}`** (no single `Stop`):
+  sequential `Empty` + `operator_stopped` → exit **0** (not RateLimit /
+  exit 1); wave → exit **0** (`OperatorStopped` was_stopped true;
+  `StopSpend` was_stopped false, reason usage/spend — **not** 130).
+- **Hygiene:** `has_review = is_frontier_class` (not bare `id.contains("REVIEW")`);
+  `extra_usage` / promotional / `nimbus_quill` → **Ignore** at `evaluate_one`
+  before amount-exhausted AccountLow; `LOOP_USAGE_REMAINING_MIN` /
+  `remainingMinPercent` **> 100** hard-errors at loop/batch
+  `preflight_validate_and_probe`.
+- **Pin:** optional for mixed standard/medium (factory exclude unsticks).
+
+**PR-3 (FEAT-006 / FEAT-007 / FEAT-008) — shipped:**
+
+- **Ask TTL CLI:** `--use-other-models-ttl <minutes>` on `loop run` / `batch run`
+  (nested + deprecated flat). `0` is allowed. Omitted → `None` (use
+  `usagePolicy.askTtlMinutes`); present `0` → `Some(0)` (defer immediately, no
+  sleep). Override is resolved to `effective_ttl` **before** `ask_or_defer`
+  (config 0 + CLI 15 → `Ask { 15 }`). Does not write `config.json`.
+- **Ask wait re-eval:** when effective TTL > 0, Ask sleeps stop-signal-aware and
+  re-reads `usagePolicy` + `routing.tierFallback` on the stop-check cadence,
+  then **re-runs evaluate/apply** on that slice (do not discard
+  `usagePolicy` / `let _ =`). Mid-wait `onLow: stop` → `HorizonStopped`
+  (not `StopSignaled` / `was_stopped`). Mid-wait flip forbade→allow continues
+  early; timeout continues iff `tier_fallback_allows`, else Deferred.
+  `.stop` during Ask → `StopSignaled`. Factory / allowing `tierFallback`
+  never emits Ask (unavailable + Proceed).
+- **Expiry map + `active_rungs`:** proto-channel is
+  `UnavailableRungsMap = HashMap<(Provider, CapabilityTier), u64>` (unix
+  expiry from bucket `resets_at`, else `now+3600`; synthetic CLI RateLimit
+  also stamps 3600). Replace-on-successful-evaluate / keep-on-API-fail
+  unchanged. Readers (`PlanContext`, exclusion, empty-selection, overflow)
+  consume `active_rungs` only — not the raw map.
+- **Down-only clamp (no `model_for`):** after the six-rung
+  `resolve_execution_plan` chain (including EXPLICIT_MODEL),
+  `apply_rung_blackout_clamp` walks **lower** defined non-blacked rungs via
+  `down_only_available_tier` + `exact_model_for` only. Never calls
+  `model_for` (bidirectional nearest-defined can walk UP onto a blacked
+  frontier). No lower rung → leave plan unchanged; selection excludes /
+  empty-handles the task (defer). `None` tierFallback forbids all clamp.
+- **Family-match at resolve:** off-ladder explicit `tasks.model` maps to a
+  capability rung via `usage.rs` (`hud_tier_from_label` /
+  `family_token_from_id` / `map_unlabeled_token`) — not substring `tier_of`.
+  `includeForced` is per-task: false → no clamp (defer via exclusion); true →
+  may clamp down. A wait-loop is **not** an accepted substitute for that
+  family-match defer.
+- **Next-PRD inherit:** batch `--chain` copies `LoopResult.unavailable_rungs`
+  forward. Abort when `account_quota_stopped` **or** non-zero exit **or**
+  incomplete + empty map. Incomplete + non-empty map + flag false continues
+  and seeds inherit (rung-scoped). `StopSpend` must set the flag in **both**
+  sequential (`iteration.rs`) and wave (`wave_scheduler.rs`) wrappers — apply
+  already does via `account_binding`. Tests must not encode chain-break as
+  `exit != 0 || !prd_complete`.
+- **Policy CLI:** `models set-usage-rule` / `set-tier-fallback` /
+  `unset-tier-fallback` (writes JSON **null**, does not delete the key) /
+  `models show` (offline: usagePolicy + tierFallback, no remaining %;
+  remaining numbers only behind `list --remote` live-fetch).
+- **Overflow:** escalate / to_1m skips active blacked rungs.
+
 The per-task reactions (`resolve_task_execution`, `handle_overflow`) fold one
 call per slot. Each coordinator pairs a production entry point with a hermetic
 `_inner` core that takes the side-effecting step (wait / review) as an injected

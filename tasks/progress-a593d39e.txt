@@ -1,0 +1,433 @@
+# Progress log — quota-rung-policy-pr2b (prefix a593d39e)
+# CONTRACT dependents: grep `## CONTRACT-002` below.
+
+---
+## 2026-09-07 - a593d39e-CONTRACT-002
+
+Design-only. Recorded stable CONTRACT-002 for FEAT-008 / FEAT-009 / FIX-010 /
+FIX-012 / PR-3 walker. Grep-verified landed holes on this tree (= pr2 / dacccb3):
+
+- `extra_mark_rungs` — `src/loop_engine/usage.rs:571` (keys on
+  `exact_model_for(primary)` — mapped-rung hole)
+- `ingest_named_sibling` — `src/loop_engine/usage.rs:352` (calls
+  `map_unlabeled_token` for weekly_scoped / rung-scoped keys — unlabeled hole)
+- `exact_model_for` — `src/loop_engine/model.rs:858`
+- Family constants — `FABLE_MODEL` / `OPUS_MODEL` / `SONNET_MODEL` /
+  `HAIKU_MODEL` in `src/loop_engine/model.rs` (lines 41–48)
+
+No production code in this task. Implementation is FEAT-008 / FEAT-009.
+
+## CONTRACT-002
+
+**Title:** HUD-family extra-mark identity union + unlabeled named sibling
+`rungs: None` (PRE-PR-3 gate between PR-2 and PR-3).
+
+**Consumers:** FEAT-008 (identity union), FEAT-009 (unlabeled `rungs: None` +
+live-shaped snapshot/exclude), FIX-010 (`wait_probe_lifted` via
+`buckets_for_run_models`), FIX-012 remaining banner, PR-3 down-only walker /
+TTL / inherit (must **not** loop until this contract is green; must **not**
+reintroduce mapped-rung extra-mark).
+
+**Pin timeline (pointer only — prose rewrite is DOCS-001):** until FEAT-008
+code is green, `models set-tier claude frontier <opus>` is **harmful** (landed
+extra-mark parks standard from a Fable HUD row). After FEAT-008: pin is
+**optional, not required**. All-high / review clamp remains PR-3.
+
+---
+
+### Precise interface
+
+```text
+// usage.rs — HUD tokens (fable/opus/sonnet/haiku as API labels) live ONLY here.
+// Family constants are used FROM model.rs (do not re-define).
+
+fn canonical_model_for_hud_tier(tier: CapabilityTier) -> Option<&'static str>
+// Frontier → FABLE_MODEL, Standard → OPUS_MODEL,
+// CostEfficient → SONNET_MODEL, Cheapest → HAIKU_MODEL.
+
+fn extra_mark_rungs_matching(
+    models: &ResolvedModelsConfig,
+    provider: Provider,                 // Claude only at call sites
+    identities: impl IntoIterator<Item = &str>,
+) -> Vec<(Provider, CapabilityTier)>
+// OR: call once per member of I and union the results.
+// Deduped rungs whose exact_model_for(provider, t) equals ANY member of I.
+// Always include HUD primary R before / as part of the union.
+// String equality only — not substring tier_of, not model_for clamp,
+// NOT exact_model_for(mapped_rung) / exact_model_for(primary)'s configured model.
+```
+
+**Identity set construction** (after HUD maps `display_name` / `id` → rung R):
+
+```text
+I = { canonical_model_for_hud_tier(R) }          // ALWAYS — never omit
+  ∪ { scope.model.id } when present              // also include when present
+```
+
+- **Do NOT** prefer `scope.model.id` over the family constant.
+- **Do NOT** build a single `identity: &str` of “id or family constant.”
+- Helper takes an identity **set** (iterator); call once per member and union.
+- Output remains `Vec<(Provider, CapabilityTier)>`.
+- Iterate **Claude** defined rungs only — do **not** iterate Grok/Codex.
+
+**Unlabeled named siblings** (`ingest_named_sibling`):
+
+```text
+// seven_day_opus / seven_day_sonnet (and other named siblings without scope.model):
+// - still ingested (NO allow-list of window names)
+// - kind may still be weekly_scoped (explicit onLow rules still match)
+// - rungs: None
+// - must NOT call map_unlabeled_token / family-token-map onto standard/cost-efficient
+```
+
+**limits[] unlabeled ids** (row has model `id`, no `display_name`): still use
+`map_unlabeled_token` (substring against configured model strings). That path
+is for `limits[]` only — named object siblings without `scope.model` must not
+use it.
+
+**Landed holes this contract replaces** (do not keep):
+
+1. `extra_mark_rungs(models, provider, primary)` comparing other tiers to
+   `exact_model_for(provider, primary)` — Fable HUD + frontier→opus pin marks
+   **standard**.
+2. `ingest_named_sibling` calling `map_unlabeled_token` for weekly_scoped /
+   rung-scoped named keys — `seven_day_opus` maps onto **standard**.
+
+---
+
+### Edge cases (fixtures FEAT-008 / FEAT-009 must pass)
+
+| Fixture | Expected `rungs` / apply |
+| --- | --- |
+| Fable HUD (`display_name` Fable / frontier), frontier pin → opus, **no** `scope.model.id` | `{frontier}` only — **not** standard |
+| Opus HUD + `id: "claude-opus-5-SNAPSHOT"` + same frontier→opus pin | `{standard, frontier}` |
+| Opus HUD, no pin | `{standard}` only |
+| Unlabeled named `seven_day_opus` / `seven_day_sonnet` (no `scope.model`) | ingested; `kind` may be `weekly_scoped`; **`rungs: None`** |
+| Live-shaped `live_shaped_oauth_json()` evaluate+apply, factory `tierFallback` | unavailable `{frontier}` only; factory **Proceed** (mixed standard work continues). Must include snapshot/exclude assertions — apply-only without snapshot/exclude is known-bad |
+| HUD token literals (`fable` / `opus` / `sonnet` / `haiku` as API labels) | **only** in `usage.rs` — REVIEW grep fails if copied into `quota.rs` / `model.rs` / `engine.rs` |
+
+---
+
+### Invariants
+
+1. `I` is **always** the family constant **plus** `scope.model.id` when present.
+2. Always include HUD primary R in the marked set.
+3. Claude rungs only (no Grok/Codex iteration).
+4. Match via string equality of `exact_model_for` against any member of `I` —
+   not substring `tier_of`, not `exact_model_for(mapped_rung)`.
+5. Named siblings without `scope.model` never call `map_unlabeled_token` for
+   `rungs`.
+6. `limits[]` unlabeled ids (id, no display_name) still use `map_unlabeled_token`.
+7. Engine / proto-channel language stays capability rungs
+   (`frontier` / `standard` / `cost-efficient` / `cheapest`); model ids appear
+   only at the ingest adapter boundary.
+
+---
+
+### Known-bad discriminators (contract / tests must reject)
+
+1. Extra-mark via `exact_model_for(mapped_rung)` / comparing to primary's
+   configured model → Fable HUD + pin marks **standard**.
+2. Prefer `scope.model.id` over the family constant → Opus HUD id
+   `claude-opus-5-SNAPSHOT` + pin fails to extra-mark **frontier**.
+3. Single `identity: &str` of “id or family constant” instead of a set union.
+4. Family-token-map `seven_day_opus` onto **standard** (or sonnet →
+   cost-efficient).
+5. Apply-only live-shaped fixture without snapshot / exclude assertions.
+
+---
+
+### Failure modes
+
+| Cause | Effect |
+| --- | --- |
+| Missing family constant in `I` | Opus snapshot + pin hole (frontier not marked when config stores `OPUS_MODEL`) |
+| Missing snapshot id in `I` | Only hurts if config stored the snapshot string (still include id when present) |
+| Unlabeled named sibling mapped onto a rung | Mixed work quota-emptied (standard/cost-efficient falsely unavailable) |
+| HUD tokens copied into `quota.rs` / `model.rs` / `engine.rs` | REVIEW grep fails; model ids leak into engine state |
+
+---
+
+### Alternatives considered (rejected)
+
+| Option | Why rejected |
+| --- | --- |
+| (a) Prefer snapshot id over family constant | Kills Opus+pin extra-mark when HUD sends `claude-opus-5-SNAPSHOT` and config stores `OPUS_MODEL` |
+| (b) Extra-mark vs mapped rung's configured model (`exact_model_for(R)`) | Fable HUD + frontier→opus pin parks **standard** — the PRE-PR-3 hole |
+| (c) Drop `seven_day_*` from ingest | No allow-list; `kind` must still match explicit `onLow` rules; keep ingest with `rungs: None` |
+
+---
+
+### Downstream impact
+
+- **FEAT-008** — implement identity-union helper + wire `map_scope_to_rungs` /
+  HUD path; Fable+pin inverse + Opus+snapshot fixtures.
+- **FEAT-009** — unlabeled named `rungs: None`; live-shaped evaluate+apply with
+  snapshot/exclude; factory Proceed when only frontier unavailable.
+- **FIX-010** — `wait_probe_lifted` uses `buckets_for_run_models` (post-apply),
+  not pre-apply `usage_suggests_lifted` on week %.
+- **FIX-012** — remaining banner / `has_review = is_frontier_class` hygiene
+  (banner path consumes run models; does not redefine extra-mark).
+- **PR-3 walker** — must not reintroduce mapped-rung extra-mark; must not start
+  the TTL / clamp / inherit loop until this contract (and FEAT-008) is green.
+  After FEAT-008, a Fable-low proto-channel does **not** contain standard, so
+  clamp onto opus is possible.
+
+---
+
+### Implementation notes for FEAT-008 / FEAT-009 (not this task)
+
+- Keep `parse_oauth_usage_json*` threshold-only; extra-mark stays in
+  `ingest_oauth_value` / HUD mapping (learning 5413).
+- `evaluate_quota` stays pure; apply owns unavailable → proto-channel replace
+  (learnings 5430 / 5409 / 5484).
+- Do not re-fold scoped windows into an account wait (learning 5361).
+- No model ids in engine / proto-channel state (learning 4481).
+
+
+## 2026-09-07 17:01:39 UTC - Iteration 1
+- Task: a593d39e-CONTRACT-002
+- Model: grok-4.5
+- Effort: high
+- Outcome: NoEligibleTasks
+- Files: src/loop_engine/usage.rs, src/loop_engine/CLAUDE.md
+---
+---
+## 2026-09-07 - a593d39e-FEAT-008
+
+Replaced mapped-rung `extra_mark_rungs` (keyed on `exact_model_for(primary)`)
+with HUD-family identity union per CONTRACT-002:
+
+- `canonical_model_for_hud_tier(R)` → FABLE/OPUS/SONNET/HAIKU constants from model.rs
+- `extra_mark_rungs_matching(models, provider, identities)` — string-equality against
+  any member of I; Claude rungs only
+- `extra_mark_for_hud_tier` builds `I = {canonical} ∪ {scope.model.id?}` and always
+  includes HUD primary
+
+Fixtures added/kept:
+- Fable HUD + frontier→opus pin → frontier only (bare + "Current week (Fable)")
+- live-shaped Fable limits[] row under pin → frontier only
+- Opus + id claude-opus-5-SNAPSHOT + pin → standard AND frontier
+- existing Opus HUD pin / no-pin / WIRE-FIX-001 / CODE-FIX-007 still pass
+
+Rejected alternative: single `identity: &str` of "id or family constant" — preferring
+snapshot id alone would fail Opus+pin extra-mark when id is a SNAPSHOT variant.
+
+Verify: `cargo fmt --check`, `cargo clippy -p task-mgr --lib -- -D warnings`,
+usage unit tests (57), AC fixtures above. Help artifact:
+`/tmp/feat008-gate/loop-help.txt` (`cargo run --bin task-mgr -- loop run --help`)
+contains no `--use-other-models-ttl`. quota.rs/engine.rs production paths still
+free of fable/opus/claude-fable-5 literals; HUD helpers live only in usage.rs.
+
+
+## 2026-09-07 17:07:23 UTC - Iteration 2
+- Task: a593d39e-FEAT-008
+- Model: grok-4.5
+- Effort: high
+- Outcome: NoEligibleTasks
+- Files: src/loop_engine/usage.rs
+---
+
+---
+## 2026-09-07 - a593d39e-FEAT-009
+
+ingest_named_sibling no longer calls map_unlabeled_token. Named siblings
+(seven_day_opus / seven_day_sonnet / …) keep rungs: None; kind may still be
+weekly_scoped for explicit onLow. Keys still walked (no allow-list). limits[]
+unlabeled ids still use map_unlabeled_token (dedicated fixture).
+
+Promoted live_shaped_oauth_json + models_with_frontier_pinned_to_standard to
+pub(crate) (cfg(test)) for shared account/pre_spawn fixtures.
+
+AC coverage:
+- ingest_live_fixture: opus/sonnet assert rungs.is_none()
+- evaluate_live_shaped: unavailable == {(Claude, Frontier)} with/without pin;
+  seven_day_sonnet + nimbus_quill Ignore
+- account: mixed t-frontier/t-standard seed → other_rungs_runnable + factory
+  Proceed with/without pin
+- pre_spawn: replace_unavailable_rungs then exclude frontier not standard
+  with/without pin
+
+Verify: cargo fmt, clippy -D warnings, 165 usage/quota/account/pre_spawn tests,
+help artifact /tmp/feat009-gate/loop-help.txt (no --use-other-models-ttl).
+
+## 2026-09-07 17:13:48 UTC - Iteration 3
+- Task: a593d39e-FEAT-009
+- Model: grok-4.5
+- Effort: high
+- Outcome: NoEligibleTasks
+- Files: src/loop_engine/usage.rs, src/loop_engine/reactions/account.rs, src/loop_engine/reactions/pre_spawn.rs
+---
+
+---
+
+## 2026-09-07 - a593d39e-FIX-010
+
+Wait-driving probe after apply (FR-009 / US-010):
+
+- QuotaAccountAction::Wait { secs, account_binding } with
+  account_binding = has_account_binding_wait (mixed session+scoped = true)
+- Pure wait_probe_lifted(info, floor, account_binding, models) in usage.rs
+  - account_binding: usage_suggests_lifted
+  - scoped-only: buckets_for_run_models; every nonempty-rungs bucket
+    remaining > floor or missing
+- Production account_quota_preflight builds probe AFTER apply via
+  PreflightWaitMode::Production + run_preflight_wait (no usage_suggests_lifted
+  closed before apply). Ask/org-fallback keep account remaining probe.
+- Threaded models onto QuotaPreflightParams (exhaustive).
+- Post-output WaitFn / UsageGateFn unchanged; Fable 3600 skip untouched.
+- Hermetic + production_with_io_seams: live_shaped week 45% does not lift
+  scoped-only Wait. Wait { 0 } ready-now; .stop → StopSignaled.
+
+Verify: cargo fmt, clippy -D warnings, 154 account+usage tests,
+help /tmp/fix010-gate/loop-help.txt (no --use-other-models-ttl).
+
+
+## 2026-09-07 17:21:01 UTC - Iteration 4
+- Task: a593d39e-FIX-010
+- Model: grok-4.5
+- Effort: high
+- Outcome: NoEligibleTasks
+- Files: src/loop_engine/usage.rs, src/loop_engine/reactions/account.rs
+---
+
+---
+## 2026-09-07 - a593d39e-FIX-011
+
+Split AccountReaction::Stop → OperatorStopped + StopSpend (delete Stop).
+
+- account.rs: spend scan BEFORE prefer-rung decide_item; wait-false →
+  OperatorStopped; RateLimitAction::StopSpend → AccountReaction::StopSpend;
+  account_stop_{sequential,wave}_mapping helpers (FR-010 wrapper SSoT).
+- iteration.rs: exhaustive match → Empty + operator_stopped (StopSignaled /
+  HorizonStopped triples); NOT RateLimit + operator_stopped (exit 1).
+- wave_scheduler.rs: OperatorStopped exit 0 was_stopped true; StopSpend exit 0
+  was_stopped false reason "usage/spend limit" (known-bad was 130).
+- reaction_parity: updated Stop asserts; mixed Fable+spend → StopSpend;
+  Fable+hit-your-limit still Wait 3600; wrapper parity lock.
+- Also fixed QuotaPreflightParams.models in reaction_parity FEAT-005 fixture
+  (sibling FIX-010 field) so parity suite compiles.
+- Do NOT implement LoopResult.account_quota_stopped / batch --chain inherit (PR-3).
+- Verified: lib mapping + decide_spend; reaction_parity FIX-011 cases; cargo check;
+  task-mgr loop run --help. Parity auditor: no StopSpend→130 / OperatorStopped→RateLimit hole.
+
+## 2026-09-07 17:32:28 UTC - Iteration 5
+- Task: a593d39e-FIX-011
+- Model: grok-4.5
+- Effort: high
+- Outcome: NoEligibleTasks
+- Files: src/loop_engine/reactions/account.rs, src/loop_engine/iteration.rs, src/loop_engine/wave_scheduler.rs, tests/reaction_parity.rs
+---
+---
+## 2026-09-07 - a593d39e-FIX-012
+
+Hygiene: is_frontier_class has_review; extra_usage Ignore-at-evaluate; remaining-min >100 preflight; AccountReactionParams.models + check_and_wait banner via react_to_outputs closure.
+
+- has_review via is_frontier_class(&id) only (MILESTONE-FINAL true, REFACTOR-REVIEW-FINAL false, claimed CODE-REVIEW-1 true)
+- evaluate_one Ignores extra_usage/promotional/nimbus_quill before amount_exhausted AccountLow; dropped extra_usage from is_spend_kind; spend dollars 0 → AccountLow+Stop
+- preflight_validate_and_probe rejects LOOP_USAGE_REMAINING_MIN / remainingMinPercent > 100 (known-bad u8 200)
+- models on AccountReactionParams; UsageGateFn unchanged; verify-task-mgr loop-help no --use-other-models-ttl; models-show text-only no remaining %
+
+
+## 2026-09-07 17:41:24 UTC - Iteration 6
+- Task: a593d39e-FIX-012
+- Model: grok-4.5
+- Effort: high
+- Outcome: NoEligibleTasks
+- Files: src/loop_engine/quota.rs, src/loop_engine/reactions/account.rs, src/loop_engine/project_config.rs, src/loop_engine/iteration.rs, src/loop_engine/wave_scheduler.rs, tests/reaction_parity.rs
+---
+---
+
+## 2026-09-07 - a593d39e-DOCS-001
+
+Strike pin-required; pin optional after PRE-PR-3 extra-mark identity.
+
+- CLAUDE.md models section: Fable frontier pin optional (not required) for
+  mixed standard/medium; recipe set-tier claude frontier <standard-model>
+  documented as optional; all-high/review clamp still PR-3; Fable CLI 3600
+  residual named when a Fable-routed task still spawns.
+- src/loop_engine/CLAUDE.md account-global: struck pin-required; expanded
+  PRE-PR-3 block with identity union (Fable+pin→frontier only;
+  Opus+pin+snapshot→standard+frontier), wait-driving probe after apply,
+  AccountReaction OperatorStopped vs StopSpend (seq Empty; wave exit 0),
+  has_review=is_frontier_class, extra_usage Ignore at evaluate,
+  remaining-min >100 preflight. Grok-only recipe untouched.
+- verify-task-mgr: models-show (primaryProvider/anchor; no remaining %);
+  loop-help has no --use-other-models-ttl.
+  Evidence: .claude/skills/verify-task-mgr/artifacts/20260907T104301-1868658/
+
+
+## 2026-09-07 17:43:35 UTC - Iteration 7
+- Task: a593d39e-DOCS-001
+- Model: grok-4.5
+- Effort: medium
+- Outcome: NoEligibleTasks
+- Files: CLAUDE.md, src/loop_engine/CLAUDE.md
+---
+---
+## 2026-09-07 - a593d39e-CODE-REVIEW-1
+
+Reviewed CONTRACT-002 / FEAT-008 / FEAT-009 / FIX-010 / FIX-011 / FIX-012 /
+DOCS-001 via rust-python-code-reviewer + loop-engine-parity-auditor + local AC
+greps/fixtures.
+
+**No issues found.**
+
+AC confirmations:
+- Extra-mark identity set (`extra_mark_rungs_matching` / `extra_mark_for_hud_tier`):
+  Fable+pin → frontier only; Opus+SNAPSHOT+pin → standard∧frontier; no
+  fable/claude-fable-5 in prod quota.rs/engine.rs; HUD tokens in usage.rs
+- Unlabeled `seven_day_*` → `rungs: None`; live-shaped evaluate unavailable
+  {frontier} only; snapshot other_rungs_runnable; exclude high/frontier not
+  medium/standard (± pin)
+- `Wait { secs, account_binding }`; `wait_probe_lifted` after apply; scoped-only
+  + week 45% does not lift; post-output `WaitFn = Fn(u64)`; QuotaPreflightParams
+  models exhaustive
+- `OperatorStopped`/`StopSpend` (no `Stop`); seq Empty; wave exit 0; spend scan
+  before prefer-rung-scoped
+- `has_review = is_frontier_class`; extra_usage Ignore-at-evaluate; remaining-min
+  >100 names LOOP_USAGE_REMAINING_MIN; banner via react_to_outputs closure
+- Pin docs optional not required; all-high clamp still PR-3; no
+  --use-other-models-ttl / walker / inherit / FR-008 CLI in help
+
+Nit only (not spawned): `RUNG_MODEL_TOKENS` CLI phrase match still in account.rs
+(CONTRACT-002 HUD-ingest scope is usage.rs; quota/engine clean). Cross-module
+env mutex for LOOP_USAGE_REMAINING_MIN tests (USAGE_REMAINING_ENV_MUTEX vs
+CLAUDE_BINARY_MUTEX) can race under filtered parallel runs — production
+preflight OK; not an AC fail.
+
+## 2026-09-07 17:49:46 UTC - Iteration 8
+- Task: a593d39e-CODE-REVIEW-1
+- Model: grok-4.5
+- Effort: high
+- Outcome: TransientBackend (retry_after_secs: None)
+- Files: src/loop_engine/usage.rs, src/loop_engine/quota.rs, src/loop_engine/reactions/account.rs, src/loop_engine/reactions/pre_spawn.rs, src/loop_engine/iteration.rs, src/loop_engine/wave_scheduler.rs, src/loop_engine/project_config.rs, src/loop_engine/engine.rs, tests/reaction_parity.rs, src/loop_engine/CLAUDE.md
+---
+---
+## 2026-09-07 - a593d39e-REVIEW-001
+
+Final PRE-PR-3 gate (2b). Prior stories all passes:true. Unit/coordinator
+proofs green; verify-task-mgr launch+sandbox+loop run --help+models show
+(artifact 20260907T105108-1884743, no --use-other-models-ttl); full
+unscoped fmt/check/clippy/test clean.
+
+Gate fixes landed:
+- usage.rs: Opus SNAPSHOT fixture builds id via OPUS_MODEL (no_hardcoded)
+- merge_resolver.rs: test fixtures use OPUS_MODEL constant
+- config.rs: remaining-min env tests share CLAUDE_BINARY_MUTEX with
+  project_config (fixes cross-module LOOP_USAGE_* race)
+
+Negative ACs: WaitFn Fn(u64); UsageGateFn (u8,&Path,u64); no
+AccountReaction::Stop; no fable/claude-fable-5 in quota.rs/engine.rs;
+no set-usage-rule / down-only walker / inherit / account_quota_stopped.
+Docs: identity union, wait-probe, OperatorStopped vs StopSpend, pin
+optional, remaining-min >100, all-high clamp still PR-3.
+
+
+## 2026-09-07 18:00:21 UTC - Iteration 9
+- Task: a593d39e-REVIEW-001
+- Model: grok-4.5
+- Effort: high
+- Outcome: NoEligibleTasks
+- Files: src/loop_engine/usage.rs, src/loop_engine/quota.rs, src/loop_engine/reactions/account.rs, src/loop_engine/reactions/pre_spawn.rs, src/loop_engine/iteration.rs, src/loop_engine/wave_scheduler.rs, src/loop_engine/project_config.rs, src/loop_engine/engine.rs, tests/reaction_parity.rs, src/loop_engine/CLAUDE.md
+---

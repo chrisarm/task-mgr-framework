@@ -14,8 +14,10 @@ const ITERATION_HEADROOM_MULTIPLIER: f64 = 1.75;
 pub struct LoopConfig {
     /// Maximum iterations before stopping (0 = auto-calculate from task count)
     pub max_iterations: usize,
-    /// Usage API threshold percentage (0-100) to trigger wait-for-reset
-    pub usage_threshold: u8,
+    /// Remaining-percent floor (0–100). Wait when account remaining ≤ this.
+    /// Default **8**. Precedence at startup: `LOOP_USAGE_REMAINING_MIN` >
+    /// `usagePolicy.remainingMinPercent` > 8. Old used≥92 ≡ remaining≤8.
+    pub usage_remaining_min: u8,
     /// Maximum consecutive crashes before aborting the loop
     pub max_crashes: u8,
     /// Delay in seconds between iterations
@@ -29,12 +31,13 @@ pub struct LoopConfig {
     /// are deliberately NOT collapsed:
     ///
     /// - **Pre-iteration** (`orchestrator::ensure_valid_token`,
-    ///   `reactions::account::account_usage_gate`):
+    ///   `reactions::account::run_account_quota_gate`):
     ///   `usage_params.enabled = LOOP_USAGE_CHECK_ENABLED && claude_enabled`.
     ///   `LOOP_USAGE_CHECK_ENABLED=true` only *requests* the check; startup
     ///   gates it off when the resolved models config has the Claude provider
     ///   disabled. Setting the env var to `false` forces the pre-check off even
-    ///   when Claude is enabled.
+    ///   when Claude is enabled (no `load_usage_info` / OAuth GET; proto-channel
+    ///   snapshot kept).
     /// - **Post-output RateLimit** (`react_to_outputs` /
     ///   `react_to_outputs_with_io_seams`):
     ///   - allow-flag: `anthropic_account_io_allowed = claude_enabled` **only**
@@ -86,13 +89,21 @@ pub struct LoopConfig {
     /// Set via `--parallel N` CLI flag or `LOOP_PARALLEL` env var. Set to 1
     /// to force sequential execution. Values outside 1-3 are rejected.
     pub parallel_slots: usize,
+    /// CLI `--use-other-models-ttl <minutes>` override for Ask wait.
+    ///
+    /// `None` = omitted (use `usagePolicy.askTtlMinutes`, default 0).
+    /// `Some(0)` is present zero — not omitted — and forces Ask-path Defer
+    /// with no sleep. Overrides config for this run only; never writes
+    /// `config.json`. Threaded into `UsageParams.ask_ttl_override` at startup
+    /// so `effective_ttl` reaches `ask_or_defer` before apply.
+    pub use_other_models_ttl: Option<u64>,
 }
 
 impl Default for LoopConfig {
     fn default() -> Self {
         Self {
             max_iterations: 0,
-            usage_threshold: 92,
+            usage_remaining_min: 8,
             max_crashes: 3,
             iteration_delay_secs: 2,
             usage_fallback_wait: 300,
@@ -105,6 +116,7 @@ impl Default for LoopConfig {
             external_git_scan_depth: 50,
             cleanup_worktree: false,
             parallel_slots: 2,
+            use_other_models_ttl: None,
         }
     }
 }
@@ -116,7 +128,9 @@ impl LoopConfig {
     /// if missing). Then reads these env vars:
     ///
     /// - `LOOP_MAX_ITERATIONS` → `max_iterations` (usize)
-    /// - `LOOP_USAGE_THRESHOLD` → `usage_threshold` (u8, 0-100)
+    /// - `LOOP_USAGE_REMAINING_MIN` → `usage_remaining_min` (u8, 0-100).
+    ///   Invalid values are ignored (default 8). Legacy `LOOP_USAGE_THRESHOLD`
+    ///   is **not** read here — loop/batch preflight hard-errors if it is set.
     /// - `LOOP_MAX_CRASHES` → `max_crashes` (u8)
     /// - `LOOP_ITERATION_DELAY_SECS` → `iteration_delay_secs` (u64)
     /// - `LOOP_USAGE_FALLBACK_WAIT` → `usage_fallback_wait` (u64)
@@ -135,7 +149,8 @@ impl LoopConfig {
 
         Self {
             max_iterations: parse_env("LOOP_MAX_ITERATIONS").unwrap_or(defaults.max_iterations),
-            usage_threshold: parse_env("LOOP_USAGE_THRESHOLD").unwrap_or(defaults.usage_threshold),
+            usage_remaining_min: parse_env("LOOP_USAGE_REMAINING_MIN")
+                .unwrap_or(defaults.usage_remaining_min),
             max_crashes: parse_env("LOOP_MAX_CRASHES").unwrap_or(defaults.max_crashes),
             iteration_delay_secs: parse_env("LOOP_ITERATION_DELAY_SECS")
                 .unwrap_or(defaults.iteration_delay_secs),
@@ -154,8 +169,18 @@ impl LoopConfig {
             parallel_slots: parse_env::<usize>("LOOP_PARALLEL")
                 .filter(|&n| (1..=3).contains(&n))
                 .unwrap_or(defaults.parallel_slots),
+            // CLI-only: never read from env (flag omitted → None).
+            use_other_models_ttl: defaults.use_other_models_ttl,
         }
     }
+}
+
+/// Resolve the live remaining-percent floor.
+///
+/// Precedence: `LOOP_USAGE_REMAINING_MIN` (when present + valid) >
+/// `usagePolicy.remainingMinPercent` (config) > **8**.
+pub fn resolve_usage_remaining_min(env: Option<u8>, config_remaining_min: u8) -> u8 {
+    env.unwrap_or(config_remaining_min)
 }
 
 /// Parse a string value into a type that implements `FromStr`.
@@ -596,15 +621,69 @@ pub fn auto_max_iterations(task_count: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     // --- LoopConfig defaults ---
 
     #[test]
-    fn test_loop_config_default_usage_threshold() {
+    fn test_loop_config_default_usage_remaining_min() {
         let config = LoopConfig::default();
         assert_eq!(
-            config.usage_threshold, 92,
-            "USAGE_THRESHOLD should default to 92"
+            config.usage_remaining_min, 8,
+            "usage_remaining_min should default to 8"
+        );
+    }
+
+    #[test]
+    fn test_resolve_usage_remaining_min_precedence() {
+        assert_eq!(resolve_usage_remaining_min(Some(15), 10), 15);
+        assert_eq!(resolve_usage_remaining_min(None, 10), 10);
+        assert_eq!(resolve_usage_remaining_min(None, 8), 8);
+    }
+
+    // Share CLAUDE_BINARY_MUTEX with project_config remaining-min preflight
+    // tests — a private mutex here races when both mutate LOOP_USAGE_*.
+    use crate::loop_engine::test_utils::CLAUDE_BINARY_MUTEX;
+
+    #[test]
+    fn test_from_env_usage_remaining_min_valid() {
+        let _guard = CLAUDE_BINARY_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::remove_var("LOOP_USAGE_THRESHOLD") };
+        unsafe { std::env::set_var("LOOP_USAGE_REMAINING_MIN", "12") };
+        let config = LoopConfig::from_env();
+        unsafe { std::env::remove_var("LOOP_USAGE_REMAINING_MIN") };
+        assert_eq!(config.usage_remaining_min, 12);
+    }
+
+    #[test]
+    fn test_from_env_usage_remaining_min_invalid_ignored() {
+        let _guard = CLAUDE_BINARY_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::remove_var("LOOP_USAGE_THRESHOLD") };
+        unsafe { std::env::set_var("LOOP_USAGE_REMAINING_MIN", "not-a-number") };
+        let config = LoopConfig::from_env();
+        unsafe { std::env::remove_var("LOOP_USAGE_REMAINING_MIN") };
+        assert_eq!(
+            config.usage_remaining_min, 8,
+            "invalid LOOP_USAGE_REMAINING_MIN must fall back to default 8"
+        );
+    }
+
+    #[test]
+    fn test_from_env_ignores_legacy_usage_threshold() {
+        let _guard = CLAUDE_BINARY_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::remove_var("LOOP_USAGE_REMAINING_MIN") };
+        unsafe { std::env::set_var("LOOP_USAGE_THRESHOLD", "92") };
+        let config = LoopConfig::from_env();
+        unsafe { std::env::remove_var("LOOP_USAGE_THRESHOLD") };
+        assert_eq!(
+            config.usage_remaining_min, 8,
+            "LOOP_USAGE_THRESHOLD must not silently drive usage_remaining_min"
         );
     }
 
@@ -928,12 +1007,17 @@ mod tests {
 
     #[test]
     fn test_from_env_cli_only_fields_always_default() {
-        // yes_mode, hours, verbose, use_worktrees are CLI-only, never read from env
+        // yes_mode, hours, verbose, use_worktrees, use_other_models_ttl are
+        // CLI-only — never read from env.
         let config = LoopConfig::from_env();
         assert!(!config.yes_mode);
         assert!(config.hours.is_none());
         assert!(!config.verbose);
         assert!(config.use_worktrees); // defaults to true
+        assert!(
+            config.use_other_models_ttl.is_none(),
+            "use_other_models_ttl is CLI-only; omitted flag → None"
+        );
     }
 
     #[test]
@@ -1271,8 +1355,6 @@ mod tests {
     // --- permission_mode_from_env() ---
     // These tests mutate environment variables and must be serialised.
 
-    use std::sync::Mutex;
-
     static PERM_ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
@@ -1416,7 +1498,7 @@ mod tests {
         // If LoopConfig had a permission_mode field, this destructuring would need it.
         let LoopConfig {
             max_iterations: _,
-            usage_threshold: _,
+            usage_remaining_min: _,
             max_crashes: _,
             iteration_delay_secs: _,
             usage_fallback_wait: _,
@@ -1429,6 +1511,7 @@ mod tests {
             external_git_scan_depth: _,
             cleanup_worktree: _,
             parallel_slots: _,
+            use_other_models_ttl: _,
         } = config;
         // Exhaustive destructure compiles only if LoopConfig has exactly these fields.
     }
@@ -1439,7 +1522,7 @@ mod tests {
     fn test_loop_config_clone() {
         let config = LoopConfig::default();
         let cloned = config.clone();
-        assert_eq!(cloned.usage_threshold, config.usage_threshold);
+        assert_eq!(cloned.usage_remaining_min, config.usage_remaining_min);
         assert_eq!(cloned.max_crashes, config.max_crashes);
         assert_eq!(cloned.iteration_delay_secs, config.iteration_delay_secs);
     }

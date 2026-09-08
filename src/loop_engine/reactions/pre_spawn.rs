@@ -30,9 +30,10 @@ use std::collections::{HashMap, HashSet};
 use rusqlite::Connection;
 
 use crate::loop_engine::engine::{
-    EffectiveRunnerInput, IterationContext, resolve_effective_runner,
+    EffectiveRunnerInput, IterationContext, active_rungs, now_unix_secs, resolve_effective_runner,
 };
 use crate::loop_engine::model::{self, Provider, ResolvedModelsConfig};
+use crate::loop_engine::project_config::TierFallback;
 use crate::loop_engine::recovery::normalize_baseline;
 use crate::loop_engine::runner::RunnerKind;
 
@@ -288,12 +289,11 @@ pub fn invalidate_stale_overrides(ctx: &mut IterationContext, conn: &Connection,
     );
 }
 
-/// FEAT-008: the set of todo task ids that are QUOTA-DEFERRED under the active
-/// provider blackouts — their effective provider is still blacked out and they
-/// cannot reroute off it. This is the `excluded_ids` set passed to
-/// `select_next_task_excluding` / `select_parallel_group_excluding`; its
-/// complement (todo tasks NOT returned) are the spillover-eligible tasks
-/// selection may run on an alternate provider.
+/// Todo task ids excluded from the next selection under active provider
+/// blackouts **and/or** the PR-2 proto-channel (`ctx.unavailable_rungs`).
+///
+/// This is the `excluded_ids` set passed to `select_next_task_excluding` /
+/// `select_parallel_group_excluding`.
 ///
 /// Per-task effective provider — the spillover-eligibility SSoT:
 /// - A task carrying a `ctx.runner_overrides` entry is PINNED to that runner
@@ -308,18 +308,21 @@ pub fn invalidate_stale_overrides(ctx: &mut IterationContext, conn: &Connection,
 ///   deferred); a frontier/review task, an explicit-model task, or one with no
 ///   enabled alternative stays on the blacked-out provider (→ deferred).
 ///
-/// Returns an empty set when no provider is blacked out (the dominant case), so
-/// the DB scan only runs while a blackout is live. Read-only — DB errors are
-/// logged and treated as "nothing excluded" so a transient failure degrades to
-/// the pre-FEAT-008 selection rather than stranding the wave.
+/// PR-2: proto-channel exclusion MUST run when `provider_blackouts` is empty —
+/// that is the production case (rung unavailable without a provider blackout).
+/// A frontier-unavailable + empty blackouts still excludes frontier-rung todo
+/// tasks. Read-only — DB errors degrade to "nothing excluded".
 pub fn compute_quota_excluded_ids(
     ctx: &IterationContext,
     conn: &Connection,
     task_prefix: Option<&str>,
     models: &ResolvedModelsConfig,
     active_blackouts: &HashSet<Provider>,
+    tier_fallback: Option<&TierFallback>,
 ) -> HashSet<String> {
-    if active_blackouts.is_empty() {
+    let active_unavailable = active_rungs(&ctx.unavailable_rungs, now_unix_secs());
+    // Do NOT early-return on empty blackouts — proto-channel may still exclude.
+    if active_blackouts.is_empty() && active_unavailable.is_empty() {
         return HashSet::new();
     }
 
@@ -353,20 +356,54 @@ pub fn compute_quota_excluded_ids(
 
     let mut excluded = HashSet::new();
     for (id, model_col, difficulty) in rows.flatten() {
-        let effective_provider = match ctx.runner_overrides.get(&id) {
-            Some(kind) => provider_of_runner(*kind),
-            None => {
-                model::resolve_execution_plan(&model::PlanContext {
+        let plan = match ctx.runner_overrides.get(&id) {
+            Some(kind) => {
+                // Pinned runner: provider from override; tier still from resolve
+                // (without treating the pin as spillover-eligible).
+                let provider = provider_of_runner(*kind);
+                let tier = model::resolve_execution_plan(&model::PlanContext {
                     task_id: &id,
                     task_model: model_col.as_deref(),
                     difficulty: difficulty.as_deref(),
                     models,
                     provider_blackouts: active_blackouts,
+                    unavailable_rungs: &active_unavailable,
+                    tier_fallback,
                 })
-                .provider
+                .tier;
+                (provider, tier)
+            }
+            None => {
+                let plan = model::resolve_execution_plan(&model::PlanContext {
+                    task_id: &id,
+                    task_model: model_col.as_deref(),
+                    difficulty: difficulty.as_deref(),
+                    models,
+                    provider_blackouts: active_blackouts,
+                    unavailable_rungs: &active_unavailable,
+                    tier_fallback,
+                });
+                (plan.provider, plan.tier)
             }
         };
-        if active_blackouts.contains(&effective_provider) {
+        let (effective_provider, effective_tier) = plan;
+        // Post-clamp resolve: if clamp moved off the blacked rung, the task
+        // stays selectable. Explicit + includeForced=false stays on the blacked
+        // tier → exclude (per-task defer).
+        if active_blackouts.contains(&effective_provider)
+            || active_unavailable.contains(&(effective_provider, effective_tier))
+        {
+            if model_col.as_ref().is_some_and(|m| !m.trim().is_empty())
+                && tier_fallback.is_some_and(|fb| !fb.include_forced)
+                && active_unavailable.contains(&(effective_provider, effective_tier))
+            {
+                eprintln!(
+                    "Deferring {} — rung {} unavailable and includeForced=false \
+                     (--include-forced / set-tier-fallback includeForced)",
+                    id,
+                    effective_tier.as_str()
+                );
+            }
             excluded.insert(id);
         }
     }
@@ -381,5 +418,117 @@ fn provider_of_runner(kind: RunnerKind) -> Provider {
         RunnerKind::Claude => Provider::Claude,
         RunnerKind::Grok => Provider::Grok,
         RunnerKind::Codex => Provider::Codex,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::loop_engine::engine::IterationContext;
+    use crate::loop_engine::model::{CapabilityTier, Provider, builtin_resolved_models};
+
+    fn seed_conn() -> Connection {
+        let conn = Connection::open_in_memory().expect("in-memory");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE tasks (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'todo',
+                model TEXT,
+                difficulty TEXT,
+                archived_at TEXT
+            );
+            INSERT INTO tasks (id, status, difficulty) VALUES
+                ('t-frontier', 'todo', 'high'),
+                ('t-standard', 'todo', 'medium');
+            "#,
+        )
+        .expect("seed");
+        conn
+    }
+
+    #[test]
+    fn proto_channel_excludes_with_empty_provider_blackouts() {
+        // Discriminator: empty blackouts used to early-return HashSet::new().
+        // Frontier unavailable must still exclude frontier-rung todos.
+        let conn = seed_conn();
+        let mut ctx = IterationContext::new(3);
+        ctx.unavailable_rungs
+            .insert((Provider::Claude, CapabilityTier::Frontier), u64::MAX);
+        let models = builtin_resolved_models();
+        let empty_blackouts = HashSet::new();
+        let excluded =
+            compute_quota_excluded_ids(&ctx, &conn, None, models, &empty_blackouts, None);
+        assert!(
+            excluded.contains("t-frontier"),
+            "frontier-rung todo must be excluded when proto-channel marks frontier unavailable \
+             even with empty provider_blackouts; got {excluded:?}"
+        );
+        assert!(
+            !excluded.contains("t-standard"),
+            "standard-rung todo must remain selectable; got {excluded:?}"
+        );
+    }
+
+    #[test]
+    fn empty_blackouts_and_empty_proto_channel_excludes_nothing() {
+        let conn = seed_conn();
+        let ctx = IterationContext::new(3);
+        let models = builtin_resolved_models();
+        let excluded = compute_quota_excluded_ids(&ctx, &conn, None, models, &HashSet::new(), None);
+        assert!(excluded.is_empty());
+    }
+
+    /// FEAT-009 / AC5: after live-shaped evaluate+replace, exclude high/frontier
+    /// ids and keep medium/standard — with and without frontier→opus pin.
+    #[test]
+    fn live_shaped_replace_excludes_frontier_not_standard_with_and_without_pin() {
+        use crate::loop_engine::quota::{UsagePolicy, evaluate_quota};
+        use crate::loop_engine::reactions::account::replace_unavailable_rungs;
+        use crate::loop_engine::usage::{
+            ingest_oauth_value, live_shaped_oauth_json, models_with_frontier_pinned_to_standard,
+        };
+
+        for (label, models) in [
+            ("builtin", builtin_resolved_models().clone()),
+            (
+                "frontier→opus pin",
+                models_with_frontier_pinned_to_standard(),
+            ),
+        ] {
+            let buckets = ingest_oauth_value(&live_shaped_oauth_json(), &models);
+            let eval = evaluate_quota(&buckets, &UsagePolicy::default(), 8);
+            assert_eq!(
+                eval.unavailable,
+                vec![(Provider::Claude, CapabilityTier::Frontier)],
+                "{label}: precondition frontier-only unavailable"
+            );
+
+            let mut ctx = IterationContext::new(3);
+            // Learning [5463]: replace-on-evaluate (not merge).
+            let applied = crate::loop_engine::reactions::account::QuotaApplyResult {
+                unavailable: eval
+                    .unavailable
+                    .iter()
+                    .copied()
+                    .map(|k| (k, u64::MAX))
+                    .collect(),
+                account: crate::loop_engine::reactions::account::QuotaAccountAction::Proceed,
+            };
+            replace_unavailable_rungs(&mut ctx.unavailable_rungs, &applied);
+
+            let conn = seed_conn();
+            let excluded =
+                compute_quota_excluded_ids(&ctx, &conn, None, &models, &HashSet::new(), None);
+            assert!(
+                excluded.contains("t-frontier"),
+                "{label}: high/frontier id must be excluded after replace; got {excluded:?}"
+            );
+            assert!(
+                !excluded.contains("t-standard"),
+                "{label}: medium/standard id must remain selectable; got {excluded:?}"
+            );
+        }
     }
 }

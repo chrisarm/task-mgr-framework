@@ -33,8 +33,8 @@ use std::path::Path;
 use rusqlite::Connection;
 
 use crate::lifecycle::TaskLifecycle;
-use crate::loop_engine::engine::IterationContext;
-use crate::loop_engine::model::{self, Provider};
+use crate::loop_engine::engine::{IterationContext, active_rungs, now_unix_secs};
+use crate::loop_engine::model::{self, Provider, ResolvedModelsConfig};
 use crate::loop_engine::overflow::{
     DumpHeader, OverflowEvent, RecoveryAction, append_event_log, dump_prompt, rotate_dumps_keep_n,
     sanitize_id_for_filename,
@@ -46,6 +46,21 @@ use crate::loop_engine::runner::{RunnerKind, runner_kind_for};
 
 /// The provider that owns `runner` (the inverse of [`provider_of_runner`]).
 /// Total: every `RunnerKind` maps to exactly one provider and back.
+/// True when `model`'s capability rung on `provider` is in the active
+/// proto-channel blackout set (FR-006 overflow skip).
+fn overflow_target_rung_blacked(
+    ctx: &IterationContext,
+    resolved: &ResolvedModelsConfig,
+    provider: Provider,
+    model: &str,
+) -> bool {
+    let Some(tier) = resolved.tier_of(provider, model) else {
+        return false;
+    };
+    let active = active_rungs(&ctx.unavailable_rungs, now_unix_secs());
+    active.contains(&(provider, tier))
+}
+
 fn provider_of_runner(runner: RunnerKind) -> Provider {
     match runner {
         RunnerKind::Claude => Provider::Claude,
@@ -199,7 +214,10 @@ pub fn handle_overflow(params: HandleOverflowParams<'_>) -> RecoveryAction {
             new_effort: next_effort.to_string(),
         }
     } else if let Some(next_model) =
-        model::escalate_below_ceiling(&resolved, source_provider, effective_model)
+        model::escalate_below_ceiling(&resolved, source_provider, effective_model).filter(|m| {
+            // FR-006: skip escalate targets whose capability rung is blacked.
+            !overflow_target_rung_blacked(ctx, &resolved, source_provider, m)
+        })
     {
         // Rung 2: step up one DEFINED tier on the SOURCE provider's ladder.
         // Returns None at the ceiling (and for single-rung providers like Grok /
@@ -211,6 +229,7 @@ pub fn handle_overflow(params: HandleOverflowParams<'_>) -> RecoveryAction {
         }
     } else if source_provider == Provider::Claude
         && let Some(m1m) = model::to_1m_model(effective_model)
+            .filter(|m| !overflow_target_rung_blacked(ctx, &resolved, source_provider, m))
     {
         // Rung 3: 1M-context suffix-append. Claude-only — gated on the source
         // provider (not the model string) so a Codex/Grok task never reaches it.

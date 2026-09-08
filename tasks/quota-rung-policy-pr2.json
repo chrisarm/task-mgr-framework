@@ -1,0 +1,737 @@
+{
+  "branchName": "feat/quota-rung-policy-pr2",
+  "description": "PR-2 only (FR-003 + FR-004 / US-003 + US-004). Generic QuotaBucket ingest (HUD label table then extra-mark by configured model string equality). Remaining percent is the operator/gate unit (usage_remaining_min default 8; LOOP_USAGE_REMAINING_MIN; LOOP_USAGE_THRESHOLD preflight error; % left banners). evaluate_quota emits per-bucket ignore/unavailable plus account wait/stop inputs and does not emit ask. Apply layer in account.rs resolves ask/wait/stop; factory default tierFallback high + includeReview true is the downgrade instruction (unavailable, not ask). Horizon: wait ≤1h; 1h–12h wait capped at MAX_WAIT_SECS; stop >12h and nothing else can run. Exclude unavailable rungs from next selection (do not account-wait); proto-channel HashSet replace-on-evaluate. No --use-other-models-ttl, no FR-006 expiry+clamp, no FR-008 CLI.",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "No warnings in `cargo check` output",
+      "No warnings in `cargo clippy -- -D warnings` (per-iteration). `--all-targets` is REVIEW-001 only",
+      "`cargo fmt --check` passes",
+      "Scoped tests for touched modules pass",
+      "No unwrap() in production code paths",
+      "Sequential and wave paths stay parity-locked for account reactions (exhaustive destructure, shared coordinators)",
+      "quota.rs and engine.rs proto-channel keys contain no model-id literals (frontier/standard/cost-efficient/cheapest only)",
+      "No --use-other-models-ttl / FR-006 clamp / FR-008 CLI in this PR",
+      "No live Anthropic / real ~/.claude credentials in tests"
+    ],
+    "description": "These criteria apply to ALL implementation tasks"
+  },
+  "mergeStrategy": "Merge to main after REVIEW-001 passes. Squash commits optional.",
+  "prdFile": "prd-quota-rung-policy.md",
+  "priorityPhilosophy": {
+    "description": "Hierarchy of what matters most when implementing tasks",
+    "hierarchy": [
+      "1. PLAN — Anticipate edge cases before coding",
+      "2. PHASE 2 FOUNDATION — ~1 day now to save ~2+ weeks later (1:10+ ratio); we are pre-launch, foundations compound",
+      "3. FUNCTIONING CODE — Pragmatic, reliable, wired in per plan",
+      "4. CORRECTNESS — Compiles, type-checks, scoped tests pass deterministically",
+      "5. CODE QUALITY — Clean code, qualityDimensions satisfied, no warnings",
+      "6. POLISH — Docs, formatting, minor improvements"
+    ],
+    "principles": [
+      "Quality dimensions explicit — qualityDimensions on every task tells you what 'good' looks like",
+      "Phase 2 foundation — generic QuotaBucket + evaluate_quota over a Fable-only special case; horizon numbers in config",
+      "Edge cases = test cases — every PR-2 known edge case must have a corresponding test",
+      "Scoped per-iteration tests, full suite at REVIEW-001 — REVIEW must leave the trunk green including pre-existing failures",
+      "Engine speaks capability rungs (frontier/standard/cost-efficient/cheapest), never model ids except the ingest adapter",
+      "evaluate_quota does not emit ask; apply in account.rs owns remaining-work + tierFallback",
+      "Factory default IS the pin-3 downgrade instruction; ask is the opt-out",
+      "Ship working code with tests to prove it; handle Option/Result explicitly; avoid unwrap() in production"
+    ]
+  },
+  "prohibitedOutcomes": [
+    "evaluate_quota emitting ask or taking other_rungs_runnable: bool",
+    "Account-waiting (check_and_wait / Wait { 3600 }) for a scoped-rung unavailable (parks standard work)",
+    "Skip-wait hot-loop of the same frontier task when unavailable (must exclude from next selection)",
+    "Reusing handle_quota_deferral for rung-only exhaustion (stale-abort, learning 3927 / 5088)",
+    "Storing fable / opus / claude-fable-5 in quota.rs or IterationContext proto-channel keys",
+    "HUD-only mapping after the PR-1 pin (Opus HUD must extra-mark rungs sharing that configured model string)",
+    "Substring tier_of for extra-mark (string equality of configured model strings only)",
+    "Treating severity / is_active as the default low predicate",
+    "Spend stop at remaining-percent floor (must be remainingAmount lte 0)",
+    "Soonest-reset among multiple low wait buckets (must be latest)",
+    "Remaining as a 0.08 ratio instead of 0–100 percent",
+    "Silently ignoring LOOP_USAGE_THRESHOLD (must preflight error)",
+    "Keeping used>=92 compare after the remaining rename",
+    "Factory default with no tierFallback (ask path is the opt-out, not the default)",
+    "Deserializing absent routing.tierFallback as None (must be factory Some; explicit JSON null is the ask opt-out)",
+    "Documenting a wait loop as accepted for explicit off-ladder tasks.model (family-match + defer if unavailable and includeForced=false is PR-3; do not document wait-loop as accepted)",
+    "Implementing --use-other-models-ttl, FR-006 expiry + down-only walker, FR-008 set-usage-rule / set-tier-fallback CLI, or models show live remaining",
+    "Dated month-name parse_reset_from_output becoming the account wait for a rung-scoped bucket",
+    "Spillover counting as a working rung for rung-scoped decisions",
+    "Collapsing dual Anthropic I/O predicates onto one flag",
+    "quota.rs importing runners, clap, or SQLite",
+    "Tests that require live Anthropic network or real ~/.claude credentials",
+    "Driving `loop run` / `batch run` (verify-task-mgr refuses; `loop run --help` is the safe probe)",
+    "Inventing a second verification harness",
+    "Manual edits to tasks/*.json for status (use task-mgr CLI / task-status tags)",
+    "unwrap() in production paths",
+    "Catch-all error handlers that swallow context"
+  ],
+  "project": "task-mgr",
+  "requires": [],
+  "reviewGuidelines": {
+    "priorityGuidelines": {
+      "critical": "1-10: Blocks further work, fix immediately",
+      "high": "11-20: Fix before phase completion",
+      "low": "51-99: Defer to hardening phase",
+      "medium": "21-50: Fix in current phase if time permits"
+    }
+  },
+  "taskPrefix": "23a44bdc",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "Precise interface: exact struct/fn signatures, JSON camelCase keys, and copy-paste access patterns from PRD §2.6 recorded under ## CONTRACT-001 in the progress log (grep-verified against existing CapabilityTier / Provider / UsageInfo / AccountUsageGateParams)",
+        "Edge cases: every PR-2 row from the PRD Known Edge Cases table is named with expected evaluate vs apply behavior (live fixture remaining + frontier unavailable; extra-mark after pin; 3h wait-capped; 5h–12h cap-and-repark; 6d stop; factory unavailable not ask; opt-out ask; proto-channel replace; API 429 keep snapshot; nimbus_quill ignore; spillover never a working rung)",
+        "Invariants: evaluate never emits ask; remaining is 0–100 never a ratio; account-binding vs rung-scoped; stop beats ask; wait among low wait buckets is latest reset; spend stop only remainingAmount lte 0; severity/is_active display-only unless rule when; proto-channel replace-on-successful-evaluate",
+        "Known-bad discriminators: (1) evaluate(..., other_rungs_runnable: bool) that returns ask; (2) remainingMinRatio: 0.08; (3) IterationContext keyed on fable; (4) applying Wait { 3600 } as an account-global sleep for scoped unavailable; (5) HUD-only map after set-tier frontier=standard-model leaving frontier unmarked on an Opus HUD row; (6) absent routing.tierFallback deserializing to None; (7) gating proto-channel exclusion on non-empty provider_blackouts",
+        "Failure modes: API 429 → keep snapshot not clear; malformed bucket → skip; unknown display_name → ignore not wait; LOOP_USAGE_THRESHOLD set → preflight error (FEAT-004)",
+        "Alternatives considered: (a) evaluate emits ask vs split apply — rejected evaluate-ask because tierFallback needs the remaining task list; (b) account-wait 3600 for unavailable vs exclude-from-selection — rejected account-wait (parks standard)",
+        "Downstream impact: FEAT-003 (ingest + evaluate classifier), FEAT-004 (remaining rename + banners), FEAT-005 (horizon + apply + proto-channel). PR-3 TTL/clamp/CLI are named as later consumers, not this slice",
+        "Contract text recorded: full copy-pasteable definition in the progress log under ## CONTRACT-001 so dependents can read it without re-exploration. Optional one-liner in src/loop_engine/CLAUDE.md account-global section"
+      ],
+      "dependsOn": [],
+      "description": "Design-only. Record in the progress log the stable contract that FEAT-003/004/005 implement. Types: QuotaBucket (id, kind, label, measurements remaining-first, resets_at, severity, is_active, optional rungs), Measurement (remaining, unit Percent|Dollars|Tokens|Credits), UsagePolicy (remainingMinPercent default 8, waitIfResetWithinMinutes 60, stopIfResetBeyondHours 12, askTtlMinutes 0, rules), TierFallback (maxDifficulty high, includeReview true, includeForced false). evaluate_quota(buckets, policy, remaining_min) is pure and per-bucket: ignore / unavailable (rung-scoped low) plus account wait/stop INPUTS (remaining, reset_secs, kind, low). It does NOT emit ask. It does NOT take other_rungs_runnable. Apply in reactions/account.rs resolves ask/wait/stop/unavailable from remaining work + tierFallback. Engine keys are (Provider, CapabilityTier). Downstream: FEAT-003, FEAT-004, FEAT-005 (PR-3 FEAT-006/007/008 consume this contract but are out of this JSON).",
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "Contract promises ask from evaluate's inputs",
+          "expectedBehavior": "FEAT-005 would have nothing to apply; known-bad discriminator must fail the contract"
+        },
+        {
+          "cause": "Implementer stores family token fable on IterationContext",
+          "expectedBehavior": "CONTRACT known-bad + REVIEW-001 grep fails"
+        }
+      ],
+      "id": "CONTRACT-001",
+      "invariants": [
+        "evaluate_quota does not emit ask and does not take other_rungs_runnable",
+        "Unavailable keys are (Provider, CapabilityTier) never model ids"
+      ],
+      "modifiesBehavior": false,
+      "notes": "Do not write production code or full test suites. Engine language is capability rungs; model ids stay in the ingest adapter. Factory default tierFallback IS the pin-3 instruction; ask is the opt-out. Learning [4126]/[5075]/[4868]: seq+wave share account reactions, exhaustive destructure. Learning [3927]/[5088]: do not reuse handle_quota_deferral for rungs. Learning [5361]: PR-1 account-binding fold stays; this contract adds buckets alongside, does not re-fold scoped windows into UsageInfo used-percent (FEAT-004 flips that field to remaining).",
+      "passes": false,
+      "priority": 1,
+      "qualityDimensions": [
+        "Contract unambiguous enough that FEAT-003 and FEAT-005 cannot disagree on evaluate vs apply or horizon vs explicit onLow",
+        "Rung language only in the decision layer; ingest adapter is the only HUD Fable→frontier map",
+        "One remaining unit: 0–100 percent",
+        "evaluate_quota is pure and sub-millisecond; no I/O, no clap, no SQLite, no runners"
+      ],
+      "requiresHuman": false,
+      "taskType": "contract",
+      "title": "Define QuotaBucket + UsagePolicy + evaluate_quota vs apply split",
+      "touchesFiles": [
+        "src/loop_engine/CLAUDE.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "New ingest_oauth_value(&Value, &ResolvedModelsConfig) -> Vec<QuotaBucket> (name may match CONTRACT-001; this is the ingest entry). Emits buckets for every object sibling with utilization/dollars and every limits[] row from a live-shaped fixture (five_hour, seven_day, seven_day_opus, seven_day_sonnet, limits session/weekly_all/weekly_scoped Fable, spend, nimbus_quill). No allow-list of window names. Null objects skip. limits[].percent accepts u64 or f64. remaining = (100.0 - util).clamp(0.0, 100.0) for percent measurements. Do NOT add a models param to parse_oauth_usage_json (PR-1 signature stays threshold-only)",
+        "HUD label table maps display_name case-insensitive prefix/token: Fable→frontier, Opus→standard, Sonnet→cost-efficient, Haiku→cheapest. Output is (Provider, CapabilityTier) never a model id. quota.rs contains no claude-fable-5 / fable identifiers (HUD tokens live only in the usage.rs ingest adapter)",
+        "After mapping display_name to a rung, extra-mark every rung whose configured model string equals that mapped rung's model (string equality, not substring tier_of). After set-tier claude frontier to the standard model, an Opus HUD row maps to standard AND marks frontier. Discriminator: HUD-only mapping leaves frontier unmarked (the PR-1 pin hole)",
+        "Unlabeled ids (no display_name): configured model_for substring of the family token against the configured model string only. Unknown → None (rule ignore). nimbus_quill 0% remaining → ignore under default policy",
+        "evaluate_quota(buckets, policy, remaining_min) is pure, unit-tested with synthetic buckets, does not emit ask, does not take other_rungs_runnable. Rung-scoped remaining ≤ floor → unavailable inputs; account-binding remaining ≤ floor → wait/stop inputs (remaining, reset_secs, kind, low); remaining > floor → ignore. Explicit rule onLow unavailable/ignore is applied here; horizon wait vs stop vs ask is FEAT-005",
+        "No unwrap on API JSON; skip malformed buckets. severity / is_active stored as display hints, not the default low predicate",
+        "mod.rs declares the quota module. Existing PR-1 parse_oauth_usage_json tests still pass (account-binding used fold unchanged until FEAT-004)"
+      ],
+      "dependsOn": [
+        "CONTRACT-001"
+      ],
+      "description": "PR-2 / FR-003. New src/loop_engine/quota.rs with CONTRACT-001 types + pure evaluate_quota classifier. New usage.rs ingest_oauth_value walks every object sibling with utilization/dollars and every limits[] row into QuotaBucket (no window-name allow-list; null objects skip). Do not add a models/ResolvedModelsConfig param to parse_oauth_usage_json — extra-mark needs config, so that belongs on ingest_oauth_value only. Map scope.model.display_name / id → one or more (Provider, CapabilityTier): (1) HUD label table maps display_name (case-insensitive prefix/token) Fable→frontier, Opus→standard, Sonnet→cost-efficient, Haiku→cheapest; (2) else unlabeled ids: configured model_for substring of the family token against the configured model string; (3) after HUD map, also mark every rung whose configured model string equals that mapped rung's model (string equality, not substring tier_of). evaluate_quota classifies ignore vs unavailable (rung-scoped low) vs account-binding low inputs; does not emit ask; does not take other_rungs_runnable. Horizon wait/stop/ask apply is FEAT-005.",
+      "edgeCases": [
+        "Fable weekly_scoped 95% critical + session 24% + week 55% → buckets remaining 76 / 45 / 5; Fable maps to frontier",
+        "Named seven_day_opus / seven_day_sonnet ingested as buckets (not account-binding)",
+        "Frontier remapped to standard's model: Opus HUD row maps to standard AND extra-marks frontier",
+        "nimbus_quill 0% remaining → ignore",
+        "Unknown display_name / unlabeled id that matches no configured model → ignore, not wait",
+        "Null object siblings skipped; malformed percent skipped"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "HUD-only mapping after set-tier claude frontier <standard-model>",
+          "expectedBehavior": "Opus HUD marks only standard; frontier still resolves to the exhausted model — extra-mark test must fail"
+        },
+        {
+          "cause": "Extra-mark uses substring tier_of / contains",
+          "expectedBehavior": "Unrelated rungs with a shared family token get marked; string-equality fixture must fail"
+        },
+        {
+          "cause": "Allow-list of window names drops a new Anthropic key",
+          "expectedBehavior": "Generic sibling walk test with an unknown object key must still emit a bucket"
+        },
+        {
+          "cause": "Adding a models/ResolvedModelsConfig param to parse_oauth_usage_json",
+          "expectedBehavior": "PR-1 parse tests and callers break; ingest_oauth_value is the extra-mark entry"
+        }
+      ],
+      "id": "FEAT-003",
+      "invariants": [
+        "quota.rs has no fable / claude-fable-5 literals",
+        "evaluate_quota does not emit ask"
+      ],
+      "modifiesBehavior": false,
+      "notes": "Implement against ## CONTRACT-001 in the progress log. Ingest entry is ingest_oauth_value — do not change parse_oauth_usage_json's signature for extra-mark (that fold stays account-binding / threshold-only until FEAT-004). Data: json.get(\"five_hour\")?.get(\"utilization\")?.as_f64(); remaining = (100.0 - util).clamp(0.0, 100.0); limit[\"kind\"]; limit[\"scope\"][\"model\"][\"display_name\"]; limit[\"percent\"] u64 or f64. Extra-mark: after HUD maps display_name to rung R, for each defined rung T if model_for(provider, T) == model_for(provider, R) { mark T }. Do not call substring tier_of. Do not implement apply/horizon/proto-channel (FEAT-005). Do not invert UsageInfo.percentage yet (FEAT-004). Learning [5361] PR-1 fold stays until FEAT-004. Learning [4481] no model ids in generated artifacts. Known-bad: HUD-only map after frontier pin; extra-mark via contains(\"opus\"); stuffing models into parse_oauth_usage_json.",
+      "passes": false,
+      "priority": 2,
+      "qualityDimensions": [
+        "Generic ingest, no allow-list of window names",
+        "Decision layer speaks rungs only; HUD Fable→frontier lives only in the ingest adapter",
+        "Extra-mark is configured-model string equality, not substring tier_of",
+        "evaluate_quota sub-millisecond, no I/O, no ask",
+        "No unwrap on JSON; skip malformed buckets",
+        "Do not reintroduce substring tier classification in tier_of",
+        "Usage fetch remains once per sequential iteration / once per wave — this task does not add a GET"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Generic OAuth ingest into QuotaBucket + evaluate_quota classifier",
+      "touchesFiles": [
+        "src/loop_engine/quota.rs",
+        "src/loop_engine/usage.rs",
+        "src/loop_engine/mod.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "LoopConfig.usage_threshold renamed usage_remaining_min default 8. UsageParams.threshold / UsageParams::disabled() use 8. Exhaustive LoopConfig + AccountUsageGateParams destructure still compile (parity lock). startup.rs passes remaining-min into the gate",
+        "Precedence: LOOP_USAGE_REMAINING_MIN (env) > usagePolicy.remainingMinPercent (config) > 8. Unit-tested; invalid env ignored like other LoopConfig env parses except the legacy name",
+        "LOOP_USAGE_THRESHOLD set → loop/batch preflight_validate_and_probe (or the shared preflight it calls) returns an error naming the new env. Non-loop commands (list/recall) must not crash. Do not silently ignore. Do not drive `loop run` to prove this — unit/preflight test only",
+        "check_and_wait / account_usage_gate: remaining > floor → BelowThreshold. Live fixture account remaining 45 > 8 proceeds. Inverse: weekly-all remaining 0 waits. Discriminator: keeping used>=92 after rename would treat remaining 45 as 45 used and never wait when remaining is 8",
+        "usage_suggests_lifted compares remaining > rule floor for both pre-gate and post-limit (no magic 0.05, no used<95). Early-lift uses that rule's remaining floor",
+        "Stderr banner on the live fixture contains `76% left` and `5% left` (and week remaining) and does not print used `95%` or `Usage: 55.0% (threshold: 92%)`. Shape: `session 76% left (<dur>) · week 45% left (<dur>) · frontier 5% left (<dur>) (floor 8%)`. Rung label is `frontier` not a model id. Dollar/token buckets print in their unit when present. format_duration (display.rs) MUST render a days band for durations ≥ 24h (e.g. `5d` / `5d 13h`, not only `Nh`). Do not byte-lock the exact substring `5d 13h` — fixture reset timestamps vary. Hermetic — do not call load_usage_info / live GET",
+        "Drive `.claude/skills/verify-task-mgr/SKILL.md` only if a clap surface changes (none expected). Safe probe: `$H capture loop-help -- loop run --help` must NOT list `--use-other-models-ttl`. Remaining banners + LOOP_USAGE_REMAINING_MIN are proven by unit tests; compile/unit tests alone are not proof that help stayed clean — capture the help artifact"
+      ],
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/loop_engine/reactions/account.rs",
+            "impact": "BREAKS",
+            "line": 1236,
+            "mitigation": "Flip field to remaining 0–100 and compare remaining > remaining_min. Live 45>8 proceeds. Inverse 0 waits.",
+            "usage": "check_and_wait compares usage.percentage to threshold with `percentage < threshold` → BelowThreshold (PR-1 used-percent)"
+          },
+          {
+            "file": "src/loop_engine/usage.rs",
+            "impact": "BREAKS",
+            "line": 438,
+            "mitigation": "Compare remaining > rule floor for both; no magic 0.05; drop used<95",
+            "usage": "usage_suggests_lifted compares percentage < 95 post-limit / < threshold pre-gate (used-percent)"
+          },
+          {
+            "file": "src/loop_engine/config.rs",
+            "impact": "BREAKS",
+            "line": 138,
+            "mitigation": "Preflight error + LOOP_USAGE_REMAINING_MIN",
+            "usage": "LOOP_USAGE_THRESHOLD → usage_threshold"
+          },
+          {
+            "file": "src/loop_engine/startup.rs",
+            "impact": "BREAKS",
+            "line": 1000,
+            "mitigation": "Pass remaining_min",
+            "usage": "UsageParams.threshold: run_config.config.usage_threshold"
+          },
+          {
+            "file": "src/loop_engine/engine.rs",
+            "impact": "BREAKS",
+            "line": 111,
+            "mitigation": "Default 8",
+            "usage": "UsageParams::disabled() threshold: 92"
+          }
+        ],
+        "semanticDistinctions": [
+          {
+            "context": "Account-binding remaining low (session / weekly-all)",
+            "currentBehavior": "Wait iff used ≥ 92",
+            "requiredBehavior": "Proceed iff remaining > remaining_min (default 8). Horizon wait vs stop is FEAT-005"
+          },
+          {
+            "context": "Operator stderr",
+            "currentBehavior": "Usage: 55.0% (threshold: 92%)",
+            "requiredBehavior": "% left banner; never used-percent; frontier not fable"
+          }
+        ]
+      },
+      "dependsOn": [
+        "CONTRACT-001",
+        "FEAT-003"
+      ],
+      "description": "PR-2 / FR-004 remaining unit + US-003. Rename LoopConfig.usage_threshold → usage_remaining_min default 8. Precedence: LOOP_USAGE_REMAINING_MIN overrides config usagePolicy.remainingMinPercent overrides 8. LOOP_USAGE_THRESHOLD set → preflight error (legacy hard-break), not silent ignore. Gate compare flips to remaining: proceed when remaining > floor (old used>=92 ≡ remaining<=8). usage_suggests_lifted uses the rule floor (no magic 0.05); drop used<95 post-limit. Operator banner uses remaining only: `session 76% left (3m) · week 45% left (5d 13h) · frontier 5% left (5d 13h) (floor 8%)`. Dollar/token buckets print in their unit when present. Rung labels in the banner (frontier not fable). UsageInfo.percentage becomes remaining 0–100 for the account-binding fold (account remaining = min of session/weekly-all remaining). Do not add --use-other-models-ttl.",
+      "edgeCases": [
+        "LOOP_USAGE_THRESHOLD=92 still set → preflight error, not silent ignore",
+        "Live fixture banners contain 76% left / 5% left and do not print used 95%",
+        "Remaining as 0–100 percent, never 0.08 ratio",
+        "usage_suggests_lifted remaining > floor (no magic 0.05)"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "Keeping used>=92 compare after rename",
+          "expectedBehavior": "Remaining 45 looks like 45 used and never waits when remaining is 8; inverse remaining-0 test must fail"
+        },
+        {
+          "cause": "Silently ignoring LOOP_USAGE_THRESHOLD",
+          "expectedBehavior": "Preflight error test fails"
+        },
+        {
+          "cause": "Banner still prints Usage: 55.0% (threshold: 92%)",
+          "expectedBehavior": "Live-fixture stderr assertion fails"
+        }
+      ],
+      "id": "FEAT-004",
+      "invariants": [
+        "usage_remaining_min is u8 0–100 default 8",
+        "Operator-facing usage lines never print used-percent after this task"
+      ],
+      "modifiesBehavior": true,
+      "notes": "Touches config.rs, startup.rs, usage.rs, account.rs, engine.rs UsageParams, project_config remainingMinPercent, display.rs days band, CLAUDE.md env names. Learning [5398]: remaining-min must be the live value, not a hardcoded 8, when selecting reset among low wait buckets (FEAT-005 uses the same live floor). Learning [5297]/[5301] dual predicate unchanged. Learning [5362] was used≥92 — this task is the invert (remaining≤8). Learning [4955] preflight_validate_and_probe is the shared loop/batch chokepoint for LOOP_USAGE_THRESHOLD. Data: config[\"usagePolicy\"][\"remainingMinPercent\"]; remaining = (100.0 - util).clamp(0.0, 100.0); account remaining = min of account-binding remaining. Known-bad: storing remaining 45 while compare is still used>=92. Do not implement horizon/ask/proto-channel (FEAT-005).",
+      "passes": false,
+      "priority": 3,
+      "qualityDimensions": [
+        "One remaining unit 0–100, never 0.08",
+        "Old used>=92 ≡ new remaining<=8; live fixture remaining 45 proceeds; inverse remaining 0 waits",
+        "ui::* for operator banners; tracing for diagnostics; byte-stable wait banners stay on stderr",
+        "Legacy env fail-fast at loop/batch preflight",
+        "Rung labels in stderr: frontier/standard/cost-efficient/cheapest, not model names",
+        "Dual predicates unchanged",
+        "No unwrap in production"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Remaining-percent rename, gate compare, % left banners, LOOP_USAGE_THRESHOLD hard-break",
+      "touchesFiles": [
+        "src/loop_engine/config.rs",
+        "src/loop_engine/startup.rs",
+        "src/loop_engine/usage.rs",
+        "src/loop_engine/reactions/account.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/project_config.rs",
+        "src/loop_engine/display.rs",
+        "src/loop_engine/CLAUDE.md",
+        "CLAUDE.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Config defaults round-trip via sparse JSON (unrelated keys preserved): usagePolicy.waitIfResetWithinMinutes 60, stopIfResetBeyondHours 12, askTtlMinutes 0. routing.tierFallback: absent key deserializes via #[serde(default = \"default_tier_fallback\")] to Some({maxDifficulty: high, includeReview: true, includeForced: false}) — NOT None. Explicit JSON null deserializes to None (ask opt-out). quota.rs does not import clap, SQLite, or runners",
+        "evaluate_quota still does not emit ask and does not take other_rungs_runnable. Apply in account.rs resolves ask/wait/stop/unavailable. Seq and wave produce the same decision for the same buckets+policy (parity; exhaustive param destructure, no `..`)",
+        "Horizon: account-binding low + reset ≤60m → wait; (60m, 12h] → wait capped at MAX_WAIT_SECS (with defaults a 3h session reset waits; 5h–12h is cap-and-repark). Same capped-wait for rung-scoped rows that wait. Account-binding low + reset >12h + no other runnable rung/provider → stop (in_progress → todo). Reset 6h only-frontier-left → cap-and-repark not stop. Reset 6d only-frontier-left no fallback → stop this PRD (do not 5h-cap-loop). Next-PRD inherit of rung-unavailable is PR-3 — document, do not implement batch inherit",
+        "Rung-scoped low + other rungs work + factory/allowing tierFallback (including absent key → factory Some) → unavailable (downgrade), not ask. Operator forbade (explicit JSON null, narrower maxDifficulty, includeReview false) → apply emits ask; PR-2 TTL default 0 + forbade → defer (no sleep, no continue). Factory default / omitted key is NOT the ask path. Explicit onLow on a matching rule wins over the heuristic. Spend default: stop only when remainingAmount lte 0 (8% credits left must not halt). severity/is_active are not default-low",
+        "Account-binding wait/stop can coexist with rung unavailable. stop beats ask. Spillover is never a working rung for rung-scoped decisions. wait among multiple low wait buckets uses the latest reset (session 2h + weekly 6d → weekly)",
+        "Exclude unavailable rungs from the next selection (extend compute_quota_excluded_ids / equivalent from the proto-channel). Do not account-wait for a scoped rung. 3600s backoff only when the remaining queue cannot run. Proto-channel: HashSet<(Provider, CapabilityTier)> on IterationContext, no expiry, replace the set on each successful evaluate, keep snapshot on API fail (not run-scoped stickiness). LOOP_USAGE_CHECK_ENABLED=false: pre-gate off; proto-channel still replaced on each successful evaluate. Do not reuse handle_quota_deferral. Do not touch provider_blackouts / runner_overrides. Main-thread only (learning 1810)",
+        "Proto-channel exclusion MUST run when provider_blackouts is empty — that is the production case (rung unavailable without a provider blackout). Do not gate proto-channel exclusion on that set being non-empty. Discriminator: compute_quota_excluded_ids currently early-returns HashSet::new() when active_blackouts.is_empty(); after this task, frontier unavailable + empty provider_blackouts still excludes frontier-rung todo tasks from the next selection",
+        "Docs: src/loop_engine/CLAUDE.md account-global section records remaining unit, evaluate vs apply, factory tierFallback high/includeReview true, proto-channel replace-on-evaluate, exclude-not-account-wait. CLAUDE.md mentions LOOP_USAGE_REMAINING_MIN. grep -n \"claude-fable-5\\|fable\" src/loop_engine/quota.rs src/loop_engine/engine.rs → 0"
+      ],
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/loop_engine/reactions/account.rs",
+            "impact": "BREAKS",
+            "line": 1215,
+            "mitigation": "Apply: account-binding wait/stop only; scoped low → exclude rungs, do not Wait 3600 unless the remaining queue cannot run",
+            "usage": "check_and_wait account-waits whenever remaining/used is past the floor"
+          },
+          {
+            "file": "src/loop_engine/reactions/pre_spawn.rs",
+            "impact": "BREAKS",
+            "line": 315,
+            "mitigation": "Proto-channel exclusion must run when provider_blackouts is empty (production). Drop/bypass that early-return. Do not reuse handle_quota_deferral",
+            "usage": "compute_quota_excluded_ids early-returns empty when provider_blackouts is empty, then keys only on that set"
+          },
+          {
+            "file": "src/loop_engine/reactions/account.rs",
+            "impact": "OK if not reused",
+            "line": 675,
+            "mitigation": "New sibling for rung exhaustion. Falling through trips stale-abort (learning 3927/5088)",
+            "usage": "handle_quota_deferral waits provider blackouts then clears"
+          }
+        ],
+        "semanticDistinctions": [
+          {
+            "context": "Rung-scoped remaining low, factory tierFallback",
+            "currentBehavior": "Not in the PR-1 fold (no account wait); no unavailable channel",
+            "requiredBehavior": "unavailable; exclude from next selection; standard work proceeds"
+          },
+          {
+            "context": "Rung-scoped remaining low, operator explicit-null / narrowed tierFallback",
+            "currentBehavior": "n/a",
+            "requiredBehavior": "apply emits ask; PR-2 TTL 0 + forbade → defer (no sleep, no continue). Absent key is factory Some, not this path"
+          },
+          {
+            "context": "Account-binding remaining low, reset in 3h",
+            "currentBehavior": "Wait (used≥92)",
+            "requiredBehavior": "Wait, capped at MAX_WAIT_SECS"
+          },
+          {
+            "context": "Account-binding remaining low, reset in 6d, nothing else runnable",
+            "currentBehavior": "5h-cap-loop until weekly reset",
+            "requiredBehavior": "stop this PRD"
+          }
+        ]
+      },
+      "dependsOn": [
+        "FEAT-003",
+        "FEAT-004"
+      ],
+      "description": "PR-2 / US-004 + FR-004 apply. Wire evaluate_quota inputs through an apply layer in reactions/account.rs that resolves ask/wait/stop/unavailable from remaining work + routing.tierFallback. Factory default tierFallback.maxDifficulty: high, includeReview: true, includeForced: false IS the downgrade instruction (rung-scoped low → unavailable, not ask). Horizon (config.json-overridable): wait if reset ≤ waitIfResetWithinMinutes (60); wait capped at MAX_WAIT_SECS if reset in (60m, 12h] (3h session waits; 5h–12h is cap-and-repark); stop if reset > stopIfResetBeyondHours (12) AND no other rung can run. Exclude unavailable rungs from the next selection; do not account-wait; 3600s only when the remaining queue cannot run. Proto-channel HashSet<(Provider, CapabilityTier)> on IterationContext: replace on each successful evaluate; keep snapshot on API fail; no expiry (PR-3). Do not reuse handle_quota_deferral. Do not implement --use-other-models-ttl, down-only walker, or family-match of explicit tasks.model (PR-3).",
+      "edgeCases": [
+        "Session reset in 3h (account-binding low) → wait, capped at MAX_WAIT_SECS",
+        "Reset in 6h (5h–12h band), only frontier work left → cap-and-repark (wait MAX_WAIT_SECS, re-evaluate)",
+        "Reset in 6d, only frontier work left, no fallback → stop this PRD (not 5h-cap-loop)",
+        "Two wait buckets low (session 2h, weekly 6d) → wait the latest (weekly); early-lift may resume at 2h if session was the only low wait",
+        "ask TTL 0, other rungs work, operator explicit JSON null tierFallback → apply emits ask; PR-2 defers (no sleep, no continue). Absent key is factory Some, not this path",
+        "ask TTL 0, factory defaults (maxDifficulty high, includeReview true) including omitted routing.tierFallback key → no ask; unavailable for eligible tasks; reviews included; forced pins still deferred (includeForced false)",
+        "PR-2 unavailable without full blackout channel → exclude unavailable rungs from next selection; do not account-wait; 3600s only when remaining queue cannot run",
+        "Frontier unavailable + empty provider_blackouts (production) → still excludes frontier-rung todo tasks; must not no-op because active_blackouts.is_empty()",
+        "Usage API 429 → keep last proto-channel snapshot; do not clear",
+        "LOOP_USAGE_CHECK_ENABLED=false → pre-gate off; proto-channel still replaced on each successful evaluate",
+        "Spend 8% credits left + default spend rule → not stop; remainingAmount 0 → stop",
+        "severity critical on session at 10% left + default predicate → not wait",
+        "Spillover is never a working rung for rung-scoped decisions",
+        "Dated Sep 12 CLI text must not become the account wait when the bucket is rung-scoped (ingest uses API resets_at ISO; do not add month-name parse as account wait)"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "Wait { 3600 } / check_and_wait for scoped unavailable while standard work remains",
+          "expectedBehavior": "Standard tasks park; exclude-from-selection test must fail"
+        },
+        {
+          "cause": "Skip-wait (wait_secs=0) on unavailable",
+          "expectedBehavior": "Same frontier task re-dispatches immediately; exclusion test must fail"
+        },
+        {
+          "cause": "Fall through handle_quota_deferral for rung-only empty selection",
+          "expectedBehavior": "stale-abort (learning 3927/5088); dedicated sibling must run instead"
+        },
+        {
+          "cause": "Proto-channel sticky for the whole run (not replaced on evaluate)",
+          "expectedBehavior": "Stale unavailable after a later evaluate that no longer lists that rung; replace-on-evaluate test must fail"
+        },
+        {
+          "cause": "Factory default missing tierFallback so frontier-low emits ask",
+          "expectedBehavior": "Factory-default fixture must assert unavailable, not ask"
+        },
+        {
+          "cause": "Absent routing.tierFallback key deserializes to None (Option default)",
+          "expectedBehavior": "Omitted-key fixture must yield factory Some(high/includeReview true/includeForced false) and unavailable, not ask. Explicit null is the opt-out"
+        },
+        {
+          "cause": "compute_quota_excluded_ids still early-returns empty when provider_blackouts is empty",
+          "expectedBehavior": "Frontier unavailable + empty provider_blackouts excludes nothing; frontier todo re-dispatches — empty-blackouts exclusion test must fail"
+        }
+      ],
+      "id": "FEAT-005",
+      "invariants": [
+        "evaluate_quota does not emit ask",
+        "Proto-channel keys are (Provider, CapabilityTier); replace on successful evaluate; keep on API fail",
+        "Unavailable rungs are excluded from selection; they do not account-wait"
+      ],
+      "modifiesBehavior": true,
+      "notes": "Implement CONTRACT-001 horizon table in apply, not in evaluate. MAX_WAIT_SECS is already 5*3600 in account.rs — reuse it. Thread proto-channel through iteration.rs + wave_scheduler.rs the same way excluded_ids already flow; prompt/sequential.rs and prompt/slot.rs already consume excluded_ids — extend compute_quota_excluded_ids rather than adding a second channel into the prompts. Empty provider_blackouts is the production case: drop or bypass the `if active_blackouts.is_empty() { return HashSet::new(); }` early-return so proto-channel exclusion still runs. serde: Option<TierFallback> with #[serde(default = \"default_tier_fallback\")]; default_tier_fallback returns Some(high/includeReview true/includeForced false); explicit null → None → ask. Learning [5075]/[4866]/[4138]/[5371] once-per-wave shared coordinators. Learning [3927]/[5088] new sibling, never handle_quota_deferral. Learning [1810]/[4373] IterationContext is main-thread-only. Learning [5087] BlackoutState stays the provider channel — this HashSet is a sibling. Learning [4868] exhaustive destructure. Out of scope: --use-other-models-ttl clap, TTL>0 re-evaluate on stop-check, resolve_execution_plan down-only walker, family-match of explicit tasks.model, models set-usage-rule / set-tier-fallback. Do not document a wait loop as accepted for off-ladder tasks.model. Known-bad: Wait { 3600 } on scoped unavailable while standard work remains; skip-wait hot-loop; evaluate returning ask; gating exclusion on non-empty provider_blackouts; absent tierFallback key → None.",
+      "passes": false,
+      "priority": 10,
+      "qualityDimensions": [
+        "Frontier-low is not an account emergency — continue on standard (unavailable, not account wait)",
+        "Factory default IS the downgrade instruction; ask is the opt-out",
+        "Horizon middle band 1h–12h: wait capped at MAX_WAIT_SECS; 5h–12h is cap-and-repark",
+        "Latest reset among wait buckets",
+        "Spend stop only at amount 0",
+        "severity/is_active display-only unless when opt-in",
+        "Spillover is never a working rung for rung-scoped decisions",
+        "Follow existing reaction coordinators: production entry + hermetic _inner + exhaustive param destructure (no `..`)",
+        "ui::* for operator lines; tracing for diagnostics",
+        "evaluate_quota stays pure; apply owns remaining-work"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Horizon heuristic + apply layer + proto-channel exclude unavailable rungs",
+      "touchesFiles": [
+        "src/loop_engine/quota.rs",
+        "src/loop_engine/project_config.rs",
+        "src/loop_engine/reactions/account.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/reactions/pre_spawn.rs",
+        "src/loop_engine/iteration.rs",
+        "src/loop_engine/wave_scheduler.rs",
+        "tests/reaction_parity.rs",
+        "src/loop_engine/CLAUDE.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Progress log lists findings or `No issues found`",
+        "Confirm live-fixture ingest remaining 76/45/5 via ingest_oauth_value (parse_oauth_usage_json signature still threshold-only), extra-mark after frontier pin (Opus HUD marks standard AND frontier), nimbus_quill ignore, quota.rs has no fable/claude-fable-5 literals",
+        "Confirm evaluate_quota does not emit ask and does not take other_rungs_runnable; apply owns ask/wait/stop; absent routing.tierFallback key is factory Some (unavailable not ask); explicit JSON null is the ask opt-out",
+        "Confirm remaining banners contain 76% left / 5% left and do not print used 95%; LOOP_USAGE_THRESHOLD preflight errors; usage_remaining_min default 8; format_duration has a days band for ≥24h",
+        "Confirm horizon 3h waits capped; 5h–12h cap-and-repark; 6d stop; exclude unavailable rungs even when provider_blackouts is empty; proto-channel replace-on-evaluate; no handle_quota_deferral for rungs; no account-wait for scoped unavailable",
+        "Confirm AccountUsageGateParams / apply params exhaustive destructure (no `..`) still compiles; seq/wave parity tests exist",
+        "Confirm no --use-other-models-ttl, no down-only walker, no FR-008 CLI",
+        "Any issues found spawn CODE-FIX / WIRE-FIX via `task-mgr add --stdin --depended-on-by REVIEW-001 --from-json tasks/quota-rung-policy-pr2.json`"
+      ],
+      "dependsOn": [
+        "CONTRACT-001",
+        "FEAT-003",
+        "FEAT-004",
+        "FEAT-005"
+      ],
+      "description": "Review CONTRACT-001, FEAT-003, FEAT-004, FEAT-005. Language idioms, security, error handling, qualityDimensions, wiring, dual predicate, remaining unit, extra-mark string equality, evaluate does not emit ask, exclude-not-account-wait, seq/wave parity. Spawn CODE-FIX / WIRE-FIX via task-mgr add --stdin --depended-on-by REVIEW-001 --from-json tasks/quota-rung-policy-pr2.json. Do not implement PR-3 (TTL CLI, down-only walker, family-match explicit tasks.model, set-usage-rule).",
+      "estimatedEffort": "high",
+      "id": "CODE-REVIEW-1",
+      "modifiesBehavior": false,
+      "notes": "Do not implement in this task. Use rust-python-code-reviewer and loop-engine-parity-auditor if available. For each issue: echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001 --from-json tasks/quota-rung-policy-pr2.json. If no issues, emit done with a one-line progress note. Learning [5297]/[5301] dual predicate; [5075] once-per-wave; [4126]/[5371] shared coordinators; [3927]/[5088] no handle_quota_deferral; [5150] parity auditor.",
+      "passes": false,
+      "priority": 13,
+      "qualityDimensions": [
+        "Wiring: ingest actually reaches evaluate; evaluate inputs actually reach apply; proto-channel actually reaches excluded ids",
+        "Parity lock not broken (seq and wave share the inner; exhaustive destructure)",
+        "Remaining unit not used-percent; evaluate not emitting ask; exclude not account-wait",
+        "No model-id engine state (fable only as HUD ingest in usage.rs)"
+      ],
+      "requiresHuman": false,
+      "taskType": "review",
+      "title": "Review PR-2 ingest, remaining rename, evaluate vs apply, proto-channel",
+      "touchesFiles": [
+        "src/loop_engine/quota.rs",
+        "src/loop_engine/usage.rs",
+        "src/loop_engine/reactions/account.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/reactions/pre_spawn.rs",
+        "tests/reaction_parity.rs",
+        "src/loop_engine/CLAUDE.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "All prior stories have passes: true (or spawned CODE-FIX/WIRE-FIX that this review depends on have landed)",
+        "Positive: live-fixture ingest remaining 76/45/5; extra-mark Opus HUD after frontier pin marks standard AND frontier; banners contain 76% left / 5% left and do not print used 95%",
+        "Positive: factory default (including omitted tierFallback key) frontier-low → unavailable not ask; explicit null is ask opt-out; 3h session waits capped at MAX_WAIT_SECS; 6d only-frontier stop; proto-channel replace-on-evaluate; exclude-from-selection not account-wait even when provider_blackouts is empty",
+        "Positive: FULL `cargo fmt --check && cargo check && cargo clippy --all-targets -- -D warnings && cargo test` all clean (no scope filter)",
+        "Negative: evaluate_quota does not emit ask; quota.rs and engine.rs have no fable/claude-fable-5 literals; `loop run --help` does not list `--use-other-models-ttl`; no down-only walker; no set-usage-rule CLI",
+        "Docs: remaining unit, factory tierFallback high/includeReview true, proto-channel replace-on-evaluate, LOOP_USAGE_REMAINING_MIN are written",
+        "Drive `.claude/skills/verify-task-mgr/SKILL.md`: launch + sandbox + `loop run --help` only; do not drive `loop run` / `batch run`; do not hit live Anthropic. Remaining banners / LOOP_USAGE_THRESHOLD are unit/preflight-proven. Compile/unit tests alone are not proof that help stayed clean — capture the help artifact",
+        "Pre-existing test failures fixed (or spawned as FIX-xxx with verifyCommand if >~12 unrelated)",
+        "If issues found: FIX-xxx via `task-mgr add --stdin --depended-on-by REVIEW-001 --from-json tasks/quota-rung-policy-pr2.json`"
+      ],
+      "dependsOn": [
+        "CODE-REVIEW-1",
+        "CODE-FIX-002",
+        "CODE-FIX-003",
+        "CODE-FIX-004",
+        "CODE-FIX-005",
+        "CODE-FIX-006",
+        "CODE-FIX-007",
+        "CODE-FIX-008",
+        "CODE-FIX-009",
+        "CODE-FIX-010",
+        "CODE-FIX-011"
+      ],
+      "description": "REVIEW-001 is the milestone for this PR-2 slice. Run the full unscoped quality gate and leave the repo green including pre-existing failures. Prove FR-003 + FR-004 remaining banners + horizon apply + proto-channel. Drive verify-task-mgr via `loop run --help` (the skill refuses `loop run` / `batch run`). Unit/coordinator tests are the proof of ingest + remaining + apply. No live Anthropic. Do not implement PR-3.",
+      "estimatedEffort": "high",
+      "id": "REVIEW-001",
+      "modifiesBehavior": false,
+      "notes": "Spawn fixes via task-mgr add --stdin --depended-on-by REVIEW-001 --from-json tasks/quota-rung-policy-pr2.json. Verification skill: .claude/skills/verify-task-mgr/SKILL.md — refuses loop run / batch run; loop run --help is the safe probe. Do not invent a second harness. Learning [4753]: if cargo test fails with paths to a removed -slot-N worktree, touch tests/<binary>.rs and rebuild — not a code regression. PR-2 appendix ship: remaining banners + horizon + factory unavailable + exclude-from-selection. Automatic frontier→standard clamp is still PR-3.",
+      "passes": false,
+      "priority": 99,
+      "qualityDimensions": [
+        "Full suite green including pre-existing",
+        "No unwrap in production",
+        "PR-2 ship table holds (remaining banners; factory unavailable; exclude not account-wait; no TTL CLI)",
+        "Verification skill named and followed; no live Anthropic"
+      ],
+      "requiresHuman": false,
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Final gate: full suite + PR-2 ship check",
+      "touchesFiles": [
+        "src/loop_engine/quota.rs",
+        "src/loop_engine/usage.rs",
+        "src/loop_engine/reactions/account.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/project_config.rs",
+        "tests/reaction_parity.rs",
+        "src/loop_engine/CLAUDE.md",
+        "CLAUDE.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "weekly_all remaining 5 (or 0), reset 6d, other_rungs_runnable true → QuotaAccountAction::Stop not Proceed",
+        "Session-only AccountLow with reset 3h still Wait capped at MAX_WAIT_SECS",
+        "Scoped frontier-low with factory tierFallback still Unavailable/Proceed when standard work exists",
+        "No live Anthropic"
+      ],
+      "description": "Post-loop review High 1. apply_quota merges session/weekly AccountLow into latest reset then uses work.other_rungs_runnable to Proceed on >12h. Weekly-all remaining 5% with a 6d reset then continues burning quota because compute_remaining_work_snapshot only subtracts eval.unavailable (scoped). Other Claude rungs share weekly_all and are not a working alternative. Decision: for account-binding AccountLow, reset >12h → Stop. Use other_rungs_runnable only for scoped unavailable, and only count a different provider.",
+      "estimatedEffort": "medium",
+      "id": "CODE-FIX-002",
+      "passes": false,
+      "priority": 0,
+      "title": "Account-binding weekly-all >12h must Stop even if other rungs look runnable",
+      "touchesFiles": [
+        "src/loop_engine/reactions/account.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Factory tierFallback + snapshot with one non-empty tasks.model + frontier 5% + standard todos → unavailable+Proceed, not Defer",
+        "Operator copy must not claim tierFallback forbade downgrade on factory defaults",
+        "includeReview false still defers review-class when that is the only remaining work",
+        "No live Anthropic"
+      ],
+      "description": "Post-loop review High 2. compute_remaining_work_snapshot sets has_forced if ANY todo/in_progress has tasks.model (overflow writes that column). tier_fallback_allows then returns false and apply Defers the whole PRD. Factory includeForced:false is the PR-3 per-task family-match defer, not an opt-out of the whole policy. Decision: do not treat has_forced && !include_forced as a global forbid. Leave forced-model tasks selectable (PR-3 walker); factory still marks eligible rungs unavailable and proceeds on standard.",
+      "estimatedEffort": "medium",
+      "id": "CODE-FIX-003",
+      "passes": false,
+      "priority": -1,
+      "title": "Factory includeForced false must not globally forbid unavailable",
+      "touchesFiles": [
+        "src/loop_engine/reactions/account.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Wait { secs: 0 } → UsageCheckResult::BelowThreshold / ready-now, not 300s",
+        "Positive wait secs still sleep",
+        "No live Anthropic"
+      ],
+      "description": "Post-loop review High 3. Evaluate emits reset_secs=0 for past/now timestamps. Apply maps secs<=60m to Wait { secs } including 0. Execute then substitutes fallback_wait (300s). wait_for_usage_reset already treats 0 as ready-now. Decision: pass 0 through; do not treat 0 as unknown.",
+      "estimatedEffort": "low",
+      "id": "CODE-FIX-004",
+      "passes": false,
+      "priority": -2,
+      "title": "Pass Wait { 0 } through as ready-now, not fallback_wait 300s",
+      "touchesFiles": [
+        "src/loop_engine/reactions/account.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "LOOP_USAGE_CHECK_ENABLED=false + Claude enabled → no load_usage_info / OAuth GET at pre-gate (spy)",
+        "Claude disabled still skips Anthropic I/O",
+        "Post-output RateLimit path unchanged vs dual-predicate table",
+        "Proto-channel snapshot kept when load is skipped",
+        "No live Anthropic"
+      ],
+      "description": "Post-loop review High 4. Dual predicate: pre-iteration OAuth is LOOP_USAGE_CHECK_ENABLED AND Claude enabled. Seq/wave call run_account_quota_gate whenever Claude is enabled; load_usage_info_with_threshold always runs; execute_account_action only skips wait/stop. Decision: skip the load when !usage_params.enabled (keep proto-channel snapshot). Do not document an exception. Post-output dual predicate unchanged.",
+      "estimatedEffort": "medium",
+      "id": "CODE-FIX-005",
+      "passes": false,
+      "priority": -3,
+      "title": "Pre-iteration OAuth must honor LOOP_USAGE_CHECK_ENABLED",
+      "touchesFiles": [
+        "src/loop_engine/iteration.rs",
+        "src/loop_engine/wave_orchestration.rs",
+        "src/loop_engine/reactions/account.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "evaluate_quota with an explicit onLow wait on weekly_scoped emits wait input, not only Unavailable",
+        "apply honors that wait/stop/ask",
+        "heuristic path without an explicit rule still Unavailable for scoped low + factory tierFallback",
+        "No live Anthropic"
+      ],
+      "description": "Post-loop review Medium 1. evaluate_quota maps OnLowAction::Wait|Stop|Ask on rung-scoped buckets to BucketEval::Unavailable, so set-usage-rule --kind weekly_scoped --on-low wait|stop cannot fire. PRD: explicit onLow on a matching rule wins over the heuristic. Decision: evaluate must preserve explicit Wait/Stop/Ask on scoped buckets; apply must honor them (not only walk account_low). CLI for the rule is PR-3; the classifier must not drop the action.",
+      "estimatedEffort": "medium",
+      "id": "CODE-FIX-006",
+      "passes": true,
+      "priority": 0,
+      "title": "Explicit onLow wait/stop/ask on rung-scoped buckets must not collapse to Unavailable",
+      "touchesFiles": [
+        "src/loop_engine/quota.rs",
+        "src/loop_engine/reactions/account.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "After frontier remapped to standard model, Opus HUD remaining line labels frontier as well as standard",
+        "Builtin-only ingest is not used for the production banner",
+        "No live Anthropic"
+      ],
+      "description": "Post-loop review Medium 2. format_oauth_remaining_banner ingests with builtin_resolved_models so after set-tier claude frontier opus stderr still says standard 5% left not frontier. Decision: banner ingest uses the same run ResolvedModelsConfig as evaluate/apply (buckets_for_run_models).",
+      "estimatedEffort": "low",
+      "id": "CODE-FIX-007",
+      "passes": true,
+      "priority": -1,
+      "title": "Remaining banner must extra-mark with the run ResolvedModelsConfig",
+      "touchesFiles": [
+        "src/loop_engine/usage.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Horizon Stop does not print Stop signal during usage wait",
+        "was_stopped is false for quota horizon Stop (account-binding chain-stop is a separate explicit flag if needed)",
+        "Operator .stop during wait still StopSignaled / was_stopped true",
+        "No live Anthropic"
+      ],
+      "description": "Post-loop review Medium 3. QuotaAccountAction::Stop and .stop during wait both become UsageCheckResult::StopSignaled. Sequential Deferred/horizon Stop returns Empty + should_stop which sets was_stopped and exit_reason stop signal. batch --chain then skips remaining PRDs. Decision: distinguish horizon/account Stop from operator .stop. Account-binding Stop may stop the chain; Defer / rung-scoped stop-this-PRD must not set was_stopped.",
+      "estimatedEffort": "medium",
+      "id": "CODE-FIX-008",
+      "passes": true,
+      "priority": -2,
+      "title": "Horizon Stop must not be reported as a stop-file",
+      "touchesFiles": [
+        "src/loop_engine/iteration.rs",
+        "src/loop_engine/wave_orchestration.rs",
+        "src/loop_engine/orchestrator.rs",
+        "src/loop_engine/reactions/account.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Proceed + all todos excluded by unavailable rungs does not increment stale-abort",
+        "in_progress reset to todo",
+        "handle_quota_deferral is not called",
+        "No live Anthropic"
+      ],
+      "description": "Post-loop review Medium 4. They did not reuse handle_quota_deferral (good). If apply Proceeds and every todo is excluded, the queue falls through to stale-abort. Decision: when proto-channel exclusions empty the eligible set, treat as quota-empty (reset in_progress, do not stale-abort). Do not call handle_quota_deferral.",
+      "estimatedEffort": "medium",
+      "id": "CODE-FIX-009",
+      "passes": true,
+      "priority": -3,
+      "title": "Rung-only empty selection must not fall through to stale-abort",
+      "touchesFiles": [
+        "src/loop_engine/orchestrator.rs",
+        "src/loop_engine/wave_orchestration.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "askTtlMinutes 0: no sleep",
+        "askTtlMinutes 15: sleep up to 15m stop-signal-aware then continue or defer per eligibility",
+        "No live Anthropic"
+      ],
+      "description": "Post-loop review Medium 5. Apply emits Ask when TTL>0; execute always maps Ask to Deferred. Clap --use-other-models-ttl is PR-3; the config knob must be wired in PR-2. Decision: execute Ask with ttl>0 as a stop-signal-aware sleep up to askTtlMinutes then continue/defer per eligibility; ttl 0 stays no-sleep defer/continue. Re-evaluate config on the stop-check cadence if already specified.",
+      "estimatedEffort": "low",
+      "id": "CODE-FIX-010",
+      "passes": true,
+      "priority": -4,
+      "title": "usagePolicy.askTtlMinutes greater than 0 must wait, not always Deferred",
+      "touchesFiles": [
+        "src/loop_engine/reactions/account.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "src/loop_engine/CLAUDE.md reactions table #3 points at run_account_quota_gate",
+        "config.rs / reactions/mod.rs comments match",
+        "account_usage_gate remains for parity tests"
+      ],
+      "description": "Post-loop review Medium 6. CLAUDE.md reactions table and config.rs comments still name account_usage_gate as the pre-iteration path. Production seq/wave call run_account_quota_gate. Decision: update docs/comments; leave account_usage_gate as the parity-test helper.",
+      "estimatedEffort": "low",
+      "id": "CODE-FIX-011",
+      "passes": true,
+      "priority": -5,
+      "title": "Docs: pre-iteration path is run_account_quota_gate not account_usage_gate",
+      "touchesFiles": [
+        "src/loop_engine/CLAUDE.md",
+        "src/loop_engine/config.rs",
+        "src/loop_engine/reactions/mod.rs"
+      ]
+    }
+  ],
+  "version": "1.0"
+}

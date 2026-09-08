@@ -97,10 +97,17 @@ pub(crate) const AUTO_MODE_DEPRECATION_HINT: &str = concat!(
 pub struct UsageParams {
     /// Whether Claude-account usage/OAuth pre-checking is enabled.
     pub enabled: bool,
-    /// Usage percentage threshold (0-100) to trigger wait.
+    /// Remaining-percent floor (0–100). Wait when account remaining ≤ this.
+    /// Default **8** (old used≥92 ≡ remaining≤8). Field name kept for call-site
+    /// stability; semantics are remaining-min, not used-percent.
     pub threshold: u8,
     /// Fallback wait time in seconds when no reset time is available.
     pub fallback_wait: u64,
+    /// CLI `--use-other-models-ttl` override (`None` = use config
+    /// `askTtlMinutes`). Must reach `ask_or_defer` via
+    /// `effective_ttl = ask_ttl_override.unwrap_or(policy.ask_ttl_minutes)`
+    /// **before** apply — LoopConfig + execute-only is the known-bad.
+    pub ask_ttl_override: Option<u64>,
 }
 
 impl UsageParams {
@@ -108,8 +115,9 @@ impl UsageParams {
     pub fn disabled() -> Self {
         Self {
             enabled: false,
-            threshold: 92,
+            threshold: 8,
             fallback_wait: 300,
+            ask_ttl_override: None,
         }
     }
 }
@@ -193,6 +201,10 @@ pub struct IterationResult {
     pub files_modified: Vec<String>,
     /// Whether the loop should stop after this iteration
     pub should_stop: bool,
+    /// True when the stop was an operator `.stop` file (including mid-wait).
+    /// False for quota horizon Stop / Deferred soft-stops that end this PRD
+    /// without meaning "operator halt the batch chain" (`LoopResult.was_stopped`).
+    pub operator_stopped: bool,
     /// Claude's stdout output (for output-based completion detection)
     pub output: String,
     /// Effective model used for this iteration (post-crash-escalation).
@@ -444,6 +456,23 @@ pub struct IterationContext {
     /// [`BlackoutState::active`]), the quota-deferral wait, and the
     /// excluded-id computation. See [`BlackoutState`] for the three rules.
     pub provider_blackouts: BlackoutState,
+    /// Proto-channel: rungs marked unavailable by quota apply (sibling of
+    /// [`BlackoutState`], never written into `provider_blackouts` /
+    /// `runner_overrides`). Main-thread only (learning 1810).
+    ///
+    /// Keyed `(Provider, CapabilityTier) → unix expiry`. Replace the entire
+    /// map on each **successful** evaluate+apply. Keep the snapshot on API
+    /// fail (do not clear). Readers MUST go through [`active_rungs`] so
+    /// expired keys are not treated as active. Consulted by
+    /// [`reactions::pre_spawn::compute_quota_excluded_ids`] even when
+    /// `provider_blackouts` is empty (the production case).
+    pub unavailable_rungs: UnavailableRungsMap,
+    /// Set when a pre-gate horizon Stop was **account-binding** (session /
+    /// weekly_all) **or** post-output CLI spend/credits StopSpend.
+    /// Copied onto [`LoopResult::account_quota_stopped`] so batch `--chain`
+    /// aborts; rung-scoped Stop leaves this `false` and inherits
+    /// [`Self::unavailable_rungs`].
+    pub account_quota_stopped: bool,
     /// The operator-resolved provider-first config (`models` + `routing`),
     /// built ONCE per run in `run_loop` from `ProjectConfig` and threaded to the
     /// per-task recovery paths that resolve Claude tier ladders — consecutive-
@@ -481,9 +510,34 @@ impl IterationContext {
             overflow_original_task_model: std::collections::HashMap::new(),
             transient_backend_attempts: 0,
             provider_blackouts: BlackoutState::default(),
+            unavailable_rungs: UnavailableRungsMap::new(),
+            account_quota_stopped: false,
             resolved_models: model::builtin_resolved_models().clone(),
         }
     }
+}
+
+/// Proto-channel map: `(Provider, CapabilityTier) → unix-epoch expiry`.
+///
+/// Ephemeral, never persisted, never mixed with `runner_overrides` /
+/// `provider_blackouts`. Filter with [`active_rungs`] before treating keys as
+/// active.
+pub type UnavailableRungsMap =
+    std::collections::HashMap<(model::Provider, model::CapabilityTier), u64>;
+
+/// Active (unexpired) keys of a proto-channel expiry map.
+///
+/// HashSet callers (`compute_quota_excluded_ids`, `handle_rung_only_empty_selection`,
+/// `PlanContext`) stay on `HashSet` via this adapter — never iterate the raw
+/// map as if every key were live.
+pub fn active_rungs(
+    map: &UnavailableRungsMap,
+    now: u64,
+) -> std::collections::HashSet<(model::Provider, model::CapabilityTier)> {
+    map.iter()
+        .filter(|&(_, &expiry)| expiry > now)
+        .map(|(k, _)| *k)
+        .collect()
 }
 
 /// Explicit input to [`resolve_effective_runner`].
@@ -936,6 +990,15 @@ pub struct LoopResult {
     /// budget or deadline with active work still queued (an ambiguous exit 0
     /// that Layer 1 may not have caught). `#[derive(Default)]` yields `false`.
     pub prd_complete: bool,
+    /// Proto-channel expiry map inherited by the next PRD in a batch/process
+    /// (FR-006). Never SQLite / never `runner_overrides`. Receiver filters with
+    /// [`active_rungs`]. Empty by default.
+    pub unavailable_rungs: UnavailableRungsMap,
+    /// `true` when this run stopped on an **account-binding** quota horizon
+    /// (session / weekly_all) or CLI spend/credits StopSpend. `false` for
+    /// rung-scoped horizon Stop (next PRD may continue and clamp from
+    /// [`Self::unavailable_rungs`]). Default false.
+    pub account_quota_stopped: bool,
 }
 
 /// Configuration for running the loop, built from CLI args + env.
@@ -980,6 +1043,11 @@ pub struct LoopRunConfig {
     /// `Explicit(prefix)`: CLI `--prefix` override.
     /// `Disabled`: no prefix (CLI `--no-prefix` flag).
     pub prefix_mode: PrefixMode,
+    /// Proto-channel expiry map seeded from a prior PRD's [`LoopResult`]
+    /// (batch `--chain` inherit). Empty for standalone runs. Orchestrator
+    /// copies into `IterationContext.unavailable_rungs` at start; receiver
+    /// filters with [`active_rungs`].
+    pub inherited_unavailable_rungs: UnavailableRungsMap,
 }
 
 /// Dispatch a list of `<task-status>` side-band updates.
@@ -1384,6 +1452,7 @@ mod tests {
             task_id: Some("FEAT-001".to_string()),
             files_modified: vec!["src/lib.rs".to_string()],
             should_stop: false,
+            operator_stopped: false,
             output: String::new(),
             effective_model: None,
             effective_effort: None,
@@ -1401,5 +1470,48 @@ mod tests {
     #[test]
     fn test_max_consecutive_reorders_is_2() {
         assert_eq!(MAX_CONSECUTIVE_REORDERS, 2);
+    }
+
+    // --- FEAT-007 active_rungs / inherit expiry ---
+
+    #[test]
+    fn active_rungs_filters_expired_keys() {
+        // (f) inherited expired keys are not active.
+        let mut map = UnavailableRungsMap::new();
+        map.insert(
+            (model::Provider::Claude, model::CapabilityTier::Frontier),
+            100,
+        );
+        map.insert(
+            (model::Provider::Claude, model::CapabilityTier::Standard),
+            200,
+        );
+        let active = active_rungs(&map, 150);
+        assert!(
+            !active.contains(&(model::Provider::Claude, model::CapabilityTier::Frontier)),
+            "expiry==100 must not be active at now=150"
+        );
+        assert!(
+            active.contains(&(model::Provider::Claude, model::CapabilityTier::Standard)),
+            "expiry==200 must be active at now=150"
+        );
+    }
+
+    #[test]
+    fn active_rungs_empty_when_all_expired() {
+        let mut map = UnavailableRungsMap::new();
+        map.insert(
+            (model::Provider::Claude, model::CapabilityTier::Frontier),
+            1,
+        );
+        assert!(active_rungs(&map, 1).is_empty());
+        assert!(active_rungs(&map, 2).is_empty());
+    }
+
+    #[test]
+    fn loop_result_default_has_empty_unavailable_and_no_account_stop() {
+        let r = LoopResult::default();
+        assert!(r.unavailable_rungs.is_empty());
+        assert!(!r.account_quota_stopped);
     }
 }

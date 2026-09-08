@@ -284,6 +284,10 @@ fn build_shared_slot_params(
 fn build_slot_prompt_params<'a>(
     params: &'a WaveIterationParams<'a>,
     provider_blackouts: &std::collections::HashSet<crate::loop_engine::model::Provider>,
+    unavailable_rungs: std::collections::HashSet<(
+        crate::loop_engine::model::Provider,
+        crate::loop_engine::model::CapabilityTier,
+    )>,
 ) -> prompt::slot::SlotPromptParams<'a> {
     prompt::slot::SlotPromptParams {
         project_root: params.source_root.to_path_buf(),
@@ -296,6 +300,8 @@ fn build_slot_prompt_params<'a>(
         // FEAT-008: the active quota blackouts, so each slot's spawn-time plan
         // reroutes spillover-eligible work consistently with `excluded_ids`.
         provider_blackouts: provider_blackouts.clone(),
+        unavailable_rungs,
+        tier_fallback: params.project_config.routing.tier_fallback.as_ref(),
     }
 }
 
@@ -720,7 +726,7 @@ pub fn run_wave_iteration(
     mut params: WaveIterationParams<'_>,
     ctx: &mut IterationContext,
 ) -> WaveOutcome {
-    if let Some(outcome) = wave_preflight_check(&params, ctx) {
+    if let Some(outcome) = wave_preflight_check(&mut params, ctx) {
         return outcome;
     }
 
@@ -793,6 +799,7 @@ pub fn run_wave_iteration(
             params.task_prefix,
             resolved_models,
             &active_blackouts,
+            params.project_config.routing.tier_fallback.as_ref(),
         )
     };
     let result = match select_parallel_group_excluding(
@@ -833,7 +840,14 @@ pub fn run_wave_iteration(
 
     let n_slots = group.len();
     let slot_paths: &[PathBuf] = &params.slot_worktree_paths[..n_slots];
-    let slot_prompt_params = build_slot_prompt_params(&params, &active_blackouts);
+    let slot_prompt_params = build_slot_prompt_params(
+        &params,
+        &active_blackouts,
+        crate::loop_engine::engine::active_rungs(
+            &ctx.unavailable_rungs,
+            crate::loop_engine::engine::now_unix_secs(),
+        ),
+    );
     let mut slot_contexts =
         build_slot_contexts(params.conn, group, slot_paths, &slot_prompt_params);
     // FEAT-002: resolve the pre-spawn execution plan per slot on the main
@@ -1072,13 +1086,16 @@ pub fn run_wave_iteration(
             primary_provider: resolved_models.primary_provider,
             blackout_fallback_secs: resolved_models.routing.spillover.blackout_fallback_secs,
             now_secs,
+            models: resolved_models,
         };
-        match reactions::account::react_to_outputs(
+        let reaction = reactions::account::react_to_outputs(
             params.conn,
             &rate_limit_items,
             &account_params,
             &mut ctx.provider_blackouts,
-        ) {
+            &mut ctx.unavailable_rungs,
+        );
+        match reaction {
             reactions::account::AccountReaction::None => {}
             // A completed wait OR a recorded quota blackout (FEAT-008
             // RerouteAndRetry / ProceedWithSpillover): the wave retries WITHOUT
@@ -1098,16 +1115,40 @@ pub fn run_wave_iteration(
                     rate_limited_retry: true,
                 };
             }
-            reactions::account::AccountReaction::Stop => {
+            // FR-010 Stop split: OperatorStopped vs StopSpend. Known-bad was
+            // every Stop → exit 130; both are now exit 0 via the shared mapping.
+            // StopSpend must set account_quota_stopped so batch --chain aborts
+            // (CLI spend exits 0 / was_stopped false; without the flag a
+            // non-empty unavailable_rungs map would incorrectly seed inherit).
+            reactions::account::AccountReaction::OperatorStopped => {
+                let mapping = reactions::account::account_stop_wave_mapping(&reaction)
+                    .expect("OperatorStopped maps");
                 return WaveOutcome {
                     tasks_completed: agg.tasks_completed,
                     iteration_consumed: true,
                     terminal: Some(WaveTerminal {
-                        exit_code: 130,
-                        reason: "stop signal during rate-limit wait".to_string(),
+                        exit_code: mapping.exit_code,
+                        reason: mapping.reason.to_string(),
                         run_status: None,
                     }),
-                    was_stopped: true,
+                    was_stopped: mapping.was_stopped,
+                    failed_merges: Vec::new(),
+                    rate_limited_retry: false,
+                };
+            }
+            reactions::account::AccountReaction::StopSpend => {
+                ctx.account_quota_stopped = true;
+                let mapping = reactions::account::account_stop_wave_mapping(&reaction)
+                    .expect("StopSpend maps");
+                return WaveOutcome {
+                    tasks_completed: agg.tasks_completed,
+                    iteration_consumed: true,
+                    terminal: Some(WaveTerminal {
+                        exit_code: mapping.exit_code,
+                        reason: mapping.reason.to_string(),
+                        run_status: None,
+                    }),
+                    was_stopped: mapping.was_stopped,
                     failed_merges: Vec::new(),
                     rate_limited_retry: false,
                 };
@@ -1619,8 +1660,9 @@ mod tests {
     const TEST_USAGE_PARAMS: crate::loop_engine::engine::UsageParams =
         crate::loop_engine::engine::UsageParams {
             enabled: false,
-            threshold: 92,
+            threshold: 8,
             fallback_wait: 300,
+            ask_ttl_override: None,
         };
 
     #[allow(clippy::too_many_arguments)]
@@ -2160,6 +2202,83 @@ mod tests {
         assert_eq!(exit_reason, "blocked");
     }
 
+    /// CODE-FIX-009: Proceed left frontier unavailable on the proto-channel;
+    /// every todo resolves to that rung → empty selection must soft-stop as
+    /// quota-empty (reset in_progress, no stale-abort). Must NOT fall through
+    /// to the stale tracker and must not treat this as a provider-blackout
+    /// deferral (`handle_quota_deferral` is skipped when rung-only fires first).
+    #[test]
+    fn test_run_wave_iteration_rung_only_empty_soft_stops_not_stale() {
+        let (temp, mut conn) = setup_test_db();
+        insert_task(&conn, "FEAT-A", "Frontier only", "todo", 10);
+        conn.execute(
+            "UPDATE tasks SET difficulty = 'high' WHERE id = 'FEAT-A'",
+            [],
+        )
+        .unwrap();
+        insert_task(&conn, "FEAT-B", "Stranded", "in_progress", 20);
+        conn.execute(
+            "UPDATE tasks SET difficulty = 'high' WHERE id = 'FEAT-B'",
+            [],
+        )
+        .unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base_prompt = tmp.path().join("base.md");
+        std::fs::write(&base_prompt, "base").unwrap();
+        let prd = tmp.path().join("prd.json");
+        let progress = tmp.path().join("progress.txt");
+        let mode = PermissionMode::Dangerous;
+        let signal = SignalFlag::new();
+        let mut ctx = IterationContext::new(5);
+        // Proto-channel: frontier unavailable, empty provider_blackouts.
+        ctx.unavailable_rungs.insert(
+            (
+                crate::loop_engine::model::Provider::Claude,
+                crate::loop_engine::model::CapabilityTier::Frontier,
+            ),
+            u64::MAX,
+        );
+        // Forbade clamp (JSON null tierFallback) so frontier-only work cannot
+        // walk down — this is the CODE-FIX-009 Exhausted path. Factory
+        // tierFallback would clamp high→standard and select the task (FR-006).
+        let mut project_cfg = crate::loop_engine::project_config::ProjectConfig::default();
+        project_cfg.routing.tier_fallback = None;
+        let prd_implicit: Vec<String> = Vec::new();
+        let outcome = run_wave_iteration(
+            make_wave_params(
+                &mut conn,
+                temp.path(),
+                tmp.path(),
+                "main",
+                &[],
+                &base_prompt,
+                &mode,
+                &signal,
+                tmp.path(),
+                &prd,
+                &progress,
+                2,
+                &project_cfg,
+                &prd_implicit,
+            ),
+            &mut ctx,
+        );
+        let t = outcome.terminal.expect("quota-empty must be terminal");
+        assert_eq!(t.exit_code, 0, "quota soft-stop exit 0, got {t:?}");
+        assert_eq!(t.reason, "quota soft-stop");
+        assert_eq!(
+            ctx.stale_tracker.count(),
+            0,
+            "rung-only empty must not bump stale-abort"
+        );
+        assert!(
+            ctx.provider_blackouts.is_empty(),
+            "must not record a provider blackout for rung-only empty"
+        );
+        assert_eq!(get_task_status(&conn, "FEAT-B"), "todo");
+        assert!(!outcome.was_stopped, "not an operator .stop");
+    }
+
     /// Regression: a wave that selects nothing because a prior wave left a
     /// task stranded in `in_progress` (merge-back / completion-detection
     /// gap) must auto-recover it to `todo` and retry next wave WITHOUT
@@ -2387,6 +2506,8 @@ mod tests {
             models_config: crate::loop_engine::project_config::default_models_config(),
             routing_config: crate::loop_engine::project_config::default_routing_config(),
             provider_blackouts: Default::default(),
+            unavailable_rungs: Default::default(),
+            tier_fallback: None,
         };
         let slot_paths = vec![tmp.path().to_path_buf()];
         let slots = build_slot_contexts(&conn, vec![scored], &slot_paths, &prompt_params);
@@ -2476,18 +2597,32 @@ mod tests {
         ///
         /// - `TASK_MGR_NO_EXTRACT_LEARNINGS=1` keeps post-slot auxiliary LLM
         ///   spawns from competing for `CLAUDE_BINARY` (post-FEAT-002).
+        /// - `CLAUDE_BINARY` + a PATH-shadow `claude` → the mock script, so a
+        ///   parallel test that clears `CLAUDE_BINARY` without the mutex still
+        ///   cannot reach the operator's real CLI (live spend-limit banners
+        ///   previously parked the suite until `resets 3:40am`).
         /// - `MOCK_CRASH_TASKS` is restored on drop so mixed-crash tests cannot
         ///   leak into siblings in the same binary.
         struct ComprehensiveWaveEnv {
             _no_extract: EnvGuard,
             _bin: EnvGuard,
+            _path: EnvGuard,
             _crash: EnvGuard,
+            /// Keeps the PATH-shadow directory (and `claude` symlink) alive.
+            _path_dir: tempfile::TempDir,
         }
 
         impl ComprehensiveWaveEnv {
             fn new(script: &std::path::Path, mock_crash_tasks: Option<&str>) -> Self {
                 let _no_extract = EnvGuard::set("TASK_MGR_NO_EXTRACT_LEARNINGS", "1");
                 let _bin = EnvGuard::set("CLAUDE_BINARY", script.to_str().unwrap());
+                let path_dir = tempfile::TempDir::new().expect("PATH shadow tempdir");
+                let shadow = path_dir.path().join("claude");
+                std::os::unix::fs::symlink(script, &shadow)
+                    .expect("symlink mock script as PATH-shadow claude");
+                let path_now = std::env::var("PATH").unwrap_or_default();
+                let shadowed = format!("{}:{path_now}", path_dir.path().display());
+                let _path = EnvGuard::set("PATH", &shadowed);
                 let _crash = match mock_crash_tasks {
                     Some(tasks) => EnvGuard::set("MOCK_CRASH_TASKS", tasks),
                     None => EnvGuard::remove("MOCK_CRASH_TASKS"),
@@ -2495,7 +2630,9 @@ mod tests {
                 Self {
                     _no_extract,
                     _bin,
+                    _path,
                     _crash,
+                    _path_dir: path_dir,
                 }
             }
         }

@@ -68,6 +68,7 @@ fn slot_early_exit(slot: &SlotContext, exit: SlotEarlyExit) -> SlotResult {
             task_id: Some(slot.prompt_bundle.task_id.clone()),
             files_modified: exit.files_modified,
             should_stop: exit.should_stop,
+            operator_stopped: false,
             output: exit.output,
             effective_model: exit.effective_model,
             effective_effort: exit.effective_effort,
@@ -393,6 +394,7 @@ pub fn run_slot_iteration(
             task_id: Some(bundle.task_id.clone()),
             files_modified: task_files,
             should_stop: false,
+            operator_stopped: false,
             output: claude_result.output,
             effective_model,
             effective_effort: effort.clone(),
@@ -471,6 +473,7 @@ pub(super) fn slot_failure_result(
             task_id,
             files_modified: vec![],
             should_stop: false,
+            operator_stopped: false,
             output: reason,
             effective_model: None,
             effective_effort: None,
@@ -759,6 +762,8 @@ mod tests {
             models_config: crate::loop_engine::project_config::default_models_config(),
             routing_config: crate::loop_engine::project_config::default_routing_config(),
             provider_blackouts: Default::default(),
+            unavailable_rungs: Default::default(),
+            tier_fallback: None,
         }
     }
 
@@ -817,6 +822,7 @@ mod tests {
                 task_id: Some("FEAT-1".to_string()),
                 files_modified: vec!["a.rs".to_string()],
                 should_stop: false,
+                operator_stopped: false,
                 output: String::new(),
                 effective_model: None,
                 effective_effort: None,

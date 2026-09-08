@@ -212,6 +212,14 @@ pub struct SlotPromptParams<'a> {
     /// time, consistent with the wave's `excluded_ids` computation. Empty (the
     /// default) → no reroute, byte-identical to the pre-FEAT-008 plan.
     pub provider_blackouts: std::collections::HashSet<crate::loop_engine::model::Provider>,
+    /// Active proto-channel rungs (`active_rungs` output). Fed to
+    /// `resolve_execution_plan` for post-resolve down-only clamp. Empty → no clamp.
+    pub unavailable_rungs: std::collections::HashSet<(
+        crate::loop_engine::model::Provider,
+        crate::loop_engine::model::CapabilityTier,
+    )>,
+    /// `routing.tierFallback` for clamp eligibility (`includeForced` per-task).
+    pub tier_fallback: Option<&'a crate::loop_engine::project_config::TierFallback>,
 }
 
 /// Send-safe bundle of everything a slot worker needs to invoke Claude and
@@ -355,6 +363,8 @@ pub fn build_prompt(
             models: &resolved_models,
             // FEAT-008: reroute off any blacked-out provider at spawn time.
             provider_blackouts: &params.provider_blackouts,
+            unavailable_rungs: &params.unavailable_rungs,
+            tier_fallback: params.tier_fallback,
         },
     );
     let resolved_model = plan.model;

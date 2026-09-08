@@ -44,7 +44,7 @@ use crate::output::ui;
 /// Returns `Some(WaveOutcome)` when the wave should bail out before doing
 /// any work, `None` when execution should proceed.
 pub(super) fn wave_preflight_check(
-    params: &WaveIterationParams<'_>,
+    params: &mut WaveIterationParams<'_>,
     ctx: &mut IterationContext,
 ) -> Option<WaveOutcome> {
     // Match sequential semantics so Ctrl+C and `.stop` files exit the loop
@@ -79,21 +79,34 @@ pub(super) fn wave_preflight_check(
         });
     }
 
-    // Pre-iteration usage gate (FEAT-003): account-global, so fire it EXACTLY
-    // once per wave (not once per slot — that would issue N redundant API/DB
-    // checks). The wave path previously LACKED this gate entirely: a
-    // rate-limited account never waited before a wave dispatched, stranding
-    // in-flight work. Routes through the SAME
-    // `reactions::account::account_usage_gate` coordinator the sequential path
-    // folds at `run_iteration` Step 1.5, so both paths agree on the
-    // GateDecision for a given usage state. Ordered after the stop check and
-    // before crash backoff to mirror the sequential Step ordering.
-    if params.usage_params.enabled {
-        match reactions::account::account_usage_gate(reactions::account::AccountUsageGateParams {
-            threshold: params.usage_params.threshold,
-            tasks_dir: params.tasks_dir,
-            fallback_wait: params.usage_params.fallback_wait,
-        }) {
+    // Pre-iteration quota gate (PR-2 / FEAT-005): account-global, EXACTLY once
+    // per wave. Same `run_account_quota_gate` as sequential Step 1.5 — evaluate
+    // + apply + proto-channel replace when usage_params.enabled; otherwise skip
+    // load/OAuth and keep the proto-channel snapshot.
+    // Ordered after the stop check and before crash backoff.
+    if ctx
+        .resolved_models
+        .is_provider_enabled(crate::loop_engine::model::Provider::Claude)
+    {
+        match reactions::account::run_account_quota_gate(
+            reactions::account::RunAccountQuotaGateParams {
+                conn: params.conn,
+                task_prefix: params.task_prefix,
+                run_id: params.run_id,
+                unavailable_rungs: &mut ctx.unavailable_rungs,
+                runner_overrides: &ctx.runner_overrides,
+                models: &ctx.resolved_models,
+                policy: &params.project_config.usage_policy,
+                tier_fallback: params.project_config.routing.tier_fallback.as_ref(),
+                threshold: params.usage_params.threshold,
+                tasks_dir: params.tasks_dir,
+                db_dir: params.db_dir,
+                fallback_wait: params.usage_params.fallback_wait,
+                ask_ttl_override: params.usage_params.ask_ttl_override,
+                execute_account_action: params.usage_params.enabled,
+                account_quota_stopped: &mut ctx.account_quota_stopped,
+            },
+        ) {
             UsageCheckResult::StopSignaled => {
                 ui::emit("Stop signal during usage wait, exiting");
                 return Some(WaveOutcome {
@@ -105,6 +118,42 @@ pub(super) fn wave_preflight_check(
                         run_status: None,
                     }),
                     was_stopped: true,
+                    failed_merges: Vec::new(),
+                    rate_limited_retry: false,
+                });
+            }
+            UsageCheckResult::HorizonStopped => {
+                ui::emit(
+                    "Quota horizon stop — reset beyond horizon and no other rung can run; stopping this PRD",
+                );
+                return Some(WaveOutcome {
+                    tasks_completed: 0,
+                    iteration_consumed: false,
+                    terminal: Some(WaveTerminal {
+                        exit_code: 0,
+                        reason: "quota horizon stop".to_string(),
+                        run_status: None,
+                    }),
+                    was_stopped: false,
+                    failed_merges: Vec::new(),
+                    rate_limited_retry: false,
+                });
+            }
+            UsageCheckResult::Deferred {
+                effective_ttl_minutes,
+            } => {
+                ui::emit(&reactions::account::deferred_ask_stop_banner(
+                    effective_ttl_minutes,
+                ));
+                return Some(WaveOutcome {
+                    tasks_completed: 0,
+                    iteration_consumed: false,
+                    terminal: Some(WaveTerminal {
+                        exit_code: 0,
+                        reason: "quota ask deferred".to_string(),
+                        run_status: None,
+                    }),
+                    was_stopped: false,
                     failed_merges: Vec::new(),
                     rate_limited_retry: false,
                 });
@@ -183,7 +232,50 @@ pub(super) fn handle_no_eligible_tasks(
     let task_prefix = params.task_prefix;
     let prd_path = params.prd_path;
 
-    // (0) FEAT-008 deferral-first — ordered BEFORE drained classification,
+    // (0a) Rung-only empty — BEFORE blackout deferral. Proceed + proto-channel
+    // exclusions can empty the eligible set with no provider blackout; that is
+    // quota-empty (reset in_progress, soft-stop), NOT stale and NOT
+    // `handle_quota_deferral` (learning 3927 / 5088).
+    let now = crate::loop_engine::engine::now_unix_secs();
+    match reactions::account::handle_rung_only_empty_selection(
+        params.conn,
+        task_prefix,
+        &ctx.unavailable_rungs,
+        &ctx.runner_overrides,
+        &ctx.resolved_models,
+        &ctx.provider_blackouts,
+        now,
+        params.project_config.routing.tier_fallback.as_ref(),
+    ) {
+        reactions::account::RungOnlyEmpty::Inactive => {}
+        reactions::account::RungOnlyEmpty::Exhausted => {
+            ui::emit("All remaining todos are on unavailable rungs — quota empty, soft-stopping");
+            progress::log_iteration(progress::LogIterationParams {
+                progress_path: params.progress_path,
+                iteration: params.iteration,
+                task_id: None,
+                outcome: &IterationOutcome::Empty,
+                files: &[],
+                model: None,
+                effort: None,
+                slot: None,
+            });
+            return WaveOutcome {
+                tasks_completed: 0,
+                iteration_consumed: true,
+                terminal: Some(WaveTerminal {
+                    exit_code: 0,
+                    reason: "quota soft-stop".to_string(),
+                    run_status: None,
+                }),
+                was_stopped: false,
+                failed_merges: Vec::new(),
+                rate_limited_retry: false,
+            };
+        }
+    }
+
+    // (0b) FEAT-008 deferral-first — ordered BEFORE drained classification,
     // auto-recovery, and the stale tracker. When a provider blackout is active
     // and todo work remains, the empty selection is quota-DEFERRAL (every
     // candidate resolves to a blacked-out provider it cannot reroute off of),
@@ -192,7 +284,6 @@ pub(super) fn handle_no_eligible_tasks(
     // retry WITHOUT touching the stale tracker (learning 3927). The wait gives
     // back the loop-bound iteration (B2) and skips the FEAT-002 reset/halt
     // check (B3) exactly like a rate-limit retry wave.
-    let now = crate::loop_engine::engine::now_unix_secs();
     match reactions::account::handle_quota_deferral(
         params.conn,
         task_prefix,

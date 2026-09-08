@@ -221,6 +221,116 @@ fn mutating_verb_on_legacy_config_hard_errors() {
         ));
 }
 
+// ---- usage-rule / tier-fallback (FEAT-008) --------------------------------
+
+#[test]
+fn set_usage_rule_and_tier_fallback_round_trip_via_cli() {
+    let sb = Sandbox::new();
+    // Seed sparse unrelated keys, then models init (preserves them).
+    sb.write_config(
+        r#"{"version":1,"additionalAllowedTools":["Bash(docker:*)"],"embeddingModel":"nomic"}"#,
+    );
+    sb.cmd().args(["models", "init"]).assert().success();
+
+    sb.cmd()
+        .args([
+            "models",
+            "set-usage-rule",
+            "--kind",
+            "weekly_scoped",
+            "--on-low",
+            "unavailable",
+        ])
+        .assert()
+        .success();
+    sb.cmd()
+        .args([
+            "models",
+            "set-tier-fallback",
+            "high",
+            "--include-review",
+            "--include-forced",
+        ])
+        .assert()
+        .success();
+
+    let raw = sb.read_config();
+    assert!(raw.contains("\"onLow\""), "camelCase onLow:\n{raw}");
+    assert!(raw.contains("additionalAllowedTools"), "sparse:\n{raw}");
+    assert!(raw.contains("embeddingModel"), "sparse:\n{raw}");
+    assert!(
+        raw.contains("\"maxDifficulty\": \"high\"") || raw.contains("\"maxDifficulty\":\"high\""),
+        "{raw}"
+    );
+    assert!(
+        raw.contains("\"includeForced\": true") || raw.contains("\"includeForced\":true"),
+        "{raw}"
+    );
+
+    let show = sb.stdout_of(&["models", "show"]);
+    assert!(show.contains("usagePolicy:"), "{show}");
+    assert!(show.contains("remainingMinPercent:"), "{show}");
+    assert!(show.contains("tierFallback:"), "{show}");
+    assert!(show.contains("maxDifficulty=high"), "{show}");
+    assert!(
+        !show.contains("% left"),
+        "offline show must not print remaining percents:\n{show}"
+    );
+
+    sb.cmd()
+        .args(["models", "unset-tier-fallback"])
+        .assert()
+        .success();
+    let raw2 = sb.read_config();
+    assert!(
+        raw2.contains("\"tierFallback\": null") || raw2.contains("\"tierFallback\":null"),
+        "unset must write JSON null:\n{raw2}"
+    );
+    let show2 = sb.stdout_of(&["models", "show"]);
+    assert!(
+        show2.contains("tierFallback: (unset)"),
+        "null renders as (unset):\n{show2}"
+    );
+}
+
+#[test]
+fn set_usage_rule_and_tier_fallback_typos_are_config_errors() {
+    let sb = Sandbox::new();
+    sb.cmd()
+        .args(["models", "set-usage-rule", "--on-low", "wait"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("CONFIG ERROR"));
+    sb.cmd()
+        .args([
+            "models",
+            "set-usage-rule",
+            "--kind",
+            "weekly_scoped",
+            "--on-low",
+            "nope",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("CONFIG ERROR"))
+        .stderr(predicates::str::contains("wait"));
+    sb.cmd()
+        .args(["models", "set-tier-fallback", "hiigh"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("CONFIG ERROR"))
+        .stderr(predicates::str::contains("low"));
+}
+
+#[test]
+fn models_help_lists_new_policy_verbs() {
+    let sb = Sandbox::new();
+    let out = sb.stdout_of(&["models", "--help"]);
+    assert!(out.contains("set-usage-rule"), "{out}");
+    assert!(out.contains("set-tier-fallback"), "{out}");
+    assert!(out.contains("unset-tier-fallback"), "{out}");
+}
+
 // ---- enable (end-to-end through the probe) -------------------------------
 
 #[cfg(unix)]

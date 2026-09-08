@@ -85,6 +85,7 @@ pub fn run_iteration(
             task_id: None,
             files_modified: vec![],
             should_stop: true,
+            operator_stopped: false,
             output: String::new(),
             effective_model: None,
             effective_effort: None,
@@ -103,6 +104,7 @@ pub fn run_iteration(
             task_id: None,
             files_modified: vec![],
             should_stop: true,
+            operator_stopped: true,
             output: String::new(),
             effective_model: None,
             effective_effort: None,
@@ -122,19 +124,30 @@ pub fn run_iteration(
         );
     }
 
-    // Step 1.5: Pre-iteration usage gate (account-global). Routes through the
-    // converged `reactions::account::account_usage_gate` coordinator — the SAME
-    // gate the wave path folds once per wave (`wave_orchestration::wave_preflight_check`),
-    // so both paths agree on the GateDecision for a given usage state. The
-    // relocated `usage::check_and_wait` leaf is `#[deprecated]` and this file
-    // carries `#![deny(deprecated)]`, so a direct call here is a compile error.
-    if params.usage_params.enabled {
-        let check_result =
-            reactions::account::account_usage_gate(reactions::account::AccountUsageGateParams {
+    // Step 1.5: Pre-iteration quota gate (account-global). PR-2: evaluate+apply
+    // + proto-channel replace, shared with the wave path. Called whenever Claude
+    // is enabled; `execute_account_action` (= usage_params.enabled = env ∧
+    // Claude) skips load/OAuth and keeps the proto-channel snapshot when false.
+    if ctx.resolved_models.is_provider_enabled(Provider::Claude) {
+        let check_result = reactions::account::run_account_quota_gate(
+            reactions::account::RunAccountQuotaGateParams {
+                conn: params.conn,
+                task_prefix: params.task_prefix,
+                run_id: params.run_id,
+                unavailable_rungs: &mut ctx.unavailable_rungs,
+                runner_overrides: &ctx.runner_overrides,
+                models: &ctx.resolved_models,
+                policy: &params.project_config.usage_policy,
+                tier_fallback: params.project_config.routing.tier_fallback.as_ref(),
                 threshold: params.usage_params.threshold,
                 tasks_dir: params.tasks_dir,
+                db_dir: params.db_dir,
                 fallback_wait: params.usage_params.fallback_wait,
-            });
+                ask_ttl_override: params.usage_params.ask_ttl_override,
+                execute_account_action: params.usage_params.enabled,
+                account_quota_stopped: &mut ctx.account_quota_stopped,
+            },
+        );
         match check_result {
             UsageCheckResult::StopSignaled => {
                 ui::emit("Stop signal during usage wait, exiting");
@@ -143,6 +156,47 @@ pub fn run_iteration(
                     task_id: None,
                     files_modified: vec![],
                     should_stop: true,
+                    operator_stopped: true,
+                    output: String::new(),
+                    effective_model: None,
+                    effective_effort: None,
+                    effective_runner: None,
+                    key_decisions_count: 0,
+                    conversation: None,
+                    shown_learning_ids: Vec::new(),
+                });
+            }
+            UsageCheckResult::HorizonStopped => {
+                ui::emit(
+                    "Quota horizon stop — reset beyond horizon and no other rung can run; stopping this PRD",
+                );
+                return Ok(IterationResult {
+                    outcome: IterationOutcome::Empty,
+                    task_id: None,
+                    files_modified: vec![],
+                    should_stop: true,
+                    operator_stopped: false,
+                    output: String::new(),
+                    effective_model: None,
+                    effective_effort: None,
+                    effective_runner: None,
+                    key_decisions_count: 0,
+                    conversation: None,
+                    shown_learning_ids: Vec::new(),
+                });
+            }
+            UsageCheckResult::Deferred {
+                effective_ttl_minutes,
+            } => {
+                ui::emit(&reactions::account::deferred_ask_stop_banner(
+                    effective_ttl_minutes,
+                ));
+                return Ok(IterationResult {
+                    outcome: IterationOutcome::Empty,
+                    task_id: None,
+                    files_modified: vec![],
+                    should_stop: true,
+                    operator_stopped: false,
                     output: String::new(),
                     effective_model: None,
                     effective_effort: None,
@@ -153,12 +207,10 @@ pub fn run_iteration(
                 });
             }
             UsageCheckResult::ApiError(ref msg) => {
-                // Graceful-degradation diagnostic: the usage API failed but the
-                // loop continues. Channel B (matches usage.rs's own API-failure
-                // routing); stays visible on the console at WARN+.
                 tracing::warn!("usage API warning: {} (continuing)", msg);
             }
-            _ => {} // BelowThreshold, WaitedAndReset, Skipped — proceed
+            // BelowThreshold, WaitedAndReset, Skipped — proceed
+            _ => {}
         }
     }
 
@@ -179,6 +231,7 @@ pub fn run_iteration(
             task_id: None,
             files_modified: vec![],
             should_stop: true,
+            operator_stopped: false,
             output: String::new(),
             effective_model: None,
             effective_effort: None,
@@ -232,6 +285,7 @@ pub fn run_iteration(
             params.task_prefix,
             resolved_models,
             &active_blackouts,
+            params.project_config.routing.tier_fallback.as_ref(),
         )
     };
 
@@ -254,6 +308,11 @@ pub fn run_iteration(
         models_config: &params.project_config.models,
         routing_config: &params.project_config.routing,
         provider_blackouts: active_blackouts.clone(),
+        unavailable_rungs: crate::loop_engine::engine::active_rungs(
+            &ctx.unavailable_rungs,
+            crate::loop_engine::engine::now_unix_secs(),
+        ),
+        tier_fallback: params.project_config.routing.tier_fallback.as_ref(),
         excluded_ids: excluded_ids.clone(),
     });
 
@@ -280,6 +339,7 @@ pub fn run_iteration(
                     task_id: None,
                     files_modified: vec![],
                     should_stop: true,
+                    operator_stopped: false,
                     output: String::new(),
                     effective_model: None,
                     effective_effort: None,
@@ -334,6 +394,11 @@ pub fn run_iteration(
                     models_config: &params.project_config.models,
                     routing_config: &params.project_config.routing,
                     provider_blackouts: active_blackouts.clone(),
+                    unavailable_rungs: crate::loop_engine::engine::active_rungs(
+                        &ctx.unavailable_rungs,
+                        crate::loop_engine::engine::now_unix_secs(),
+                    ),
+                    tier_fallback: params.project_config.routing.tier_fallback.as_ref(),
                     excluded_ids: excluded_ids.clone(),
                 });
                 match retry_attempt {
@@ -348,6 +413,7 @@ pub fn run_iteration(
                             task_id: None,
                             files_modified: vec![],
                             should_stop: false,
+                            operator_stopped: false,
                             output: String::new(),
                             effective_model: None,
                             effective_effort: None,
@@ -376,6 +442,7 @@ pub fn run_iteration(
                     task_id: None,
                     files_modified: vec![],
                     should_stop: false,
+                    operator_stopped: false,
                     output: String::new(),
                     effective_model: None,
                     effective_effort: None,
@@ -589,6 +656,7 @@ pub fn run_iteration(
                 task_id: Some(task_id),
                 files_modified: task_files,
                 should_stop: false,
+                operator_stopped: false,
                 output: hint,
                 effective_model,
                 effective_effort: effort.clone(),
@@ -608,6 +676,7 @@ pub fn run_iteration(
                 task_id: Some(task_id),
                 files_modified: task_files,
                 should_stop: false,
+                operator_stopped: false,
                 output: hint,
                 effective_model,
                 effective_effort: effort.clone(),
@@ -635,6 +704,7 @@ pub fn run_iteration(
                 task_id: Some(task_id),
                 files_modified: task_files,
                 should_stop: false,
+                operator_stopped: false,
                 output: String::new(),
                 effective_model,
                 effective_effort: effort.clone(),
@@ -717,6 +787,7 @@ pub fn run_iteration(
             task_id: Some(task_id),
             files_modified: task_files,
             should_stop: false,
+            operator_stopped: false,
             output: claude_result.output,
             effective_model,
             effective_effort: effort.clone(),
@@ -748,6 +819,7 @@ pub fn run_iteration(
             task_id: Some(task_id),
             files_modified: task_files,
             should_stop: true,
+            operator_stopped: false,
             output: claude_result.output,
             effective_model: None,
             effective_effort: None,
@@ -769,7 +841,7 @@ pub fn run_iteration(
     // home both execution paths share. The sequential path folds its one output
     // into a one-item slice; the wave path folds its N. `WaitedAndRetry` (or
     // `None`) falls through with the outcome still `RateLimit` (`run_loop` marks
-    // it non-counting); `Stop` returns early with `should_stop` and empty output.
+    // it non-counting); OperatorStopped / StopSpend return early as Empty.
     if outcome == IterationOutcome::RateLimit {
         ui::emit("Rate limit detected in output, running account reaction...");
         let reaction = {
@@ -801,12 +873,14 @@ pub fn run_iteration(
                 primary_provider: resolved_models.primary_provider,
                 blackout_fallback_secs: resolved_models.routing.spillover.blackout_fallback_secs,
                 now_secs: crate::loop_engine::engine::now_unix_secs(),
+                models: resolved_models,
             };
             reactions::account::react_to_outputs(
                 params.conn,
                 &items,
                 &account_params,
                 &mut ctx.provider_blackouts,
+                &mut ctx.unavailable_rungs,
             )
         };
         // `RerouteAndRetry` / `ProceedWithSpillover` (FEAT-008) and
@@ -814,21 +888,55 @@ pub fn run_iteration(
         // which `run_loop` marks non-counting (budget give-back). The blackout
         // recorded on `ctx.provider_blackouts` reroutes spillover-eligible work
         // on the next iteration; the no-eligible deferral branch waits only if
-        // everything is quota-deferred. Only `Stop` exits early here.
-        if reaction == reactions::account::AccountReaction::Stop {
-            return Ok(IterationResult {
-                outcome: IterationOutcome::RateLimit,
-                task_id: Some(task_id),
-                files_modified: task_files,
-                should_stop: true,
-                output: String::new(),
-                effective_model: None,
-                effective_effort: None,
-                effective_runner: Some(effective_runner),
-                key_decisions_count: 0,
-                conversation: None,
-                shown_learning_ids: Vec::new(),
-            });
+        // everything is quota-deferred. OperatorStopped / StopSpend exit early
+        // as Empty (pre-gate StopSignaled / HorizonStopped triples) — never
+        // RateLimit + operator_stopped (orchestrator `_` → exit 1).
+        match reaction {
+            reactions::account::AccountReaction::OperatorStopped => {
+                let mapping = reactions::account::account_stop_sequential_mapping(&reaction)
+                    .expect("OperatorStopped maps");
+                return Ok(IterationResult {
+                    outcome: IterationOutcome::Empty,
+                    task_id: None,
+                    files_modified: vec![],
+                    should_stop: true,
+                    operator_stopped: mapping.operator_stopped,
+                    output: String::new(),
+                    effective_model: None,
+                    effective_effort: None,
+                    effective_runner: None,
+                    key_decisions_count: 0,
+                    conversation: None,
+                    shown_learning_ids: Vec::new(),
+                });
+            }
+            reactions::account::AccountReaction::StopSpend => {
+                // CLI spend/credits RateLimit: account is out of credits.
+                // Apply-layer Stop already writes this via account_binding;
+                // post-output StopSpend must too so batch --chain aborts
+                // instead of seeding inherit when unavailable_rungs is non-empty.
+                ctx.account_quota_stopped = true;
+                let mapping = reactions::account::account_stop_sequential_mapping(&reaction)
+                    .expect("StopSpend maps");
+                return Ok(IterationResult {
+                    outcome: IterationOutcome::Empty,
+                    task_id: None,
+                    files_modified: vec![],
+                    should_stop: true,
+                    operator_stopped: mapping.operator_stopped,
+                    output: String::new(),
+                    effective_model: None,
+                    effective_effort: None,
+                    effective_runner: None,
+                    key_decisions_count: 0,
+                    conversation: None,
+                    shown_learning_ids: Vec::new(),
+                });
+            }
+            reactions::account::AccountReaction::None
+            | reactions::account::AccountReaction::WaitedAndRetry
+            | reactions::account::AccountReaction::RerouteAndRetry
+            | reactions::account::AccountReaction::ProceedWithSpillover => {}
         }
     }
 
@@ -916,6 +1024,7 @@ pub fn run_iteration(
         task_id: Some(task_id),
         files_modified: task_files,
         should_stop,
+        operator_stopped: false,
         output: claude_output,
         effective_model,
         effective_effort: effort.clone(),
