@@ -14,8 +14,10 @@ Every write to the `tasks.status` column must go through a `TaskLifecycle` verb
 
 - Category A — user-intent status transitions (`apply()`)
 - Category B — race-safe pre-claim (`try_claim()`)
-- Category C — bulk recovery (`recover_in_progress_for_prefix()`,
-  `auto_block_after_failures()`, `resurrect_for_iteration()`)
+- Category C — bulk + per-id recovery (`recover_in_progress_for_prefix()`,
+  `recover_in_progress()`, `reopen_after_merge_fail()`,
+  `auto_block_after_failures()`, `resurrect_for_iteration()`,
+  `resurrect_with_model_override()`)
 - Category D — PRD-driven reconciliation (`reconcile_from_prd()`)
 - Category D — doctor heuristic repair (`repair_stale()`)
 - Side effects that travel with a status write: `run_tasks` bookkeeping,
@@ -88,7 +90,7 @@ and mapped to `TransitionSource` variants and lifecycle verbs.
 |---|---|---|---|
 | **A** user-intent | `commands/complete.rs:248`, `commands/fail/transition.rs:83`, `commands/skip.rs:125`, `commands/irrelevant.rs:136`, `commands/unblock.rs:87+146`, `commands/review.rs:215+242+282`, `commands/reset.rs:78` | `apply()` | `Operator` / `LoopStatusTag` |
 | **B** race-safe pre-claim | `commands/next/mod.rs:244` (CLI `next --claim`), `loop_engine/engine.rs:786` (`claim_slot_task` — slot wave) | `try_claim()` | `Operator` / `LoopStatusTag` |
-| **C** bulk recovery | `loop_engine/engine.rs:1642` (slot reset), `engine.rs:2407` (mid-run stale sweep), `engine.rs:3258` (startup sweep), `engine.rs:5145` (auto-block), `commands/next/decay.rs:129` (decay reset), `loop_engine/overflow.rs:460+466+471` (overflow rungs 3-5) | `recover_in_progress_for_prefix()`, `auto_block_after_failures()`, `resurrect_for_iteration()` | `Recovery` |
+| **C** bulk + per-id recovery | `wave_scheduler.rs` (`reset_orphan_claim_to_todo` → 17.5/17.6; `reset_task_to_todo` → merge-fail), `startup.rs` / `iteration.rs` / `reactions/account.rs` (bulk sweep), `reactions/post_output.rs` (overflow rungs 1–3 + rung 5 auto-block + rung 4 model override), `loop_engine/recovery.rs` (`auto_block_task` shim), `commands/next/decay.rs` (decay reset). Do **not** cite carved `engine.rs:NNNN` / `overflow.rs` line numbers — those sites moved. | `recover_in_progress_for_prefix()`, `recover_in_progress()`, `reopen_after_merge_fail()`, `auto_block_after_failures()`, `resurrect_for_iteration()`, `resurrect_with_model_override()` | `Recovery` |
 | **D** PRD-driven | `loop_engine/prd_reconcile.rs:305` (passes:true), `prd_reconcile.rs:550` (irrelevant mutation) | `reconcile_from_prd()` | `ReconcilePrd` |
 | **D** doctor heuristic | `commands/doctor/fixes.rs:30` (`fix_stale_task`), `doctor/fixes.rs:93` (`fix_git_reconciliation`) | `repair_stale()` | `DoctorRepair` |
 | **Exception** | `commands/init/mod.rs:518` | _(raw SQL — `LIFECYCLE-EXCEPTION` comment required)_ | n/a |
@@ -101,28 +103,37 @@ doctor sub-decision.
 
 ## Recovery verb families (Recovery vs. Plan-driven)
 
-The three **Recovery** verbs (`recover_in_progress_for_prefix`,
-`auto_block_after_failures`, `resurrect_for_iteration`) are intentionally
-**not** routed through the plan/matrix path used by ReconcilePrd / DoctorRepair /
-DecayReset.
+Category C **Recovery** verbs are intentionally **not** routed through the
+plan/matrix path used by ReconcilePrd / DoctorRepair / DecayReset. They carry
+`TransitionSource::Recovery` and own their status predicates as conditional
+WHERE clauses (atomic UPDATE — no SELECT-then-write; learning #4810).
 
-- They carry `TransitionSource::Recovery`.
-- `recover_in_progress_for_prefix` and `auto_block_after_failures` keep an
-  explicit `WHERE status = 'in_progress'` guard (matching their original
-  inline SQL).
-- `resurrect_for_iteration` (the per-ID reset used by wave FEAT-002 and
-  overflow rungs) **deliberately omits** that guard so callers can list any
-  task ID they want forced back to `todo`. This was a conscious contract
-  relaxation during the extraction (see TEST-INIT-002 and the
-  `reset_task_to_todo` call sites).
+| Verb | Predicate | Typical callers |
+|---|---|---|
+| `recover_in_progress_for_prefix` | bulk `status = 'in_progress'` | mid-run / startup sweeps |
+| `recover_in_progress` | per-id `status = 'in_progress'` | 17.5/17.6 orphan reclaim (FIX-001); overflow rungs 1–3 (FIX-003) |
+| `reopen_after_merge_fail` | per-id `status IN ('in_progress', 'done')` | FEAT-002 merge-fail only (FIX-002) |
+| `auto_block_after_failures` | per-id `status = 'in_progress'` → `blocked` | `handle_task_failure` auto-block |
+| `resurrect_with_model_override` | per-id `status = 'in_progress'` + set model | overflow rung 4 provider pivot |
+| `resurrect_for_iteration` | **unguarded** per-id force-to-`todo` | escape hatch only — **do not** add `WHERE status = 'in_progress'` (learning #4358) |
+
+**Two predicates, not one shared helper.** Orphan reclaim and merge-fail must
+not share a single `in_progress`-only `reset_task_to_todo`: merge-fail after
+premature `:done` on a slot-local ephemeral would strand work. Do not invent a
+flag on one verb instead of two verbs.
+
+**`resurrect_for_iteration` stays unguarded.** Callers that need status-gated
+resets use `recover_in_progress` or `reopen_after_merge_fail`. Guarding
+`resurrect` would break intentional force-any-status consumers (recovery_tests
+pin `blocked → todo`).
 
 In contrast, plan-driven verbs go through `allowed_from_for_plan` +
 `matrix::validate` and only produce the transitions listed in the matrix.
 
 This split keeps hot recovery paths simple and avoids forcing every recovery
 action through a generic plan builder. The asymmetry is documented here and in
-the rustdoc for `resurrect_for_iteration` so future maintainers do not assume
-all Recovery verbs behave the same.
+the rustdoc for each verb so future maintainers do not assume all Recovery
+verbs behave the same.
 
 ## TransitionSource matrix
 
@@ -133,7 +144,7 @@ Key expansions beyond the `Operator` baseline:
 
 | Source | Extra-allowed transitions |
 |---|---|
-| `Recovery` | `InProgress → Todo` (stuck task reset) |
+| `Recovery` | `InProgress → Todo` (stuck/orphan reset); `Done → Todo` only via `reopen_after_merge_fail` conditional WHERE (not matrix-consulted) |
 | `ReconcilePrd` | `Done → Irrelevant`, `Todo → Done`, `Todo → Irrelevant` |
 | `DoctorRepair` | `InProgress → Todo`, `Todo → Done` |
 
