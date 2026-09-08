@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-09-08
+
+### Added
+- Quota rung policy: remaining-percent gate, horizon heuristic, proto-channel
+  exclude, `--use-other-models-ttl`, down-only clamp, and
+  `models set-usage-rule` / `set-tier-fallback`. A low frontier HUD row is not
+  an account emergency — continue on standard and cheaper rungs without a
+  `set-tier` pin.
+
+### Changed
+- Clippy 1.98 clean (`-D warnings`) on CI stable.
+
 ### Added
 - `task-mgr add` subcommand: accepts a task JSON object on stdin (`--stdin`),
   auto-assigns priority relative to existing tasks, and syncs the PRD JSON file
