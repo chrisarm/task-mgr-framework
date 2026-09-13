@@ -1,0 +1,1117 @@
+{
+  "branchName": "feat/agent-task-ops-pr1",
+  "description": "PR-1 only of agent-task-ops-ux: pure worktree remapper + pin-19 path identity, extract commands/context.rs pin protocol, prd_json unique-tmp write chokepoint, clap --from-json on add and current (pin, not import), CLI write-path policy (worktree JSON when that file exists), ≥2-prefix unpinned add refuse, JSON-sync failure copy that names current/--from-json (never export), cheatsheet recipe, and verify-task-mgr sandbox proof. Do not implement PR-2 update or PR-3 export.",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "No warnings in `cargo check` output",
+      "No warnings in `cargo clippy -- -D warnings` (per-iteration). `--all-targets` is REVIEW-001 only",
+      "`cargo fmt --check` passes",
+      "Scoped tests for touched modules pass",
+      "No unwrap() on filesystem or SQLite in new production paths",
+      "Operator pin/refuse/sync-failure copy uses `ui::emit` / `ui::emit_err` (CONTRACT-LOG-001), never tracing",
+      "Do not implement PR-2 or PR-3 stories",
+      "Existing `--no-prefix` add unit/integration tests stay green",
+      "Existing `tests/worktree_db_resolution.rs` DB-anchoring tests stay green",
+      "User-facing add/current `--from-json` clap, pin, and refuse proof is FEAT-009 + REVIEW-001 via `.claude/skills/verify-task-mgr/SKILL.md` (compile/unit tests alone are not proof for those stories). FEAT-004 / FEAT-005 / FEAT-006 keep rust tests only — no skill drive"
+    ],
+    "description": "These criteria apply to ALL implementation tasks"
+  },
+  "mergeStrategy": "Merge to main after REVIEW-001 passes. Squash commits optional. Clap `--from-json` on add/current, the ≥2-prefix refuse, and the cheatsheet recipe MUST land on this branch before merge (pin 20).",
+  "prdFile": "prd-agent-task-ops-pr1.md",
+  "priorityPhilosophy": {
+    "description": "Hierarchy of what matters most when implementing tasks",
+    "hierarchy": [
+      "1. PLAN — Anticipate edge cases before coding",
+      "2. PHASE 2 FOUNDATION — ~1 day now to save ~2+ weeks later (1:10+ ratio); we are pre-launch, foundations compound",
+      "3. FUNCTIONING CODE — Pragmatic, reliable, wired in per plan",
+      "4. CORRECTNESS — Compiles, type-checks, scoped tests pass deterministically",
+      "5. CODE QUALITY — Clean code, qualityDimensions satisfied, no warnings",
+      "6. POLISH — Docs, formatting, minor improvements"
+    ],
+    "principles": [
+      "Quality dimensions explicit — qualityDimensions on every task tells you what 'good' looks like",
+      "Phase 2 foundation — path identity + prd_json chokepoint are the substrate for PR-2 update and PR-3 export; do not invent a second writer or a discovery remapper",
+      "Edge cases = test cases — every PR-1 known edge case must have a corresponding test",
+      "Scoped per-iteration tests, full suite at REVIEW-001 — REVIEW must leave the trunk green including pre-existing failures",
+      "Pins 1–4 / 11–16 / 19–21 are law; pins 5–10 / 17–18 must not be implemented or contradicted",
+      "Ship working code with tests to prove it; handle Option/Result explicitly; avoid unwrap() in production"
+    ]
+  },
+  "prohibitedOutcomes": [
+    "Implementing PR-2 (`task-mgr update`, humanReviewOutcome persistence, error_recovery hint swap, CLARIFY docs) or PR-3 (export scoping, task_ops prompt, enhance/intents remaining alignment, best-practices copy)",
+    "`add --from-json` creating or registering a new PRD, or calling `init` / `register_prd_files`",
+    "`exists()`, dest `canonicalize`, basename search, or directory walk inside `remap_into_worktree`",
+    "Sharing CLI existence policy into loop startup Step 8.5 (pin 15)",
+    "Dropping startup's canonicalize-`source_root` before the helper",
+    "Shipping the ≥2-prefix refuse without clap `--from-json` on add (pin 20)",
+    "Erroring inside `resolve_context` for 2+ prefixes (breaks `current` probe)",
+    "`if ctx.is_none() { refuse }` (breaks `--no-prefix` / 0-prefix insert)",
+    "`apply_prefix(\"\")` or `prefix_id(\"\", id)` on a NULL-prefix `--from-json` pin (inserted id `-FEAT-001`)",
+    "Second `locate_prd_json` write after DB commit (display vs write split, learning #4237)",
+    "Remapping `--from-json PATH` away from the canonical flag path",
+    "Keeping `locate_prd_json` `LIMIT 1` as a prefix-miss fallback (writes PRD #1)",
+    "JSON-sync failure copy naming `task-mgr export`",
+    "Keeping `.{name}.task-mgr-add.tmp` (learning #1562)",
+    "Deserializing existing `userStories` through `PrdUserStory` on append (strips unknown keys; pins 12 / 17)",
+    "Changing DB anchoring (main checkout `.task-mgr` from a worktree stays)",
+    "Rewriting historical `tasks/*-prompt.md`; MCP task wrappers; a `set-status` command; claim-scoped short `<task-status>` ids; putting `priority` on the update whitelist",
+    "Making `get_project_root` → `git::worktree_root` a required story",
+    "Merging `update_prd_task_passes` into the add writer (share `unique_tmp_path` only)",
+    "Inventing a second verification harness; treating compile/unit tests as proof for add/current `--from-json` clap, pin, or refuse",
+    "Driving `loop run` / `batch run` through verify-task-mgr; claiming worktree live-path cases via that harness",
+    "Identity tests seeding a bare basename unless that is what `register_prd_files` stored",
+    "Manual edits to `tasks/*.json` for status (use task-mgr CLI / task-status tags)",
+    "unwrap() on filesystem or SQLite in new modules unless a prior invariant makes it unreachable",
+    "tracing for operator-facing pin/refuse/sync-failure copy (use `ui::emit` / `ui::emit_err`)",
+    "Tests that only assert 'no crash' or check type without verifying content"
+  ],
+  "project": "task-mgr",
+  "requires": [],
+  "reviewGuidelines": {
+    "priorityGuidelines": {
+      "critical": "1-10: Blocks further work, fix immediately",
+      "high": "11-20: Fix before phase completion",
+      "low": "51-99: Defer to hardening phase",
+      "medium": "21-50: Fix in current phase if time permits"
+    }
+  },
+  "taskPrefix": "a410d276",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "Precise interface: `git::worktree_root_at(dir: &Path) -> Option<PathBuf>` and `git::worktree_root() -> Option<PathBuf>` mirror `main_repo_root_at` / `main_repo_root` (`git rev-parse --show-toplevel`, canonicalized like `main_repo_root_at`); `git::remap_into_worktree(registered: &Path, source_root: &Path, worktree_root: &Path) -> PathBuf` is infallible path math; pin-19 identity in `context` is (b)+(c) only — `canonicalize(flag) == canonicalize(resolved)` OR `canonicalize(flag) == remap_into_worktree(...)` after joining relative `registered` to `source_root`",
+        "Edge cases: dest missing still remaps (no dest canonicalize); main checkout (`worktree_root == source_root`) returns joined registered path; relative registered joined before remap; symlink `source_root` vs canonical `prd_file` (caller canonicalizes `source_root`, helper does not canonicalize dest); strip_prefix miss returns `resolved` unchanged; identity tests seed `prd_files` as init would (`tasks/foo.json` or absolute)",
+        "Invariants: helper has no `exists()`, no basename search, no directory walk, no dest canonicalize, no fs side effects; loop Step 8.5 keeps canonicalize-`source_root` then calls the helper; CLI existence is a different caller-side function never imported by startup; match (a) (`JSON taskPrefix` in `prd_metadata`) is NOT this function",
+        "Known-bad discriminators: (1) putting `exists()` inside the helper so a missing dest returns the main path — naive 'round-trip when dest exists' tests pass, dest-missing unit fails; (2) treating pin-19 as including match (a) so a stray same-prefix copy is 'the' identity — path identity must stay (b)+(c); (3) seeding identity tests with a bare basename `foo.json` when init stores `tasks/foo.json`",
+        "Failure modes: `worktree_root_at` returns None outside a repo / git missing (same class as `main_repo_root_at`); remap is infallible even when dest does not exist; canonicalize of the flag path may io-err (caller of identity, not the helper)",
+        "Alternatives considered: rejected 'one resolve-live-JSON helper with exists() inside' (pin 15 — startup would stop remapping a missing dest); rejected basename/discovery search (pin 14 / learning #2236)",
+        "Downstream impact: FEAT-001 (implement remapper + startup call), FEAT-004 (relative+worktree `--from-json` registration), FEAT-004b (default write path), FEAT-005 (`current` target= + live worktree matrix); later PR-2 update / PR-3 export overwrite-guard (do not implement)",
+        "Contract text recorded: full copy-pasteable definition (signatures, seed algorithm, identity (b)+(c) vs match (a), startup canonicalize rule) written into the progress log under ## CONTRACT-001"
+      ],
+      "dependsOn": [],
+      "description": "Design-only. Record the pure remapper and pin-19 identity function so FEAT-001, FEAT-004, FEAT-004b, FEAT-005, and later PR-2/PR-3 update/export overwrite-guard share one path-math contract. Match (a) is a separate prefix OR, not this function. Do not write production code.",
+      "edgeCases": [
+        "Loop dest missing: helper still returns worktree_root.join(rel)",
+        "Symlink source_root vs canonical prd_file: caller canonicalizes source_root then helper; strip_prefix hits",
+        "Identity test seeded with a bare basename: forbidden unless that is what init stored",
+        "Stray copy whose taskPrefix matches prd_metadata: registered via match (a), not pin-19"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "Helper canonicalizes dest and dest is missing",
+          "expectedBehavior": "Contract forbids dest canonicalize; dest-missing unit must fail that design"
+        },
+        {
+          "cause": "Identity is canonicalize-only without source_root.join",
+          "expectedBehavior": "Relative prd_files + worktree --from-json false-refuses (pin 2)"
+        }
+      ],
+      "id": "CONTRACT-001",
+      "invariants": [
+        "remap_into_worktree never calls exists(), canonicalize(dest), or walks directories",
+        "Pin-19 function never reads JSON taskPrefix"
+      ],
+      "modifiesBehavior": false,
+      "notes": "Architecture seed (do not re-expand): resolved = absolute registered else source_root.join(registered); if let Ok(rel) = resolved.strip_prefix(source_root) { worktree_root.join(rel) } else { resolved }. Learning [4441]/[4237]/[3240]: add from worktree wrote main or failed to open a bare filename. Learning [2303]/[2798]: loop re-imports the worktree copy. Match (a) can pin a stray same-prefix copy and write that PATH (pin 4) — documented residual, not a bug to 'fix'.",
+      "passes": false,
+      "priority": 0,
+      "qualityDimensions": [
+        "Remap is path math only — no fs probe, no dest canonicalize",
+        "Pin 19 identity is (b)+(c); match (a) is a separate prefix OR",
+        "Relative `prd_files` rows are joined to `source_root` before remap/canonicalize",
+        "Startup keeps canonicalize-`source_root`; helper does not canonicalize dest",
+        "Contract is stable enough that FEAT-001 and FEAT-004/005 cannot disagree on exists() placement"
+      ],
+      "requiresHuman": false,
+      "taskType": "contract",
+      "title": "Define remap_into_worktree + pin-19 path identity (b)+(c)",
+      "touchesFiles": [
+        "src/git/mod.rs",
+        "src/commands/context.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Precise interface: `resolve_context(conn: &Connection, from_json: Option<&Path>, command: &str) -> TaskMgrResult<Option<ResolvedContext>>`; `ResolvedContext { prefix: String, source: ResolutionSource, prd_json_path: PathBuf }`; `ResolutionSource::FromJsonFlag` displays `from-json`; `invalid_state` command-name is the `command` parameter, never hardcoded `\"add\"`; `load_known_prefixes` stays `WHERE task_prefix IS NOT NULL`",
+        "Edge cases: flag (regular file + (a) prefix OR or pin-19 (b)/(c)) else invalid_state 'not a registered task_list' naming `loop init`; missing/directory flag errors before any write txn; flag vs env mismatch → flag wins + stderr note; NULL task_prefix on matched row → prefix = \"\" (callers skip apply_prefix and prefix_id); stale env pin errors with parameterized command; 0 and 2+ prefixes both Ok(None); logging `resolve_context(&conn, None, …)` uses from_json: None",
+        "Invariants: `--from-json` never registers and never remaps the write target (`prd_json_path` = canonical PATH); resolve_context does not refuse ≥2 prefixes; add-only refuse is `ctx.is_none() && load_known_prefixes().len() >= 2` → invalid_state naming `--from-json` / `TASK_MGR_ACTIVE_PREFIX`; zero prefixes still insert; current without flag stays a probe (exit 0)",
+        "Known-bad discriminators: (1) erroring inside resolve_context for 2+ prefixes — current would stop exiting 0; (2) `if ctx.is_none() { refuse }` — `--no-prefix` add breaks; (3) treating Some(ctx) with empty prefix as 'always apply_prefix'",
+        "Failure modes: unregistered/missing/directory `--from-json` is Err (both add and current); stale env is Err; 0/2+ without flag is Ok(None) not Err",
+        "Alternatives considered: rejected folding refuse into resolve_context (breaks current probe); rejected refuse-on-every-None (breaks PrefixMode::Disabled)",
+        "Downstream impact: FEAT-002 (extract + signature), FEAT-004 (FromJsonFlag wiring + pin matrix), FEAT-006 (add-only refuse); current (FEAT-005) consumes Ok(None) probe",
+        "Contract text recorded: full copy-pasteable precedence (flag → env → exactly one non-NULL prefix → None) plus add-only refuse predicate in the progress log under ## CONTRACT-002"
+      ],
+      "dependsOn": [],
+      "description": "Design-only. Record the pin protocol so add, current, and later update/export share one resolver whose errors name the calling command. resolve_context keeps Ok(None) for both 0 and 2+ prefixes. The ≥2 refuse is add-only. Do not write production code.",
+      "edgeCases": [
+        "stale env pin names the calling command (current must not say add)",
+        "2+ prefixes still Ok(None) so current exits 0",
+        "--from-json NULL-prefix returns Some(ctx) with empty prefix — not the refuse path"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "Refuse implemented as if ctx.is_none() { error }",
+          "expectedBehavior": "--no-prefix add tests fail; contract lists this as known-bad"
+        }
+      ],
+      "id": "CONTRACT-002",
+      "invariants": [
+        "resolve_context returns Ok(None) for both 0 and 2+ non-NULL prefixes",
+        "FromJsonFlag path never inserts prd_files / prd_metadata"
+      ],
+      "modifiesBehavior": false,
+      "notes": "FromJsonFlag is no longer reserved. Help text must say pin, not import. init --from-json stays the deprecated import shim. Learning [2236]/[2281]: omitted --from-json leaks WIRE-FIX/CODE-FIX into the wrong JSON. Learning [4234]: reuse one prefix resolver. Learning [2903]/[4876]: TASK_MGR_ACTIVE_PREFIX leaks into tests — EnvIsolation required.",
+      "passes": false,
+      "priority": 1,
+      "qualityDimensions": [
+        "Pin protocol is one function; command name is a parameter",
+        "Refuse-without-pin applies iff ≥2 registered non-NULL prefixes, and only at the add caller",
+        "Zero-prefix / --no-prefix is a different mode: DB insert OK",
+        "`--from-json` never registers a PRD",
+        "Contract is unambiguous enough that FEAT-004 and FEAT-006 cannot disagree on where the refuse lives"
+      ],
+      "requiresHuman": false,
+      "taskType": "contract",
+      "title": "Define resolve_context pin protocol + add-only ≥2 refuse",
+      "touchesFiles": [
+        "src/commands/context.rs",
+        "src/commands/add.rs",
+        "src/commands/current.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Precise interface: `prd_json::unique_tmp_path(prd_path: &Path) -> PathBuf` with scheme `.{base}.{pid}-{n}-{nanos}.tmp` next to the target (same AtomicU64 so successive calls are distinct); `prd_json::append_user_story` is today's `append_task_to_prd_json` moved; `prd_json` must not import `add`; `prd_reconcile::update_prd_task_passes` keeps its own mutate but MUST call the shared helper",
+        "Edge cases: leftover tmp after crash is identifiable (`.<basename>.<pid>-<n>-<nanos>.tmp`); trailing newline preserved (today's behavior); concurrent add vs update_prd_task_passes tmp names do not collide; unknown keys on existing stories survive (Value round-trip of the file; only the new story is to_value'd from PrdUserStory)",
+        "Invariants: same-directory tmp + rename (learning #2667); do not deserialize existing stories to PrdUserStory and write them back (pins 12 / 17); do not keep `.{name}.task-mgr-add.tmp` (learning #1562)",
+        "Known-bad discriminators: (1) mapping the userStories array through Vec<PrdUserStory> — extra keys like a future humanReviewOutcome vanish while tests that only check the new id pass; (2) a fixed tmp name shared with update_prd_task_passes — collision test fails",
+        "Failure modes: invalid JSON / duplicate id → Err, no rename; fs write/rename errors → invalid_state naming the path; crash mid-write leaves a unique tmp, not a truncated target",
+        "Alternatives considered: rejected merging update_prd_task_passes into prd_json (different mutate: passes flip vs append); share tmp helper only",
+        "Downstream impact: FEAT-003 (implement chokepoint + move tests); FEAT-004 / FEAT-004b (add calls append_user_story on ctx.prd_json_path); PR-2 update must call this chokepoint (do not implement)",
+        "Contract text recorded: full copy-pasteable tmp scheme, append Value rule, and ownership (prd_json vs prd_reconcile) in the progress log under ## CONTRACT-003"
+      ],
+      "dependsOn": [],
+      "description": "Design-only. Record the JSON write chokepoint so add (this PR) and PR-2 update share unique tmp + Value round-trip. Do not implement update. Do not merge update_prd_task_passes into the add writer. Do not write production code beyond recording the contract.",
+      "edgeCases": [
+        "leftover tmp after crash is identifiable",
+        "trailing newline preserved",
+        "concurrent add vs update_prd_task_passes tmp names do not collide"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "Append deserializes the whole file to Vec<PrdUserStory>",
+          "expectedBehavior": "Unknown-key survival test fails; contract forbids it"
+        }
+      ],
+      "id": "CONTRACT-003",
+      "invariants": [
+        "unique_tmp_path successive calls yield distinct paths (pid + counter + nanos)",
+        "Existing userStories entries are not typed as PrdUserStory on write-back"
+      ],
+      "modifiesBehavior": false,
+      "notes": "Sharing unique_tmp_path by moving it into prd_json.rs is in scope (loop_engine already depends on commands). Learning [1562] old name; [2667] same-directory rename; [4564] cross-filesystem rename requires same dir; [3440]/[1561] JSON sync is best-effort after DB commit — not this contract's writer, but callers must not roll back on append Err.",
+      "passes": false,
+      "priority": 2,
+      "qualityDimensions": [
+        "One JSON write chokepoint: unique tmp + rename",
+        "Preserve unknown keys on existing stories (Value round-trip)",
+        "prd_json must not import add",
+        "Tmp files stay in the same directory as the target"
+      ],
+      "requiresHuman": false,
+      "taskType": "contract",
+      "title": "Define prd_json unique-tmp write chokepoint + append_user_story",
+      "touchesFiles": [
+        "src/commands/prd_json.rs",
+        "src/loop_engine/prd_reconcile.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Export `git::worktree_root_at(dir)` + `git::worktree_root()` as the cwd-toplevel pair to `main_repo_root_at` / `main_repo_root`. `worktree_root_at` uses `git rev-parse --show-toplevel` (linked worktree working tree), then canonicalizes like `main_repo_root_at`. Do **not** copy `main_repo_root_at`'s `--git-common-dir` body — that is the main checkout, and copying it remaps onto main",
+        "`remap_into_worktree(registered, source_root, worktree_root) -> PathBuf` implements the CONTRACT-001 seed exactly (join relative to source_root first; strip_prefix miss returns resolved). Pure: no exists(), no basename search, no directory walk, no canonicalize of dest",
+        "`startup.rs` Step 8.5 keeps canonicalize-source_root (today's comment at ~665–671) then calls the helper. Do not drop that canonicalize. Step 8.4 copy-if-missing stays separate. Grep: Step 8.5 has no exists() and still canonicalizes source_root before the helper",
+        "Unit: dest path need not exist; return value is still worktree_root.join(rel) (helper does not canonicalize dest)",
+        "Unit: main checkout (worktree_root == source_root) returns the joined registered path unchanged",
+        "Unit: symlink source_root vs canonical prd_file still remaps (strip_prefix hits after the caller canonicalize)",
+        "Existing worktree re-import exists() gate after remap is unchanged (that is not remap)"
+      ],
+      "dependsOn": [
+        "CONTRACT-001"
+      ],
+      "description": "US-001. Export git::worktree_root_at / worktree_root and remap_into_worktree from the CONTRACT-001 seed. Startup Step 8.5 keeps canonicalize-source_root then calls the helper. Step 8.4 copy-if-missing stays a separate copy policy. Existing worktree re-import exists() gate after remap is unchanged.",
+      "edgeCases": [
+        "Main checkout cwd: remap is a no-op (joined registered path)",
+        "Loop dest missing: helper still returns worktree_root.join(rel)",
+        "Relative registered joined to source_root before remap",
+        "Symlink source_root vs canonical prd_file still remaps"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Caller drops canonicalize-source_root",
+          "expectedBehavior": "Symlink unit fails (strip_prefix miss); contract requires keeping it"
+        }
+      ],
+      "id": "FEAT-001",
+      "invariants": [
+        "Step 8.5 remap path does not call exists()",
+        "copy-if-missing (Step 8.4) remains a separate function with its own exists() copy policy"
+      ],
+      "modifiesBehavior": false,
+      "notes": "Implement against ## CONTRACT-001 in the progress log. Canonicalize the `--show-toplevel` result like `main_repo_root_at` does for `--git-common-dir`'s parent — but do not copy that git-common-dir invocation. Switching main.rs::get_project_root onto git::worktree_root is optional, not this story. Learning [4441]/[3240]: path math from a worktree cwd is not 'the worktree JSON' today. Do not change db::path::resolve_db_dir.",
+      "passes": false,
+      "priority": 3,
+      "qualityDimensions": [
+        "Helper is path math only — no exists(), no dest canonicalize",
+        "Startup keeps canonicalize-source_root then calls the helper",
+        "CLI existence policy is not imported into startup",
+        "Follow existing git/mod.rs Command + canonicalize patterns",
+        "Comments explain why remap is unconditional vs caller-side exists"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Implement unconditional worktree remapper and wire startup Step 8.5",
+      "touchesFiles": [
+        "src/git/mod.rs",
+        "src/loop_engine/startup.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "New `src/commands/context.rs` owns ResolvedContext, ResolutionSource, resolve_context, resolve_active_prefix, locate_prd_json, load_known_prefixes, and a pin-19 identity (b)+(c) stub/function matching CONTRACT-001 (used by FEAT-004)",
+        "add.rs and current.rs import from context. Re-export from commands/mod.rs (or update call sites) so `commands::add::resolve_context` logging in main.rs and tests compile. Logging uses `from_json: None`",
+        "invalid_state command-name is a &str parameter. Stale-pin from current must not say \"add\"",
+        "FromJsonFlag is no longer documented as reserved; resolve_context accepts `from_json: Option<&Path>` (full registration matching may land in FEAT-004, but the signature and variant are wired)",
+        "resolve_context keeps Ok(None) for both 0 and 2+ prefixes. It does not refuse ≥2 prefixes",
+        "claude.rs comment that points at add.rs resolve_active_prefix is updated to context.rs",
+        "Existing current unit tests (env / single-prefix / zero / two prefixes → None) still pass after the move; split resolver vs write-policy tests if add's 2+ tests would now be ambiguous"
+      ],
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/main.rs",
+            "impact": "OK",
+            "line": 76,
+            "mitigation": "Pass from_json: None; keep best-effort None on error",
+            "usage": "logging resolve_context(&conn) → prefix suffix for log file"
+          },
+          {
+            "file": "src/commands/current.rs",
+            "impact": "NEEDS_REVIEW",
+            "line": 29,
+            "mitigation": "Signature grows from_json + command; 0/2+ still Ok(None). Stale env must name current not add",
+            "usage": "resolve_context(&conn); no-active is context: None, exit 0"
+          },
+          {
+            "file": "src/commands/add.rs",
+            "impact": "NEEDS_REVIEW",
+            "line": 238,
+            "mitigation": "Call with from_json from clap (FEAT-004). Do not refuse ≥2 here",
+            "usage": "resolve_context(conn) before insert"
+          }
+        ],
+        "semanticDistinctions": [
+          {
+            "context": "current without --from-json, 2+ prefixes",
+            "currentBehavior": "Ok(None), exit 0 probe",
+            "requiredBehavior": "Keep Ok(None); refuse is add-only in FEAT-006"
+          },
+          {
+            "context": "stale TASK_MGR_ACTIVE_PREFIX from current",
+            "currentBehavior": "invalid_state command name hardcoded add",
+            "requiredBehavior": "command parameter is current"
+          }
+        ]
+      },
+      "dependsOn": [
+        "CONTRACT-002",
+        "CONTRACT-001"
+      ],
+      "description": "US-002. Move ResolvedContext, ResolutionSource, resolve_context, resolve_active_prefix, locate_prd_json, and load_known_prefixes out of add.rs into src/commands/context.rs. Parameterize invalid_state command-name. Change resolve_context to (conn, from_json, command) but keep 0 and 2+ prefixes as Ok(None). FromJsonFlag variant exists; full pin matching is FEAT-004. Do not implement the ≥2 refuse here.",
+      "edgeCases": [
+        "stale env pin names the calling command",
+        "logging resolve_context uses from_json: None",
+        "2+ prefixes still Ok(None) so current exits 0"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Move leaves FromJsonFlag in add.rs and current still calls add::resolve_context with old signature",
+          "expectedBehavior": "compile fail at main.rs:76 / current.rs; re-export or update call sites in this task"
+        }
+      ],
+      "id": "FEAT-002",
+      "invariants": [
+        "load_known_prefixes remains the single WHERE task_prefix IS NOT NULL query",
+        "No ≥2 refuse inside resolve_context"
+      ],
+      "modifiesBehavior": true,
+      "notes": "Implement against ## CONTRACT-002. Pin-19 identity (b)+(c) here is a stub/function matching CONTRACT-001; full `--from-json` registration matching is FEAT-004 — do not collapse that split. context must not import prd_json write helpers. Do not implement add's ≥2 refuse here (FEAT-006). Do not change locate_prd_json LIMIT 1 in this task — FEAT-004b drops it. After this move, later FEATs must grep `locate_prd_json` / `apply_prefix` rather than trusting authoring line numbers in add.rs. Learning [4234]: one resolver. Learning [2903]/[4883]: EnvIsolation + mutex for TASK_MGR_ACTIVE_PREFIX tests; field drop order in add.rs EnvIsolation is load-bearing. Data contract: prd_files.file_path TEXT → PathBuf (relative or absolute).",
+      "passes": false,
+      "priority": 4,
+      "qualityDimensions": [
+        "invalid_state command-name is a parameter, not hardcoded add",
+        "resolve_context Ok(None) for both 0 and 2+ prefixes (current stays a probe)",
+        "context must not import prd_json write helpers",
+        "Types that move out of add.rs live in context.rs (resolution), not left as FromJsonFlag in add.rs",
+        "ui/tracing split: no tracing for pin errors"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Extract commands/context.rs pin types and resolver",
+      "touchesFiles": [
+        "src/commands/context.rs",
+        "src/commands/add.rs",
+        "src/commands/current.rs",
+        "src/commands/mod.rs",
+        "src/main.rs",
+        "src/loop_engine/claude.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "New `src/commands/prd_json.rs`. `append_user_story` (today `append_task_to_prd_json`) lives here. `prd_json` does not import `add`",
+        "Tmp scheme matches prd_reconcile::unique_tmp_path: `.{base}.{pid}-{n}-{nanos}.tmp`. Do not keep `.{name}.task-mgr-add.tmp`. Grep the tree for `task-mgr-add.tmp` → zero hits in production code",
+        "Shared helper: move unique_tmp_path here; prd_reconcile calls it (same AtomicU64 so the collision test is structural). Move or duplicate `test_unique_tmp_path_distinct_per_call` so it still compiles against the public helper",
+        "Append preserves unknown keys on existing stories (Value round-trip of the file; only the new story is to_value'd from PrdUserStory). Test: a file that already has an extra key on a seed story keeps that key after append",
+        "Existing append unit tests move with the function and stay green (duplicate id, reverse --depended-on-by, prefix strip, trailing newline)",
+        "Test: concurrent add vs update_prd_task_passes tmp names do not collide (distinct unique_tmp_path calls)"
+      ],
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/commands/add.rs",
+            "impact": "NEEDS_REVIEW",
+            "line": 346,
+            "mitigation": "Call prd_json::append_user_story. Write-path still locate_prd_json until FEAT-004b",
+            "usage": "append_task_to_prd_json after DB commit. Authoring snapshot — grep append_task_to_prd_json; do not trust this line number after FEAT-002"
+          },
+          {
+            "file": "src/loop_engine/prd_reconcile.rs",
+            "impact": "BREAKS",
+            "line": 29,
+            "mitigation": "Call commands::prd_json::unique_tmp_path; keep mutate local",
+            "usage": "private unique_tmp_path for update_prd_task_passes"
+          }
+        ],
+        "semanticDistinctions": [
+          {
+            "context": "add append",
+            "currentBehavior": "fixed .{name}.task-mgr-add.tmp",
+            "requiredBehavior": "unique pid-counter-nanos tmp via shared helper"
+          },
+          {
+            "context": "prd_reconcile passes flip",
+            "currentBehavior": "already unique tmp, private helper",
+            "requiredBehavior": "same helper, different mutate — do not merge writers"
+          }
+        ]
+      },
+      "dependsOn": [
+        "CONTRACT-003",
+        "FEAT-002"
+      ],
+      "description": "US-003. New src/commands/prd_json.rs owns unique_tmp_path and append_user_story (today append_task_to_prd_json). prd_reconcile calls the shared helper (same AtomicU64). Delete .{name}.task-mgr-add.tmp. Preserve unknown keys on existing stories. Move existing append unit tests with the function.",
+      "edgeCases": [
+        "leftover tmp after crash is identifiable (.<basename>.<pid>-<n>-<nanos>.tmp)",
+        "trailing newline preserved (today's behavior)",
+        "concurrent add vs update_prd_task_passes tmp names do not collide"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Append maps userStories through Vec<PrdUserStory>",
+          "expectedBehavior": "Unknown-key survival test fails"
+        }
+      ],
+      "id": "FEAT-003",
+      "invariants": [
+        "Successive unique_tmp_path calls are distinct",
+        "Existing extra keys on seed stories survive append"
+      ],
+      "modifiesBehavior": true,
+      "notes": "Implement against ## CONTRACT-003. Depends on FEAT-002 because both touch add.rs (serialize). Do not merge update_prd_task_passes into this writer. Grep `append_task_to_prd_json` / `atomic_write` — do not trust frozen add.rs line numbers from authoring. Learning [1562] old tmp name; [2667] same-directory rename; [2310] do not use static /tmp paths in tests. Data contract: root_obj[\"userStories\"].as_array_mut(); push to_value(new_story); do not map existing entries through PrdUserStory.",
+      "passes": false,
+      "priority": 5,
+      "qualityDimensions": [
+        "One JSON write chokepoint: unique tmp pid-counter-nanos + rename",
+        "Preserve unknown keys on existing stories",
+        "prd_json must not import add",
+        "Tmp files stay next to the target (same-directory rename)",
+        "No unwrap on filesystem in the new module"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Implement prd_json.rs unique-tmp chokepoint and move append",
+      "touchesFiles": [
+        "src/commands/prd_json.rs",
+        "src/commands/add.rs",
+        "src/commands/mod.rs",
+        "src/loop_engine/prd_reconcile.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Clap `--from-json <PATH>` on Commands::Add. Help: pin this already-registered effort, not import. Distinct from init --from-json. Clap parse test in src/cli/tests.rs; main.rs dispatch passes the path into add()",
+        "FromJsonFlag wired: add → resolve_context(conn, Some(path), \"add\"). Exit early on missing/directory/unregistered before opening a write transaction",
+        "Happy: pin registered file, auto-prefix (non-empty prefix only), append userStories, reverse --depended-on-by",
+        "Unregistered / never-inited file → invalid_state naming loop init; no DB row (SELECT COUNT(*) FROM tasks unchanged)",
+        "Missing path → error before parse and before a write txn; no DB row; copy distinct from unregistered and from directory",
+        "Directory `--from-json`: reject if `!metadata.file_type().is_file()` **before** parse and **before** a write txn (`fs::canonicalize` on a directory succeeds — do not wait for a JSON parse error). Distinct copy from \"not a registered task_list\" / missing path; no DB row",
+        "Flag vs env mismatch → flag wins; stderr note; still proceed",
+        "Cross-PRD --depended-on-by still refuses (reject_cross_prd_depended_on_by); no row",
+        "--from-json does not insert prd_files / prd_metadata rows",
+        "--from-json of a NULL-prefix / --no-prefix registered file returns Some(ctx) with empty prefix, source=from-json, write path set, and does not call apply_prefix AND does not call prefix_id on --depended-on-by. Test: inserted id is FEAT-001, not -FEAT-001",
+        "Relative prd_files row tasks/foo.json + worktree --from-json tasks/foo.json is registered (pin-19 (b)/(c) and/or match (a)). Identity tests seed prd_files as init would (tasks/foo.json or absolute), never a bare basename unless that is what init stored"
+      ],
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/commands/add.rs",
+            "impact": "BREAKS",
+            "line": 262,
+            "mitigation": "Skip both when ctx.prefix is empty (NULL-prefix --from-json)",
+            "usage": "if let Some(ref ctx) = resolved_ctx { apply_prefix(&ctx.prefix); prefix_id on depended_on_by }. Authoring snapshot — grep apply_prefix / prefix_id; do not trust this line number after FEAT-002"
+          },
+          {
+            "file": "src/main.rs",
+            "impact": "NEEDS_REVIEW",
+            "line": 822,
+            "mitigation": "Pass new flag into add()",
+            "usage": "Commands::Add dispatch has no from_json"
+          }
+        ],
+        "semanticDistinctions": [
+          {
+            "context": "init --from-json",
+            "currentBehavior": "import shim; registers PRD",
+            "requiredBehavior": "unchanged (import). add --from-json is pin only"
+          },
+          {
+            "context": "add --from-json NULL-prefix registered file",
+            "currentBehavior": "flag does not exist",
+            "requiredBehavior": "Some(ctx) empty prefix; skip apply_prefix and prefix_id; id FEAT-001"
+          }
+        ]
+      },
+      "dependsOn": [
+        "CONTRACT-001",
+        "CONTRACT-002",
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003"
+      ],
+      "description": "US-004 pin/clap slice. Clap --from-json on Add; wire FromJsonFlag through resolve_context; pin an already-registered effort; refuse unregistered/missing/directory; flag wins over env; no registration side effect; NULL-prefix pin skips apply_prefix AND prefix_id. Write-path policy (append ctx.prd_json_path only, default remap+exists, drop LIMIT 1) is FEAT-004b. Current clap is FEAT-005. ≥2 refuse is FEAT-006. Same PR/branch as those tasks (pin 20).",
+      "edgeCases": [
+        "Unregistered / never-inited --from-json: error naming loop init; no DB row",
+        "Missing path --from-json: error before parse/txn; no DB row",
+        "Directory --from-json: is_file() reject before parse/txn; distinct copy from missing and from unregistered",
+        "Flag vs env mismatch: flag wins; stderr note",
+        "Cross-PRD --depended-on-by: still refuses; no row",
+        "Relative prd_files (tasks/foo.json) + worktree --from-json tasks/foo.json: treat as registered",
+        "--from-json NULL-prefix + apply_prefix(\"\"): skip; inserted id FEAT-001 not -FEAT-001",
+        "Stray copy whose taskPrefix matches prd_metadata: registered via (a); pin 4 writes that PATH",
+        "No registration side effect: prd_files / prd_metadata row count unchanged"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "Canonicalize-only identity without source_root.join",
+          "expectedBehavior": "Relative+worktree registration test fails (pin 2)"
+        },
+        {
+          "cause": "Some(ctx) always apply_prefix",
+          "expectedBehavior": "NULL-prefix test sees id -FEAT-001"
+        }
+      ],
+      "id": "FEAT-004",
+      "invariants": [
+        "--from-json never inserts prd_files or prd_metadata",
+        "Empty ctx.prefix ⇒ skip apply_prefix and prefix_id"
+      ],
+      "modifiesBehavior": true,
+      "notes": "Implement against ## CONTRACT-001 and ## CONTRACT-002. --from-json PATH → ctx.prd_json_path is canonical PATH (never remapped away) — store that in this task even if default remap+exists lands in FEAT-004b. Architect tightening: empty ctx.prefix skips apply_prefix AND prefix_id on --depended-on-by. Grep `apply_prefix` / `prefix_id` / `resolve_context` — do not trust frozen add.rs line numbers from authoring (they move after FEAT-002). No skill drive on this task (rust tests only; FEAT-009 + REVIEW-001 own the sandbox). Learning [2236]: omitted flag leaks fixups. Learning [3126]: pre-flight before write txn. Learning [1252]: userStories key. Data contract: let canon = fs::canonicalize(path)?; registered if (a) prefixes.contains(json taskPrefix) OR pin-19 (b)/(c). Read taskPrefix off serde_json::Value; do not deserialize stories. Directory check is metadata.file_type().is_file() before canonicalize-as-parse.",
+      "passes": false,
+      "priority": 6,
+      "qualityDimensions": [
+        "--from-json means pin an already-registered effort; help says pin, not import",
+        "Unregistered path refuses naming loop init; relative prd_files + worktree remap count as registered",
+        "--from-json never registers and never remaps the write target",
+        "Empty prefix skips apply_prefix and prefix_id (no -FEAT-001)",
+        "Exit early on missing/directory/unregistered before a write transaction",
+        "ui::emit_err for mismatch note; invalid_state for refuses",
+        "Identity tests seed init-shaped prd_files rows"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Add clap --from-json pin protocol (registered effort only)",
+      "touchesFiles": [
+        "src/cli/commands.rs",
+        "src/cli/tests.rs",
+        "src/main.rs",
+        "src/commands/add.rs",
+        "src/commands/context.rs",
+        "tests/add_integration.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "After DB commit, append_user_story is called on ResolvedContext.prd_json_path only. Delete the second locate_prd_json write in add.rs. Display path == write path",
+        "--from-json → ctx.prd_json_path is canonical PATH (never remapped away). Default (no flag) → remap then is_file() (worktree else registered else skip); that result is ctx.prd_json_path (PathBuf::new() when skipping)",
+        "ctx is None → JSON sync iff exactly one task_list row; that row uses remap-then-is_file() (architect tightening). Else skip; DB already committed",
+        "Drop LIMIT 1 as a prefix-miss fallback; count==1 lookup only on the None path (architect tightening). Prefix-scoped locate for reject_cross_prd_depended_on_by foreign path stays",
+        "Test: default add from a tree where the remapped path is a regular file writes that file; when only the registered (joined) path is a file, write that; when neither is a file, skip JSON (DB row still inserted if refuse does not apply)",
+        "Grep add.rs after insert: no locate_prd_json call on the write path"
+      ],
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/commands/add.rs",
+            "impact": "BREAKS",
+            "line": 345,
+            "mitigation": "Delete this locate; append ctx.prd_json_path only",
+            "usage": "second locate_prd_json after insert (display uses ctx.prd_json_path). Authoring snapshot — grep locate_prd_json after tx.commit(); do not trust this line number after FEAT-002"
+          }
+        ],
+        "semanticDistinctions": [
+          {
+            "context": "CLI write policy (add/current)",
+            "currentBehavior": "raw prd_files path via second locate_prd_json",
+            "requiredBehavior": "remap then exists; result on ctx.prd_json_path; not used by startup"
+          },
+          {
+            "context": "locate_prd_json LIMIT 1, no prefix",
+            "currentBehavior": "first task_list",
+            "requiredBehavior": "only ctx is None AND exactly one task_list, then remap-then-is_file"
+          }
+        ]
+      },
+      "dependsOn": [
+        "FEAT-004",
+        "FEAT-001",
+        "FEAT-003"
+      ],
+      "description": "US-004 write-path slice + architect tightenings. After DB commit, append_user_story uses ResolvedContext.prd_json_path only (delete the second locate_prd_json). Default (no flag): remap then is_file() (worktree else registered else skip). --from-json: canonical PATH, never remapped away. ctx is None → JSON sync iff exactly one task_list, using remap-then-is_file on that row. Drop LIMIT 1 as a prefix-miss fallback.",
+      "edgeCases": [
+        "Display remaps, write still locate_prd_json: forbidden — append ctx.prd_json_path only",
+        "ctx is None + two task_list rows → DB insert, skip JSON",
+        "ctx is None + one task_list → remap-then-is_file on that row",
+        "--from-json write path is canonical PATH (never remapped away)",
+        "Neither remapped nor registered is a file: writers skip (prd_json_path empty)"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "Leave the second locate_prd_json",
+          "expectedBehavior": "Worktree display vs main write split returns (#4237); FEAT-005 live tests fail"
+        }
+      ],
+      "id": "FEAT-004b",
+      "invariants": [
+        "No locate_prd_json on the post-commit write path",
+        "Prefix-miss does not fall back to LIMIT 1 first task_list"
+      ],
+      "modifiesBehavior": true,
+      "notes": "This is the #4237 fix. Live linked-worktree matrix (main bytes unchanged vs only-main-exists) is FEAT-005 rust tests — this task can use temp dirs / unit fixtures; do not require git worktree add here. Not a verify-task-mgr drive (sandboxes are not worktrees). Grep `locate_prd_json` after the DB commit / `append_user_story` — do not trust frozen add.rs:345 from authoring. Learning [4237]: display remapped, write still locate. Learning [3440]/[1561]: DB first; append Err does not roll back (FEAT-007 copy). Data contract: let target = remap_into_worktree(...); if target.is_file() { target } else if resolved.is_file() { resolved } else { skip }. After commit: append_user_story(&ctx.prd_json_path, …) only.",
+      "passes": false,
+      "priority": 7,
+      "qualityDimensions": [
+        "After DB commit, append uses ctx.prd_json_path only — no second locate",
+        "--from-json PATH is never remapped away",
+        "Default writers: remap then caller-side is_file(); do not invent a path",
+        "LIMIT 1 prefix-miss fallback is gone; count==1 only on ctx is None",
+        "Do not share is_file() into startup"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Single write path on ctx.prd_json_path; drop LIMIT 1 fallback",
+      "touchesFiles": [
+        "src/commands/add.rs",
+        "src/commands/context.rs",
+        "tests/add_integration.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Clap `--from-json` on Commands::Current. Same pin semantics as add. Help says pin, not import. Parse test in src/cli/tests.rs; main.rs dispatch passes the path",
+        "Update Commands::Current rustdoc (not only after_help): exit 0 for no-flag probe; non-zero for unregistered / missing / directory --from-json. Delete \"Exits 0 in all cases\"",
+        "Update `current()` / module rustdoc the same way: exit 0 for no-flag probe; non-zero for bad `--from-json`. Delete \"Never returns an error for no active PRD\" (unregistered/missing/directory `--from-json` is Err)",
+        "Default (no flag): target= is the CLI write path (remap, then existence policy). Loop remap remains unconditional and is not used here. One-sentence docs/ARCHITECTURE.md (~line 464): pin with --from-json; worktree writes the live copy",
+        "When neither remapped nor registered path is a regular file, current prints target=(none) (writers skip; probe must not invent a path)",
+        "--from-json registered: source=from-json, target= canonical PATH (the write path)",
+        "--from-json unregistered: error (not exit 0); copy names loop init",
+        "Live path tests (worktree harness in tests/worktree_db_resolution.rs and/or new CLI tests that spawn git worktree add): (1) main checkout cwd → registered path unchanged; (2) linked worktree, worktree file exists → add writes worktree copy, cmp of main JSON is empty; (3) linked worktree, only main file exists → write main, no invent, no basename search; (4) DB row still lands in main-repo .task-mgr (existing worktree_db_resolution tests stay green)",
+        "current without pin and ≥2 prefixes still exits 0 with no active PRD (probe, not refuse) — resolve_context returns Ok(None). Worktree live-path cases are rust tests, not verify-task-mgr"
+      ],
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/commands/current.rs",
+            "impact": "BREAKS",
+            "line": 27,
+            "mitigation": "from_json argument; write path; unregistered is Err; rustdoc updated",
+            "usage": "current(db_dir); target= raw DB path; rustdoc Exits 0 in all cases"
+          },
+          {
+            "file": "tests/worktree_db_resolution.rs",
+            "impact": "OK",
+            "line": 159,
+            "mitigation": "Do not change DB-anchoring assertions; add JSON write-path cases beside them",
+            "usage": "add from worktree cwd lands in main .task-mgr"
+          }
+        ],
+        "semanticDistinctions": [
+          {
+            "context": "current no flag, 2+ prefixes",
+            "currentBehavior": "exit 0, no active PRD",
+            "requiredBehavior": "unchanged (probe)"
+          },
+          {
+            "context": "current --from-json unregistered",
+            "currentBehavior": "n/a (flag missing)",
+            "requiredBehavior": "error naming loop init; not exit 0"
+          }
+        ]
+      },
+      "dependsOn": [
+        "FEAT-004b",
+        "FEAT-001",
+        "FEAT-002"
+      ],
+      "description": "US-005. Clap --from-json on Current with the same pin semantics as add. current target= is the write path add would use. Live rust tests (git worktree add): main cwd unchanged; worktree file exists → write worktree (main bytes unchanged); only main exists → write main; DB still main-repo .task-mgr. verify-task-mgr does not spawn worktrees.",
+      "edgeCases": [
+        "Main checkout cwd, registered path: write registered path; other copies untouched",
+        "Linked worktree, worktree file exists: write worktree copy; main JSON bytes unchanged",
+        "Linked worktree, only main file exists: write main; no basename search; no create",
+        "Neither remapped nor registered is a file: current prints target=(none)",
+        "current --from-json registered vs unregistered: target= write path vs error",
+        "DB from worktree cwd: row lands in main-repo .task-mgr"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "Invent a worktree path when only main exists",
+          "expectedBehavior": "Live test (3) fails; pin 4 / 14 forbid invent"
+        },
+        {
+          "cause": "current --from-json unregistered still exits 0",
+          "expectedBehavior": "current() rustdoc AC and rust tests fail"
+        }
+      ],
+      "id": "FEAT-005",
+      "invariants": [
+        "Existing worktree_db_resolution DB-anchoring tests stay green",
+        "Loop startup remap is not called from current"
+      ],
+      "modifiesBehavior": true,
+      "notes": "Reuse tests/worktree_db_resolution.rs helpers (init_repo, add_worktree, env_remove TASK_MGR_DIR and TASK_MGR_ACTIVE_PREFIX). Learning [2903]/[2434]: isolate TASK_MGR_ACTIVE_PREFIX in subprocess tests. Learning [5261]: TASK_MGR_DIR overrides. Do not change db::path anchoring. No skill drive on this task (rust tests only; FEAT-009 + REVIEW-001 own the sandbox). Live path is rust tests that spawn git worktree add. Grep `current(` / module rustdoc — do not trust frozen current.rs:22–23.",
+      "passes": false,
+      "priority": 8,
+      "qualityDimensions": [
+        "current target= is the write path (post-policy for default; canonical PATH for --from-json)",
+        "Neither copy exists → target=(none); do not invent a path",
+        "current without --from-json and ≥2 prefixes stays a probe (exit 0)",
+        "Unregistered --from-json is an error on current too",
+        "DB anchoring unchanged (main checkout .task-mgr from a worktree)",
+        "Help/rustdoc say pin, not import; rustdoc must not say Exits 0 in all cases"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "current --from-json + CLI write-path live worktree matrix",
+      "touchesFiles": [
+        "src/cli/commands.rs",
+        "src/cli/tests.rs",
+        "src/commands/current.rs",
+        "src/main.rs",
+        "tests/worktree_db_resolution.rs",
+        "docs/ARCHITECTURE.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "resolve_context keeps Ok(None) for both 0 and 2+ prefixes (so current stays a probe). Do not error inside resolve_context for 2+ prefixes. Do not `if ctx.is_none() { refuse }` (that breaks --no-prefix)",
+        "add only, when ctx.is_none() && load_known_prefixes().len() >= 2, returns invalid_state naming --from-json / TASK_MGR_ACTIVE_PREFIX; no DB row; no JSON write",
+        "Zero prefixes / --no-prefix DB: ctx is None and load_known_prefixes().len() == 0 → add still inserts (existing unit tests stay green). JSON sync iff exactly one task_list row (FEAT-004b policy)",
+        "--from-json of a NULL-prefix registered file is Some(ctx) (empty prefix) — not this refuse path — and does not call apply_prefix (FEAT-004 test: FEAT-001, not -FEAT-001)",
+        "Exactly one non-NULL prefix: existing auto-prefix + JSON sync via ctx.prd_json_path unchanged. Env pin still selects among ≥2 prefixes",
+        "--depended-on-by without pin on a worktree-only file, ≥2 prefixes: cannot pin; refuse (same as no-pin) — pin 1",
+        "This refuse ships in the same PR/branch as clap --from-json (pin 20). current on 2+ prefixes still exit 0"
+      ],
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/commands/add.rs",
+            "impact": "BREAKS",
+            "line": 238,
+            "mitigation": "Add-only refuse; no row; no JSON",
+            "usage": "≥2 prefixes no pin: insert + LIMIT 1 JSON. Authoring snapshot — grep resolve_context at the add caller; do not trust this line number after FEAT-002"
+          },
+          {
+            "file": "src/commands/add.rs",
+            "impact": "NEEDS_REVIEW",
+            "line": 1433,
+            "mitigation": "Keep resolver None; add() now errors — split tests",
+            "usage": "unit tests for 2+ prefixes → resolve_active_prefix None"
+          }
+        ],
+        "semanticDistinctions": [
+          {
+            "context": "add, ≥2 prefixes, no env, no flag",
+            "currentBehavior": "inserts + may write PRD #1",
+            "requiredBehavior": "invalid_state refuse; no row"
+          },
+          {
+            "context": "add --no-prefix / 0-prefix DB",
+            "currentBehavior": "inserts",
+            "requiredBehavior": "still inserts (not this refuse)"
+          },
+          {
+            "context": "current, ≥2 prefixes, no flag",
+            "currentBehavior": "exit 0 probe",
+            "requiredBehavior": "unchanged"
+          }
+        ]
+      },
+      "dependsOn": [
+        "FEAT-004",
+        "FEAT-004b",
+        "CONTRACT-002"
+      ],
+      "description": "US-006. add only, when ctx.is_none() && load_known_prefixes().len() >= 2, returns invalid_state naming --from-json / TASK_MGR_ACTIVE_PREFIX; no DB row; no JSON write. resolve_context stays Ok(None) for 0 and 2+. --no-prefix / 0-prefix still inserts. Must land on the same branch as clap --from-json (pin 20).",
+      "edgeCases": [
+        "≥2 prefixes, no pin: refuse the write; no row",
+        "--no-prefix / 0-prefix DB: add still inserts; JSON sync only if exactly one task_list",
+        "0-prefix + two task_list rows → DB insert, skip JSON",
+        "2+ prefixes + --from-json pin proceeds",
+        "current on 2+ prefixes still exit 0",
+        "--depended-on-by without pin on a worktree-only file, ≥2 prefixes: refuse (cannot pin)"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Refuse inside resolve_context",
+          "expectedBehavior": "current 2+ tests fail (no longer exit 0)"
+        },
+        {
+          "cause": "if ctx.is_none() { refuse }",
+          "expectedBehavior": "--no-prefix add tests fail"
+        }
+      ],
+      "id": "FEAT-006",
+      "invariants": [
+        "resolve_context never errors solely because len>=2",
+        "load_known_prefixes().len()==0 is not the refuse path"
+      ],
+      "modifiesBehavior": true,
+      "notes": "Implement against ## CONTRACT-002. Split resolver vs write-policy tests: resolve_active_prefix / resolve_context 2+ → None still; add now errors. Keep the add-only predicate `ctx.is_none() && load_known_prefixes().len() >= 2` — not inside resolve_context. Grep `resolve_context` / `load_known_prefixes` at the add caller — do not trust frozen add.rs:238 from authoring. No skill drive on this task (rust tests only; FEAT-009 + REVIEW-001 own the sandbox). Learning [2236]: omitted --from-json leaked fixups into PRD #1 via LIMIT 1.",
+      "passes": false,
+      "priority": 9,
+      "qualityDimensions": [
+        "Refuse is add-only: ctx.is_none() && load_known_prefixes().len() >= 2",
+        "Zero-prefix / --no-prefix still inserts",
+        "current probe unchanged",
+        "invalid_state names --from-json and TASK_MGR_ACTIVE_PREFIX",
+        "No DB row and no JSON write on refuse",
+        "Clap --from-json already exists on this branch (pin 20)"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Refuse unpinned add when ≥2 prefixes; keep 0-prefix insert",
+      "touchesFiles": [
+        "src/commands/add.rs",
+        "tests/add_integration.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "add.rs comment and ui::emit_err warning no longer mention task-mgr export",
+        "Copy names task-mgr current and retry with --from-json",
+        "DB commit still happens first (learning #3440); failure does not roll back",
+        "Test asserts the warning substrings and the absence of export. Both ctx-is-None skip note and sync Err on ctx.prd_json_path drop export; neither names locate_prd_json as the write site"
+      ],
+      "dependsOn": [
+        "FEAT-004b"
+      ],
+      "description": "US-007. After a best-effort JSON sync miss, stderr must name task-mgr current and retry --from-json, never export. DB commit still happens first.",
+      "edgeCases": [
+        "ctx is None skip note vs sync Err on ctx.prd_json_path — both drop export; neither names locate_prd_json as the write site"
+      ],
+      "estimatedEffort": "low",
+      "failureModes": [
+        {
+          "cause": "Leave export in the comment only",
+          "expectedBehavior": "AC requires comment AND ui::emit_err; test greps both"
+        }
+      ],
+      "id": "FEAT-007",
+      "invariants": [
+        "Grep add.rs for task-mgr export → zero hits"
+      ],
+      "modifiesBehavior": true,
+      "notes": "Learning [3440]/[1561]: JSON sync is best-effort after DB commit. PR-3 will also require --force onto a registered file — do not implement export here; just stop telling agents to run it. ui::emit_err, not tracing. Grep `task-mgr export` / the JSON-sync warning — do not trust frozen add.rs line numbers from authoring.",
+      "passes": false,
+      "priority": 10,
+      "qualityDimensions": [
+        "Failure copy names task-mgr current and retry --from-json, never export",
+        "DB commit is authoritative; JSON failure does not roll back",
+        "ui::emit_err for the warning (CONTRACT-LOG-001)"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "JSON-sync failure copy names current and retry --from-json",
+      "touchesFiles": [
+        "src/commands/add.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Delete forbidden anchor `add --from-json` from cheatsheet.rs unit test AND tests/cheatsheet_drift.rs",
+        "Add `add --from-json` to CURATED_RECIPES (keep `--stdin --depended-on-by`; recipes stay ≤30 lines)",
+        "Still forbids `set-status`, `recall --top-k`, `learnings show`",
+        "Same PR/branch as clap --from-json (pin 20). Drift extractor still parses the new recipe token; set-status synthetic test unchanged"
+      ],
+      "dependsOn": [
+        "FEAT-004"
+      ],
+      "description": "US-008. Delete the forbidden anchor add --from-json; add it to CURATED_RECIPES (keep --stdin --depended-on-by). Still forbids set-status, recall --top-k, learnings show. Same PR/branch as clap --from-json (pin 20).",
+      "edgeCases": [
+        "Cheatsheet in the clap PR: contains add --from-json; still forbids set-status, recall --top-k, learnings show",
+        "Drift extractor still parses the new recipe token; set-status synthetic test unchanged"
+      ],
+      "estimatedEffort": "low",
+      "failureModes": [
+        {
+          "cause": "Flip the forbidden test but forget CURATED_RECIPES",
+          "expectedBehavior": "Pin 20 intent fails: agents still do not see the recipe"
+        }
+      ],
+      "id": "FEAT-008",
+      "invariants": [
+        "Forbidden list no longer includes add --from-json",
+        "Forbidden list still includes set-status"
+      ],
+      "modifiesBehavior": true,
+      "notes": "CURATED_RECIPES is a const &str parsed by tests/cheatsheet_drift.rs against clap. Prefer `task-mgr add --from-json` in backticks. Keep entry count under 16. Do not add set-status.",
+      "passes": false,
+      "priority": 11,
+      "qualityDimensions": [
+        "Cheatsheet contains add --from-json; still forbids set-status, recall --top-k, learnings show",
+        "Curated recipes ≤30 lines",
+        "Drift extractor parses the new recipe token"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Cheatsheet recipe add --from-json in the clap PR",
+      "touchesFiles": [
+        "src/commands/cheatsheet.rs",
+        "tests/cheatsheet_drift.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "New feature file `.claude/skills/verify-task-mgr/features/add-and-current-from-json.md` following features/README.md (H1 + paragraph; Sub-features; How to get to it; Driving it with verify-task-mgr; Gotchas). Update features/README.md Features list. Create the recipe in this task, then drive it (004–008 have no skill drive)",
+        "Drive via `.claude/skills/verify-task-mgr/SKILL.md`: launch, sandbox-new, doctor, capture/cli, snapshot-db, cleanup. Never PATH binary; never checkout .task-mgr; never operator HOME",
+        "Proof (artifacts kept under .claude/skills/verify-task-mgr/artifacts/<run-id>/): happy pin + append; unregistered refuse (no row); missing/directory refuse; ≥2-prefix unpinned refuse; --no-prefix add still inserts; current --from-json registered target=; current --from-json unregistered error; add --help / current --help say pin. ≥2-prefix refuse requires two `loop init`s **without** `--no-prefix` (or two files with distinct `taskPrefix`). Do not use two `--no-prefix` copies of sample_prd",
+        "Worktree live-path cases are not claimed via this harness; they are FEAT-005 rust tests",
+        "Compile/unit tests alone do not satisfy this story. If the skill is blocked (can't launch, unmet precondition), emit BLOCKED rather than marking done"
+      ],
+      "dependsOn": [
+        "FEAT-004",
+        "FEAT-004b",
+        "FEAT-005",
+        "FEAT-006",
+        "FEAT-007",
+        "FEAT-008"
+      ],
+      "description": "US-009. Create features/add-and-current-from-json.md (four H2 sections per features/README.md), link it from the map, and drive SKILL.md for add/current --from-json in an isolated sandbox. Compile/unit tests alone do not satisfy this story. Worktree live-path stays rust tests.",
+      "edgeCases": [
+        "Helper unsets TASK_MGR_ACTIVE_PREFIX; use --dir injection only",
+        "Unregistered / never-inited --from-json: error, no DB row (artifact)",
+        "Missing file / directory --from-json: error, no DB row (artifact)",
+        "≥2 prefixes, no pin: refuse (artifact). Two loop inits without --no-prefix (or two files with distinct taskPrefix); not two --no-prefix copies of sample_prd",
+        "--no-prefix add still inserts (artifact)",
+        "current --from-json registered vs unregistered (artifact)"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "Mark done from cargo test only",
+          "expectedBehavior": "AC forbids it; REVIEW-001 re-drives mapped features"
+        }
+      ],
+      "id": "FEAT-009",
+      "invariants": [
+        "doctor isolation: ok before drive",
+        "After cleanup, artifacts/<run-id>/ still lists captured files"
+      ],
+      "modifiesBehavior": false,
+      "notes": "Helper unsets TASK_MGR_ACTIVE_PREFIX — use --dir injection only. Seeded sample_prd.json has taskPrefix 3019e47c; SKILL.md's canned recipe is loop init --no-prefix. Two --no-prefix imports ⇒ load_known_prefixes().len()==0 ⇒ refuse never fires. ≥2-prefix refuse: two loop inits without --no-prefix, or two files with distinct taskPrefix — not two --no-prefix copies of sample_prd. Learning [5443]: isolating HOME breaks rustup — the helper must keep RUSTUP_HOME/CARGO_HOME; do not invent a second sandbox. Learning [1494]: launch builds this checkout's binary. Do not drive loop run. Follow `.claude/skills/verify-task-mgr/SKILL.md` feature `add-and-current-from-json`; do not invent a second harness.",
+      "passes": false,
+      "priority": 12,
+      "qualityDimensions": [
+        "User-facing proof is the skill drive + artifacts, not cargo test",
+        "Feature file uses the four H2 sections in order; no implementation internals",
+        "Sandbox isolation: --dir under /tmp/task-mgr-verify-*, HOME inside that root",
+        "Worktree live-path is explicitly out of this harness",
+        "Helper unsets TASK_MGR_ACTIVE_PREFIX — recipes must not rely on it"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "verify-task-mgr feature file + isolated sandbox proof",
+      "touchesFiles": [
+        ".claude/skills/verify-task-mgr/features/add-and-current-from-json.md",
+        ".claude/skills/verify-task-mgr/features/README.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Grep Step 8.5: no exists(); canonicalize-source_root still precedes remap_into_worktree",
+        "Grep add.rs post-commit write path: append_user_story(&ctx.prd_json_path) only; no second locate_prd_json",
+        "Empty ctx.prefix skips apply_prefix and prefix_id; ≥2 refuse is add-only (ctx.is_none() && len()>=2), not inside resolve_context",
+        "prd_json does not import add; unique tmp is pid-counter-nanos; existing extra JSON keys survive append",
+        "Clap --from-json on add and current; cheatsheet contains add --from-json; ≥2 refuse present (pin 20)",
+        "qualityDimensions met; no unwrap on fs/SQLite in new modules; ui::emit_err for operator copy; CONTRACT-001/002/003 respected",
+        "New code reachable: context used by add/current/main logging; prd_json used by add and prd_reconcile; git remapper used by startup and context identity",
+        "Any issues found have corresponding CODE-FIX-xxx / WIRE-FIX-xxx tasks added via task-mgr add --stdin --depended-on-by REVIEW-001 (pass --from-json tasks/agent-task-ops-pr1.json once the flag exists)"
+      ],
+      "dependsOn": [
+        "CONTRACT-001",
+        "CONTRACT-002",
+        "CONTRACT-003",
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "FEAT-004b",
+        "FEAT-005",
+        "FEAT-006",
+        "FEAT-007",
+        "FEAT-008",
+        "FEAT-009"
+      ],
+      "description": "Post-implementation wiring review of CONTRACT implementations and FEAT-001–009. Look for exists() leaked into startup, second locate_prd_json, apply_prefix(\"\"), refuse-on-None, PrdUserStory round-trip, export in failure copy, clap/refuse/cheatsheet split across branches, and unreachable new modules.",
+      "estimatedEffort": "high",
+      "id": "CODE-REVIEW-1",
+      "modifiesBehavior": false,
+      "notes": "If no issues, emit status with a one-line 'No issues found' in the progress file. Spawn fixups with --depended-on-by REVIEW-001 and --from-json tasks/agent-task-ops-pr1.json so they do not leak into another PRD (learning #2236 — this PRD is the fix).",
+      "passes": false,
+      "priority": 13,
+      "qualityDimensions": [
+        "Wiring: new modules are called from production paths",
+        "Pins 1–4 / 11–16 / 19–21 not contradicted",
+        "Known-bad discriminators from CONTRACTs actually have tests"
+      ],
+      "requiresHuman": false,
+      "taskType": "review",
+      "title": "Review remapper, pin protocol, chokepoint, clap, refuse, and wiring",
+      "touchesFiles": [
+        "src/git/mod.rs",
+        "src/commands/context.rs",
+        "src/commands/prd_json.rs",
+        "src/commands/add.rs",
+        "src/commands/current.rs",
+        "src/loop_engine/startup.rs",
+        "src/cli/commands.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No duplicate strip_prefix remap left inline in startup.rs beside the helper call",
+        "FromJsonFlag / ResolvedContext / locate_prd_json / unique_tmp_path / append_user_story do not remain as parallel copies in add.rs",
+        "Coupling budget held: startup must not call CLI exists() policy; prd_json must not import add; --from-json must not call init/register_prd_files",
+        "Complexity/clarity: resolve_context precedence is readable; add-only refuse is a small predicate at the add caller, not a new abstraction",
+        "Any issues found have corresponding REFACTOR-xxx tasks added via task-mgr add --stdin --depended-on-by REVIEW-001 --from-json tasks/agent-task-ops-pr1.json"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "FEAT-004b",
+        "FEAT-005",
+        "FEAT-006",
+        "FEAT-007",
+        "FEAT-008",
+        "FEAT-009",
+        "CODE-REVIEW-1"
+      ],
+      "description": "Full-context pass over the new modules and call sites: DRY (duplicate remap math left in startup), coupling (prd_json importing add, context importing writers, startup importing CLI exists), leftover add.rs types, and contract fidelity.",
+      "estimatedEffort": "high",
+      "id": "REFACTOR-REVIEW-FINAL",
+      "modifiesBehavior": false,
+      "notes": "Optional in the lean skeleton; included because this PR extracts two modules and a git helper that PR-2/PR-3 will depend on. Do not bundle drive-by cleanup unrelated to the extracts.",
+      "passes": false,
+      "priority": 70,
+      "qualityDimensions": [
+        "Extracts are the only copies of remap math, pin protocol, and unique tmp",
+        "No speculative abstraction beyond the three CONTRACTs"
+      ],
+      "requiresHuman": false,
+      "taskType": "review",
+      "title": "Final refactor review of context / prd_json / remapper extracts",
+      "touchesFiles": [
+        "src/commands/context.rs",
+        "src/commands/prd_json.rs",
+        "src/commands/add.rs",
+        "src/git/mod.rs",
+        "src/loop_engine/startup.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Full unscoped gate green: cargo fmt --check && cargo check && cargo clippy --all-targets -- -D warnings && cargo test (fix every failure including pre-existing, or spawn FIX-xxx --depended-on-by REVIEW-001)",
+        "Drive `.claude/skills/verify-task-mgr/SKILL.md` feature add-and-current-from-json (every sub-feature this PRD touched). A skipped sub-feature is reported skipped, not verified via a sibling path. Evidence captured",
+        "Pin 20: clap --from-json on add and current, ≥2-prefix refuse, and cheatsheet recipe are all present on this branch",
+        "Grep guards: no exists() in startup Step 8.5 remap; no second locate_prd_json write; no task-mgr export in add.rs; no task-mgr-add.tmp; no apply_prefix on empty prefix; cheatsheet still forbids set-status",
+        "Out of scope held: no task-mgr update command, no export --all/--force, no humanReviewOutcome DB column, no DB-anchoring change, no historical prompt rewrites",
+        "Any issues found have corresponding FIX-xxx tasks added via task-mgr add --stdin --depended-on-by REVIEW-001 --from-json tasks/agent-task-ops-pr1.json"
+      ],
+      "dependsOn": [
+        "CONTRACT-001",
+        "CONTRACT-002",
+        "CONTRACT-003",
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "FEAT-004b",
+        "FEAT-005",
+        "FEAT-006",
+        "FEAT-007",
+        "FEAT-008",
+        "FEAT-009",
+        "CODE-REVIEW-1",
+        "REFACTOR-REVIEW-FINAL"
+      ],
+      "description": "PR-1 milestone. Full unscoped quality gate on a clean checkout. Re-drive verify-task-mgr feature add-and-current-from-json. Leave the trunk green including pre-existing failures. Confirm pins 5–10 / 17–18 were not implemented.",
+      "estimatedEffort": "high",
+      "id": "REVIEW-001",
+      "modifiesBehavior": false,
+      "notes": "REVIEW-001 is the milestone. Follow `.claude/skills/verify-task-mgr/SKILL.md` feature `add-and-current-from-json`. ≥2-prefix refuse in the sandbox: two loop inits without --no-prefix (or two files with distinct taskPrefix) — do not use two --no-prefix copies of sample_prd. Worktree live-path is FEAT-005 rust tests, not this skill. Do not invent a second harness. Below ~12 unrelated failures, fix them; above that, spawn one FIX/CLARIFY and BLOCKED.",
+      "passes": false,
+      "priority": 99,
+      "qualityDimensions": [
+        "Trunk green including pre-existing failures",
+        "Mapped verify-task-mgr feature fully driven",
+        "PR-1 scope lock: no PR-2/PR-3 implementation"
+      ],
+      "requiresHuman": false,
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Final gate: full suite + mapped verify-task-mgr drive",
+      "touchesFiles": [
+        "src/git/mod.rs",
+        "src/commands/context.rs",
+        "src/commands/prd_json.rs",
+        "src/commands/add.rs",
+        "src/commands/current.rs",
+        ".claude/skills/verify-task-mgr/features/add-and-current-from-json.md"
+      ]
+    }
+  ],
+  "version": "1.0"
+}

@@ -323,6 +323,8 @@ PRD Review Agent Prompt
   - description: string
   - userStories: array of task objects
 
+  **`taskPrefix` is not a review field.** Fresh lists from `/prd-tasks` and `/plan-tasks` omit it on purpose. `task-mgr init` / `loop init` / `batch init` generate the prefix, store it in the DB, and write it back into the JSON on import — before the first iteration. Sibling `tasks/*.json` files often already have it because they have been imported; that is not a generation-schema requirement. Never report absent or present `taskPrefix` as a finding of any severity (not critical, not warning, not informational). Do not infer required top-level fields from already-imported sibling JSON.
+
   Required per-task fields:
   - id: string (e.g., "US-001", "SEC-105", "TEST-003")
   - title: string

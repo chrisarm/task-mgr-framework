@@ -1,0 +1,227 @@
+{
+  "branchName": "feat/claim-short-status-id",
+  "description": "When an agent emits a bare story id in <task-status> (or <completed>) that is the prefix-stripped form of this iteration's claimed task, rewrite to the full claimed DB id before dispatch so short tags complete instead of leaving claims stuck in_progress → stale recovery → re-pick until max iterations.",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "Rust: No warnings in `cargo check` output",
+      "Rust: No warnings in `cargo clippy -- -D warnings`",
+      "Rust: Scoped tests for touched modules pass",
+      "Rust: `cargo fmt --check` passes",
+      "No unwrap() in production code paths",
+      "No breaking changes to existing APIs unless explicitly required",
+      "Sequential and wave both benefit via process_iteration_output only (no path-specific fork)"
+    ],
+    "description": "These criteria apply to ALL implementation tasks"
+  },
+  "prdFile": "claim-short-status-id.md",
+  "priorityPhilosophy": {
+    "description": "Hierarchy of what matters most when implementing tasks",
+    "hierarchy": [
+      "1. PLAN — Anticipate edge cases before coding",
+      "2. PHASE 2 FOUNDATION — ~1 day now to save ~2+ weeks later (1:10+ ratio); we are pre-launch, foundations compound",
+      "3. FUNCTIONING CODE — Pragmatic, reliable, wired in per plan",
+      "4. CORRECTNESS — Compiles, type-checks, scoped tests pass deterministically",
+      "5. CODE QUALITY — Clean code, qualityDimensions satisfied, no warnings",
+      "6. POLISH — Docs, formatting, minor improvements"
+    ],
+    "principles": [
+      "Quality dimensions explicit — qualityDimensions on every task tells you what 'good' looks like",
+      "Phase 2 foundation — prefer solutions that lay strong post-launch foundations (1:10+ savings ratio)",
+      "Edge cases = test cases — every known edge case must have a corresponding test",
+      "Scoped per-iteration tests, full suite at REVIEW-001 — REVIEW must leave the trunk green including pre-existing failures",
+      "Ship working code with tests to prove it; handle Option/Result explicitly; avoid unwrap() in production",
+      "Claim-scoped rewrite only — never global short-id lookup against the tasks table"
+    ]
+  },
+  "prohibitedOutcomes": [
+    "Global short-id resolution against the whole tasks table (ambiguous across PRDs)",
+    "Unrestricted ends_with / substring match that lets '001' match '…-REFACTOR-001'",
+    "Changing TaskLifecycle exact-id lookup as the fix (lifecycle stays exact-id SSoT)",
+    "Rewriting only inside extract_status_updates (no claim context; keep parse pure)",
+    "Rewriting peer bare ids to the claimed task when they are not the claim's bare form",
+    "Altering the dispatch-failed warning byte format for true misses (lifecycle_stderr_contract)",
+    "Using a single global status_updates_applied>0 gate instead of per-claimed (id, Done, true) — Learning 2238",
+    "Tests that only assert no crash without verifying DB status and outcome flip",
+    "Manual edits to tasks/*.json for status (use task-mgr CLI / task-status tags)",
+    "Error messages that don't identify what went wrong",
+    "Catch-all error handlers that swallow context"
+  ],
+  "project": "task-mgr",
+  "requires": [],
+  "taskPrefix": "c313c1e3",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "Positive: resolve('REFACTOR-001', '97be64d7-REFACTOR-001', Some('97be64d7')) → full claim",
+        "Positive: resolve(full, full, Some(prefix)) → full (identity)",
+        "Positive: resolve('REFACTOR-001', '97be64d7-REFACTOR-001', None) → full claim via 8-hex fallback",
+        "Positive: resolve('REFACTOR-001', 'REFACTOR-001', None) → identity",
+        "Negative: resolve('OTHER-001', '97be64d7-REFACTOR-001', Some('97be64d7')) → OTHER-001 unchanged",
+        "Negative: resolve('001', '97be64d7-REFACTOR-001', Some('97be64d7')) → '001' unchanged (no loose ends_with)",
+        "Negative: resolve('FEAT-001', 'P5.1-FEAT-001', None) → 'FEAT-001' unchanged (non-hex custom prefix, no task_prefix — no rewrite)",
+        "Positive: resolve('REFACTOR-001', '97be64d7-REFACTOR-001', Some('wrongpfx')) → full claim (wrong prefix string still matches via 8-hex fallback)",
+        "Unit test: each row above has a named assert",
+        "Known-bad: an implementation using claimed.ends_with(tag_id) alone would pass full-body tests but FAIL the '001' negative — that test MUST exist",
+        "Failure mode: if strip_task_prefix returns claimed unchanged and 8-hex does not apply, resolve is identity (no panic)"
+      ],
+      "dependsOn": [],
+      "description": "Add pure helpers next to `strip_task_prefix` that decide whether a tag id names this iteration's claimed task (full id or bare/prefix-stripped form) and resolve to the full claimed id.\n\nDO:\n1. In `src/loop_engine/output_parsing.rs`, add:\n   - `tag_id_refers_to_claimed(tag_id, claimed_id, task_prefix) -> bool`\n   - `resolve_tag_id_to_claimed(tag_id, claimed_id, task_prefix) -> &str` (or Cow) returning `claimed_id` when matched, else `tag_id`\n2. Match rules (in order):\n   a) `tag_id == claimed_id` → match (identity)\n   b) `strip_task_prefix(claimed_id, task_prefix)` is a real strip (`bare != claimed_id`) and `tag_id == bare` → match\n   c) Fallback: if claimed has standard 8-lowercase-hex PRD prefix (`[0-9a-f]{8}-…`), body after that prefix equals `tag_id` → match (handles missing/wrong `task_prefix`)\n3. Unit tests for all table rows in edgeCases.\n\nDO NOT:\n- Use unrestricted `ends_with` (Known-bad: `001` matching `97be64d7-REFACTOR-001`)\n- Look up ids in the DB\n- Import `detection::TaskStatusUpdate` into output_parsing (keep pure string helpers; pipeline owns the rewrite loop)\n- Change `extract_status_updates` or lifecycle apply\n\nKnown-bad to guard against:\n- Suffix-only matching without dash+body equality\n- Treating any substring of claimed as a match",
+      "edgeCases": [
+        "Full id already: identity, no rewrite needed",
+        "Bare id with correct task_prefix: rewrite to claim",
+        "Bare id with task_prefix None but 8-hex claim: rewrite via hex fallback",
+        "Bare id with non-hex custom prefix and prefix None: no rewrite",
+        "tag '001' vs claim '…-REFACTOR-001': no match",
+        "Unrelated bare OTHER-001: no match"
+      ],
+      "estimatedEffort": "low",
+      "failureModes": [
+        {
+          "cause": "Loose ends_with match",
+          "expectedBehavior": "Unit test for tag '001' fails the PR until match is tightened"
+        },
+        {
+          "cause": "Forgot 8-hex fallback",
+          "expectedBehavior": "Unit test with prefix None + hex claim fails"
+        }
+      ],
+      "id": "FEAT-001",
+      "modifiesBehavior": false,
+      "notes": "Reuse strip_task_prefix in the same module. Mirror the 8-hex rule from model::strip_prd_prefix (private) as a small private helper in output_parsing — do not couple to model.rs. Learning [4959]: dash-boundary / token-aware prefix matching — never bare substring. Learning [4965]: production ids are deterministic 8-hex PRD prefixes. Learning [193]/[4495]: substring false positives are a recurring class — negative tests required.",
+      "passes": false,
+      "priority": 1,
+      "qualityDimensions": [
+        "Match logic is pure, deterministic, and side-effect free",
+        "No false positives on short numeric suffixes",
+        "Helpers are independently unit-testable without DB or pipeline",
+        "Docs on the fn explain claim-scoped intent in one sentence"
+      ],
+      "taskType": "implementation",
+      "title": "Pure short-id → claimed resolve helpers",
+      "touchesFiles": [
+        "src/loop_engine/output_parsing.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: process_iteration_output with claimed aaaaaaaa-REFACTOR-001 + <task-status>REFACTOR-001:done</task-status> + task_prefix Some(aaaaaaaa) marks DB done and flips outcome to Completed",
+        "Positive: status_results / completed_task_ids use the FULL claimed id after rewrite",
+        "Positive: short <completed> bare id for claim also marks done (Step 4b)",
+        "Positive: short :failed (or :blocked) for claim applies to full id (not only done)",
+        "Negative: bare OTHER-001:done with same claim does NOT mark claim done and status_updates_applied stays 0 for that tag",
+        "Negative: peer bare id is NOT rewritten to claimed",
+        "CONTRACT: Step 4a still gates on per-entry (id, Done, applied==true) for claimed_id equality after rewrite — Learning 2238",
+        "Known-bad: only counting status_updates_applied>0 without id==claimed would pass happy path but fail peer-isolation tests already in iteration_pipeline — do not regress them",
+        "Failure mode: if rewrite does not run (task_id None), behavior remains exact-id-only (unchanged)",
+        "Positive: on rewrite the production path calls ui::emit with a note containing both the bare id and the full claimed id (grep/read-verified wiring; integration may assert via ui capture if available)"
+      ],
+      "dependsOn": [
+        "FEAT-001"
+      ],
+      "description": "In `process_iteration_output`, rewrite short-form ids that refer to the claimed task before lifecycle dispatch and before `<completed>` mark_task_done, so the production failure chain (dispatch miss → stuck in_progress → stale recovery → re-pick) stops for claim-matching bare tags.\n\nDO:\n1. Step 3: after `extract_status_updates`, if `task_id` is Some(claimed), for each update if `tag_id_refers_to_claimed(&u.task_id, claimed, task_prefix)` and tag != claimed, set `u.task_id = claimed.to_string()` and emit one operator note via `ui::emit`:\n   `Note: resolved short task-status id {bare} → {full} (claimed this iteration)`\n2. Apply rewrite for ALL status keywords (done/failed/skipped/irrelevant/unblock/reset), not only done.\n3. Step 4b: before `mark_task_done`, rewrite bare `<completed>` ids that refer to claimed the same way (optional note can reuse the same wording with 'completed' instead of 'task-status').\n4. Update module docs Step 3 bullet: one sentence on claim-scoped short-id rewrite.\n5. Integration tests in `tests/iteration_pipeline.rs`:\n   - Happy path: claim `aaaaaaaa-REFACTOR-001`, prefix Some('aaaaaaaa'), tag REFACTOR-001:done → DB done, status_updates_applied==1, outcome Completed, completed_task_ids has full id\n   - Non-match: tag OTHER-001:done → not done, status_updates_applied==0\n   - Full id regression still completes\n   - Short failed (or blocked) status rewrites and applies for claim\n   - Short `<completed>REFACTOR-001</completed>` completes claim\n\nDO NOT:\n- Pass claimed into apply_status_updates / TaskLifecycle (rewrite stays loop-side)\n- Rewrite peer bare ids that do not match this claim's bare form\n- Change dispatch-failed warning format for true TaskNotFound\n- Fork sequential vs wave — only touch process_iteration_output\n\nmodifiesBehavior: true — bare claim-matching tags now complete instead of TaskNotFound.\n\nKnown-bad: rewriting then checking only global status_updates_applied would reintroduce Learning 2238 peer false complete.",
+      "edgeCases": [
+        "No claimed task (task_id None): no rewrite",
+        "Dual tags short+full for same claim: both resolve to full; second Done may no-op; completed_set dedups",
+        "Wave slot: only that slot's claim is in scope (already true per call)",
+        "Whitespace-trimmed bare id still matches (extract already trims)"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Rewrite after apply instead of before",
+          "expectedBehavior": "Happy-path integration fails (DB never done)"
+        },
+        {
+          "cause": "Rewrite only Done keyword",
+          "expectedBehavior": "Short failed-status test fails"
+        }
+      ],
+      "id": "FEAT-002",
+      "modifiesBehavior": true,
+      "notes": "Depends on FEAT-001 helpers. Call sites of process_iteration_output: sequential orchestrator + wave process_slot_result — both already pass full claimed task_id and task_prefix. Learning [2238]: claimed-task per-entry gate. Learning [2284]/[2635]/[3334]: per-update success tuples / partial failure tolerance. Learning [2065]/[2086]: shared pipeline is the only wire point for seq+wave parity. Learning [2188]: peer completions stay independent — do not map peer bare ids to claim. Learning [1571]/[1578]/[4054]: side-band tag contract. Learning [3461]: auto-claim todo→done on LoopStatusTag still works when rewrite supplies full id. Learning [2270]: complete is idempotent — dual short+full tags ok. Data contract: ProcessingParams.task_id = Option<&str> full DB id; TaskStatusUpdate.task_id rewritten in-place before apply_status_updates; apply returns Vec<(String, TaskStatusChange, bool)> with rewritten ids.",
+      "passes": false,
+      "priority": 2,
+      "qualityDimensions": [
+        "Production short-id miss is fixed end-to-end in the shared pipeline",
+        "Peer and non-matching bare tags remain exact-id / TaskNotFound",
+        "Seq and wave parity preserved by single insertion point",
+        "Operator can see rewrites without noise on identity tags"
+      ],
+      "taskType": "implementation",
+      "title": "Rewrite short status/completed tags before dispatch in pipeline",
+      "touchesFiles": [
+        "src/loop_engine/iteration_pipeline.rs",
+        "tests/iteration_pipeline.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No code duplication (DRY principle)",
+        "Functions under 30 lines (flag complex ones)",
+        "Clear separation of concerns (pure match vs pipeline rewrite)",
+        "Code follows existing project patterns",
+        "Any issues found spawn REFACTOR-FIX-xxx via `task-mgr add --stdin --depended-on-by REVIEW-001`"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002"
+      ],
+      "description": "Review FEAT-001/002 for DRY, complexity, coupling, and maintainability.\n\nDO: Check for duplicated 8-hex strip vs model::strip_prd_prefix docs, functions >30 lines, unnecessary coupling between detection and output_parsing.\nDO NOT: Expand scope to global short-id lookup or lifecycle changes. Skip only if truly clean — then empty commit + done is valid (Learning 3142).",
+      "estimatedEffort": "high",
+      "id": "REFACTOR-001",
+      "notes": "If issues found: `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001`. If no issues, emit full-id status tag. Learning [2210]: surgical refactors only. Learning [3142]: no-op refactor is valid.",
+      "passes": false,
+      "priority": 98,
+      "qualityDimensions": [
+        "DRY across modules",
+        "Single-responsibility functions",
+        "Pattern consistency with existing code"
+      ],
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Review for refactoring opportunities",
+      "touchesFiles": [
+        "src/loop_engine/output_parsing.rs",
+        "src/loop_engine/iteration_pipeline.rs",
+        "tests/iteration_pipeline.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: All new code reachable from process_iteration_output (grep-verified)",
+        "Positive: FULL cargo test, cargo clippy -- -D warnings, cargo fmt --check all clean",
+        "Positive: Happy-path short-id integration test green",
+        "Negative: No unwrap() in production code paths",
+        "Negative: No loose ends_with-only match for claim resolution",
+        "Documentation: iteration_pipeline module step list mentions claim-scoped short-id rewrite",
+        "Pre-existing test failures fixed (or spawned as FIX-xxx with verifyCommand if >~12 unrelated)",
+        "If issues found: FIX-xxx tasks spawned via `task-mgr add --stdin --depended-on-by REVIEW-001`"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "REFACTOR-001"
+      ],
+      "description": "Review implementation for quality, security, wiring, and documentation. RUN THE FULL QUALITY GATE (unscoped test suite).\n\nDO: Verify rewrite is reachable only via process_iteration_output; confirm no lifecycle exact-id change; confirm 001 negative test exists; run full cargo test / clippy / fmt.\nDO NOT: Scope the test suite — this is THE full-suite gate. Do not reopen global short-id lookup.",
+      "estimatedEffort": "high",
+      "id": "REVIEW-001",
+      "notes": "Spawn fixes via `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001`. Emit status with FULL prefixed task id from the iteration banner. Learning [2238]/[2284] still hold after this change.",
+      "passes": false,
+      "priority": 99,
+      "qualityDimensions": [
+        "No unwrap in production",
+        "All new code wired through shared pipeline",
+        "Full suite green including pre-existing"
+      ],
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Code review + final verification",
+      "touchesFiles": [
+        "src/loop_engine/output_parsing.rs",
+        "src/loop_engine/iteration_pipeline.rs",
+        "tests/iteration_pipeline.rs"
+      ]
+    }
+  ],
+  "version": "1.0"
+}

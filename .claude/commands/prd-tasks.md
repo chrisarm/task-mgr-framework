@@ -15,11 +15,12 @@ Convert a markdown PRD into JSON task list and prompt file for task-mgr loop exe
 
 You are converting a human-readable PRD into machine-executable task artifacts for the Claude Loop autonomous agent system.
 
-> **CRITICAL — Three principles must be embedded in every task and the prompt file:**
+> **CRITICAL — Four principles must be embedded in every task and the prompt file:**
 >
 > 1. **Quality dimensions explicit** — every implementation task carries `qualityDimensions` (one flat list) from PRD section 2.5. The agent must know what "good" looks like, not just what to build.
 > 2. **Edge cases = test cases** — every PRD Known Edge Case becomes an `edgeCases` entry on a TEST-INIT task. 1:1 mapping, no exceptions. Unnamed edge cases get discovered in production.
 > 3. **Scoped per-iteration, full suite at milestones** — iterations run format + type-check + lint + tests scoped to `touchesFiles`. Milestones run the full unscoped suite and fix every failure (including pre-existing). This is what lets iterations move fast without letting the trunk degrade.
+> 4. **Project verification skills are the proof** — if the code repo ships a `.claude/skills/verif*` or `.grok/skills/verif*` skill, the loop agent must Read and follow it for covered user-facing changes. Language-level gates (fmt, type-check, lint, scoped tests) are necessary but not sufficient. Do not invent a second harness.
 
 ### Step 1: Read and Parse the PRD
 
@@ -167,6 +168,33 @@ task-mgr recall --tags <domain> --query "<concept>" --limit 10
 3. **Add to prompt file** — include a "Key learnings from task-mgr" section in the prompt (see Step 11's prompt template)
 
 Skip this step only if task-mgr has no learnings (fresh project) or the feature is purely greenfield with no overlap.
+
+### Step 2.6: Discover Project Verification Skills
+
+Project-level verification skills (directories matching `verif*` under `.claude/skills/` or `.grok/skills/`) are the maintained harness for proving a change on the real user surface. The loop agent will not reliably find them unless the generated prompt names them.
+
+**Search roots** — the code repo the loop agent will work in (`externalGitRepo` if set, else this repo):
+
+```bash
+# From the code-repo root:
+ls -d .claude/skills/verif*/SKILL.md .grok/skills/verif*/SKILL.md 2>/dev/null
+```
+
+Example: `../restaurant_agent_ex/.claude/skills/verify-restaurant-agent/SKILL.md` (when that repo is `externalGitRepo` or is the cwd).
+
+**For each hit:**
+
+1. Read the YAML frontmatter (`name`, `description`) — keep the description as one line; do not paraphrase it into a second procedure.
+2. If `features/README.md` exists next to `SKILL.md`, read it and map this PRD's stories onto feature ids (e.g. `cart-editing` ↔ `FEAT-002`). Unmapped features stay out of this prompt.
+3. Do **not** paste the SKILL.md body into the prompt (context economy). The loop agent Reads the skill at verification time.
+
+**How to use:**
+
+1. Populate `{{VERIFICATION_SKILLS}}` in the prompt (Step 6). Omit the whole section only when the glob is empty.
+2. For each implementation task that maps to a feature id, add an acceptance criterion (`Drive <skill-path> feature <id> per SKILL.md; evidence captured; compile/unit tests alone are not proof`) and a `notes` line pointing at the skill + feature id.
+3. REVIEW-001 / milestone criteria must include driving every mapped feature.
+
+Skip this step only when the glob is empty.
 
 ### Step 3: Validate Story Sizing
 
@@ -388,7 +416,8 @@ The agent checks these before starting any task. If the required task in the oth
         "Specific, testable criterion 1",
         "Specific, testable criterion 2",
         "CONTRACT: field names match EXACTLY the struct fields in {source module} (grep to verify)",
-        "CONTRACT: serde_json::from_value::<TargetStruct>(output) succeeds with production data"
+        "CONTRACT: serde_json::from_value::<TargetStruct>(output) succeeds with production data",
+        "Drive <skill-path> feature <id> per SKILL.md; evidence captured; compile/unit tests alone are not proof (omit this criterion when no verif* skill maps to this task)"
       ],
       "priority": 1,
       "estimatedEffort": "low|medium|high",
@@ -397,7 +426,7 @@ The agent checks these before starting any task. If the required task in the oth
       "environmentRequirements": ["docker", "protoc", "uv"],
       "preflightChecks": ["docker --version", "protoc --version"],
       "completionCheck": "cargo test -p deskmait-proto",
-      "notes": "Implementation hints, gotchas",
+      "notes": "Implementation hints, gotchas. If a project verif* skill covers this story: follow <skill-path> feature <id>; do not invent a second harness.",
       "timeoutSecs": 1800,
       "touchesFiles": ["path/to/file.rs"],
       "dependsOn": [],
@@ -451,6 +480,16 @@ Create `tasks/{feature}-prompt.md` using the template below, replacing placehold
 - `{{DATA_FLOW_CONTRACTS}}` - Optional but **strongly recommended**: Copy-pasteable access patterns from PRD Section 6 "Data Flow Contracts". If the feature accesses data across module boundaries, this section prevents the #1 class of silent bugs (wrong key types). Read actual code to verify key types at each level — never guess from variable names.
 - `{{KEY_LEARNINGS}}` - **REQUIRED for context economy**: Distilled excerpts from `task-mgr recall` (Step 2.5). Embed the 5-10 most relevant learnings (IDs + one-line summaries) directly in the prompt so the loop agent does **not** need to call `task-mgr recall` on every iteration or Read `tasks/long-term-learnings.md` / `tasks/learnings.md` at all. Format: `- **[ID]** <one-line takeaway>`. Omit the section entirely only when recall returned zero relevant hits.
 - `{{CLAUDE_MD_EXCERPTS}}` - **REQUIRED if the PRD touches any area documented in CLAUDE.md**: Grep CLAUDE.md for the touched subsystems (e.g. "ADP", "workflow", "KB", "sanitization") and paste the 3-10 bullet points that matter for this PRD — nothing more. This way the loop agent never has to Read CLAUDE.md (which can be hundreds of lines) during iterations. Omit the section if the PRD is greenfield and no existing gotchas apply.
+- `{{VERIFICATION_SKILLS}}` - **REQUIRED if the code repo (or `externalGitRepo`) ships a project-level verification skill.** From Step 2.6: glob `.claude/skills/verif*/SKILL.md` and `.grok/skills/verif*/SKILL.md`. Paths are relative to the code repo the loop agent will work in. Omit the whole section only when the glob is empty. Do **not** paste the SKILL.md body into the prompt. Render each hit as:
+
+  ```
+  - **`verify-restaurant-agent`** — `.claude/skills/verify-restaurant-agent/SKILL.md`
+    Prove restaurant_agent_ex ordering behavior after a code change: scoped tests + the feature ratchet, reload Phoenix, drive the MCP twin of the phone call, capture evidence.
+    Feature map: `.claude/skills/verify-restaurant-agent/features/README.md`
+    **This PRD maps to:** `build-a-cart` (FEAT-001), `cart-editing` (FEAT-002)
+  ```
+
+  Use the frontmatter `description` as the one-line blurb (do not paraphrase into a second procedure). If there is no feature map, write `**This PRD maps to:** all user-facing implementation tasks in this list`.
 - `{{PROHIBITED_OUTCOMES}}` - **REQUIRED, sourced from the JSON you're generating**: Render the `prohibitedOutcomes` array from the PRD JSON as a bulleted list (one `- ` line per entry). The loop agent is told not to Read the JSON, so these must live in the prompt.
 - `{{GLOBAL_ACCEPTANCE_CRITERIA}}` - **REQUIRED, sourced from the JSON**: Render the `globalAcceptanceCriteria.criteria` array from the PRD JSON as a bulleted list. Same reason — the agent can't see the JSON fields directly, so anything that applies to every task must be embedded here.
 - `{{CROSS_PRD_REQUIRES}}` - **REQUIRED only when the JSON `requires[]` array is non-empty**: Render each entry as a bulleted line: `- **<other-prd>.json :: <task-id>** — <reason>`. Omit the whole conditional section when `requires[]` is empty. The loop agent reads this block every iteration to decide whether to block, so it must be present; do NOT expect the agent to `jq '.requires'` during iterations.
@@ -478,7 +517,7 @@ Before writing code:
 2. **Plan edge-case handling** — For each `edgeCases` / `invariants` / `failureModes` entry on the task, decide how it'll be handled before coding.
 3. **Pick an approach** — State assumptions in your head. Only for `estimatedEffort: "high"` or `modifiesBehavior: true` tasks, name the one alternative you rejected and why.
 
-After writing code, the scoped quality gate is your critic — run it (Quality Checks § Per-iteration). Don't add a separate self-critique step; the linters, type-checker, and targeted tests catch more than a re-read does.
+After writing code, the scoped quality gate is your critic — run it (Quality Checks § Per-iteration). If a **Project Verification Skills** section applies to this task, follow that skill after the language gate. Don't add a separate self-critique step; the linters, type-checker, targeted tests, and (when present) the project verification skill catch more than a re-read does.
 
 ---
 
@@ -516,7 +555,7 @@ This PRD blocks on work in other PRD files. Before working `## Current Task`, ve
 
 ## Task Files + CLI (IMPORTANT — context economy)
 
-**Never read or edit `tasks/*.json` directly.** PRDs are thousands of lines; loading one wastes a huge amount of context and editing corrupts loop-engine state. Everything the agent needs about this iteration's task is embedded in `## Current Task`; everything PRD-wide that matters for implementation (Priority Philosophy, Prohibited Outcomes, Global Acceptance Criteria, Cross-PRD Requires, Key Learnings, CLAUDE.md Excerpts, Data Flow Contracts, Key Context) is already embedded in **this prompt file** — that is the authoritative copy. If something here looks inconsistent with the JSON, trust this file and surface the discrepancy.
+**Never read or edit `tasks/*.json` directly.** PRDs are thousands of lines; loading one wastes a huge amount of context and editing corrupts loop-engine state. Everything the agent needs about this iteration's task is embedded in `## Current Task`; everything PRD-wide that matters for implementation (Priority Philosophy, Prohibited Outcomes, Global Acceptance Criteria, Cross-PRD Requires, Key Learnings, CLAUDE.md Excerpts, Data Flow Contracts, Project Verification Skills, Key Context) is already embedded in **this prompt file** — that is the authoritative copy. If something here looks inconsistent with the JSON, trust this file and surface the discrepancy.
 
 ### Getting your PRD's task prefix
 
@@ -580,7 +619,7 @@ Optimize for context economy: pull only what's needed, don't dump whole files.
    ```bash
    grep -n -A 10 '<keyword or header>' CLAUDE.md
    ```
-   The authoritative per-task rules (Priority Philosophy, Prohibited Outcomes, Data Flow Contracts, Key Context, and the CLAUDE.md excerpts that matter for this PRD) are already embedded in **this prompt file**. Prefer it over re-reading source docs.
+   The authoritative per-task rules (Priority Philosophy, Prohibited Outcomes, Data Flow Contracts, Project Verification Skills, Key Context, and the CLAUDE.md excerpts that matter for this PRD) are already embedded in **this prompt file**. Prefer it over re-reading source docs. When a verification skill applies, Read that SKILL.md at verification time — do not paste it into the progress log.
 
 4. **Verify branch** — `git branch --show-current` matches the `branchName` task-mgr printed. Switch if wrong.
 
@@ -592,7 +631,7 @@ Optimize for context economy: pull only what's needed, don't dump whole files.
 
 6. **Implement** — single task, code and tests in one coherent change.
 
-7. **Run the scoped quality gate** (see Quality Checks below — scoped tests only, NOT the full suite). Fix failures before committing; never commit broken code.
+7. **Run the scoped quality gate** (see Quality Checks below — scoped tests only, NOT the full suite). If a **Project Verification Skills** entry covers this task, Read that SKILL.md and follow it after the language gate; do not invent a second harness. A green compile/test run is not proof for covered user-facing changes. If the skill is blocked (can't launch, unmet precondition), emit `<promise>BLOCKED</promise>` rather than marking the task done. Fix failures before committing; never commit broken code.
 
 8. **Commit**: `feat: <TASK-ID>-completed - [Title]` (or `refactor:`/`fix:`/`test:` as appropriate). Multiple tasks per iteration: `feat: ID1-completed, ID2-completed - [Title]`.
 
@@ -654,6 +693,8 @@ Scoping heuristic: start from `touchesFiles`. For each Rust file, run `cargo tes
 
 **Do NOT** run the entire workspace test suite (`cargo test` with no filter, `pytest` with no path) during regular iterations — that's the milestone's job.
 
+**Project verification skill:** if this prompt has a **Project Verification Skills** section, run it after the language gate for covered tasks (see that section). Compile/unit tests alone are not proof for those changes.
+
 ### Final gate at REVIEW-001 (the milestone)
 
 The single `REVIEW-001` task at the end of the lean path runs the **full, unscoped** suite on a clean checkout and must finish green. There are no separate MILESTONE-1 or MILESTONE-2 tasks in the reduced-ceremony skeleton.
@@ -675,7 +716,27 @@ Pragmatic escape hatch: if there are **more than ~12 failures AND they're all cl
 
 Below the ~12-failure threshold, just fix them. Each failure you punt is a tax on every future milestone, so the bar to punt is deliberately high.
 
+If a **Project Verification Skills** section is present, this gate also includes that skill's mapped-feature drive (see that section).
+
 ---
+
+{{#if VERIFICATION_SKILLS}}
+
+## Project Verification Skills
+
+This repo ships a project-level verification skill. Language-level gates (fmt, type-check, lint, scoped tests) are **necessary but not sufficient** for user-facing changes the skill covers. Follow the skill literally — do not invent a second harness, and do not paste the skill body into the progress log.
+
+{{VERIFICATION_SKILLS}}
+
+**Per-iteration:** if this task is listed in **This PRD maps to** (or is a FIX / WIRE-FIX spawned from a mapped task), Read that SKILL.md (and the matching `features/*.md` if listed) and drive that recipe after the scoped language gate. Capture evidence where the skill says. A green compile/test run is not proof.
+
+**REVIEW-001 / milestone:** drive every listed feature this PRD touched. A skipped sub-feature is reported skipped, not verified via a sibling path.
+
+**Blocked skill:** if you cannot launch or a precondition fails, emit `<promise>BLOCKED</promise>` with the unmet precondition. Do not skip the drive and mark the task done.
+
+---
+
+{{/if}}
 
 ## Common Wiring Failures (CODE-REVIEW-1 reference)
 
@@ -736,7 +797,7 @@ echo '{
 }' | task-mgr add --stdin --depended-on-by MILESTONE-1
 ```
 
-`--depended-on-by` wires the new task into the milestone's `dependsOn` AND syncs the PRD JSON atomically — don't edit the JSON yourself. Commit with `chore: <REVIEW-ID> - Add <FIX|REFACTOR> tasks`, then emit `<task-status><REVIEW-ID>:done</task-status>`. If no issues found, emit the status with a one-line "No issues found" in the progress file.
+`--depended-on-by` wires the new task into the milestone's `dependsOn` AND syncs the PRD JSON atomically — don't edit the JSON yourself. When a **Project Verification Skills** entry covers the issue, set `verifyCommand` to that skill's drive (the helper or recipe the SKILL.md names), not a unit-test invocation. Commit with `chore: <REVIEW-ID> - Add <FIX|REFACTOR> tasks`, then emit `<task-status><REVIEW-ID>:done</task-status>`. If no issues found, emit the status with a one-line "No issues found" in the progress file.
 
 ---
 
@@ -815,7 +876,7 @@ Milestones (MILESTONE-xxx) are **full-gate checkpoints**: they prove the trunk i
 ### Milestone Protocol
 
 1. Check all `dependsOn` tasks have `passes: true`. If any don't, the milestone can't run yet.
-2. **Run the full quality gate** (see Quality Checks § Milestone gate — unscoped format, type-check, lint, and the complete test suite). This is the ONE place in the loop where the entire test suite runs.
+2. **Run the full quality gate** (see Quality Checks § Milestone gate — unscoped format, type-check, lint, and the complete test suite). This is the ONE place in the loop where the entire test suite runs. If a **Project Verification Skills** section is present, also drive every mapped feature this PRD touched.
 3. **Leave the repo green.** For every failure, including pre-existing ones that predate this PRD:
    - Trivial fixes go in the milestone's own commit: `chore: MILESTONE-N - fix stale test <name>`.
    - Non-trivial failures → spawn a `FIX-xxx` task via `task-mgr add --stdin --depended-on-by <THIS-MILESTONE>` with the failure's `verifyCommand`. The loop picks it up; the milestone re-runs when the FIX passes.
@@ -909,7 +970,7 @@ Every task list follows a lean phased structure. The table below is the spine fo
 | 3a| 71-85    | `REFACTOR-xxx`                  | implementation  | REFACTOR-REVIEW-FINAL | —                                | `estimatedEffort: high` |
 | 4 | 99       | `REVIEW-001` (the final gate)   | review          | —                | all prior work + REFACTOR (if any)  | `estimatedEffort: high`, 1800s; review-class → frontier-forced |
 
-**REVIEW-001 is the milestone.** It runs the full, unscoped quality gate and must leave the repo green (including pre-existing failures). There are no separate MILESTONE-1 / MILESTONE-2 tasks in the lean skeleton.
+**REVIEW-001 is the milestone.** It runs the full, unscoped quality gate and must leave the repo green (including pre-existing failures). There are no separate MILESTONE-1 / MILESTONE-2 tasks in the lean skeleton. If Step 2.6 found a project `verif*` skill, REVIEW-001 also drives every mapped feature from that skill's feature map.
 
 ### Notes that don't fit in the table
 
@@ -917,7 +978,7 @@ Every task list follows a lean phased structure. The table below is the spine fo
 
 - **ANALYSIS-xxx** (opt-in) — Only for behavior-modifying changes that span >2 top-level directories *or* when the PRD/spike author explicitly requests it (set `requiresConsumerAnalysis: true` or create the task manually). For small localized changes, document the callers directly in the FEAT task description instead.
 
-- **FEAT-xxx** — Tests for the new behavior live *inside* the same coherent change (see the lean skeleton in `plan-tasks.md`). `edgeCases`, `invariants`, and known-bad discriminators are still required on the task. Do not stamp `model` on FEAT tasks; mark `estimatedEffort: "high"` and/or `modifiesBehavior: true` when you want a stronger tier (anchor+1 via the anchor window). The runtime `models` + `routing` config selects the actual model/runner.
+- **FEAT-xxx** — Tests for the new behavior live *inside* the same coherent change (see the lean skeleton in `plan-tasks.md`). `edgeCases`, `invariants`, and known-bad discriminators are still required on the task. Do not stamp `model` on FEAT tasks; mark `estimatedEffort: "high"` and/or `modifiesBehavior: true` when you want a stronger tier (anchor+1 via the anchor window). The runtime `models` + `routing` config selects the actual model/runner. If Step 2.6 mapped a project `verif*` skill onto this story, the task's `acceptanceCriteria` and `notes` must point at that SKILL.md + feature id.
 
 - **Middle milestones, separate TEST-INIT, INT-xxx, and VERIFY-001 removed** — These were identified as low-ROI ceremony (see anti-pattern table in `plan-tasks.md`). The single `REVIEW-001` at the end runs the full gate and serves as the milestone. `INT-xxx` concerns are now handled inside the final review's acceptance criteria and the PRD's Boundary Contracts section. A `CONTRACT-xxx` (when present) does the deep edge-case/invariant work before any implementation begins.
 
@@ -1040,6 +1101,7 @@ After generation, verify:
 - [ ] **Quality dimensions carried through**: Every implementation task has `qualityDimensions` populated from PRD section 2.5
 - [ ] **Edge case coverage**: Every PRD Known Edge Case appears as an `edgeCases` entry on at least one TEST-INIT task
 - [ ] **Prompt instructs scoped per-iteration testing and full-suite-at-milestones** (Quality Checks section is present and splits the two gates)
+- [ ] **Implementation tasks that Step 2.6 mapped onto a `verif*` feature** include a drive-the-skill acceptance criterion and a `notes` pointer at SKILL.md + feature id
 - [ ] **No task has `synergyWith` / `batchWith` / `conflictsWith` populated** (dropped — `touchesFiles` drives synergy at selection time; conflicts expressed via `dependsOn`)
 - [ ] **No `model` fields anywhere** (no per-task models AND no top-level PRD model; the anchor window, `routing` config, and the built-in review-class frontier force drive selection)
 - [ ] Review gates, MILESTONE-*, REFACTOR-REVIEW-FINAL, complex CONTRACTs and repair FIXes carry `estimatedEffort: "high"` (so difficulty triggers opus baseline rung when no stronger config route applies)
@@ -1051,6 +1113,7 @@ After generation, verify:
   - [ ] `{{CROSS_PRD_REQUIRES}}` — rendered as bullets if JSON `requires[]` is non-empty; whole section omitted otherwise
   - [ ] `{{KEY_LEARNINGS}}` — 5-10 recalled learnings distilled into one-liners (or omitted if recall was empty)
   - [ ] `{{CLAUDE_MD_EXCERPTS}}` — only the CLAUDE.md bullets that apply to this PRD's touched subsystems (or omitted if greenfield)
+  - [ ] `{{VERIFICATION_SKILLS}}` — populated from Step 2.6 if `.claude/skills/verif*` / `.grok/skills/verif*` exists; whole section omitted only when the glob is empty
   - [ ] Grep the generated prompt for `{{` — zero hits means all placeholders were substituted; any remaining `{{X}}` indicates a missed field
 - [ ] **Data flow contracts**: If the feature accesses data across module boundaries, the prompt's `{{DATA_FLOW_CONTRACTS}}` section is populated with verified, copy-pasteable access patterns showing key types at each level. If not applicable, section is omitted.
 - [ ] **Behavior modification validation**:
@@ -1064,6 +1127,7 @@ After generation, verify:
 - A Bug Fix task lacks the Semantic Distinctions section from PRD
 - An implementation task depends on ANALYSIS but ANALYSIS has no acceptance criteria
 - The feature accesses nested data structures across module boundaries but no Data Flow Contracts section exists in the prompt — this is the #1 source of silent bugs in multi-layer systems
+- The code repo has a `verif*` skill but the generated prompt has no Project Verification Skills section — loop agents will stop at cargo/pytest and skip the real user-surface proof
 
 Report to user:
 

@@ -21,6 +21,7 @@ You are generating a lean, executable task list for the Claude Loop agent system
 > 2. **Edge cases = test cases** — every identified edge case becomes an `edgeCases` entry on the task that handles it. 1:1 mapping. Unnamed edge cases get discovered in production.
 > 3. **Scoped per-iteration, full suite at REVIEW-001** — iterations run format + type-check + lint + tests scoped to `touchesFiles`. REVIEW-001 runs the full unscoped suite and fixes every failure (including pre-existing). This is what lets iterations move fast without letting the trunk degrade.
 > 4. **Data flow contracts verified** — for any data structure accessed across module boundaries, document the exact key type at each level with a copy-pasteable access pattern. Wrong-key-type bugs are silent.
+> 5. **Project verification skills are the proof** — if the code repo ships a `.claude/skills/verif*` or `.grok/skills/verif*` skill, the loop agent must Read and follow it for covered user-facing changes. Language-level gates (fmt, type-check, lint, scoped tests) are necessary but not sufficient. Do not invent a second harness.
 >
 > **Core philosophy**: Group by coherent change, not by activity type. "Add functions + their tests" is one task. Minimize ceremony, maximize code output per loop iteration.
 
@@ -80,6 +81,7 @@ Use Glob and Grep to quickly identify:
 - **Data flow paths**: For any data structure that crosses module boundaries, trace the key type at each hop (struct field → map key → JSONB key). Note where key types change between levels — these need Data Flow Contracts (see Step 5.5).
 - **Existing documentation**: Check `docs/` for architecture design docs. If the feature adds new modules, changes data flow, or introduces new subsystems, note which docs need creating or updating.
 - **CLAUDE.md excerpts**: Grep `CLAUDE.md` for the subsystems being touched (e.g. "ADP", "workflow", "KB", "sanitization") and note the 3-10 bullet points that matter for this change. The prompt file will embed these so the loop agent never has to Read CLAUDE.md.
+- **Project verification skills**: Glob `.claude/skills/verif*/SKILL.md` and `.grok/skills/verif*/SKILL.md` (also under `externalGitRepo` if set). If any exist, the prompt names them so the loop agent follows that harness instead of inventing one. See Step 2.6.
 
 **Time-box this to essentials.** Identify the 3-5 critical things the loop agent needs to know upfront to avoid wasted iterations:
 
@@ -128,6 +130,33 @@ task-mgr recall --tags <domain> --query "<concept>" --limit 10
 3. **Adjust acceptance criteria**: If a learning reveals a known-bad pattern or a specific import path, add it as a negative criterion or known-bad discriminator.
 
 **Skip this step** only if task-mgr has no learnings (fresh project) or the task is purely greenfield with no overlap to prior work.
+
+### Step 2.6: Discover Project Verification Skills
+
+Project-level verification skills (directories matching `verif*` under `.claude/skills/` or `.grok/skills/`) are the maintained harness for proving a change on the real user surface. The loop agent will not reliably find them unless the generated prompt names them.
+
+**Search roots** — the code repo the loop agent will work in (`externalGitRepo` if set, else this repo):
+
+```bash
+# From the code-repo root:
+ls -d .claude/skills/verif*/SKILL.md .grok/skills/verif*/SKILL.md 2>/dev/null
+```
+
+Example: `../restaurant_agent_ex/.claude/skills/verify-restaurant-agent/SKILL.md` (when that repo is `externalGitRepo` or is the cwd).
+
+**For each hit:**
+
+1. Read the YAML frontmatter (`name`, `description`) — keep the description as one line; do not paraphrase it into a second procedure.
+2. If `features/README.md` exists next to `SKILL.md`, read it and map this change's tasks onto feature ids (e.g. `cart-editing` ↔ `FEAT-002`). Unmapped features stay out of this prompt.
+3. Do **not** paste the SKILL.md body into the prompt (context economy). The loop agent Reads the skill at verification time.
+
+**How to use:**
+
+1. Populate `{{VERIFICATION_SKILLS}}` in the prompt (Step 9). Omit the whole section only when the glob is empty.
+2. For each implementation task that maps to a feature id, add an acceptance criterion (`Drive <skill-path> feature <id> per SKILL.md; evidence captured; compile/unit tests alone are not proof`) and a `notes` line pointing at the skill + feature id.
+3. REVIEW-001 criteria must include driving every mapped feature.
+
+Skip this step only when the glob is empty.
 
 ### Step 3: Expose Hidden Assumptions
 
@@ -289,6 +318,7 @@ FEAT-001: [First coherent change] (priority 1)
   — Edge cases to handle (edgeCases field)
   — Known-bad patterns to avoid
   — Failure modes and expected behavior
+  — If Step 2.6 mapped a project `verif*` skill onto this change, acceptanceCriteria + notes point at that SKILL.md + feature id
   — Do not set model; use estimatedEffort: "high" (or `modifiesBehavior: true`) when you want a stronger tier (anchor+1 via the anchor window); the models+routing config drives actual selection. Omit `model` on FEATs to preserve runtime provider routing.
 
 FEAT-002: [Second coherent change] (priority 2)
@@ -309,6 +339,7 @@ REVIEW-001: Code review + final verification (priority 99)
   — `estimatedEffort: "high"`, `timeoutSecs: 1800` (review-class IDs are frontier-forced built-in; no per-task `model` field)
   — Quality, security, integration wiring, documentation
   — RUNS THE FULL QUALITY GATE (unscoped test suite)
+  — If a project `verif*` skill exists, drives every mapped feature (see Project Verification Skills)
   — Updates remaining task descriptions based on learnings
   — Spawns FIX-xxx tasks if issues found (via task-mgr add --stdin --depended-on-by REVIEW-001)
   — Checks documentation needs (architecture docs, dev guides, CLAUDE.md)
@@ -330,6 +361,7 @@ Each acceptance criterion should be **specific enough that a different person (o
 "Negative: must NOT use unwrap() — use map_err(TaskMgrError::DatabaseError) for all DB operations"
 "CONTRACT: field names match EXACTLY the struct fields in {source module} (grep to verify)"
 "CONTRACT: serde_json::from_value::<TargetStruct>(output_from_dependency) succeeds with production data"
+"Drive `.claude/skills/<verif-skill>/` feature `<id>` per SKILL.md; evidence captured; compile/unit tests alone are not proof"
 ```
 
 **CONTRACT: prefix — cross-module boundary checks:**
@@ -468,12 +500,13 @@ The agent checks these before starting any task. If the required task hasn't pas
         "Unit test: [edge case scenario] returns [expected result]",
         "Known-bad: [describe naive implementation that would pass other tests but is wrong, and the test that catches it]",
         "Failure mode: if [error scenario], then [expected recovery behavior]",
-        "CONTRACT: field names match EXACTLY the struct fields in {source module} (grep to verify)"
+        "CONTRACT: field names match EXACTLY the struct fields in {source module} (grep to verify)",
+        "Drive <skill-path> feature <id> per SKILL.md; evidence captured; compile/unit tests alone are not proof (omit this criterion when no verif* skill maps to this task)"
       ],
       "priority": 1,
       "estimatedEffort": "low|medium|high",
       "passes": false,
-      "notes": "Implementation hints. Key functions to reuse: [list with file paths]. Patterns to follow: [reference]. Anti-patterns to avoid: [list]. Learning [ID]: <summary>.",
+      "notes": "Implementation hints. Key functions to reuse: [list with file paths]. Patterns to follow: [reference]. Anti-patterns to avoid: [list]. Learning [ID]: <summary>. If a project verif* skill covers this task: follow <skill-path> feature <id>; do not invent a second harness.",
       "qualityDimensions": ["What 'good' looks like for this task — correctness invariants, perf/efficiency requirements, idiomatic patterns vs anti-patterns. One flat list, no sub-buckets."],
       "edgeCases": [
         "Empty/null input: [expected behavior]",
@@ -526,7 +559,8 @@ The agent checks these before starting any task. If the required task hasn't pas
         "Documentation: CLAUDE.md updated with quick-reference for new tooling/patterns",
         "Task update: Remaining tasks reviewed and updated if implementation changed APIs/assumptions",
         "Pre-existing test failures fixed (or spawned as FIX-xxx with verifyCommand if >~12 unrelated)",
-        "If issues found: FIX-xxx tasks spawned via `task-mgr add --stdin --depended-on-by REVIEW-001`"
+        "If issues found: FIX-xxx tasks spawned via `task-mgr add --stdin --depended-on-by REVIEW-001`",
+        "If a project verification skill covers this change: SKILL.md followed, every mapped feature recipe driven, evidence captured (skipped sub-features reported skipped, not verified via a sibling path)"
       ],
       "priority": 99,
       "estimatedEffort": "high",
@@ -554,7 +588,7 @@ The agent checks these before starting any task. If the required task hasn't pas
 - `estimatedEffort`: `low` (1 file, 1-3 criteria), `medium` (2-3 files, new function), `high` (3+ files, new module).
 - `touchesFiles`: Actual file paths the agent will modify. Drives scoped per-iteration tests and synergy-based selection at runtime.
 - `dependsOn`: Only hard dependencies. Don't over-constrain — let the loop pick optimal order.
-- `acceptanceCriteria`: Mix positive requirements, negative requirements, test expectations, known-bad discriminators, and failure modes. Be specific enough that an agent can verify each one unambiguously.
+- `acceptanceCriteria`: Mix positive requirements, negative requirements, test expectations, known-bad discriminators, and failure modes. Be specific enough that an agent can verify each one unambiguously. When Step 2.6 mapped a `verif*` skill onto the task, include a drive-the-skill criterion.
 - `description`: Include DO/DO NOT sections, edge cases, and known-bad patterns. This is the agent's primary context.
 - `notes`: Implementation hints — functions to reuse (with file paths), patterns to follow, anti-patterns to avoid, relevant `Learning [ID]:` one-liners.
 - `qualityDimensions`: **Flat array** of strings, NOT `{correctness, performance, style}` sub-objects. What "good" looks like for this task.
@@ -615,6 +649,16 @@ Create `tasks/{feature-name}-prompt.md` using the template below. Replace placeh
 - `{{BRANCH_NAME}}` - Branch to work on
 - `{{KEY_LEARNINGS}}` - **REQUIRED for context economy**: 5-10 distilled one-liners from `task-mgr recall` (Step 2.5). Format: `- **[ID]** <one-line takeaway>`. Omit the whole section only if recall returned zero hits.
 - `{{CLAUDE_MD_EXCERPTS}}` - **REQUIRED if the change touches any area documented in CLAUDE.md**: grep CLAUDE.md for the touched subsystems and paste the 3-10 relevant bullets. The loop agent never has to Read CLAUDE.md this way. Omit if greenfield.
+- `{{VERIFICATION_SKILLS}}` - **REQUIRED if the code repo (or `externalGitRepo`) ships a project-level verification skill.** From Step 2.6: glob `.claude/skills/verif*/SKILL.md` and `.grok/skills/verif*/SKILL.md`. Paths are relative to the code repo the loop agent will work in. Omit the whole section only when the glob is empty. Do **not** paste the SKILL.md body into the prompt. Render each hit as:
+
+  ```
+  - **`verify-restaurant-agent`** — `.claude/skills/verify-restaurant-agent/SKILL.md`
+    Prove restaurant_agent_ex ordering behavior after a code change: scoped tests + the feature ratchet, reload Phoenix, drive the MCP twin of the phone call, capture evidence.
+    Feature map: `.claude/skills/verify-restaurant-agent/features/README.md`
+    **This change maps to:** `build-a-cart` (FEAT-001), `cart-editing` (FEAT-002)
+  ```
+
+  Use the frontmatter `description` as the one-line blurb (do not paraphrase into a second procedure). If there is no feature map, write `**This change maps to:** all user-facing implementation tasks in this list`.
 - `{{PROHIBITED_OUTCOMES}}` - **REQUIRED, sourced from the JSON `prohibitedOutcomes[]` array**: render as a bulleted list (one `- ` line per entry). The agent doesn't Read the JSON, so these must live in the prompt.
 - `{{GLOBAL_ACCEPTANCE_CRITERIA}}` - **REQUIRED, sourced from the JSON `globalAcceptanceCriteria.criteria[]`**: render as a bulleted list.
 - `{{CROSS_PRD_REQUIRES}}` - **REQUIRED only when the JSON `requires[]` array is non-empty**: render each as `- **<prd>.json :: <task-id>** — <reason>`. Omit the conditional section when `requires[]` is empty.
@@ -644,7 +688,7 @@ Before writing code:
 2. **Plan edge-case handling** — For each `edgeCases` / `failureModes` entry on the task, decide how it'll be handled before coding.
 3. **Pick an approach** — State assumptions in your head. Only for `estimatedEffort: "high"` or `modifiesBehavior: true` tasks, name the one alternative you rejected and why.
 
-After writing code, the scoped quality gate is your critic — run it (Quality Checks § Per-iteration). Don't add a separate self-critique step; the linters, type-checker, and targeted tests catch more than a re-read does.
+After writing code, the scoped quality gate is your critic — run it (Quality Checks § Per-iteration). If a **Project Verification Skills** section applies to this task, follow that skill after the language gate. Don't add a separate self-critique step; the linters, type-checker, targeted tests, and (when present) the project verification skill catch more than a re-read does.
 
 ---
 
@@ -682,7 +726,7 @@ This task list blocks on work in other PRD files. Before working `## Current Tas
 
 ## Task Files + CLI (IMPORTANT — context economy)
 
-**Never read or edit `tasks/*.json` directly.** Loading the JSON wastes context and editing corrupts loop-engine state. Everything the agent needs about this iteration's task is embedded in `## Current Task`; everything global (Priority Philosophy, Prohibited Outcomes, Global Acceptance Criteria, Cross-PRD Requires, Key Learnings, CLAUDE.md Excerpts, Data Flow Contracts, Key Context) is already embedded in **this prompt file** — that is the authoritative copy. If something here looks inconsistent with the JSON, trust this file and surface the discrepancy.
+**Never read or edit `tasks/*.json` directly.** Loading the JSON wastes context and editing corrupts loop-engine state. Everything the agent needs about this iteration's task is embedded in `## Current Task`; everything global (Priority Philosophy, Prohibited Outcomes, Global Acceptance Criteria, Cross-PRD Requires, Key Learnings, CLAUDE.md Excerpts, Data Flow Contracts, Project Verification Skills, Key Context) is already embedded in **this prompt file** — that is the authoritative copy. If something here looks inconsistent with the JSON, trust this file and surface the discrepancy.
 
 ### Getting your task prefix
 
@@ -746,7 +790,7 @@ Optimize for context economy: pull only what's needed, don't dump whole files.
    ```bash
    grep -n -A 10 '<keyword or header>' CLAUDE.md
    ```
-   The authoritative per-task rules (Priority Philosophy, Prohibited Outcomes, Data Flow Contracts, Key Context, and the CLAUDE.md excerpts that matter here) are already embedded in **this prompt file**. Prefer it over re-reading source docs.
+   The authoritative per-task rules (Priority Philosophy, Prohibited Outcomes, Data Flow Contracts, Project Verification Skills, Key Context, and the CLAUDE.md excerpts that matter here) are already embedded in **this prompt file**. Prefer it over re-reading source docs. When a verification skill applies, Read that SKILL.md at verification time — do not paste it into the progress log.
 
 4. **Verify branch** — `git branch --show-current` matches the `branchName` task-mgr printed. Switch if wrong.
 
@@ -758,7 +802,7 @@ Optimize for context economy: pull only what's needed, don't dump whole files.
 
 6. **Implement** — single task, code and tests in one coherent change.
 
-7. **Run the scoped quality gate** (see Quality Checks below — scoped tests only, NOT the full suite). Fix failures before committing; never commit broken code.
+7. **Run the scoped quality gate** (see Quality Checks below — scoped tests only, NOT the full suite). If a **Project Verification Skills** entry covers this task, Read that SKILL.md and follow it after the language gate; do not invent a second harness. A green compile/test run is not proof for covered user-facing changes. If the skill is blocked (can't launch, unmet precondition), emit `<promise>BLOCKED</promise>` rather than marking the task done. Fix failures before committing; never commit broken code.
 
 8. **Commit**: `feat: <TASK-ID>-completed - [Title]` (or `refactor:`/`fix:`/`test:` as appropriate).
 
@@ -812,6 +856,8 @@ Scoping heuristic: start from `touchesFiles`. For each Rust file, run `cargo tes
 
 **Do NOT** run the entire workspace test suite (`cargo test` with no filter, `pytest` with no path) during regular iterations — that's REVIEW-001's job.
 
+**Project verification skill:** if this prompt has a **Project Verification Skills** section, run it after the language gate for covered tasks (see that section). Compile/unit tests alone are not proof for those changes.
+
 ### Full gate (REFACTOR-001 / REVIEW-001)
 
 These tasks run the **full, unscoped** suite on a clean checkout and must finish green:
@@ -833,7 +879,27 @@ Pragmatic escape hatch: if there are **more than ~12 failures AND they're all cl
 
 Below the ~12-failure threshold, just fix them.
 
+If a **Project Verification Skills** section is present, this gate also includes that skill's mapped-feature drive (see that section).
+
 ---
+
+{{#if VERIFICATION_SKILLS}}
+
+## Project Verification Skills
+
+This repo ships a project-level verification skill. Language-level gates (fmt, type-check, lint, scoped tests) are **necessary but not sufficient** for user-facing changes the skill covers. Follow the skill literally — do not invent a second harness, and do not paste the skill body into the progress log.
+
+{{VERIFICATION_SKILLS}}
+
+**Per-iteration:** if this task is listed in **This change maps to** (or is a FIX / WIRE-FIX spawned from a mapped task), Read that SKILL.md (and the matching `features/*.md` if listed) and drive that recipe after the scoped language gate. Capture evidence where the skill says. A green compile/test run is not proof.
+
+**REVIEW-001:** drive every listed feature this change touched. A skipped sub-feature is reported skipped, not verified via a sibling path.
+
+**Blocked skill:** if you cannot launch or a precondition fails, emit `<promise>BLOCKED</promise>` with the unmet precondition. Do not skip the drive and mark the task done.
+
+---
+
+{{/if}}
 
 ## Common Wiring Failures (REVIEW-001 reference)
 
@@ -857,7 +923,7 @@ REFACTOR-001 and REVIEW-001 spawn follow-up tasks for each issue found. The loop
 | Review         | Priority | Spawns (priority)                  | Focus                                                                                                   |
 | -------------- | -------- | ---------------------------------- | ------------------------------------------------------------------------------------------------------- |
 | REFACTOR-001   | 98       | `REFACTOR-FIX-xxx` (50-97)         | DRY, complexity, coupling, clarity, pattern adherence                                                   |
-| REVIEW-001     | 99       | `FIX-xxx` / `WIRE-FIX-xxx` (50-97) | Language idioms, security, memory, error handling, no `unwrap()`, `qualityDimensions` met, wiring reachable, full-suite green |
+| REVIEW-001     | 99       | `FIX-xxx` / `WIRE-FIX-xxx` (50-97) | Language idioms, security, memory, error handling, no `unwrap()`, `qualityDimensions` met, wiring reachable, full-suite green, project `verif*` skill driven if present |
 
 Use the **rust-python-code-reviewer** / equivalent language agent when reviewing code. Document findings in the progress file. If a specific prior iteration produced something ugly and you don't want to wait for REFACTOR-001, invoke `/simplify` on that touchpoint directly — don't file a dedicated review task just for it.
 
@@ -877,7 +943,7 @@ echo '{
 }' | task-mgr add --stdin --depended-on-by REVIEW-001
 ```
 
-`--depended-on-by` wires the new task into REVIEW-001's `dependsOn` AND syncs the PRD JSON atomically — don't edit the JSON yourself. Commit with `chore: <REVIEW-ID> - Add <FIX|REFACTOR> tasks`, then emit `<task-status><REVIEW-ID>:done</task-status>`. If no issues found, emit the status with a one-line "No issues found" in the progress file.
+`--depended-on-by` wires the new task into REVIEW-001's `dependsOn` AND syncs the PRD JSON atomically — don't edit the JSON yourself. When a **Project Verification Skills** entry covers the issue, set `verifyCommand` to that skill's drive (the helper or recipe the SKILL.md names), not a unit-test invocation. Commit with `chore: <REVIEW-ID> - Add <FIX|REFACTOR> tasks`, then emit `<task-status><REVIEW-ID>:done</task-status>`. If no issues found, emit the status with a one-line "No issues found" in the progress file.
 
 ---
 
@@ -1039,8 +1105,10 @@ Verify:
   - [ ] `{{KEY_LEARNINGS}}` — 5-10 recalled learnings distilled into one-liners (or omitted if recall was empty)
   - [ ] `{{CLAUDE_MD_EXCERPTS}}` — only the CLAUDE.md bullets that apply to this change's touched subsystems (or omitted if greenfield)
   - [ ] `{{DATA_FLOW_CONTRACTS}}` — populated if cross-module data access exists; omitted otherwise
+  - [ ] `{{VERIFICATION_SKILLS}}` — populated from Step 2.6 if `.claude/skills/verif*` / `.grok/skills/verif*` exists; whole section omitted only when the glob is empty
   - [ ] Grep the generated prompt for `{{` — zero hits confirms all placeholders substituted
 - [ ] Prompt splits **scoped per-iteration** vs **full-suite at REVIEW-001** quality gates
+- [ ] Implementation tasks that Step 2.6 mapped onto a `verif*` feature include a drive-the-skill acceptance criterion and a `notes` pointer at SKILL.md + feature id
 - [ ] Documentation needs identified and included in REVIEW-001 criteria
 - [ ] Task count is 2-10 (if more, suggest `/prd` + `/prd-tasks`)
 
@@ -1106,3 +1174,4 @@ To run: task-mgr loop -y tasks/{feature}.json
 | Running full cargo test every iteration        | Slow; defeats scoping                                         | Scoped per-iteration gate; full gate only at REVIEW-001         |
 | Agent reads CLAUDE.md in full                  | CLAUDE.md is hundreds of lines                                | Embed the 3-10 relevant bullets in `{{CLAUDE_MD_EXCERPTS}}`     |
 | Agent reads `tasks/long-term-learnings.md`     | Grows unboundedly                                             | Embed in `{{KEY_LEARNINGS}}`; use `task-mgr recall` for gaps    |
+| Prompt ignores project `verif*` skills         | Agent "proves" via cargo/pytest and ships undriven user-facing bugs | Discover `.claude/skills/verif*` / `.grok/skills/verif*`; embed in `{{VERIFICATION_SKILLS}}`; require the skill as proof |

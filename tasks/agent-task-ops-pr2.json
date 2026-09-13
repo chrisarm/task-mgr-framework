@@ -1,0 +1,1011 @@
+{
+  "branchName": "feat/agent-task-ops-pr2",
+  "description": "PR-2 only of agent-task-ops-ux: task-mgr update load-merge-write, overlay whitelist + reject (status/passes/unknown keys/type-null), prd_json::patch_user_story, humanReviewOutcome JSON-only on PrdUserStory + AddTaskInput, clap Update + same --from-json pin as add, error_recovery/CLARIFY docs (update --stdin then complete), worktree live-path rust tests, and verify-task-mgr sandbox proof. Do not implement PR-3 export scoping or remapper/add clap.",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "No warnings in `cargo check` output",
+      "No warnings in `cargo clippy -- -D warnings` (per-iteration). `--all-targets` is REVIEW-001 only",
+      "`cargo fmt --check` passes",
+      "Scoped tests for touched modules pass",
+      "No unwrap() on filesystem or SQLite in new production paths (`update.rs` / `patch_user_story`)",
+      "Operator overlay/refuse/sync-failure copy uses `ui::emit` / `ui::emit_err` (CONTRACT-LOG-001), never tracing",
+      "Do not implement PR-3 (export default/`--all`/`--force`, cheatsheet/`task_ops`/historical prompts/best-practices) or re-implement PR-1 remapper/add clap",
+      "Grep `src/commands/update.rs` for `update_task` and `delete_task_relationships` → zero hits",
+      "Grep `src/commands/prd_json.rs` for `use crate::commands::add` / `use crate::commands::update` → zero hits",
+      "No `tasks.human_review_outcome` column and no new migration",
+      "Existing `tests/worktree_db_resolution.rs` add DB-anchoring tests stay green",
+      "Clap parse tests live in `src/cli/tests.rs` and are run with `cargo test -p task-mgr cli::` (not `cargo test --test cli_tests`)",
+      "Later FEATs grep symbols (`refuse_unpinned_write`, `preflight_from_json_path`, `sole_task_list_path`, `cli_write_path`, `strip_prefix_in_id_array`, `resolve_context`, `into_prd_user_story`, `atomic_write`) — do not freeze `add.rs:NNN` line numbers from authoring",
+      "User-facing update/overlay-reject/CLARIFY proof is FEAT-008 + REVIEW-001 via `.claude/skills/verify-task-mgr/SKILL.md` (compile/unit tests alone are not proof for those stories). FEAT-001–007 keep rust tests only — no skill drive"
+    ],
+    "description": "These criteria apply to ALL implementation tasks"
+  },
+  "mergeStrategy": "Merge to main after REVIEW-001 passes. Squash commits optional. Assumes PR-1 public surface (`resolve_context`, `prd_json`, add `--from-json` pin) at merge — do not re-ship remapper or add clap. Do not land PR-3 export in this branch.",
+  "prdFile": "prd-agent-task-ops-pr2.md",
+  "priorityPhilosophy": {
+    "description": "Hierarchy of what matters most when implementing tasks",
+    "hierarchy": [
+      "1. PLAN — Anticipate edge cases before coding",
+      "2. PHASE 2 FOUNDATION — ~1 day now to save ~2+ weeks later (1:10+ ratio); we are pre-launch, foundations compound",
+      "3. FUNCTIONING CODE — Pragmatic, reliable, wired in per plan",
+      "4. CORRECTNESS — Compiles, type-checks, scoped tests pass deterministically",
+      "5. CODE QUALITY — Clean code, qualityDimensions satisfied, no warnings",
+      "6. POLISH — Docs, formatting, minor improvements"
+    ],
+    "principles": [
+      "Quality dimensions explicit — qualityDimensions on every task tells you what 'good' looks like",
+      "Phase 2 foundation — a dedicated overlay writer is the only substrate that keeps lifecycle SSoT and extra JSON keys intact; do not reuse import::update_task",
+      "Edge cases = test cases — every PR-2 known edge case must have a corresponding test",
+      "Scoped per-iteration tests, full suite at REVIEW-001 — REVIEW must leave the trunk green including pre-existing failures",
+      "Pins 5–7 / 10–13 / 16–17 / 19 / 21 are law for this PR; pins 8–9 / 18 (export) must not be implemented; pins 1–4 / 14–15 / 20 are consumed from PR-1, not re-shipped",
+      "Ship working code with tests to prove it; handle Option/Result explicitly; avoid unwrap() in production"
+    ]
+  },
+  "prohibitedOutcomes": [
+    "Implementing PR-3 (export default/`--all`/`--force` overwrite, cheatsheet/`task_ops` jq `.userStories[]`, remaining prompt one-liners, `~/.claude/docs/task-mgr-best-practices.md`) or re-implementing PR-1 remapper / add `--from-json` clap / `current --from-json`",
+    "Calling `init::import::update_task` from `task-mgr update` (full-row SET + `archived_at = NULL`)",
+    "Calling `delete_task_relationships` from update (wipes every `rel_type`; old synergy/batch/conflicts rows must survive)",
+    "SET `tasks.status`, `archived_at`, `priority`, or `id` from update / JSON patch",
+    "Silent skip / drop of overlay `status` / `passes` / unknown keys (including `priority`, `synergyWith`)",
+    "Deserializing the overlay or an existing story to `PrdUserStory` for merge/write-back (strips extra keys; `passes` defaults false)",
+    "JSON-only overlay (`id` + `humanReviewOutcome` only, including `null` remove) returning `Ok` with a skip note when the file cannot be patched",
+    "A `tasks.human_review_outcome` column or any new migration",
+    "Copying overlay `id` onto the JSON story, or writing prefixed `dependsOn` ids (must use `strip_prefix_in_id_array`)",
+    "`invalid_state` command-name leftover `\"add\"` on the update / `patch_user_story` / `atomic_write` path",
+    "Putting ≥2 refuse inside `resolve_context` (breaks `current` probe)",
+    "`if ctx.is_none() { refuse }` (breaks `--no-prefix` / 0-prefix)",
+    "`apply_prefix(\"\")` or `prefix_id(\"\", id)` on empty prefix (lookup id `-FEAT-001`)",
+    "Opening a second connection only to beat overlay parse; unregistered/`≥2` refuse before parse disagrees with add",
+    "Directory `--from-json` waiting for JSON parse (`canonicalize` on a dir succeeds — `is_file()` / `preflight_from_json_path` before parse)",
+    "Remapping `--from-json PATH` away from the canonical flag path",
+    "`--from-json` inserting `prd_files` / `prd_metadata` (pin, never register)",
+    "JSON-sync failure copy (mixed overlay) naming `task-mgr export`",
+    "`prd_json` importing `add` or `update`; `context` importing `prd_json` write helpers",
+    "Hand-editing inside `TASK_MGR:BEGIN/END` instead of `task-mgr enhance agents` after the template rewrite",
+    "Leaving `context.rs` rustdoc saying ≥2 refuse is add-only",
+    "Putting `priority` on the update whitelist; a `set-status` command; claim-scoped short `<task-status>` ids; MCP wrappers; changing DB anchoring",
+    "Rewriting historical `tasks/*-prompt.md`; changing `init::import::update_task` SQL",
+    "Positional `task-mgr update <id> --title/--notes` flag-per-field CLI",
+    "Schema-validating inner `humanReviewOutcome` keys (opaque `Value`)",
+    "Two `--no-prefix` inits as ≥2-prefix sandbox proof (that is 0 prefixes)",
+    "Driving verify-task-mgr on a task before the feature file exists; claiming worktree live-path via that harness; driving `loop run` / `batch run`",
+    "Inventing a second verification harness; treating compile/unit tests as proof for clap/overlay-reject/CLARIFY",
+    "Manual edits to `tasks/*.json` for status (use task-mgr CLI / task-status tags)",
+    "unwrap() on filesystem or SQLite in new modules unless a prior invariant makes it unreachable",
+    "tracing for operator-facing overlay/refuse/sync-failure copy (use `ui::emit` / `ui::emit_err`)",
+    "Tests that only assert 'no crash' or check type without verifying content"
+  ],
+  "project": "task-mgr",
+  "requires": [],
+  "reviewGuidelines": {
+    "priorityGuidelines": {
+      "critical": "1-10: Blocks further work, fix immediately",
+      "high": "11-20: Fix before phase completion",
+      "low": "51-99: Defer to hardening phase",
+      "medium": "21-50: Fix in current phase if time permits"
+    }
+  },
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "Precise interface: `update::update(db_dir, input_json, from_json) -> TaskMgrResult<UpdateResult>` and `update_with_conn`; `prd_json::patch_user_story(prd_path, story_id, overlay: &Value, prefix, command: &str) -> TaskMgrResult<()>` — command forwarded into every `invalid_state`. LockGuard like add. Must not call `init::import::update_task` or `delete_task_relationships`",
+        "Edge cases: notes-only / archived notes-only leave title/priority/status/`archived_at` identical; in-progress notes-only keeps `status`; `dependsOn` present (incl. `[]`) deletes only `rel_type = 'dependsOn'` (seeded synergy/batch/conflicts rows survive); JSON-only overlay + missing path or patch `Err` → `invalid_state` naming `task-mgr current` and retry `--from-json` (not `Ok` skip; no DB write); mixed overlay + patch `Err` → pin 11 warning, DB committed, never `export`",
+        "Invariants: partial `UPDATE tasks SET` only for present whitelist DB columns + `updated_at`; never SET `status`, `archived_at`, `priority`, `id`; JSON-only overlay issues no `UPDATE tasks`; overlay `id` is lookup-only; JSON merge skips overlay `id` (story `id` byte-identical); `dependsOn` JSON written unprefixed via `strip_prefix_in_id_array`; existing extra keys survive; never `from_value::<PrdUserStory>` of overlay or existing story",
+        "Known-bad discriminators: (1) calling `import::update_task` — notes-only test sees `archived_at` NULL and clobbered priority/title; (2) `delete_task_relationships` — synergy seed row gone; (3) JSON-only copying add's skip path — `Ok` with nothing persisted (pin 17 vs pin 11); (4) mapping existing `userStories` through `PrdUserStory` — extra keys vanish",
+        "Failure modes: missing/empty overlay `id`, unknown task id, `id`-only overlay (`no updatable fields`) error before writes; patch story-not-found is `Err` (JSON-only → `invalid_state`, mixed → pin 11 warning); fs/rename errors name command `\"update\"`",
+        "Alternatives considered: rejected reuse of `import::update_task` even with a skip-`archived_at` flag (still full-row SET + DELETE+reinsert + status-from-passes at init caller; pin 5); rejected deserializing overlay to `PrdUserStory` (omitted title becomes `\"\"`, extra keys stripped, `passes` defaults false)",
+        "Downstream impact: FEAT-002 (`patch_user_story`), FEAT-004 (DB load-merge-write + JSON-only refuse), FEAT-005 (clap wrapper + pin/write path), FEAT-007 (live-path uses the same write path)",
+        "Contract text recorded: full copy-pasteable signatures, partial-UPDATE column list, JSON-only vs mixed failure split, skip-overlay-`id` / unprefixed-`dependsOn` rules under ## CONTRACT-001"
+      ],
+      "dependsOn": [],
+      "description": "Design-only. Record the update load-merge-write SSoT (partial SQL + `patch_user_story`; never `import::update_task` / `delete_task_relationships`; skip overlay `id`; unprefixed `dependsOn`; JSON-only overlay cannot `Ok` skip) so FEAT-002/004/005/007 cannot drift. Do not write production code.",
+      "edgeCases": [
+        "Notes-only overlay must not clobber title/priority/status/archived_at",
+        "Archived notes-only: archived_at stays non-NULL",
+        "JSON-only overlay + missing write path or patch Err: invalid_state, not Ok skip",
+        "Mixed overlay + patch Err: DB committed; warning never names export",
+        "dependsOn present must not wipe synergy/batch/conflicts rows"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "Writer calls import::update_task",
+          "expectedBehavior": "Archived notes-only test fails; contract forbids the call"
+        },
+        {
+          "cause": "JSON-only overlay Ok-skips when ctx.prd_json_path is empty",
+          "expectedBehavior": "invalid_state; no DB write; contract lists this as known-bad"
+        }
+      ],
+      "id": "CONTRACT-001",
+      "invariants": [
+        "update.rs never calls update_task or delete_task_relationships",
+        "JSON-only overlay never UPDATE tasks and never Ok-skips a missing file",
+        "patch_user_story does not copy overlay id; dependsOn written unprefixed"
+      ],
+      "modifiesBehavior": false,
+      "notes": "Architecture seed (do not re-expand). Learning [1561]/[3440]/[5615]: JSON sync is best-effort after DB commit for mixed overlays; JSON-only has nothing else to persist so Err, not skip. Learning [2667]/[1562]/[5577]: unique tmp pid-counter-nanos, same-dir rename. Learning [5578]: Value round-trip existing stories. Learning [3923]/[5604]: prefixed DB ids vs unprefixed JSON ids.",
+      "passes": false,
+      "priority": 0,
+      "qualityDimensions": [
+        "Load-merge-write is partial UPDATE + conditional table replace — never full-row SET",
+        "JSON-only overlay cannot Ok a skip (pin 17 vs pin 11)",
+        "One JSON write chokepoint: unique tmp + Value merge; skip overlay id",
+        "Contract is stable enough that FEAT-002 and FEAT-004 cannot disagree on skip vs invalid_state"
+      ],
+      "requiresHuman": false,
+      "taskType": "contract",
+      "title": "Define update load-merge-write SSoT + JSON-only refuse",
+      "touchesFiles": [
+        "src/commands/update.rs",
+        "src/commands/prd_json.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Precise interface: overlay is `serde_json::Value` object (not `PrdUserStory`). Validation order is load-bearing: top-level `status`/`passes` (any value, incl. false/null) → lifecycle `invalid_state(\"update\", …)` pointing at `complete`/`fail`/`skip`/`<task-status>` → other unknown keys (name ALL of them) → type/null table → no whitelist field besides `id` (`id`-only is FEAT-004). Id is lookup-only (`newId`/`renameTo` unknown). Both `estimatedEffort` and `difficulty` present → ambiguous hard-error; either present SETs `difficulty` and JSON-patches as `estimatedEffort` (remove leftover `difficulty` key)",
+        "Whitelist (JSON camelCase) plus lookup `id`: `title`, `description`, `notes`, `acceptanceCriteria`, `touchesFiles`, `dependsOn`, `estimatedEffort`/`difficulty`, `model`, `escalationNote`, `requiredTests`, `maxRetries`, `requiresHuman`, `humanReviewTimeout`, `claimsSharedInfra`, `reviewScope`, `severity`, `sourceReview`, `humanReviewOutcome`. Nothing else (`priority`, `synergyWith`/`batchWith`/`conflictsWith`, `foo` are unknown)",
+        "Type/null table binds overlay keys to `PrdUserStory` field types (src/commands/init/parse.rs) but overlay reject is fail-closed — do not reuse serde defaults: `title` → `title: String` (non-empty string; null/empty/non-string error); nullable `Option<String>` scalars `description`/`notes`/`model`/`escalation_note`/`severity`/`source_review`/`difficulty` (overlay `estimatedEffort`/`difficulty`) → string or `null` clears, wrong type error; `humanReviewTimeout` → `human_review_timeout: Option<u32>` integer or `null` clears; `claimsSharedInfra` → `claims_shared_infra: Option<bool>` bool or `null` clears; `reviewScope` → `review_scope: Option<Value>` any JSON or `null` clears; arrays `dependsOn`/`touchesFiles`/`acceptanceCriteria`/`requiredTests` → `Vec<String>` (`[]` clears; `null`/non-array/non-string element error); `requiresHuman` → `requires_human: Option<bool>` but overlay requires JSON bool (`null`/non-bool error — stricter than serde Option); `maxRetries` → `max_retries: Option<i32>` but overlay requires integer (`null` error, column NOT NULL, do not default to 3); `humanReviewOutcome` → `human_review_outcome: Option<Value>` object or `null` (array/string/number/bool error). Nested `passes` inside `humanReviewOutcome` is not a top-level key — allowed",
+        "Edge cases: full story blob with `\"passes\": false` plus valid `notes` takes the lifecycle error (order: status/passes first); `priority` unknown-key (not a 'coming soon' message); synergyWith unknown; `title` empty; `dependsOn: null`; `maxRetries: null`; `requiresHuman: 1`",
+        "Invariants: no writes on any reject; no partial apply; deny_unknown_fields is NOT set on `PrdUserStory` (would break extra keys on import of old PRDs)",
+        "Known-bad discriminators: (1) `from_value::<PrdUserStory>(overlay)` — `passes` defaults false (ignored or applied) and extra keys vanish; (2) treating `maxRetries: null` as serde None then defaulting to 3 — column NOT NULL trap; (3) checking nested keys inside `humanReviewOutcome` for `passes`",
+        "Failure modes: every reject is `invalid_state(\"update\", …)` before LockGuard/write txn when possible; always before any UPDATE",
+        "Alternatives considered: rejected `deny_unknown_fields` on `PrdUserStory` (breaks old PRD extra keys; overlay reject is a different type); rejected 'null always clears' (arrays/`requiresHuman`/`maxRetries`/`title` would corrupt NOT NULL / tables)",
+        "Downstream impact: FEAT-003 (implement validator), FEAT-004 (calls it before writes), FEAT-005 (directory preflight still before parse), FEAT-006 (error copy), FEAT-008 (sandbox rejects)",
+        "Contract text recorded: full whitelist, validation order, and type/null table bound to named `PrdUserStory` fields under ## CONTRACT-002"
+      ],
+      "dependsOn": [],
+      "description": "Design-only. Record overlay whitelist + reject (`status`/`passes` lifecycle error; unknown keys hard-error; id lookup-only; type/null table bound to `PrdUserStory` field types, fail-closed). Lives in `update.rs` (or a small update submodule), not `init::parse`. Do not write production code.",
+      "edgeCases": [
+        "Full blob with passes:false takes lifecycle error even when notes is valid",
+        "priority / synergyWith / foo are unknown-key hard-errors (no partial apply)",
+        "title null or empty; dependsOn: null; maxRetries: null; requiresHuman: 1",
+        "Nested passes inside humanReviewOutcome is allowed",
+        "Both estimatedEffort and difficulty present: ambiguous hard-error"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "Overlay typed as PrdUserStory",
+          "expectedBehavior": "passes:false full-blob test fails (silent skip or status write); contract forbids it"
+        }
+      ],
+      "id": "CONTRACT-002",
+      "invariants": [
+        "Validation order: status/passes → unknown keys → type/null → id-only",
+        "Type/null checks bind to PrdUserStory field types but are stricter than serde Option defaults",
+        "No writes on reject"
+      ],
+      "modifiesBehavior": false,
+      "notes": "Pass-2: nullable scalars bind to PrdUserStory field types (grep the struct in parse.rs; do not invent types). Overlay `requiresHuman`/`maxRetries` are stricter than Option serde. Learning [3419]/[5345]: status via TaskLifecycle only. Pin 21: priority is unknown, not a future flag.",
+      "passes": false,
+      "priority": 1,
+      "qualityDimensions": [
+        "Overlay is a Value object with an explicit whitelist — never PrdUserStory",
+        "status/passes hard-error before unknown-key (pasted full blob always gets the lifecycle pointer)",
+        "Type/null table fail-closed; bind keys to named PrdUserStory fields",
+        "Unknown keys including priority and synergyWith hard-error (no silent drop)"
+      ],
+      "requiresHuman": false,
+      "taskType": "contract",
+      "title": "Define overlay whitelist + reject + type/null bound to PrdUserStory",
+      "touchesFiles": [
+        "src/commands/update.rs",
+        "src/commands/init/parse.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Precise interface: `PrdUserStory.human_review_outcome: Option<Value>` and `AddTaskInput.human_review_outcome: Option<Value>` with `#[serde(default, skip_serializing_if = \"Option::is_none\")]` (JSON camelCase `humanReviewOutcome`). `into_prd_user_story` copies it. Opaque object — do not schema-validate inner keys. No `tasks.human_review_outcome` column. No migration. Field does not live on `models::Task`",
+        "Edge cases: spawned `add` of a CLARIFY row that includes the key must not drop it; absent field serializes without the key; `null` overlay removes the JSON key (CONTRACT-001 write policy); `loop init --append --update-existing` after update still has the object in the file; `PRAGMA table_info(tasks)` has no such column; `init::import::update_task` SQL stays unchanged (field rides unused during DB SET — correct)",
+        "Invariants: JSON-only overlay persist is `patch_user_story` or `invalid_state` — never `Ok` skip (split with CONTRACT-001). Import may deserialize onto the struct and ignore it for SQL",
+        "Known-bad discriminators: (1) adding a DB column 'so it survives import' — pin 17 forbids; pragma test fails; (2) putting the field only on `PrdUserStory` so `AddTaskInput` drops it on spawned CLARIFY; (3) `Ok` skip when JSON-only cannot patch",
+        "Failure modes: JSON-only + missing path / patch `Err` → `invalid_state(\"update\", …)` naming `current` + retry `--from-json`; mixed overlay + same JSON `Err` stays pin 11",
+        "Alternatives considered: rejected a DB column (loop never queries it; invites lifecycle-adjacent dumps); rejected a typed inner struct (would silently drop extra `confirmedValues` keys — the original bug class)",
+        "Downstream impact: FEAT-001 (struct field + literals + add copy), FEAT-004 (JSON-only persist/refuse), FEAT-008 (operator drive: overlay then loop init survival)",
+        "Contract text recorded: field attrs, no-column rule, add-copy, JSON-only persist split under ## CONTRACT-003"
+      ],
+      "dependsOn": [],
+      "description": "Design-only. Record `humanReviewOutcome` JSON-only round-trip (`PrdUserStory` + `AddTaskInput`; no DB column; JSON-only persist is `invalid_state` if the file cannot be patched). Do not write production code.",
+      "edgeCases": [
+        "Add-spawned CLARIFY row must copy the key",
+        "skip_serializing_if none omits the key",
+        "Re-import survival without a DB column",
+        "JSON-only refuse when no task_list"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "Field only on PrdUserStory",
+          "expectedBehavior": "Spawned add drops the key; contract requires AddTaskInput copy"
+        }
+      ],
+      "id": "CONTRACT-003",
+      "invariants": [
+        "No tasks.human_review_outcome column and no new migration",
+        "into_prd_user_story copies human_review_outcome",
+        "JSON-only overlay cannot succeed with nothing persisted"
+      ],
+      "modifiesBehavior": false,
+      "notes": "Learning [3498]/[3283]/[3156]/[3764]: outcome belongs in the task JSON; resolution then complete. Pin 17. Import update_task SQL unchanged is success, not a missing bind.",
+      "passes": false,
+      "priority": 2,
+      "qualityDimensions": [
+        "humanReviewOutcome is Option<Value> on JSON structs only — never a tasks column",
+        "skip_serializing_if Option::is_none so absent stays absent",
+        "AddTaskInput copy so spawned CLARIFY cannot drop the key",
+        "JSON-only persist Err, not skip"
+      ],
+      "requiresHuman": false,
+      "taskType": "contract",
+      "title": "Define humanReviewOutcome JSON-only round-trip (no DB column)",
+      "touchesFiles": [
+        "src/commands/init/parse.rs",
+        "src/commands/add.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "`PrdUserStory` grows `human_review_outcome: Option<Value>` with `#[serde(default, skip_serializing_if = \"Option::is_none\")]` (camelCase `humanReviewOutcome`). Grep the struct in `parse.rs` — do not trust authoring line numbers",
+        "`AddTaskInput` grows the same field; `into_prd_user_story` copies it (spawned CLARIFY row must not drop the key). Unit: `AddTaskInput` JSON with the object → `to_value` of the story still contains `humanReviewOutcome`",
+        "Every existing `PrdUserStory { … }` literal compiles (`human_review_outcome: None`). Grep `PrdUserStory {` (helpers in `add.rs`, `init/import.rs` tests, PR-1 `prd_json.rs` tests) — do not freeze line numbers",
+        "No migration; no `tasks.human_review_outcome` column. Test: `PRAGMA table_info(tasks)` does not contain that name",
+        "Round-trip: deserialize a story JSON that includes the object; serialize still includes it. Absent field: serialize omits the key",
+        "`init::import::update_task` SQL is unchanged (still no outcome bind) — grep the SET list; do not rewrite this function"
+      ],
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/commands/add.rs",
+            "impact": "BREAKS",
+            "line": 0,
+            "mitigation": "Add field + copy in into_prd_user_story. Grep the struct and the helper — do not trust frozen line numbers",
+            "usage": "AddTaskInput / into_prd_user_story struct literals"
+          },
+          {
+            "file": "src/commands/init/import.rs",
+            "impact": "OK",
+            "line": 0,
+            "mitigation": "Add None at test literals; do not bind a new SQL column",
+            "usage": "update_task full-row SET; test PrdUserStory literals"
+          },
+          {
+            "file": "src/commands/prd_json.rs",
+            "impact": "NEEDS_REVIEW",
+            "line": 0,
+            "mitigation": "PR-1 test literals (if any) get None; append still to_value of the new story only",
+            "usage": "PR-1 append tests may construct PrdUserStory"
+          }
+        ],
+        "semanticDistinctions": [
+          {
+            "context": "serde of existing PRD JSON without the key",
+            "currentBehavior": "key silently dropped (no field)",
+            "requiredBehavior": "default None; serialize omits"
+          },
+          {
+            "context": "add --stdin spawned CLARIFY",
+            "currentBehavior": "typed input drops unknown keys including outcome",
+            "requiredBehavior": "field copied so the appended JSON object keeps it"
+          }
+        ]
+      },
+      "dependsOn": [
+        "CONTRACT-003"
+      ],
+      "description": "US-003 struct slice. Add `human_review_outcome: Option<Value>` on `PrdUserStory` and `AddTaskInput`, copy in `into_prd_user_story`, fix every struct literal, prove serde round-trip and pragma absence. JSON-only persist/refuse is FEAT-004. Do not add a DB column. No skill drive.",
+      "edgeCases": [
+        "Add-spawned CLARIFY row includes the key",
+        "skip_serializing_if none omits the key",
+        "PRAGMA table_info(tasks) has no human_review_outcome",
+        "Existing extra JSON keys on a story are unrelated — do not deny_unknown_fields"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Add the field only on PrdUserStory",
+          "expectedBehavior": "AddTaskInput still drops it; unit copy test fails"
+        }
+      ],
+      "id": "FEAT-001",
+      "invariants": [
+        "No new migration and no tasks.human_review_outcome column",
+        "into_prd_user_story copies human_review_outcome"
+      ],
+      "modifiesBehavior": true,
+      "notes": "Implement against ## CONTRACT-003. Grep `PrdUserStory {` / `into_prd_user_story` — do not freeze add.rs/import.rs line numbers (they move after PR-1 extracts). JSON-only overlay persist is FEAT-004. No skill drive. Learning [3156]/[3764]: outcome in the JSON. Data contract: `#[serde(default, skip_serializing_if = \"Option::is_none\")] pub human_review_outcome: Option<Value>` — never a rusqlite bind.",
+      "passes": false,
+      "priority": 3,
+      "qualityDimensions": [
+        "Option<Value> with skip_serializing_if none — absent stays absent",
+        "AddTaskInput copy so spawned CLARIFY cannot drop the key",
+        "No DB column / no migration",
+        "import::update_task SQL unchanged"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Add humanReviewOutcome on PrdUserStory and AddTaskInput",
+      "touchesFiles": [
+        "src/commands/init/parse.rs",
+        "src/commands/add.rs",
+        "src/commands/init/import.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "`prd_json::patch_user_story(prd_path, story_id, overlay: &Value, prefix, command: &str)` — `command` is forwarded into every `invalid_state` (update passes `\"update\"`)",
+        "Existing story is a `Value` object; merge overlay whitelist keys onto it. Do not `from_value::<PrdUserStory>`. Extra keys already on the story survive a notes-only overlay",
+        "Merge skips overlay `id`. After a successful patch, the JSON story's `id` string is byte-identical to before the patch (unit: seed prefixed or unprefixed id; assert `entry[\"id\"]` unchanged)",
+        "Id match: prefixed or unprefixed (`strip_task_prefix`), same as `append_user_story`",
+        "`dependsOn` written unprefixed via the same `strip_prefix_in_id_array` helper as `append_user_story` (promote to `pub(crate)` if needed; do not duplicate). Unit: overlay `dependsOn` with a prefixed id; file array contains the unprefixed form only",
+        "`humanReviewOutcome: null` removes the key; a present object replaces",
+        "Overlay `difficulty` or `estimatedEffort` (either key, not both — both is FEAT-003 reject) writes JSON canonical `estimatedEffort` and removes a leftover `difficulty` key on that story. Unit: seed a story that already has `\"difficulty\": \"low\"`; overlay `{id, estimatedEffort: \"high\"}` (or `{id, difficulty: \"high\"}`); after patch, `entry[\"estimatedEffort\"] == \"high\"` and `entry.get(\"difficulty\")` is None. Both keys present is not this task (validator rejects)",
+        "Parameterize `atomic_write` with `command: &str` so update errors cannot say `\"add\"`. `append_user_story` may keep passing `\"add\"`. Unit: patch path `invalid_state` command == `\"update\"`",
+        "`prd_json` does not import `add` or `update`. Unique tmp + rename (existing `unique_tmp_path`); trailing newline preserved. Story not found in file: return `Err`"
+      ],
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/commands/prd_json.rs",
+            "impact": "BREAKS",
+            "line": 0,
+            "mitigation": "Parameterize atomic_write(command). Grep atomic_write — PR-1 currently hardcodes add",
+            "usage": "atomic_write / append_user_story / unique_tmp_path"
+          }
+        ],
+        "semanticDistinctions": [
+          {
+            "context": "append_user_story",
+            "currentBehavior": "to_value of the new story only; existing entries Value-preserved",
+            "requiredBehavior": "unchanged; patch is a new function"
+          },
+          {
+            "context": "patch_user_story",
+            "currentBehavior": "n/a",
+            "requiredBehavior": "Value merge; skip overlay id; unprefixed dependsOn; never PrdUserStory"
+          }
+        ]
+      },
+      "dependsOn": [
+        "CONTRACT-001",
+        "CONTRACT-002"
+      ],
+      "description": "US-004. Add `prd_json::patch_user_story` Value-merge on the write chokepoint; skip overlay `id`; unprefixed `dependsOn`; alias `difficulty`/`estimatedEffort` → JSON `estimatedEffort` (remove leftover `difficulty`); parameterize `atomic_write(command)`. Do not import add/update. JSON-only vs mixed caller mapping of `Err` is FEAT-004. No skill drive.",
+      "edgeCases": [
+        "Extra key on the existing story survives notes-only",
+        "Overlay id not copied (JSON id byte-identical)",
+        "Prefixed overlay dependsOn stripped on write",
+        "Unprefixed JSON id vs prefixed DB id still matches",
+        "Leftover add on update path forbidden (command param)",
+        "Trailing newline preserved",
+        "humanReviewOutcome null removes the key",
+        "Overlay difficulty or estimatedEffort writes JSON estimatedEffort and removes leftover difficulty",
+        "Concurrent update vs update_prd_task_passes: distinct unique_tmp_path"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "Merge copies overlay id after prefix_id",
+          "expectedBehavior": "Byte-identical id unit fails"
+        },
+        {
+          "cause": "atomic_write still hardcodes add",
+          "expectedBehavior": "Update-path invalid_state says add; unit fails"
+        }
+      ],
+      "id": "FEAT-002",
+      "invariants": [
+        "prd_json does not import add or update",
+        "Successive unique_tmp_path calls stay distinct (shared AtomicU64)",
+        "Existing extra keys survive patch",
+        "Either overlay effort key writes JSON estimatedEffort and removes leftover difficulty"
+      ],
+      "modifiesBehavior": true,
+      "notes": "Implement against ## CONTRACT-001 and ## CONTRACT-002 (effort alias). Grep `atomic_write` / `strip_prefix_in_id_array` / `unique_tmp_path` — do not freeze PR-1 prd_json.rs line numbers. Value merge does not need the PrdUserStory field (FEAT-001); `humanReviewOutcome: null` is key removal on the Value object. Alias: either overlay key → JSON `estimatedEffort`, delete leftover `difficulty` (DB `SET difficulty` is FEAT-004). Learning [5578]/[5593]/[5577]: Value round-trip, chokepoint, pid-n-nanos. Learning [3923]/[5604]: unprefixed JSON ids. No skill drive.",
+      "passes": false,
+      "priority": 4,
+      "qualityDimensions": [
+        "Value merge — never from_value PrdUserStory of an existing story",
+        "Skip overlay id; dependsOn unprefixed via the same helper as append",
+        "difficulty/estimatedEffort alias: JSON canonical estimatedEffort; leftover difficulty key removed",
+        "invalid_state command-name is a parameter (update path says update)",
+        "Tmp files stay next to the target (same-directory rename)"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Implement prd_json::patch_user_story Value merge",
+      "touchesFiles": [
+        "src/commands/prd_json.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Parse overlay as `serde_json::Value` object first (not `PrdUserStory`). Reject non-object input. Validator lives in `update.rs` (or a small update submodule), not `init::parse`",
+        "Top-level `status` or `passes` (any value, including `false` / `null`) → `invalid_state(\"update\", …)` pointing at `complete` / `fail` / `skip` / `<task-status>`. No silent skip. Full blob with `\"passes\": false` plus valid `notes` still takes the lifecycle error (order: status/passes first)",
+        "Any other non-whitelist top-level key (including `priority`, `synergyWith`/`batchWith`/`conflictsWith`, `foo`, `newId`) → hard-error naming all unknown keys. No partial apply",
+        "Both `estimatedEffort` and `difficulty` present → hard-error (ambiguous)",
+        "Nested `\"passes\"` inside `humanReviewOutcome` is not a top-level overlay key — allowed",
+        "Type/null table (no writes on violation), bound to `PrdUserStory` fields per ## CONTRACT-002: `title` non-empty string; `Option<String>` scalars null-clear; `humanReviewTimeout` integer or null; `claimsSharedInfra` bool or null; `reviewScope` JSON or null; arrays of strings (`[]` clears, null errors); `requiresHuman` bool (`null`/non-bool error); `maxRetries` integer (`null` error, do not default to 3); `humanReviewOutcome` object or null",
+        "`pub mod update` in `src/commands/mod.rs` so the new `update.rs` compiles. This task is validator-only: no SQL writer, no JSON patch, no `update()`/`update_with_conn` load-merge-write (those are FEAT-004)"
+      ],
+      "dependsOn": [
+        "CONTRACT-002"
+      ],
+      "description": "US-002. Implement overlay whitelist + reject as a testable function in `update.rs`. Value parse; lifecycle error before unknown keys; type/null table bound to `PrdUserStory` field types. `pub mod update` only — no SQL/JSON writer (FEAT-004). No skill drive.",
+      "edgeCases": [
+        "Full story blob with passes:false",
+        "Overlay with status:done",
+        "Unknown key foo plus valid notes: no partial apply",
+        "priority unknown-key (not a dedicated coming-soon message)",
+        "synergyWith / batchWith / conflictsWith unknown",
+        "Both estimatedEffort and difficulty present",
+        "Nested passes inside humanReviewOutcome allowed",
+        "title null or empty; dependsOn: null / non-array / [1]; maxRetries: null; requiresHuman: 1 / \"true\" / null"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "from_value PrdUserStory of the overlay",
+          "expectedBehavior": "passes:false blob is silently skipped or applied; lifecycle unit fails"
+        }
+      ],
+      "id": "FEAT-003",
+      "invariants": [
+        "Validator never writes DB or JSON",
+        "status/passes checked before other unknown keys",
+        "commands/mod.rs declares pub mod update; this task does not implement the writer"
+      ],
+      "modifiesBehavior": false,
+      "notes": "Implement against ## CONTRACT-002. Bind types by grepping `PrdUserStory` in parse.rs — do not invent. Overlay `requiresHuman`/`maxRetries` are stricter than serde Option. `pub mod update` here so `update.rs` compiles; do not land SQL/JSON writer (FEAT-004). No skill drive. Learning [3419]/[5345]: not a status verb.",
+      "passes": false,
+      "priority": 5,
+      "qualityDimensions": [
+        "Overlay is Value; fail closed; no partial apply",
+        "Lifecycle pointer for status/passes including a pasted full blob",
+        "Type/null table matches named PrdUserStory fields",
+        "Unknown keys including priority hard-error"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Implement overlay whitelist + reject (Value, fail closed)",
+      "touchesFiles": [
+        "src/commands/update.rs",
+        "src/commands/mod.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Extend `src/commands/update.rs` (FEAT-003 already added `pub mod update` + validator) with `update_with_conn` (testable) performing load-merge-write after FEAT-003 validation. Grep: `update.rs` does not call `import::update_task` or `delete_task_relationships`. `delete_task_files` only when the overlay contains `touchesFiles`",
+        "Partial `UPDATE tasks SET …` only for present whitelist DB columns + `updated_at`. Never SET `status`, `archived_at`, `priority`, `id`. Either overlay `estimatedEffort` or `difficulty` → `SET difficulty` (JSON canonical `estimatedEffort` is FEAT-002). JSON-only overlay (`{id, humanReviewOutcome}` or `{id, humanReviewOutcome: null}`) issues no `UPDATE tasks`",
+        "Notes-only: title, priority, status, `archived_at` unchanged (seed `archived_at` non-NULL; it stays). In-progress notes-only: status stays `in_progress`",
+        "`dependsOn` present (including `[]`) → `DELETE FROM task_relationships WHERE task_id = ? AND rel_type = 'dependsOn'` then insert. Seed an old synergy/batch/conflicts row; it survives. Absent key leaves all relationship rows. `touchesFiles` omit vs replace (including `[]` clears) covered by unit tests",
+        "JSON-only overlay + missing write path or `patch_user_story` `Err` → `invalid_state(\"update\", …)` naming `task-mgr current` and retry `--from-json`. Do not `Ok` with a skip note. No DB write. Mixed overlay (`notes` + `humanReviewOutcome`) + patch `Err` → pin 11 warning; DB committed; never `export` (warning may mention later `loop init --append --update-existing` will SET from stale JSON)",
+        "Missing / empty overlay `id`, unknown task id, and `id`-only overlay (`no updatable fields`) error before writes. Overlay `id` in DB but not in JSON: mixed → pin 11; JSON-only → `invalid_state` no DB write",
+        "After a successful JSON-only overlay with a write path, the file contains the object; `PRAGMA table_info(tasks)` still has no `human_review_outcome`. After `loop init --append --update-existing`, the JSON file still contains the object (`import::update_task` SQL unchanged)"
+      ],
+      "dependsOn": [
+        "CONTRACT-001",
+        "CONTRACT-002",
+        "CONTRACT-003",
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003"
+      ],
+      "description": "US-001 + remaining US-003 persist. Dedicated writer: partial UPDATE, scoped dependsOn delete, JSON-only refuse vs mixed pin 11, humanReviewOutcome persist + re-import survival. Clap / pin-order wrapper is FEAT-005. No skill drive.",
+      "edgeCases": [
+        "Notes-only overlay: only notes + updated_at change",
+        "Archived row notes-only: archived_at stays non-NULL",
+        "In-progress notes-only: status stays in_progress",
+        "dependsOn omitted vs [] vs replace; synergy row survives",
+        "touchesFiles omitted vs [] vs replace; null already rejected by FEAT-003",
+        "JSON-only overlay no write path: invalid_state, no DB write",
+        "JSON-only overlay patch Err: invalid_state, no DB write",
+        "Mixed overlay JSON Err: DB committed; warning never export",
+        "humanReviewOutcome only overlay with write path OK: JSON gains object; no tasks column",
+        "Overlay id not in DB: error before writes",
+        "Overlay id in DB not in JSON: mixed pin 11 vs JSON-only invalid_state",
+        "id-only overlay and missing id: error before writes",
+        "loop init --append --update-existing after update keeps the outcome key",
+        "Either overlay estimatedEffort or difficulty → SET tasks.difficulty"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "Call delete_task_relationships for dependsOn",
+          "expectedBehavior": "Synergy seed row gone; unit fails"
+        },
+        {
+          "cause": "JSON-only copies add skip path",
+          "expectedBehavior": "Ok with nothing persisted; invalid_state unit fails"
+        }
+      ],
+      "id": "FEAT-004",
+      "invariants": [
+        "Never SET status, archived_at, priority, id",
+        "Either overlay effort key SETs tasks.difficulty",
+        "JSON-only overlay never UPDATE tasks and never Ok-skips",
+        "dependsOn DELETE is rel_type-scoped"
+      ],
+      "modifiesBehavior": false,
+      "notes": "Implement against ## CONTRACT-001 / 002 / 003. Pin order, clap, and `update()` public wrapper are FEAT-005 — this task owns `update_with_conn` given a resolved path/prefix. `pub mod update` is already in `commands/mod.rs` from FEAT-003. Either overlay effort key → `SET difficulty` (JSON `estimatedEffort` + leftover `difficulty` removal is FEAT-002). Empty prefix skip of `prefix_id` on lookup/dependsOn SQL belongs here if this function prefixes ids: skip when prefix empty (learning [5597]). Grep `update_task` / `delete_task_relationships` / `prefix_id` / `patch_user_story`. Data contract: overlay stays Value; `DELETE FROM task_relationships WHERE task_id = ? AND rel_type = 'dependsOn'`; then `insert_relationship`. JSON-only: no rusqlite UPDATE. No skill drive. Learning [1211]: seed archived_at via SQL UPDATE in tests (not production SET).",
+      "passes": false,
+      "priority": 6,
+      "qualityDimensions": [
+        "Partial UPDATE only for present DB columns — notes-only cannot clobber",
+        "Either overlay estimatedEffort or difficulty SETs tasks.difficulty",
+        "JSON-only overlay invalid_state if file cannot be patched",
+        "Scoped dependsOn delete; never delete_task_relationships",
+        "invalid_state command-name is update; mixed JSON Err never names export",
+        "No unwrap on filesystem or SQLite"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Implement update load-merge-write (partial SQL + JSON-only refuse)",
+      "touchesFiles": [
+        "src/commands/update.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "`Commands::Update { json: Option<String>, stdin: bool, from_json: Option<PathBuf> }` next to Add. `--json` conflicts with `--stdin`. Help: pin this already-registered effort, not import. Distinct from `init --from-json`. Clap parse test in `src/cli/tests.rs` (`cargo test -p task-mgr cli::`)",
+        "`main.rs` dispatch mirrors Add (read `--json` / `--stdin`; neither → `invalid_state(\"update\", \"input\", …)`; pass `from_json`). Print the same `→ active prefix= source= target=` line as add. `--from-json` does not insert `prd_files` / `prd_metadata` rows",
+        "Pin order matches add (do not invent a second connection to beat parse): (1) `--from-json` missing/directory: `preflight_from_json_path` (or shared equivalent) **before** overlay parse; (2) parse overlay JSON; (3) LockGuard + open conn; (4) `resolve_context(conn, from_json, \"update\")` — unregistered pin errors here; (5) ≥2 refuse via shared helper `refuse_unpinned_write` (`ctx.is_none() && load_known_prefixes().len() >= 2`) **before** the write txn. Do not put this inside `resolve_context`. Extract the helper from add if PR-1 inlined it; prefer extract so copies cannot drift",
+        "Zero-prefix / `--no-prefix`: update of an existing unprefixed id OK; JSON sync iff `sole_task_list_path` returns `Some` and `cli_write_path` is a regular file. Empty `ctx.prefix`: skip `apply_prefix` **and** `prefix_id` on overlay `id` (lookup) and `dependsOn` ids used for SQL",
+        "Mixed overlay: after DB commit, `patch_user_story` on `ctx.prd_json_path` **only**. `--from-json` → canonical PATH (never remapped away). Default → remap then `is_file()` (worktree else registered else skip). `ctx is None` → `sole_task_list_path` then `cli_write_path`. JSON-only: same path selection; missing/empty path or patch `Err` → `invalid_state` (FEAT-004). Unregistered `--from-json`: error **after** parse, before write txn; copy names `loop init`; `SELECT` unchanged",
+        "Mixed-overlay JSON-sync failure: warning names `task-mgr current` and retry `--from-json`; never `export`; DB not rolled back. Warning may add that a later `loop init --append --update-existing` will SET DB columns from the stale JSON"
+      ],
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/main.rs",
+            "impact": "NEEDS_REVIEW",
+            "line": 0,
+            "mitigation": "Mirror Add dispatch with from_json. Grep Commands::Add — do not freeze line numbers",
+            "usage": "Commands enum match; lookup_hint on clap failure"
+          },
+          {
+            "file": "src/commands/add.rs",
+            "impact": "NEEDS_REVIEW",
+            "line": 0,
+            "mitigation": "Extract refuse_unpinned_write; add keeps calling it. Grep the ≥2 predicate",
+            "usage": "PR-1 may inline ctx.is_none() && load_known_prefixes().len() >= 2"
+          },
+          {
+            "file": "src/commands/context.rs",
+            "impact": "NEEDS_REVIEW",
+            "line": 0,
+            "mitigation": "Helper lives outside resolve_context; current probe stays Ok(None)",
+            "usage": "resolve_context / sole_task_list_path / cli_write_path / preflight_from_json_path"
+          }
+        ],
+        "semanticDistinctions": [
+          {
+            "context": "init --from-json",
+            "currentBehavior": "import shim; registers PRD",
+            "requiredBehavior": "unchanged. update --from-json is pin only"
+          },
+          {
+            "context": "current without flag, 2+ prefixes",
+            "currentBehavior": "Ok(None) probe",
+            "requiredBehavior": "Keep probe; refuse is write-only at add AND update callers"
+          }
+        ]
+      },
+      "dependsOn": [
+        "CONTRACT-001",
+        "CONTRACT-002",
+        "FEAT-004"
+      ],
+      "description": "US-005. Clap `Update` + pin/write-policy wrapper around FEAT-004. Same `--from-json` pin as add; directory `is_file()` before parse; unregistered/≥2 after parse; extract `refuse_unpinned_write` (write-only). Live git-worktree matrix is FEAT-007. No skill drive.",
+      "edgeCases": [
+        "Directory / missing --from-json: error before overlay parse; no DB",
+        "Unregistered --from-json: error after parse, before write txn; copy names loop init",
+        "≥2 prefixes, no env, no --from-json: refuse; no DB write; no JSON write; current still probe",
+        "--no-prefix / 0-prefix: update of existing row OK; JSON sync iff exactly one task_list file",
+        "Empty ctx.prefix: skip apply_prefix and prefix_id (no -FEAT-001)",
+        "--from-json PATH always writes that PATH (never remapped away)",
+        "JSON-only vs mixed failure (invalid_state vs pin 11 warning)",
+        "Failure copy drops export",
+        "Match (a) stray same-prefix copy: registered via prefix OR; pin 4 writes that PATH (PR-1 residual, do not reopen)"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "Unregistered check before parse via a second connection",
+          "expectedBehavior": "Disagrees with add; FEAT-005 pin-order tests fail"
+        },
+        {
+          "cause": "Directory --from-json waits for JSON parse (canonicalize succeeds on a dir)",
+          "expectedBehavior": "Opaque parse error; AC requires is_file() before parse"
+        },
+        {
+          "cause": "Refuse inside resolve_context",
+          "expectedBehavior": "current ≥2 probe stops exiting 0"
+        }
+      ],
+      "id": "FEAT-005",
+      "invariants": [
+        "Pin order: missing/directory before parse; unregistered/≥2 after parse, before write txn",
+        "refuse_unpinned_write is outside resolve_context",
+        "--from-json never inserts prd_files or prd_metadata"
+      ],
+      "modifiesBehavior": true,
+      "notes": "Implement against ## CONTRACT-001 / PR-1 `resolve_context`. Grep `preflight_from_json_path` / `refuse_unpinned_write` / `sole_task_list_path` / `cli_write_path` / `resolve_context` — do not freeze add.rs line numbers. Help says pin, not import. Clap tests: `cargo test -p task-mgr cli::`. Binary hint tests stay `tests/cli_tests.rs` (FEAT-006). No skill drive (FEAT-008). Learning [3126]: pre-flight before txn. Learning [5596]/[5602]: pin, never remap PATH. Learning [5597]: empty prefix skips both prefix helpers. Learning [2903]: EnvIsolation for TASK_MGR_ACTIVE_PREFIX tests.",
+      "passes": false,
+      "priority": 7,
+      "qualityDimensions": [
+        "--from-json means pin; help says pin, not import",
+        "Directory is_file() before overlay parse; unregistered after parse",
+        "≥2 refuse is write-only (add and update), not inside resolve_context",
+        "Empty prefix skips apply_prefix and prefix_id",
+        "JSON-sync failure copy names current + retry --from-json, never export",
+        "ui::emit_err for operator copy"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Add clap Update + pin/write policy matching add",
+      "touchesFiles": [
+        "src/cli/commands.rs",
+        "src/cli/tests.rs",
+        "src/main.rs",
+        "src/commands/update.rs",
+        "src/commands/add.rs",
+        "src/commands/context.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Remove `update` from `WRONG_SUBCOMMAND_HINTS`. Once the command exists, `lookup_hint` on argv `update …` must not say `has no update subcommand`. Rewrite `update_hint_references_loop_init_workflow` and `tests/cli_tests.rs` cases at the `[\"update\", \"FOO-1\", \"--title\", \"x\"]` rows (currently expect no-update / loop init). Optional `WRONG_ARG_HINTS` for `update` + `--title`: overlay is `--stdin`/`--json`, `id` in the object",
+        "`edit` and `change` hints point at `task-mgr update --stdin` (overlay JSON with `id` + whitelist fields; pin with `--from-json` when ≥2 prefixes). They must not tell the user to edit JSON + `loop init`. `set-status` hint unchanged (lifecycle table)",
+        "Enhance template CLARIFY block (`templates.rs` Human-in-the-loop section): on resolution, pipe `{id, humanReviewOutcome}` to `task-mgr update --stdin` (with `--from-json tasks/<prd>.json` when pinning), then `task-mgr complete <clarify-id>`. Stop telling operators to embed the block by hand-editing the JSON and `loop init --append --update-existing` as the field-write path. Keep the example outcome object (it is the overlay field value). Downstream task field updates in the same resolution also go through `update --stdin`, not `Edit`",
+        "After the template rewrite, regenerate the managed `CLAUDE.md` block with `task-mgr enhance agents` (do not hand-edit inside `TASK_MGR:BEGIN/END`). Unit: fenced block contains `update --stdin` and does not tell agents to `Edit` the JSON for `humanReviewOutcome`",
+        "Intents: (a) JSON Don't-hand-edit recipe lists `task-mgr update --stdin` for field patches; (b) a CLARIFY intent (keyword bag includes `clarify`) shows `update --stdin` then `complete <clarify-id>`. Do not rewrite cheatsheet / `task_ops` / historical `tasks/*-prompt.md` (PR-3). `how` unit test: query containing `clarify` contains `update --stdin` and `complete`",
+        "Flip PR-1 `context.rs` rustdoc/comments that say the ≥2 refuse is add-only to write-only (add and update) when extracting `refuse_unpinned_write` (module docs, `resolve_context` docs, `load_known_prefixes` docs, the 2+ probe test comment). Grep `add-only` in `context.rs` → zero hits on the refuse"
+      ],
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/cli/error_recovery.rs",
+            "impact": "BREAKS",
+            "line": 0,
+            "mitigation": "Delete the update WRONG_SUBCOMMAND row; retarget edit/change. Grep WRONG_SUBCOMMAND_HINTS",
+            "usage": "update/edit/change hints; lookup_hint on any clap failure"
+          },
+          {
+            "file": "tests/cli_tests.rs",
+            "impact": "BREAKS",
+            "line": 0,
+            "mitigation": "Rewrite update FOO-1 --title x cases; set-status cases stay",
+            "usage": "expect no update subcommand / loop init"
+          },
+          {
+            "file": "src/commands/enhance/templates.rs",
+            "impact": "BREAKS",
+            "line": 0,
+            "mitigation": "Rewrite CLARIFY block then task-mgr enhance agents",
+            "usage": "Human-in-the-loop embed-in-JSON recipe"
+          },
+          {
+            "file": "CLAUDE.md",
+            "impact": "BREAKS",
+            "line": 0,
+            "mitigation": "Regenerate via enhance agents; do not hand-edit TASK_MGR markers",
+            "usage": "Managed fenced workflow block still teaches hand-edit"
+          },
+          {
+            "file": "src/commands/intents.rs",
+            "impact": "NEEDS_REVIEW",
+            "line": 0,
+            "mitigation": "Add update --stdin to Don't-hand-edit; add clarify intent",
+            "usage": "JSON Don't-hand-edit list; how(query)"
+          }
+        ],
+        "semanticDistinctions": [
+          {
+            "context": "lookup_hint first token update after clap grows the command",
+            "currentBehavior": "WRONG_SUBCOMMAND says no update yet; edit JSON; loop init",
+            "requiredBehavior": "Row gone; optional WRONG_ARG_HINT for --title points at --stdin"
+          },
+          {
+            "context": "set-status",
+            "currentBehavior": "lifecycle table hint",
+            "requiredBehavior": "unchanged (pin 21)"
+          }
+        ]
+      },
+      "dependsOn": [
+        "FEAT-005"
+      ],
+      "description": "US-006. Swap error_recovery hints, rewrite CLARIFY enhance template then `task-mgr enhance agents`, add intents + how(clarify) test, flip context.rs add-only refuse comments to write-only. Cheatsheet/task_ops/historical prompts are PR-3. No skill drive.",
+      "edgeCases": [
+        "lookup_hint still fires on clap parse failure for the now-valid update subcommand — must not lie",
+        "task-mgr update FOO-1 --title x: clap fails; hint (if any) points at --stdin/--json overlay",
+        "task-mgr edit / change: hint points at update --stdin, not loop init",
+        "task-mgr set-status: unchanged lifecycle hint table",
+        "In-tree CLAUDE.md fenced block matches template after enhance agents",
+        "context.rs no longer says add-only refuse"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Leave the update WRONG_SUBCOMMAND row",
+          "expectedBehavior": "lookup_hint still says no update subcommand after clap exists"
+        },
+        {
+          "cause": "Template rewrite without enhance agents",
+          "expectedBehavior": "In-tree CLAUDE.md still teaches hand-edit + loop init"
+        }
+      ],
+      "id": "FEAT-006",
+      "invariants": [
+        "set-status hint table unchanged",
+        "Managed CLAUDE.md is regenerated, not hand-edited inside markers"
+      ],
+      "modifiesBehavior": true,
+      "notes": "Grep `WRONG_SUBCOMMAND_HINTS` / `update_hint_references_loop_init` / `Human-in-the-loop` / `add-only` — do not freeze error_recovery.rs:32 or cli_tests.rs:2860. Binary hint tests stay `tests/cli_tests.rs`. how test in `src/commands/how.rs`. Do not rewrite cheatsheet (PR-3). No skill drive. Learning [4224]: CLI-only task ops.",
+      "passes": false,
+      "priority": 8,
+      "qualityDimensions": [
+        "update is a real command; lookup_hint must not say it does not exist",
+        "edit/change point at update --stdin, not JSON + loop init",
+        "CLARIFY recipe is update --stdin then complete; managed CLAUDE.md regenerated",
+        "context.rs refuse comments say write-only",
+        "set-status remains the lifecycle table (pin 21)"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Swap hints + CLARIFY docs to update --stdin then complete",
+      "touchesFiles": [
+        "src/cli/error_recovery.rs",
+        "tests/cli_tests.rs",
+        "src/commands/enhance/templates.rs",
+        "CLAUDE.md",
+        "src/commands/intents.rs",
+        "src/commands/how.rs",
+        "src/commands/context.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Live-path tests following `tests/worktree_db_resolution.rs` (spawn `git worktree add`); not the verify-task-mgr sandbox",
+        "Main checkout cwd → registered path unchanged",
+        "Linked worktree, worktree file exists → patch worktree copy; `cmp` of main JSON empty; DB row in main-repo `.task-mgr`",
+        "Linked worktree, only main file exists → patch main; do not invent a worktree path; no basename search",
+        "`--from-json PATH` always patches that PATH (never remapped away), including a worktree path that is registered via pin-19 identity and/or match (a)",
+        "Existing `worktree_db_resolution` add assertions stay green (DB anchoring unchanged)"
+      ],
+      "dependsOn": [
+        "FEAT-005"
+      ],
+      "description": "US-007. Linked-worktree live-path rust tests for update (worktree file exists vs only-main-exists; `--from-json` not remapped; DB still main checkout). Pattern: `tests/worktree_db_resolution.rs`. Not verify-task-mgr. No skill drive.",
+      "edgeCases": [
+        "Linked worktree, worktree file exists: patch worktree; main JSON bytes unchanged; DB in main .task-mgr",
+        "Linked worktree, only main file exists: patch main; no invent; no basename search",
+        "--from-json PATH never remapped away",
+        "DB anchoring unchanged (existing add tests stay green)"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Invent a worktree JSON path when only main exists",
+          "expectedBehavior": "Data loss / empty file; only-main-exists unit fails"
+        }
+      ],
+      "id": "FEAT-007",
+      "invariants": [
+        "DB still resolves to main checkout .task-mgr from a worktree cwd",
+        "No basename search"
+      ],
+      "modifiesBehavior": false,
+      "notes": "Follow tests/worktree_db_resolution.rs (spawn git worktree add). Learning [4237]/[4441]/[3240]: write the live copy when it exists. Learning [2903]: EnvIsolation — helper/tests must not leak TASK_MGR_ACTIVE_PREFIX. Sandboxes are not worktrees — do not claim these via verify-task-mgr. No skill drive.",
+      "passes": false,
+      "priority": 9,
+      "qualityDimensions": [
+        "Worktree file exists → that file is patched; cmp of main JSON is empty",
+        "--from-json PATH is never remapped away",
+        "Do not invent a path; do not search by basename",
+        "DB anchoring unchanged"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Worktree live-path rust tests for update",
+      "touchesFiles": [
+        "tests/worktree_db_resolution.rs",
+        "src/commands/update.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Create `.claude/skills/verify-task-mgr/features/update-and-human-review-outcome.md` following `features/README.md` (H1 + paragraph; Sub-features; How to get to it; Driving it with verify-task-mgr; Gotchas) **before** any drive AC in this task. Link it from `features/README.md`. Then drive it (001–007 have no skill drive)",
+        "Drive via `.claude/skills/verify-task-mgr/SKILL.md`: launch, sandbox-new, doctor, capture/cli, snapshot-db, cleanup. Never PATH binary; never checkout `.task-mgr`; never operator HOME",
+        "Proof (artifacts kept under `.claude/skills/verify-task-mgr/artifacts/<run-id>/`): notes-only (sql title/priority/status unchanged); full blob with `passes` rejected (no sql change); unknown key rejected; type/null reject (`title` empty or `dependsOn: null`); `humanReviewOutcome` overlay then `loop init --append --update-existing` (jq still has the key; pragma/sql has no column); JSON-only overlay with no registered `task_list` is non-zero (`invalid_state`, not skip); `--from-json` pin; ≥2-prefix unpinned refuse (**two `loop init`s without `--no-prefix`** — `sample_prd --no-prefix` twice yields 0 prefixes); `--no-prefix` update still works; `update --help` says **pin**; `edit` hint names `update --stdin`; managed `CLAUDE.md` fenced block names `update --stdin` for CLARIFY",
+        "Worktree live-path cases are not claimed via this harness; they are FEAT-007 rust tests",
+        "Compile/unit tests alone do not satisfy this story. If the skill is blocked (can't launch, unmet precondition), emit BLOCKED rather than marking done. Drive `.claude/skills/verify-task-mgr/SKILL.md` feature `update-and-human-review-outcome` per SKILL.md; evidence captured"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "FEAT-005",
+        "FEAT-006",
+        "FEAT-007"
+      ],
+      "description": "US-008. Create `features/update-and-human-review-outcome.md` (four H2 sections per features/README.md), link it from the map, then drive SKILL.md for update/overlay-reject/CLARIFY in an isolated sandbox. Compile/unit tests alone do not satisfy this story. Worktree live-path stays rust tests.",
+      "edgeCases": [
+        "Helper unsets TASK_MGR_ACTIVE_PREFIX; use --dir injection only",
+        "≥2-prefix proof is two prefixed loop inits (distinct taskPrefix), not two --no-prefix copies of sample_prd",
+        "Create recipe then drive (file exists before the drive AC)",
+        "JSON-only overlay with no registered task_list is non-zero invalid_state, not skip"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "Mark done from cargo test only",
+          "expectedBehavior": "AC forbids it; REVIEW-001 re-drives mapped features"
+        },
+        {
+          "cause": "Two --no-prefix inits as ≥2-prefix proof",
+          "expectedBehavior": "0 prefixes; refuse never fires; drive looks green while pin 3 is untested"
+        }
+      ],
+      "id": "FEAT-008",
+      "invariants": [
+        "doctor isolation: ok before drive",
+        "After cleanup, artifacts/<run-id>/ still lists captured files",
+        "Feature file exists before the drive steps in this same task"
+      ],
+      "modifiesBehavior": false,
+      "notes": "Helper unsets TASK_MGR_ACTIVE_PREFIX — use --dir injection only. Seeded sample_prd.json has taskPrefix 3019e47c; SKILL.md's canned recipe is loop init --no-prefix. Two --no-prefix imports ⇒ load_known_prefixes().len()==0 ⇒ refuse never fires. ≥2-prefix refuse: two loop inits without --no-prefix (distinct taskPrefix) — not two --no-prefix copies of sample_prd. Learning [5443]: isolating HOME breaks rustup — the helper must keep RUSTUP_HOME/CARGO_HOME. Learning [1494]: launch builds this checkout's binary. Do not drive loop run. Follow `.claude/skills/verify-task-mgr/SKILL.md` feature `update-and-human-review-outcome`; do not invent a second harness.",
+      "passes": false,
+      "priority": 12,
+      "qualityDimensions": [
+        "User-facing proof is the skill drive + artifacts, not cargo test",
+        "Feature file uses the four H2 sections in order; no implementation internals",
+        "Sandbox isolation: --dir under /tmp/task-mgr-verify-*, HOME inside that root",
+        "Worktree live-path is explicitly out of this harness",
+        "≥2-prefix sandbox is two prefixed loop inits"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "verify-task-mgr feature file + isolated sandbox proof",
+      "touchesFiles": [
+        ".claude/skills/verify-task-mgr/features/update-and-human-review-outcome.md",
+        ".claude/skills/verify-task-mgr/features/README.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Grep `update.rs`: no `update_task`, no `delete_task_relationships`. Production SQL never `SET status` / `archived_at` / `priority` / `id` (JSON-only path issues no `UPDATE tasks`). Tests may seed `archived_at` via raw SQL — that is not a production SET",
+        "Grep `prd_json.rs`: no import of `add` or `update`; `atomic_write` takes `command`; patch skips overlay `id`; `dependsOn` uses `strip_prefix_in_id_array`",
+        "≥2 refuse is write-only (`refuse_unpinned_write` outside `resolve_context`); empty prefix skips `apply_prefix` and `prefix_id`; pin order matches add (directory `is_file()` before parse)",
+        "`WRONG_SUBCOMMAND_HINTS` has no `update` row; `edit`/`change` name `update --stdin`; managed `CLAUDE.md` fenced block names `update --stdin` for CLARIFY; `context.rs` does not say add-only refuse",
+        "qualityDimensions met; no unwrap on fs/SQLite in new modules; ui::emit_err for operator copy; CONTRACT-001/002/003 respected; no `human_review_outcome` column",
+        "New code reachable: `Commands::Update` dispatched in `main.rs`; `update` calls `patch_user_story` and `resolve_context`; enhance template regenerated",
+        "Any issues found have corresponding CODE-FIX-xxx / WIRE-FIX-xxx tasks added via task-mgr add --stdin --depended-on-by REVIEW-001 --from-json tasks/agent-task-ops-pr2.json"
+      ],
+      "dependsOn": [
+        "CONTRACT-001",
+        "CONTRACT-002",
+        "CONTRACT-003",
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "FEAT-005",
+        "FEAT-006",
+        "FEAT-007"
+      ],
+      "description": "Post-implementation wiring review of CONTRACT implementations and FEAT-001–007. Look for import::update_task reuse, delete_task_relationships, PrdUserStory overlay parse, JSON-only Ok-skip, leftover add in invalid_state, refuse inside resolve_context, add-only comments, unregenerated CLAUDE.md, and unreachable Update clap. Production SQL never SET status/archived_at/priority/id; tests may seed archived_at.",
+      "estimatedEffort": "high",
+      "id": "CODE-REVIEW-1",
+      "modifiesBehavior": false,
+      "notes": "If no issues, emit status with a one-line 'No issues found' in the progress file. Spawn fixups with --depended-on-by REVIEW-001 and --from-json tasks/agent-task-ops-pr2.json (learning #2236). FEAT-008 skill drive is user-facing proof, not this wiring review. Grep production UPDATE in update.rs for status/archived_at/priority/id — do not flag test helpers that seed archived_at.",
+      "passes": false,
+      "priority": 13,
+      "qualityDimensions": [
+        "Wiring: Update clap reaches update.rs reaches patch_user_story",
+        "Pins 5–7 / 10–13 / 16–17 / 19 / 21 not contradicted",
+        "Known-bad discriminators from CONTRACTs actually have tests"
+      ],
+      "requiresHuman": false,
+      "taskType": "review",
+      "title": "Review update writer, overlay reject, outcome field, clap, and wiring",
+      "touchesFiles": [
+        "src/commands/update.rs",
+        "src/commands/prd_json.rs",
+        "src/commands/context.rs",
+        "src/commands/init/parse.rs",
+        "src/commands/add.rs",
+        "src/cli/commands.rs",
+        "src/cli/error_recovery.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Overlay whitelist + type/null table do not remain as a second copy in `init::parse` or `import.rs`",
+        "Coupling budget held: `update` must not call `import::update_task` or `delete_task_relationships`; `prd_json` must not import `add` or `update`; `--from-json` must not call `init` / `register_prd_files`; ≥2 refuse must not enter `resolve_context`",
+        "Complexity/clarity: pin order is readable and matches add; JSON-only vs mixed failure split is a small predicate, not a new abstraction; `refuse_unpinned_write` is the only ≥2 write-refuse copy",
+        "Any issues found have corresponding REFACTOR-xxx tasks added via task-mgr add --stdin --depended-on-by REVIEW-001 --from-json tasks/agent-task-ops-pr2.json"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "FEAT-005",
+        "FEAT-006",
+        "FEAT-007",
+        "FEAT-008",
+        "CODE-REVIEW-1"
+      ],
+      "description": "Full-context pass over the new writer and call sites: DRY (duplicate refuse predicate left in add.rs), coupling (prd_json importing update, overlay reject on PrdUserStory), leftover add-only comments, and contract fidelity.",
+      "estimatedEffort": "high",
+      "id": "REFACTOR-REVIEW-FINAL",
+      "modifiesBehavior": false,
+      "notes": "Optional in the lean skeleton; included because this PR adds a writer PR-3 export will sit beside. Do not bundle drive-by cleanup unrelated to update/outcome.",
+      "passes": false,
+      "priority": 70,
+      "qualityDimensions": [
+        "One overlay validator, one JSON patch function, one write-refuse helper",
+        "No speculative abstraction beyond the three CONTRACTs"
+      ],
+      "requiresHuman": false,
+      "taskType": "review",
+      "title": "Final refactor review of update writer / patch / refuse extract",
+      "touchesFiles": [
+        "src/commands/update.rs",
+        "src/commands/prd_json.rs",
+        "src/commands/context.rs",
+        "src/commands/add.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Full unscoped gate green: cargo fmt --check && cargo check && cargo clippy --all-targets -- -D warnings && cargo test (fix every failure including pre-existing, or spawn FIX-xxx --depended-on-by REVIEW-001)",
+        "Drive `.claude/skills/verify-task-mgr/SKILL.md` feature `update-and-human-review-outcome` (every sub-feature this PRD touched). A skipped sub-feature is reported skipped, not verified via a sibling path. Evidence captured. Compile/unit tests alone are not proof",
+        "Grep guards: no `update_task` / `delete_task_relationships` in `update.rs`; no `human_review_outcome` in migrations; no `task-mgr export` in update JSON-sync copy; `WRONG_SUBCOMMAND_HINTS` has no `update` row; fenced `CLAUDE.md` contains `update --stdin`; `context.rs` refuse is write-only",
+        "Out of scope held: no export `--all`/`--force`, no remapper/add clap rewrite, no `set-status` command, no DB-anchoring change, no historical prompt rewrites, no `priority` on the whitelist",
+        "Any issues found have corresponding FIX-xxx tasks added via task-mgr add --stdin --depended-on-by REVIEW-001 --from-json tasks/agent-task-ops-pr2.json"
+      ],
+      "dependsOn": [
+        "CONTRACT-001",
+        "CONTRACT-002",
+        "CONTRACT-003",
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "FEAT-005",
+        "FEAT-006",
+        "FEAT-007",
+        "FEAT-008",
+        "CODE-REVIEW-1",
+        "REFACTOR-REVIEW-FINAL"
+      ],
+      "description": "PR-2 milestone. Full unscoped quality gate on a clean checkout. Re-drive verify-task-mgr feature update-and-human-review-outcome. Leave the trunk green including pre-existing failures. Confirm pins 8–9 / 18 were not implemented and remapper/add clap were not re-shipped.",
+      "estimatedEffort": "high",
+      "id": "REVIEW-001",
+      "modifiesBehavior": false,
+      "notes": "REVIEW-001 is the milestone. Follow `.claude/skills/verify-task-mgr/SKILL.md` feature `update-and-human-review-outcome`. ≥2-prefix refuse in the sandbox: two loop inits without --no-prefix (distinct taskPrefix) — do not use two --no-prefix copies of sample_prd. Worktree live-path is FEAT-007 rust tests, not this skill. Do not invent a second harness. Below ~12 unrelated failures, fix them; above that, spawn one FIX/CLARIFY and BLOCKED.",
+      "passes": false,
+      "priority": 99,
+      "qualityDimensions": [
+        "Trunk green including pre-existing failures",
+        "Mapped verify-task-mgr feature fully driven",
+        "PR-2 scope lock: no PR-3 export; no remapper/add clap rewrite"
+      ],
+      "requiresHuman": false,
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Final gate: full suite + mapped verify-task-mgr drive",
+      "touchesFiles": [
+        "src/commands/update.rs",
+        "src/commands/prd_json.rs",
+        "src/cli/commands.rs",
+        ".claude/skills/verify-task-mgr/features/update-and-human-review-outcome.md"
+      ]
+    }
+  ],
+  "version": "1.0"
+}

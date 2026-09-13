@@ -1,0 +1,609 @@
+{
+  "version": "1.0",
+  "project": "task-mgr",
+  "branchName": "feat/quota-rung-policy",
+  "prdFile": "prd-quota-rung-policy.md",
+  "description": "Stop folding rung-scoped Claude usage (frontier weekly) into the account wait clock. Remaining percent is the unit. Generic quota buckets + horizon heuristic (wait ≤1h, ask when other rungs work, stop if reset >12h and nothing else can run). Engine keys unavailability on capability rungs (frontier/standard/cost-efficient/cheapest), never model ids. --use-other-models-ttl caps ask before continuing on working rungs.",
+  "requires": [],
+  "mergeStrategy": "Merge to main after REVIEW-001 passes. Squash commits optional.",
+  "priorityPhilosophy": {
+    "description": "Hierarchy of what matters most when implementing tasks",
+    "hierarchy": [
+      "1. PLAN — Anticipate edge cases before coding",
+      "2. PHASE 2 FOUNDATION — ~1 day now to save ~2+ weeks later (1:10+ ratio); we are pre-launch, foundations compound",
+      "3. FUNCTIONING CODE — Pragmatic, reliable, wired in per plan",
+      "4. CORRECTNESS — Compiles, type-checks, scoped tests pass deterministically",
+      "5. CODE QUALITY — Clean code, qualityDimensions satisfied, no warnings",
+      "6. POLISH — Docs, formatting, minor improvements"
+    ],
+    "principles": [
+      "Quality dimensions explicit — qualityDimensions on every task tells you what 'good' looks like",
+      "Phase 2 foundation — generic QuotaBucket + evaluate_quota over a Fable-only special case",
+      "Edge cases = test cases — every known edge case must have a corresponding test",
+      "Scoped per-iteration tests, full suite at REVIEW-001 — REVIEW must leave the trunk green including pre-existing failures",
+      "PR-1 (FIX-001/FIX-002) is independently shippable and must not wait on CONTRACT-001",
+      "Engine speaks capability rungs, never model ids except the ingest adapter",
+      "Ship working code with tests to prove it; handle Option/Result explicitly; avoid unwrap() in production"
+    ]
+  },
+  "prohibitedOutcomes": [
+    "Folding weekly_scoped / severity=critical / is_active into the account remaining or reset_at",
+    "Storing fable / opus / claude-fable-5 in quota.rs or IterationContext blackout keys",
+    "Treating frontier-low as an account wait or as crash/auto-block",
+    "Soonest-reset among multiple low wait buckets (must be latest)",
+    "Spend stop at remaining-percent floor (must be remainingAmount lte 0)",
+    "Default-low on severity=critical or is_active",
+    "PR-2 skip-wait on unavailable/ask before the rung-blackout channel exists (hot loop)",
+    "Reusing handle_quota_deferral for rung-only exhaustion (stale-abort, learning 3927)",
+    "Collapsing dual Anthropic I/O predicates onto one flag",
+    "Silently ignoring LOOP_USAGE_THRESHOLD (must preflight error)",
+    "Remaining as a 0.08 ratio instead of 0–100 percent",
+    "Live remaining numbers on models show without a remote-gated fetch",
+    "Tests that require live Anthropic network or real ~/.claude credentials",
+    "Manual edits to tasks/*.json for status",
+    "unwrap() in production paths",
+    "Catch-all error handlers that swallow context"
+  ],
+  "globalAcceptanceCriteria": {
+    "description": "These criteria apply to ALL implementation tasks",
+    "criteria": [
+      "No warnings in `cargo check` output",
+      "No warnings in `cargo clippy --all-targets -- -D warnings`",
+      "`cargo fmt --check` passes",
+      "Scoped tests for touched modules pass",
+      "No unwrap() in production code paths",
+      "Sequential and wave paths stay parity-locked for account reactions (exhaustive destructure, shared coordinators)",
+      "quota.rs and engine.rs blackout keys contain no model-id literals (frontier/standard/cost-efficient/cheapest only)"
+    ]
+  },
+  "reviewGuidelines": {
+    "priorityGuidelines": {
+      "critical": "1-10: Blocks further work, fix immediately",
+      "high": "11-20: Fix before phase completion",
+      "medium": "21-50: Fix in current phase if time permits",
+      "low": "51-99: Defer to hardening phase"
+    }
+  },
+  "userStories": [
+    {
+      "id": "FIX-001",
+      "title": "Account wait uses only session and weekly-all remaining",
+      "taskType": "implementation",
+      "description": "PR-1 parse bugfix. parse_oauth_usage_json must compute gate remaining and reset_at from account-binding windows only (five_hour, seven_day, limits[] kind session/weekly_all). Remaining = (100-used).clamp(0,100). Account remaining = min of those. Exhausted/critical on weekly_scoped must not fold in. Independently shippable — do not wait for CONTRACT-001.",
+      "acceptanceCriteria": [
+        "Live fixture (Fable weekly_scoped 95% critical, session 24%, week 55%): account remaining is 45% left (min of 76 and 45), reset_at is session, check_and_wait at remaining-min 8 is BelowThreshold",
+        "Inverse: seven_day/weekly_all remaining 0 with session 20% left waits on the weekly resets_at",
+        "limits[].severity=critical on a scoped row does not mark the account exhausted",
+        "Existing test_parse_oauth_usage_one_percent_is_not_exhausted still treats utilization 1.0 as 1% used = 99% left, not 100% used",
+        "No live network in tests"
+      ],
+      "priority": 2,
+      "estimatedEffort": "medium",
+      "passes": false,
+      "requiresHuman": false,
+      "notes": "PR-1 unstick. After this lands, mw_integrations still needs models set-tier claude frontier to the standard model until FEAT-007. Learning [5090]: parse_reset fallback. Data contract: json['five_hour']['utilization'] f64; json['limits'][i]['kind'] str; json['limits'][i]['percent'] u64 or f64; json['limits'][i]['scope']['model']['display_name']. Do not use scoped percent in the account fold. Learning [5075]/[4866]: gate remains once-per-wave.",
+      "touchesFiles": [
+        "src/loop_engine/usage.rs"
+      ],
+      "dependsOn": [],
+      "modifiesBehavior": true,
+      "qualityDimensions": [
+        "Remaining percent is 0–100 everywhere",
+        "Account-binding vs rung-scoped: only session/weekly-all may wait the account",
+        "severity/is_active are not the default exhausted predicate",
+        "No unwrap on API JSON; skip malformed buckets",
+        "ui/tracing split: tests may assert parse results, not live fetch"
+      ],
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/loop_engine/reactions/account.rs",
+            "line": 1068,
+            "usage": "check_and_wait compares usage.percentage to threshold",
+            "impact": "BREAKS",
+            "mitigation": "After this fix, percentage (until FEAT-004 rename) is account-binding remaining, so 45 < 92 still proceeds; keep comparison working for used-or-remaining until FEAT-004 flips the compare"
+          },
+          {
+            "file": "src/loop_engine/reactions/account.rs",
+            "line": 350,
+            "usage": "load_usage_info reset_at → api_secs for post-output wait",
+            "impact": "NEEDS_REVIEW",
+            "mitigation": "Scoped buckets must not supply weekly Fable resets_at as account wait — FIX-002 also pins Fable CLI to 3600s"
+          }
+        ],
+        "semanticDistinctions": [
+          {
+            "context": "Account-binding remaining low",
+            "currentBehavior": "Wait",
+            "requiredBehavior": "Still wait (FIX-001 only stops scoped fold)"
+          },
+          {
+            "context": "Rung-scoped remaining low",
+            "currentBehavior": "Same wait as account",
+            "requiredBehavior": "Must not set account percentage/reset"
+          }
+        ]
+      },
+      "edgeCases": [
+        "Fable weekly_scoped 95% critical + session 24% + week 55% → account remaining 45% left, no wait",
+        "weekly_all 100%, session 20% → wait on weekly reset"
+      ],
+      "invariants": [
+        "Account remaining is min of session and weekly-all remaining, never max of all windows including scoped"
+      ],
+      "failureModes": [
+        {
+          "cause": "Still taking max(util) across limits[]",
+          "expectedBehavior": "Live fixture test fails"
+        }
+      ]
+    },
+    {
+      "id": "FIX-002",
+      "title": "Fable CLI phrasing is RateLimit with 3600s backoff, not crash",
+      "taskType": "implementation",
+      "description": "PR-1. is_rate_limited must match You've reached your Fable limit and switch models with /model. Post-output for that phrasing waits blackoutFallbackSecs (default 3600), not a parsed Sep 12 date and not crash-backoff. Dated parse_reset_from_output (resets Sep 12, 12:59am) still works for account messages. Independently shippable.",
+      "acceptanceCriteria": [
+        "is_rate_limited true for You've reached your Fable limit and switch models with /model",
+        "analyze_output classifies those strings as RateLimit (not Crash)",
+        "Post-output wait_secs for Fable phrasing is 3600 (or configured blackoutFallbackSecs), not ~6 days",
+        "parse_reset_from_output parses 'resets Sep 12, 12:59am (America/Los_Angeles)' to a future unix delta when that date is in the future",
+        "Auto-block / consecutive-failure counters do not increment on Fable RateLimit (existing RateLimit path)",
+        "LOOP_USAGE_CHECK_ENABLED=false still classifies post-output RateLimit (dual predicate; one iteration may be consumed)"
+      ],
+      "priority": 3,
+      "estimatedEffort": "medium",
+      "passes": false,
+      "requiresHuman": false,
+      "notes": "Learning [5090]: malformed quota messages fall back. Learning [5297]/[5298]/[5301]: dual predicate — do not skip post RateLimit when env=false. Do not wait the weekly date for a rung-scoped CLI hit. Seq+wave both go through react_to_outputs.",
+      "touchesFiles": [
+        "src/loop_engine/detection.rs",
+        "src/loop_engine/reactions/account.rs"
+      ],
+      "dependsOn": [],
+      "modifiesBehavior": true,
+      "qualityDimensions": [
+        "Fable CLI is RateLimit never crash/auto-block",
+        "Dual predicates unchanged",
+        "Account-global reaction once per wave",
+        "No unwrap in production"
+      ],
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/loop_engine/recovery.rs",
+            "line": 654,
+            "usage": "is_rate_limited distinguishes crash vs rate-limit",
+            "impact": "OK",
+            "mitigation": "Widening detection prevents auto-block"
+          },
+          {
+            "file": "src/loop_engine/reactions/account.rs",
+            "line": 423,
+            "usage": "parse_reset_from_output feeds decide_account_rate_limit",
+            "impact": "BREAKS if dated weekly reset wins for Fable CLI",
+            "mitigation": "Force 3600s for Fable phrasing in PR-1"
+          }
+        ],
+        "semanticDistinctions": [
+          {
+            "context": "Session limit CLI",
+            "currentBehavior": "RateLimit + parsed time-of-day wait",
+            "requiredBehavior": "Keep"
+          },
+          {
+            "context": "Fable limit CLI",
+            "currentBehavior": "Crash",
+            "requiredBehavior": "RateLimit + 3600s backoff"
+          }
+        ]
+      },
+      "edgeCases": [
+        "You've reached your Fable limit → RateLimit not crash",
+        "Dated resets Sep 12, 12:59am parsed for account messages; Fable phrasing still 3600s not that date",
+        "LOOP_USAGE_CHECK_ENABLED=false: pre-gate off; first Fable CLI hit still RateLimit"
+      ],
+      "failureModes": [
+        {
+          "cause": "is_rate_limited misses Fable sentence",
+          "expectedBehavior": "Unit test fails; auto-block would fire in production"
+        }
+      ]
+    },
+    {
+      "id": "CONTRACT-001",
+      "title": "QuotaBucket, UsagePolicy, evaluate_quota, QuotaDecision",
+      "taskType": "contract",
+      "description": "Design-only. Record in the progress log the stable contract that FEAT-003+ implement. Types: QuotaBucket, Measurement (remaining-first, unit Percent|Dollars|Tokens|Credits), UsagePolicy (remainingMinPercent, waitIfResetWithinMinutes, stopIfResetBeyondHours, askTtlMinutes, rules), QuotaDecision (stop, ask, wait_secs, unavailable: Vec<(Provider, CapabilityTier)>, display). evaluate_quota is pure. Horizon heuristic and onLow wait|unavailable|stop|ask|ignore. Engine keys are rungs not model ids. Downstream: FEAT-003, FEAT-004, FEAT-005, FEAT-006, FEAT-007, FEAT-008.",
+      "acceptanceCriteria": [
+        "Progress log contains ## CONTRACT-001 with signatures, field names, JSON camelCase keys, and copy-paste access patterns from PRD §2.6",
+        "Positive: unavailable is Vec<(Provider, CapabilityTier)> — frontier/standard/cost-efficient/cheapest",
+        "Positive: remainingMinPercent is u8 0–100 default 8; LOOP_USAGE_REMAINING_MIN overrides config overrides 8",
+        "Positive: wait among multiple low wait buckets uses latest reset",
+        "Positive: spend default onLow stop only when remainingAmount lte 0",
+        "Positive: ask vs stop vs wait horizon numbers named (60m / 12h / askTtlMinutes default 0)",
+        "Negative: contract must NOT key blackouts on fable/opus model strings",
+        "Negative: contract must NOT treat severity/is_active as default-low",
+        "Known-bad: remainingMinRatio 0.08 fails this contract",
+        "Downstream Impact list names FEAT-003 through FEAT-008"
+      ],
+      "priority": 4,
+      "estimatedEffort": "high",
+      "passes": false,
+      "requiresHuman": false,
+      "notes": "Do not write production code. Optional one-liner in src/loop_engine/CLAUDE.md account-global section. Learning [4126]/[5075]: seq+wave share account reactions. Ingest adapter (usage.rs) is the only place HUD Fable→frontier mapping may mention display_name.",
+      "touchesFiles": [
+        "src/loop_engine/CLAUDE.md"
+      ],
+      "dependsOn": [],
+      "modifiesBehavior": false,
+      "qualityDimensions": [
+        "Contract unambiguous enough that FEAT-003 and FEAT-005 cannot disagree on horizon vs explicit onLow",
+        "Rung language only in the decision layer",
+        "One remaining unit: 0–100 percent"
+      ],
+      "edgeCases": [],
+      "failureModes": [
+        {
+          "cause": "Implementer stores family token fable on IterationContext",
+          "expectedBehavior": "CONTRACT known-bad + REVIEW-001 grep fails"
+        }
+      ]
+    },
+    {
+      "id": "FEAT-003",
+      "title": "Ingest OAuth JSON into QuotaBuckets and evaluate_quota skeleton",
+      "taskType": "implementation",
+      "description": "PR-2. New src/loop_engine/quota.rs implementing CONTRACT-001 types + evaluate_quota. usage.rs walks every object sibling and limits[] into QuotaBucket (no window-name allow-list). Map display_name/id to Option<CapabilityTier> via configured model_for substring then HUD table (Fable→frontier, Opus→standard, Sonnet→cost-efficient, Haiku→cheapest). Unknown → None (ignore). nimbus_quill default ignore. Until FEAT-007's blackout channel exists, evaluate_quota unavailable/ask on the post-output path must NOT skip-wait — callers back off 3600s (hot-loop guard).",
+      "acceptanceCriteria": [
+        "Ingest emits buckets for five_hour, seven_day, limits:weekly_scoped:Fable, spend, nimbus_quill from the live-shaped fixture",
+        "Fable display_name maps to CapabilityTier::Frontier, never stored as fable in QuotaDecision.unavailable",
+        "nimbus_quill 0% remaining → ignore under default policy",
+        "quota.rs contains no claude-fable-5 / fable identifiers",
+        "evaluate_quota is pure (unit-tested with synthetic buckets)",
+        "Post-output unavailable without blackout channel backs off 3600s (document + test the call-site until FEAT-007)",
+        "Drive not required (no CLI yet)"
+      ],
+      "priority": 10,
+      "estimatedEffort": "high",
+      "passes": false,
+      "requiresHuman": false,
+      "notes": "Implement against CONTRACT-001 in the progress log. Data: json.get(\"limits\").and_then(|v| v.as_array()); limit[\"kind\"]; limit[\"scope\"][\"model\"][\"display_name\"]. Learning [5075] once-per-wave. PR-2 hot-loop: do not return wait_secs=0 for unavailable.",
+      "touchesFiles": [
+        "src/loop_engine/quota.rs",
+        "src/loop_engine/usage.rs",
+        "src/loop_engine/mod.rs"
+      ],
+      "dependsOn": ["CONTRACT-001", "FIX-001"],
+      "modifiesBehavior": false,
+      "qualityDimensions": [
+        "Generic ingest, no allow-list of window names",
+        "Decision layer speaks rungs only",
+        "evaluate_quota sub-millisecond, no I/O",
+        "No unwrap on JSON"
+      ],
+      "edgeCases": [
+        "nimbus_quill 0% remaining → ignore",
+        "PR-2 unavailable without blackout channel → 3600s backoff not tight retry"
+      ],
+      "failureModes": [
+        {
+          "cause": "Skip-wait on unavailable in PR-2",
+          "expectedBehavior": "Same frontier task re-dispatches immediately; test must forbid wait_secs==0 for that case"
+        }
+      ]
+    },
+    {
+      "id": "FEAT-004",
+      "title": "Remaining-percent rename, gate compare, operator banner",
+      "taskType": "implementation",
+      "description": "Rename LoopConfig.usage_threshold → usage_remaining_min default 8. Env LOOP_USAGE_REMAINING_MIN overrides usagePolicy.remainingMinPercent overrides 8. LOOP_USAGE_THRESHOLD preflight errors. check_and_wait / usage_suggests_lifted compare remaining > floor (no magic 0.05). Stderr HUD line uses % left and format_duration, never used-percent. Rung labels in the banner (frontier not fable).",
+      "acceptanceCriteria": [
+        "Default usage_remaining_min == 8; LOOP_USAGE_REMAINING_MIN parsed",
+        "LOOP_USAGE_THRESHOLD set → preflight error (legacy hard-break)",
+        "Live-fixture stderr contains 76% left and 5% left and does not print used 95%",
+        "Banner uses frontier not a model id",
+        "usage_suggests_lifted uses the rule floor for both pre-gate and post-limit",
+        "AccountUsageGateParams exhaustive destructure still compiles (parity lock)"
+      ],
+      "priority": 21,
+      "estimatedEffort": "medium",
+      "passes": false,
+      "requiresHuman": false,
+      "notes": "Touches config.rs, startup.rs, account.rs, usage.rs, preflight. Learning [5297] dual predicate. Precedence: env > config > default 8.",
+      "touchesFiles": [
+        "src/loop_engine/config.rs",
+        "src/loop_engine/startup.rs",
+        "src/loop_engine/usage.rs",
+        "src/loop_engine/reactions/account.rs",
+        "src/loop_engine/project_config.rs"
+      ],
+      "dependsOn": ["FIX-001", "CONTRACT-001"],
+      "modifiesBehavior": true,
+      "qualityDimensions": [
+        "One remaining unit 0–100, never 0.08",
+        "ui::* for operator banners",
+        "Legacy env fail-fast at preflight"
+      ],
+      "edgeCases": [
+        "LOOP_USAGE_THRESHOLD=92 still set → preflight error"
+      ],
+      "failureModes": [
+        {
+          "cause": "Keeping used>=92 compare after rename",
+          "expectedBehavior": "45 remaining would look like 45 used and never wait when it should; tests on remaining<=8 must fail"
+        }
+      ]
+    },
+    {
+      "id": "FEAT-005",
+      "title": "Horizon heuristic: wait / ask / stop",
+      "taskType": "implementation",
+      "description": "Wire evaluate_quota default onLow when a rule does not pin it: wait if reset ≤ waitIfResetWithinMinutes (60); stop if account-binding (or no other runnable rung) and reset > stopIfResetBeyondHours (12); ask if rung-scoped, other rungs work, no tierFallback; unavailable if tierFallback would accept some remaining work. Explicit rule onLow wins. Multiple wait buckets → latest reset. Config.json fields on usagePolicy.",
+      "acceptanceCriteria": [
+        "Two wait buckets low (session 2h, weekly 6d) → wait_secs is weekly, not session",
+        "Account-binding remaining 0 and reset 2 days + no other rung → stop",
+        "Rung-scoped frontier 5% left, standard runnable, no tierFallback → ask (not stop, not account wait)",
+        "Explicit onLow wait on weekly_scoped overrides heuristic",
+        "Spend 8% credits left + default spend rule → not stop; remainingAmount 0 → stop",
+        "severity critical on session at 10% left + default predicate → not wait",
+        "Config waitIfResetWithinMinutes / stopIfResetBeyondHours round-trip via sparse JSON"
+      ],
+      "priority": 22,
+      "estimatedEffort": "high",
+      "passes": false,
+      "requiresHuman": false,
+      "notes": "Implement CONTRACT-001 horizon table. Learning [5075] once-per-wave. Do not use soonest_reset for wait aggregation.",
+      "touchesFiles": [
+        "src/loop_engine/quota.rs",
+        "src/loop_engine/project_config.rs",
+        "src/loop_engine/reactions/account.rs"
+      ],
+      "dependsOn": ["FEAT-003", "FEAT-004"],
+      "modifiesBehavior": true,
+      "qualityDimensions": [
+        "Frontier-low is not an account emergency",
+        "Latest reset among wait buckets",
+        "Spend stop only at amount 0",
+        "severity/is_active display-only unless when opt-in"
+      ],
+      "edgeCases": [
+        "Two wait buckets session 2h and weekly 6d → wait latest (weekly); probe may lift at 2h",
+        "severity critical on session at 10% left + default predicate → not wait"
+      ],
+      "failureModes": [
+        {
+          "cause": "soonest_reset used for wait aggregation",
+          "expectedBehavior": "Unit test with session 2h + weekly 6d fails"
+        }
+      ]
+    },
+    {
+      "id": "FEAT-006",
+      "title": "--use-other-models-ttl and ask timeout continue on working rungs",
+      "taskType": "implementation",
+      "description": "clap --use-other-models-ttl <minutes> on loop run and batch run (0 allowed). Overrides usagePolicy.askTtlMinutes for this run. Default askTtlMinutes is 0 (unattended loops never pause). TTL 0: no sleep, continue on working rungs. TTL >0: stop-signal-aware sleep then continue on working rungs without requiring tierFallback. Distinct stderr. Ask timeout does not stop batch --chain; .stop during ask does (exit 130).",
+      "acceptanceCriteria": [
+        "task-mgr loop run --help and batch run --help list --use-other-models-ttl",
+        "TTL 0: evaluate/ask path does not sleep; continues on working rungs",
+        "TTL 15 with no human: sleeps ≤15m (interruptible) then continues on working rungs",
+        "Stderr names frontier, the TTL flag, and that it will continue on standard",
+        "Drive .claude/skills/verify-task-mgr/SKILL.md: $H capture loop-help -- loop run --help (harness refuses loop run itself); evidence captured",
+        "Flag 0 is valid; negative rejected by clap"
+      ],
+      "priority": 23,
+      "estimatedEffort": "medium",
+      "passes": false,
+      "requiresHuman": false,
+      "notes": "verify-task-mgr feature status-and-doctor: loop run --help is the safe probe. Do not invoke loop run through the harness. Thread TTL through AccountUsageGateParams exhaustive destructure. Learning [5297] dual predicate unused here.",
+      "touchesFiles": [
+        "src/cli/commands.rs",
+        "src/cli/tests.rs",
+        "src/loop_engine/config.rs",
+        "src/loop_engine/reactions/account.rs",
+        "src/loop_engine/orchestrator.rs"
+      ],
+      "dependsOn": ["FEAT-005"],
+      "modifiesBehavior": true,
+      "qualityDimensions": [
+        "ask vs stop: timeout continues on working rungs",
+        "TTL 0 must not sleep",
+        "Exhaustive param destructure",
+        "ui::* for ask banners"
+      ],
+      "edgeCases": [
+        "ask TTL 0, other rungs work, no tierFallback → no sleep, continue on working rungs",
+        "ask TTL 15, no human → sleep ≤15m then continue on working rungs"
+      ],
+      "failureModes": [
+        {
+          "cause": "ask timeout treated as stop",
+          "expectedBehavior": "Chain would halt; tests must assert continue-on-working-rungs"
+        }
+      ]
+    },
+    {
+      "id": "FEAT-007",
+      "title": "Rung blackout channel, clamp, excluded ids, long-horizon exit",
+      "taskType": "implementation",
+      "description": "PR-3. IterationContext channel keyed (Provider, CapabilityTier) → expiry. Never persisted, never touches runner_overrides. Replace-from QuotaDecision.unavailable; keep snapshot on API 429. resolve_execution_plan clamps down defined rungs when the planned rung is blacked and tierFallback allows; else excluded ids. Overflow skips blacked target rungs. All leftover work needs blacked rungs: reset ≤ wait window → wait; reset > 12h → stop this PRD (reset in_progress→todo), batch --chain continues. Must not call handle_quota_deferral for rung-only exhaustion. Default tierFallback unset. Deferral stderr names set-tier-fallback / --include-review / --include-forced.",
+      "acceptanceCriteria": [
+        "Blackout key is (Provider, CapabilityTier); engine.rs has no fable literal",
+        "set-tier claude frontier to the standard model + frontier HUD low → standard still runs",
+        "Explicit off-ladder pin includeForced=false → deferred; includeForced=true → clamp down",
+        "Reset 2h, only frontier work, no fallback → wait (not exit)",
+        "Reset 6d, only frontier work, no fallback → stop this PRD, chain continues, no 5h-cap-loop",
+        "Usage API 429 keeps last snapshot (do not clear)",
+        "handle_quota_deferral is not entered for rung-only empty selection (no stale-abort)",
+        "Overflow escalate_below_ceiling / to_1m skip targets whose rung is blacked"
+      ],
+      "priority": 24,
+      "estimatedEffort": "high",
+      "passes": false,
+      "requiresHuman": false,
+      "notes": "Learning [3927] quota deferral vs stale. Learning [1810] loop-thread-local maps. PlanContext.unavailable_rungs: &HashSet<(Provider, CapabilityTier)>. Data: plan.unavailable_rungs.contains(&(Provider::Claude, CapabilityTier::Frontier)). FEAT-008 CLI writes tierFallback; this task consumes the struct even if CLI is later. Thread PlanContext in prompt/sequential.rs, prompt/slot.rs, pre_spawn.rs.",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/model.rs",
+        "src/loop_engine/reactions/pre_spawn.rs",
+        "src/loop_engine/reactions/account.rs",
+        "src/loop_engine/reactions/post_output.rs",
+        "src/loop_engine/prompt/sequential.rs",
+        "src/loop_engine/prompt/slot.rs",
+        "src/loop_engine/orchestrator.rs",
+        "src/loop_engine/iteration.rs",
+        "src/loop_engine/wave_scheduler.rs"
+      ],
+      "dependsOn": ["FEAT-005"],
+      "modifiesBehavior": true,
+      "qualityDimensions": [
+        "Rung key not model id",
+        "tier_of stays exact-match; ingest mapping is the only contains",
+        "provider_blackouts / runner_overrides untouched by this channel",
+        "Once-per-wave account reactions",
+        "Do not Block overflow solely because frontier is out"
+      ],
+      "edgeCases": [
+        "Frontier remapped to standard's model → Fable HUD marks frontier unavailable; standard still runs",
+        "Explicit tasks.model off-ladder frontier id + includeForced=false → defer",
+        "Reset 2h only frontier work no fallback → wait",
+        "Reset 6d only frontier work no fallback → stop this PRD, chain continues",
+        "Usage API 429 → keep last rung-blackout snapshot"
+      ],
+      "failureModes": [
+        {
+          "cause": "Fall through handle_quota_deferral",
+          "expectedBehavior": "stale-abort (learning 3927); dedicated sibling must run instead"
+        }
+      ]
+    },
+    {
+      "id": "FEAT-008",
+      "title": "models set-usage-rule, set-tier-fallback, models show policy",
+      "taskType": "implementation",
+      "description": "Sparse config writes for usagePolicy.rules and routing.tierFallback. models show prints policy from config (remainingMinPercent, horizon, rules, tierFallback unset=no auto-downgrade). Remaining numbers only with the same live-fetch gate as models list --remote; without it print (usage not fetched). CLAUDE.md account-global + models CLI cheat-sheet update.",
+      "acceptanceCriteria": [
+        "task-mgr models set-usage-rule --kind weekly_scoped --on-low wait|unavailable|stop|ask|ignore writes camelCase usagePolicy.rules",
+        "task-mgr models set-tier-fallback high --include-review --include-forced / unset-tier-fallback round-trip unrelated config keys",
+        "models show includes usagePolicy and tierFallback without a network call",
+        "models show --remote (or documented equivalent) may print remaining; default show does not persist buckets",
+        "Drive .claude/skills/verify-task-mgr/SKILL.md feature models-routing: models-show after set-tier-fallback / set-usage-rule; evidence captured; compile/unit tests alone are not proof",
+        "src/loop_engine/CLAUDE.md documents remaining unit, rung vs provider blackout, ask TTL, dual predicate unchanged"
+      ],
+      "priority": 25,
+      "estimatedEffort": "medium",
+      "passes": false,
+      "requiresHuman": false,
+      "notes": "verify-task-mgr features/models-routing.md. models is text-only. Do not models list --remote in default proofs (helper unsets TASK_MGR_USE_API). Sparse serde_json::Value write via config_io.",
+      "touchesFiles": [
+        "src/commands/models/handlers.rs",
+        "src/commands/models/mod.rs",
+        "src/main.rs",
+        "src/cli/commands.rs",
+        "src/loop_engine/project_config.rs",
+        "src/loop_engine/CLAUDE.md",
+        "CLAUDE.md"
+      ],
+      "dependsOn": ["FEAT-005", "FEAT-007"],
+      "modifiesBehavior": false,
+      "qualityDimensions": [
+        "Sparse round-trip preserves unrelated keys",
+        "No persisted last-fetch buckets",
+        "Operator stderr/docs use rung names"
+      ],
+      "edgeCases": [],
+      "failureModes": [
+        {
+          "cause": "models show always hits Anthropic",
+          "expectedBehavior": "Sandbox proof without API key must still print policy"
+        }
+      ]
+    },
+    {
+      "id": "CODE-REVIEW-1",
+      "title": "Review PR-1 parse/detection and quota ingest contract fidelity",
+      "taskType": "review",
+      "description": "Review FIX-001, FIX-002, CONTRACT-001, FEAT-003, FEAT-004. Language idioms, dual predicate, remaining unit, no model ids in quota.rs, wiring of parse into the gate. Spawn CODE-FIX/WIRE-FIX via task-mgr add --stdin --depended-on-by REVIEW-001.",
+      "acceptanceCriteria": [
+        "Progress log lists findings or No issues found",
+        "Confirm live-fixture tests exist and do not hit the network",
+        "Confirm Fable CLI is RateLimit with 3600s backoff",
+        "Confirm quota.rs has no fable/claude-fable-5 literals",
+        "Spawned fixes use --depended-on-by REVIEW-001"
+      ],
+      "priority": 13,
+      "estimatedEffort": "high",
+      "passes": false,
+      "requiresHuman": false,
+      "notes": "Use rust-python-code-reviewer. Do not implement in this task.",
+      "timeoutSecs": 1800,
+      "touchesFiles": [
+        "src/loop_engine/usage.rs",
+        "src/loop_engine/quota.rs",
+        "src/loop_engine/detection.rs",
+        "src/loop_engine/reactions/account.rs"
+      ],
+      "dependsOn": ["FIX-001", "FIX-002", "CONTRACT-001", "FEAT-003", "FEAT-004"],
+      "modifiesBehavior": false,
+      "qualityDimensions": [
+        "Wiring: parse results actually reach check_and_wait",
+        "Parity lock not broken"
+      ]
+    },
+    {
+      "id": "REFACTOR-REVIEW-FINAL",
+      "title": "Final DRY/coupling pass on quota + account reactions",
+      "taskType": "review",
+      "description": "All implementation: DRY, complexity, coupling, contract fidelity. Spawn REFACTOR-N via task-mgr add --stdin --depended-on-by REVIEW-001.",
+      "acceptanceCriteria": [
+        "Progress log lists findings or No issues found",
+        "No second usage parser in account.rs",
+        "Rung blackout not collapsed into provider_blackouts"
+      ],
+      "priority": 70,
+      "estimatedEffort": "high",
+      "passes": false,
+      "requiresHuman": false,
+      "notes": "Optional /simplify on ugly touchpoints.",
+      "timeoutSecs": 1800,
+      "touchesFiles": [
+        "src/loop_engine/quota.rs",
+        "src/loop_engine/usage.rs",
+        "src/loop_engine/reactions/account.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/model.rs"
+      ],
+      "dependsOn": ["FEAT-003", "FEAT-004", "FEAT-005", "FEAT-006", "FEAT-007", "FEAT-008", "CODE-REVIEW-1"],
+      "modifiesBehavior": false,
+      "qualityDimensions": [
+        "Cohesion: horizon defaults live with usagePolicy",
+        "quota.rs has no SQLite/clap/runner imports"
+      ]
+    },
+    {
+      "id": "REVIEW-001",
+      "title": "Full unscoped quality gate",
+      "taskType": "review",
+      "description": "Milestone. Full cargo fmt/check/clippy/test. Drive verify-task-mgr mapped features this PRD touched (models-routing after FEAT-008; loop run --help after FEAT-006). Fix every failure including pre-existing. Trunk green.",
+      "acceptanceCriteria": [
+        "cargo fmt --check && cargo check && cargo clippy --all-targets -- -D warnings && cargo test all green",
+        "Drive verify-task-mgr features models-routing and loop-help; skipped sub-features reported skipped not verified via a sibling path",
+        "Live-fixture unit tests still pass",
+        "quota.rs and engine.rs still have no fable model-id literals",
+        "CLAUDE.md / loop_engine CLAUDE.md remaining-unit + dual-predicate notes present"
+      ],
+      "priority": 99,
+      "estimatedEffort": "high",
+      "passes": false,
+      "requiresHuman": false,
+      "timeoutSecs": 1800,
+      "notes": "H=.claude/skills/verify-task-mgr/scripts/verify-task-mgr. Never loop run through the harness. Spawn FIX via --depended-on-by REVIEW-001 if the suite is red.",
+      "touchesFiles": [],
+      "dependsOn": ["FIX-001", "FIX-002", "FEAT-003", "FEAT-004", "FEAT-005", "FEAT-006", "FEAT-007", "FEAT-008", "CODE-REVIEW-1", "REFACTOR-REVIEW-FINAL"],
+      "modifiesBehavior": false,
+      "qualityDimensions": [
+        "Trunk green including pre-existing failures below the 12-unrelated threshold"
+      ]
+    }
+  ]
+}

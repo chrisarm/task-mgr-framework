@@ -1,0 +1,556 @@
+{
+  "branchName": "feat/honest-terminal-closes",
+  "description": "Keep honest terminal closes (blocked/skipped/irrelevant/done) from being force-reset to todo at loop exit. Split Recovery predicates: recover_in_progress for orphan reclaim and overflow rungs 1–3; reopen_after_merge_fail for FEAT-002 (reopens in_progress and done only). Leave resurrect_for_iteration unguarded. Skip handle_task_failure inside the function when the row is already terminal.",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "No warnings in `cargo check` output",
+      "No warnings in `cargo clippy --all-targets -- -D warnings`",
+      "`cargo fmt --check` passes",
+      "Scoped tests for touched modules pass",
+      "No unwrap() in production code paths",
+      "Every tasks.status write goes through a TaskLifecycle verb",
+      "Sequential and wave stay parity-locked for the new skip and the two reset predicates"
+    ],
+    "description": "These criteria apply to ALL implementation tasks"
+  },
+  "mergeStrategy": "Merge to main after REVIEW-001 passes. Squash commits optional.",
+  "prdFile": "prd-honest-terminal-closes.md",
+  "priorityPhilosophy": {
+    "description": "Hierarchy of what matters most when implementing tasks",
+    "hierarchy": [
+      "1. PLAN — Anticipate edge cases before coding",
+      "2. PHASE 2 FOUNDATION — ~1 day now to save ~2+ weeks later (1:10+ ratio); we are pre-launch, foundations compound",
+      "3. FUNCTIONING CODE — Pragmatic, reliable, wired in per plan",
+      "4. CORRECTNESS — Compiles, type-checks, scoped tests pass deterministically",
+      "5. CODE QUALITY — Clean code, qualityDimensions satisfied, no warnings",
+      "6. POLISH — Docs, formatting, minor improvements"
+    ],
+    "principles": [
+      "Quality dimensions explicit — qualityDimensions on every task tells you what 'good' looks like",
+      "Phase 2 foundation — two Recovery verbs now avoids a later resurrect_for_iteration incident and silent lost-work on done+merge-fail",
+      "Edge cases = test cases — every known edge case must have a corresponding test",
+      "Scoped per-iteration tests, full suite at REVIEW-001 — REVIEW must leave the trunk green including pre-existing failures",
+      "Ship working code with tests to prove it; handle Option/Result explicitly; avoid unwrap() in production"
+    ]
+  },
+  "prohibitedOutcomes": [
+    "Adding WHERE status = 'in_progress' to resurrect_for_iteration (learning #4358; recovery_tests pin blocked → todo)",
+    "SELECT status + TaskStatus::from_str + maybe-write in wave_scheduler or orchestrator (wrong module, TOCTOU)",
+    "One shared in_progress-only guard on reset_task_to_todo used by both 17.5/17.6 and merge-fail (strands premature :done on the ephemeral)",
+    "ProcessingOutcome.closed_task_ids or widening completed_task_ids to all terminals",
+    "Treating <promise>BLOCKED</promise> without a status tag as a DB close",
+    "Counting a terminal close as tasks_completed / wrapper-commit / IterationOutcome::Completed",
+    "Dual-site handle_task_failure skip at orchestrator ~597 and wave_scheduler ~1216",
+    "Skipping handle_task_failure when status is todo (overflow rungs 1–3 still need the counter)",
+    "Adding TaskStatusChange::Blocked or flipping pipeline outcome to IterationOutcome::Blocked on :blocked",
+    "Fixing the adjacent wave TransientBackend exclusion-list hole in this PRD",
+    "Changing decay / doctor / CLI reset / unblock / unskip / reconcile force=true",
+    "Reordering reconcile_ambiguous_exit / prd_complete to after 17.5 (learning #5151)",
+    "Unifying last_claimed_task + pending_slot_tasks, or drain-on-terminal as the load-bearing fix",
+    "New raw UPDATE tasks SET status outside src/lifecycle/",
+    "Tests that only assert no crash without checking DB status",
+    "Manual edits to tasks/*.json for status (use task-mgr CLI / task-status tags)",
+    "Error messages that don't identify what went wrong",
+    "Catch-all error handlers that swallow context"
+  ],
+  "project": "task-mgr",
+  "requires": [],
+  "reviewGuidelines": {
+    "priorityGuidelines": {
+      "critical": "1-10: Blocks further work, fix immediately",
+      "high": "11-20: Fix before phase completion",
+      "low": "51-99: Defer to hardening phase",
+      "medium": "21-50: Fix in current phase if time permits"
+    }
+  },
+  "taskPrefix": "341bda3c",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "Precise interface implemented: TaskLifecycle::recover_in_progress(&self, task_id: &str) -> Result<bool, TaskMgrError> with WHERE id = ? AND status = 'in_progress'; TaskLifecycle::reopen_after_merge_fail(&self, task_id: &str) -> Result<bool, TaskMgrError> with WHERE id = ? AND status IN ('in_progress', 'done'); both SET status='todo', started_at=NULL, updated_at=datetime('now')",
+        "Edge cases: every PRD §2.5 Known Edge Case is named with which verb/no-op applies",
+        "Invariants: atomic conditional UPDATE (no SELECT-then-write); Ok(true) iff one row updated; missing/unparsable status → Ok(false); resurrect_for_iteration SQL frozen",
+        "Known-bad: a single reset_task_to_todo in_progress-only guard used by both 17.5/17.6 and merge-fail (strands :done) fails this contract",
+        "Known-bad: adding WHERE status='in_progress' to resurrect_for_iteration fails this contract (learning #4358)",
+        "Failure modes: DB execute error → Err; 0-row UPDATE → Ok(false) with no log obligation (wrappers log only on true)",
+        "Alternatives considered: SELECT+from_str in wave_scheduler (rejected: wrong module, TOCTOU); guarding resurrect_for_iteration (rejected: #4358)",
+        "Downstream impact: FIX-001 (orphan 17.5/17.6), FIX-002 (merge-fail), FIX-003 (overflow rungs 1–3) list this task in dependsOn; FIX-004 uses read_status + is_terminal() (documented, not a new verb)",
+        "Contract text recorded in the progress log under ## CONTRACT-001 so dependents can implement without re-exploration",
+        "src/lifecycle/CLAUDE.md Recovery-family note + FR-006 table list both new verbs (stale 'six verbs' / 'three Recovery verbs' wording updated); no loop-engine call-site swap"
+      ],
+      "dependsOn": [],
+      "description": "Land the two Category C Recovery verbs + table-driven recovery_tests + CLAUDE.md/mod.rs rustdoc. Record the full contract in the progress log under ## CONTRACT-001. No loop-engine call-site swap — FIX-001/002/003 do that.\n\nDO: Implement TaskLifecycle::recover_in_progress and TaskLifecycle::reopen_after_merge_fail as atomic conditional UPDATEs (SET status='todo', started_at=NULL, updated_at=datetime('now')). Write the predicate table (orphan vs merge-fail vs unguarded resurrect) into the progress log. Name every downstream task. List known-bad implementations (shared in_progress-only helper; SELECT-then-write; mutating resurrect_for_iteration).\n\nDO NOT: Swap 17.5/17.6, merge-fail, or overflow call sites. Do not change resurrect_for_iteration SQL. Do not invent a flag on one verb instead of two verbs.",
+      "edgeCases": [
+        "Unknown / unparsable status text: conditional UPDATE touches 0 rows, Ok(false)",
+        "Missing row: Ok(false), no log line"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "Implementer adds WHERE to resurrect_for_iteration instead of new verbs",
+          "expectedBehavior": "CONTRACT known-bad + existing recovery_tests::resurrect_for_iteration_flips_listed_ids_to_todo fail the review"
+        }
+      ],
+      "id": "CONTRACT-001",
+      "invariants": [
+        "Recovery verbs bypass the plan/matrix path and carry TransitionSource::Recovery",
+        "started_at is cleared in the same UPDATE that sets status='todo' (learning #3093)"
+      ],
+      "modifiesBehavior": false,
+      "notes": "Produced from architect-reviewed plan Approach C. This story LANDS the two verbs + recovery_tests so FIX-003 (parallel, post_output.rs only) can compile. Learning [4358]: do not 'fix' resurrect_for_iteration. Learning [4810]: gate via WHERE status, not SELECT-then-write. Learning [4357]: Recovery verbs stay separate from plan-driven verbs. Learning [3846]: Category C organization. Downstream must treat the recorded contract as authoritative.",
+      "passes": false,
+      "priority": 1,
+      "qualityDimensions": [
+        "Contract is stable enough that FIX-001, FIX-002, and FIX-003 cannot disagree on which verb each site calls",
+        "Predicate table is the SSoT: orphan = in_progress only; merge-fail = in_progress|done; resurrect = unguarded",
+        "Non-goals listed so implementers do not expand into decay/doctor/CLI reset or tag-history"
+      ],
+      "requiresHuman": false,
+      "taskType": "contract",
+      "title": "Define recover_in_progress and reopen_after_merge_fail Recovery predicates",
+      "touchesFiles": [
+        "src/lifecycle/recovery.rs",
+        "src/lifecycle/tests/recovery_tests.rs",
+        "src/lifecycle/CLAUDE.md",
+        "src/lifecycle/mod.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Steps 17.5 and 17.6 call recover_in_progress (via a wrapper that logs only on Ok(true)); they do not call resurrect_for_iteration",
+        "reset_task_to_todo is no longer the policy SSoT — split or replace so merge-fail cannot silently pick up the orphan predicate",
+        "Wave claimed :blocked remains blocked after the 17.6 helper; table-drive :failed/:fail/:blocked (all seed status='blocked') plus :skipped / :irrelevant",
+        "True orphan (in_progress, no tag) still resets and emits 'Reset uncompleted [slot] task {id} to todo'",
+        "Overflow rung 5 then helper: blocked survives (fails if anyone simplifies to tag-history)",
+        "Auto-block then helper: blocked survives",
+        "recover_in_progress unit table (if not already landed in CONTRACT-001): blocked/skipped/irrelevant/done/todo/missing → false unchanged; in_progress → todo",
+        "Rustdoc on the orphan wrapper and orchestrator 17.5 / 17.6 comments no longer say closed = <completed>"
+      ],
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/loop_engine/orchestrator.rs",
+            "impact": "BREAKS",
+            "line": 734,
+            "mitigation": "Point at recover_in_progress; that is the fix",
+            "usage": "17.5 / 17.6 call reset_task_to_todo on last_claimed and pending_slot_tasks"
+          },
+          {
+            "file": "src/loop_engine/wave_scheduler.rs",
+            "impact": "NEEDS_REVIEW",
+            "line": 586,
+            "mitigation": "Do not retarget merge-fail in this task; FIX-002 owns reopen_after_merge_fail",
+            "usage": "merge-fail currently shares reset_task_to_todo"
+          }
+        ],
+        "semanticDistinctions": [
+          {
+            "context": "Loop-exit orphan reclaim (17.5/17.6)",
+            "currentBehavior": "* → todo via resurrect_for_iteration",
+            "requiredBehavior": "in_progress → todo only"
+          },
+          {
+            "context": "Merge-fail FEAT-002",
+            "currentBehavior": "same unguarded helper",
+            "requiredBehavior": "unchanged in this task; FIX-002 switches to in_progress|done"
+          }
+        ]
+      },
+      "dependsOn": [
+        "CONTRACT-001"
+      ],
+      "description": "Point loop-exit orphan reclaim (orchestrator 17.5 last_claimed, 17.6 pending_slot_tasks) at recover_in_progress (already landed by CONTRACT-001). Split reset_task_to_todo so merge-fail cannot silently inherit the orphan predicate.\n\nDO: Wrapper logs 'Reset uncompleted [slot] task {id} to todo' only on Ok(true). Wave claimed :blocked stays blocked after the 17.6 helper. Table-drive by seeding blocked/skipped/irrelevant — :failed/:fail/:blocked all seed status='blocked' (no 'failed' row). True orphan still resets. Overflow rung 5 then helper and auto-block then helper stay blocked. Prefer insert-status → call orphan wrapper → assert DB + log; do not stand up a full overflow+wave+exit e2e.\n\nDO NOT: Call resurrect_for_iteration from 17.5/17.6. Do not put SELECT+from_str in the wrapper. Do not change merge-fail in this task (FIX-002). Do not add closed_task_ids. Do not reorder reconcile_ambiguous_exit / prd_complete.",
+      "edgeCases": [
+        "Claimed :blocked / :failed / :skipped / :irrelevant then loop exit → stay terminal",
+        "Overflow rung 5 Blocked then 17.5/17.6 → stay blocked",
+        "auto_block_after_failures then exit → stay blocked",
+        "Drain-classifier exit 1 after sibling :done + this :blocked → B stays blocked; count_remaining_active_tasks == 0 remains true",
+        ":blocked + ID-completed commit, merge OK → reset must not reopen",
+        "Peer :blocked on another slot's claimed id → helper no-ops on blocked",
+        "Multi-tag :blocked then :unblock → final DB todo; helper no-ops",
+        "Multi-tag :blocked then :done → matrix rejects Blocked→Done; final blocked; helper no-ops",
+        "Rate-limit / transient already reset to todo → helper no-ops",
+        "True orphan (crash, no tag, still in_progress) → helper does reset",
+        "<promise>BLOCKED</promise> only, no status tag → still in_progress; helper does reset",
+        "Claim-fail (claim_succeeded=false) → never pushed; never reset",
+        "Unblock / Reset tags → todo; helper no-op",
+        "Unknown / unparsable status text → 0 rows, no write",
+        "Missing row → Ok(false), no log line"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "Tag-history-only drain without DB-status verb",
+          "expectedBehavior": "Overflow-rung-5-then-helper and auto-block-then-helper tests fail"
+        }
+      ],
+      "id": "FIX-001",
+      "invariants": [
+        "17.5/17.6 never flip a non-in_progress row",
+        "True in_progress orphans still become todo"
+      ],
+      "modifiesBehavior": true,
+      "notes": "Learning [4358]: do not change resurrect_for_iteration. Learning [4810]: WHERE status guard. Learning [5151]: reconcile_ambiguous_exit MUST run before 17.5 — do not reorder. Learning [2304]: crash-map prune is not reset authority. Sequential last-iter fixture (max-iter 1, output only :blocked → DB blocked after 17.5) is should-have if cheap — put it in the same change if a fixture already exists. Data contract: TaskLifecycle::new(conn).recover_in_progress(task_id)? — no pre-read of status.",
+      "passes": false,
+      "priority": 2,
+      "qualityDimensions": [
+        "SSoT is current DB TaskStatus, not pipeline tag-history",
+        "Orphan reclaim may only perform in_progress → todo (use == InProgress via SQL WHERE, not !is_terminal())",
+        "Atomic conditional UPDATE, not SELECT-then-write",
+        "Do not change resurrect_for_iteration SQL",
+        "Do not count a terminal close as tasks_completed",
+        "<promise>BLOCKED</promise> without a status tag is not a DB close — leftover in_progress still resets",
+        "reconcile_ambiguous_exit / prd_complete stay before 17.5",
+        "Log Reset line only on Ok(true); reset failures never propagate",
+        "Every tasks.status write goes through a TaskLifecycle verb"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "17.5 / 17.6 orphan reclaim uses recover_in_progress",
+      "touchesFiles": [
+        "src/loop_engine/wave_scheduler.rs",
+        "src/loop_engine/orchestrator.rs",
+        "src/lifecycle/recovery.rs",
+        "src/lifecycle/tests/recovery_tests.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "apply_merge_fail_reset_and_halt_check calls reopen_after_merge_fail, not resurrect_for_iteration and not recover_in_progress",
+        "Merge-fail × in_progress: status becomes todo (existing FEAT-002 tests keep passing)",
+        "Merge-fail × done: status becomes todo (new test — pins the product fork)",
+        "Merge-fail × blocked / skipped / irrelevant: status unchanged; pending still drained; halt counter still increments",
+        "Reset failure is logged and never fatal (existing FEAT-002 AC)",
+        "reopen_after_merge_fail unit table (if not already landed): true for in_progress and done; false for blocked/skipped/irrelevant/todo/missing"
+      ],
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/loop_engine/wave_scheduler.rs",
+            "impact": "NEEDS_REVIEW",
+            "line": 586,
+            "mitigation": "Use reopen_after_merge_fail so :done reopens and :blocked does not",
+            "usage": "apply_merge_fail_reset_and_halt_check resets failed slot task ids"
+          },
+          {
+            "file": "src/loop_engine/wave_scheduler.rs",
+            "impact": "OK",
+            "line": 3300,
+            "mitigation": "Still true under the new predicate",
+            "usage": "FEAT-002 tests insert in_progress and assert todo"
+          }
+        ],
+        "semanticDistinctions": [
+          {
+            "context": "Merge-fail of in_progress",
+            "currentBehavior": "force todo",
+            "requiredBehavior": "Keep: force todo"
+          },
+          {
+            "context": "Merge-fail of done (work never landed)",
+            "currentBehavior": "force todo (unguarded)",
+            "requiredBehavior": "Keep: reopen to todo"
+          },
+          {
+            "context": "Merge-fail of blocked/skipped/irrelevant",
+            "currentBehavior": "force todo (bug)",
+            "requiredBehavior": "Leave terminal; still increment halt and drain pending"
+          }
+        ]
+      },
+      "dependsOn": [
+        "CONTRACT-001",
+        "FIX-001"
+      ],
+      "description": "Point apply_merge_fail_reset_and_halt_check at reopen_after_merge_fail. Halt counter and pending drain are independent of the status write.\n\nDO: in_progress → todo (existing FEAT-002 tests). done → todo (new pin). blocked/skipped/irrelevant unchanged. Reset failure logged, never fatal.\n\nDO NOT: Call recover_in_progress or resurrect_for_iteration from merge-fail. Do not skip halt increment when the status write no-ops.",
+      "edgeCases": [
+        "Merge-fail of already blocked / skipped / irrelevant → status unchanged; halt counter increments; pending drained",
+        "Merge-fail of already done → reopen to todo"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Merge-fail pointed at recover_in_progress",
+          "expectedBehavior": "Merge-fail × done test fails (row stays done, work stranded)"
+        }
+      ],
+      "id": "FIX-002",
+      "invariants": [
+        "FEAT-002: a failed-slot task is never left pinned in in_progress",
+        "Honest terminals other than done are never reopened by merge-fail"
+      ],
+      "modifiesBehavior": true,
+      "notes": "Depends on FIX-001 because both edit wave_scheduler.rs reset wrappers. Learning [4358]. Data contract: TaskLifecycle::new(conn).reopen_after_merge_fail(task_id)? — no pre-read.",
+      "passes": false,
+      "priority": 3,
+      "qualityDimensions": [
+        "Merge-fail may perform in_progress → todo and done → todo; blocked/skipped/irrelevant stay closed",
+        "Halt counter and pending drain still run when the status write is a no-op",
+        "Atomic conditional UPDATE, not SELECT-then-write",
+        "Do not change resurrect_for_iteration SQL",
+        "Every tasks.status write goes through a TaskLifecycle verb",
+        "Reset failures never propagate"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Merge-fail uses reopen_after_merge_fail (reopens done, keeps honest terminals)",
+      "touchesFiles": [
+        "src/loop_engine/wave_scheduler.rs",
+        "src/lifecycle/recovery.rs",
+        "src/lifecycle/tests/recovery_tests.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "reactions/post_output.rs rungs 1–3 call recover_in_progress instead of resurrect_for_iteration",
+        "Rung 4 stays on resurrect_with_model_override; rung 5 stays on auto_block_after_failures",
+        "Existing overflow tests stay green (rungs 1–3 only fire on a claimed in_progress row; overflow runs before the pipeline)",
+        "resurrect_for_iteration itself is not deleted and its unguarded contract tests remain"
+      ],
+      "dependsOn": [
+        "CONTRACT-001"
+      ],
+      "description": "Migrate overflow rungs 1–3 from unguarded resurrect_for_iteration to recover_in_progress so resurrect_for_iteration has no accidental orphan-reclaim callers left.\n\nDO: Change the RecoveryAction::_ arm in post_output.rs. Keep rung 4 on resurrect_with_model_override and rung 5 on auto_block_after_failures. Existing overflow tests stay green.\n\nDO NOT: Delete resurrect_for_iteration or change its SQL. Do not touch rung 4/5.",
+      "edgeCases": [
+        "Overflow rungs 1–3 on a claimed in_progress row → still reset to todo (behavior-neutral)"
+      ],
+      "estimatedEffort": "low",
+      "failureModes": [
+        {
+          "cause": "Rung 5 accidentally pointed at recover_in_progress",
+          "expectedBehavior": "Overflow-block tests fail (row would become todo instead of blocked)"
+        }
+      ],
+      "id": "FIX-003",
+      "invariants": [
+        "handle_overflow still runs before the shared pipeline on both sequential and wave paths"
+      ],
+      "modifiesBehavior": false,
+      "notes": "Learning [2126]/[2988]: overflow BEFORE pipeline. Learning [3093]: clear started_at. Learning [4358]: leave resurrect unguarded. Can run in parallel with FIX-001 (different file). Data contract: TaskLifecycle::new(conn).recover_in_progress(task_id).",
+      "passes": false,
+      "priority": 4,
+      "qualityDimensions": [
+        "Retry-in-place is in_progress-only, matching overflow rung 4's existing guard",
+        "Atomic conditional UPDATE, not SELECT-then-write",
+        "Do not change resurrect_for_iteration SQL",
+        "Every tasks.status write goes through a TaskLifecycle verb",
+        "Overflow ordering stays: handle_overflow BEFORE process_iteration_output (both paths)"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Overflow rungs 1–3 call recover_in_progress",
+      "touchesFiles": [
+        "src/loop_engine/reactions/post_output.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Skip lives at the top of handle_task_failure_with_runner via read_status + is_terminal(); sequential and wave call sites are not duplicated",
+        "CodexAuthFailure / GrokAuthFailure call-site exclusions are untouched",
+        "todo is not skipped (overflow 1–3 still need the counter)",
+        "One unit/integration test: already-terminal row → consecutive_failures unchanged",
+        "Do not add IterationOutcome::Blocked to both exclusion lists",
+        "Do not fix the adjacent wave-missing-TransientBackend exclusion"
+      ],
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/loop_engine/orchestrator.rs",
+            "impact": "OK",
+            "line": 597,
+            "mitigation": "Call site unchanged; skip is inside the function",
+            "usage": "sequential handle_task_failure_with_runner after outcome exclusions"
+          },
+          {
+            "file": "src/loop_engine/wave_scheduler.rs",
+            "impact": "OK",
+            "line": 1216,
+            "mitigation": "Call site unchanged; skip is inside the function",
+            "usage": "wave handle_task_failure_with_runner after outcome exclusions"
+          },
+          {
+            "file": "tests/retry_tracking.rs",
+            "impact": "NEEDS_REVIEW",
+            "line": 264,
+            "mitigation": "Skip only when already terminal; in_progress/todo paths unchanged",
+            "usage": "handle_task_failure increment + auto-block suites"
+          }
+        ],
+        "semanticDistinctions": [
+          {
+            "context": "Honest :blocked / overflow-5 / auto-block already applied",
+            "currentBehavior": "increments consecutive_failures; auto_block is a no-op",
+            "requiredBehavior": "return Ok(()) before increment"
+          },
+          {
+            "context": "Overflow rungs 1–3 already flipped row to todo",
+            "currentBehavior": "increments",
+            "requiredBehavior": "Keep increment (todo is not terminal)"
+          },
+          {
+            "context": "Crash(GrokAuthFailure) / Crash(CodexAuthFailure)",
+            "currentBehavior": "call-site exclusion, never enters the function",
+            "requiredBehavior": "Keep call-site exclusion; do not fold into the terminal skip"
+          }
+        ]
+      },
+      "dependsOn": [
+        "CONTRACT-001"
+      ],
+      "description": "At the top of handle_task_failure_with_runner, return Ok(()) when read_status is terminal. One site, both paths.\n\nDO: crate::lifecycle::read_status(conn, task_id).is_some_and(|s| s.is_terminal()). One test: already-terminal row → consecutive_failures unchanged. todo is NOT skipped.\n\nDO NOT: Duplicate the skip at orchestrator ~597 and wave_scheduler ~1216. Do not touch CodexAuthFailure / GrokAuthFailure call-site exclusions. Do not add IterationOutcome::Blocked to both exclusion lists. Do not fix the wave TransientBackend exclusion hole.",
+      "edgeCases": [
+        "Already-terminal :blocked / :skipped / :irrelevant / :done → consecutive_failures unchanged",
+        "todo after overflow rungs 1–3 → handle_task_failure still increments"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Skip copied at both call sites and one misses TransientBackend later",
+          "expectedBehavior": "Parity auditor + this AC forbid dual-site skip; do not 'fix' TransientBackend here"
+        }
+      ],
+      "id": "FIX-004",
+      "invariants": [
+        "Auth-lapse exclusions stay at the two call sites, not inside this skip",
+        "in_progress and todo still enter the increment + maybe auto-block path"
+      ],
+      "modifiesBehavior": true,
+      "notes": "Learning [3727]: do not increment for non-task-logic outcomes. Learning [3101]: wave retry tracking is main-thread — keep skip inside the shared function. Learning [4422]: some crashes already non-counting at the call site. Data contract: crate::lifecycle::read_status(conn, task_id).is_some_and(|s| s.is_terminal()). Parity auditor runs on CODE-REVIEW-1 / REVIEW-001, not as a hard AC here (auditor is a subagent, not a cargo test).",
+      "passes": false,
+      "priority": 5,
+      "qualityDimensions": [
+        "handle_task_failure skip uses is_terminal(), not == InProgress",
+        "read_status is allowed only inside handle_task_failure_with_runner (a read that decides whether to skip a write)",
+        "Sequential and wave share one failure-skip — dual-site copies are prohibited",
+        "An already-terminal honest close is not a retry-ladder event (learning #3727)"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Skip handle_task_failure when the claimed row is already terminal",
+      "touchesFiles": [
+        "src/loop_engine/recovery.rs",
+        "tests/retry_tracking.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "IterationContext::pending_slot_tasks rustdoc no longer equates pending with 'not <completed>'",
+        "Orchestrator steps 17.5 / 17.6 comments name recover_in_progress and DB-status gating",
+        "Orphan / merge-fail wrapper rustdoc names the verb and the predicate",
+        "src/loop_engine/CLAUDE.md status-mutation table lists recover_in_progress (orphan + overflow 1–3) and reopen_after_merge_fail (merge-fail)",
+        "No tracker-drain call-site churn; no closed_task_ids"
+      ],
+      "dependsOn": [
+        "FIX-001",
+        "FIX-002"
+      ],
+      "description": "Comments and rustdoc must describe orphan reclaim as 'still in_progress', not 'not <completed>'. Update the loop_engine status-mutation table to name recover_in_progress and reopen_after_merge_fail.\n\nDO: IterationContext::pending_slot_tasks, orchestrator 17.5/17.6, wrappers, slot.rs if it still says remove-on-done as if that were orphan policy, both CLAUDE.md Recovery/status tables.\n\nDO NOT: Add tracker-drain call-site churn. Do not add closed_task_ids. Do not rewrite docs/designs/coherence-refactoring.md (historical).",
+      "estimatedEffort": "low",
+      "id": "POLISH-001",
+      "modifiesBehavior": false,
+      "notes": "Learning [4358] should remain cited wherever resurrect_for_iteration is described. Slot.rs rustdoc only if it still teaches done-only as orphan policy.",
+      "passes": false,
+      "priority": 6,
+      "qualityDimensions": [
+        "Comments/rustdoc must stop saying closed = <completed>",
+        "The next lifecycle audit must not be invited to 'fix' resurrect_for_iteration"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Hygiene: rustdoc matches the new orphan / merge-fail policy",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/orchestrator.rs",
+        "src/loop_engine/wave_scheduler.rs",
+        "src/loop_engine/slot.rs",
+        "src/loop_engine/CLAUDE.md",
+        "src/lifecycle/CLAUDE.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "17.5/17.6 do not call resurrect_for_iteration; merge-fail does not call recover_in_progress",
+        "handle_task_failure skip is inside the function; call-site auth exclusions untouched",
+        "resurrect_for_iteration SQL and blocked→todo recovery test unchanged",
+        "loop-engine-parity-auditor run on orchestrator.rs, wave_scheduler.rs, slot.rs, recovery.rs; no new seq/wave divergence",
+        "qualityDimensions met; no unwrap() in production; no SELECT-then-write policy in the loop engine",
+        "Any issues found have corresponding CODE-FIX / WIRE-FIX tasks added via task-mgr add --stdin --depended-on-by REVIEW-001"
+      ],
+      "dependsOn": [
+        "CONTRACT-001",
+        "FIX-001",
+        "FIX-002",
+        "FIX-003",
+        "FIX-004",
+        "POLISH-001"
+      ],
+      "description": "Review implementation for contract fidelity, sequential/wave parity, and wiring. Run loop-engine-parity-auditor on orchestrator.rs, wave_scheduler.rs, slot.rs, recovery.rs.\n\nDO: Confirm 17.5/17.6 → recover_in_progress, merge-fail → reopen_after_merge_fail, overflow 1–3 → recover_in_progress, failure skip inside handle_task_failure_with_runner only. Spawn CODE-FIX / WIRE-FIX via task-mgr add --stdin --depended-on-by REVIEW-001.\n\nDO NOT: Implement fixes in this task. Do not expand into TransientBackend exclusion or prd_complete redesign.",
+      "estimatedEffort": "high",
+      "id": "CODE-REVIEW-1",
+      "modifiesBehavior": false,
+      "notes": "For each issue: echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001. If no issues, emit done with a one-line progress note. Use rust-python-code-reviewer and loop-engine-parity-auditor.",
+      "passes": false,
+      "priority": 13,
+      "qualityDimensions": [
+        "Contract fidelity: two predicates, not one shared helper",
+        "Sequential/wave parity for the failure skip",
+        "No new status-write sites outside TaskLifecycle"
+      ],
+      "requiresHuman": false,
+      "taskType": "review",
+      "title": "Review Recovery-verb wiring, dual-path parity, and contract fidelity",
+      "touchesFiles": [
+        "src/lifecycle/recovery.rs",
+        "src/loop_engine/wave_scheduler.rs",
+        "src/loop_engine/orchestrator.rs",
+        "src/loop_engine/recovery.rs",
+        "src/loop_engine/reactions/post_output.rs",
+        "src/loop_engine/slot.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "All prior stories have passes: true (or spawned CODE-FIX/WIRE-FIX that this review depends on have landed)",
+        "Positive: recover_in_progress no-ops on every non-in_progress status; reopen_after_merge_fail reopens in_progress and done only",
+        "Positive: wave claimed :blocked (and table-driven terminals) remains that status after 17.6",
+        "Positive: overflow rung 5 then helper and auto-block then helper stay blocked",
+        "Positive: true orphan still resets; merge-fail × done reopens; merge-fail × blocked stays",
+        "Positive: handle_task_failure on already-terminal row leaves consecutive_failures unchanged",
+        "Positive: FULL cargo test, cargo clippy --all-targets -- -D warnings, cargo fmt --check all clean (no scope filter)",
+        "Negative: resurrect_for_iteration_flips_listed_ids_to_todo still asserts FEAT-2 blocked → todo",
+        "Negative: no ProcessingOutcome.closed_task_ids; completed_task_ids stay done-only",
+        "Pre-existing test failures fixed (or spawned as FIX-xxx with verifyCommand if >~12 unrelated)",
+        "If issues found: FIX-xxx via task-mgr add --stdin --depended-on-by REVIEW-001"
+      ],
+      "dependsOn": [
+        "CODE-REVIEW-1"
+      ],
+      "description": "REVIEW-001 is the milestone. Run the full unscoped quality gate and leave the repo green including pre-existing failures.\n\nDO: Verify all FIX ACs; confirm no closed_task_ids; confirm resurrect_for_iteration still flips blocked→todo in recovery_tests; full cargo test / clippy -D warnings / fmt.\n\nDO NOT: Scope the test suite. Do not reopen out-of-scope items (TransientBackend exclusion, restaurant_agent_ex re-block, prd_complete redesign) unless they regressed.",
+      "estimatedEffort": "high",
+      "id": "REVIEW-001",
+      "modifiesBehavior": false,
+      "notes": "Operator follow-up (not this PRD): after the fix ships, re-block 805856aa-VERIFY-PACER-OBS in restaurant_agent_ex or let the next honest VERIFY iteration block it.",
+      "passes": false,
+      "priority": 99,
+      "qualityDimensions": [
+        "Full suite green including pre-existing",
+        "No unwrap in production",
+        "All new verbs wired to the production call sites named in the PRD",
+        "Two-predicate split preserved under review pressure"
+      ],
+      "requiresHuman": false,
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Final gate: full suite + honest-terminal close verification",
+      "touchesFiles": [
+        "src/lifecycle/recovery.rs",
+        "src/lifecycle/tests/recovery_tests.rs",
+        "src/loop_engine/wave_scheduler.rs",
+        "src/loop_engine/orchestrator.rs",
+        "src/loop_engine/recovery.rs",
+        "src/loop_engine/reactions/post_output.rs"
+      ]
+    }
+  ],
+  "version": "1.0"
+}
