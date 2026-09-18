@@ -22,7 +22,7 @@ use crate::loop_engine::model::{
     CapabilityTier, FABLE_MODEL, HAIKU_MODEL, OPUS_MODEL, Provider, ResolvedModelsConfig,
     SONNET_MODEL, builtin_resolved_models,
 };
-use crate::loop_engine::quota::{Measurement, MeasurementUnit, QuotaBucket};
+use crate::loop_engine::quota::{Measurement, MeasurementUnit, QuotaBucket, RemainingFloors};
 
 /// Claude Code OAuth usage endpoint (matches `/usage` HUD).
 const OAUTH_USAGE_API_URL: &str = "https://api.anthropic.com/api/oauth/usage";
@@ -39,13 +39,6 @@ const OAUTH_USAGE_USER_AGENT_FALLBACK: &str = "claude-code/unknown";
 
 /// Legacy org-level usage endpoint (API-key / org accounts).
 const ORG_USAGE_API_URL: &str = "https://api.anthropic.com/v1/organizations/usage";
-
-/// Default remaining-percent floor for selecting `reset_at` among account-binding
-/// windows. Matches `LoopConfig::usage_remaining_min` default (8). Callers that
-/// know the live config (`check_and_wait`, post-output load) pass the live floor
-/// so wait duration tracks the same bar as the remaining compare.
-/// Old used≥92 ≡ remaining≤8.
-const DEFAULT_USAGE_REMAINING_MIN: f64 = 8.0;
 
 /// Connect + response budget for usage GETs. Without this, a SYN hang to
 /// Anthropic (or a wedged path when `~/.claude` credentials exist during unit
@@ -79,9 +72,9 @@ pub struct UsageInfo {
     /// ISO 8601 reset timestamp for waiting, if available.
     ///
     /// For the OAuth endpoint: **latest** `resets_at` among account-binding
-    /// windows whose remaining is ≤ the live floor (default
-    /// [`DEFAULT_USAGE_REMAINING_MIN`] / 8, or `LoopConfig::usage_remaining_min`
-    /// when threaded through [`load_usage_info_with_threshold`]); if none are
+    /// windows whose remaining is ≤ that window's live floor (factory other 2 /
+    /// weekly 1, or the resolved [`RemainingFloors`] when threaded through
+    /// [`load_usage_info_with_threshold`]); if none are
     /// gate-relevant, prefer the session window (`five_hour` or `limits[]`
     /// kind `session`), else any account-binding reset. Not the soonest
     /// exhausted / severity-critical timestamp across all windows.
@@ -140,21 +133,23 @@ pub enum UsageCheckResult {
 ///
 /// Returns `None` if both calls fail (logged via tracing).
 pub fn check_usage_api(access_token: &str) -> Option<UsageInfo> {
-    check_usage_api_with_threshold(access_token, DEFAULT_USAGE_REMAINING_MIN as u8)
+    check_usage_api_with_threshold(access_token, RemainingFloors::factory())
 }
 
-/// Like [`check_usage_api`], but `reset_at` uses `threshold` as the
-/// remaining-min floor (same value `check_and_wait` compares against
-/// `percentage`).
-pub fn check_usage_api_with_threshold(access_token: &str, threshold: u8) -> Option<UsageInfo> {
-    match fetch_oauth_usage(access_token, threshold) {
+/// Like [`check_usage_api`], but `reset_at` uses `floors` as the
+/// remaining-min bar (same values `check_and_wait` compares against).
+pub fn check_usage_api_with_threshold(
+    access_token: &str,
+    floors: RemainingFloors,
+) -> Option<UsageInfo> {
+    match fetch_oauth_usage(access_token, floors) {
         Some(info) => Some(info),
         None => fetch_org_usage(access_token),
     }
 }
 
 /// Fetch Claude Code OAuth usage (five_hour / seven_day / limits[]).
-fn fetch_oauth_usage(access_token: &str, threshold: u8) -> Option<UsageInfo> {
+fn fetch_oauth_usage(access_token: &str, floors: RemainingFloors) -> Option<UsageInfo> {
     let mut response = match usage_http_agent()
         .get(OAUTH_USAGE_API_URL)
         .header("Authorization", format!("Bearer {}", access_token))
@@ -181,14 +176,14 @@ fn fetch_oauth_usage(access_token: &str, threshold: u8) -> Option<UsageInfo> {
         }
     };
 
-    let mut info = parse_oauth_usage_json_with_threshold(&json, f64::from(threshold))?;
+    let mut info = parse_oauth_usage_json_with_threshold(&json, floors)?;
     // Provisional builtin banner for callers without run models (e.g.
     // check_and_wait). Production pre-dispatch gate MUST rebuild via
     // remaining_banner_for_run_models / format_oauth_remaining_banner with
     // the run ResolvedModelsConfig so frontier→opus pins label both rungs.
     info.remaining_banner = Some(format_oauth_remaining_banner(
         &json,
-        threshold,
+        floors,
         Utc::now(),
         builtin_resolved_models(),
     ));
@@ -652,16 +647,16 @@ pub(crate) fn map_unlabeled_token(
     out
 }
 
-/// Parse the Claude Code OAuth usage JSON into [`UsageInfo`] using the default
-/// remaining floor ([`DEFAULT_USAGE_REMAINING_MIN`] / 8).
+/// Parse the Claude Code OAuth usage JSON into [`UsageInfo`] using factory
+/// remaining floors (other 2 / weekly 1).
 ///
 /// Test convenience wrapper. Production always calls
 /// [`parse_oauth_usage_json_with_threshold`] with the live
-/// `LoopConfig::usage_remaining_min` so `reset_at` matches the remaining compare
+/// [`RemainingFloors`] so `reset_at` matches the remaining compare
 /// in `check_and_wait`.
 #[cfg(test)]
 pub(crate) fn parse_oauth_usage_json(json: &serde_json::Value) -> Option<UsageInfo> {
-    parse_oauth_usage_json_with_threshold(json, DEFAULT_USAGE_REMAINING_MIN)
+    parse_oauth_usage_json_with_threshold(json, RemainingFloors::factory())
 }
 
 /// Live-shaped OAuth usage JSON shared by usage / account / pre_spawn tests
@@ -770,15 +765,15 @@ pub(crate) fn models_with_frontier_pinned_to_standard() -> ResolvedModelsConfig 
 ///   `session` or `weekly_all`. Remaining = `(100 - used).clamp(0, 100)`.
 ///   Named `seven_day_opus` / `seven_day_sonnet` and `limits[]` kinds
 ///   `weekly_scoped` / `extra_usage` / `promotional` are skipped.
-/// - **reset_at** = latest among those windows with remaining ≤ `remaining_min`
-///   (live floor, default 8); if none, prefer session; else any account-binding
-///   reset. Gate-relevant means remaining ≤ floor (old used≥92 ≡ remaining≤8).
+/// - **reset_at** = latest among those windows with remaining ≤ that window's
+///   floor (other vs weekly); if none, prefer session; else any account-binding
+///   reset. Gate-relevant means remaining ≤ the per-kind floor.
 ///
 /// Pure / unit-testable — no I/O. Does not set [`UsageInfo::remaining_banner`]
 /// (call [`format_oauth_remaining_banner`] separately).
 pub(crate) fn parse_oauth_usage_json_with_threshold(
     json: &serde_json::Value,
-    remaining_min: f64,
+    floors: RemainingFloors,
 ) -> Option<UsageInfo> {
     let mut windows: Vec<UsageWindow> = Vec::new();
 
@@ -841,7 +836,14 @@ pub(crate) fn parse_oauth_usage_json_with_threshold(
     let reset_at = latest_reset(
         windows
             .iter()
-            .filter(|w| w.remaining() <= remaining_min)
+            .filter(|w| {
+                let floor = if w.is_session {
+                    f64::from(floors.other)
+                } else {
+                    f64::from(floors.weekly)
+                };
+                w.remaining() <= floor
+            })
             .map(|w| &w.reset),
     )
     .or_else(|| {
@@ -911,19 +913,19 @@ fn latest_reset<'a>(resets: impl Iterator<Item = &'a Option<String>>) -> Option<
 
 /// Single chokepoint: credentials path → read → optional refresh → usage API.
 ///
-/// Uses the default remaining floor (8) for `reset_at` selection. Prefer
-/// [`load_usage_info_with_threshold`] when the live `usage_remaining_min` is known.
+/// Uses factory remaining floors (other 2 / weekly 1) for `reset_at` selection. Prefer
+/// [`load_usage_info_with_threshold`] when the live floors are known.
 ///
 /// Used by the pre-iteration gate, post-rate-limit resolve, spillover blackout
 /// duration, and early-lift probes. Returns `None` when credentials are missing
 /// or both usage endpoints fail.
 pub fn load_usage_info() -> Option<UsageInfo> {
-    load_usage_info_with_threshold(DEFAULT_USAGE_REMAINING_MIN as u8)
+    load_usage_info_with_threshold(RemainingFloors::factory())
 }
 
-/// Like [`load_usage_info`], but `reset_at` is selected with `threshold` as the
-/// remaining-min floor (same value compared to `percentage` in `check_and_wait`).
-pub fn load_usage_info_with_threshold(threshold: u8) -> Option<UsageInfo> {
+/// Like [`load_usage_info`], but `reset_at` is selected with `floors` as the
+/// remaining-min bar (same values compared in `check_and_wait`).
+pub fn load_usage_info_with_threshold(floors: RemainingFloors) -> Option<UsageInfo> {
     let path = super::oauth::credentials_path();
     let mut creds = super::oauth::read_credentials(&path)?;
     if super::oauth::is_token_expiring(&creds, 5) {
@@ -941,16 +943,42 @@ pub fn load_usage_info_with_threshold(threshold: u8) -> Option<UsageInfo> {
             }
         }
     }
-    check_usage_api_with_threshold(&creds.access_token, threshold)
+    check_usage_api_with_threshold(&creds.access_token, floors)
 }
 
 /// Whether an early-lift probe should treat the account as recovered.
 ///
 /// Both pre-gate and post-limit: remaining **above** the rule floor
 /// (`percentage` is remaining 0–100). No magic 0.05 ratio and no used<95.
-pub fn usage_suggests_lifted(info: &UsageInfo, threshold: u8, post_limit: bool) -> bool {
+pub fn usage_suggests_lifted(info: &UsageInfo, floors: RemainingFloors, post_limit: bool) -> bool {
     let _ = post_limit; // same remaining > floor rule for both legs
-    info.percentage > f64::from(threshold)
+    account_binding_above_floors(info, floors)
+}
+
+/// Account-binding proceed/lift: every session/weekly_all percent window is
+/// above **its** floor. Org-API (no those buckets) falls back to `percentage`
+/// vs the other floor. Do **not** compare min remaining to a single floor.
+fn account_binding_above_floors(info: &UsageInfo, floors: RemainingFloors) -> bool {
+    let relevant: Vec<&QuotaBucket> = info
+        .buckets
+        .iter()
+        .filter(|b| b.kind == "session" || b.kind == "weekly_all")
+        .filter(|b| {
+            b.measurements
+                .iter()
+                .any(|m| m.unit == MeasurementUnit::Percent)
+        })
+        .collect();
+    if relevant.is_empty() {
+        return info.percentage > f64::from(floors.other);
+    }
+    relevant.iter().all(|b| {
+        b.measurements
+            .iter()
+            .find(|m| m.unit == MeasurementUnit::Percent)
+            .map(|m| m.remaining > f64::from(floors.for_kind(&b.kind)))
+            .unwrap_or(true)
+    })
 }
 
 /// Preflight Wait early-lift probe (FR-009 / US-010). Pure — no GET.
@@ -966,14 +994,13 @@ pub fn usage_suggests_lifted(info: &UsageInfo, threshold: u8, post_limit: bool) 
 /// `WaitFn` stays `Fn(u64) -> bool` and does not use this helper.
 pub fn wait_probe_lifted(
     info: &UsageInfo,
-    floor: u8,
+    floors: RemainingFloors,
     account_binding: bool,
     models: &ResolvedModelsConfig,
 ) -> bool {
     if account_binding {
-        return usage_suggests_lifted(info, floor, false);
+        return usage_suggests_lifted(info, floors, false);
     }
-    let floor_f = f64::from(floor);
     buckets_for_run_models(info, models)
         .iter()
         .filter(|b| b.rungs.as_ref().is_some_and(|r| !r.is_empty()))
@@ -983,7 +1010,7 @@ pub fn wait_probe_lifted(
                 .iter()
                 .find(|m| m.unit == MeasurementUnit::Percent)
             {
-                Some(m) => m.remaining > floor_f,
+                Some(m) => m.remaining > f64::from(floors.for_kind(&b.kind)),
                 None => true,
             }
         })
@@ -1045,7 +1072,8 @@ pub fn buckets_for_run_models(
 
 /// Format the operator remaining banner from OAuth HUD JSON (hermetic).
 ///
-/// Shape: `session 76% left (3m) · week 45% left (5d 13h) · frontier 5% left (5d 13h) (floor 8%)`.
+/// Shape: `session 76% left (3m) · week 45% left (5d 13h) · frontier 5% left (5d 13h) (floor 8%)`
+/// when floors are uniform; split factory prints `(floor 2% · weekly 1%)`.
 /// Rung labels use capability-tier names (`frontier`), never model ids (`fable`).
 ///
 /// `models` must be the same run [`ResolvedModelsConfig`] used by
@@ -1053,12 +1081,12 @@ pub fn buckets_for_run_models(
 /// extra-marks both rungs on the Opus HUD line.
 pub fn format_oauth_remaining_banner(
     json: &serde_json::Value,
-    remaining_min: u8,
+    floors: RemainingFloors,
     now: DateTime<Utc>,
     models: &ResolvedModelsConfig,
 ) -> String {
     let buckets = ingest_oauth_value(json, models);
-    format_remaining_usage_banner(&buckets, remaining_min, now)
+    format_remaining_usage_banner(&buckets, floors, now)
 }
 
 /// Rebuild the remaining banner with the run's [`ResolvedModelsConfig`].
@@ -1068,16 +1096,11 @@ pub fn format_oauth_remaining_banner(
 pub fn remaining_banner_for_run_models(
     info: &UsageInfo,
     models: &ResolvedModelsConfig,
-    remaining_min: u8,
+    floors: RemainingFloors,
     now: DateTime<Utc>,
 ) -> Option<String> {
     match &info.oauth_json {
-        Some(json) => Some(format_oauth_remaining_banner(
-            json,
-            remaining_min,
-            now,
-            models,
-        )),
+        Some(json) => Some(format_oauth_remaining_banner(json, floors, now, models)),
         None => info.remaining_banner.clone(),
     }
 }
@@ -1085,7 +1108,7 @@ pub fn remaining_banner_for_run_models(
 /// Format a remaining banner from already-ingested [`QuotaBucket`]s.
 pub fn format_remaining_usage_banner(
     buckets: &[QuotaBucket],
-    remaining_min: u8,
+    floors: RemainingFloors,
     now: DateTime<Utc>,
 ) -> String {
     let mut segments: Vec<String> = Vec::new();
@@ -1130,9 +1153,9 @@ pub fn format_remaining_usage_banner(
     }
 
     if segments.is_empty() {
-        format!("(floor {remaining_min}%)")
+        floors.banner_suffix()
     } else {
-        format!("{} (floor {remaining_min}%)", segments.join(" · "))
+        format!("{} {}", segments.join(" · "), floors.banner_suffix())
     }
 }
 
@@ -1400,7 +1423,7 @@ mod tests {
             }
         });
         let info = parse_oauth_usage_json(&json).expect("must parse");
-        // remaining 10 for both; 10 > floor 8 → prefer session reset.
+        // remaining 10 for both; 10 > factory floors → prefer session reset.
         assert!((info.percentage - 10.0).abs() < f64::EPSILON);
         assert_eq!(
             info.reset_at.as_deref(),
@@ -1472,8 +1495,8 @@ mod tests {
             "nothing ≤ floor 8 → prefer session reset, not weekly Fable"
         );
         assert!(
-            info.percentage > DEFAULT_USAGE_REMAINING_MIN,
-            "45 > 8 implies check_and_wait would return BelowThreshold"
+            info.percentage > f64::from(RemainingFloors::factory().other),
+            "45 > factory other floor implies check_and_wait would return BelowThreshold"
         );
     }
 
@@ -1511,7 +1534,7 @@ mod tests {
         assert_eq!(
             info.reset_at.as_deref(),
             Some("2026-09-12T19:00:00Z"),
-            "weekly_all remaining 0 ≤ 8 → reset_at is weekly, not session"
+            "weekly_all remaining 0 ≤ weekly floor → reset_at is weekly, not session"
         );
     }
 
@@ -1528,7 +1551,8 @@ mod tests {
                 "resets_at": "2026-09-13T19:00:00Z"
             }
         });
-        let info = parse_oauth_usage_json(&json).expect("must parse");
+        let info = parse_oauth_usage_json_with_threshold(&json, RemainingFloors::uniform(8))
+            .expect("must parse");
         // min remaining of 5 and 7 = 5
         assert!((info.percentage - 5.0).abs() < f64::EPSILON);
         assert_eq!(
@@ -1568,7 +1592,8 @@ mod tests {
                 }
             ]
         });
-        let info = parse_oauth_usage_json(&json).expect("must parse");
+        let info = parse_oauth_usage_json_with_threshold(&json, RemainingFloors::uniform(8))
+            .expect("must parse");
         assert!((info.percentage - 5.0).abs() < f64::EPSILON);
         assert_eq!(
             info.reset_at.as_deref(),
@@ -1607,7 +1632,7 @@ mod tests {
                 }
             ]
         });
-        let info = parse_oauth_usage_json_with_threshold(&json, 20.0)
+        let info = parse_oauth_usage_json_with_threshold(&json, RemainingFloors::uniform(20))
             .expect("must parse at remaining_min 20");
         assert!((info.percentage - 15.0).abs() < f64::EPSILON);
         assert_eq!(
@@ -1615,13 +1640,102 @@ mod tests {
             Some("2026-09-12T19:00:00Z"),
             "remaining 15 ≤ live floor 20 → reset_at is weekly"
         );
-        // Default floor 8 still prefers session (15 > 8).
+        // Factory weekly floor 1 still prefers session (15 > 1).
         let info_default = parse_oauth_usage_json(&json).expect("default parse");
         assert_eq!(
             info_default.reset_at.as_deref(),
             Some("2026-09-07T06:00:00Z"),
-            "default floor 8 must still prefer session when weekly remaining is 15"
+            "factory weekly floor 1 must still prefer session when weekly remaining is 15"
         );
+    }
+
+    #[test]
+    fn parse_factory_floors_weekly_one_picks_weekly_reset() {
+        let json = serde_json::json!({
+            "five_hour": {
+                "utilization": 50.0,
+                "resets_at": "2026-09-07T06:00:00Z"
+            },
+            "seven_day": {
+                "utilization": 99.0,
+                "resets_at": "2026-09-12T19:00:00Z"
+            }
+        });
+        let info = parse_oauth_usage_json(&json).expect("must parse");
+        assert!((info.percentage - 1.0).abs() < f64::EPSILON);
+        assert_eq!(
+            info.reset_at.as_deref(),
+            Some("2026-09-12T19:00:00Z"),
+            "weekly remaining 1 ≤ factory weekly floor 1"
+        );
+    }
+
+    #[test]
+    fn usage_suggests_lifted_split_floors_does_not_use_min_remaining() {
+        // Session 3% / weekly 1.5% → min 1.5 looks low vs other=2, but weekly
+        // is still above 1 and session above 2.
+        let info = UsageInfo {
+            percentage: 1.5,
+            reset_at: None,
+            remaining_banner: None,
+            buckets: vec![
+                QuotaBucket {
+                    id: "five_hour".into(),
+                    kind: "session".into(),
+                    label: String::new(),
+                    measurements: vec![Measurement {
+                        remaining: 3.0,
+                        unit: MeasurementUnit::Percent,
+                    }],
+                    resets_at: None,
+                    severity: None,
+                    is_active: None,
+                    rungs: None,
+                },
+                QuotaBucket {
+                    id: "seven_day".into(),
+                    kind: "weekly_all".into(),
+                    label: String::new(),
+                    measurements: vec![Measurement {
+                        remaining: 1.5,
+                        unit: MeasurementUnit::Percent,
+                    }],
+                    resets_at: None,
+                    severity: None,
+                    is_active: None,
+                    rungs: None,
+                },
+            ],
+            oauth_json: None,
+        };
+        assert!(
+            usage_suggests_lifted(&info, RemainingFloors::factory(), false),
+            "min remaining 1.5 must not park when each window is above its floor"
+        );
+        let low_session = UsageInfo {
+            percentage: 2.0,
+            reset_at: None,
+            remaining_banner: None,
+            buckets: vec![QuotaBucket {
+                id: "five_hour".into(),
+                kind: "session".into(),
+                label: String::new(),
+                measurements: vec![Measurement {
+                    remaining: 2.0,
+                    unit: MeasurementUnit::Percent,
+                }],
+                resets_at: None,
+                severity: None,
+                is_active: None,
+                rungs: None,
+            }],
+            oauth_json: None,
+        };
+        assert!(!usage_suggests_lifted(
+            &low_session,
+            RemainingFloors::factory(),
+            false
+        ));
     }
 
     #[test]
@@ -1706,10 +1820,26 @@ mod tests {
             buckets: Vec::new(),
             oauth_json: None,
         };
-        assert!(usage_suggests_lifted(&lifted, 80, true));
-        assert!(!usage_suggests_lifted(&low, 80, true));
-        assert!(usage_suggests_lifted(&lifted, 80, false));
-        assert!(!usage_suggests_lifted(&low, 80, false));
+        assert!(usage_suggests_lifted(
+            &lifted,
+            RemainingFloors::uniform(80),
+            true
+        ));
+        assert!(!usage_suggests_lifted(
+            &low,
+            RemainingFloors::uniform(80),
+            true
+        ));
+        assert!(usage_suggests_lifted(
+            &lifted,
+            RemainingFloors::uniform(80),
+            false
+        ));
+        assert!(!usage_suggests_lifted(
+            &low,
+            RemainingFloors::uniform(80),
+            false
+        ));
     }
 
     #[test]
@@ -1725,11 +1855,16 @@ mod tests {
         };
         let models = builtin_models();
         assert!(
-            !wait_probe_lifted(&info, 8, false, &models),
+            !wait_probe_lifted(&info, RemainingFloors::uniform(8), false, &models),
             "scoped-only probe must ignore week 45% and see Fable 5%"
         );
         // Account-binding still uses account remaining (45 > 8 → lifted).
-        assert!(wait_probe_lifted(&info, 8, true, &models));
+        assert!(wait_probe_lifted(
+            &info,
+            RemainingFloors::uniform(8),
+            true,
+            &models
+        ));
     }
 
     #[test]
@@ -1746,7 +1881,7 @@ mod tests {
         };
         let models = builtin_models();
         assert!(
-            wait_probe_lifted(&info, 8, false, &models),
+            wait_probe_lifted(&info, RemainingFloors::uniform(8), false, &models),
             "scoped Fable remaining 50% > floor 8 may lift"
         );
     }
@@ -1771,7 +1906,12 @@ mod tests {
         let now = DateTime::parse_from_rfc3339("2026-09-07T05:57:00Z")
             .expect("fixture now")
             .with_timezone(&Utc);
-        let banner = format_oauth_remaining_banner(&json, 8, now, builtin_resolved_models());
+        let banner = format_oauth_remaining_banner(
+            &json,
+            RemainingFloors::uniform(8),
+            now,
+            builtin_resolved_models(),
+        );
         assert!(
             banner.contains("76% left"),
             "session remaining missing: {banner}"
@@ -1823,7 +1963,8 @@ mod tests {
             is_active: None,
             rungs: None,
         }];
-        let banner = format_remaining_usage_banner(&buckets, 8, Utc::now());
+        let banner =
+            format_remaining_usage_banner(&buckets, RemainingFloors::uniform(8), Utc::now());
         assert!(
             banner.contains("$12.5 left"),
             "dollar buckets must print in unit: {banner}"
@@ -2311,7 +2452,7 @@ mod tests {
     /// without the frontier→opus pin. Named seven_day_* stay Ignore.
     #[test]
     fn evaluate_live_shaped_unavailable_is_frontier_only_with_and_without_pin() {
-        use crate::loop_engine::quota::{BucketEval, UsagePolicy, evaluate_quota};
+        use crate::loop_engine::quota::{BucketEval, RemainingFloors, UsagePolicy, evaluate_quota};
 
         for (label, models) in [
             ("builtin", builtin_models()),
@@ -2321,7 +2462,11 @@ mod tests {
             ),
         ] {
             let buckets = ingest_oauth_value(&live_shaped_oauth_json(), &models);
-            let eval = evaluate_quota(&buckets, &UsagePolicy::default(), 8);
+            let eval = evaluate_quota(
+                &buckets,
+                &UsagePolicy::default(),
+                RemainingFloors::uniform(8),
+            );
             assert_eq!(
                 eval.unavailable,
                 vec![(Provider::Claude, CapabilityTier::Frontier)],
@@ -2499,7 +2644,7 @@ mod tests {
     #[test]
     fn parse_oauth_usage_json_signature_stays_threshold_only() {
         // Compile-time guard: PR-1 fold must not grow a models param.
-        let _f: fn(&serde_json::Value, f64) -> Option<UsageInfo> =
+        let _f: fn(&serde_json::Value, RemainingFloors) -> Option<UsageInfo> =
             parse_oauth_usage_json_with_threshold;
     }
 
@@ -2522,8 +2667,12 @@ mod tests {
             .expect("fixture now")
             .with_timezone(&Utc);
 
-        let builtin_banner =
-            format_oauth_remaining_banner(&json, 8, now, builtin_resolved_models());
+        let builtin_banner = format_oauth_remaining_banner(
+            &json,
+            RemainingFloors::uniform(8),
+            now,
+            builtin_resolved_models(),
+        );
         assert!(
             builtin_banner.contains("standard"),
             "precondition: builtin Opus HUD → standard: {builtin_banner}"
@@ -2533,7 +2682,8 @@ mod tests {
             "precondition: builtin must NOT label frontier when Fable≠Opus: {builtin_banner}"
         );
 
-        let run_banner = format_oauth_remaining_banner(&json, 8, now, &pinned);
+        let run_banner =
+            format_oauth_remaining_banner(&json, RemainingFloors::uniform(8), now, &pinned);
         assert!(
             run_banner.contains("standard"),
             "run models must still label standard: {run_banner}"
@@ -2557,7 +2707,8 @@ mod tests {
             oauth_json: Some(json),
         };
         let rebuilt =
-            remaining_banner_for_run_models(&info, &pinned, 8, now).expect("oauth_json present");
+            remaining_banner_for_run_models(&info, &pinned, RemainingFloors::uniform(8), now)
+                .expect("oauth_json present");
         assert!(
             rebuilt.contains("frontier") && rebuilt.contains("standard"),
             "remaining_banner_for_run_models must extra-mark both rungs; got {rebuilt}"
@@ -2574,7 +2725,7 @@ mod tests {
     /// so evaluate marks both unavailable. Hermetic — no live Anthropic.
     #[test]
     fn gate_buckets_for_run_models_extra_mark_under_frontier_opus_pin() {
-        use crate::loop_engine::quota::{UsagePolicy, evaluate_quota};
+        use crate::loop_engine::quota::{RemainingFloors, UsagePolicy, evaluate_quota};
 
         let pinned = models_with_frontier_pinned_to_standard();
         let json = serde_json::json!({
@@ -2623,7 +2774,11 @@ mod tests {
             "run models under frontier=opus pin must extra-mark frontier; got {rungs:?}"
         );
 
-        let eval = evaluate_quota(&gate_buckets, &UsagePolicy::default(), 8);
+        let eval = evaluate_quota(
+            &gate_buckets,
+            &UsagePolicy::default(),
+            RemainingFloors::uniform(8),
+        );
         assert!(
             eval.unavailable
                 .contains(&(Provider::Claude, CapabilityTier::Standard)),

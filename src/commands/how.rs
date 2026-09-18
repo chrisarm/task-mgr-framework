@@ -158,6 +158,21 @@ mod tests {
     }
 
     #[test]
+    fn quota_intent_points_at_set_usage_policy() {
+        let r = how(Some("quota"));
+        assert!(
+            r.content.contains("set-usage-policy"),
+            "quota recipe must name set-usage-policy: {}",
+            r.content,
+        );
+        assert!(
+            r.content.contains("--remaining-min-weekly"),
+            "quota recipe must name weekly floor: {}",
+            r.content,
+        );
+    }
+
+    #[test]
     fn deterministic_across_repeated_calls() {
         let r1 = how(Some("sync json"));
         let r2 = how(Some("sync json"));

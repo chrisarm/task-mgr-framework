@@ -220,6 +220,15 @@ What happens behind the scenes:
 5. It records learnings and moves to the next task
 6. Repeat until all tasks are done or time runs out
 
+The loop parks Claude account remaining at **2% session / 1% weekly** by default
+(leftover for `/compound` and a couple of manual turns). Inspect and change:
+
+```bash
+task-mgr models show
+task-mgr models set-usage-policy --remaining-min 2 --remaining-min-weekly 1
+task-mgr how "quota"
+```
+
 ### Step 6: Check progress
 
 While the loop is running (or after):
@@ -285,6 +294,11 @@ task-mgr reset TASK-001                         # Back to todo
 task-mgr loop tasks/feature.json --yes          # Run the loop
 task-mgr status tasks/feature.json              # Check progress
 task-mgr batch 'tasks/*.json' --yes             # Run multiple PRDs
+
+# Claude usage floors (factory: 2% session / 1% weekly remaining)
+task-mgr models show
+task-mgr models set-usage-policy --remaining-min 2 --remaining-min-weekly 1
+task-mgr how "quota"
 
 # Learnings (institutional memory)
 task-mgr learn --outcome failure \

@@ -284,7 +284,7 @@ The built-in loop engine (`task-mgr loop`) replaces the external `claude-loop.sh
 - **Steering**: Runtime control via `.task-mgr/.pause`, `.task-mgr/.stop`, and `.task-mgr/steering.md`
 - **Closed-loop feedback**: Automatically marks learnings as applied when tasks succeed, improving the UCB ranking
 - **Adaptive weights**: Calibrates selection weights based on historical success correlations
-- **Token tracking**: Monitors API usage for budgeting
+- **Usage floors**: Parks Claude loops at **2% session / 1% weekly** remaining so wrap-up and a couple of manual turns still fit. Inspect with `task-mgr models show`; persist with `task-mgr models set-usage-policy`; override one run with `--usage-remaining-min` / `--wait-if-reset-within` on `loop run` / `batch run`. `task-mgr how "quota"` prints the recipes.
 - **Batch mode**: Run multiple PRDs sequentially with `task-mgr batch`
 
 ```bash

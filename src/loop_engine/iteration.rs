@@ -139,7 +139,9 @@ pub fn run_iteration(
                 models: &ctx.resolved_models,
                 policy: &params.project_config.usage_policy,
                 tier_fallback: params.project_config.routing.tier_fallback.as_ref(),
-                threshold: params.usage_params.threshold,
+                floors: params.usage_params.floors,
+                wait_if_reset_within_cli: params.usage_params.wait_if_reset_within_cli,
+                stop_if_reset_beyond_cli: params.usage_params.stop_if_reset_beyond_cli,
                 tasks_dir: params.tasks_dir,
                 db_dir: params.db_dir,
                 fallback_wait: params.usage_params.fallback_wait,
@@ -855,7 +857,7 @@ pub fn run_iteration(
             // once-per-run resolution on the context rather than rebuilding it.
             let resolved_models = &ctx.resolved_models;
             let account_params = reactions::account::AccountReactionParams {
-                threshold: params.usage_params.threshold,
+                floors: params.usage_params.floors,
                 usage_enabled: params.usage_params.enabled,
                 // FEAT-002 dual predicate: post-output Anthropic I/O is keyed
                 // ONLY on Claude provider enablement — NEVER on

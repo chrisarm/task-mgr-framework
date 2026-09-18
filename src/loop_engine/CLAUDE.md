@@ -236,8 +236,8 @@ underscore are **not** word boundaries — otherwise hyphenated `OPUS_MODEL` /
 `contains` matches docs/commentary).
 `/model` alone is not enough. Plain `reached your session limit` / `hit your
 limit · resets 4pm` stay ordinary RateLimit. Account-binding `reset_at` uses
-the live `usage_remaining_min` (remaining floor, default 8; old used≥92 ≡
-remaining≤8), not a hardcoded compile-time value. **Residual:** if a
+the live remaining floors (factory other 2 / weekly 1), not a hardcoded
+compile-time value. **Residual:** if a
 Fable-routed task actually spawns (`LOOP_USAGE_CHECK_ENABLED=false`, usage
 fetch fail, or explicit `tasks.model`), one Fable RateLimit still sleeps the
 **whole wave** 3600s. Pinning frontier off Fable
@@ -247,7 +247,11 @@ explicit-frontier work clamps **down** onto a working rung via the PR-3
 down-only walker (FEAT-007) when `tierFallback` allows.
 
 **PR-2 quota contract (CONTRACT-001 / FEAT-005):** remaining 0–100 is the gate
-unit (`LOOP_USAGE_REMAINING_MIN` > `usagePolicy.remainingMinPercent` > 8).
+unit. Operator pick-up: `task-mgr models show`, `task-mgr how "quota"`,
+`models set-usage-policy`. Factory floors: other/session **2**, weekly **1**.
+Other: CLI `--usage-remaining-min` > `LOOP_USAGE_REMAINING_MIN` >
+`usagePolicy.remainingMinPercent` > 2. Weekly: CLI `--usage-remaining-min-weekly`
+> `LOOP_USAGE_REMAINING_MIN_WEEKLY` > `remainingMinWeeklyPercent` > 1.
 `evaluate_quota` is pure per-bucket (ignore / unavailable + account wait/stop
 inputs — never ask, never `other_rungs_runnable`). Apply in `account.rs`
 (`apply_quota` / `run_account_quota_gate`) resolves ask/wait/stop/unavailable
@@ -318,7 +322,8 @@ Full copy-paste lives under `## CONTRACT-001` in the progress log.
 - **Hygiene:** `has_review = is_frontier_class` (not bare `id.contains("REVIEW")`);
   `extra_usage` / promotional / `nimbus_quill` → **Ignore** at `evaluate_one`
   before amount-exhausted AccountLow; `LOOP_USAGE_REMAINING_MIN` /
-  `remainingMinPercent` **> 100** hard-errors at loop/batch
+  `remainingMinPercent` **and** `LOOP_USAGE_REMAINING_MIN_WEEKLY` /
+  `remainingMinWeeklyPercent` **> 100** hard-error at loop/batch
   `preflight_validate_and_probe`.
 - **Pin:** optional for mixed standard/medium (factory exclude unsticks).
 
@@ -363,10 +368,14 @@ Full copy-paste lives under `## CONTRACT-001` in the progress log.
   sequential (`iteration.rs`) and wave (`wave_scheduler.rs`) wrappers — apply
   already does via `account_binding`. Tests must not encode chain-break as
   `exit != 0 || !prd_complete`.
-- **Policy CLI:** `models set-usage-rule` / `set-tier-fallback` /
+- **Policy CLI:** `models set-usage-rule` / `set-usage-policy` (sparse remaining
+  floors + horizon) / `set-tier-fallback` /
   `unset-tier-fallback` (writes JSON **null**, does not delete the key) /
   `models show` (offline: usagePolicy + tierFallback, no remaining %;
   remaining numbers only behind `list --remote` live-fetch).
+  Per-run overlays on `loop run` / `batch run`: `--usage-remaining-min`,
+  `--usage-remaining-min-weekly`, `--wait-if-reset-within`,
+  `--stop-if-reset-beyond` (omitted → config; present `0` is `Some(0)`).
 - **Overflow:** escalate / to_1m skips active blacked rungs.
 
 The per-task reactions (`resolve_task_execution`, `handle_overflow`) fold one
