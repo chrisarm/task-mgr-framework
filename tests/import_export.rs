@@ -214,7 +214,9 @@ fn test_import_with_force_replaces_data() {
     .unwrap();
     drop(conn);
 
-    // Re-import with --force
+    // Re-import with --force (scoped soft-archive of identity ∪ about-to-apply;
+    // does not hard-delete task rows, so fresh_import may be false when the
+    // same unprefixed ids are revived/updated in place).
     let force_result = init::init(
         temp_dir.path(),
         &[&prd_path],
@@ -225,13 +227,11 @@ fn test_import_with_force_replaces_data() {
         init::PrefixMode::Disabled,
     )
     .unwrap();
-    assert!(
-        force_result.fresh_import,
-        "--force should result in fresh import"
-    );
+    let force_total = force_result.tasks_imported + force_result.tasks_updated;
     assert_eq!(
-        force_result.tasks_imported, first_result.tasks_imported,
-        "Should import same number of tasks"
+        force_total, first_result.tasks_imported,
+        "Should re-apply the same number of tasks (import+update); got imported={} updated={}",
+        force_result.tasks_imported, force_result.tasks_updated
     );
 
     // Export and verify the modification was replaced

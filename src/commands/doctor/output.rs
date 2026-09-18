@@ -25,6 +25,8 @@ pub enum IssueType {
     DecayWarning,
     /// Task completed in git history but not marked done in DB
     GitReconciliation,
+    /// Two+ `prd_metadata` rows whose task_list paths share pin-19 identity
+    PathIdentityTwin,
 }
 
 impl std::fmt::Display for IssueType {
@@ -36,6 +38,7 @@ impl std::fmt::Display for IssueType {
             IssueType::OrphanBranchPrd => write!(f, "orphan_branch_prd"),
             IssueType::DecayWarning => write!(f, "decay_warning"),
             IssueType::GitReconciliation => write!(f, "git_reconciliation"),
+            IssueType::PathIdentityTwin => write!(f, "path_identity_twin"),
         }
     }
 }
@@ -95,6 +98,8 @@ pub struct DoctorSummary {
     pub decay_warnings: usize,
     /// Number of tasks reconciled from git history
     pub reconciled: usize,
+    /// Number of path-identity twin clusters (2+ prd_ids for one file)
+    pub path_identity_twins: usize,
     /// Total issues found
     pub total_issues: usize,
     /// Total issues fixed
@@ -192,6 +197,25 @@ pub fn format_doctor_verbose(result: &DoctorResult) -> String {
             .issues
             .iter()
             .filter(|i| i.issue_type == IssueType::OrphanBranchPrd)
+        {
+            output.push_str(&format!("    - {}\n", issue.entity_id));
+        }
+    }
+
+    // Check 6: Path-identity twins
+    output.push_str("\n[verbose] Check 6: Path-identity twins\n");
+    output.push_str(
+        "  Query: prd_files task_list rows whose pin-19 identity matches 2+ prd_metadata rows\n",
+    );
+    output.push_str(&format!(
+        "  Found: {} issue(s)\n",
+        result.summary.path_identity_twins
+    ));
+    if result.summary.path_identity_twins > 0 {
+        for issue in result
+            .issues
+            .iter()
+            .filter(|i| i.issue_type == IssueType::PathIdentityTwin)
         {
             output.push_str(&format!("    - {}\n", issue.entity_id));
         }
@@ -322,6 +346,21 @@ pub fn format_text(result: &DoctorResult) -> String {
             .issues
             .iter()
             .filter(|i| i.issue_type == IssueType::GitReconciliation)
+        {
+            output.push_str(&format!("  - {}: {}\n", issue.entity_id, issue.description));
+        }
+        output.push('\n');
+    }
+
+    if result.summary.path_identity_twins > 0 {
+        output.push_str(&format!(
+            "Path-identity twins ({})\n",
+            result.summary.path_identity_twins
+        ));
+        for issue in result
+            .issues
+            .iter()
+            .filter(|i| i.issue_type == IssueType::PathIdentityTwin)
         {
             output.push_str(&format!("  - {}: {}\n", issue.entity_id, issue.description));
         }

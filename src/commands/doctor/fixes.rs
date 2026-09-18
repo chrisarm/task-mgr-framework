@@ -97,3 +97,11 @@ pub fn fix_orphaned_relationship(
 
     Ok(())
 }
+
+/// Drop empty-side path-identity twin metadata (`prd_files` then `prd_metadata`).
+///
+/// Does **not** archive tasks, move JSON files, or touch the live-side PRD.
+/// Callers must only pass a side with zero unarchived tasks.
+pub fn fix_path_identity_twin_empty_side(conn: &Connection, prd_id: i64) -> TaskMgrResult<()> {
+    crate::db::soft_archive::drop_prd_rows(conn, &[prd_id])
+}

@@ -238,6 +238,33 @@ impl LockGuard {
     }
 }
 
+/// Lock file name for a PRD loop: `loop-{prefix}.lock`, or `loop.lock` when unprefixed.
+#[must_use]
+pub fn loop_lock_filename(prefix: Option<&str>) -> String {
+    match prefix {
+        Some(p) => format!("loop-{p}.lock"),
+        None => "loop.lock".to_string(),
+    }
+}
+
+/// Returns true when `dir/filename` has an active exclusive flock held by another process.
+///
+/// Stale lock files (no holder) return false. Missing files return false.
+pub fn is_named_lock_held(dir: &Path, filename: &str) -> bool {
+    let path = dir.join(filename);
+    let Ok(file) = File::open(&path) else {
+        return false;
+    };
+    match file.try_lock_exclusive() {
+        Ok(()) => {
+            let _ = file.unlock();
+            false
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => true,
+        Err(_) => false,
+    }
+}
+
 impl Drop for LockGuard {
     fn drop(&mut self) {
         // Release the lock

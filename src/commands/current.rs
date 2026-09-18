@@ -10,7 +10,7 @@ use std::path::Path;
 use serde::Serialize;
 
 use crate::TaskMgrResult;
-use crate::commands::add::{ResolvedContext, resolve_context};
+use crate::commands::add::{ResolvedContext, resolve_context_at};
 
 /// Result of `task-mgr current`.
 #[derive(Debug, Clone, Serialize)]
@@ -26,7 +26,14 @@ pub struct CurrentResult {
 /// (just `init` is enough; the schema + migrations are applied automatically).
 pub fn current(db_dir: &Path) -> TaskMgrResult<CurrentResult> {
     let conn = crate::db::open_and_migrate(db_dir)?;
-    let context = resolve_context(&conn)?;
+    let source_root = crate::git::main_repo_root_at(db_dir)
+        .or_else(|| db_dir.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| db_dir.to_path_buf());
+    let worktree_root = std::env::current_dir()
+        .ok()
+        .filter(|cwd| crate::git::is_inside_worktree_at(cwd).unwrap_or(false))
+        .unwrap_or_else(|| source_root.clone());
+    let context = resolve_context_at(&conn, &source_root, &worktree_root)?;
     Ok(CurrentResult { context })
 }
 

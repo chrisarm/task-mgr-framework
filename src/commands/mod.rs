@@ -96,8 +96,8 @@ pub use import_learnings::{
     ImportLearningsResult, format_text as format_import_learnings_text, import_learnings,
 };
 pub use init::{
-    DryRunDeletePreview, InitResult, PrefixMode, format_init_verbose,
-    format_text as format_init_text, init,
+    DryRunDeletePreview, InitOpts, InitResult, PrefixMode, format_init_verbose,
+    format_text as format_init_text, init, init_with_opts,
 };
 pub use invalidate_learning::{
     InvalidateLearningResult, format_text as format_invalidate_learning_text, invalidate_learning,

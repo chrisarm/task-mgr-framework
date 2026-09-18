@@ -4,6 +4,7 @@ use super::*;
 use crate::db::open_connection;
 use crate::loop_engine::model::{HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL};
 use std::fs;
+use std::path::PathBuf;
 use tempfile::TempDir;
 
 /// Create a minimal valid PRD JSON for testing.
@@ -91,7 +92,7 @@ fn test_init_with_force() {
     )
     .unwrap();
 
-    // Second import with force should replace
+    // Second import with force soft-archives then unarchives/updates in place
     let result = init(
         temp_dir.path(),
         &[&json_path],
@@ -104,7 +105,18 @@ fn test_init_with_force() {
     .unwrap();
 
     assert!(result.fresh_import);
-    assert_eq!(result.tasks_imported, 2);
+    assert_eq!(result.tasks_imported, 0);
+    assert_eq!(result.tasks_updated, 2);
+
+    let conn = open_connection(temp_dir.path()).unwrap();
+    let live: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tasks WHERE archived_at IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(live, 2, "force must revive tasks (not hard-delete)");
 }
 
 #[test]
@@ -910,16 +922,31 @@ fn test_init_dry_run_with_force_shows_delete_preview() {
     .unwrap();
 
     assert!(result.dry_run);
-    assert!(result.would_delete.is_some());
-    let preview = result.would_delete.unwrap();
-    assert_eq!(preview.tasks, 2);
-    assert_eq!(preview.files, 3);
-    assert_eq!(preview.relationships, 1); // synergyWith ignored
+    assert!(
+        result.would_archive.is_some(),
+        "scoped --force dry-run must preview archive counts"
+    );
+    assert!(result.would_delete.is_none());
+    let preview = result.would_archive.unwrap();
+    assert!(
+        !preview.prefixes.is_empty(),
+        "dry-run must list union prefixes"
+    );
+    let total_tasks: usize = preview.prefixes.iter().map(|p| p.tasks).sum();
+    assert_eq!(total_tasks, 2);
 
     let count_after: i32 = conn
         .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(count_after, 2);
+    assert_eq!(count_after, 2, "dry-run must not mutate tasks");
+    let archived: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tasks WHERE archived_at IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(archived, 0, "dry-run must not soft-archive");
 }
 
 #[test]
@@ -2574,7 +2601,7 @@ mod multi_prd_import_tests {
             "P2 prd_metadata must survive scoped --force of P1"
         );
 
-        // P1 task must be re-imported (force deleted then re-inserted)
+        // P1 task soft-archived then revived (not hard-deleted)
         let p1_task_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM tasks WHERE id LIKE 'P1-%'", [], |r| {
                 r.get(0)
@@ -2582,7 +2609,18 @@ mod multi_prd_import_tests {
             .unwrap();
         assert_eq!(
             p1_task_count, 1,
-            "P1 task must be re-imported after --force"
+            "P1 task row must still exist after --force"
+        );
+        let p1_live: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE id LIKE 'P1-%' AND archived_at IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            p1_live, 1,
+            "P1 task must be live (unarchived) after --force"
         );
     }
 }
@@ -3361,4 +3399,1013 @@ fn test_git_rm_non_cached_never_invoked() {
             );
         }
     }
+}
+
+// ============================================================================
+// Sticky identity prefix resolver (FEAT-002)
+// ============================================================================
+
+/// Minimal PRD under `proj/tasks/` with InitOpts roots for identity tests.
+fn sticky_project_fixture(branch: &str) -> (TempDir, PathBuf, PathBuf, PathBuf) {
+    let temp_dir = TempDir::new().unwrap();
+    let project = temp_dir.path().join("proj");
+    let tasks_dir = project.join("tasks");
+    let db_dir = project.join(".task-mgr");
+    fs::create_dir_all(&tasks_dir).unwrap();
+    fs::create_dir_all(&db_dir).unwrap();
+    let json_path = tasks_dir.join("prd.json");
+    let json = format!(
+        r#"{{
+        "project": "sticky-test",
+        "branchName": "{branch}",
+        "userStories": [
+            {{"id": "US-001", "title": "Task 1", "priority": 1, "passes": false}}
+        ]
+    }}"#
+    );
+    fs::write(&json_path, json).unwrap();
+    (temp_dir, project, db_dir, json_path)
+}
+
+fn sticky_opts(project: &Path) -> InitOpts {
+    InitOpts {
+        source_root: Some(project.to_path_buf()),
+        worktree_root: Some(project.to_path_buf()),
+    }
+}
+
+#[test]
+fn test_sticky_explicit_then_auto_one_prd_restores_json() {
+    let (_tmp, project, db_dir, json_path) = sticky_project_fixture("feat/sticky");
+    let opts = sticky_opts(&project);
+
+    let r1 = init_with_opts(
+        &db_dir,
+        &[&json_path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Explicit("FOO".into()),
+        opts.clone(),
+    )
+    .unwrap();
+    assert_eq!(r1.prefix_applied.as_deref(), Some("FOO"));
+
+    // Operator (or prior Auto) left a different taskPrefix in JSON.
+    let mut value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&json_path).unwrap()).unwrap();
+    value
+        .as_object_mut()
+        .unwrap()
+        .insert("taskPrefix".into(), serde_json::json!("WRONG"));
+    fs::write(
+        &json_path,
+        format!("{}\n", serde_json::to_string_pretty(&value).unwrap()),
+    )
+    .unwrap();
+
+    let r2 = init_with_opts(
+        &db_dir,
+        &[&json_path],
+        false,
+        true, // append
+        true, // update_existing
+        false,
+        PrefixMode::Auto,
+        opts,
+    )
+    .unwrap();
+    assert_eq!(r2.prefix_applied.as_deref(), Some("FOO"));
+
+    let conn = open_connection(&db_dir).unwrap();
+    let meta_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM prd_metadata", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(meta_count, 1, "must not insert a second prd_metadata row");
+    let prefix: String = conn
+        .query_row("SELECT task_prefix FROM prd_metadata", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(prefix, "FOO");
+
+    let content = fs::read_to_string(&json_path).unwrap();
+    assert!(
+        content.contains("\"taskPrefix\": \"FOO\""),
+        "JSON must be restored to registered Explicit prefix: {content}"
+    );
+}
+
+#[test]
+fn test_sticky_relative_then_absolute_same_identity() {
+    let (_tmp, project, db_dir, json_path) = sticky_project_fixture("feat/rel-abs");
+    let opts = sticky_opts(&project);
+    let rel = PathBuf::from("tasks/prd.json");
+    // init with path relative to project (as operators often pass)
+    let cwd_rel = project.join(&rel);
+
+    let r1 = init_with_opts(
+        &db_dir,
+        &[&cwd_rel],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Explicit("REL1".into()),
+        opts.clone(),
+    )
+    .unwrap();
+    assert_eq!(r1.prefix_applied.as_deref(), Some("REL1"));
+    let prd_id1: i64 = {
+        let conn = open_connection(&db_dir).unwrap();
+        conn.query_row("SELECT id FROM prd_metadata", [], |r| r.get(0))
+            .unwrap()
+    };
+
+    let abs = fs::canonicalize(&json_path).unwrap();
+    let r2 = init_with_opts(
+        &db_dir,
+        &[&abs],
+        false,
+        true,
+        true,
+        false,
+        PrefixMode::Auto,
+        opts,
+    )
+    .unwrap();
+    assert_eq!(r2.prefix_applied.as_deref(), Some("REL1"));
+
+    let conn = open_connection(&db_dir).unwrap();
+    let meta_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM prd_metadata", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(meta_count, 1);
+    let prd_id2: i64 = conn
+        .query_row("SELECT id FROM prd_metadata", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(prd_id1, prd_id2);
+}
+
+#[test]
+fn test_sticky_source_vs_worktree_same_identity() {
+    let temp_dir = TempDir::new().unwrap();
+    let source = temp_dir.path().join("main");
+    let worktree = temp_dir.path().join("wt");
+    fs::create_dir_all(source.join("tasks")).unwrap();
+    fs::create_dir_all(worktree.join("tasks")).unwrap();
+    let db_dir = source.join(".task-mgr");
+    fs::create_dir_all(&db_dir).unwrap();
+
+    let src_json = source.join("tasks/prd.json");
+    let wt_json = worktree.join("tasks/prd.json");
+    let body = r#"{
+        "project": "sticky-wt",
+        "branchName": "feat/wt",
+        "userStories": [
+            {"id": "US-001", "title": "Task 1", "priority": 1, "passes": false}
+        ]
+    }"#;
+    fs::write(&src_json, body).unwrap();
+    fs::write(&wt_json, body).unwrap();
+
+    let opts_src = InitOpts {
+        source_root: Some(source.clone()),
+        worktree_root: Some(source.clone()),
+    };
+    let r1 = init_with_opts(
+        &db_dir,
+        &[&src_json],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Explicit("WT1".into()),
+        opts_src,
+    )
+    .unwrap();
+    assert_eq!(r1.prefix_applied.as_deref(), Some("WT1"));
+
+    let opts_wt = InitOpts {
+        source_root: Some(source.clone()),
+        worktree_root: Some(worktree.clone()),
+    };
+    let r2 = init_with_opts(
+        &db_dir,
+        &[&wt_json],
+        false,
+        true,
+        true,
+        false,
+        PrefixMode::Auto,
+        opts_wt,
+    )
+    .unwrap();
+    assert_eq!(r2.prefix_applied.as_deref(), Some("WT1"));
+
+    let conn = open_connection(&db_dir).unwrap();
+    let meta_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM prd_metadata", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(meta_count, 1);
+}
+
+#[test]
+fn test_sticky_branch_name_change_keeps_prefix() {
+    let (_tmp, project, db_dir, json_path) = sticky_project_fixture("feat/original");
+    let opts = sticky_opts(&project);
+
+    let r1 = init_with_opts(
+        &db_dir,
+        &[&json_path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Auto,
+        opts.clone(),
+    )
+    .unwrap();
+    let prefix1 = r1.prefix_applied.clone().unwrap();
+    let expected_original = generate_prefix(Some("feat/original"), "prd.json");
+    assert_eq!(prefix1, expected_original);
+
+    // Edit branchName — naive re-hash would mint a twin; sticky must keep prefix1.
+    let mut value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&json_path).unwrap()).unwrap();
+    value
+        .as_object_mut()
+        .unwrap()
+        .insert("branchName".into(), serde_json::json!("feat/renamed"));
+    fs::write(
+        &json_path,
+        format!("{}\n", serde_json::to_string_pretty(&value).unwrap()),
+    )
+    .unwrap();
+
+    let would_be_new = generate_prefix(Some("feat/renamed"), "prd.json");
+    assert_ne!(
+        prefix1, would_be_new,
+        "precondition: branch rename must change the hash input"
+    );
+
+    let r2 = init_with_opts(
+        &db_dir,
+        &[&json_path],
+        false,
+        true,
+        true,
+        false,
+        PrefixMode::Auto,
+        opts,
+    )
+    .unwrap();
+    assert_eq!(r2.prefix_applied.as_deref(), Some(prefix1.as_str()));
+
+    let conn = open_connection(&db_dir).unwrap();
+    let meta_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM prd_metadata", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        meta_count, 1,
+        "branchName edit must not mint a second metadata row"
+    );
+    let stored: String = conn
+        .query_row("SELECT task_prefix FROM prd_metadata", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(stored, prefix1);
+}
+
+#[test]
+fn test_sticky_json_prefix_edit_restores_registered() {
+    let (_tmp, project, db_dir, json_path) = sticky_project_fixture("feat/edit-json");
+    let opts = sticky_opts(&project);
+
+    let r1 = init_with_opts(
+        &db_dir,
+        &[&json_path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Auto,
+        opts.clone(),
+    )
+    .unwrap();
+    let registered = r1.prefix_applied.unwrap();
+
+    let mut value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&json_path).unwrap()).unwrap();
+    value
+        .as_object_mut()
+        .unwrap()
+        .insert("taskPrefix".into(), serde_json::json!("EDITED99"));
+    fs::write(
+        &json_path,
+        format!("{}\n", serde_json::to_string_pretty(&value).unwrap()),
+    )
+    .unwrap();
+
+    let r2 = init_with_opts(
+        &db_dir,
+        &[&json_path],
+        false,
+        true,
+        true,
+        false,
+        PrefixMode::Auto,
+        opts,
+    )
+    .unwrap();
+    assert_eq!(r2.prefix_applied.as_deref(), Some(registered.as_str()));
+
+    let conn = open_connection(&db_dir).unwrap();
+    let meta_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM prd_metadata", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(meta_count, 1);
+    let content = fs::read_to_string(&json_path).unwrap();
+    assert!(content.contains(&format!("\"taskPrefix\": \"{registered}\"")));
+    assert!(!content.contains("EDITED99"));
+}
+
+#[test]
+fn test_sticky_twins_refuse_with_doctor_hint() {
+    let (_tmp, project, db_dir, json_path) = sticky_project_fixture("feat/twins");
+    let opts = sticky_opts(&project);
+
+    init_with_opts(
+        &db_dir,
+        &[&json_path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Explicit("TWIN-A".into()),
+        opts.clone(),
+    )
+    .unwrap();
+
+    // Inject a second metadata row with absolute path for the same live file.
+    let abs = fs::canonicalize(&json_path).unwrap();
+    let abs_str = abs.to_str().unwrap();
+    {
+        let conn = open_connection(&db_dir).unwrap();
+        conn.execute(
+            "INSERT INTO prd_metadata (project, task_prefix, updated_at)
+             VALUES ('twin-b', 'TWIN-B', datetime('now'))",
+            [],
+        )
+        .unwrap();
+        let twin_id: i64 = conn
+            .query_row("SELECT last_insert_rowid()", [], |r| r.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO prd_files (prd_id, file_path, file_type) VALUES (?, ?, 'task_list')",
+            rusqlite::params![twin_id, abs_str],
+        )
+        .unwrap();
+    }
+
+    let err = init_with_opts(
+        &db_dir,
+        &[&json_path],
+        false,
+        true,
+        true,
+        false,
+        PrefixMode::Auto,
+        opts,
+    )
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("doctor"),
+        "twin refuse must name doctor: {msg}"
+    );
+    assert!(
+        msg.contains("path-identity") || msg.contains("2 path-identity"),
+        "twin refuse must describe identity collision: {msg}"
+    );
+
+    let conn = open_connection(&db_dir).unwrap();
+    let meta_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM prd_metadata", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(meta_count, 2, "refuse must not insert a third metadata row");
+}
+
+#[test]
+fn test_sticky_no_prefix_on_registered_refuses() {
+    let (_tmp, project, db_dir, json_path) = sticky_project_fixture("feat/nopfx");
+    let opts = sticky_opts(&project);
+
+    init_with_opts(
+        &db_dir,
+        &[&json_path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Explicit("KEEP".into()),
+        opts.clone(),
+    )
+    .unwrap();
+
+    let err = init_with_opts(
+        &db_dir,
+        &[&json_path],
+        false,
+        true,
+        true,
+        false,
+        PrefixMode::Disabled,
+        opts,
+    )
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("--no-prefix") || msg.contains("Disabled"),
+        "must refuse --no-prefix on registered non-NULL: {msg}"
+    );
+}
+
+#[test]
+fn test_sticky_explicit_other_refuses_unless_force() {
+    let (_tmp, project, db_dir, json_path) = sticky_project_fixture("feat/other");
+    let opts = sticky_opts(&project);
+
+    init_with_opts(
+        &db_dir,
+        &[&json_path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Explicit("ORIG".into()),
+        opts.clone(),
+    )
+    .unwrap();
+
+    let err = init_with_opts(
+        &db_dir,
+        &[&json_path],
+        false, // no force
+        true,
+        true,
+        false,
+        PrefixMode::Explicit("OTHER".into()),
+        opts.clone(),
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("Explicit") || err.to_string().contains("OTHER"),
+        "Explicit(other) must refuse without --force: {err}"
+    );
+
+    // --force drops identity first, so Explicit(other) is allowed (reprefix hatch).
+    let r = init_with_opts(
+        &db_dir,
+        &[&json_path],
+        true, // force
+        false,
+        false,
+        false,
+        PrefixMode::Explicit("OTHER".into()),
+        opts,
+    )
+    .unwrap();
+    assert_eq!(r.prefix_applied.as_deref(), Some("OTHER"));
+}
+
+#[test]
+fn test_sticky_restore_write_error_surfaces() {
+    let (_tmp, project, db_dir, json_path) = sticky_project_fixture("feat/ro");
+    let opts = sticky_opts(&project);
+
+    init_with_opts(
+        &db_dir,
+        &[&json_path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Explicit("RO1".into()),
+        opts.clone(),
+    )
+    .unwrap();
+
+    // Make JSON disagree so sticky Auto will attempt write_prefix_to_json.
+    let mut value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&json_path).unwrap()).unwrap();
+    value
+        .as_object_mut()
+        .unwrap()
+        .insert("taskPrefix".into(), serde_json::json!("DRIFT"));
+    fs::write(
+        &json_path,
+        format!("{}\n", serde_json::to_string_pretty(&value).unwrap()),
+    )
+    .unwrap();
+
+    // Read-only file → restore write must return Err (not swallowed).
+    let mut perms = fs::metadata(&json_path).unwrap().permissions();
+    perms.set_readonly(true);
+    fs::set_permissions(&json_path, perms).unwrap();
+
+    let err = init_with_opts(
+        &db_dir,
+        &[&json_path],
+        false,
+        true,
+        true,
+        false,
+        PrefixMode::Auto,
+        opts,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, crate::TaskMgrError::IoError(_)),
+        "restore IO failure must surface as Err, got: {err:?}"
+    );
+
+    // Cleanup so TempDir can remove the file.
+    let mut perms = fs::metadata(&json_path).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    perms.set_readonly(false);
+    fs::set_permissions(&json_path, perms).unwrap();
+}
+
+#[test]
+fn test_sticky_first_auto_arm_does_not_honor_json_prefix() {
+    // Structural guard: first-registration Auto must hash, not assign from prd.task_prefix.
+    // Behavioral cover: test_init_auto_prefix_ignores_json_field.
+    // Shared helper `first_registration_prefix` is the single Auto first-reg arm
+    // (also used after scoped --force).
+    let impl_src = include_str!("mod.rs");
+    let helper = impl_src
+        .split("fn first_registration_prefix(")
+        .nth(1)
+        .expect("first_registration_prefix helper missing");
+    let arm_body = helper.split("\nfn ").next().unwrap_or(helper);
+    assert!(
+        arm_body.contains("compute_auto_prefix") || arm_body.contains("generate_prefix"),
+        "first Auto must hash via compute_auto_prefix/generate_prefix"
+    );
+    assert!(
+        !arm_body.contains("prd.task_prefix.clone()")
+            && !arm_body.contains("prd.task_prefix.as_ref().cloned()")
+            && !arm_body.contains("Some(prd.task_prefix"),
+        "first Auto must not honor JSON taskPrefix as the chosen prefix"
+    );
+    // Scoped --force must share the helper (no duplicated generate+write arm).
+    assert!(
+        impl_src.contains("resolve_prefix_after_scoped_force"),
+        "scoped --force Auto first-reg must go through shared helper"
+    );
+    let force_helper = impl_src
+        .split("fn resolve_prefix_after_scoped_force(")
+        .nth(1)
+        .expect("resolve_prefix_after_scoped_force missing");
+    let force_body = force_helper.split("\nfn ").next().unwrap_or(force_helper);
+    assert!(
+        force_body.contains("maybe_write_auto_first_prefix")
+            || force_body.contains("first_registration_prefix"),
+        "force path must share Auto write/first-reg helpers"
+    );
+}
+
+// ============================================================================
+// FEAT-003: --force union archive-not-delete reprefix hatch
+// ============================================================================
+
+/// Structural: prefix-scoped force helpers must not hard-delete tasks.
+#[test]
+fn test_force_union_archive_helper_has_no_delete_from_tasks() {
+    // Match executable SQL string literals, not doc comments that say "no DELETE".
+    let sql_delete_tasks = "\"DELETE FROM tasks";
+
+    let soft = include_str!("../../db/soft_archive.rs");
+    let archive_fn = soft
+        .split("pub fn archive_prd_by_prefix")
+        .nth(1)
+        .expect("archive_prd_by_prefix missing");
+    let body = archive_fn
+        .split("pub fn archive_unprefixed_live_tasks")
+        .next()
+        .unwrap_or(archive_fn);
+    assert!(
+        !body.contains(sql_delete_tasks),
+        "archive_prd_by_prefix must not DELETE FROM tasks"
+    );
+
+    let unprefixed = soft
+        .split("pub fn archive_unprefixed_live_tasks")
+        .nth(1)
+        .expect("archive_unprefixed_live_tasks missing");
+    let up_body = unprefixed
+        .split("pub fn drop_prd_rows")
+        .next()
+        .unwrap_or(unprefixed);
+    assert!(
+        !up_body.contains(sql_delete_tasks),
+        "archive_unprefixed_live_tasks must not DELETE FROM tasks"
+    );
+
+    let import = include_str!("import.rs");
+    let force_fn = import
+        .split("pub fn force_union_archive")
+        .nth(1)
+        .expect("force_union_archive missing");
+    let force_body = force_fn
+        .split("pub fn get_archive_preview")
+        .next()
+        .unwrap_or(force_fn);
+    assert!(
+        !force_body.contains(sql_delete_tasks),
+        "force_union_archive must not DELETE FROM tasks"
+    );
+    // Contrast: legacy drop_existing_data still hard-deletes for global wipe.
+    assert!(
+        import.contains("DELETE FROM tasks WHERE id LIKE"),
+        "drop_existing_data must retain DELETE FROM tasks for legacy path"
+    );
+}
+
+#[test]
+fn test_force_auto_archives_identity_and_about_to_apply() {
+    let (_tmp, project, db_dir, json_path) = sticky_project_fixture("feat/force-union");
+    let opts = sticky_opts(&project);
+
+    // Register under Explicit OLD (identity).
+    init_with_opts(
+        &db_dir,
+        &[&json_path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Explicit("OLD".into()),
+        opts.clone(),
+    )
+    .unwrap();
+
+    let hash = generate_prefix(Some("feat/force-union"), "prd.json");
+    assert_ne!(hash, "OLD");
+
+    // Seed live tasks + metadata under the about-to-apply hash (known-bad leftover).
+    let conn = open_connection(&db_dir).unwrap();
+    conn.execute(
+        "INSERT INTO prd_metadata (project, task_prefix) VALUES ('hash-leftover', ?1)",
+        [&hash],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, priority, acceptance_criteria) \
+         VALUES (?1, 'hash task', 'todo', 1, '[]')",
+        [format!("{hash}-US-H")],
+    )
+    .unwrap();
+    drop(conn);
+
+    // Put a stale JSON taskPrefix distinct from both identity and hash.
+    let mut value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&json_path).unwrap()).unwrap();
+    value
+        .as_object_mut()
+        .unwrap()
+        .insert("taskPrefix".into(), serde_json::json!("JSONX"));
+    fs::write(
+        &json_path,
+        format!("{}\n", serde_json::to_string_pretty(&value).unwrap()),
+    )
+    .unwrap();
+
+    // Seed JSONX live tasks (third name).
+    let conn = open_connection(&db_dir).unwrap();
+    conn.execute(
+        "INSERT INTO prd_metadata (project, task_prefix) VALUES ('json-leftover', 'JSONX')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, priority, acceptance_criteria) \
+         VALUES ('JSONX-US-J', 'json task', 'todo', 1, '[]')",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    // Dry-run: lists union prefixes, no mutation.
+    let dry = init_with_opts(
+        &db_dir,
+        &[&json_path],
+        true,
+        false,
+        false,
+        true,
+        PrefixMode::Auto,
+        opts.clone(),
+    )
+    .unwrap();
+    assert!(dry.dry_run);
+    let preview = dry.would_archive.expect("would_archive");
+    let names: Vec<Option<&str>> = preview
+        .prefixes
+        .iter()
+        .map(|p| p.prefix.as_deref())
+        .collect();
+    assert!(
+        names.contains(&Some("OLD")),
+        "dry-run must list identity OLD: {names:?}"
+    );
+    assert!(
+        names.contains(&Some(hash.as_str())),
+        "dry-run must list about-to-apply hash: {names:?}"
+    );
+    assert!(
+        names.contains(&Some("JSONX")),
+        "dry-run must list JSON prefix: {names:?}"
+    );
+
+    let conn = open_connection(&db_dir).unwrap();
+    let live_before: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tasks WHERE archived_at IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(live_before >= 3);
+    drop(conn);
+
+    // Real --force Auto.
+    let result = init_with_opts(
+        &db_dir,
+        &[&json_path],
+        true,
+        false,
+        false,
+        false,
+        PrefixMode::Auto,
+        opts,
+    )
+    .unwrap();
+    assert_eq!(result.prefix_applied.as_deref(), Some(hash.as_str()));
+
+    let conn = open_connection(&db_dir).unwrap();
+
+    // OLD tasks still exist (archived or revived only if same id — they are not).
+    let old_total: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tasks WHERE id LIKE 'OLD-%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(old_total >= 1, "OLD tasks must remain as rows, not deleted");
+    let old_archived: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tasks WHERE id LIKE 'OLD-%' AND archived_at IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        old_archived, old_total,
+        "OLD tasks must be soft-archived (count archived == total, not zero rows)"
+    );
+
+    // Hash metadata leftover row must be gone; only one metadata under about-to-apply.
+    let meta_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM prd_metadata", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(meta_count, 1, "must register exactly one prd_metadata");
+    let stored: String = conn
+        .query_row("SELECT task_prefix FROM prd_metadata", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(stored, hash);
+
+    let hash_meta: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM prd_metadata WHERE task_prefix = ?1",
+            [&hash],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(hash_meta, 1);
+
+    let jsonx_meta: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM prd_metadata WHERE task_prefix = 'JSONX'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(jsonx_meta, 0, "JSONX metadata must be dropped");
+
+    let old_meta: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM prd_metadata WHERE task_prefix = 'OLD'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(old_meta, 0, "OLD identity metadata must be dropped");
+
+    // JSON/prompt files stay in place (no move into tasks/archive/).
+    assert!(json_path.exists(), "JSON must not be moved to archive/");
+    let archive_dir = project.join("tasks").join("archive");
+    assert!(
+        !archive_dir.exists(),
+        "--force must not create tasks/archive/"
+    );
+}
+
+#[test]
+fn test_force_same_prefix_unarchives_without_unique_crash() {
+    let (_tmp, project, db_dir, json_path) = sticky_project_fixture("feat/force-same");
+    let opts = sticky_opts(&project);
+
+    init_with_opts(
+        &db_dir,
+        &[&json_path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Explicit("SAME".into()),
+        opts.clone(),
+    )
+    .unwrap();
+
+    // Second --force same prefix must update/unarchive, not UNIQUE-crash.
+    let result = init_with_opts(
+        &db_dir,
+        &[&json_path],
+        true,
+        false,
+        false,
+        false,
+        PrefixMode::Explicit("SAME".into()),
+        opts,
+    )
+    .unwrap();
+    assert_eq!(result.prefix_applied.as_deref(), Some("SAME"));
+    assert_eq!(result.tasks_updated, 1);
+    assert_eq!(result.tasks_imported, 0);
+
+    let conn = open_connection(&db_dir).unwrap();
+    let live: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tasks WHERE id LIKE 'SAME-%' AND archived_at IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(live, 1);
+    let total: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tasks WHERE id LIKE 'SAME-%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(total, 1, "must not duplicate rows on same-prefix --force");
+}
+
+#[test]
+fn test_force_refuses_when_union_loop_lock_held() {
+    let (_tmp, project, db_dir, json_path) = sticky_project_fixture("feat/force-lock");
+    let opts = sticky_opts(&project);
+
+    init_with_opts(
+        &db_dir,
+        &[&json_path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Explicit("LOCKP".into()),
+        opts.clone(),
+    )
+    .unwrap();
+
+    // Hold identity prefix lock (not only about-to-apply).
+    let _guard = crate::db::LockGuard::acquire_named(&db_dir, "loop-LOCKP.lock").unwrap();
+
+    let err = init_with_opts(
+        &db_dir,
+        &[&json_path],
+        true,
+        false,
+        false,
+        false,
+        PrefixMode::Explicit("OTHER".into()),
+        opts,
+    )
+    .unwrap_err();
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("loop-LOCKP.lock") || matches!(err, crate::TaskMgrError::InvalidState { .. }),
+        "must name the held lock file: {msg}"
+    );
+    match &err {
+        crate::TaskMgrError::InvalidState { id, actual, .. } => {
+            assert!(
+                id.contains("loop-LOCKP.lock") || actual.contains("loop-LOCKP.lock"),
+                "InvalidState must name lock file: id={id} actual={actual}"
+            );
+        }
+        other => panic!("expected InvalidState, got {other:?}"),
+    }
+
+    // No partial archive: LOCKP tasks still live.
+    let conn = open_connection(&db_dir).unwrap();
+    let live: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tasks WHERE id LIKE 'LOCKP-%' AND archived_at IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(live, 1, "tasks must be unchanged when lock refuse fires");
+    let meta: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM prd_metadata WHERE task_prefix = 'LOCKP'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(meta, 1, "metadata must be unchanged on lock refuse");
+}
+
+#[test]
+fn test_force_null_identity_plus_hash_archives_both() {
+    let (_tmp, project, db_dir, json_path) = sticky_project_fixture("feat/force-null");
+    let opts = sticky_opts(&project);
+
+    // NULL identity via --no-prefix.
+    init_with_opts(
+        &db_dir,
+        &[&json_path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Disabled,
+        opts.clone(),
+    )
+    .unwrap();
+
+    let hash = generate_prefix(Some("feat/force-null"), "prd.json");
+    let conn = open_connection(&db_dir).unwrap();
+    conn.execute(
+        "INSERT INTO prd_metadata (project, task_prefix) VALUES ('hash-row', ?1)",
+        [&hash],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, priority, acceptance_criteria) \
+         VALUES (?1, 'h', 'todo', 1, '[]')",
+        [format!("{hash}-T")],
+    )
+    .unwrap();
+    drop(conn);
+
+    // Force Auto: union includes NULL identity + hash about-to-apply.
+    init_with_opts(
+        &db_dir,
+        &[&json_path],
+        true,
+        false,
+        false,
+        false,
+        PrefixMode::Auto,
+        opts,
+    )
+    .unwrap();
+
+    let conn = open_connection(&db_dir).unwrap();
+    let meta: i64 = conn
+        .query_row("SELECT COUNT(*) FROM prd_metadata", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(meta, 1);
+    let stored: Option<String> = conn
+        .query_row("SELECT task_prefix FROM prd_metadata", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(stored.as_deref(), Some(hash.as_str()));
+
+    // Bare NULL-identity tasks soft-archived (still present).
+    let bare_archived: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tasks WHERE id = 'US-001' AND archived_at IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        bare_archived, 1,
+        "NULL-identity task must be archived not deleted"
+    );
 }

@@ -25,9 +25,12 @@ pub struct InitResult {
     pub warnings: Vec<String>,
     /// Whether this was a dry run (no changes made)
     pub dry_run: bool,
-    /// Preview of what would be deleted (only populated in dry-run mode with --force)
+    /// Preview of what would be deleted (dry-run + legacy global `--force` wipe)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub would_delete: Option<DryRunDeletePreview>,
+    /// Preview of what would be soft-archived (dry-run + prefix-scoped `--force`)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub would_archive: Option<DryRunArchivePreview>,
     /// The prefix that was applied to task IDs, if any
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefix_applied: Option<String>,
@@ -54,6 +57,22 @@ pub struct DryRunDeletePreview {
     pub runs: usize,
 }
 
+/// Per-prefix soft-archive counts for dry-run `--force`.
+#[derive(Debug, Serialize, Clone)]
+pub struct ArchivePrefixPreview {
+    /// Task prefix (`None` = NULL / unprefixed identity)
+    pub prefix: Option<String>,
+    /// Live tasks that would be soft-archived under this prefix
+    pub tasks: usize,
+}
+
+/// Preview of prefix-scoped `--force` soft-archive (no task hard-delete).
+#[derive(Debug, Serialize)]
+pub struct DryRunArchivePreview {
+    /// One entry per union prefix (identity ∪ about-to-apply)
+    pub prefixes: Vec<ArchivePrefixPreview>,
+}
+
 /// Formats the init result for text output.
 #[must_use]
 pub fn format_text(result: &InitResult) -> String {
@@ -61,6 +80,13 @@ pub fn format_text(result: &InitResult) -> String {
 
     if result.dry_run {
         output.push_str("[DRY RUN] Preview of changes:\n");
+        if let Some(ref preview) = result.would_archive {
+            output.push_str("  Would archive (--force):\n");
+            for entry in &preview.prefixes {
+                let name = entry.prefix.as_deref().unwrap_or("(null)");
+                output.push_str(&format!("    {}: {} tasks\n", name, entry.tasks));
+            }
+        }
         if let Some(ref preview) = result.would_delete {
             output.push_str(&format!(
                 "  Would delete: {} tasks, {} files, {} relationships, {} learnings, {} runs\n",
@@ -135,7 +161,14 @@ pub fn format_init_verbose(result: &InitResult) -> String {
 
     output.push_str(&format!("{}\n", "-".repeat(50)));
 
-    // What would be deleted (dry-run with --force)
+    // What would be archived / deleted (dry-run with --force)
+    if let Some(ref preview) = result.would_archive {
+        output.push_str("\n[verbose] Would archive (--force flag):\n");
+        for entry in &preview.prefixes {
+            let name = entry.prefix.as_deref().unwrap_or("(null)");
+            output.push_str(&format!("  {}: {} tasks\n", name, entry.tasks));
+        }
+    }
     if let Some(ref preview) = result.would_delete {
         output.push_str("\n[verbose] Would delete (--force flag):\n");
         output.push_str(&format!("  Tasks: {}\n", preview.tasks));

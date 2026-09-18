@@ -62,9 +62,11 @@ TASK ID PREFIXING:
     By default, all task IDs are prefixed to prevent cross-phase collisions.
     The prefix is determined in this order:
       1. --prefix flag (highest priority)
-      2. \"taskPrefix\" field in the PRD JSON
-      3. Auto-generated 8-char UUID (written back to JSON for stability)
-    Use --no-prefix to import task IDs exactly as they appear in the JSON.
+      2. Registered path-identity prefix (sticky after first import)
+      3. md5(branchName:filename)[:8] on first Auto registration
+         (written back to JSON for stability)
+    First Auto registration does not read JSON taskPrefix. Use --no-prefix
+    to import task IDs exactly as they appear in the JSON.
 ")]
     Init {
         /// Path to the JSON PRD file(s) to import.
@@ -84,7 +86,8 @@ TASK ID PREFIXING:
         #[arg(long, default_value_t = false)]
         enhance: bool,
 
-        /// Force re-initialization, dropping existing data.
+        /// Force re-initialization: soft-archive identity ∪ about-to-apply
+        /// (sets `archived_at`; does not hard-delete task rows or move JSON).
         ///
         /// Honored only on the deprecated `--from-json` shim path. Project-level
         /// init has no destructive form — `task-mgr init --force` (no
@@ -112,9 +115,9 @@ TASK ID PREFIXING:
         dry_run: bool,
 
         /// Prefix to prepend to all task IDs (e.g., "P3" becomes "P3-FEAT-001").
-        /// Overrides the "taskPrefix" field in the PRD JSON.
-        /// If neither this flag nor the JSON field is set, a short UUID prefix is
-        /// auto-generated and written back to the JSON for stability.
+        /// Highest priority over registered identity and Auto hash.
+        /// Without --prefix, Auto uses sticky registered identity when present,
+        /// otherwise md5(branchName:filename)[:8] (written back to JSON).
         #[arg(long, conflicts_with = "no_prefix")]
         prefix: Option<String>,
 
@@ -1347,7 +1350,8 @@ pub enum LoopCommand {
         /// Path to the JSON PRD file to import
         prd_file: PathBuf,
 
-        /// Force re-initialization, dropping existing data
+        /// Force re-initialization: soft-archive identity ∪ about-to-apply
+        /// (sets `archived_at`; does not hard-delete task rows or move JSON).
         #[arg(long, default_value_t = false)]
         force: bool,
 
@@ -1364,6 +1368,10 @@ pub enum LoopCommand {
         dry_run: bool,
 
         /// Prefix to prepend to all task IDs (e.g., "P3" becomes "P3-FEAT-001").
+        /// Highest priority over registered identity and Auto hash.
+        /// Without --prefix: sticky registered identity, else
+        /// md5(branchName:filename)[:8] written back to JSON (first Auto does
+        /// not read JSON taskPrefix).
         #[arg(long, conflicts_with = "no_prefix")]
         prefix: Option<String>,
 
@@ -1451,7 +1459,8 @@ pub enum BatchCommand {
         #[arg(required = true)]
         patterns: Vec<String>,
 
-        /// Force re-initialization, dropping existing data
+        /// Force re-initialization: soft-archive identity ∪ about-to-apply
+        /// (sets `archived_at`; does not hard-delete task rows or move JSON).
         #[arg(long, default_value_t = false)]
         force: bool,
 
@@ -1468,6 +1477,10 @@ pub enum BatchCommand {
         dry_run: bool,
 
         /// Prefix to prepend to all task IDs.
+        /// Highest priority over registered identity and Auto hash.
+        /// Without --prefix: sticky registered identity, else
+        /// md5(branchName:filename)[:8] written back to JSON (first Auto does
+        /// not read JSON taskPrefix).
         #[arg(long, conflicts_with = "no_prefix")]
         prefix: Option<String>,
 

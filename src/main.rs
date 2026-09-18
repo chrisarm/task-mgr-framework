@@ -15,14 +15,15 @@ use task_mgr::cli::{
     WorktreesAction, resolve_batch_command, resolve_loop_command,
 };
 use task_mgr::commands::{
-    LearnParams, LearningsListParams, RecallCmdParams, ReviewOptions, add, apply_learning,
-    audit_setup, auto_unblock_all, begin, cheatsheet, complete, count_resettable_tasks, current,
-    decline_decision_cmd, doctor, end, export, fail, format_doctor_verbose, format_init_verbose,
-    format_next_verbose, format_recall_verbose, get_reviewable_tasks, history, history_detail, how,
-    import_learnings, init, invalidate_learning, irrelevant, learn, list, list_decisions,
-    list_learnings, migrate_all, migrate_down_cmd, migrate_status, migrate_up_cmd, next, recall,
-    reset_all_tasks, reset_tasks, resolve_decision_cmd, revert_decision_cmd, show, skip, stats,
-    unblock, unskip, update, worktrees_list, worktrees_prune, worktrees_remove,
+    InitOpts, LearnParams, LearningsListParams, RecallCmdParams, ReviewOptions, add,
+    apply_learning, audit_setup, auto_unblock_all, begin, cheatsheet, complete,
+    count_resettable_tasks, current, decline_decision_cmd, doctor, end, export, fail,
+    format_doctor_verbose, format_init_verbose, format_next_verbose, format_recall_verbose,
+    get_reviewable_tasks, history, history_detail, how, import_learnings, init_with_opts,
+    invalidate_learning, irrelevant, learn, list, list_decisions, list_learnings, migrate_all,
+    migrate_down_cmd, migrate_status, migrate_up_cmd, next, recall, reset_all_tasks, reset_tasks,
+    resolve_decision_cmd, revert_decision_cmd, show, skip, stats, unblock, unskip, update,
+    worktrees_list, worktrees_prune, worktrees_remove,
 };
 use task_mgr::db::{DbDirSource, LockGuard, ResolvedDbDir, open_connection, resolve_db_dir};
 use task_mgr::handlers::{
@@ -305,7 +306,7 @@ fn dispatch_init_shim(
 
     // Identical call shape to LoopCommand::Init / BatchCommand::Init dispatch arms.
     let _lock = LockGuard::acquire(db_dir)?;
-    let result = init(
+    let result = init_with_opts(
         db_dir,
         &args.from_json,
         args.force,
@@ -313,6 +314,10 @@ fn dispatch_init_shim(
         args.update_existing,
         args.dry_run,
         prefix_mode,
+        InitOpts {
+            source_root: Some(project_root.clone()),
+            worktree_root: Some(project_root),
+        },
     )?;
 
     if verbose {
@@ -1169,8 +1174,9 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                 } => {
                     let prefix_mode =
                         task_mgr::commands::init::PrefixMode::from_cli_flags(no_prefix, prefix);
+                    let project_root = project_root_for_init(&cli.dir);
                     let _lock = LockGuard::acquire(&cli.dir)?;
-                    let result = init(
+                    let result = init_with_opts(
                         &cli.dir,
                         &[prd_file],
                         force,
@@ -1178,6 +1184,10 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                         update_existing,
                         dry_run,
                         prefix_mode,
+                        InitOpts {
+                            source_root: Some(project_root.clone()),
+                            worktree_root: Some(project_root),
+                        },
                     )?;
                     if !dry_run {
                         stage_global_skills(false);
@@ -1354,8 +1364,9 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                     // thin shell around `init()` keeps the PRD-import path in
                     // one place (commands::init::init).
                     let paths = task_mgr::loop_engine::batch::expand_patterns(&patterns)?;
+                    let project_root = project_root_for_init(&cli.dir);
                     let _lock = LockGuard::acquire(&cli.dir)?;
-                    let result = init(
+                    let result = init_with_opts(
                         &cli.dir,
                         &paths,
                         force,
@@ -1363,6 +1374,10 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                         update_existing,
                         dry_run,
                         prefix_mode,
+                        InitOpts {
+                            source_root: Some(project_root.clone()),
+                            worktree_root: Some(project_root),
+                        },
                     )?;
                     if !dry_run {
                         stage_global_skills(false);

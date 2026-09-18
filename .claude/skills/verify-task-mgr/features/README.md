@@ -48,3 +48,4 @@ Keep implementation details out of the map. Name only user paths, stable handles
 - [Learnings](./learnings.md) covers record, list, and `--for-task` recall.
 - [Models routing](./models-routing.md) covers `models init`, `show`, offline `list`, and `set-anchor`.
 - [Status and doctor](./status-and-doctor.md) covers the status dashboard, health check, and the skipped live-loop path.
+- [Add and current `--from-json` pin](./add-and-current-from-json.md) covers pin (not import) on `add`/`current`, refuse paths, ≥2-prefix unpinned refuse, and zero-prefix insert.

@@ -20,6 +20,8 @@
 
 **Gotcha — two Recovery predicates, not one reset helper.** Loop-exit 17.5/17.6 and overflow rungs 1–3 call `recover_in_progress` (`in_progress → todo` only). Merge-fail calls `reopen_after_merge_fail` (`in_progress|done → todo`). Sharing one helper either reopens an honest `:blocked` at process exit or strands a premature `:done` after a failed slot merge. `resurrect_for_iteration` stays the unguarded escape hatch — do not add `WHERE status = 'in_progress'` to it (learning #4358). Trackers (`pending_slot_tasks`, `last_claimed_task`) drain on `:done` / merge-fail retain only; they are **not** reset authority. See `src/lifecycle/CLAUDE.md` "Recovery verb families".
 
+**Gotcha — sticky path identity (one path → one prefix).** First `PrefixMode::Auto` registration always hashes `md5(branchName:filename)[:8]` and freezes that into `prd_metadata`; JSON `taskPrefix` is not read on first Auto. Re-import / `loop run` restore the registered prefix (do not re-hash). Path-identity twins (relative + absolute `prd_files` for the same live JSON) refuse at init — run `task-mgr doctor` (never `LIMIT 1`, never `archive` to collapse twins). Scoped `--force` soft-archives identity ∪ about-to-apply (`archived_at`); it does not `DELETE FROM tasks` or move JSON files.
+
 ## Subsystem design notes
 
 Module-level CLAUDE.md files (auto-loaded when files in the module are read):

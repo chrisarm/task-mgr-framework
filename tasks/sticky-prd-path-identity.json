@@ -1,0 +1,367 @@
+{
+  "version": "1.0",
+  "project": "task-mgr",
+  "branchName": "feat/sticky-prd-path-identity",
+  "prdFile": "sticky-prd-path-identity.md",
+  "taskPrefix": "9679f319",
+  "description": "One path identity maps to at most one prd_id with a frozen task_prefix. Auto still hashes on first registration; re-import/worktree/relative-vs-absolute cannot mint a second prefix or silently rewrite JSON to a different hash. --force archives old tasks instead of hard-deleting. Twins refuse until doctor.",
+  "requires": [],
+  "priorityPhilosophy": {
+    "description": "Hierarchy of what matters most when implementing tasks",
+    "hierarchy": [
+      "1. PLAN \u2014 Anticipate edge cases before coding",
+      "2. PHASE 2 FOUNDATION \u2014 ~1 day now to save ~2+ weeks later (1:10+ ratio); we are pre-launch, foundations compound",
+      "3. FUNCTIONING CODE \u2014 Pragmatic, reliable, wired in per plan",
+      "4. CORRECTNESS \u2014 Compiles, type-checks, scoped tests pass deterministically",
+      "5. CODE QUALITY \u2014 Clean code, qualityDimensions satisfied, no warnings",
+      "6. POLISH \u2014 Docs, formatting, minor improvements"
+    ],
+    "principles": [
+      "Quality dimensions explicit \u2014 qualityDimensions on every task tells you what 'good' looks like",
+      "Phase 2 foundation \u2014 prefer solutions that lay strong post-launch foundations (1:10+ savings ratio)",
+      "Edge cases = test cases \u2014 every known edge case must have a corresponding test",
+      "Full floor every iteration \u2014 every iteration's quality gate is the full suite before the completion commit; REVIEW must leave the trunk green including pre-existing failures",
+      "Ship working code with tests to prove it; handle Option/Result explicitly; avoid unwrap() in production"
+    ]
+  },
+  "prohibitedOutcomes": [
+    "Honoring JSON taskPrefix on first PrefixMode::Auto (batch uniqueness of raw IDs; existing test_init_auto_prefix_ignores_json_field must stay)",
+    "LIMIT 1 on path-identity twins (must refuse + doctor hint)",
+    "Naive UNIQUE(file_path) migration that fails on existing relative+absolute twins",
+    "Calling task-mgr archive / moving JSON files to collapse twins or --force",
+    "drop_existing_data hard-DELETE FROM tasks on the --force reprefix hatch (must soft-archive archived_at)",
+    "Forking pin-19 identity math outside src/git/mod.rs",
+    "Deriving source_root only from db_dir in production loop paths (loop source_root != db_dir)",
+    "let _ = write_prefix_to_json (restore-on-disagree must surface errors)",
+    "remap_into_worktree calling exists() or canonicalize(dest)",
+    "Seeding identity tests with a bare basename unless that is what init stored",
+    "Manual edits to tasks/*.json for status (use task-mgr CLI / task-status tags)",
+    "Error messages that don't identify what went wrong",
+    "Catch-all error handlers that swallow context",
+    "Putting a model field on any task or at PRD top level"
+  ],
+  "globalAcceptanceCriteria": {
+    "description": "These criteria apply to ALL implementation tasks",
+    "criteria": [
+      "No warnings in `cargo check` output",
+      "No warnings in `cargo clippy --all-targets -- -D warnings`",
+      "`cargo fmt --check` passes",
+      "Scoped tests for touched modules pass",
+      "No unwrap() in production code paths",
+      "Identity helper is the only pin-19 implementation (later context.rs must import it, not copy it)"
+    ]
+  },
+  "userStories": [
+    {
+      "id": "9679f319-CONTRACT-001",
+      "title": "Pin-19 path identity + worktree remapper",
+      "description": "Materialize path identity as the SSoT for which PRD a JSON file belongs to. Multiple FEATs depend on this exact math.\n\nDO: Add `remap_into_worktree(registered, source_root, worktree_root) -> PathBuf` and `paths_identify(flag, registered, source_root, worktree_root) -> bool` in `src/git/mod.rs` (pin-19 exact, learning [5576]). Join relative `registered` to `source_root` first; strip_prefix miss returns resolved unchanged. Pure: no exists(), no basename search, no dest canonicalize. Add `find_registered_task_lists(conn, live, source_root, worktree_root) -> Result<Vec<(prd_id, Option<prefix>)>>` in `src/commands/init/import.rs` (or `src/db/`) that scans `prd_files` WHERE file_type='task_list' JOIN prd_metadata and calls `paths_identify`. 0 hits = empty; 1 hit = that pair; 2+ = still return all (callers refuse). Do NOT add rusqlite to `src/git/mod.rs`.\n\nDO NOT: Implement init resolver, register_prd_files rewrite, or doctor in this task. Do NOT put identity in add.rs or a new context.rs. Do NOT canonicalize dest inside the remapper.\n\nKnown-bad: treating basename equality as identity (two tasks/foo.json in different dirs).",
+      "priority": 1,
+      "passes": true,
+      "notes": "Pin-19 seed: tasks/prd-agent-task-ops-pr1.md CONTRACT-001 / \u00a76. Startup Step 8.5 already inlines canonicalize-source_root then strip_prefix \u2014 extract that math, keep startup's canonicalize of source_root at the caller. Learning [5576]: pin-19 is (b)+(c) only. Learning [5602]: --from-json keeps canonical PATH. Data contract: prd_files.file_path TEXT \u2192 PathBuf (relative OR absolute today). Access: let registered = PathBuf::from(row); let resolved = if registered.is_absolute() { registered.clone() } else { source_root.join(&registered) }; then paths_identify. Return type must include prd_id (i64) + prefix (Option<String> from prd_metadata.task_prefix) \u2014 PR-3 wanted this promotion; do it now.",
+      "acceptanceCriteria": [
+        "Positive: remap dest need not exist; return is worktree_root.join(rel) after joining relative registered to source_root",
+        "Positive: main checkout (worktree_root == source_root) returns the joined registered path unchanged",
+        "Positive: symlink source_root vs canonical flag still remaps after caller canonicalizes source_root",
+        "Positive: paths_identify hits canonicalize(flag)==canonicalize(source_root.join(relative)) OR canonicalize(flag)==remap_into_worktree(...)",
+        "Negative: remap_into_worktree must NOT call exists() or canonicalize on dest (grep the function body)",
+        "Negative: identity must NOT treat match (a) JSON taskPrefix as a path hit",
+        "Unit test: relative registered `tasks/foo.json` + absolute live path identify",
+        "Unit test: source vs worktree live path identify as one file",
+        "Unit test: two different directories' `foo.json` do not identify",
+        "CONTRACT: src/git/mod.rs has no rusqlite/Connection; find_registered_task_lists lives in init/import (or db) and calls paths_identify",
+        "Known-bad: seeding with a bare basename `foo.json` would pass a naive strip; tests seed init-shaped paths only (`tasks/foo.json` or absolute)",
+        "Failure mode: unreadable/missing flag canonicalize fails closed (not a hit), never panics"
+      ],
+      "touchesFiles": [
+        "src/commands/init/import.rs",
+        "src/git/mod.rs"
+      ],
+      "difficulty": "medium",
+      "maxRetries": 3,
+      "completedByProvider": "grok"
+    },
+    {
+      "id": "9679f319-FEAT-001",
+      "title": "Store source-root-relative prd_files + read helper + InitOpts roots",
+      "description": "Stop storing worktree-absolute or `.task-mgr/tasks`-stripped paths. Thread project roots into init so identity and storage share one form.\n\nDO: Change `register_prd_files` to store POSIX paths relative to source_root (task_list AND prompt rows). Add a read helper `resolve_prd_file_path(stored, source_root, worktree_root) -> PathBuf` used by archive discovery, `locate_prd_json` (add + current), and any consumer that currently `tasks_dir.join(stored)`. Keep the existing 7-arg `init()` as a wrapper that passes `InitOpts::default()`. Add `init_with_opts` (or last-arg InitOpts with a wrapper). Do not add a required 8th positional \u2014 ~90 test call sites must keep compiling. Production `startup.rs` / `main.rs` loop-init MUST call the opts path with explicit `run_config.source_root` and working_root / project root. Export does not join `prd_files` task_list paths \u2014 do not change export.\n\nDO NOT: Change prefix resolution yet (FEAT-002). Do NOT add UNIQUE(file_path). Do NOT move files. Do NOT join source-root-relative paths onto `.task-mgr/tasks`.\n\n`modifiesBehavior: true` for archive/add path joining.",
+      "priority": 2,
+      "passes": true,
+      "notes": "Learning [3816]: prefix-aware file naming. Learning [5576] identity. Data contract: stored TEXT is source-root-relative POSIX; live Path is absolute. Access: resolve_prd_file_path. archive.rs `tasks_dir = dir.join(\"tasks\")` is `.task-mgr/tasks` \u2014 wrong join target for project `tasks/*.json`. export does not join prd_files task_list paths \u2014 do not change export. InitOpts Default fallback is test-only; loop production paths pass roots. verify-task-mgr: unit test is the stored-path proof; optional sub-feature init-stored-relative-path.",
+      "acceptanceCriteria": [
+        "Positive: loop init of `tasks/foo.json` stores `tasks/foo.json` (or equivalent source-root-relative), not an absolute worktree path and not a path under `.task-mgr/tasks`",
+        "Positive: second register of the same file via absolute path INSERT OR IGNORE / identity does not add a second distinct file_path string after normalize",
+        "Positive: prompt file rows store source-root-relative POSIX (same rule as task_list), never `.task-mgr/tasks`-stripped caller paths",
+        "Positive: `locate_prd_json` returns a path resolved via the read helper (source_root join / remap), so add/current do not treat `tasks/foo.json` as cwd-relative",
+        "Positive: archive `query_prd_files` consumers resolve via the read helper",
+        "Negative: 7-arg init() still compiles at all existing tests/*.rs call sites (wrapper + Default); do not add a required 8th positional",
+        "CONTRACT: archive `discover_archivable_files` must NOT `tasks_dir.join` a source-root-relative stored path (that would miss the live JSON)",
+        "Negative: production loop init/startup must NOT omit InitOpts roots (grep startup.rs init( calls)",
+        "Unit test: relative then absolute register \u2192 one canonical relative row",
+        "Known-bad: strip_prefix(.task-mgr/tasks).unwrap_or(json_path) still in register_prd_files would keep storing caller paths \u2014 grep must show it gone",
+        "Failure mode: json_path outside source_root \u2192 store a stable relative or absolute canonical form documented in rustdoc; do not panic",
+        "Drive `.claude/skills/verify-task-mgr/SKILL.md` feature `init-and-import` (loop-init) per SKILL.md; evidence captured"
+      ],
+      "touchesFiles": [
+        "src/commands/add.rs",
+        "src/commands/init/import.rs",
+        "src/commands/init/mod.rs",
+        "src/commands/init/tests.rs",
+        "src/loop_engine/archive.rs",
+        "src/loop_engine/orchestrator.rs",
+        "src/loop_engine/startup.rs",
+        "src/main.rs"
+      ],
+      "dependsOn": [
+        "9679f319-CONTRACT-001"
+      ],
+      "difficulty": "high",
+      "maxRetries": 3,
+      "completedByProvider": "grok"
+    },
+    {
+      "id": "9679f319-FEAT-002",
+      "title": "Sticky identity prefix resolver (init path)",
+      "description": "Init-only sticky resolver. Order: (1) path-identity 2+ \u2192 invalid_state naming doctor; 1 match \u2192 registered prefix, restore JSON if missing/different (write_prefix_to_json must return Result and be checked). branchName edits do not re-hash. (2) else first registration: Explicit / Disabled / Auto generate_prefix+write-back. JSON taskPrefix is NOT read on first Auto. (3) never INSERT new prd_metadata for a known identity.\n\nRefuses unless --force: Explicit(other) on registered path; --no-prefix on registered non-NULL.\n\nDO NOT: honor JSON on first Auto. Do NOT LIMIT 1 twins. Do NOT wire startup pre_lock / Step 8.5 / orchestrator here (FEAT-002b). Do NOT implement --force union (FEAT-003).\n\nmodifiesBehavior: true \u2014 init prefix selection and JSON write-back on re-init.",
+      "priority": 3,
+      "passes": true,
+      "notes": "Learning [4965] first-reg hash. [5624] --no-prefix vs metadata prefix. [516] UNIQUE(task_prefix) allows multiple NULLs \u2014 identity returns prd_id. [4601] refuse if one init() batch would attach files to different identity prefixes \u2014 not a batch redesign. PrefixMode rustdoc currently LIES \u2014 update in FEAT-005; code here must match hash-on-first.",
+      "acceptanceCriteria": [
+        "Positive: first Auto with JSON taskPrefix P5 still stores the hash and writes it back (test_init_auto_prefix_ignores_json_field stays)",
+        "Positive: Explicit then Auto same file \u2192 one prd_id, JSON restored to Explicit prefix, no second metadata row",
+        "Positive: relative then absolute (and source vs worktree) \u2192 one identity, same prefix",
+        "Positive: branchName change after register \u2192 same prefix (not a new hash)",
+        "Positive: JSON taskPrefix edited then re-init restores registered prefix, no second row",
+        "Negative: 2+ identity hits refuse with a doctor hint; do not pick LIMIT 1; do not insert a third",
+        "Negative: --no-prefix on registered non-NULL refuses; Explicit(other) refuses unless --force",
+        "Negative: first Auto must NOT read JSON taskPrefix (grep Auto arm)",
+        "Known-bad: hashing branchName:filename on every Auto call would pass first-init tests and still mint twins on branchName edit \u2014 the branchName-change test catches this",
+        "Failure mode: write_prefix_to_json IO error on restore \u2192 init returns Err, does not swallow (no let _ = write_prefix_to_json)",
+        "CONTRACT: never INSERT a new prd_metadata row for a known identity (upsert stays ON CONFLICT task_prefix only after identity miss)"
+      ],
+      "touchesFiles": [
+        "src/commands/init/import.rs",
+        "src/commands/init/mod.rs",
+        "src/commands/init/tests.rs"
+      ],
+      "dependsOn": [
+        "9679f319-CONTRACT-001",
+        "9679f319-FEAT-001"
+      ],
+      "difficulty": "high",
+      "maxRetries": 3,
+      "completedByProvider": "grok"
+    },
+    {
+      "id": "9679f319-FEAT-002b",
+      "title": "pre_lock + startup/orchestrator use sticky resolver",
+      "description": "Wire the FEAT-002 resolver into loop startup and re-import.\n\nDO: pre_lock_prefix uses the resolver so loop-{prefix}.lock matches the prefix that will run. Identity lookup needs DB before the loop lock \u2014 open/migrate + tasks.db.lock around resolve, then acquire loop-{resolved}.lock. Startup Step 8.5 live_prd_file uses remap_into_worktree after caller canonicalizes source_root (no leftover strip_prefix(source_root) for that remap). Orchestrator hash-change re-import goes through init (already) and must restore registered prefix. Auto loop run on registered NULL identity refuses. batch.rs generate_prefix warning must not mint a second prd_metadata row on re-run of already-registered files.\n\nDO NOT: reimplement identity math in startup. Do NOT derive production source_root from db_dir.\n\nmodifiesBehavior: true \u2014 lock names and worktree live path.",
+      "priority": 4,
+      "passes": true,
+      "notes": "Learning [1486] lock=run prefix. [5649]/[5624] NULL vs Auto loop run. Do not derive production source_root from db_dir. Chicken-egg: resolve identity under tasks.db.lock before naming loop-{prefix}.lock.",
+      "acceptanceCriteria": [
+        "Positive: pre_lock name equals post-init prefix on identity hit (not a fresh generate_prefix)",
+        "Positive: startup Step 8.5 live_prd_file uses remap_into_worktree after caller canonicalizes source_root; grep shows no remaining strip_prefix(source_root) for that remap",
+        "Positive: orchestrator-style re-import after only taskPrefix edit restores registered prefix, no second row",
+        "Negative: Auto loop run on registered NULL identity refuses (NULL cannot be Auto-run); loop init --no-prefix first registration still allowed",
+        "CONTRACT: startup.rs pre_lock and init() share one resolver function (grep generate_prefix in startup \u2014 only first-registration / unknown-identity fallback)",
+        "Known-bad: batch.rs Step 2.5 generate_prefix warning must not mint a second prd_metadata row on re-run of already-registered files",
+        "Failure mode: identity+insert under tasks.db.lock; Explicit mismatch refuses rather than second row",
+        "Drive `.claude/skills/verify-task-mgr/SKILL.md` feature `init-and-import`: add sub-feature sticky-reinit (loop init twice append/update keeps one prefix); evidence captured"
+      ],
+      "touchesFiles": [
+        "src/commands/init/mod.rs",
+        "src/loop_engine/batch.rs",
+        "src/loop_engine/orchestrator.rs",
+        "src/loop_engine/startup.rs"
+      ],
+      "dependsOn": [
+        "9679f319-FEAT-002"
+      ],
+      "difficulty": "high",
+      "maxRetries": 3,
+      "completedByProvider": "grok"
+    },
+    {
+      "id": "9679f319-FEAT-003",
+      "title": "--force union archive-not-delete reprefix hatch",
+      "description": "Replace Auto --force scoping (today: delete by JSON taskPrefix, then import under hash) with union(identity prefixes including NULL, about-to-apply). For each prefix use archive_prd_data semantics: soft_archive_by_prefix, UPDATE tasks.archived_at, DELETE relationships/task_files, DELETE prd_files+prd_metadata. Do NOT move JSON/prompt files. Do NOT DELETE FROM tasks.\n\nThen register one prd_id under about-to-apply and import. Same-prefix --force must unarchive/update matching archived IDs (get_existing_task_ids includes archived \u2014 INSERT would UNIQUE-crash). Prefer update-in-place of archived rows back to todo over delete.\n\nRefuse --force if that PRD's loop lock is held. Dry-run lists both prefixes and archive (not delete) counts.\n\nDO NOT: call run_archive / move files. Do NOT keep drop_existing_data hard-delete as the --force path for this hatch. Global wipe (force_prefix None) is a separate legacy path \u2014 do not silently change it without tests; prefix-scoped --force is this task.\n\nmodifiesBehavior: true \u2014 --force no longer hard-deletes tasks.",
+      "priority": 5,
+      "passes": true,
+      "notes": "Reuse archive_prd_data / soft_archive_by_prefix (src/loop_engine/archive.rs, src/db/soft_archive). Learning [1505] FK delete order \u2014 metadata after prd_files. Learning [319] LIKE prefix dash. Do not apply learning [1165] (hard-delete reimport targets) to this prefix-scoped hatch. Global wipe force_prefix None stays legacy. InitResult/dry-run preview currently get_delete_preview \u2014 extend to archive counts. Callers: main.rs loop init --force.",
+      "acceptanceCriteria": [
+        "Positive: Auto --force with JSON\u2260hash archives unarchived tasks for BOTH prefixes, drops both metadata rows, registers one; SELECT COUNT(*) FROM tasks WHERE id LIKE old-% is the archived count not zero rows",
+        "Positive: dry-run lists both prefixes and would-archive counts; no DB mutation",
+        "Positive: same-prefix --force after archive does not UNIQUE-crash on archived IDs; tasks return to live under that prefix (unarchive/update)",
+        "Negative: --force refuses if any union prefix has loop-{prefix}.lock held (not only the about-to-apply name); tasks unchanged",
+        "Negative: JSON/prompt files stay in place (no rename into tasks/archive/)",
+        "Negative: must NOT DELETE FROM tasks in the prefix-scoped --force path (grep the new helper vs drop_existing_data)",
+        "Positive: union is identity prefixes (including NULL) \u222a {about-to-apply}; JSON prefix \u2260 identity prefix \u2260 about-to-apply hash archives all three names' live tasks",
+        "Known-bad: deleting only JSON prefix (today) would leave the hash row \u2014 test asserts hash row gone too",
+        "Failure mode: loop lock held \u2192 invalid_state naming the lock file; no partial archive",
+        "Drive `.claude/skills/verify-task-mgr/SKILL.md` feature `init-and-import`: add sub-feature force-union-archive; loop init --force --dry-run then real --force; snapshot-db shows tasks archived_at or reimported, not missing"
+      ],
+      "touchesFiles": [
+        "src/commands/init/import.rs",
+        "src/commands/init/mod.rs",
+        "src/commands/init/output.rs",
+        "src/commands/init/tests.rs",
+        "src/loop_engine/archive.rs"
+      ],
+      "dependsOn": [
+        "9679f319-FEAT-002b"
+      ],
+      "difficulty": "high",
+      "maxRetries": 3,
+      "completedByProvider": "grok"
+    },
+    {
+      "id": "9679f319-FEAT-004",
+      "title": "Doctor path-identity twins check + conservative auto-fix",
+      "description": "New IssueType for two prd_ids whose task_list paths identify as the same file. Report both prefixes and unarchived task counts. Auto-fix ONLY when COUNT(*) FROM tasks WHERE id LIKE prefix% ESCAPE '\\' AND archived_at IS NULL = 0 for one side: DELETE prd_metadata (cascade prd_files) for the empty side. Any live row including all-irrelevant or all-done \u2192 report only. Two live twins \u2192 never auto-pick. Never move files.\n\nInit/loop already refuse 2+ (FEAT-002); doctor is the repair tool.\n\nDO NOT: auto-fix when both sides have live tasks. Do NOT call archive. Do NOT LIMIT 1 pick-a-winner.\n\nAdd verify-task-mgr sub-feature `doctor-path-twins` to status-and-doctor.md.",
+      "priority": 6,
+      "passes": true,
+      "notes": "IssueType is a closed enum with Display+serde snake_case \u2014 add a variant and update tests/cli_tests that match issue types. Learning [4809] verify DB state not just query success. LIKE must use make_like_pattern (dash, escape) [319]. verify-task-mgr skill forbids writing SQLite yourself \u2014 do not seed twins via $H sql INSERT in the recipe if that violates the skill; prefer unit tests + document skip. If $H sql is allowed for proof dumps only, still don't INSERT twins through it.",
+      "acceptanceCriteria": [
+        "Positive: doctor JSON includes a new snake_case issue type for path twins with both prefixes in description/entity",
+        "Positive: auto-fix deletes empty-side metadata only when that prefix has zero unarchived tasks; other PRD unchanged",
+        "Negative: all-done or all-irrelevant live rows (archived_at IS NULL) block auto-fix \u2014 report only",
+        "Negative: both sides live \u2192 no auto-pick",
+        "Negative: auto-fix does not rename/move JSON files",
+        "Unit test: empty twin collapsed; both-live reported",
+        "Known-bad: treating irrelevant as empty-enough to auto-fix would drop a still-registered effort the operator marked irrelevant but not archived",
+        "Failure mode: identity helper error \u2192 doctor reports the issue as unfixed, does not crash the rest of doctor checks",
+        "Drive `.claude/skills/verify-task-mgr/SKILL.md` feature `status-and-doctor` (doctor-healthy still 0 issues on fresh import; new twin recipe if seedable without raw SQL \u2014 otherwise unit test is the proof and the feature file documents verified-unreachable for CLI twin seed)",
+        "Documentation: features/status-and-doctor.md lists doctor-path-twins",
+        "Edge: NULL-prefix twin is reported with entity showing NULL/empty prefix, not skipped"
+      ],
+      "touchesFiles": [
+        ".claude/skills/verify-task-mgr/features/status-and-doctor.md",
+        "src/commands/doctor/checks.rs",
+        "src/commands/doctor/fixes.rs",
+        "src/commands/doctor/mod.rs",
+        "src/commands/doctor/output.rs",
+        "src/commands/doctor/tests.rs"
+      ],
+      "dependsOn": [
+        "9679f319-CONTRACT-001",
+        "9679f319-FEAT-001"
+      ],
+      "difficulty": "medium",
+      "maxRetries": 3,
+      "completedByProvider": "grok"
+    },
+    {
+      "id": "9679f319-FEAT-005",
+      "title": "Align CLI/rustdoc/best-practices with hash-then-sticky",
+      "description": "Docs currently claim Auto uses JSON taskPrefix then UUID. Reality and this change: --prefix > registered identity > md5(branchName:filename) > write-back.\n\nDO: Update PrefixMode rustdoc, src/cli/commands.rs TASK ID PREFIXING help, ~/.claude/docs is generated from repo \u2014 update the in-repo skill/docs that gen-docs or enhance copies if any (src/cli, CLAUDE.md workflow if it mentions JSON taskPrefix order). Keep test_init_auto_prefix_ignores_json_field. Add a gotcha to verify-task-mgr init-and-import.md: Auto writes hash into the sandbox copy (already noted); re-init restores registered not JSON edits.\n\nDO NOT: invert the ignore-JSON first-init test. Do NOT invent task-mgr models or reprefix docs.",
+      "priority": 7,
+      "passes": true,
+      "notes": "src/cli/commands.rs lines ~61-67 and ~114-117. PrefixMode rustdoc in init/mod.rs. CLAUDE.md command reference is enhance-managed \u2014 do not hand-edit inside TASK_MGR markers. Learning [2361] filename prefix vs task prefix. If gen-docs --check covers help text, run it.",
+      "acceptanceCriteria": [
+        "Positive: PrefixMode::Auto rustdoc states hash-on-first then sticky identity",
+        "Positive: `task-mgr init --help` / loop init help no longer lists JSON taskPrefix as step 2 before hash",
+        "Positive: order documented as --prefix > registered identity > md5(branchName:filename)[:8] > write-back; not JSON taskPrefix then UUID",
+        "Positive: task-mgr loop init --help and batch init --help --force text matches archive-not-delete (not 'dropping existing data')",
+        "Negative: must NOT document 'Auto honors JSON taskPrefix'",
+        "Unit test: existing ignore-JSON first-init test still passes"
+      ],
+      "touchesFiles": [
+        ".claude/skills/verify-task-mgr/features/init-and-import.md",
+        "src/cli/commands.rs",
+        "src/commands/init/mod.rs"
+      ],
+      "dependsOn": [
+        "9679f319-FEAT-002b",
+        "9679f319-FEAT-003"
+      ],
+      "difficulty": "low",
+      "maxRetries": 3,
+      "completedByProvider": "grok"
+    },
+    {
+      "id": "9679f319-REFACTOR-001",
+      "title": "Review for refactoring opportunities",
+      "description": "Review all implementation for DRY violations, complexity, coupling, and maintainability.\n\nDO: Check identity math is not copied into init/doctor/archive. Check InitOpts vs a pile of new init() positional args. Functions under 30 lines where reasonable.\nDO NOT: Skip. Do not re-open honor-JSON-on-Auto.",
+      "priority": 98,
+      "passes": true,
+      "notes": "If issues found: `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001`. If no issues, invoke /simplify on any ugly touchpoint, then emit done.",
+      "acceptanceCriteria": [
+        "No duplicated pin-19 math outside src/git/mod.rs",
+        "Functions under 30 lines (flag complex ones)",
+        "Clear separation: identity in git, register/read in init/import, doctor consumes identity",
+        "Any issues spawn REFACTOR-FIX-xxx via `task-mgr add --stdin --depended-on-by REVIEW-001`"
+      ],
+      "touchesFiles": [
+        "all modified files"
+      ],
+      "dependsOn": [
+        "9679f319-CONTRACT-001",
+        "9679f319-FEAT-001",
+        "9679f319-FEAT-002",
+        "9679f319-FEAT-002b",
+        "9679f319-FEAT-003",
+        "9679f319-FEAT-004",
+        "9679f319-FEAT-005"
+      ],
+      "difficulty": "high",
+      "maxRetries": 3,
+      "completedByProvider": "grok"
+    },
+    {
+      "id": "9679f319-REFACTOR-FIX-001",
+      "title": "Decompose init_with_opts + dedupe force-path Auto first-reg",
+      "description": "From REFACTOR-001: init_with_opts is ~473 lines (was ~369 on main); resolve_sticky_prefix is ~105 lines; build_force_archive_plan ~70. The scoped --force branch in init_with_opts re-implements Auto first-registration (generate_prefix + ignore-JSON note + write_prefix_to_json) instead of sharing resolve_sticky_prefix / a first_registration_prefix helper. DO: extract helpers so production fns stay near \u226430 lines where reasonable; dedupe Auto first-reg; keep InitOpts as trailing struct (do not pile positionals); do not reopen honor-JSON-on-Auto. DO NOT: change sticky/force semantics.",
+      "priority": 55,
+      "passes": true,
+      "acceptanceCriteria": [
+        "Scoped --force Auto first-reg shares one helper with resolve_sticky_prefix (no duplicated generate_prefix+write arm)",
+        "init_with_opts body decomposed into named helpers; no behavior change in sticky/force/append paths",
+        "InitOpts remains a trailing struct (not new positionals)",
+        "Scoped tests: cargo test --lib commands::init"
+      ],
+      "touchesFiles": [
+        "src/commands/init/import.rs",
+        "src/commands/init/mod.rs"
+      ],
+      "difficulty": "medium",
+      "maxRetries": 3,
+      "completedByProvider": "grok"
+    },
+    {
+      "id": "9679f319-REVIEW-001",
+      "title": "Code review + final verification",
+      "description": "Review all implementation for quality, security, integration wiring, and documentation. RUN THE FULL QUALITY GATE (unscoped test suite).\n\nDO: Confirm invariant: one path identity \u2192 one prd_id \u2192 frozen prefix. Confirm --force does not hard-delete tasks or move files. Confirm twins refuse. Drive verify-task-mgr mapped features. Fix pre-existing suite failures or spawn FIX-xxx.\nDO NOT: Scope the test suite. Do not reopen first-Auto honor-JSON.",
+      "priority": 99,
+      "passes": true,
+      "notes": "Spawn fixes via add --stdin --depended-on-by REVIEW-001. verify-task-mgr: isolated --dir + HOME; never PATH binary; never checkout .task-mgr; never loop run.",
+      "acceptanceCriteria": [
+        "Positive: All new code reachable from production entry points (grep-verified)",
+        "Positive: All errors propagated with context (map_err, not unwrap)",
+        "Positive: FULL cargo test, cargo clippy -- -D warnings, cargo fmt --check all clean (no scope filter)",
+        "Negative: No unwrap() in production code paths",
+        "Negative: No dest canonicalize/exists in remap_into_worktree",
+        "Documentation: CLAUDE.md gotcha for dual-prefix / sticky identity if a one-liner fits outside TASK_MGR markers; CLI help matches",
+        "If issues found: FIX-xxx via `task-mgr add --stdin --depended-on-by REVIEW-001`",
+        "Drive `.claude/skills/verify-task-mgr/SKILL.md` features `init-and-import` and `status-and-doctor` per SKILL.md; evidence captured; compile/unit tests alone are not proof"
+      ],
+      "touchesFiles": [
+        "all modified files"
+      ],
+      "dependsOn": [
+        "9679f319-CONTRACT-001",
+        "9679f319-FEAT-001",
+        "9679f319-FEAT-002",
+        "9679f319-FEAT-002b",
+        "9679f319-FEAT-003",
+        "9679f319-FEAT-004",
+        "9679f319-FEAT-005",
+        "9679f319-REFACTOR-001",
+        "9679f319-REFACTOR-FIX-001"
+      ],
+      "difficulty": "high",
+      "maxRetries": 3,
+      "completedByProvider": "grok"
+    }
+  ]
+}

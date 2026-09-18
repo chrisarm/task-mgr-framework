@@ -5,15 +5,196 @@
 //! - Active runs without proper end
 //! - Orphaned relationships referencing non-existent tasks
 //! - Tasks completed in git history but not marked done in DB
+//! - Path-identity twins (2+ prd_metadata rows for one task_list file)
 
-use std::collections::HashSet;
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use rusqlite::Connection;
 
 use crate::TaskMgrResult;
+use crate::commands::init::import::{find_registered_task_lists, resolve_prd_file_path};
 use crate::db::LockGuard;
+use crate::db::prefix::make_like_pattern;
+
+/// One `prd_metadata` side of a path-identity twin cluster.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathIdentityTwinSide {
+    pub prd_id: i64,
+    /// `None` when `prd_metadata.task_prefix` is NULL.
+    pub prefix: Option<String>,
+    /// Unarchived task count for `prefix-%`. `None` when prefix is NULL
+    /// (cannot LIKE-scope — never auto-fix this side).
+    pub live_task_count: Option<i64>,
+}
+
+/// A cluster of 2+ prd_ids whose task_list paths share pin-19 identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathIdentityTwin {
+    pub sides: Vec<PathIdentityTwinSide>,
+    /// Representative stored/live path string for the issue description.
+    pub sample_path: String,
+}
+
+impl PathIdentityTwin {
+    /// Entity id for JSON/text: `prefix_a|prefix_b|...` with NULL shown as `NULL`.
+    pub fn entity_id(&self) -> String {
+        self.sides
+            .iter()
+            .map(|s| s.prefix.as_deref().unwrap_or("NULL"))
+            .collect::<Vec<_>>()
+            .join("|")
+    }
+
+    /// Human-readable description including prefixes and live counts.
+    pub fn description(&self) -> String {
+        let sides_desc = self
+            .sides
+            .iter()
+            .map(|s| {
+                let pfx = s.prefix.as_deref().unwrap_or("NULL");
+                match s.live_task_count {
+                    Some(n) => format!("'{pfx}' ({n} unarchived)"),
+                    None => format!("'{pfx}' (NULL prefix — live count unknown)"),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let autofix_note = match self.autofix_empty_sides().as_slice() {
+            [] => {
+                "Report only — no auto-fix (need exactly one empty prefixed side with another live side; never pick among live twins)."
+                    .to_string()
+            }
+            empty => {
+                let names: Vec<&str> = empty
+                    .iter()
+                    .map(|s| s.prefix.as_deref().unwrap_or("NULL"))
+                    .collect();
+                format!(
+                    "Auto-fix can DELETE prd_metadata for empty side(s): {}.",
+                    names.join(", ")
+                )
+            }
+        };
+        format!(
+            "Path-identity twins for '{}': {}. {}",
+            self.sample_path, sides_desc, autofix_note
+        )
+    }
+
+    /// Sides safe to drop: `live_task_count == Some(0)`, and at least one other
+    /// side has live tasks (`Some(n) where n > 0`). NULL-prefix and all-empty
+    /// clusters never auto-fix. All-done / all-irrelevant still count as live.
+    pub fn autofix_empty_sides(&self) -> Vec<&PathIdentityTwinSide> {
+        let has_live = self
+            .sides
+            .iter()
+            .any(|s| s.live_task_count.is_some_and(|c| c > 0));
+        if !has_live {
+            return Vec::new();
+        }
+        self.sides
+            .iter()
+            .filter(|s| s.live_task_count == Some(0))
+            .collect()
+    }
+}
+
+/// Count unarchived tasks whose id matches `prefix-%` (ESCAPE).
+///
+/// Returns `None` when `prefix` is `None` — NULL-prefix sides cannot be
+/// LIKE-scoped and must never be treated as empty-enough to auto-fix.
+pub fn count_unarchived_tasks_for_prefix(
+    conn: &Connection,
+    prefix: Option<&str>,
+) -> TaskMgrResult<Option<i64>> {
+    let Some(prefix) = prefix else {
+        return Ok(None);
+    };
+    let pattern = make_like_pattern(prefix);
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM tasks WHERE id LIKE ? ESCAPE '\\' AND archived_at IS NULL",
+        rusqlite::params![pattern],
+        |row| row.get(0),
+    )?;
+    Ok(Some(count))
+}
+
+/// Find clusters of 2+ `prd_metadata` rows whose task_list paths identify as one file.
+///
+/// Uses [`find_registered_task_lists`] (pin-19) — no `LIMIT 1`. Dedupes by sorted
+/// prd_id set. Missing on-disk files yield no identity hit (paths_identify fails
+/// closed) and are skipped.
+pub fn find_path_identity_twins(
+    conn: &Connection,
+    source_root: &Path,
+    worktree_root: &Path,
+) -> TaskMgrResult<Vec<PathIdentityTwin>> {
+    let mut stmt = conn.prepare(
+        "SELECT pf.file_path, pm.id, pm.task_prefix
+         FROM prd_files pf
+         JOIN prd_metadata pm ON pm.id = pf.prd_id
+         WHERE pf.file_type = 'task_list'
+         ORDER BY pm.id",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        let file_path: String = row.get(0)?;
+        let prd_id: i64 = row.get(1)?;
+        let prefix: Option<String> = row.get(2)?;
+        Ok((file_path, prd_id, prefix))
+    })?;
+
+    let mut seen_clusters: BTreeSet<Vec<i64>> = BTreeSet::new();
+    let mut twins = Vec::new();
+
+    for row in rows {
+        let (file_path, _prd_id, _prefix) = row?;
+        let stored = PathBuf::from(&file_path);
+        let live = resolve_prd_file_path(&stored, source_root, worktree_root);
+        // Identity requires a canonicalize-able live path; skip missing files.
+        if !live.exists() {
+            continue;
+        }
+        let hits = find_registered_task_lists(conn, &live, source_root, worktree_root)?;
+        if hits.len() < 2 {
+            continue;
+        }
+
+        let mut prd_ids: Vec<i64> = hits.iter().map(|(id, _)| *id).collect();
+        prd_ids.sort_unstable();
+        prd_ids.dedup();
+        if prd_ids.len() < 2 {
+            continue;
+        }
+        if !seen_clusters.insert(prd_ids.clone()) {
+            continue;
+        }
+
+        // Preserve hit order but unique by prd_id for side building.
+        let mut by_id: BTreeMap<i64, Option<String>> = BTreeMap::new();
+        for (id, pfx) in hits {
+            by_id.entry(id).or_insert(pfx);
+        }
+
+        let mut sides = Vec::with_capacity(by_id.len());
+        for (prd_id, prefix) in by_id {
+            let live_task_count = count_unarchived_tasks_for_prefix(conn, prefix.as_deref())?;
+            sides.push(PathIdentityTwinSide {
+                prd_id,
+                prefix,
+                live_task_count,
+            });
+        }
+
+        twins.push(PathIdentityTwin {
+            sides,
+            sample_path: file_path,
+        });
+    }
+
+    Ok(twins)
+}
 
 /// Find tasks that are in_progress but have no active run tracking them.
 ///

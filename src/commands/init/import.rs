@@ -3,17 +3,126 @@
 //! This module contains all functions for inserting, updating, and deleting
 //! task data in the SQLite database.
 
-use std::collections::HashSet;
-use std::path::Path;
+use std::collections::{BTreeSet, HashSet};
+use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 
 use crate::TaskMgrResult;
 use crate::db::prefix::make_like_pattern;
+use crate::db::soft_archive::{
+    archive_prd_by_prefix, archive_unprefixed_live_tasks, drop_prd_rows,
+};
 use crate::models::TaskStatus;
 
-use super::output::DryRunDeletePreview;
+use super::output::{ArchivePrefixPreview, DryRunArchivePreview, DryRunDeletePreview};
 use super::parse::{PrdFile, PrdUserStory};
+
+/// Plan for prefix-scoped `--force`: soft-archive union, never hard-delete tasks.
+#[derive(Debug, Clone, Default)]
+pub struct ForceArchivePlan {
+    /// Prefixed names to soft-archive via `{prefix}-%` LIKE (identity ∪ about-to-apply).
+    pub prefixes: BTreeSet<String>,
+    /// `prd_metadata.id` rows with `task_prefix IS NULL` from path identity.
+    pub null_prd_ids: Vec<i64>,
+    /// Whether the union includes the NULL / unprefixed identity.
+    pub includes_null: bool,
+}
+
+impl ForceArchivePlan {
+    /// True when this hatch should soft-archive rather than legacy global wipe.
+    #[must_use]
+    pub fn is_scoped(&self) -> bool {
+        !self.prefixes.is_empty() || self.includes_null
+    }
+}
+
+/// Soft-archive every prefix in `plan` (no `DELETE FROM tasks`, no file moves).
+///
+/// Returns total tasks soft-archived across all union members.
+pub fn force_union_archive(conn: &Connection, plan: &ForceArchivePlan) -> TaskMgrResult<usize> {
+    let mut total = 0usize;
+
+    // Preserve-prefix set for NULL unprefixed archiving: all Some() union members
+    // (and any other live PRD prefixes) so we do not touch sibling PRDs.
+    let mut preserve: Vec<String> = plan.prefixes.iter().cloned().collect();
+    if plan.includes_null {
+        // Also preserve every other registered non-NULL prefix not already in the union.
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT task_prefix FROM prd_metadata WHERE task_prefix IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        for row in rows {
+            let p = row?;
+            if !preserve.contains(&p) {
+                preserve.push(p);
+            }
+        }
+        // Before archiving prefixed members, unprefixed archive must run against
+        // the pre-drop preserve set. Prefixed archive below may drop metadata.
+        total += archive_unprefixed_live_tasks(conn, &preserve)?;
+        drop_prd_rows(conn, &plan.null_prd_ids)?;
+    }
+
+    for prefix in &plan.prefixes {
+        total += archive_prd_by_prefix(conn, prefix, None)?;
+    }
+
+    Ok(total)
+}
+
+/// Dry-run counts for each union prefix (live tasks only).
+pub fn get_archive_preview(
+    conn: &Connection,
+    plan: &ForceArchivePlan,
+) -> TaskMgrResult<DryRunArchivePreview> {
+    let mut prefixes = Vec::new();
+
+    if plan.includes_null {
+        // Count live tasks not matching any preserve prefix (same scope as archive).
+        let mut preserve: Vec<String> = plan.prefixes.iter().cloned().collect();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT task_prefix FROM prd_metadata WHERE task_prefix IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        for row in rows {
+            let p = row?;
+            if !preserve.contains(&p) {
+                preserve.push(p);
+            }
+        }
+        let patterns: Vec<String> = preserve.iter().map(|p| make_like_pattern(p)).collect();
+        let mut sql = String::from("SELECT COUNT(*) FROM tasks WHERE archived_at IS NULL");
+        for _ in &patterns {
+            sql.push_str(" AND id NOT LIKE ? ESCAPE '\\'");
+        }
+        let mut q = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::types::ToSql> = patterns
+            .iter()
+            .map(|p| p as &dyn rusqlite::types::ToSql)
+            .collect();
+        let tasks: i64 = q.query_row(params.as_slice(), |row| row.get(0))?;
+        prefixes.push(ArchivePrefixPreview {
+            prefix: None,
+            tasks: tasks as usize,
+        });
+    }
+
+    for prefix in &plan.prefixes {
+        let pattern = make_like_pattern(prefix);
+        let tasks: usize = conn.query_row(
+            "SELECT COUNT(*) FROM tasks WHERE id LIKE ? ESCAPE '\\' AND archived_at IS NULL",
+            [&pattern],
+            |row| Ok(row.get::<_, i64>(0)? as usize),
+        )?;
+        prefixes.push(ArchivePrefixPreview {
+            prefix: Some(prefix.clone()),
+            tasks,
+        });
+    }
+
+    Ok(DryRunArchivePreview { prefixes })
+}
 
 /// Drop existing data from the database.
 ///
@@ -270,6 +379,78 @@ pub fn insert_prd_metadata(
     Ok(prd_id)
 }
 
+/// Update an existing `prd_metadata` row by primary key.
+///
+/// Used by the sticky identity resolver when a path is already registered:
+/// refreshes project fields / raw_json but **never** changes `task_prefix`
+/// (prefix is frozen at first registration). Prefer this over
+/// [`insert_prd_metadata`] for known identities so NULL-prefix rows cannot
+/// mint a twin via `ON CONFLICT(task_prefix)` (UNIQUE allows multiple NULLs).
+pub fn update_prd_metadata_by_id(
+    conn: &Connection,
+    prd_id: i64,
+    prd: &PrdFile,
+    raw_json: Option<&str>,
+) -> TaskMgrResult<()> {
+    if prd.model.is_some() {
+        crate::output::warn(
+            "PRD `default_model` is ignored under the models config; use models.anchor / \
+             routing instead",
+        );
+    }
+    let priority_philosophy = prd
+        .priority_philosophy
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
+    let global_acceptance = prd
+        .global_acceptance_criteria
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
+    let review_guidelines = prd
+        .review_guidelines
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
+
+    let updated = conn.execute(
+        r#"UPDATE prd_metadata SET
+               project = ?1,
+               branch_name = ?2,
+               description = ?3,
+               priority_philosophy = ?4,
+               global_acceptance_criteria = ?5,
+               review_guidelines = ?6,
+               raw_json = ?7,
+               external_git_repo = ?8,
+               default_model = ?9,
+               default_max_retries = ?10,
+               updated_at = datetime('now')
+           WHERE id = ?11"#,
+        rusqlite::params![
+            prd.project,
+            prd.branch_name,
+            prd.description,
+            priority_philosophy,
+            global_acceptance,
+            review_guidelines,
+            raw_json,
+            prd.external_git_repo,
+            prd.model,
+            prd.default_max_retries,
+            prd_id,
+        ],
+    )?;
+    if updated == 0 {
+        return Err(crate::TaskMgrError::NotFound {
+            resource_type: "prd_metadata".to_string(),
+            id: prd_id.to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Serialized fields shared between insert_task and update_task.
 struct TaskSerializedFields {
     acceptance_criteria: String,
@@ -516,26 +697,86 @@ pub fn insert_prd_file(
     Ok(())
 }
 
-/// Register all files associated with a PRD in the prd_files table.
+/// Convert a live filesystem path to the canonical `prd_files.file_path` form.
+///
+/// **Contract:** stored `TEXT` is source-root-relative POSIX (forward slashes),
+/// e.g. `tasks/foo.json`. Never strip against `.task-mgr/tasks`.
+///
+/// When `path` lies outside `source_root` (strip fails), this stores a stable
+/// absolute form: `canonicalize(path)` when that succeeds, otherwise the
+/// absolute path as given (or `source_root.join(path)` when still relative).
+/// Never panics.
+pub fn path_for_prd_files_storage(path: &Path, source_root: &Path) -> String {
+    let to_posix = |p: &Path| p.to_string_lossy().replace('\\', "/");
+    let canon_root = std::fs::canonicalize(source_root).ok();
+
+    // Absolute (or cwd-resolvable) path: canonicalize + strip source_root.
+    let canon_path = std::fs::canonicalize(path).ok();
+    if let (Some(cp), Some(cr)) = (&canon_path, &canon_root)
+        && let Ok(rel) = cp.strip_prefix(cr)
+    {
+        return to_posix(rel);
+    }
+
+    // Relative caller path (e.g. CLI `tasks/foo.json`): resolve via source_root.
+    if !path.is_absolute() {
+        let joined = source_root.join(path);
+        if let (Ok(cp), Some(cr)) = (std::fs::canonicalize(&joined), &canon_root)
+            && let Ok(rel) = cp.strip_prefix(cr)
+        {
+            return to_posix(rel);
+        }
+        // Not on disk yet — store the relative POSIX form as given.
+        return to_posix(path);
+    }
+
+    // Logical strip without canonicalize.
+    if let Ok(rel) = path.strip_prefix(source_root) {
+        return to_posix(rel);
+    }
+    if let (Some(cr), Ok(cp)) = (&canon_root, std::fs::canonicalize(path))
+        && let Ok(rel) = cp.strip_prefix(cr)
+    {
+        return to_posix(rel);
+    }
+
+    // Outside source_root: stable absolute form; do not panic.
+    if let Some(cp) = canon_path {
+        return to_posix(&cp);
+    }
+    to_posix(path)
+}
+
+/// Resolve a stored `prd_files.file_path` to a live filesystem path.
+///
+/// Absolute stored paths (legacy rows) are used as-is then remapped into
+/// `worktree_root`. Relative paths are joined to `source_root` then remapped.
+/// This is the single read helper for archive discovery, `locate_prd_json`,
+/// and any consumer that previously did `tasks_dir.join(stored)`.
+///
+/// Delegates path math to [`crate::git::remap_into_worktree`] (pin-19).
+pub fn resolve_prd_file_path(stored: &Path, source_root: &Path, worktree_root: &Path) -> PathBuf {
+    crate::git::remap_into_worktree(stored, source_root, worktree_root)
+}
+
+/// Register all files associated with a PRD in the `prd_files` table.
 ///
 /// Records:
 /// 1. The task list JSON file as `task_list` type
 /// 2. The derived prompt file (`<stem>-prompt.md`) as `prompt` type if it exists
 /// 3. The PRD markdown file from `prd.prd_file` as `prd` type if set
 ///
-/// All paths are stored relative to the tasks directory.
+/// Task-list and prompt paths are stored as **source-root-relative POSIX**
+/// via [`path_for_prd_files_storage`]. Do not join those stored values onto
+/// `.task-mgr/tasks` — use [`resolve_prd_file_path`] on read.
 pub fn register_prd_files(
     conn: &Connection,
     prd_id: i64,
     json_path: &Path,
     prd: &PrdFile,
-    tasks_dir: &Path,
+    source_root: &Path,
 ) -> TaskMgrResult<()> {
-    // Store the JSON task list path (relative to tasks dir)
-    let json_relative = json_path
-        .strip_prefix(tasks_dir)
-        .unwrap_or(json_path)
-        .to_string_lossy();
+    let json_relative = path_for_prd_files_storage(json_path, source_root);
     insert_prd_file(conn, prd_id, &json_relative, "task_list")?;
 
     // Derive prompt file path: <stem>-prompt.md
@@ -543,20 +784,59 @@ pub fn register_prd_files(
         let prompt_name = format!("{}-prompt.md", stem.to_string_lossy());
         let prompt_path = json_path.with_file_name(&prompt_name);
         if prompt_path.exists() {
-            let prompt_relative = prompt_path
-                .strip_prefix(tasks_dir)
-                .unwrap_or(&prompt_path)
-                .to_string_lossy();
+            let prompt_relative = path_for_prd_files_storage(&prompt_path, source_root);
             insert_prd_file(conn, prd_id, &prompt_relative, "prompt")?;
         }
     }
 
-    // Store PRD markdown file if specified
+    // Store PRD markdown file if specified (already a project-relative string
+    // from JSON metadata — keep as-is when relative; normalize when absolute).
     if let Some(ref prd_file) = prd.prd_file {
-        insert_prd_file(conn, prd_id, prd_file, "prd")?;
+        let stored = if Path::new(prd_file).is_absolute() {
+            path_for_prd_files_storage(Path::new(prd_file), source_root)
+        } else {
+            prd_file.replace('\\', "/")
+        };
+        insert_prd_file(conn, prd_id, &stored, "prd")?;
     }
 
     Ok(())
+}
+
+/// Find `prd_files` task_list rows whose pin-19 identity matches `live`.
+///
+/// Scans `prd_files` WHERE `file_type = 'task_list'`, joins `prd_metadata`, and
+/// returns every `(prd_id, task_prefix)` where
+/// [`crate::git::paths_identify`] is true. Zero hits → empty; one hit → that
+/// pair; two or more → all hits (callers refuse / doctor). Does not `LIMIT 1`.
+pub fn find_registered_task_lists(
+    conn: &Connection,
+    live: &Path,
+    source_root: &Path,
+    worktree_root: &Path,
+) -> TaskMgrResult<Vec<(i64, Option<String>)>> {
+    let mut stmt = conn.prepare(
+        "SELECT pf.file_path, pm.id, pm.task_prefix
+         FROM prd_files pf
+         JOIN prd_metadata pm ON pm.id = pf.prd_id
+         WHERE pf.file_type = 'task_list'",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        let file_path: String = row.get(0)?;
+        let prd_id: i64 = row.get(1)?;
+        let prefix: Option<String> = row.get(2)?;
+        Ok((file_path, prd_id, prefix))
+    })?;
+
+    let mut hits = Vec::new();
+    for row in rows {
+        let (file_path, prd_id, prefix) = row?;
+        let registered = PathBuf::from(file_path);
+        if crate::git::paths_identify(live, &registered, source_root, worktree_root) {
+            hits.push((prd_id, prefix));
+        }
+    }
+    Ok(hits)
 }
 
 #[cfg(test)]
@@ -710,5 +990,247 @@ mod tests {
 
         assert!(task.requires_human);
         assert_eq!(task.human_review_timeout, None);
+    }
+
+    fn seed_prd_with_task_list(conn: &Connection, prefix: Option<&str>, file_path: &str) -> i64 {
+        conn.execute(
+            "INSERT INTO prd_metadata (project, task_prefix, updated_at)
+             VALUES ('test', ?, datetime('now'))",
+            rusqlite::params![prefix],
+        )
+        .unwrap();
+        let prd_id: i64 = conn
+            .query_row("SELECT last_insert_rowid()", [], |row| row.get(0))
+            .unwrap();
+        insert_prd_file(conn, prd_id, file_path, "task_list").unwrap();
+        prd_id
+    }
+
+    #[test]
+    fn find_registered_relative_and_absolute_live_identify() {
+        let tmp = TempDir::new().unwrap();
+        let source_raw = tmp.path().join("main");
+        std::fs::create_dir_all(source_raw.join("tasks")).unwrap();
+        let file = source_raw.join("tasks/foo.json");
+        std::fs::write(&file, "{}").unwrap();
+        let source = std::fs::canonicalize(&source_raw).unwrap();
+
+        let (_db_tmp, conn) = setup_db();
+        // Init-shaped relative path only — never bare basename.
+        let prd_id = seed_prd_with_task_list(&conn, Some("abc12345"), "tasks/foo.json");
+
+        let live = std::fs::canonicalize(&file).unwrap();
+        let hits = find_registered_task_lists(&conn, &live, &source, &source).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, prd_id);
+        assert_eq!(hits[0].1.as_deref(), Some("abc12345"));
+    }
+
+    #[test]
+    fn find_registered_source_and_worktree_identify_as_one() {
+        let tmp = TempDir::new().unwrap();
+        let source_raw = tmp.path().join("main");
+        let worktree_raw = tmp.path().join("wt");
+        std::fs::create_dir_all(source_raw.join("tasks")).unwrap();
+        std::fs::create_dir_all(worktree_raw.join("tasks")).unwrap();
+        let src_file = source_raw.join("tasks/foo.json");
+        let wt_file = worktree_raw.join("tasks/foo.json");
+        std::fs::write(&src_file, "{}").unwrap();
+        std::fs::write(&wt_file, "{}").unwrap();
+        let source = std::fs::canonicalize(&source_raw).unwrap();
+        let worktree = std::fs::canonicalize(&worktree_raw).unwrap();
+
+        let (_db_tmp, conn) = setup_db();
+        let prd_id = seed_prd_with_task_list(&conn, Some("wtprefix"), "tasks/foo.json");
+
+        let live_wt = std::fs::canonicalize(&wt_file).unwrap();
+        let hits = find_registered_task_lists(&conn, &live_wt, &source, &worktree).unwrap();
+        assert_eq!(hits, vec![(prd_id, Some("wtprefix".into()))]);
+
+        let live_src = std::fs::canonicalize(&src_file).unwrap();
+        let hits_src = find_registered_task_lists(&conn, &live_src, &source, &worktree).unwrap();
+        assert_eq!(hits_src, vec![(prd_id, Some("wtprefix".into()))]);
+    }
+
+    #[test]
+    fn find_registered_different_dirs_same_basename_no_hit() {
+        let tmp = TempDir::new().unwrap();
+        let source_a = tmp.path().join("proj-a");
+        let source_b = tmp.path().join("proj-b");
+        std::fs::create_dir_all(source_a.join("tasks")).unwrap();
+        std::fs::create_dir_all(source_b.join("tasks")).unwrap();
+        std::fs::write(source_a.join("tasks/foo.json"), "{}").unwrap();
+        let file_b = source_b.join("tasks/foo.json");
+        std::fs::write(&file_b, "{}").unwrap();
+        let source = std::fs::canonicalize(&source_a).unwrap();
+
+        let (_db_tmp, conn) = setup_db();
+        seed_prd_with_task_list(&conn, Some("prefix-a"), "tasks/foo.json");
+
+        let live_b = std::fs::canonicalize(&file_b).unwrap();
+        let hits = find_registered_task_lists(&conn, &live_b, &source, &source).unwrap();
+        assert!(hits.is_empty(), "basename equality must not identify");
+    }
+
+    #[test]
+    fn find_registered_returns_all_twins_no_limit_one() {
+        let tmp = TempDir::new().unwrap();
+        let source_raw = tmp.path().join("main");
+        std::fs::create_dir_all(source_raw.join("tasks")).unwrap();
+        let file = source_raw.join("tasks/foo.json");
+        std::fs::write(&file, "{}").unwrap();
+        let source = std::fs::canonicalize(&source_raw).unwrap();
+        let abs = std::fs::canonicalize(&file).unwrap();
+
+        let (_db_tmp, conn) = setup_db();
+        // Twin rows: relative + absolute for the same live file (split-brain).
+        let id1 = seed_prd_with_task_list(&conn, Some("twin-a"), "tasks/foo.json");
+        let id2 = seed_prd_with_task_list(&conn, Some("twin-b"), abs.to_str().unwrap());
+
+        let live = abs.clone();
+        let mut hits = find_registered_task_lists(&conn, &live, &source, &source).unwrap();
+        hits.sort_by_key(|(id, _)| *id);
+        assert_eq!(hits.len(), 2, "twins must all be returned; callers refuse");
+        assert_eq!(hits[0].0, id1);
+        assert_eq!(hits[1].0, id2);
+    }
+
+    #[test]
+    fn find_registered_zero_hits_empty() {
+        let tmp = TempDir::new().unwrap();
+        let source_raw = tmp.path().join("main");
+        std::fs::create_dir_all(source_raw.join("tasks")).unwrap();
+        let file = source_raw.join("tasks/other.json");
+        std::fs::write(&file, "{}").unwrap();
+        let source = std::fs::canonicalize(&source_raw).unwrap();
+
+        let (_db_tmp, conn) = setup_db();
+        seed_prd_with_task_list(&conn, Some("only-foo"), "tasks/foo.json");
+
+        let live = std::fs::canonicalize(&file).unwrap();
+        let hits = find_registered_task_lists(&conn, &live, &source, &source).unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn path_for_prd_files_storage_relative_then_absolute_same_string() {
+        let tmp = TempDir::new().unwrap();
+        let source_raw = tmp.path().join("proj");
+        std::fs::create_dir_all(source_raw.join("tasks")).unwrap();
+        let file = source_raw.join("tasks/foo.json");
+        std::fs::write(&file, "{}").unwrap();
+        let source = std::fs::canonicalize(&source_raw).unwrap();
+        let abs = std::fs::canonicalize(&file).unwrap();
+
+        let from_rel = path_for_prd_files_storage(Path::new("tasks/foo.json"), &source);
+        let from_abs = path_for_prd_files_storage(&abs, &source);
+        assert_eq!(from_rel, "tasks/foo.json");
+        assert_eq!(from_abs, "tasks/foo.json");
+    }
+
+    #[test]
+    fn register_relative_then_absolute_one_canonical_row() {
+        let tmp = TempDir::new().unwrap();
+        let source_raw = tmp.path().join("proj");
+        std::fs::create_dir_all(source_raw.join("tasks")).unwrap();
+        let file = source_raw.join("tasks/foo.json");
+        std::fs::write(&file, r#"{"project":"p","userStories":[]}"#).unwrap();
+        // Prompt beside the JSON so both task_list + prompt register.
+        std::fs::write(source_raw.join("tasks/foo-prompt.md"), "# p").unwrap();
+        let source = std::fs::canonicalize(&source_raw).unwrap();
+        let abs = std::fs::canonicalize(&file).unwrap();
+
+        let (_db_tmp, conn) = setup_db();
+        let prd = PrdFile {
+            project: "p".into(),
+            branch_name: None,
+            description: None,
+            priority_philosophy: None,
+            global_acceptance_criteria: None,
+            review_guidelines: None,
+            user_stories: vec![],
+            external_git_repo: None,
+            task_prefix: Some("abc12345".into()),
+            prd_file: None,
+            model: None,
+            default_max_retries: None,
+            implicit_overlap_files: None,
+        };
+        let prd_id = insert_prd_metadata(&conn, &prd, None).unwrap();
+
+        // First register via relative-shaped path under source_root.
+        let rel_path = source.join("tasks/foo.json");
+        register_prd_files(&conn, prd_id, &rel_path, &prd, &source).unwrap();
+        // Second register via absolute path — INSERT OR IGNORE + same stored
+        // string must not create a twin file_path row.
+        register_prd_files(&conn, prd_id, &abs, &prd, &source).unwrap();
+
+        let paths: Vec<String> = conn
+            .prepare("SELECT file_path FROM prd_files WHERE prd_id = ? AND file_type = 'task_list'")
+            .unwrap()
+            .query_map([prd_id], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(paths, vec!["tasks/foo.json".to_string()]);
+
+        let prompt_paths: Vec<String> = conn
+            .prepare("SELECT file_path FROM prd_files WHERE prd_id = ? AND file_type = 'prompt'")
+            .unwrap()
+            .query_map([prd_id], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(prompt_paths, vec!["tasks/foo-prompt.md".to_string()]);
+    }
+
+    #[test]
+    fn path_for_prd_files_storage_outside_source_root_is_absolute_stable() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("proj");
+        let outside = tmp.path().join("other");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let file = outside.join("orphan.json");
+        std::fs::write(&file, "{}").unwrap();
+        let source = std::fs::canonicalize(&source).unwrap();
+        let file = std::fs::canonicalize(&file).unwrap();
+
+        let stored = path_for_prd_files_storage(&file, &source);
+        assert!(
+            Path::new(&stored).is_absolute(),
+            "outside source_root must store absolute form, got {stored}"
+        );
+        assert_eq!(stored, file.to_string_lossy().replace('\\', "/"));
+    }
+
+    #[test]
+    fn resolve_prd_file_path_joins_source_root_relative() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("proj");
+        let worktree = tmp.path().join("wt");
+        std::fs::create_dir_all(source.join("tasks")).unwrap();
+        std::fs::create_dir_all(worktree.join("tasks")).unwrap();
+        let got = resolve_prd_file_path(Path::new("tasks/foo.json"), &source, &worktree);
+        assert_eq!(got, worktree.join("tasks/foo.json"));
+    }
+
+    #[test]
+    fn register_prd_files_no_tasks_dir_strip_prefix() {
+        // Grep-guard companion: storage must not use .task-mgr/tasks strip.
+        let src = include_str!("import.rs");
+        let start = src
+            .find("pub fn register_prd_files(")
+            .expect("register_prd_files present");
+        let body = &src[start..];
+        let end = body[1..]
+            .find("\npub fn ")
+            .map(|i| i + 1)
+            .unwrap_or(body.len());
+        let fn_body = &body[..end];
+        assert!(
+            !fn_body.contains("strip_prefix(tasks_dir)") && !fn_body.contains(".task-mgr/tasks"),
+            "register_prd_files must not strip_prefix(.task-mgr/tasks)"
+        );
     }
 }

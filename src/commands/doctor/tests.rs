@@ -377,6 +377,7 @@ fn test_format_text_healthy() {
             orphan_branch_prds: 0,
             decay_warnings: 0,
             reconciled: 0,
+            path_identity_twins: 0,
             total_issues: 0,
             total_fixed: 0,
         },
@@ -406,6 +407,7 @@ fn test_format_text_with_issues() {
             orphan_branch_prds: 0,
             decay_warnings: 0,
             reconciled: 0,
+            path_identity_twins: 0,
             total_issues: 1,
             total_fixed: 0,
         },
@@ -440,6 +442,7 @@ fn test_format_text_with_fixes() {
             orphan_branch_prds: 0,
             decay_warnings: 0,
             reconciled: 0,
+            path_identity_twins: 0,
             total_issues: 1,
             total_fixed: 1,
         },
@@ -471,6 +474,7 @@ fn test_doctor_result_serialization() {
             orphan_branch_prds: 0,
             decay_warnings: 0,
             reconciled: 0,
+            path_identity_twins: 0,
             total_issues: 1,
             total_fixed: 0,
         },
@@ -664,6 +668,7 @@ fn test_format_text_dry_run() {
             orphan_branch_prds: 0,
             decay_warnings: 0,
             reconciled: 0,
+            path_identity_twins: 0,
             total_issues: 1,
             total_fixed: 0,
         },
@@ -1158,6 +1163,7 @@ fn test_format_text_git_reconciliation() {
             orphan_branch_prds: 0,
             decay_warnings: 0,
             reconciled: 1,
+            path_identity_twins: 0,
             total_issues: 1,
             total_fixed: 0,
         },
@@ -1187,6 +1193,7 @@ fn test_format_text_git_reconciliation_verbose() {
             orphan_branch_prds: 0,
             decay_warnings: 0,
             reconciled: 1,
+            path_identity_twins: 0,
             total_issues: 1,
             total_fixed: 0,
         },
@@ -1236,6 +1243,7 @@ fn test_format_doctor_verbose_orphan_branch_prd() {
             orphan_branch_prds: 1,
             decay_warnings: 0,
             reconciled: 0,
+            path_identity_twins: 0,
             total_issues: 1,
             total_fixed: 0,
         },
@@ -1270,6 +1278,7 @@ fn test_format_text_orphan_branch_prd() {
             orphan_branch_prds: 1,
             decay_warnings: 0,
             reconciled: 0,
+            path_identity_twins: 0,
             total_issues: 1,
             total_fixed: 0,
         },
@@ -1305,6 +1314,7 @@ fn test_git_reconciliation_serialization() {
             orphan_branch_prds: 0,
             decay_warnings: 0,
             reconciled: 1,
+            path_identity_twins: 0,
             total_issues: 1,
             total_fixed: 1,
         },
@@ -1344,4 +1354,305 @@ fn test_archived_run_excluded_from_active_runs_without_end() {
         result.summary.active_runs, 0,
         "Archived runs must not be counted as active runs without end"
     );
+}
+
+// ============ path-identity twin tests (FEAT-004) ============
+
+/// Project layout: `<project>/tasks/foo.json` + DB under `<project>/.task-mgr`.
+/// Doctor derives source_root as parent of the DB dir.
+fn setup_project_with_db() -> (TempDir, rusqlite::Connection, std::path::PathBuf) {
+    let project = TempDir::new().unwrap();
+    let tasks_dir = project.path().join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    let json_path = tasks_dir.join("foo.json");
+    std::fs::write(&json_path, r#"{"tasks":[]}"#).unwrap();
+
+    let db_dir = project.path().join(".task-mgr");
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let mut conn = open_connection(&db_dir).unwrap();
+    create_schema(&conn).unwrap();
+    run_migrations(&mut conn).unwrap();
+    (project, conn, db_dir)
+}
+
+fn insert_prd_with_task_list(
+    conn: &rusqlite::Connection,
+    prd_id: i64,
+    prefix: Option<&str>,
+    stored_path: &str,
+) {
+    conn.execute(
+        "INSERT INTO prd_metadata (id, project, task_prefix) VALUES (?, ?, ?)",
+        rusqlite::params![prd_id, format!("proj-{prd_id}"), prefix],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO prd_files (prd_id, file_path, file_type) VALUES (?, ?, 'task_list')",
+        rusqlite::params![prd_id, stored_path],
+    )
+    .unwrap();
+}
+
+#[test]
+fn test_path_identity_twin_empty_side_autofix_collapses() {
+    let (project, mut conn, db_dir) = setup_project_with_db();
+    let abs = project.path().join("tasks/foo.json");
+    let abs_str = abs.to_string_lossy().replace('\\', "/");
+
+    // Live side (relative) + empty twin (absolute legacy) — same identity.
+    insert_prd_with_task_list(&conn, 1, Some("liveaaaa"), "tasks/foo.json");
+    insert_prd_with_task_list(&conn, 2, Some("emptybbb"), &abs_str);
+    insert_test_task(&conn, "liveaaaa-001", "todo");
+    // emptybbb has zero unarchived tasks
+
+    let json_before = std::fs::read_to_string(&abs).unwrap();
+
+    let result = doctor(&mut conn, true, false, 0, false, &db_dir).unwrap();
+
+    assert_eq!(result.summary.path_identity_twins, 1);
+    assert!(
+        result
+            .issues
+            .iter()
+            .any(|i| i.issue_type == IssueType::PathIdentityTwin
+                && i.entity_id.contains("liveaaaa")
+                && i.entity_id.contains("emptybbb")),
+        "entity must list both prefixes: {:?}",
+        result.issues
+    );
+    assert!(
+        result
+            .fixed
+            .iter()
+            .any(|f| f.issue_type == IssueType::PathIdentityTwin),
+        "empty side must be auto-fixed: {:?}",
+        result.fixed
+    );
+
+    // Empty-side metadata gone; live side unchanged.
+    let empty_meta: i64 = conn
+        .query_row("SELECT COUNT(*) FROM prd_metadata WHERE id = 2", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(empty_meta, 0, "empty-side prd_metadata must be deleted");
+    let empty_files: i64 = conn
+        .query_row("SELECT COUNT(*) FROM prd_files WHERE prd_id = 2", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(empty_files, 0, "empty-side prd_files must be gone");
+    let live_meta: i64 = conn
+        .query_row("SELECT COUNT(*) FROM prd_metadata WHERE id = 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(live_meta, 1, "live-side PRD must be unchanged");
+    let live_task: String = conn
+        .query_row(
+            "SELECT status FROM tasks WHERE id = 'liveaaaa-001'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(live_task, "todo");
+
+    // Never move/rename JSON files.
+    assert!(abs.exists(), "JSON file must remain on disk");
+    assert_eq!(
+        std::fs::read_to_string(&abs).unwrap(),
+        json_before,
+        "JSON contents must be untouched"
+    );
+}
+
+#[test]
+fn test_path_identity_twin_both_live_report_only() {
+    let (project, mut conn, db_dir) = setup_project_with_db();
+    let abs = project.path().join("tasks/foo.json");
+    let abs_str = abs.to_string_lossy().replace('\\', "/");
+
+    insert_prd_with_task_list(&conn, 1, Some("sideaaaa"), "tasks/foo.json");
+    insert_prd_with_task_list(&conn, 2, Some("sidebbbb"), &abs_str);
+    insert_test_task(&conn, "sideaaaa-001", "todo");
+    insert_test_task(&conn, "sidebbbb-001", "todo");
+
+    let result = doctor(&mut conn, true, false, 0, false, &db_dir).unwrap();
+
+    assert_eq!(result.summary.path_identity_twins, 1);
+    assert!(
+        result
+            .issues
+            .iter()
+            .any(|i| i.issue_type == IssueType::PathIdentityTwin
+                && i.entity_id.contains("sideaaaa")
+                && i.entity_id.contains("sidebbbb"))
+    );
+    assert!(
+        !result
+            .fixed
+            .iter()
+            .any(|f| f.issue_type == IssueType::PathIdentityTwin),
+        "both-live must never auto-pick: {:?}",
+        result.fixed
+    );
+    let meta_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM prd_metadata", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(meta_count, 2, "both PRD rows must remain");
+}
+
+#[test]
+fn test_path_identity_twin_all_done_blocks_autofix() {
+    let (project, mut conn, db_dir) = setup_project_with_db();
+    let abs = project.path().join("tasks/foo.json");
+    let abs_str = abs.to_string_lossy().replace('\\', "/");
+
+    insert_prd_with_task_list(&conn, 1, Some("doneaaaa"), "tasks/foo.json");
+    insert_prd_with_task_list(&conn, 2, Some("emptybbb"), &abs_str);
+    // All-done live rows still count (archived_at IS NULL) — block auto-fix
+    // of the *done* side; empty side CAN still be fixed.
+    insert_test_task(&conn, "doneaaaa-001", "done");
+
+    let result = doctor(&mut conn, true, false, 0, false, &db_dir).unwrap();
+
+    assert_eq!(result.summary.path_identity_twins, 1);
+    // emptybbb has 0 live → may be deleted; doneaaaa must remain
+    let done_meta: i64 = conn
+        .query_row("SELECT COUNT(*) FROM prd_metadata WHERE id = 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(done_meta, 1, "all-done side must not be deleted");
+    let empty_meta: i64 = conn
+        .query_row("SELECT COUNT(*) FROM prd_metadata WHERE id = 2", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(empty_meta, 0, "true-empty side may still collapse");
+}
+
+#[test]
+fn test_path_identity_twin_all_irrelevant_vs_live_no_delete_irrelevant() {
+    // Known-bad: treating irrelevant as empty-enough would drop a still-registered
+    // effort. Both sides have live (unarchived) rows → report only.
+    let (project, mut conn, db_dir) = setup_project_with_db();
+    let abs = project.path().join("tasks/foo.json");
+    let abs_str = abs.to_string_lossy().replace('\\', "/");
+
+    insert_prd_with_task_list(&conn, 1, Some("irrelaaa"), "tasks/foo.json");
+    insert_prd_with_task_list(&conn, 2, Some("livbbbbb"), &abs_str);
+    insert_test_task(&conn, "irrelaaa-001", "irrelevant");
+    insert_test_task(&conn, "livbbbbb-001", "todo");
+
+    let result = doctor(&mut conn, true, false, 0, false, &db_dir).unwrap();
+
+    assert_eq!(result.summary.path_identity_twins, 1);
+    assert!(
+        !result
+            .fixed
+            .iter()
+            .any(|f| f.issue_type == IssueType::PathIdentityTwin),
+        "irrelevant is still live — must not auto-fix either side"
+    );
+    let meta_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM prd_metadata", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(meta_count, 2);
+}
+
+#[test]
+fn test_path_identity_twin_null_prefix_reported_not_skipped() {
+    let (project, mut conn, db_dir) = setup_project_with_db();
+    let abs = project.path().join("tasks/foo.json");
+    let abs_str = abs.to_string_lossy().replace('\\', "/");
+
+    insert_prd_with_task_list(&conn, 1, None, "tasks/foo.json");
+    insert_prd_with_task_list(&conn, 2, Some("namedccc"), &abs_str);
+    insert_test_task(&conn, "namedccc-001", "todo");
+
+    let result = doctor(&mut conn, true, false, 0, false, &db_dir).unwrap();
+
+    assert_eq!(result.summary.path_identity_twins, 1);
+    let issue = result
+        .issues
+        .iter()
+        .find(|i| i.issue_type == IssueType::PathIdentityTwin)
+        .expect("twin issue");
+    assert!(
+        issue.entity_id.contains("NULL"),
+        "NULL-prefix must appear in entity: {}",
+        issue.entity_id
+    );
+    assert!(
+        issue.entity_id.contains("namedccc"),
+        "named prefix must appear in entity: {}",
+        issue.entity_id
+    );
+    // NULL side never auto-fixed; named side has live tasks — no empty drop.
+    // (NULL has unknown count; named has live → no Some(0) empty side.)
+    assert!(
+        !result
+            .fixed
+            .iter()
+            .any(|f| f.issue_type == IssueType::PathIdentityTwin)
+    );
+}
+
+#[test]
+fn test_path_identity_twin_check_error_does_not_abort_doctor() {
+    let (tmp_dir, mut conn) = setup_test_db();
+    insert_test_task(&conn, "US-001", "in_progress"); // stale — other check must still run
+
+    // Break the identity scan so find_path_identity_twins returns Err.
+    conn.execute("DROP TABLE prd_files", []).unwrap();
+
+    let result = doctor(&mut conn, false, false, 0, false, tmp_dir.path()).unwrap();
+
+    assert!(
+        result
+            .issues
+            .iter()
+            .any(|i| i.issue_type == IssueType::PathIdentityTwin
+                && i.entity_id == "path_identity_check"),
+        "identity error must surface as unfixed twin issue: {:?}",
+        result.issues
+    );
+    assert!(
+        result
+            .issues
+            .iter()
+            .any(|i| i.issue_type == IssueType::StaleInProgressTask),
+        "other doctor checks must still run after twin-check failure"
+    );
+    assert_eq!(result.summary.total_fixed, 0);
+}
+
+#[test]
+fn test_path_identity_twin_json_snake_case() {
+    let result = DoctorResult {
+        issues: vec![Issue {
+            issue_type: IssueType::PathIdentityTwin,
+            entity_id: "NULL|abcdef12".to_string(),
+            description: "twins".to_string(),
+        }],
+        fixed: vec![],
+        would_fix: vec![],
+        auto_fix: false,
+        dry_run: false,
+        summary: DoctorSummary {
+            stale_tasks: 0,
+            active_runs: 0,
+            orphaned_relationships: 0,
+            orphan_branch_prds: 0,
+            decay_warnings: 0,
+            reconciled: 0,
+            path_identity_twins: 1,
+            total_issues: 1,
+            total_fixed: 0,
+        },
+    };
+    let json = serde_json::to_string(&result).unwrap();
+    assert!(json.contains("path_identity_twin"));
+    assert!(json.contains("NULL|abcdef12"));
 }

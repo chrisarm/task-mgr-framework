@@ -20,7 +20,7 @@ use serde_json::Value;
 
 use crate::commands::init::import::{
     DEPRECATED_RELATIONSHIPS_WARNING, insert_relationship, insert_task, insert_task_file,
-    insert_task_relationships,
+    insert_task_relationships, resolve_prd_file_path,
 };
 use crate::commands::init::parse::PrdUserStory;
 use crate::commands::next;
@@ -201,17 +201,42 @@ pub fn add(
 
     let _lock = crate::db::LockGuard::acquire(db_dir)?;
     let conn = crate::db::open_connection(db_dir)?;
+    let (source_root, worktree_root) = default_prd_roots(db_dir);
 
-    add_with_conn(&conn, input, priority_override, depended_on_by)
+    add_with_conn(
+        &conn,
+        input,
+        priority_override,
+        depended_on_by,
+        &source_root,
+        &worktree_root,
+    )
+}
+
+/// Resolve source/worktree roots for PRD path reads when the caller only has `db_dir`.
+fn default_prd_roots(db_dir: &Path) -> (PathBuf, PathBuf) {
+    let source_root = crate::git::main_repo_root_at(db_dir)
+        .or_else(|| db_dir.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| db_dir.to_path_buf());
+    let worktree_root = std::env::current_dir()
+        .ok()
+        .filter(|cwd| crate::git::is_inside_worktree_at(cwd).unwrap_or(false))
+        .unwrap_or_else(|| source_root.clone());
+    (source_root, worktree_root)
 }
 
 /// Testable variant that takes an already-open connection (used by unit tests
 /// with in-memory DBs).
+///
+/// `source_root` / `worktree_root` resolve stored `prd_files` paths via
+/// [`resolve_prd_file_path`]. Tests may pass the temp project dir for both.
 pub fn add_with_conn(
     conn: &Connection,
     mut input: AddTaskInput,
     priority_override: Option<i32>,
     depended_on_by: &[String],
+    source_root: &Path,
+    worktree_root: &Path,
 ) -> TaskMgrResult<AddResult> {
     // Re-validate id/title so callers that bypass `add()` (tests, future
     // internal callers) still get the guarantee.
@@ -235,7 +260,7 @@ pub fn add_with_conn(
     // Auto-prefix: when exactly one active PRD prefix exists, prepend it to the
     // task ID and all cross-references. Idempotent — already-prefixed IDs are
     // left unchanged.
-    let resolved_ctx = resolve_context(conn)?;
+    let resolved_ctx = resolve_context_at(conn, source_root, worktree_root)?;
 
     // Emit resolved-context line as the FIRST stderr output, before any write
     // or downstream warning. Agents can read stderr line 1 to learn which PRD
@@ -256,7 +281,13 @@ pub fn add_with_conn(
     // foreign-prefix target gets a worked refusal naming the foreign PRD's
     // path and both fix commands. Pre-flight runs before the DB transaction
     // opens so a refusal can never leak a stray row or touch the target JSON.
-    reject_cross_prd_depended_on_by(conn, depended_on_by, resolved_ctx.as_ref())?;
+    reject_cross_prd_depended_on_by(
+        conn,
+        depended_on_by,
+        resolved_ctx.as_ref(),
+        source_root,
+        worktree_root,
+    )?;
 
     let prefixed_depended_on_by: Vec<String>;
     let effective_depended_on_by: &[String] = if let Some(ref ctx) = resolved_ctx {
@@ -342,7 +373,7 @@ pub fn add_with_conn(
     // Best-effort PRD JSON sync. Failure here logs but does not roll back
     // the DB — the task is already in the database, and `task-mgr export`
     // can reconcile the JSON later.
-    let prd_path = match locate_prd_json(conn, task_prefix.as_deref()) {
+    let prd_path = match locate_prd_json(conn, task_prefix.as_deref(), source_root, worktree_root) {
         Ok(Some(path)) => match append_task_to_prd_json(
             &path,
             &story,
@@ -448,10 +479,29 @@ pub struct ResolvedContext {
 
 /// Resolve the active prefix and annotate it with source + target PRD path.
 ///
+/// Uses cwd / main-repo heuristics for path resolution. Prefer
+/// [`resolve_context_at`] when `db_dir` (or explicit roots) are known.
+///
 /// Returns `Ok(None)` when the DB has zero or 2+ prefixes and `TASK_MGR_ACTIVE_PREFIX`
 /// is not set — the caller should treat this as "no active PRD" rather than an
 /// error. Propagates `Err` for stale env pins or DB failures.
 pub fn resolve_context(conn: &Connection) -> TaskMgrResult<Option<ResolvedContext>> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let source_root = crate::git::main_repo_root_at(&cwd).unwrap_or_else(|| cwd.clone());
+    let worktree_root = if crate::git::is_inside_worktree_at(&cwd).unwrap_or(false) {
+        cwd
+    } else {
+        source_root.clone()
+    };
+    resolve_context_at(conn, &source_root, &worktree_root)
+}
+
+/// Like [`resolve_context`], but resolves `prd_files` via explicit project roots.
+pub fn resolve_context_at(
+    conn: &Connection,
+    source_root: &Path,
+    worktree_root: &Path,
+) -> TaskMgrResult<Option<ResolvedContext>> {
     let env_value = std::env::var(crate::loop_engine::claude::ACTIVE_PREFIX_ENV).ok();
     let env_set = env_value.as_deref().is_some_and(|v| !v.is_empty());
 
@@ -468,7 +518,8 @@ pub fn resolve_context(conn: &Connection) -> TaskMgrResult<Option<ResolvedContex
         ResolutionSource::SinglePrefix
     };
 
-    let prd_json_path = locate_prd_json(conn, Some(&prefix))?.unwrap_or_default();
+    let prd_json_path =
+        locate_prd_json(conn, Some(&prefix), source_root, worktree_root)?.unwrap_or_default();
 
     Ok(Some(ResolvedContext {
         prefix,
@@ -648,6 +699,8 @@ fn reject_cross_prd_depended_on_by(
     conn: &Connection,
     depended_on_by: &[String],
     active_ctx: Option<&ResolvedContext>,
+    source_root: &Path,
+    worktree_root: &Path,
 ) -> TaskMgrResult<()> {
     for target_id in depended_on_by {
         let Some(target_prefix) = extract_id_prefix(target_id) else {
@@ -667,7 +720,7 @@ fn reject_cross_prd_depended_on_by(
         if target_prefix == ctx.prefix {
             continue;
         }
-        let foreign_path = locate_prd_json(conn, Some(target_prefix))?;
+        let foreign_path = locate_prd_json(conn, Some(target_prefix), source_root, worktree_root)?;
         let active_prefix = &ctx.prefix;
         return Err(match foreign_path {
             Some(path) => TaskMgrError::invalid_state(
@@ -704,9 +757,20 @@ fn reject_cross_prd_depended_on_by(
 /// Falls back to the first registered `task_list` file when prefix is `None`
 /// or the prefix-scoped query finds nothing.
 ///
+/// Stored `prd_files.file_path` values are resolved through
+/// [`resolve_prd_file_path`] so relative rows like `tasks/foo.json` are not
+/// treated as cwd-relative.
+///
 /// Returns `Ok(None)` when no `task_list` file is registered (valid state:
 /// e.g. the DB was populated programmatically without a source JSON).
-fn locate_prd_json(conn: &Connection, task_prefix: Option<&str>) -> TaskMgrResult<Option<PathBuf>> {
+fn locate_prd_json(
+    conn: &Connection,
+    task_prefix: Option<&str>,
+    source_root: &Path,
+    worktree_root: &Path,
+) -> TaskMgrResult<Option<PathBuf>> {
+    let resolve =
+        |stored: String| resolve_prd_file_path(Path::new(&stored), source_root, worktree_root);
     if let Some(prefix) = task_prefix {
         let result: Option<String> = conn
             .query_row(
@@ -723,7 +787,7 @@ fn locate_prd_json(conn: &Connection, task_prefix: Option<&str>) -> TaskMgrResul
                 other => Err(other),
             })?;
         if let Some(path) = result {
-            return Ok(Some(PathBuf::from(path)));
+            return Ok(Some(resolve(path)));
         }
     }
     // Fallback: first registered task_list regardless of prefix.
@@ -736,7 +800,7 @@ fn locate_prd_json(conn: &Connection, task_prefix: Option<&str>) -> TaskMgrResul
                 rusqlite::Error::QueryReturnedNoRows => Ok(None),
                 other => Err(other),
             })?;
-    Ok(path.map(PathBuf::from))
+    Ok(path.map(resolve))
 }
 
 /// Append a serialized task to the PRD JSON's `userStories` array, atomically.
@@ -1126,7 +1190,8 @@ mod tests {
         )
         .unwrap();
         let input = minimal_input("X-SEED-001");
-        let err = add_with_conn(&conn, input, None, &[]).unwrap_err();
+        let err =
+            add_with_conn(&conn, input, None, &[], Path::new("."), Path::new(".")).unwrap_err();
         let msg = format!("{}", err);
         assert!(
             msg.contains("X-SEED-001"),
@@ -1163,7 +1228,7 @@ mod tests {
         let _iso = isolate_env();
         let conn = memory_db();
         let input = minimal_input("X-FEAT-001");
-        let res = add_with_conn(&conn, input, None, &[]).unwrap();
+        let res = add_with_conn(&conn, input, None, &[], Path::new("."), Path::new(".")).unwrap();
         assert_eq!(res.task_id, "X-FEAT-001");
         assert_eq!(res.priority_source, PrioritySource::AutoEmptyQueue);
 
@@ -1189,7 +1254,7 @@ mod tests {
         let mut input = minimal_input("X-FEAT-002");
         input.depends_on = vec!["X-FEAT-001".to_string()];
         input.touches_files = vec!["src/foo.rs".to_string(), "src/bar.rs".to_string()];
-        add_with_conn(&conn, input, None, &[]).unwrap();
+        add_with_conn(&conn, input, None, &[], Path::new("."), Path::new(".")).unwrap();
 
         let rel_count: i64 = conn
             .query_row(
@@ -1213,7 +1278,7 @@ mod tests {
     #[test]
     fn test_locate_prd_json_returns_none_when_no_file_registered() {
         let conn = memory_db();
-        let path = locate_prd_json(&conn, None).unwrap();
+        let path = locate_prd_json(&conn, None, Path::new("."), Path::new(".")).unwrap();
         assert!(path.is_none());
     }
 
@@ -1327,7 +1392,15 @@ mod tests {
         seed_task(&conn, "MILESTONE-1");
 
         let input = minimal_input("NEW-001");
-        add_with_conn(&conn, input, None, &["MILESTONE-1".to_string()]).unwrap();
+        add_with_conn(
+            &conn,
+            input,
+            None,
+            &["MILESTONE-1".to_string()],
+            Path::new("."),
+            Path::new("."),
+        )
+        .unwrap();
 
         // Reverse row: MILESTONE-1 (existing) dependsOn NEW-001 (new).
         let row_count: i64 = conn
@@ -1361,7 +1434,15 @@ mod tests {
         let conn = memory_db();
         // Do NOT seed NONEXISTENT-ID.
         let input = minimal_input("NEW-002");
-        let err = add_with_conn(&conn, input, None, &["NONEXISTENT-ID".to_string()]).unwrap_err();
+        let err = add_with_conn(
+            &conn,
+            input,
+            None,
+            &["NONEXISTENT-ID".to_string()],
+            Path::new("."),
+            Path::new("."),
+        )
+        .unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("NONEXISTENT-ID"),
@@ -1393,6 +1474,8 @@ mod tests {
             input,
             None,
             &["TARGET-A".to_string(), "TARGET-B".to_string()],
+            Path::new("."),
+            Path::new("."),
         )
         .unwrap();
 
@@ -1657,7 +1740,7 @@ mod tests {
 
         let mut input = minimal_input("FIX-001");
         input.depends_on = vec!["OTHER-1".to_string()];
-        let res = add_with_conn(&conn, input, None, &[]).unwrap();
+        let res = add_with_conn(&conn, input, None, &[], Path::new("."), Path::new(".")).unwrap();
 
         assert_eq!(res.task_id, "A-FIX-001", "task ID must be auto-prefixed");
 
@@ -1705,8 +1788,14 @@ mod tests {
     fn cross_prd_check_no_active_ctx_with_prefixed_target_refuses() {
         let conn = memory_db();
         // Active context is None → any prefixed target refuses.
-        let err = reject_cross_prd_depended_on_by(&conn, &["X-MILESTONE-FINAL".to_string()], None)
-            .unwrap_err();
+        let err = reject_cross_prd_depended_on_by(
+            &conn,
+            &["X-MILESTONE-FINAL".to_string()],
+            None,
+            Path::new("."),
+            Path::new("."),
+        )
+        .unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("no active PRD"), "{msg}");
         assert!(msg.contains("TASK_MGR_ACTIVE_PREFIX"), "{msg}");
@@ -1717,15 +1806,28 @@ mod tests {
     fn cross_prd_check_no_active_ctx_bare_target_ok() {
         let conn = memory_db();
         // Bare id (no recognizable prefix) is fine even without an active context.
-        reject_cross_prd_depended_on_by(&conn, &["MILESTONE-1".to_string()], None).unwrap();
+        reject_cross_prd_depended_on_by(
+            &conn,
+            &["MILESTONE-1".to_string()],
+            None,
+            Path::new("."),
+            Path::new("."),
+        )
+        .unwrap();
     }
 
     #[test]
     fn cross_prd_check_same_prefix_passes() {
         let conn = memory_db();
         let ctx = fake_ctx("alpha", "");
-        reject_cross_prd_depended_on_by(&conn, &["alpha-MILESTONE-FINAL".to_string()], Some(&ctx))
-            .unwrap();
+        reject_cross_prd_depended_on_by(
+            &conn,
+            &["alpha-MILESTONE-FINAL".to_string()],
+            Some(&ctx),
+            Path::new("."),
+            Path::new("."),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1744,6 +1846,8 @@ mod tests {
             &conn,
             &["5ba153a7-MILESTONE-FINAL".to_string()],
             Some(&ctx),
+            Path::new("."),
+            Path::new("."),
         )
         .unwrap_err();
         let msg = format!("{err}");
@@ -1773,9 +1877,14 @@ mod tests {
         // 'unknown' is NOT registered.
         let ctx = fake_ctx("alpha", "");
 
-        let err =
-            reject_cross_prd_depended_on_by(&conn, &["unknown-FEAT-001".to_string()], Some(&ctx))
-                .unwrap_err();
+        let err = reject_cross_prd_depended_on_by(
+            &conn,
+            &["unknown-FEAT-001".to_string()],
+            Some(&ctx),
+            Path::new("."),
+            Path::new("."),
+        )
+        .unwrap_err();
         let msg = format!("{err}");
 
         assert!(msg.contains("Refusing:"), "{msg}");
@@ -1794,8 +1903,9 @@ mod tests {
     fn cross_prd_check_empty_depended_on_by_ok() {
         let conn = memory_db();
         let ctx = fake_ctx("alpha", "");
-        reject_cross_prd_depended_on_by(&conn, &[], Some(&ctx)).unwrap();
-        reject_cross_prd_depended_on_by(&conn, &[], None).unwrap();
+        reject_cross_prd_depended_on_by(&conn, &[], Some(&ctx), Path::new("."), Path::new("."))
+            .unwrap();
+        reject_cross_prd_depended_on_by(&conn, &[], None, Path::new("."), Path::new(".")).unwrap();
     }
 
     #[test]
@@ -1830,6 +1940,8 @@ mod tests {
             input,
             None,
             &["5ba153a7-MILESTONE-FINAL".to_string()],
+            Path::new("."),
+            Path::new("."),
         )
         .unwrap_err();
         let msg = format!("{err}");
@@ -1866,8 +1978,15 @@ mod tests {
         seed_task(&conn, "alpha-NEW-001");
 
         let input = minimal_input("NEW-001");
-        let err =
-            add_with_conn(&conn, input, None, &["beta-MILESTONE-FINAL".to_string()]).unwrap_err();
+        let err = add_with_conn(
+            &conn,
+            input,
+            None,
+            &["beta-MILESTONE-FINAL".to_string()],
+            Path::new("."),
+            Path::new("."),
+        )
+        .unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("Refusing:"),
@@ -1895,6 +2014,8 @@ mod tests {
             input,
             None,
             &["5ba153a7-MILESTONE-FINAL".to_string()],
+            Path::new("."),
+            Path::new("."),
         );
         assert!(
             res.is_ok(),
