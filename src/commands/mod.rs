@@ -26,6 +26,7 @@ pub mod add;
 pub mod apply_learning;
 pub mod cheatsheet;
 pub mod complete;
+pub mod context;
 pub mod curate;
 pub mod current;
 pub mod decisions;
@@ -47,6 +48,7 @@ pub mod list;
 pub mod migrate;
 pub mod models;
 pub mod next;
+pub mod prd_json;
 pub mod recall;
 pub mod reset;
 pub mod review;
@@ -57,10 +59,7 @@ pub mod stats;
 pub mod unblock;
 pub mod worktrees;
 
-pub use add::{
-    AddResult, AddTaskInput, PrioritySource, ResolutionSource, ResolvedContext, add,
-    format_text as format_add_text, resolve_context,
-};
+pub use add::{AddResult, AddTaskInput, PrioritySource, add, format_text as format_add_text};
 pub use apply_learning::{
     ApplyLearningResult, apply_learning, format_text as format_apply_learning_text,
 };
@@ -68,6 +67,7 @@ pub use cheatsheet::{CheatsheetResult, cheatsheet, format_text as format_cheatsh
 pub use complete::{
     CompleteResult, TaskCompletionResult, complete, format_text as format_complete_text,
 };
+pub use context::{ResolutionSource, ResolvedContext, resolve_context};
 pub use current::{CurrentResult, current, format_text as format_current_text};
 pub use decisions::{
     DecisionDeclineResult, DecisionResolveResult, DecisionRevertResult, DecisionSummary,

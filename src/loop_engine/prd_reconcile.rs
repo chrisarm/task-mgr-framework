@@ -1,15 +1,14 @@
 //! PRD metadata and pass reconciliation: read PRD state from DB, update JSON files,
 //! and synchronise task completion status between the PRD JSON and the task database.
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::Path;
 
 use rusqlite::Connection;
 
 use crate::TaskMgrResult;
 use crate::commands::complete as complete_cmd;
 use crate::commands::dependency_checker;
+use crate::commands::prd_json::unique_tmp_path;
 use crate::db::prefix::prefix_and;
 use crate::lifecycle::{ReconcileItem, ReconcilePlan, TaskLifecycle};
 use crate::loop_engine::claude;
@@ -18,29 +17,6 @@ use crate::loop_engine::model::SONNET_MODEL;
 use crate::loop_engine::output_parsing::strip_task_prefix;
 use crate::models::TaskStatus;
 use crate::output::ui;
-
-/// Build a per-writer tmp path next to `prd_path` for atomic rename.
-///
-/// The name embeds pid + a process-local counter + wall-clock nanos so two
-/// concurrent writers (e.g. `<task-status>` dispatcher vs.
-/// `mutate_prd_from_feedback`) don't race on a shared `.json.tmp` name and
-/// silently clobber each other's pending write. Any leftover tmp file after
-/// a crash is still obvious (`.<basename>.<pid>-<n>-<nanos>.tmp`).
-fn unique_tmp_path(prd_path: &Path) -> PathBuf {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let pid = std::process::id();
-    let parent = prd_path.parent().unwrap_or_else(|| Path::new("."));
-    let base = prd_path
-        .file_name()
-        .map(|f| f.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "prd.json".to_string());
-    parent.join(format!(".{base}.{pid}-{n}-{nanos}.tmp"))
-}
 
 /// PRD metadata read from the database.
 pub(crate) struct PrdMetadata {
@@ -1316,6 +1292,7 @@ mod tests {
 
     #[test]
     fn test_unique_tmp_path_distinct_per_call() {
+        // Shared helper lives in commands::prd_json (same AtomicU64).
         let prd = Path::new("/tmp/tasks/prd.json");
         let a = unique_tmp_path(prd);
         let b = unique_tmp_path(prd);

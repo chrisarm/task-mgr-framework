@@ -642,41 +642,37 @@ pub(crate) fn initialize_loop(
         run_config.source_root.clone()
     };
 
-    // Step 8.4: Ensure task files exist in the worktree.
-    // If using a worktree, copy PRD JSON, prompt, and PRD markdown from source_root
-    // if they don't already exist in the worktree.
-    if working_root != run_config.source_root {
+    // Steps 8.4–8.5: worktree bootstrap + live PRD path.
+    // One canonicalize(source_root); all dest path math via `git::remap_into_worktree`
+    // (no inline strip_prefix remap). exists()/copy and the re-import exists() gate
+    // below are worktree policy — not CLI `choose_cli_write_path` (pin 15).
+    let live_prd_file = if working_root != run_config.source_root {
         let canonical_source = run_config
             .source_root
             .canonicalize()
             .unwrap_or_else(|_| run_config.source_root.clone());
 
-        // Same SSoT as Step 8.5: canonicalize then remap_into_worktree; exists()/copy stay here.
+        // Step 8.4: copy PRD JSON / prompt / PRD markdown into the worktree when missing.
         let copy_if_missing = |src: &Path| {
             let dest = crate::git::remap_into_worktree(src, &canonical_source, &working_root);
-            // Strip miss returns `src` unchanged — nothing to stage into the worktree.
-            if dest.as_path() == src || dest.exists() || !src.exists() {
+            // Strip miss returns resolved unchanged — only copy when remapped into wt.
+            let Ok(rel) = dest.strip_prefix(&working_root) else {
                 return;
-            }
-            if let Some(parent) = dest.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            // Log display only — remapper owns source_root strip+join.
-            let rel = dest.strip_prefix(&working_root).unwrap_or(dest.as_path());
-            if let Err(e) = std::fs::copy(src, &dest) {
-                tracing::warn!("failed to copy {} to worktree: {}", rel.display(), e);
-            } else {
-                ui::emit(&format!("Copied {} to worktree", rel.display()));
+            };
+            if !dest.exists() && src.exists() {
+                if let Some(parent) = dest.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if let Err(e) = std::fs::copy(src, &dest) {
+                    tracing::warn!("failed to copy {} to worktree: {}", rel.display(), e);
+                } else {
+                    ui::emit(&format!("Copied {} to worktree", rel.display()));
+                }
             }
         };
 
-        // PRD JSON (task list)
         copy_if_missing(&paths.prd_file);
-
-        // Prompt file
         copy_if_missing(&paths.prompt_file);
-
-        // PRD markdown (from prdFile field in JSON, if present)
         if let Ok(content) = std::fs::read_to_string(&paths.prd_file)
             && let Ok(json) = serde_json::from_str::<serde_json::Value>(&content)
             && let Some(prd_md) = json.get("prdFile").and_then(|v| v.as_str())
@@ -688,18 +684,18 @@ pub(crate) fn initialize_loop(
                 .join(prd_md);
             copy_if_missing(&prd_md_path);
         }
-    }
 
-    // Step 8.5: Compute live PRD path (worktree copy if using worktrees, else source_root)
-    // Claude edits the worktree copy, so hash checks and re-imports must use that path.
-    // paths.prd_file is canonicalized by resolve_paths(); canonicalize source_root
-    // before remap_into_worktree so symlink-safe strip happens inside the SSoT helper.
-    let live_prd_file = if working_root != run_config.source_root {
-        let canonical_source = run_config
-            .source_root
-            .canonicalize()
-            .unwrap_or_else(|_| run_config.source_root.clone());
-        crate::git::remap_into_worktree(&paths.prd_file, &canonical_source, &working_root)
+        // Step 8.5: unconditional live PRD remap (path math only).
+        let remapped =
+            crate::git::remap_into_worktree(&paths.prd_file, &canonical_source, &working_root);
+        if remapped == paths.prd_file {
+            tracing::warn!(
+                "could not remap PRD to worktree (prd={}, source={})",
+                paths.prd_file.display(),
+                canonical_source.display()
+            );
+        }
+        remapped
     } else {
         paths.prd_file.clone()
     };

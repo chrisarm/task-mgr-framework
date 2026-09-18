@@ -20,6 +20,9 @@
 //! separate predicate — do not fold it into [`paths_identify`]. DB scan lives
 //! in [`crate::commands::init::import::find_registered_task_lists`] (no
 //! rusqlite in this module). See progress log `## CONTRACT-001`.
+//!
+//! [`worktree_root_at`] / [`worktree_root`] return the *current* worktree
+//! toplevel (`git rev-parse --show-toplevel`), not [`main_repo_root_at`].
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -96,6 +99,47 @@ pub fn is_inside_worktree() -> bool {
         return false;
     };
     is_inside_worktree_at(&cwd).unwrap_or(false)
+}
+
+/// Return the canonical filesystem path of the *current* worktree's toplevel
+/// for the git checkout containing `dir`, or `None` if `dir` is not inside a
+/// git repo (or `git` is missing / errors out).
+///
+/// Uses `git rev-parse --show-toplevel` — the linked worktree's working tree,
+/// not the main checkout. Do **not** confuse with [`main_repo_root_at`], which
+/// walks `--git-common-dir` and always lands on the main worktree.
+///
+/// Both inputs and outputs are canonicalized so callers can rely on path
+/// equality even when one side reaches the repo via a symlink.
+pub fn worktree_root_at(dir: &Path) -> Option<PathBuf> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--path-format=absolute", "--show-toplevel"])
+        .current_dir(dir)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let toplevel = String::from_utf8(output.stdout).ok()?;
+    let toplevel = toplevel.trim();
+    if toplevel.is_empty() {
+        return None;
+    }
+
+    let path = PathBuf::from(toplevel);
+    if !path.is_dir() {
+        return None;
+    }
+
+    std::fs::canonicalize(&path).ok()
+}
+
+/// Return the current worktree toplevel for the current working directory.
+pub fn worktree_root() -> Option<PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    worktree_root_at(&cwd)
 }
 
 /// Remap a registered PRD path from `source_root` into `worktree_root`.
@@ -247,6 +291,46 @@ mod tests {
         assert!(status.success());
 
         assert!(is_inside_worktree_at(&wt_path).unwrap());
+    }
+
+    #[test]
+    fn worktree_root_at_returns_none_outside_git() {
+        let tmp = TempDir::new().unwrap();
+        assert!(worktree_root_at(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn worktree_root_at_main_repo_returns_repo_path() {
+        let tmp = init_git_repo();
+        let got = worktree_root_at(tmp.path()).expect("Some");
+        assert_eq!(got, std::fs::canonicalize(tmp.path()).unwrap());
+    }
+
+    #[test]
+    fn worktree_root_at_linked_worktree_returns_worktree_not_main() {
+        let tmp = init_git_repo();
+        let wt_parent = TempDir::new().unwrap();
+        let wt_path = wt_parent.path().join("wt");
+        let status = PCmd::new("git")
+            .args([
+                "worktree",
+                "add",
+                "-b",
+                "feat/toplevel",
+                wt_path.to_str().unwrap(),
+            ])
+            .current_dir(tmp.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let got = worktree_root_at(&wt_path).expect("Some");
+        assert_eq!(got, std::fs::canonicalize(&wt_path).unwrap());
+        // Contrast: main_repo_root_at still points at the main checkout.
+        assert_eq!(
+            main_repo_root_at(&wt_path).expect("Some"),
+            std::fs::canonicalize(tmp.path()).unwrap()
+        );
     }
 
     #[test]

@@ -54,7 +54,7 @@ pub const CURATED_RECIPES: &str = "## Common Recipes\n\
 - Look up one task: `task-mgr show <task-id>`\n\
 - List tasks: `task-mgr list` (filter with `--status` / `--prefix` / `--task-type`)\n\
 - Pick and claim the next eligible task: `task-mgr next --claim`\n\
-- Add a fixup / follow-up task: pipe JSON to `task-mgr add --stdin --depended-on-by <id>`\n\
+- Add a fixup / follow-up task: pipe JSON to `task-mgr add --stdin --from-json tasks/<prd>.json --depended-on-by <id>`\n\
 - Mark status from a loop iteration: emit `<task-status>TASK-ID:done</task-status>` (done / failed / skipped / irrelevant / blocked)\n\
 - Mark status outside the loop: `task-mgr complete <id>` (also: `task-mgr fail`, `task-mgr skip`, `task-mgr unblock`, `task-mgr unskip`, `task-mgr reset`)\n\
 - Record a learning: `task-mgr learn --outcome <success|failure|workaround|pattern> --title \"...\"`\n\
@@ -173,21 +173,28 @@ mod tests {
 
     #[test]
     fn cheatsheet_does_not_contain_known_wrong_strings() {
-        // Negative anchors per FEAT-002 acceptance: these substrings
-        // were clap-verified WRONG on 2026-05-18 and must never appear
-        // in the cheatsheet stdout.
+        // Negative anchors: these substrings must never appear in the
+        // cheatsheet stdout. `add --from-json` was removed from this
+        // list in FEAT-008 once clap accepted the pin flag.
         let content = cheatsheet().content;
-        for anchor in [
-            "set-status",
-            "add --from-json",
-            "recall --top-k",
-            "learnings show ",
-        ] {
+        for anchor in ["set-status", "recall --top-k", "learnings show "] {
             assert!(
                 !content.contains(anchor),
                 "cheatsheet contains forbidden anchor {anchor:?}"
             );
         }
+    }
+
+    #[test]
+    fn curated_recipes_include_add_from_json_pin() {
+        assert!(
+            CURATED_RECIPES.contains("task-mgr add --stdin --from-json"),
+            "CURATED_RECIPES must document add --from-json pin"
+        );
+        assert!(
+            CURATED_RECIPES.contains("--depended-on-by"),
+            "CURATED_RECIPES must keep --stdin --depended-on-by on add"
+        );
     }
 
     #[test]

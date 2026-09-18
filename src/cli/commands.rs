@@ -646,6 +646,10 @@ EXAMPLES:
     echo '{\"id\":\"CODE-FIX-001\",\"title\":\"Fix race\",\"difficulty\":\"medium\",\"touchesFiles\":[\"src/foo.rs\"]}' \\
       | task-mgr add --stdin
 
+    # Pin an already-registered effort (not an import — distinct from init --from-json)
+    echo '{\"id\":\"CODE-FIX-001\",\"title\":\"Fix race\"}' \\
+      | task-mgr add --stdin --from-json tasks/my-prd.json
+
     # Add from an inline string
     task-mgr add --json '{\"id\":\"REFACTOR-001\",\"title\":\"Split module\"}'
 
@@ -656,6 +660,11 @@ PRIORITY:
     When --priority is absent and the JSON omits \"priority\", the command
     runs the same scoring as `task-mgr next`, reads the top task's priority,
     and assigns (top.priority - 1). Empty queue → 0.
+
+--from-json (pin, not import):
+    Pins writes to an already-registered task_list. Does NOT register a new
+    PRD — run `task-mgr loop init <prd>.json` first. Distinct from
+    `task-mgr init --from-json` (the deprecated import shim).
 ")]
     Add {
         /// Inline JSON string (mutually exclusive with --stdin)
@@ -676,6 +685,15 @@ PRIORITY:
         /// array in the PRD JSON. Repeat the flag for multiple targets.
         #[arg(long = "depended-on-by")]
         depended_on_by: Vec<String>,
+
+        /// Pin this already-registered effort (not an import).
+        ///
+        /// Writes go to PATH. The file must already be a registered `task_list`
+        /// (or its JSON `taskPrefix` must be in `prd_metadata`). Unregistered /
+        /// missing / directory paths are refused. Distinct from
+        /// `init --from-json` / `loop init`, which register a new PRD.
+        #[arg(long = "from-json", value_name = "PATH")]
+        from_json: Option<PathBuf>,
     },
 
     /// Reset task(s) to todo status for re-running
@@ -1236,11 +1254,15 @@ GENERATED MAN PAGES:
 
     /// Show the currently resolved active PRD context (prefix, source, target path)
     ///
-    /// Exits 0 in all cases — "no active PRD" is a probe result, not an error.
+    /// Exit 0 for the no-flag probe (including "no active PRD" / ≥2 prefixes).
+    /// Non-zero when `--from-json` is unregistered, missing, or a directory.
     #[command(after_help = "\
 EXAMPLES:
     # Show the active PRD context
     task-mgr current
+
+    # Pin an already-registered effort (not an import — distinct from init --from-json)
+    task-mgr current --from-json tasks/my-prd.json
 
     # Machine-readable (JSON)
     task-mgr --format json current | jq '.context.prefix'
@@ -1251,10 +1273,28 @@ OUTPUT:
     source is one of: env (TASK_MGR_ACTIVE_PREFIX), single-prefix (auto),
     from-json (--from-json flag), or none (ambiguous / empty DB).
 
+    target= is the CLI write path add would use (remap, then existence policy).
+    When neither remapped nor registered path is a regular file: target=(none).
+
     When no PRD can be resolved, prints:
     no active PRD; pass --from-json or set TASK_MGR_ACTIVE_PREFIX
+
+--from-json (pin, not import):
+    Pins the probe to an already-registered task_list. Does NOT register a new
+    PRD — run `task-mgr loop init <prd>.json` first. Distinct from
+    `task-mgr init --from-json` (the deprecated import shim).
 ")]
-    Current,
+    Current {
+        /// Pin this already-registered effort (not an import).
+        ///
+        /// Reports PATH as the write target. The file must already be a
+        /// registered `task_list` (or its JSON `taskPrefix` must be in
+        /// `prd_metadata`). Unregistered / missing / directory paths are
+        /// refused. Distinct from `init --from-json` / `loop init`, which
+        /// register a new PRD.
+        #[arg(long = "from-json", value_name = "PATH")]
+        from_json: Option<PathBuf>,
+    },
 
     /// Manage the task-mgr-fenced block in CLAUDE.md / AGENTS.md
     #[command(after_help = "\

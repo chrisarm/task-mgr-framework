@@ -3925,3 +3925,141 @@ fn test_loop_flat_use_other_models_ttl_threads_through_resolve() {
         other => panic!("flat resolve must thread Some(0); got {other:?}"),
     }
 }
+
+// =============================================================================
+// Add --from-json pin (FEAT-004) — clap parse only; pin semantics are in
+// commands::context / add_integration.
+// =============================================================================
+
+#[test]
+fn test_add_from_json_parses_path() {
+    let cli = Cli::parse_from([
+        "task-mgr",
+        "add",
+        "--stdin",
+        "--from-json",
+        "tasks/my-prd.json",
+    ]);
+    match cli.command {
+        Commands::Add {
+            stdin,
+            from_json,
+            json,
+            ..
+        } => {
+            assert!(stdin);
+            assert!(json.is_none());
+            assert_eq!(from_json, Some(PathBuf::from("tasks/my-prd.json")));
+        }
+        other => panic!("expected Add, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_add_from_json_optional_defaults_none() {
+    let cli = Cli::parse_from(["task-mgr", "add", "--json", r#"{"id":"X","title":"t"}"#]);
+    match cli.command {
+        Commands::Add { from_json, .. } => {
+            assert!(from_json.is_none(), "omitted --from-json must be None");
+        }
+        other => panic!("expected Add, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_add_from_json_help_says_pin_not_import() {
+    let mut cmd = Cli::command();
+    let add = cmd.find_subcommand_mut("add").expect("add subcommand");
+    let help = add.render_long_help().to_string();
+    assert!(
+        help.to_lowercase().contains("pin") || help.contains("already-registered"),
+        "add --from-json help must say pin / already-registered, got:\n{help}"
+    );
+    // Must not describe add's flag as an import (init owns import).
+    let from_json_help = add
+        .get_arguments()
+        .find(|a| a.get_long() == Some("from-json"))
+        .map(|a| {
+            format!(
+                "{} {}",
+                a.get_help().map(|h| h.to_string()).unwrap_or_default(),
+                a.get_long_help().map(|h| h.to_string()).unwrap_or_default()
+            )
+        })
+        .unwrap_or_default();
+    assert!(
+        from_json_help.to_lowercase().contains("pin")
+            || from_json_help.contains("already-registered"),
+        "--from-json arg help must say pin: {from_json_help}"
+    );
+    assert!(
+        !from_json_help.to_lowercase().contains("import a prd")
+            && !from_json_help.to_lowercase().contains("import the"),
+        "--from-json on add must not read as import: {from_json_help}"
+    );
+}
+
+// =============================================================================
+// Current --from-json pin (FEAT-005) — clap parse only; pin semantics are in
+// commands::current / worktree_db_resolution.
+// =============================================================================
+
+#[test]
+fn test_current_from_json_parses_path() {
+    let cli = Cli::parse_from(["task-mgr", "current", "--from-json", "tasks/my-prd.json"]);
+    match cli.command {
+        Commands::Current { from_json } => {
+            assert_eq!(from_json, Some(PathBuf::from("tasks/my-prd.json")));
+        }
+        other => panic!("expected Current, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_current_from_json_optional_defaults_none() {
+    let cli = Cli::parse_from(["task-mgr", "current"]);
+    match cli.command {
+        Commands::Current { from_json } => {
+            assert!(from_json.is_none(), "omitted --from-json must be None");
+        }
+        other => panic!("expected Current, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_current_from_json_help_says_pin_not_import() {
+    let mut cmd = Cli::command();
+    let current = cmd
+        .find_subcommand_mut("current")
+        .expect("current subcommand");
+    let help = current.render_long_help().to_string();
+    assert!(
+        help.to_lowercase().contains("pin") || help.contains("already-registered"),
+        "current --from-json help must say pin / already-registered, got:\n{help}"
+    );
+    assert!(
+        !help.contains("Exits 0 in all cases"),
+        "rustdoc/after_help must not claim exit 0 in all cases:\n{help}"
+    );
+    let from_json_help = current
+        .get_arguments()
+        .find(|a| a.get_long() == Some("from-json"))
+        .map(|a| {
+            format!(
+                "{} {}",
+                a.get_help().map(|h| h.to_string()).unwrap_or_default(),
+                a.get_long_help().map(|h| h.to_string()).unwrap_or_default()
+            )
+        })
+        .unwrap_or_default();
+    assert!(
+        from_json_help.to_lowercase().contains("pin")
+            || from_json_help.contains("already-registered"),
+        "--from-json arg help must say pin: {from_json_help}"
+    );
+    assert!(
+        !from_json_help.to_lowercase().contains("import a prd")
+            && !from_json_help.to_lowercase().contains("import the"),
+        "--from-json on current must not read as import: {from_json_help}"
+    );
+}

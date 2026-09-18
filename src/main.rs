@@ -74,7 +74,7 @@ fn resolve_active_prefix_for_logging(db_dir: &Path) -> Option<String> {
         return None;
     }
     let conn = open_connection(db_dir).ok()?;
-    task_mgr::commands::add::resolve_context(&conn)
+    task_mgr::commands::add::resolve_context(&conn, None, "logging")
         .ok()
         .flatten()
         .map(|ctx| ctx.prefix)
@@ -829,6 +829,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
             stdin,
             priority,
             depended_on_by,
+            from_json,
         } => {
             let input_json = if let Some(j) = json {
                 j
@@ -847,7 +848,13 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                     "neither provided",
                 ));
             };
-            let result = add(&cli.dir, &input_json, priority, &depended_on_by)?;
+            let result = add(
+                &cli.dir,
+                &input_json,
+                priority,
+                &depended_on_by,
+                from_json.as_deref(),
+            )?;
             output_result(&result, cli.format);
             Ok(())
         }
@@ -904,8 +911,8 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
             Ok(())
         }
 
-        Commands::Current => {
-            let result = current(&cli.dir)?;
+        Commands::Current { from_json } => {
+            let result = current(&cli.dir, from_json.as_deref())?;
             output_result(&result, cli.format);
             Ok(())
         }

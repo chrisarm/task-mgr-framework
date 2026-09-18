@@ -114,7 +114,7 @@
       ],
       "modifiesBehavior": false,
       "notes": "Architecture seed (do not re-expand): resolved = absolute registered else source_root.join(registered); if let Ok(rel) = resolved.strip_prefix(source_root) { worktree_root.join(rel) } else { resolved }. Learning [4441]/[4237]/[3240]: add from worktree wrote main or failed to open a bare filename. Learning [2303]/[2798]: loop re-imports the worktree copy. Match (a) can pin a stray same-prefix copy and write that PATH (pin 4) — documented residual, not a bug to 'fix'.",
-      "passes": false,
+      "passes": true,
       "priority": 0,
       "qualityDimensions": [
         "Remap is path math only — no fs probe, no dest canonicalize",
@@ -163,7 +163,7 @@
       ],
       "modifiesBehavior": false,
       "notes": "FromJsonFlag is no longer reserved. Help text must say pin, not import. init --from-json stays the deprecated import shim. Learning [2236]/[2281]: omitted --from-json leaks WIRE-FIX/CODE-FIX into the wrong JSON. Learning [4234]: reuse one prefix resolver. Learning [2903]/[4876]: TASK_MGR_ACTIVE_PREFIX leaks into tests — EnvIsolation required.",
-      "passes": false,
+      "passes": true,
       "priority": 1,
       "qualityDimensions": [
         "Pin protocol is one function; command name is a parameter",
@@ -213,7 +213,7 @@
       ],
       "modifiesBehavior": false,
       "notes": "Sharing unique_tmp_path by moving it into prd_json.rs is in scope (loop_engine already depends on commands). Learning [1562] old name; [2667] same-directory rename; [4564] cross-filesystem rename requires same dir; [3440]/[1561] JSON sync is best-effort after DB commit — not this contract's writer, but callers must not roll back on append Err.",
-      "passes": false,
+      "passes": true,
       "priority": 2,
       "qualityDimensions": [
         "One JSON write chokepoint: unique tmp + rename",
@@ -263,7 +263,7 @@
       ],
       "modifiesBehavior": false,
       "notes": "Implement against ## CONTRACT-001 in the progress log. Canonicalize the `--show-toplevel` result like `main_repo_root_at` does for `--git-common-dir`'s parent — but do not copy that git-common-dir invocation. Switching main.rs::get_project_root onto git::worktree_root is optional, not this story. Learning [4441]/[3240]: path math from a worktree cwd is not 'the worktree JSON' today. Do not change db::path::resolve_db_dir.",
-      "passes": false,
+      "passes": true,
       "priority": 3,
       "qualityDimensions": [
         "Helper is path math only — no exists(), no dest canonicalize",
@@ -351,7 +351,7 @@
       ],
       "modifiesBehavior": true,
       "notes": "Implement against ## CONTRACT-002. Pin-19 identity (b)+(c) here is a stub/function matching CONTRACT-001; full `--from-json` registration matching is FEAT-004 — do not collapse that split. context must not import prd_json write helpers. Do not implement add's ≥2 refuse here (FEAT-006). Do not change locate_prd_json LIMIT 1 in this task — FEAT-004b drops it. After this move, later FEATs must grep `locate_prd_json` / `apply_prefix` rather than trusting authoring line numbers in add.rs. Learning [4234]: one resolver. Learning [2903]/[4883]: EnvIsolation + mutex for TASK_MGR_ACTIVE_PREFIX tests; field drop order in add.rs EnvIsolation is load-bearing. Data contract: prd_files.file_path TEXT → PathBuf (relative or absolute).",
-      "passes": false,
+      "passes": true,
       "priority": 4,
       "qualityDimensions": [
         "invalid_state command-name is a parameter, not hardcoded add",
@@ -435,7 +435,7 @@
       ],
       "modifiesBehavior": true,
       "notes": "Implement against ## CONTRACT-003. Depends on FEAT-002 because both touch add.rs (serialize). Do not merge update_prd_task_passes into this writer. Grep `append_task_to_prd_json` / `atomic_write` — do not trust frozen add.rs line numbers from authoring. Learning [1562] old tmp name; [2667] same-directory rename; [2310] do not use static /tmp paths in tests. Data contract: root_obj[\"userStories\"].as_array_mut(); push to_value(new_story); do not map existing entries through PrdUserStory.",
-      "passes": false,
+      "passes": true,
       "priority": 5,
       "qualityDimensions": [
         "One JSON write chokepoint: unique tmp pid-counter-nanos + rename",
@@ -535,7 +535,7 @@
       ],
       "modifiesBehavior": true,
       "notes": "Implement against ## CONTRACT-001 and ## CONTRACT-002. --from-json PATH → ctx.prd_json_path is canonical PATH (never remapped away) — store that in this task even if default remap+exists lands in FEAT-004b. Architect tightening: empty ctx.prefix skips apply_prefix AND prefix_id on --depended-on-by. Grep `apply_prefix` / `prefix_id` / `resolve_context` — do not trust frozen add.rs line numbers from authoring (they move after FEAT-002). No skill drive on this task (rust tests only; FEAT-009 + REVIEW-001 own the sandbox). Learning [2236]: omitted flag leaks fixups. Learning [3126]: pre-flight before write txn. Learning [1252]: userStories key. Data contract: let canon = fs::canonicalize(path)?; registered if (a) prefixes.contains(json taskPrefix) OR pin-19 (b)/(c). Read taskPrefix off serde_json::Value; do not deserialize stories. Directory check is metadata.file_type().is_file() before canonicalize-as-parse.",
-      "passes": false,
+      "passes": true,
       "priority": 6,
       "qualityDimensions": [
         "--from-json means pin an already-registered effort; help says pin, not import",
@@ -617,7 +617,7 @@
       ],
       "modifiesBehavior": true,
       "notes": "This is the #4237 fix. Live linked-worktree matrix (main bytes unchanged vs only-main-exists) is FEAT-005 rust tests — this task can use temp dirs / unit fixtures; do not require git worktree add here. Not a verify-task-mgr drive (sandboxes are not worktrees). Grep `locate_prd_json` after the DB commit / `append_user_story` — do not trust frozen add.rs:345 from authoring. Learning [4237]: display remapped, write still locate. Learning [3440]/[1561]: DB first; append Err does not roll back (FEAT-007 copy). Data contract: let target = remap_into_worktree(...); if target.is_file() { target } else if resolved.is_file() { resolved } else { skip }. After commit: append_user_story(&ctx.prd_json_path, …) only.",
-      "passes": false,
+      "passes": true,
       "priority": 7,
       "qualityDimensions": [
         "After DB commit, append uses ctx.prd_json_path only — no second locate",
@@ -709,7 +709,7 @@
       ],
       "modifiesBehavior": true,
       "notes": "Reuse tests/worktree_db_resolution.rs helpers (init_repo, add_worktree, env_remove TASK_MGR_DIR and TASK_MGR_ACTIVE_PREFIX). Learning [2903]/[2434]: isolate TASK_MGR_ACTIVE_PREFIX in subprocess tests. Learning [5261]: TASK_MGR_DIR overrides. Do not change db::path anchoring. No skill drive on this task (rust tests only; FEAT-009 + REVIEW-001 own the sandbox). Live path is rust tests that spawn git worktree add. Grep `current(` / module rustdoc — do not trust frozen current.rs:22–23.",
-      "passes": false,
+      "passes": true,
       "priority": 8,
       "qualityDimensions": [
         "current target= is the write path (post-policy for default; canonical PATH for --from-json)",
@@ -808,7 +808,7 @@
       ],
       "modifiesBehavior": true,
       "notes": "Implement against ## CONTRACT-002. Split resolver vs write-policy tests: resolve_active_prefix / resolve_context 2+ → None still; add now errors. Keep the add-only predicate `ctx.is_none() && load_known_prefixes().len() >= 2` — not inside resolve_context. Grep `resolve_context` / `load_known_prefixes` at the add caller — do not trust frozen add.rs:238 from authoring. No skill drive on this task (rust tests only; FEAT-009 + REVIEW-001 own the sandbox). Learning [2236]: omitted --from-json leaked fixups into PRD #1 via LIMIT 1.",
-      "passes": false,
+      "passes": true,
       "priority": 9,
       "qualityDimensions": [
         "Refuse is add-only: ctx.is_none() && load_known_prefixes().len() >= 2",
@@ -853,7 +853,7 @@
       ],
       "modifiesBehavior": true,
       "notes": "Learning [3440]/[1561]: JSON sync is best-effort after DB commit. PR-3 will also require --force onto a registered file — do not implement export here; just stop telling agents to run it. ui::emit_err, not tracing. Grep `task-mgr export` / the JSON-sync warning — do not trust frozen add.rs line numbers from authoring.",
-      "passes": false,
+      "passes": true,
       "priority": 10,
       "qualityDimensions": [
         "Failure copy names task-mgr current and retry --from-json, never export",
@@ -896,7 +896,7 @@
       ],
       "modifiesBehavior": true,
       "notes": "CURATED_RECIPES is a const &str parsed by tests/cheatsheet_drift.rs against clap. Prefer `task-mgr add --from-json` in backticks. Keep entry count under 16. Do not add set-status.",
-      "passes": false,
+      "passes": true,
       "priority": 11,
       "qualityDimensions": [
         "Cheatsheet contains add --from-json; still forbids set-status, recall --top-k, learnings show",
@@ -950,7 +950,7 @@
       ],
       "modifiesBehavior": false,
       "notes": "Helper unsets TASK_MGR_ACTIVE_PREFIX — use --dir injection only. Seeded sample_prd.json has taskPrefix 3019e47c; SKILL.md's canned recipe is loop init --no-prefix. Two --no-prefix imports ⇒ load_known_prefixes().len()==0 ⇒ refuse never fires. ≥2-prefix refuse: two loop inits without --no-prefix, or two files with distinct taskPrefix — not two --no-prefix copies of sample_prd. Learning [5443]: isolating HOME breaks rustup — the helper must keep RUSTUP_HOME/CARGO_HOME; do not invent a second sandbox. Learning [1494]: launch builds this checkout's binary. Do not drive loop run. Follow `.claude/skills/verify-task-mgr/SKILL.md` feature `add-and-current-from-json`; do not invent a second harness.",
-      "passes": false,
+      "passes": true,
       "priority": 12,
       "qualityDimensions": [
         "User-facing proof is the skill drive + artifacts, not cargo test",
@@ -998,7 +998,7 @@
       "id": "CODE-REVIEW-1",
       "modifiesBehavior": false,
       "notes": "If no issues, emit status with a one-line 'No issues found' in the progress file. Spawn fixups with --depended-on-by REVIEW-001 and --from-json tasks/agent-task-ops-pr1.json so they do not leak into another PRD (learning #2236 — this PRD is the fix).",
-      "passes": false,
+      "passes": true,
       "priority": 13,
       "qualityDimensions": [
         "Wiring: new modules are called from production paths",
@@ -1044,7 +1044,7 @@
       "id": "REFACTOR-REVIEW-FINAL",
       "modifiesBehavior": false,
       "notes": "Optional in the lean skeleton; included because this PR extracts two modules and a git helper that PR-2/PR-3 will depend on. Do not bundle drive-by cleanup unrelated to the extracts.",
-      "passes": false,
+      "passes": true,
       "priority": 70,
       "qualityDimensions": [
         "Extracts are the only copies of remap math, pin protocol, and unique tmp",
@@ -1085,14 +1085,17 @@
         "FEAT-008",
         "FEAT-009",
         "CODE-REVIEW-1",
-        "REFACTOR-REVIEW-FINAL"
+        "REFACTOR-REVIEW-FINAL",
+        "CODE-FIX-001",
+        "CODE-FIX-002",
+        "CODE-FIX-003"
       ],
       "description": "PR-1 milestone. Full unscoped quality gate on a clean checkout. Re-drive verify-task-mgr feature add-and-current-from-json. Leave the trunk green including pre-existing failures. Confirm pins 5–10 / 17–18 were not implemented.",
       "estimatedEffort": "high",
       "id": "REVIEW-001",
       "modifiesBehavior": false,
       "notes": "REVIEW-001 is the milestone. Follow `.claude/skills/verify-task-mgr/SKILL.md` feature `add-and-current-from-json`. ≥2-prefix refuse in the sandbox: two loop inits without --no-prefix (or two files with distinct taskPrefix) — do not use two --no-prefix copies of sample_prd. Worktree live-path is FEAT-005 rust tests, not this skill. Do not invent a second harness. Below ~12 unrelated failures, fix them; above that, spawn one FIX/CLARIFY and BLOCKED.",
-      "passes": false,
+      "passes": true,
       "priority": 99,
       "qualityDimensions": [
         "Trunk green including pre-existing failures",
@@ -1110,6 +1113,61 @@
         "src/commands/add.rs",
         "src/commands/current.rs",
         ".claude/skills/verify-task-mgr/features/add-and-current-from-json.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "current.rs EnvIsolation locks crate::ENV_PREFIX_MUTEX (no private ENV_MUTEX)",
+        "Drop order restores env before releasing the shared lock (learning #4883)",
+        "cargo test -p task-mgr --lib commands::current:: commands::add:: commands::context:: is green at default parallelism with and without TASK_MGR_ACTIVE_PREFIX in the parent env",
+        "No production behavior change"
+      ],
+      "description": "commands/current.rs EnvIsolation uses a private ENV_MUTEX while add.rs and context.rs serialize on crate::ENV_PREFIX_MUTEX. Parallel cargo test races on TASK_MGR_ACTIVE_PREFIX: stale/foreign env pins leak across modules (e.g. actual other-prefix / A / stale- while another test expected unset or a different pin). Fix: point current.rs at crate::ENV_PREFIX_MUTEX (same field-order Drop discipline as add/context: restore env before releasing the lock). Optionally collapse the three EnvIsolation copies onto one test helper. Acceptance: cargo test -p task-mgr --lib -- commands::current:: commands::add:: commands::context:: with default test-threads is green under TASK_MGR_ACTIVE_PREFIX set and unset; no private ENV_MUTEX remains in current.rs.",
+      "estimatedEffort": "medium",
+      "id": "CODE-FIX-001",
+      "passes": true,
+      "priority": 12,
+      "title": "Unify TASK_MGR_ACTIVE_PREFIX test isolation on ENV_PREFIX_MUTEX",
+      "touchesFiles": [
+        "src/commands/current.rs",
+        "src/commands/add.rs",
+        "src/commands/context.rs",
+        "src/lib.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "NULL-prefix --from-json add of CODE-FIX-001 writes JSON id CODE-FIX-001 not FIX-001",
+        "DB id is unprefixed CODE-FIX-001",
+        "--depended-on-by CODE-REVIEW-1 on NULL-prefix pin does not refuse as foreign prefix CODE",
+        "Test uses 3-segment spawn-fixup ids, not only FEAT-001",
+        "Prefixed pin still strips to CODE-FIX-001 in JSON"
+      ],
+      "description": "From auto-review H1. When ctx.prefix is empty (NULL-prefix / --no-prefix pin), pass None into append_user_story — never input.task_prefix() from id shape. CODE-FIX-001 in DB must write CODE-FIX-001 in JSON, not FIX-001. reject_cross_prd_depended_on_by: only refuse 3-segment targets whose first segment is a known OTHER prd_metadata.task_prefix; empty active prefix is not a foreign-prefix match. Add a test: --from-json of a NULL-prefix file with {\"id\":\"CODE-FIX-001\"} and --depended-on-by CODE-REVIEW-1 inserts/strips nothing. Prefixed 8-hex pins stay unchanged. Decision: fix in this PR-1; not deferred to PR-2.",
+      "estimatedEffort": "medium",
+      "id": "CODE-FIX-002",
+      "passes": true,
+      "priority": 0,
+      "title": "NULL-prefix --from-json must not strip 3-segment ids",
+      "touchesFiles": [
+        "src/commands/add.rs",
+        "src/commands/prd_json.rs",
+        "src/commands/context.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Skip note does not claim prd_files unregistered when a row exists",
+        "Still never names task-mgr export"
+      ],
+      "description": "From auto-review M1. When a prd_files row exists but neither remapped nor registered path is a regular file, CLI skip is correct (no invent) but the note still says no PRD JSON registered in prd_files. Fix the reason string; keep recovery hint task-mgr current + retry --from-json; never name export.",
+      "estimatedEffort": "low",
+      "id": "CODE-FIX-003",
+      "passes": true,
+      "priority": -1,
+      "title": "Skip-note must not say unregistered when prd_files row exists",
+      "touchesFiles": [
+        "src/commands/add.rs"
       ]
     }
   ],

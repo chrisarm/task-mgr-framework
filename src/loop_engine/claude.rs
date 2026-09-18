@@ -33,7 +33,7 @@ pub(crate) const MAX_TOOL_USE_BYTES: usize = 500;
 pub(crate) const MAX_TOOL_RESULT_BYTES: usize = 1_000;
 
 /// Env var name written to the spawned subprocess to communicate the active PRD prefix.
-/// Consumed by `resolve_active_prefix` in `src/commands/add.rs` so that
+/// Consumed by `resolve_active_prefix` in `src/commands/context.rs` so that
 /// `task-mgr add --stdin` calls from inside a loop iteration auto-prefix IDs to the
 /// correct PRD without requiring `--from-json` or `--depended-on-by`.
 pub(crate) const ACTIVE_PREFIX_ENV: &str = "TASK_MGR_ACTIVE_PREFIX";
