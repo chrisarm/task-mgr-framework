@@ -27,11 +27,12 @@ use rusqlite::Connection;
 
 use crate::commands::doctor::setup_checks::pre_check_loop_setup;
 use crate::commands::doctor::setup_output::SetupSeverity;
-use crate::commands::init::{PrefixMode, generate_prefix};
+use crate::commands::init::{PrdFile, PrefixMode, resolve_sticky_prefix};
 use crate::commands::run as run_cmd;
 use crate::db::LockGuard;
 use crate::db::prefix::{prefix_and, validate_prefix};
 use crate::db::schema::key_decisions as key_decisions_db;
+use crate::error::TaskMgrError;
 use crate::lifecycle::TaskLifecycle;
 use crate::loop_engine::branch;
 use crate::loop_engine::config::{self, PermissionMode};
@@ -279,31 +280,53 @@ pub(crate) fn initialize_loop(
         });
     }
 
-    // Step 4.5: Acquire exclusive loop lock — prevents concurrent loops on same DB.
-    // Must be before any DB mutations (init, migrations, recovery).
-    // Separate from tasks.db.lock (short-lived per-command) so read-only commands
-    // like `status` and `stats` are not blocked.
-    //
-    // Read the PRD's taskPrefix BEFORE acquiring the lock so we can use a
-    // per-prefix lock file (loop-{prefix}.lock) that allows concurrent loops
-    // on different PRDs. Falls back to "loop.lock" when prefix is unknown.
-    // Read both hints in a single file parse.
+    // Step 4.5: Resolve sticky prefix under tasks.db.lock, then acquire
+    // loop-{resolved}.lock. Identity lookup needs the DB before the loop lock
+    // so the lock name matches the prefix init will actually run (learning [1486]).
+    // Separate from tasks.db.lock (short-lived) so read-only commands are not
+    // blocked for the duration of the run.
     let prd_hints = read_prd_hints(&run_config.prd_file);
     let pre_lock_branch = prd_hints.branch_name;
-    let pre_lock_prefix: Option<String> = match &run_config.prefix_mode {
-        // Explicit prefix (batch mode): use it directly, skip PRD hints.
-        PrefixMode::Explicit(p) => Some(p.clone()),
-        // Disabled: no prefix at all.
-        PrefixMode::Disabled => None,
-        // Auto: always generate deterministically from branchName + filename.
-        // The JSON's taskPrefix field is ignored to prevent mismatch bugs.
-        PrefixMode::Auto => {
-            let filename = run_config
-                .prd_file
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
-            Some(generate_prefix(pre_lock_branch.as_deref(), filename))
+    let prd_display = run_config.prd_file.display();
+    let pre_lock_prefix: Option<String> = {
+        let _db_lock = match LockGuard::acquire(&run_config.db_dir) {
+            Ok(guard) => guard,
+            Err(e) => {
+                ui::emit_err(&format!(
+                    "Error: cannot resolve prefix for {prd_display} — database lock held. {e}"
+                ));
+                return Err(LoopResult {
+                    exit_code: 1,
+                    ..Default::default()
+                });
+            }
+        };
+        let conn = match crate::db::open_and_migrate(&run_config.db_dir) {
+            Ok(c) => c,
+            Err(e) => {
+                ui::emit_err(&format!("Error opening database for prefix resolve: {e}"));
+                return Err(LoopResult {
+                    exit_code: 1,
+                    ..Default::default()
+                });
+            }
+        };
+        // worktree not set up yet — identity against source_root is correct.
+        match resolve_loop_pre_lock_prefix(
+            &conn,
+            &run_config.prd_file,
+            &run_config.prefix_mode,
+            &run_config.source_root,
+            &run_config.source_root,
+        ) {
+            Ok(prefix) => prefix,
+            Err(e) => {
+                ui::emit_err(&format!("Error resolving loop prefix: {e}"));
+                return Err(LoopResult {
+                    exit_code: 1,
+                    ..Default::default()
+                });
+            }
         }
     }
     .filter(|p| validate_prefix(p).is_ok());
@@ -311,7 +334,6 @@ pub(crate) fn initialize_loop(
         Some(p) => format!("loop-{p}.lock"),
         None => "loop.lock".to_string(),
     };
-    let prd_display = run_config.prd_file.display();
     let mut loop_lock = match LockGuard::acquire_named(&run_config.db_dir, &lock_name) {
         Ok(guard) => guard,
         Err(e) => {
@@ -369,7 +391,8 @@ pub(crate) fn initialize_loop(
 
     // Step 5: Initialize PRD (creates schema + imports tasks, idempotent)
     // Uses run_config.prefix_mode: Auto for single runs, Explicit for batch mode.
-    if let Err(e) = crate::commands::init(
+    // Pass explicit roots — loop source_root ≠ db_dir; Default InitOpts is test-only.
+    if let Err(e) = crate::commands::init_with_opts(
         &run_config.db_dir,
         &[&run_config.prd_file],
         false, // force
@@ -377,6 +400,10 @@ pub(crate) fn initialize_loop(
         true,  // update_existing
         false, // dry_run
         run_config.prefix_mode.clone(),
+        crate::commands::InitOpts {
+            source_root: Some(run_config.source_root.clone()),
+            worktree_root: Some(run_config.source_root.clone()),
+        },
     ) {
         ui::emit_err(&format!("Error initializing PRD: {}", e));
         return Err(LoopResult {
@@ -421,8 +448,8 @@ pub(crate) fn initialize_loop(
     }
 
     // Step 6.55: Reuse the prefix already determined at step 4.5 — no second file read.
-    // pre_lock_prefix holds either the PRD's explicit taskPrefix or the deterministic
-    // auto-generated value (same algorithm as init), so it matches after step 5 runs.
+    // pre_lock_prefix comes from the shared sticky resolver (same as init), so the
+    // lock name matches the prefix that actually runs after step 5.
     let early_task_prefix: Option<String> = pre_lock_prefix.clone();
 
     // Step 6.6: Recover stale in_progress tasks from previous crashed/killed runs.
@@ -615,38 +642,37 @@ pub(crate) fn initialize_loop(
         run_config.source_root.clone()
     };
 
-    // Step 8.4: Ensure task files exist in the worktree.
-    // If using a worktree, copy PRD JSON, prompt, and PRD markdown from source_root
-    // if they don't already exist in the worktree.
-    if working_root != run_config.source_root {
+    // Steps 8.4–8.5: worktree bootstrap + live PRD path.
+    // One canonicalize(source_root); all dest path math via `git::remap_into_worktree`
+    // (no inline strip_prefix remap). exists()/copy and the re-import exists() gate
+    // below are worktree policy — not CLI `choose_cli_write_path` (pin 15).
+    let live_prd_file = if working_root != run_config.source_root {
         let canonical_source = run_config
             .source_root
             .canonicalize()
             .unwrap_or_else(|_| run_config.source_root.clone());
 
+        // Step 8.4: copy PRD JSON / prompt / PRD markdown into the worktree when missing.
         let copy_if_missing = |src: &Path| {
-            if let Ok(rel) = src.strip_prefix(&canonical_source) {
-                let dest = working_root.join(rel);
-                if !dest.exists() && src.exists() {
-                    if let Some(parent) = dest.parent() {
-                        let _ = std::fs::create_dir_all(parent);
-                    }
-                    if let Err(e) = std::fs::copy(src, &dest) {
-                        tracing::warn!("failed to copy {} to worktree: {}", rel.display(), e);
-                    } else {
-                        ui::emit(&format!("Copied {} to worktree", rel.display()));
-                    }
+            let dest = crate::git::remap_into_worktree(src, &canonical_source, &working_root);
+            // Strip miss returns resolved unchanged — only copy when remapped into wt.
+            let Ok(rel) = dest.strip_prefix(&working_root) else {
+                return;
+            };
+            if !dest.exists() && src.exists() {
+                if let Some(parent) = dest.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if let Err(e) = std::fs::copy(src, &dest) {
+                    tracing::warn!("failed to copy {} to worktree: {}", rel.display(), e);
+                } else {
+                    ui::emit(&format!("Copied {} to worktree", rel.display()));
                 }
             }
         };
 
-        // PRD JSON (task list)
         copy_if_missing(&paths.prd_file);
-
-        // Prompt file
         copy_if_missing(&paths.prompt_file);
-
-        // PRD markdown (from prdFile field in JSON, if present)
         if let Ok(content) = std::fs::read_to_string(&paths.prd_file)
             && let Ok(json) = serde_json::from_str::<serde_json::Value>(&content)
             && let Some(prd_md) = json.get("prdFile").and_then(|v| v.as_str())
@@ -658,27 +684,18 @@ pub(crate) fn initialize_loop(
                 .join(prd_md);
             copy_if_missing(&prd_md_path);
         }
-    }
 
-    // Step 8.5: Compute live PRD path (worktree copy if using worktrees, else source_root)
-    // Claude edits the worktree copy, so hash checks and re-imports must use that path.
-    // paths.prd_file is canonicalized by resolve_paths(); canonicalize source_root too
-    // so strip_prefix works reliably (e.g. symlinks resolved on both sides).
-    let live_prd_file = if working_root != run_config.source_root {
-        let canonical_source = run_config
-            .source_root
-            .canonicalize()
-            .unwrap_or_else(|_| run_config.source_root.clone());
-        if let Ok(rel) = paths.prd_file.strip_prefix(&canonical_source) {
-            working_root.join(rel)
-        } else {
+        // Step 8.5: unconditional live PRD remap (path math only).
+        let remapped =
+            crate::git::remap_into_worktree(&paths.prd_file, &canonical_source, &working_root);
+        if remapped == paths.prd_file {
             tracing::warn!(
                 "could not remap PRD to worktree (prd={}, source={})",
                 paths.prd_file.display(),
                 canonical_source.display()
             );
-            paths.prd_file.clone()
         }
+        remapped
     } else {
         paths.prd_file.clone()
     };
@@ -687,7 +704,7 @@ pub(crate) fn initialize_loop(
     // by Claude during a previous run that only exist in the worktree copy).
     if live_prd_file != run_config.prd_file
         && live_prd_file.exists()
-        && let Err(e) = crate::commands::init(
+        && let Err(e) = crate::commands::init_with_opts(
             &run_config.db_dir,
             &[&live_prd_file],
             false, // force
@@ -695,6 +712,10 @@ pub(crate) fn initialize_loop(
             true,  // update_existing
             false, // dry_run
             run_config.prefix_mode.clone(),
+            crate::commands::InitOpts {
+                source_root: Some(run_config.source_root.clone()),
+                worktree_root: Some(working_root.clone()),
+            },
         )
     {
         tracing::warn!("worktree PRD re-import failed: {} (continuing)", e);
@@ -988,19 +1009,33 @@ pub(crate) fn initialize_loop(
     if run_config.config.usage_check_enabled && !usage_check_enabled {
         ui::emit("Skipping Claude usage/OAuth pre-check (Claude provider disabled)");
     }
-    // Precedence: LOOP_USAGE_REMAINING_MIN (env) > usagePolicy.remainingMinPercent > 8.
+    // Floors: CLI > env > usagePolicy > factory 2 / 1. Horizon CLI overlays
+    // stay Option so Ask-wait re-eval can re-apply them after a disk re-read.
     let env_remaining = std::env::var("LOOP_USAGE_REMAINING_MIN")
         .ok()
         .and_then(|v| v.parse::<u8>().ok());
-    let remaining_min = crate::loop_engine::config::resolve_usage_remaining_min(
-        env_remaining,
-        project_config.usage_policy.remaining_min_percent,
-    );
+    let env_weekly = std::env::var("LOOP_USAGE_REMAINING_MIN_WEEKLY")
+        .ok()
+        .and_then(|v| v.parse::<u8>().ok());
+    let floors = crate::loop_engine::quota::RemainingFloors {
+        other: crate::loop_engine::config::resolve_remaining_floor(
+            run_config.config.usage_remaining_min_cli,
+            env_remaining,
+            project_config.usage_policy.remaining_min_percent,
+        ),
+        weekly: crate::loop_engine::config::resolve_remaining_floor(
+            run_config.config.usage_remaining_min_weekly_cli,
+            env_weekly,
+            project_config.usage_policy.remaining_min_weekly_percent,
+        ),
+    };
     let usage_params = UsageParams {
         enabled: usage_check_enabled,
-        threshold: remaining_min,
+        floors,
         fallback_wait: run_config.config.usage_fallback_wait,
         ask_ttl_override: run_config.config.use_other_models_ttl,
+        wait_if_reset_within_cli: run_config.config.wait_if_reset_within_cli,
+        stop_if_reset_beyond_cli: run_config.config.stop_if_reset_beyond_cli,
     };
 
     Ok(LoopInitContext {
@@ -1027,4 +1062,335 @@ pub(crate) fn initialize_loop(
         permission_mode,
         usage_params,
     })
+}
+
+/// Resolve the prefix for `loop-{prefix}.lock` via the shared sticky resolver.
+///
+/// Caller must hold `tasks.db.lock` and pass an open/migrated connection.
+/// Uses `dry_run = true` so JSON restore is deferred to init under the loop lock.
+///
+/// Refuses `PrefixMode::Auto` on a registered NULL identity (NULL cannot be
+/// Auto-run). First `loop init --no-prefix` registration remains allowed via
+/// init's Disabled path.
+fn resolve_loop_pre_lock_prefix(
+    conn: &Connection,
+    prd_file: &Path,
+    prefix_mode: &PrefixMode,
+    source_root: &Path,
+    worktree_root: &Path,
+) -> Result<Option<String>, TaskMgrError> {
+    let content = std::fs::read_to_string(prd_file).map_err(|e| {
+        TaskMgrError::IoError(std::io::Error::new(
+            e.kind(),
+            format!("Failed to read {}: {}", prd_file.display(), e),
+        ))
+    })?;
+    let prd: PrdFile = serde_json::from_str(&content)?;
+    let (prefix, sticky_id) = resolve_sticky_prefix(
+        conn,
+        prd_file,
+        &prd,
+        prefix_mode,
+        source_root,
+        worktree_root,
+        true, // dry_run: no JSON write before loop lock
+    )?;
+    if matches!(prefix_mode, PrefixMode::Auto) && prefix.is_none() && sticky_id.is_some() {
+        return Err(TaskMgrError::InvalidState {
+            resource_type: "PRD".to_string(),
+            id: prd_file.display().to_string(),
+            expected: "non-NULL registered prefix for Auto loop run".to_string(),
+            actual: "registered NULL identity (from loop init --no-prefix); \
+                     Auto loop run refuses — re-init with --prefix/--force, or run with --no-prefix"
+                .to_string(),
+        });
+    }
+    Ok(prefix)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::init::{InitOpts, PrefixMode, generate_prefix, init_with_opts};
+    use crate::db::open_connection;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn write_minimal_prd(path: &Path, prefix: Option<&str>, branch: &str) {
+        let prefix_field = match prefix {
+            Some(p) => format!(r#""taskPrefix": "{p}","#),
+            None => String::new(),
+        };
+        fs::write(
+            path,
+            format!(
+                r#"{{
+  "project": "pre-lock-test",
+  {prefix_field}
+  "branchName": "{branch}",
+  "userStories": [
+    {{
+      "id": "TASK-001",
+      "title": "One",
+      "description": "d",
+      "acceptanceCriteria": ["a"],
+      "priority": 1,
+      "passes": false,
+      "dependsOn": []
+    }}
+  ]
+}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_pre_lock_matches_sticky_registered_prefix_not_fresh_hash() {
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path().to_path_buf();
+        let db_dir = project.join(".task-mgr");
+        fs::create_dir_all(&db_dir).unwrap();
+        let json_path = project.join("prd.json");
+        write_minimal_prd(&json_path, None, "feat/original");
+
+        init_with_opts(
+            &db_dir,
+            &[&json_path],
+            false,
+            false,
+            false,
+            false,
+            PrefixMode::Explicit("FROZEN01".into()),
+            InitOpts {
+                source_root: Some(project.clone()),
+                worktree_root: Some(project.clone()),
+            },
+        )
+        .unwrap();
+
+        // Simulate branchName change that would mint a different generate_prefix.
+        write_minimal_prd(&json_path, Some("FROZEN01"), "feat/renamed");
+        let would_hash = generate_prefix(Some("feat/renamed"), "prd.json");
+        assert_ne!(would_hash, "FROZEN01");
+
+        let conn = open_connection(&db_dir).unwrap();
+        let pre_lock =
+            resolve_loop_pre_lock_prefix(&conn, &json_path, &PrefixMode::Auto, &project, &project)
+                .unwrap();
+        assert_eq!(pre_lock.as_deref(), Some("FROZEN01"));
+
+        // Post-init sticky restore keeps the same prefix (no second row).
+        init_with_opts(
+            &db_dir,
+            &[&json_path],
+            false,
+            true,
+            true,
+            false,
+            PrefixMode::Auto,
+            InitOpts {
+                source_root: Some(project.clone()),
+                worktree_root: Some(project.clone()),
+            },
+        )
+        .unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM prd_metadata", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        let stored: String = conn
+            .query_row("SELECT task_prefix FROM prd_metadata", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored, "FROZEN01");
+        assert_eq!(pre_lock.as_deref(), Some(stored.as_str()));
+    }
+
+    #[test]
+    fn test_pre_lock_auto_on_registered_null_refuses() {
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path().to_path_buf();
+        let db_dir = project.join(".task-mgr");
+        fs::create_dir_all(&db_dir).unwrap();
+        let json_path = project.join("prd.json");
+        write_minimal_prd(&json_path, None, "feat/null-auto");
+
+        init_with_opts(
+            &db_dir,
+            &[&json_path],
+            false,
+            false,
+            false,
+            false,
+            PrefixMode::Disabled,
+            InitOpts {
+                source_root: Some(project.clone()),
+                worktree_root: Some(project.clone()),
+            },
+        )
+        .unwrap();
+
+        let conn = open_connection(&db_dir).unwrap();
+        let err =
+            resolve_loop_pre_lock_prefix(&conn, &json_path, &PrefixMode::Auto, &project, &project)
+                .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("NULL") || msg.contains("null") || msg.contains("--no-prefix"),
+            "expected NULL/Auto refuse message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_pre_lock_explicit_mismatch_refuses() {
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path().to_path_buf();
+        let db_dir = project.join(".task-mgr");
+        fs::create_dir_all(&db_dir).unwrap();
+        let json_path = project.join("prd.json");
+        write_minimal_prd(&json_path, None, "feat/mismatch");
+
+        init_with_opts(
+            &db_dir,
+            &[&json_path],
+            false,
+            false,
+            false,
+            false,
+            PrefixMode::Explicit("KEEPME01".into()),
+            InitOpts {
+                source_root: Some(project.clone()),
+                worktree_root: Some(project.clone()),
+            },
+        )
+        .unwrap();
+
+        let conn = open_connection(&db_dir).unwrap();
+        let err = resolve_loop_pre_lock_prefix(
+            &conn,
+            &json_path,
+            &PrefixMode::Explicit("OTHER001".into()),
+            &project,
+            &project,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("KEEPME01") || msg.contains("Explicit"),
+            "expected mismatch refuse, got: {msg}"
+        );
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM prd_metadata", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "mismatch must not mint a second row");
+    }
+
+    #[test]
+    fn test_step_8_4_and_8_5_use_remap_into_worktree_not_inline_strip_prefix() {
+        let src = fs::read_to_string(file!()).unwrap();
+
+        fn block_between<'a>(src: &'a str, start: &str, end: &str) -> &'a str {
+            let from = src.find(start).unwrap_or_else(|| panic!("{start} present"));
+            let rest = &src[from..];
+            let to = rest
+                .find(end)
+                .unwrap_or_else(|| panic!("{end} follows {start}"));
+            &rest[..to]
+        }
+
+        let block_84 = block_between(&src, "// Step 8.4:", "// Step 8.5:");
+        assert!(
+            block_84.contains("remap_into_worktree"),
+            "Step 8.4 must call remap_into_worktree"
+        );
+        // dest.strip_prefix(working_root) for log display is OK; forbid remapper-shaped strip.
+        assert!(
+            !block_84.contains("strip_prefix(&canonical_source)"),
+            "Step 8.4 must not inline strip_prefix(source_root); remap owns that"
+        );
+
+        let block_85 = block_between(&src, "// Step 8.5:", "// Step 9:");
+        assert!(
+            block_85.contains("remap_into_worktree"),
+            "Step 8.5 must call remap_into_worktree"
+        );
+        assert!(
+            !block_85.contains("strip_prefix"),
+            "Step 8.5 must not inline strip_prefix(source_root); remap owns that"
+        );
+    }
+
+    #[test]
+    fn test_startup_generate_prefix_only_via_sticky_resolver() {
+        let src = fs::read_to_string(file!()).unwrap();
+        // Production body must not call generate_prefix; first-reg hash lives
+        // inside resolve_sticky_prefix (init). Tests may still mention it.
+        let prod = src.split("#[cfg(test)]").next().unwrap();
+        assert!(
+            !prod.contains("generate_prefix"),
+            "startup production code must not call generate_prefix; use resolve_sticky_prefix"
+        );
+        assert!(
+            prod.contains("resolve_sticky_prefix") || prod.contains("resolve_loop_pre_lock_prefix"),
+            "startup must share the sticky resolver"
+        );
+    }
+
+    #[test]
+    fn test_orchestrator_style_reimport_restores_prefix_one_row() {
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path().to_path_buf();
+        let db_dir = project.join(".task-mgr");
+        fs::create_dir_all(&db_dir).unwrap();
+        let json_path = project.join("prd.json");
+        write_minimal_prd(&json_path, None, "feat/reimport");
+
+        init_with_opts(
+            &db_dir,
+            &[&json_path],
+            false,
+            false,
+            false,
+            false,
+            PrefixMode::Explicit("ORCH0001".into()),
+            InitOpts {
+                source_root: Some(project.clone()),
+                worktree_root: Some(project.clone()),
+            },
+        )
+        .unwrap();
+
+        // Operator (or Claude) edits only taskPrefix — orchestrator re-imports via init.
+        write_minimal_prd(&json_path, Some("WRONGPRE"), "feat/reimport");
+        init_with_opts(
+            &db_dir,
+            &[&json_path],
+            false,
+            true,
+            true,
+            false,
+            PrefixMode::Auto,
+            InitOpts {
+                source_root: Some(project.clone()),
+                worktree_root: Some(project.clone()),
+            },
+        )
+        .unwrap();
+
+        let conn = open_connection(&db_dir).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM prd_metadata", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        let stored: String = conn
+            .query_row("SELECT task_prefix FROM prd_metadata", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored, "ORCH0001");
+        let json = fs::read_to_string(&json_path).unwrap();
+        assert!(
+            json.contains(r#""taskPrefix": "ORCH0001""#)
+                || json.contains(r#""taskPrefix":"ORCH0001""#),
+            "JSON must be restored to registered prefix, got: {json}"
+        );
+    }
 }

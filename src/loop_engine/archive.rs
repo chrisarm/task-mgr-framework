@@ -89,6 +89,8 @@ fn archive_single_prd(
     conn: &mut rusqlite::Connection,
     prd: &PrdRecord,
     tasks_dir: &Path,
+    source_root: &Path,
+    worktree_root: &Path,
     date_str: &str,
     dry_run: bool,
 ) -> TaskMgrResult<PrdArchiveOutcome> {
@@ -119,8 +121,16 @@ fn archive_single_prd(
     };
     let archive_dir = tasks_dir.join("archive").join(&archive_folder_name);
 
-    let files_to_archive = discover_archivable_files(conn, tasks_dir, prd.id, &prd.project)?;
+    let files_to_archive = discover_archivable_files(
+        conn,
+        tasks_dir,
+        source_root,
+        worktree_root,
+        prd.id,
+        &prd.project,
+    )?;
     let mut items: Vec<ArchivedItem> = Vec::new();
+    let mut move_sources: Vec<PathBuf> = Vec::new();
     for source in &files_to_archive {
         let file_name = source
             .file_name()
@@ -131,14 +141,19 @@ fn archive_single_prd(
         {
             continue;
         }
+        // Display relative to source_root when possible; never re-join onto
+        // `.task-mgr/tasks` for move (stored paths are source-root-relative).
+        let display_source = source
+            .strip_prefix(source_root)
+            .or_else(|_| source.strip_prefix(tasks_dir))
+            .unwrap_or(source)
+            .display()
+            .to_string();
         items.push(ArchivedItem {
-            source: source
-                .strip_prefix(tasks_dir)
-                .unwrap_or(source)
-                .display()
-                .to_string(),
+            source: display_source,
             destination: format!("archive/{}/{}", archive_folder_name, file_name),
         });
+        move_sources.push(source.clone());
     }
 
     let task_count = if dry_run {
@@ -157,10 +172,9 @@ fn archive_single_prd(
                     e,
                 )
             })?;
-            for item in &items {
-                let source = tasks_dir.join(&item.source);
+            for source in &move_sources {
                 let dest = archive_dir.join(source.file_name().unwrap_or_default());
-                fs::rename(&source, &dest).map_err(|e| {
+                fs::rename(source, &dest).map_err(|e| {
                     crate::TaskMgrError::io_error(
                         source.display().to_string(),
                         "moving file to archive",
@@ -231,6 +245,12 @@ pub fn run_archive(
     }
 
     let tasks_dir = dir.join("tasks");
+    // `prd_files` stores source-root-relative paths (e.g. tasks/foo.json), not
+    // paths under `.task-mgr/tasks`. Resolve via the shared read helper.
+    let source_root = crate::git::main_repo_root_at(dir)
+        .or_else(|| dir.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| dir.to_path_buf());
+    let worktree_root = std::env::current_dir().unwrap_or_else(|_| source_root.clone());
     let date_str = Local::now().format("%Y-%m-%d").to_string();
 
     let mut archived_items: Vec<ArchivedItem> = Vec::new();
@@ -239,7 +259,15 @@ pub fn run_archive(
     let mut total_tasks_archived: usize = 0;
 
     for prd in &all_prds {
-        match archive_single_prd(&mut conn, prd, &tasks_dir, &date_str, dry_run)? {
+        match archive_single_prd(
+            &mut conn,
+            prd,
+            &tasks_dir,
+            &source_root,
+            &worktree_root,
+            &date_str,
+            dry_run,
+        )? {
             PrdArchiveOutcome::Archived { summary, items } => {
                 total_tasks_archived += summary.tasks_archived;
                 prds_archived.push(summary);
@@ -370,10 +398,15 @@ fn strip_branch_prefix(branch: &str) -> String {
 /// Discover files associated with the PRD that should be archived.
 ///
 /// Prefers the `prd_files` table (v6+) for accurate file discovery.
-/// Falls back to project-name-based guessing for pre-v6 databases.
+/// Stored paths are resolved with [`crate::commands::init::import::resolve_prd_file_path`]
+/// — never `tasks_dir.join(stored)` for source-root-relative rows (that would
+/// look under `.task-mgr/tasks` and miss project `tasks/*.json`).
+/// Falls back to project-name-based guessing under `tasks_dir` for pre-v6 DBs.
 fn discover_archivable_files(
     conn: &rusqlite::Connection,
     tasks_dir: &Path,
+    source_root: &Path,
+    worktree_root: &Path,
     prd_id: i64,
     project: &str,
 ) -> TaskMgrResult<Vec<PathBuf>> {
@@ -383,11 +416,22 @@ fn discover_archivable_files(
     let prd_file_paths = query_prd_files(conn, prd_id)?;
 
     if !prd_file_paths.is_empty() {
-        // Use paths from the database
-        for relative_path in &prd_file_paths {
-            let path = tasks_dir.join(relative_path);
+        for stored in &prd_file_paths {
+            let path = crate::commands::init::import::resolve_prd_file_path(
+                Path::new(stored),
+                source_root,
+                worktree_root,
+            );
             if path.exists() {
                 files.push(path);
+                continue;
+            }
+            // Legacy pre-FEAT-001 rows: basename (or path) under `.task-mgr/tasks`.
+            // Never use this join as the primary strategy for source-root-relative
+            // storage (`tasks/foo.json` → `.task-mgr/tasks/tasks/foo.json` misses).
+            let legacy = tasks_dir.join(stored);
+            if legacy != path && legacy.exists() {
+                files.push(legacy);
             }
         }
     } else {
@@ -433,12 +477,10 @@ fn query_prd_files(conn: &rusqlite::Connection, prd_id: i64) -> TaskMgrResult<Ve
 
 /// Soft-archive task data scoped to a single PRD.
 ///
-/// Sets `archived_at = datetime('now')` on tasks, run_tasks, key_decisions,
-/// and fully-archived runs matching `{prefix}-%`. A run is soft-archived only
-/// when ALL its run_tasks have `archived_at IS NOT NULL`. Hard-deletes
-/// task_relationships and task_files (no historical value). Also hard-deletes
-/// prd_files and prd_metadata. Resets `iteration_counter` only when no active
-/// (archived_at IS NULL) tasks remain across all PRDs.
+/// Soft-archive a completed PRD's DB rows (no file moves).
+///
+/// Delegates to [`crate::db::soft_archive::archive_prd_by_prefix`] inside a
+/// transaction. Shared with prefix-scoped `init --force` (FEAT-003).
 ///
 /// Returns the number of tasks soft-archived.
 fn archive_prd_data(
@@ -446,88 +488,9 @@ fn archive_prd_data(
     prd_id: i64,
     prefix: &str,
 ) -> TaskMgrResult<usize> {
-    let pattern = make_like_pattern(prefix);
-
     let tx = conn.transaction()?;
-
-    // 1-3. Soft-archive run_tasks, key_decisions, and runs for this prefix
-    crate::db::soft_archive::soft_archive_by_prefix(&tx, prefix)?;
-
-    // 4. Hard-delete task_relationships touching this prefix (no historical value)
-    tx.execute(
-        "DELETE FROM task_relationships \
-         WHERE task_id LIKE ? ESCAPE '\\' OR related_id LIKE ? ESCAPE '\\'",
-        rusqlite::params![pattern, pattern],
-    )?;
-
-    // 5. Hard-delete task_files for this prefix (no historical value)
-    tx.execute(
-        "DELETE FROM task_files WHERE task_id LIKE ? ESCAPE '\\'",
-        rusqlite::params![pattern],
-    )?;
-
-    // 6. Soft-archive tasks and capture the count for reporting
-    let archived = tx.execute(
-        "UPDATE tasks SET archived_at = datetime('now') \
-             WHERE id LIKE ? ESCAPE '\\' AND archived_at IS NULL",
-        rusqlite::params![pattern],
-    )?;
-
-    // 7. Hard-delete prd_files for this PRD (may not exist in pre-v6 databases)
-    let _ = tx.execute(
-        "DELETE FROM prd_files WHERE prd_id = ?",
-        rusqlite::params![prd_id],
-    );
-
-    // 8. Hard-delete prd_metadata row
-    tx.execute(
-        "DELETE FROM prd_metadata WHERE id = ?",
-        rusqlite::params![prd_id],
-    )?;
-
-    // 9. NULL out last_task_id if the referenced task is now archived
-    tx.execute(
-        "UPDATE global_state SET last_task_id = NULL \
-         WHERE id = 1 AND last_task_id IS NOT NULL \
-         AND NOT EXISTS ( \
-             SELECT 1 FROM tasks \
-             WHERE tasks.id = global_state.last_task_id \
-             AND tasks.archived_at IS NULL \
-         )",
-        [],
-    )?;
-
-    // 10. NULL out last_run_id if the referenced run is now archived
-    tx.execute(
-        "UPDATE global_state SET last_run_id = NULL \
-         WHERE id = 1 AND last_run_id IS NOT NULL \
-         AND NOT EXISTS ( \
-             SELECT 1 FROM runs \
-             WHERE runs.run_id = global_state.last_run_id \
-             AND runs.archived_at IS NULL \
-         )",
-        [],
-    )?;
-
-    // 11. Reset counters only when no active (non-archived) tasks remain
-    let remaining: i64 = tx.query_row(
-        "SELECT COUNT(*) FROM tasks WHERE archived_at IS NULL",
-        [],
-        |row| row.get(0),
-    )?;
-
-    if remaining == 0 {
-        tx.execute(
-            "UPDATE global_state \
-             SET iteration_counter = 0, last_task_id = NULL, last_run_id = NULL, \
-                 updated_at = datetime('now') \
-             WHERE id = 1",
-            [],
-        )?;
-    }
-
+    let archived = crate::db::soft_archive::archive_prd_by_prefix(&tx, prefix, Some(prd_id))?;
     tx.commit()?;
-
     Ok(archived)
 }
 
@@ -780,7 +743,9 @@ mod tests {
         fs::write(tasks_dir.join("progress.txt"), "# Progress").unwrap();
         fs::write(tasks_dir.join("unrelated.txt"), "other").unwrap();
 
-        let files = discover_archivable_files(&conn, tasks_dir, 1, "my-project").unwrap();
+        let files =
+            discover_archivable_files(&conn, tasks_dir, tasks_dir, tasks_dir, 1, "my-project")
+                .unwrap();
         assert_eq!(files.len(), 3);
 
         let filenames: Vec<String> = files
@@ -799,7 +764,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let conn = setup_db(dir.path());
 
-        let files = discover_archivable_files(&conn, dir.path(), 1, "nonexistent").unwrap();
+        let files =
+            discover_archivable_files(&conn, dir.path(), dir.path(), dir.path(), 1, "nonexistent")
+                .unwrap();
         assert!(files.is_empty());
     }
 
@@ -1168,7 +1135,12 @@ mod tests {
         // (prd_files takes precedence over project-name guessing)
         fs::write(tasks_dir.join("model-selection.json"), "{}").unwrap();
 
-        let files = discover_archivable_files(&conn, tasks_dir, 1, "model-selection").unwrap();
+        // Legacy basename rows: resolve against the directory that holds them
+        // (source_root == tasks_dir). New init stores source-root-relative
+        // paths like `tasks/foo.json` and resolves against the project root.
+        let files =
+            discover_archivable_files(&conn, tasks_dir, tasks_dir, tasks_dir, 1, "model-selection")
+                .unwrap();
 
         let filenames: Vec<String> = files
             .iter()
@@ -1396,7 +1368,7 @@ mod tests {
 
     #[test]
     fn test_init_registers_prd_files() {
-        use crate::commands::init::{PrefixMode, init};
+        use crate::commands::init::{InitOpts, PrefixMode, init_with_opts};
 
         let dir = TempDir::new().unwrap();
         let tasks_dir = dir.path().join("tasks");
@@ -1415,7 +1387,7 @@ mod tests {
         // Create the prompt file so it gets registered
         fs::write(tasks_dir.join("prd-model-phase1-prompt.md"), "# Prompt").unwrap();
 
-        init(
+        init_with_opts(
             dir.path(),
             &[&json_path],
             false,
@@ -1423,6 +1395,10 @@ mod tests {
             false,
             false,
             PrefixMode::Disabled,
+            InitOpts {
+                source_root: Some(dir.path().to_path_buf()),
+                worktree_root: Some(dir.path().to_path_buf()),
+            },
         )
         .unwrap();
 
@@ -1434,7 +1410,7 @@ mod tests {
             .unwrap();
         assert_eq!(file_count, 3); // task_list + prompt + prd
 
-        // Verify specific entries
+        // Source-root-relative POSIX (not basename, not .task-mgr/tasks-stripped)
         let task_list: String = conn
             .query_row(
                 "SELECT file_path FROM prd_files WHERE file_type = 'task_list'",
@@ -1442,7 +1418,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(task_list, "prd-model-phase1.json");
+        assert_eq!(task_list, "tasks/prd-model-phase1.json");
 
         let prompt: String = conn
             .query_row(
@@ -1451,7 +1427,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(prompt, "prd-model-phase1-prompt.md");
+        assert_eq!(prompt, "tasks/prd-model-phase1-prompt.md");
 
         let prd: String = conn
             .query_row(

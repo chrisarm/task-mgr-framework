@@ -1092,7 +1092,7 @@ pub fn run_wave_iteration(
         let resolved_models = &ctx.resolved_models;
         let now_secs = crate::loop_engine::engine::now_unix_secs();
         let account_params = reactions::account::AccountReactionParams {
-            threshold: params.usage_params.threshold,
+            floors: params.usage_params.floors,
             usage_enabled: params.usage_params.enabled,
             // FEAT-002 dual predicate: post-output Anthropic I/O is keyed ONLY
             // on Claude provider enablement — NEVER on `usage_params.enabled`
@@ -1684,9 +1684,11 @@ mod tests {
     const TEST_USAGE_PARAMS: crate::loop_engine::engine::UsageParams =
         crate::loop_engine::engine::UsageParams {
             enabled: false,
-            threshold: 8,
+            floors: crate::loop_engine::quota::RemainingFloors::uniform(8),
             fallback_wait: 300,
             ask_ttl_override: None,
+            wait_if_reset_within_cli: None,
+            stop_if_reset_beyond_cli: None,
         };
 
     #[allow(clippy::too_many_arguments)]

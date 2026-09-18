@@ -474,16 +474,22 @@ fn test_init_without_force_fails_on_existing_data() {
         init::PrefixMode::Disabled,
     );
 
-    // Should fail because data already exists (either UNIQUE constraint or explicit duplicate check)
+    // Should fail: sticky path identity refuses --no-prefix when the first
+    // import registered a non-NULL prefix from JSON taskPrefix into
+    // prd_metadata (learning #5624). Older builds hit UNIQUE on tasks.id;
+    // sticky refuses earlier with a doctor/--force hint.
     assert!(result.is_err());
     let err = result.unwrap_err();
     let msg = err.to_string();
 
-    // Error message should indicate duplicate or existing data issue
-    // The actual error is a UNIQUE constraint failure at the database level
     assert!(
-        msg.contains("Duplicate") || msg.contains("UNIQUE") || msg.contains("constraint"),
-        "Error should indicate duplicate/existing data: {}",
+        msg.contains("registered prefix")
+            || msg.contains("--no-prefix")
+            || msg.contains("--force")
+            || msg.contains("Duplicate")
+            || msg.contains("UNIQUE")
+            || msg.contains("constraint"),
+        "Error should indicate sticky refuse or duplicate/existing data: {}",
         msg
     );
 }

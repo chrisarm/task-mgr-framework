@@ -332,3 +332,229 @@ fn models_show_from_worktree_prints_db_dir_and_source() {
         "models show must mention the main-repo .task-mgr path, got: {stdout}"
     );
 }
+
+// =============================================================================
+// FEAT-005: CLI write-path live worktree matrix (add + current target=)
+// =============================================================================
+
+const LIVE_PRD_JSON: &str = r#"{
+  "project": "live-write-path",
+  "taskPrefix": "LIVE",
+  "userStories": [
+    {"id": "SEED-001", "title": "seed", "priority": 50, "passes": false}
+  ]
+}"#;
+
+/// Init git repo, write `tasks/foo.json`, `task-mgr init` + `loop init --prefix LIVE`.
+fn setup_repo_with_registered_prd() -> (TempDir, PathBuf) {
+    let repo = init_repo();
+    let tasks = repo.path().join("tasks");
+    std::fs::create_dir_all(&tasks).unwrap();
+    let prd = tasks.join("foo.json");
+    std::fs::write(&prd, LIVE_PRD_JSON).unwrap();
+    // Commit so worktree add copies the JSON.
+    git(repo.path(), &["add", "tasks/foo.json"]);
+    git(repo.path(), &["commit", "-m", "add prd"]);
+
+    let init_out = Command::new(task_mgr_bin())
+        .current_dir(repo.path())
+        .args(["init"])
+        .env_remove("TASK_MGR_DIR")
+        .env_remove("TASK_MGR_ACTIVE_PREFIX")
+        .output()
+        .expect("spawn init");
+    assert!(
+        init_out.status.success(),
+        "task-mgr init failed: {}",
+        String::from_utf8_lossy(&init_out.stderr)
+    );
+
+    let loop_out = Command::new(task_mgr_bin())
+        .current_dir(repo.path())
+        .args(["loop", "init", "--prefix", "LIVE", "tasks/foo.json"])
+        .env_remove("TASK_MGR_DIR")
+        .env_remove("TASK_MGR_ACTIVE_PREFIX")
+        .output()
+        .expect("spawn loop init");
+    assert!(
+        loop_out.status.success(),
+        "task-mgr loop init failed: {}",
+        String::from_utf8_lossy(&loop_out.stderr)
+    );
+
+    // Prefer the relative `tasks/foo.json` form the AC names for remap math.
+    let conn = rusqlite::Connection::open(repo.path().join(".task-mgr/tasks.db")).unwrap();
+    conn.execute(
+        "UPDATE prd_files SET file_path = 'tasks/foo.json' WHERE file_type = 'task_list'",
+        [],
+    )
+    .unwrap();
+
+    (repo, prd)
+}
+
+fn run_current(cwd: &Path, extra_args: &[&str]) -> (String, String, std::process::ExitStatus) {
+    let out = Command::new(task_mgr_bin())
+        .current_dir(cwd)
+        .args(["current"])
+        .args(extra_args)
+        .env_remove("TASK_MGR_DIR")
+        .env_remove("TASK_MGR_ACTIVE_PREFIX")
+        .output()
+        .expect("spawn task-mgr current");
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status,
+    )
+}
+
+#[test]
+fn live_main_checkout_write_path_unchanged() {
+    let (repo, main_prd) = setup_repo_with_registered_prd();
+    let before = std::fs::read_to_string(&main_prd).unwrap();
+
+    let (stdout, stderr, status) = run_current(repo.path(), &[]);
+    assert!(status.success(), "current failed: {stderr}\n{stdout}");
+    assert!(
+        stdout.contains("source=single-prefix") || stdout.contains("source=env"),
+        "expected resolved source, got: {stdout}"
+    );
+    let canon_main = main_prd.canonicalize().unwrap();
+    assert!(
+        stdout.contains(&canon_main.display().to_string())
+            || stdout.contains(&main_prd.display().to_string()),
+        "main cwd target= must be the registered main path, got: {stdout}"
+    );
+
+    let (_o, stderr, status) = run_add(repo.path(), &add_payload("MAIN-WP-001"), &[], &[]);
+    assert!(status.success(), "add from main failed: {stderr}");
+    assert_task_in_db(&repo.path().join(".task-mgr"), "LIVE-MAIN-WP-001");
+
+    let after = std::fs::read_to_string(&main_prd).unwrap();
+    assert_ne!(before, after, "main JSON must receive the append");
+    assert!(
+        after.contains("MAIN-WP-001") || after.contains("LIVE-MAIN-WP-001"),
+        "main JSON must contain the new task id"
+    );
+}
+
+#[test]
+fn live_worktree_file_exists_writes_worktree_main_unchanged() {
+    let (repo, main_prd) = setup_repo_with_registered_prd();
+    let wt_parent = TempDir::new().unwrap();
+    let wt = add_worktree(repo.path(), wt_parent.path(), "wp-exists");
+    let wt_prd = wt.join("tasks/foo.json");
+    assert!(wt_prd.is_file(), "worktree must carry tasks/foo.json");
+
+    let main_before = std::fs::read_to_string(&main_prd).unwrap();
+
+    let (stdout, stderr, status) = run_current(&wt, &[]);
+    assert!(status.success(), "current from worktree failed: {stderr}");
+    let canon_wt = wt_prd.canonicalize().unwrap();
+    assert!(
+        stdout.contains(&canon_wt.display().to_string())
+            || stdout.contains(&wt_prd.display().to_string()),
+        "worktree current target= must be the live worktree copy, got: {stdout}"
+    );
+
+    let (_o, stderr, status) = run_add(&wt, &add_payload("WT-WP-001"), &[], &[]);
+    assert!(status.success(), "add from worktree failed: {stderr}");
+    assert_task_in_db(&repo.path().join(".task-mgr"), "LIVE-WT-WP-001");
+    assert!(
+        !wt.join(".task-mgr").exists(),
+        "DB must stay on main-repo .task-mgr"
+    );
+
+    let main_after = std::fs::read_to_string(&main_prd).unwrap();
+    assert_eq!(
+        main_before, main_after,
+        "main JSON bytes must be unchanged when worktree copy exists"
+    );
+    let wt_after = std::fs::read_to_string(&wt_prd).unwrap();
+    assert!(
+        wt_after.contains("WT-WP-001") || wt_after.contains("LIVE-WT-WP-001"),
+        "worktree JSON must receive the append"
+    );
+}
+
+#[test]
+fn live_worktree_only_main_exists_writes_main_no_invent() {
+    let (repo, main_prd) = setup_repo_with_registered_prd();
+    let wt_parent = TempDir::new().unwrap();
+    let wt = add_worktree(repo.path(), wt_parent.path(), "wp-main-only");
+    let wt_prd = wt.join("tasks/foo.json");
+    assert!(wt_prd.is_file());
+    // Only main file remains — no invent / basename search into the worktree.
+    std::fs::remove_file(&wt_prd).unwrap();
+    assert!(!wt_prd.exists());
+
+    let (stdout, stderr, status) = run_current(&wt, &[]);
+    assert!(status.success(), "current failed: {stderr}");
+    let canon_main = main_prd.canonicalize().unwrap();
+    assert!(
+        stdout.contains(&canon_main.display().to_string())
+            || stdout.contains(&main_prd.display().to_string()),
+        "when only main exists, target= must be main (no invent), got: {stdout}"
+    );
+    assert!(
+        !stdout.contains(&wt_prd.display().to_string()),
+        "must not invent worktree path: {stdout}"
+    );
+
+    let main_before = std::fs::read_to_string(&main_prd).unwrap();
+    let (_o, stderr, status) = run_add(&wt, &add_payload("FALLBACK-001"), &[], &[]);
+    assert!(status.success(), "add fallback-to-main failed: {stderr}");
+    assert_task_in_db(&repo.path().join(".task-mgr"), "LIVE-FALLBACK-001");
+
+    let main_after = std::fs::read_to_string(&main_prd).unwrap();
+    assert_ne!(main_before, main_after, "main JSON must receive the write");
+    assert!(
+        !wt_prd.exists(),
+        "must not invent/create the remapped worktree path"
+    );
+    // No basename search: a stray tasks/<basename> elsewhere must not appear.
+    assert!(
+        !wt.join("foo.json").exists(),
+        "must not basename-search invent foo.json at worktree root"
+    );
+}
+
+#[test]
+fn live_current_from_json_registered_and_unregistered() {
+    let (repo, main_prd) = setup_repo_with_registered_prd();
+
+    let (stdout, stderr, status) =
+        run_current(repo.path(), &["--from-json", main_prd.to_str().unwrap()]);
+    assert!(
+        status.success(),
+        "current --from-json registered failed: {stderr}"
+    );
+    assert!(
+        stdout.contains("source=from-json"),
+        "registered pin must report source=from-json: {stdout}"
+    );
+    let canon = main_prd.canonicalize().unwrap();
+    assert!(
+        stdout.contains(&canon.display().to_string()),
+        "target must be canonical PATH: {stdout}"
+    );
+
+    let orphan = repo.path().join("tasks/orphan.json");
+    std::fs::write(
+        &orphan,
+        r#"{"project":"x","taskPrefix":"ORPHAN","userStories":[]}"#,
+    )
+    .unwrap();
+    let (stdout, stderr, status) =
+        run_current(repo.path(), &["--from-json", orphan.to_str().unwrap()]);
+    assert!(
+        !status.success(),
+        "unregistered --from-json must be non-zero: stdout={stdout} stderr={stderr}"
+    );
+    let err = format!("{stdout}{stderr}");
+    assert!(
+        err.contains("loop init"),
+        "unregistered copy must name loop init: {err}"
+    );
+}

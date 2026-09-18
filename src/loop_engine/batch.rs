@@ -497,6 +497,10 @@ pub async fn run_batch(
     cli_force_on: bool,
     cli_force_off: bool,
     use_other_models_ttl: Option<u64>,
+    usage_remaining_min_cli: Option<u8>,
+    usage_remaining_min_weekly_cli: Option<u8>,
+    wait_if_reset_within_cli: Option<u64>,
+    stop_if_reset_beyond_cli: Option<u64>,
 ) -> BatchResult {
     // Cached once at the top of run_batch — matches the run-level config caching
     // convention (CLAUDE.md): mid-loop edits to .task-mgr/config.json do NOT take
@@ -544,17 +548,41 @@ pub async fn run_batch(
         }
     };
 
-    // Step 2.5: Warn if two PRDs would produce the same Auto prefix (same filename + branchName).
+    // Step 2.5: Warn if two PRDs would share the same resolved Auto prefix.
+    // Advisory only — does not write prd_metadata. Prefer sticky identity when
+    // the DB already has a registration so re-runs of registered files are not
+    // warned (or collided) as if they would mint a fresh generate_prefix row.
     {
+        use crate::commands::init::{PrdFile, resolve_sticky_prefix};
         use std::collections::HashMap;
+        let sticky_conn = crate::db::open_and_migrate(dir).ok();
         let mut prefix_to_files: HashMap<String, Vec<&Path>> = HashMap::new();
         for (prd_file, _) in &pairs {
             let filename = prd_file
                 .file_name()
                 .and_then(|f| f.to_str())
                 .unwrap_or("unknown.json");
-            let branch = status_queries::read_branch_name_from_prd(prd_file);
-            let prefix = crate::commands::init::generate_prefix(branch.as_deref(), filename);
+            let prefix = match sticky_conn.as_ref().and_then(|conn| {
+                let content = std::fs::read_to_string(prd_file).ok()?;
+                let prd: PrdFile = serde_json::from_str(&content).ok()?;
+                resolve_sticky_prefix(
+                    conn,
+                    prd_file,
+                    &prd,
+                    &PrefixMode::Auto,
+                    project_root,
+                    project_root,
+                    true, // dry_run: warning must not write JSON or mint rows
+                )
+                .ok()
+                .and_then(|(pfx, _)| pfx)
+            }) {
+                Some(p) => p,
+                None => {
+                    let branch = status_queries::read_branch_name_from_prd(prd_file);
+                    crate::commands::init::generate_prefix(branch.as_deref(), filename)
+                }
+            };
             prefix_to_files
                 .entry(prefix)
                 .or_default()
@@ -563,7 +591,7 @@ pub async fn run_batch(
         for (prefix, files) in &prefix_to_files {
             if files.len() > 1 {
                 ui::emit_err(&format!(
-                    "Warning: {} PRDs would share prefix '{}' (same filename + branchName):",
+                    "Warning: {} PRDs would share prefix '{}' (same filename + branchName, or sticky identity):",
                     files.len(),
                     prefix
                 ));
@@ -632,6 +660,10 @@ pub async fn run_batch(
         // (mirrors loop's behavior: explicit flag > env var > default).
         config.parallel_slots = parallel_slots;
         config.use_other_models_ttl = use_other_models_ttl;
+        config.usage_remaining_min_cli = usage_remaining_min_cli;
+        config.usage_remaining_min_weekly_cli = usage_remaining_min_weekly_cli;
+        config.wait_if_reset_within_cli = wait_if_reset_within_cli;
+        config.stop_if_reset_beyond_cli = stop_if_reset_beyond_cli;
         if let Some(max_iter) = max_iterations {
             config.max_iterations = max_iter;
         }

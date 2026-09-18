@@ -484,7 +484,7 @@ mod tests {
     /// ids and keep medium/standard — with and without frontier→opus pin.
     #[test]
     fn live_shaped_replace_excludes_frontier_not_standard_with_and_without_pin() {
-        use crate::loop_engine::quota::{UsagePolicy, evaluate_quota};
+        use crate::loop_engine::quota::{RemainingFloors, UsagePolicy, evaluate_quota};
         use crate::loop_engine::reactions::account::replace_unavailable_rungs;
         use crate::loop_engine::usage::{
             ingest_oauth_value, live_shaped_oauth_json, models_with_frontier_pinned_to_standard,
@@ -498,7 +498,11 @@ mod tests {
             ),
         ] {
             let buckets = ingest_oauth_value(&live_shaped_oauth_json(), &models);
-            let eval = evaluate_quota(&buckets, &UsagePolicy::default(), 8);
+            let eval = evaluate_quota(
+                &buckets,
+                &UsagePolicy::default(),
+                RemainingFloors::uniform(8),
+            );
             assert_eq!(
                 eval.unavailable,
                 vec![(Provider::Claude, CapabilityTier::Frontier)],

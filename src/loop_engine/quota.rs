@@ -73,6 +73,68 @@ pub enum OnLowAction {
     Ignore,
 }
 
+/// Per-kind remaining-percent floors (0–100, never a 0.08 ratio).
+///
+/// Factory: **other** (session / extra / …) **2**, **weekly** (`weekly_all` /
+/// `weekly_scoped`) **1**. That leaves a thin reserve for wrap-up / a couple
+/// of manual session turns after the loop parks. Classifier tests that pin a
+/// historical bar use [`RemainingFloors::uniform`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemainingFloors {
+    /// Session and other non-weekly percent windows.
+    pub other: u8,
+    /// `weekly_all` / `weekly_scoped` percent windows.
+    pub weekly: u8,
+}
+
+impl RemainingFloors {
+    /// Same floor on every percent window (hermetic classifier tests).
+    pub const fn uniform(n: u8) -> Self {
+        Self {
+            other: n,
+            weekly: n,
+        }
+    }
+
+    /// Factory defaults: other 2, weekly 1.
+    pub const fn factory() -> Self {
+        Self {
+            other: 2,
+            weekly: 1,
+        }
+    }
+
+    /// Floor for an ingested bucket `kind`.
+    pub fn for_kind(self, kind: &str) -> u8 {
+        if is_weekly_kind(kind) {
+            self.weekly
+        } else {
+            self.other
+        }
+    }
+
+    /// Operator banner suffix. Uniform → `(floor N%)`; split →
+    /// `(floor 2% · weekly 1%)`.
+    pub fn banner_suffix(self) -> String {
+        if self.other == self.weekly {
+            format!("(floor {}%)", self.other)
+        } else {
+            format!("(floor {}% · weekly {}%)", self.other, self.weekly)
+        }
+    }
+}
+
+impl Default for RemainingFloors {
+    fn default() -> Self {
+        Self::factory()
+    }
+}
+
+/// Weekly percent windows that use [`RemainingFloors::weekly`].
+pub fn is_weekly_kind(kind: &str) -> bool {
+    matches!(kind, "weekly_all" | "weekly_scoped")
+}
+
 /// Operator usage policy (remaining floor + horizon knobs + ordered rules).
 ///
 /// Serde wiring onto `routing` / config JSON lands with FEAT-008; evaluate takes
@@ -80,9 +142,14 @@ pub enum OnLowAction {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct UsagePolicy {
-    /// Remaining-percent floor (0–100). Default **8**. Not a ratio.
+    /// Remaining-percent floor for session / other percent windows (0–100).
+    /// Default **2**. Not a ratio. Weekly windows use
+    /// [`Self::remaining_min_weekly_percent`].
     #[serde(default = "default_remaining_min_percent")]
     pub remaining_min_percent: u8,
+    /// Remaining-percent floor for weekly windows (0–100). Default **1**.
+    #[serde(default = "default_remaining_min_weekly_percent")]
+    pub remaining_min_weekly_percent: u8,
     #[serde(default = "default_wait_if_reset_within_minutes")]
     pub wait_if_reset_within_minutes: u64,
     #[serde(default = "default_stop_if_reset_beyond_hours")]
@@ -95,7 +162,10 @@ pub struct UsagePolicy {
 }
 
 fn default_remaining_min_percent() -> u8 {
-    8
+    2
+}
+fn default_remaining_min_weekly_percent() -> u8 {
+    1
 }
 fn default_wait_if_reset_within_minutes() -> u64 {
     60
@@ -111,10 +181,38 @@ impl Default for UsagePolicy {
     fn default() -> Self {
         Self {
             remaining_min_percent: default_remaining_min_percent(),
+            remaining_min_weekly_percent: default_remaining_min_weekly_percent(),
             wait_if_reset_within_minutes: default_wait_if_reset_within_minutes(),
             stop_if_reset_beyond_hours: default_stop_if_reset_beyond_hours(),
             ask_ttl_minutes: default_ask_ttl_minutes(),
             rules: Vec::new(),
+        }
+    }
+}
+
+impl UsagePolicy {
+    /// Overlay per-run CLI horizon flags. `None` keeps the current value
+    /// (`Some(0)` is present zero — wait-within 0 minutes).
+    pub fn overlay_horizon(
+        &self,
+        wait_within_minutes: Option<u64>,
+        stop_beyond_hours: Option<u64>,
+    ) -> Self {
+        let mut out = self.clone();
+        if let Some(w) = wait_within_minutes {
+            out.wait_if_reset_within_minutes = w;
+        }
+        if let Some(s) = stop_beyond_hours {
+            out.stop_if_reset_beyond_hours = s;
+        }
+        out
+    }
+
+    /// Floors from this policy's serde fields (before CLI/env overlay).
+    pub fn floors(&self) -> RemainingFloors {
+        RemainingFloors {
+            other: self.remaining_min_percent,
+            weekly: self.remaining_min_weekly_percent,
         }
     }
 }
@@ -166,7 +264,7 @@ pub struct AccountLowInput {
 pub fn evaluate_quota(
     buckets: &[QuotaBucket],
     policy: &UsagePolicy,
-    remaining_min: u8,
+    floors: RemainingFloors,
 ) -> QuotaEval {
     let now = Utc::now();
     let mut per_bucket = Vec::with_capacity(buckets.len());
@@ -174,7 +272,7 @@ pub fn evaluate_quota(
     let mut account_low = Vec::new();
 
     for bucket in buckets {
-        let eval = evaluate_one(bucket, policy, remaining_min, now);
+        let eval = evaluate_one(bucket, policy, floors, now);
         match &eval {
             BucketEval::Unavailable { rungs } => {
                 for rung in rungs {
@@ -212,10 +310,10 @@ pub fn evaluate_quota(
 fn evaluate_one(
     bucket: &QuotaBucket,
     policy: &UsagePolicy,
-    remaining_min: u8,
+    floors: RemainingFloors,
     now: DateTime<Utc>,
 ) -> BucketEval {
-    let floor = f64::from(remaining_min);
+    let floor = f64::from(floors.for_kind(&bucket.kind));
     let percent = percent_remaining(bucket);
     let amount = non_percent_remaining(bucket);
     let rung_scoped = is_rung_scoped(bucket);
@@ -407,7 +505,11 @@ mod tests {
     #[test]
     fn evaluate_ignores_when_remaining_above_floor() {
         let buckets = [percent_bucket("five_hour", "session", 76.0, None)];
-        let eval = evaluate_quota(&buckets, &UsagePolicy::default(), 8);
+        let eval = evaluate_quota(
+            &buckets,
+            &UsagePolicy::default(),
+            RemainingFloors::uniform(8),
+        );
         assert_eq!(eval.per_bucket.len(), 1);
         assert_eq!(eval.per_bucket[0].1, BucketEval::Ignore);
         assert!(eval.unavailable.is_empty());
@@ -417,7 +519,11 @@ mod tests {
     #[test]
     fn evaluate_account_binding_low_emits_account_low_not_ask() {
         let buckets = [percent_bucket("seven_day", "weekly_all", 5.0, None)];
-        let eval = evaluate_quota(&buckets, &UsagePolicy::default(), 8);
+        let eval = evaluate_quota(
+            &buckets,
+            &UsagePolicy::default(),
+            RemainingFloors::uniform(8),
+        );
         match &eval.per_bucket[0].1 {
             BucketEval::AccountLow {
                 remaining,
@@ -449,7 +555,11 @@ mod tests {
             5.0,
             Some(rungs.clone()),
         )];
-        let eval = evaluate_quota(&buckets, &UsagePolicy::default(), 8);
+        let eval = evaluate_quota(
+            &buckets,
+            &UsagePolicy::default(),
+            RemainingFloors::uniform(8),
+        );
         match &eval.per_bucket[0].1 {
             BucketEval::Unavailable { rungs: got } => assert_eq!(got, &rungs),
             other => panic!("expected Unavailable, got {other:?}"),
@@ -467,7 +577,7 @@ mod tests {
         let mut b = percent_bucket("weekly", "weekly_all", 50.0, None);
         b.severity = Some("critical".into());
         b.is_active = Some(true);
-        let eval = evaluate_quota(&[b], &UsagePolicy::default(), 8);
+        let eval = evaluate_quota(&[b], &UsagePolicy::default(), RemainingFloors::uniform(8));
         assert_eq!(eval.per_bucket[0].1, BucketEval::Ignore);
     }
 
@@ -475,7 +585,11 @@ mod tests {
     fn evaluate_unknown_kind_low_is_ignore() {
         // nimbus_quill-shaped: 0% remaining, no rungs, not session/weekly_all.
         let buckets = [percent_bucket("nimbus_quill", "nimbus_quill", 0.0, None)];
-        let eval = evaluate_quota(&buckets, &UsagePolicy::default(), 8);
+        let eval = evaluate_quota(
+            &buckets,
+            &UsagePolicy::default(),
+            RemainingFloors::uniform(8),
+        );
         assert_eq!(eval.per_bucket[0].1, BucketEval::Ignore);
         assert!(eval.account_low.is_empty());
         assert!(eval.unavailable.is_empty());
@@ -498,7 +612,7 @@ mod tests {
             0.0,
             Some(vec![(Provider::Claude, CapabilityTier::Frontier)]),
         )];
-        let eval = evaluate_quota(&buckets, &policy, 8);
+        let eval = evaluate_quota(&buckets, &policy, RemainingFloors::uniform(8));
         assert_eq!(eval.per_bucket[0].1, BucketEval::Ignore);
         assert!(eval.unavailable.is_empty());
     }
@@ -521,7 +635,7 @@ mod tests {
             5.0,
             Some(vec![(Provider::Claude, CapabilityTier::Frontier)]),
         )];
-        let eval = evaluate_quota(&buckets, &policy, 8);
+        let eval = evaluate_quota(&buckets, &policy, RemainingFloors::uniform(8));
         match &eval.per_bucket[0].1 {
             BucketEval::AccountLow {
                 remaining,
@@ -561,7 +675,7 @@ mod tests {
                 0.0,
                 Some(vec![(Provider::Claude, CapabilityTier::Frontier)]),
             )];
-            let eval = evaluate_quota(&buckets, &policy, 8);
+            let eval = evaluate_quota(&buckets, &policy, RemainingFloors::uniform(8));
             assert!(
                 matches!(eval.per_bucket[0].1, BucketEval::AccountLow { .. }),
                 "{action:?} on scoped must emit AccountLow, got {:?}",
@@ -588,7 +702,11 @@ mod tests {
             is_active: None,
             rungs: None,
         };
-        let eval = evaluate_quota(&[bucket], &UsagePolicy::default(), 8);
+        let eval = evaluate_quota(
+            &[bucket],
+            &UsagePolicy::default(),
+            RemainingFloors::uniform(8),
+        );
         assert_eq!(eval.per_bucket[0].1, BucketEval::Ignore);
     }
 
@@ -607,7 +725,11 @@ mod tests {
             is_active: None,
             rungs: None,
         };
-        let eval = evaluate_quota(&[bucket], &UsagePolicy::default(), 8);
+        let eval = evaluate_quota(
+            &[bucket],
+            &UsagePolicy::default(),
+            RemainingFloors::uniform(8),
+        );
         match &eval.per_bucket[0].1 {
             BucketEval::AccountLow { remaining, low, .. } => {
                 assert!(*remaining == 0.0);
@@ -638,7 +760,7 @@ mod tests {
         let eval = evaluate_quota(
             &[dollars_bucket("extra_usage", "extra_usage", 0.0)],
             &UsagePolicy::default(),
-            8,
+            RemainingFloors::uniform(8),
         );
         assert_eq!(eval.per_bucket[0].1, BucketEval::Ignore);
         assert!(eval.account_low.is_empty());
@@ -649,7 +771,7 @@ mod tests {
         let eval = evaluate_quota(
             &[dollars_bucket("nimbus_quill", "nimbus_quill", 0.0)],
             &UsagePolicy::default(),
-            8,
+            RemainingFloors::uniform(8),
         );
         assert_eq!(eval.per_bucket[0].1, BucketEval::Ignore);
         assert!(eval.account_low.is_empty());
@@ -660,7 +782,7 @@ mod tests {
         let eval = evaluate_quota(
             &[dollars_bucket("promotional", "promotional", 0.0)],
             &UsagePolicy::default(),
-            8,
+            RemainingFloors::uniform(8),
         );
         assert_eq!(eval.per_bucket[0].1, BucketEval::Ignore);
         assert!(eval.account_low.is_empty());
@@ -669,7 +791,84 @@ mod tests {
     #[test]
     fn evaluate_does_not_take_other_rungs_runnable() {
         // Compile-time / API shape guard: three-arg signature only.
-        let _f: fn(&[QuotaBucket], &UsagePolicy, u8) -> QuotaEval = evaluate_quota;
+        let _f: fn(&[QuotaBucket], &UsagePolicy, RemainingFloors) -> QuotaEval = evaluate_quota;
+    }
+
+    #[test]
+    fn factory_floors_weekly_two_is_ignore_one_is_low() {
+        let policy = UsagePolicy::default();
+        let floors = RemainingFloors::factory();
+        let above = percent_bucket("seven_day", "weekly_all", 2.0, None);
+        let eval = evaluate_quota(std::slice::from_ref(&above), &policy, floors);
+        assert_eq!(eval.per_bucket[0].1, BucketEval::Ignore);
+        let low = percent_bucket("seven_day", "weekly_all", 1.0, None);
+        let eval = evaluate_quota(std::slice::from_ref(&low), &policy, floors);
+        match &eval.per_bucket[0].1 {
+            BucketEval::AccountLow {
+                remaining,
+                kind,
+                low,
+                ..
+            } => {
+                assert!((*remaining - 1.0).abs() < f64::EPSILON);
+                assert_eq!(kind, "weekly_all");
+                assert!(*low);
+            }
+            other => panic!("expected AccountLow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn factory_floors_session_three_is_ignore_two_is_low() {
+        let policy = UsagePolicy::default();
+        let floors = RemainingFloors::factory();
+        let above = percent_bucket("five_hour", "session", 3.0, None);
+        let eval = evaluate_quota(std::slice::from_ref(&above), &policy, floors);
+        assert_eq!(eval.per_bucket[0].1, BucketEval::Ignore);
+        let low = percent_bucket("five_hour", "session", 2.0, None);
+        let eval = evaluate_quota(std::slice::from_ref(&low), &policy, floors);
+        match &eval.per_bucket[0].1 {
+            BucketEval::AccountLow {
+                remaining,
+                kind,
+                low,
+                ..
+            } => {
+                assert!((*remaining - 2.0).abs() < f64::EPSILON);
+                assert_eq!(kind, "session");
+                assert!(*low);
+            }
+            other => panic!("expected AccountLow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn factory_floors_session_two_weekly_two_only_session_low() {
+        let policy = UsagePolicy::default();
+        let floors = RemainingFloors::factory();
+        let buckets = [
+            percent_bucket("five_hour", "session", 2.0, None),
+            percent_bucket("seven_day", "weekly_all", 2.0, None),
+        ];
+        let eval = evaluate_quota(&buckets, &policy, floors);
+        match &eval.per_bucket[0].1 {
+            BucketEval::AccountLow { kind, .. } => assert_eq!(kind, "session"),
+            other => panic!("session 2 must be AccountLow, got {other:?}"),
+        }
+        assert_eq!(eval.per_bucket[1].1, BucketEval::Ignore);
+        assert_eq!(eval.account_low.len(), 1);
+        assert_eq!(eval.account_low[0].kind, "session");
+    }
+
+    #[test]
+    fn overlay_horizon_present_zero_wait_is_not_omitted() {
+        let policy = UsagePolicy::default();
+        let over = policy.overlay_horizon(Some(0), None);
+        assert_eq!(over.wait_if_reset_within_minutes, 0);
+        assert_eq!(over.stop_if_reset_beyond_hours, 12);
+        let over = policy.overlay_horizon(None, Some(1));
+        assert_eq!(over.wait_if_reset_within_minutes, 60);
+        assert_eq!(over.stop_if_reset_beyond_hours, 1);
     }
 
     #[test]

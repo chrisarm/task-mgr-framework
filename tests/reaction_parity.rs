@@ -44,6 +44,7 @@ use task_mgr::db::{create_schema, open_connection};
 use task_mgr::loop_engine::config::{IterationOutcome, PermissionMode};
 use task_mgr::loop_engine::engine::{BlackoutState, UnavailableRungsMap};
 use task_mgr::loop_engine::model::{Provider, builtin_resolved_models};
+use task_mgr::loop_engine::quota::RemainingFloors;
 use task_mgr::loop_engine::reactions::account::{
     AccountReaction, AccountReactionParams, AccountStopSequentialMapping, AccountStopWaveMapping,
     OutputReactionItem, WaitFn, account_stop_sequential_mapping, account_stop_wave_mapping,
@@ -185,7 +186,7 @@ static PERMISSION_MODE: PermissionMode = PermissionMode::Dangerous;
 /// TempDir path (the injected wait never actually polls it).
 fn params<'a>(tasks_dir: &'a Path, fallback_wait: u64) -> AccountReactionParams<'a> {
     AccountReactionParams {
-        threshold: 80,
+        floors: RemainingFloors::uniform(80),
         usage_enabled: false,
         // Claude-enabled is the historical default these inner cases were
         // written against. The hermetic inner ignores the field entirely (the
@@ -878,7 +879,7 @@ fn all_overrides_cleared(ctx: &IterationContext, task_id: &str) -> bool {
 /// the coordinator must map it through unchanged.
 struct UsageGateSpy {
     calls: Cell<u32>,
-    last_threshold: Cell<Option<u8>>,
+    last_threshold: Cell<Option<RemainingFloors>>,
     last_fallback: Cell<Option<u64>>,
 }
 
@@ -891,10 +892,10 @@ impl UsageGateSpy {
         }
     }
 
-    fn closure(&self) -> impl Fn(u8, &Path, u64) -> UsageCheckResult + '_ {
-        move |threshold, _dir, fallback| {
+    fn closure(&self) -> impl Fn(RemainingFloors, &Path, u64) -> UsageCheckResult + '_ {
+        move |floors, _dir, fallback| {
             self.calls.set(self.calls.get() + 1);
-            self.last_threshold.set(Some(threshold));
+            self.last_threshold.set(Some(floors));
             self.last_fallback.set(Some(fallback));
             UsageCheckResult::BelowThreshold
         }
@@ -1101,7 +1102,7 @@ fn account_usage_gate_inner_same_decision_both_shapes() {
     let seq_gate = seq_spy.closure();
     let seq_decision = account_usage_gate_inner(
         AccountUsageGateParams {
-            threshold: 80,
+            floors: RemainingFloors::uniform(80),
             tasks_dir: seq_dir.path(),
             fallback_wait: 600,
         },
@@ -1112,7 +1113,7 @@ fn account_usage_gate_inner_same_decision_both_shapes() {
     let wave_gate = wave_spy.closure();
     let wave_decision = account_usage_gate_inner(
         AccountUsageGateParams {
-            threshold: 80,
+            floors: RemainingFloors::uniform(80),
             tasks_dir: wave_dir.path(),
             fallback_wait: 600,
         },
@@ -1136,7 +1137,7 @@ fn account_usage_gate_inner_same_decision_both_shapes() {
     );
     assert_eq!(
         seq_spy.last_threshold.get(),
-        Some(80),
+        Some(RemainingFloors::uniform(80)),
         "the threshold param must flow through to the gate, not be dropped",
     );
     assert_eq!(seq_spy.last_fallback.get(), Some(600));
@@ -1206,7 +1207,7 @@ fn pre_spawn_and_gate_harness_compiles_and_setup_works() {
     let spy = UsageGateSpy::new();
     let _gate = spy.closure();
     let _gate_params = AccountUsageGateParams {
-        threshold: 80,
+        floors: RemainingFloors::uniform(80),
         tasks_dir: db_temp.path(),
         fallback_wait: 600,
     };
@@ -3111,8 +3112,8 @@ impl IoSeamSpy {
         }
     }
 
-    fn usage_gate(&self) -> impl Fn(u8, &Path, u64) -> UsageCheckResult + '_ {
-        move |_threshold, _tasks_dir, _fallback_wait| {
+    fn usage_gate(&self) -> impl Fn(RemainingFloors, &Path, u64) -> UsageCheckResult + '_ {
+        move |_floors, _tasks_dir, _fallback_wait| {
             self.usage_gate_calls.set(self.usage_gate_calls.get() + 1);
             if self.usage_gate_waited {
                 UsageCheckResult::WaitedAndReset
@@ -3269,7 +3270,7 @@ fn claude_disabled_rate_limit_never_reaches_exploding_anthropic_seams() {
     let boom_load = || -> Option<UsageInfo> {
         panic!("load_usage_info reached on a Claude-disabled loop");
     };
-    let boom_gate = |_: u8, _: &Path, _: u64| -> UsageCheckResult {
+    let boom_gate = |_: RemainingFloors, _: &Path, _: u64| -> UsageCheckResult {
         panic!("Anthropic usage load reached on a Claude-disabled loop");
     };
     let boom_probe = |_: &PermissionMode| -> bool {
@@ -3668,7 +3669,7 @@ fn collapsed_single_flag_wait<'a>(
     move |wait_secs: u64| {
         // BUG: `anthropic_account_io_allowed` is never consulted.
         if p.usage_enabled {
-            match usage_gate(p.threshold, p.tasks_dir, p.fallback_wait) {
+            match usage_gate(p.floors, p.tasks_dir, p.fallback_wait) {
                 UsageCheckResult::StopSignaled => return false,
                 UsageCheckResult::WaitedAndReset => return true,
                 _ => {}
@@ -4345,7 +4346,9 @@ fn account_quota_preflight_inner_same_decision_both_shapes() {
 
     let seq = account_quota_preflight_inner(
         QuotaPreflightParams {
-            threshold: 8,
+            floors: RemainingFloors::uniform(8),
+            wait_if_reset_within_cli: None,
+            stop_if_reset_beyond_cli: None,
             tasks_dir: Path::new("/tmp"),
             db_dir: Path::new("/tmp"),
             fallback_wait: 300,
@@ -4365,7 +4368,9 @@ fn account_quota_preflight_inner_same_decision_both_shapes() {
     );
     let wave = account_quota_preflight_inner(
         QuotaPreflightParams {
-            threshold: 8,
+            floors: RemainingFloors::uniform(8),
+            wait_if_reset_within_cli: None,
+            stop_if_reset_beyond_cli: None,
             tasks_dir: Path::new("/tmp"),
             db_dir: Path::new("/tmp"),
             fallback_wait: 300,

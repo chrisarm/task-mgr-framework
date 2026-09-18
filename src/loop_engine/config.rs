@@ -14,10 +14,14 @@ const ITERATION_HEADROOM_MULTIPLIER: f64 = 1.75;
 pub struct LoopConfig {
     /// Maximum iterations before stopping (0 = auto-calculate from task count)
     pub max_iterations: usize,
-    /// Remaining-percent floor (0–100). Wait when account remaining ≤ this.
-    /// Default **8**. Precedence at startup: `LOOP_USAGE_REMAINING_MIN` >
-    /// `usagePolicy.remainingMinPercent` > 8. Old used≥92 ≡ remaining≤8.
+    /// Remaining-percent floor for session / other windows (0–100).
+    /// Default **2**. Precedence at startup: CLI `--usage-remaining-min` >
+    /// `LOOP_USAGE_REMAINING_MIN` > `usagePolicy.remainingMinPercent` > 2.
     pub usage_remaining_min: u8,
+    /// Remaining-percent floor for weekly windows (0–100). Default **1**.
+    /// Precedence: CLI `--usage-remaining-min-weekly` >
+    /// `LOOP_USAGE_REMAINING_MIN_WEEKLY` > `usagePolicy.remainingMinWeeklyPercent` > 1.
+    pub usage_remaining_min_weekly: u8,
     /// Maximum consecutive crashes before aborting the loop
     pub max_crashes: u8,
     /// Delay in seconds between iterations
@@ -97,13 +101,22 @@ pub struct LoopConfig {
     /// `config.json`. Threaded into `UsageParams.ask_ttl_override` at startup
     /// so `effective_ttl` reaches `ask_or_defer` before apply.
     pub use_other_models_ttl: Option<u64>,
+    /// CLI `--usage-remaining-min` (`None` = env/config/factory).
+    pub usage_remaining_min_cli: Option<u8>,
+    /// CLI `--usage-remaining-min-weekly` (`None` = env/config/factory).
+    pub usage_remaining_min_weekly_cli: Option<u8>,
+    /// CLI `--wait-if-reset-within` minutes (`None` = config; `Some(0)` present zero).
+    pub wait_if_reset_within_cli: Option<u64>,
+    /// CLI `--stop-if-reset-beyond` hours (`None` = config; `Some(0)` present zero).
+    pub stop_if_reset_beyond_cli: Option<u64>,
 }
 
 impl Default for LoopConfig {
     fn default() -> Self {
         Self {
             max_iterations: 0,
-            usage_remaining_min: 8,
+            usage_remaining_min: 2,
+            usage_remaining_min_weekly: 1,
             max_crashes: 3,
             iteration_delay_secs: 2,
             usage_fallback_wait: 300,
@@ -117,6 +130,10 @@ impl Default for LoopConfig {
             cleanup_worktree: false,
             parallel_slots: 2,
             use_other_models_ttl: None,
+            usage_remaining_min_cli: None,
+            usage_remaining_min_weekly_cli: None,
+            wait_if_reset_within_cli: None,
+            stop_if_reset_beyond_cli: None,
         }
     }
 }
@@ -129,8 +146,11 @@ impl LoopConfig {
     ///
     /// - `LOOP_MAX_ITERATIONS` → `max_iterations` (usize)
     /// - `LOOP_USAGE_REMAINING_MIN` → `usage_remaining_min` (u8, 0-100).
-    ///   Invalid values are ignored (default 8). Legacy `LOOP_USAGE_THRESHOLD`
+    ///   Invalid values are ignored (default 2). Legacy `LOOP_USAGE_THRESHOLD`
     ///   is **not** read here — loop/batch preflight hard-errors if it is set.
+    ///   Does **not** override weekly.
+    /// - `LOOP_USAGE_REMAINING_MIN_WEEKLY` → `usage_remaining_min_weekly`
+    ///   (u8, 0-100). Invalid values ignored (default 1).
     /// - `LOOP_MAX_CRASHES` → `max_crashes` (u8)
     /// - `LOOP_ITERATION_DELAY_SECS` → `iteration_delay_secs` (u64)
     /// - `LOOP_USAGE_FALLBACK_WAIT` → `usage_fallback_wait` (u64)
@@ -151,6 +171,8 @@ impl LoopConfig {
             max_iterations: parse_env("LOOP_MAX_ITERATIONS").unwrap_or(defaults.max_iterations),
             usage_remaining_min: parse_env("LOOP_USAGE_REMAINING_MIN")
                 .unwrap_or(defaults.usage_remaining_min),
+            usage_remaining_min_weekly: parse_env("LOOP_USAGE_REMAINING_MIN_WEEKLY")
+                .unwrap_or(defaults.usage_remaining_min_weekly),
             max_crashes: parse_env("LOOP_MAX_CRASHES").unwrap_or(defaults.max_crashes),
             iteration_delay_secs: parse_env("LOOP_ITERATION_DELAY_SECS")
                 .unwrap_or(defaults.iteration_delay_secs),
@@ -171,16 +193,23 @@ impl LoopConfig {
                 .unwrap_or(defaults.parallel_slots),
             // CLI-only: never read from env (flag omitted → None).
             use_other_models_ttl: defaults.use_other_models_ttl,
+            usage_remaining_min_cli: defaults.usage_remaining_min_cli,
+            usage_remaining_min_weekly_cli: defaults.usage_remaining_min_weekly_cli,
+            wait_if_reset_within_cli: defaults.wait_if_reset_within_cli,
+            stop_if_reset_beyond_cli: defaults.stop_if_reset_beyond_cli,
         }
     }
 }
 
-/// Resolve the live remaining-percent floor.
-///
-/// Precedence: `LOOP_USAGE_REMAINING_MIN` (when present + valid) >
-/// `usagePolicy.remainingMinPercent` (config) > **8**.
+/// Resolve one remaining-percent floor: CLI > env > config > factory default
+/// encoded in `config_remaining_min` (serde default already applied).
 pub fn resolve_usage_remaining_min(env: Option<u8>, config_remaining_min: u8) -> u8 {
     env.unwrap_or(config_remaining_min)
+}
+
+/// CLI > env > config for one floor. Present CLI zero is `Some(0)`.
+pub fn resolve_remaining_floor(cli: Option<u8>, env: Option<u8>, config_remaining_min: u8) -> u8 {
+    cli.or(env).unwrap_or(config_remaining_min)
 }
 
 /// Parse a string value into a type that implements `FromStr`.
@@ -629,8 +658,12 @@ mod tests {
     fn test_loop_config_default_usage_remaining_min() {
         let config = LoopConfig::default();
         assert_eq!(
-            config.usage_remaining_min, 8,
-            "usage_remaining_min should default to 8"
+            config.usage_remaining_min, 2,
+            "usage_remaining_min should default to 2"
+        );
+        assert_eq!(
+            config.usage_remaining_min_weekly, 1,
+            "usage_remaining_min_weekly should default to 1"
         );
     }
 
@@ -638,7 +671,10 @@ mod tests {
     fn test_resolve_usage_remaining_min_precedence() {
         assert_eq!(resolve_usage_remaining_min(Some(15), 10), 15);
         assert_eq!(resolve_usage_remaining_min(None, 10), 10);
-        assert_eq!(resolve_usage_remaining_min(None, 8), 8);
+        assert_eq!(resolve_usage_remaining_min(None, 2), 2);
+        assert_eq!(resolve_remaining_floor(Some(0), Some(15), 10), 0);
+        assert_eq!(resolve_remaining_floor(None, Some(15), 10), 15);
+        assert_eq!(resolve_remaining_floor(None, None, 2), 2);
     }
 
     // Share CLAUDE_BINARY_MUTEX with project_config remaining-min preflight
@@ -667,8 +703,8 @@ mod tests {
         let config = LoopConfig::from_env();
         unsafe { std::env::remove_var("LOOP_USAGE_REMAINING_MIN") };
         assert_eq!(
-            config.usage_remaining_min, 8,
-            "invalid LOOP_USAGE_REMAINING_MIN must fall back to default 8"
+            config.usage_remaining_min, 2,
+            "invalid LOOP_USAGE_REMAINING_MIN must fall back to default 2"
         );
     }
 
@@ -682,7 +718,7 @@ mod tests {
         let config = LoopConfig::from_env();
         unsafe { std::env::remove_var("LOOP_USAGE_THRESHOLD") };
         assert_eq!(
-            config.usage_remaining_min, 8,
+            config.usage_remaining_min, 2,
             "LOOP_USAGE_THRESHOLD must not silently drive usage_remaining_min"
         );
     }
@@ -1499,6 +1535,7 @@ mod tests {
         let LoopConfig {
             max_iterations: _,
             usage_remaining_min: _,
+            usage_remaining_min_weekly: _,
             max_crashes: _,
             iteration_delay_secs: _,
             usage_fallback_wait: _,
@@ -1512,6 +1549,10 @@ mod tests {
             cleanup_worktree: _,
             parallel_slots: _,
             use_other_models_ttl: _,
+            usage_remaining_min_cli: _,
+            usage_remaining_min_weekly_cli: _,
+            wait_if_reset_within_cli: _,
+            stop_if_reset_beyond_cli: _,
         } = config;
         // Exhaustive destructure compiles only if LoopConfig has exactly these fields.
     }

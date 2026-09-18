@@ -10,23 +10,29 @@
 //! queue is empty), guaranteeing the new task ranks ahead on the next
 //! iteration.
 
-use std::fmt;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::commands::context::{
+    choose_cli_write_path, cli_write_path, load_known_prefixes, locate_prd_json,
+    sole_task_list_path,
+};
 use crate::commands::init::import::{
     DEPRECATED_RELATIONSHIPS_WARNING, insert_relationship, insert_task, insert_task_file,
-    insert_task_relationships,
+    insert_task_relationships, resolve_prd_file_path,
 };
 use crate::commands::init::parse::PrdUserStory;
 use crate::commands::next;
-use crate::loop_engine::output_parsing::strip_task_prefix;
+use crate::commands::prd_json::append_user_story;
 use crate::output::ui;
 use crate::{TaskMgrError, TaskMgrResult};
+
+// Re-export so `commands::add::resolve_context` (main.rs logging) and existing
+// test paths keep compiling after the move to `commands::context`.
+pub use crate::commands::context::{ResolutionSource, ResolvedContext, resolve_context};
 
 /// Deserialized input for `task-mgr add`.
 ///
@@ -166,13 +172,22 @@ pub enum PrioritySource {
 ///
 /// `db_dir` is the `.task-mgr` directory. `input_json` is a single task's
 /// PRD-shape JSON. `priority_override` from the CLI wins over any
-/// `priority` field in the input JSON.
+/// `priority` field in the input JSON. `from_json` pins an already-registered
+/// effort (CONTRACT-002); missing/directory paths fail before input parse.
 pub fn add(
     db_dir: &Path,
     input_json: &str,
     priority_override: Option<i32>,
     depended_on_by: &[String],
+    from_json: Option<&Path>,
 ) -> TaskMgrResult<AddResult> {
+    // Missing / directory pin checks before parsing input JSON (AC: error
+    // before parse). Full registration still runs via resolve_context below
+    // (needs the DB) and still precedes any write transaction.
+    if let Some(path) = from_json {
+        preflight_from_json_path(path)?;
+    }
+
     let input: AddTaskInput = serde_json::from_str(input_json).map_err(|e| {
         TaskMgrError::invalid_state(
             "add",
@@ -201,17 +216,98 @@ pub fn add(
 
     let _lock = crate::db::LockGuard::acquire(db_dir)?;
     let conn = crate::db::open_connection(db_dir)?;
+    let (source_root, worktree_root) = default_prd_roots(db_dir);
 
-    add_with_conn(&conn, input, priority_override, depended_on_by)
+    add_with_conn_in(
+        &conn,
+        input,
+        priority_override,
+        depended_on_by,
+        from_json,
+        Some(&source_root),
+        Some(&worktree_root),
+    )
+}
+
+/// Same fallback as [`crate::commands::init::InitOpts::resolve_roots`].
+fn default_prd_roots(db_dir: &Path) -> (PathBuf, PathBuf) {
+    let source_root = crate::git::main_repo_root_at(db_dir)
+        .or_else(|| db_dir.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| db_dir.to_path_buf());
+    let worktree_root = std::env::current_dir()
+        .ok()
+        .filter(|cwd| crate::git::is_inside_worktree_at(cwd).unwrap_or(false))
+        .unwrap_or_else(|| source_root.clone());
+    (source_root, worktree_root)
+}
+
+/// Filesystem-only preflight for `--from-json`: missing and non-file paths
+/// fail before input JSON parse. Registration matching stays in
+/// `resolve_context` (needs DB) but still before any write transaction.
+fn preflight_from_json_path(path: &Path) -> TaskMgrResult<()> {
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(TaskMgrError::invalid_state(
+                "add",
+                "--from-json",
+                "an existing regular file path to a registered task_list",
+                format!("path does not exist: {}", path.display()),
+            ));
+        }
+        Err(e) => {
+            return Err(TaskMgrError::io_error(
+                path.display().to_string(),
+                "reading --from-json path metadata",
+                e,
+            ));
+        }
+    };
+    if !meta.file_type().is_file() {
+        return Err(TaskMgrError::invalid_state(
+            "add",
+            "--from-json",
+            "a regular file (already-registered task_list)",
+            format!(
+                "path is not a regular file (directory or special): {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Testable variant that takes an already-open connection (used by unit tests
 /// with in-memory DBs).
+///
+/// `source_root` / `worktree_root` resolve stored `prd_files` paths via
+/// [`resolve_prd_file_path`]. Tests may pass the temp project dir for both.
 pub fn add_with_conn(
+    conn: &Connection,
+    input: AddTaskInput,
+    priority_override: Option<i32>,
+    depended_on_by: &[String],
+    from_json: Option<&Path>,
+) -> TaskMgrResult<AddResult> {
+    add_with_conn_in(
+        conn,
+        input,
+        priority_override,
+        depended_on_by,
+        from_json,
+        None,
+        None,
+    )
+}
+
+fn add_with_conn_in(
     conn: &Connection,
     mut input: AddTaskInput,
     priority_override: Option<i32>,
     depended_on_by: &[String],
+    from_json: Option<&Path>,
+    source_root: Option<&Path>,
+    worktree_root: Option<&Path>,
 ) -> TaskMgrResult<AddResult> {
     // Re-validate id/title so callers that bypass `add()` (tests, future
     // internal callers) still get the guarantee.
@@ -232,10 +328,35 @@ pub fn add_with_conn(
         ));
     }
 
-    // Auto-prefix: when exactly one active PRD prefix exists, prepend it to the
-    // task ID and all cross-references. Idempotent — already-prefixed IDs are
-    // left unchanged.
-    let resolved_ctx = resolve_context(conn)?;
+    // Auto-prefix / pin: flag → env → single-prefix. Empty prefix (NULL-prefix
+    // --from-json pin) skips apply_prefix AND prefix_id.
+    let resolved_ctx = crate::commands::context::resolve_context_with_roots(
+        conn,
+        from_json,
+        "add",
+        source_root,
+        worktree_root,
+    )?;
+
+    // Add-only write policy (CONTRACT-002 / FEAT-006): refuse unpinned writes
+    // when ≥2 non-NULL prefixes are registered. Keep this OUT of
+    // resolve_context so `current` stays an Ok(None) probe. Do NOT fold into
+    // `if ctx.is_none()` alone — that breaks zero-prefix / --no-prefix insert.
+    if resolved_ctx.is_none() {
+        let known = load_known_prefixes(conn)?;
+        if known.len() >= 2 {
+            return Err(TaskMgrError::invalid_state(
+                "add",
+                "--from-json / TASK_MGR_ACTIVE_PREFIX",
+                "pin via --from-json or TASK_MGR_ACTIVE_PREFIX",
+                format!(
+                    "{} registered prefixes ({}), none selected",
+                    known.len(),
+                    known.join(", ")
+                ),
+            ));
+        }
+    }
 
     // Emit resolved-context line as the FIRST stderr output, before any write
     // or downstream warning. Agents can read stderr line 1 to learn which PRD
@@ -261,20 +382,26 @@ pub fn add_with_conn(
     let prefixed_depended_on_by: Vec<String>;
     let effective_depended_on_by: &[String] = if let Some(ref ctx) = resolved_ctx {
         let prefix = &ctx.prefix;
-        reject_foreign_prefix(conn, &input.id, &input.depends_on, depended_on_by, prefix)?;
-        let original_id = input.id.clone();
-        input.apply_prefix(prefix);
-        if input.id != original_id {
-            ui::emit(&format!(
-                "Note: auto-prefixed task ID as {} (active prefix: {})",
-                input.id, prefix,
-            ));
+        if prefix.is_empty() {
+            // NULL-prefix / --no-prefix pin: skip apply_prefix AND prefix_id
+            // (otherwise prefix_id("", "FEAT-001") → "-FEAT-001").
+            depended_on_by
+        } else {
+            reject_foreign_prefix(conn, &input.id, &input.depends_on, depended_on_by, prefix)?;
+            let original_id = input.id.clone();
+            input.apply_prefix(prefix);
+            if input.id != original_id {
+                ui::emit(&format!(
+                    "Note: auto-prefixed task ID as {} (active prefix: {})",
+                    input.id, prefix,
+                ));
+            }
+            prefixed_depended_on_by = depended_on_by
+                .iter()
+                .map(|id| super::init::prefix_id(prefix, id))
+                .collect();
+            &prefixed_depended_on_by
         }
-        prefixed_depended_on_by = depended_on_by
-            .iter()
-            .map(|id| super::init::prefix_id(prefix, id))
-            .collect();
-        &prefixed_depended_on_by
     } else {
         depended_on_by
     };
@@ -318,7 +445,13 @@ pub fn add_with_conn(
     // Resolve priority.
     let (priority, priority_source) = resolve_priority(conn, &input, priority_override);
 
-    let task_prefix = input.task_prefix().map(String::from);
+    // JSON sync strip prefix: active PRD prefix only. Never derive from id
+    // shape — CODE-FIX-001 → "CODE" would strip to FIX-001 on NULL-prefix.
+    let task_prefix = resolved_ctx
+        .as_ref()
+        .map(|c| c.prefix.as_str())
+        .filter(|p| !p.is_empty())
+        .map(str::to_string);
     let story = input.into_prd_user_story(priority);
 
     // Insert task + relationships + files in a single transaction.
@@ -340,10 +473,42 @@ pub fn add_with_conn(
     }
 
     // Best-effort PRD JSON sync. Failure here logs but does not roll back
-    // the DB — the task is already in the database, and `task-mgr export`
-    // can reconcile the JSON later.
-    let prd_path = match locate_prd_json(conn, task_prefix.as_deref()) {
-        Ok(Some(path)) => match append_task_to_prd_json(
+    // the DB — the task is already in the database (learnings #3440 / #1561).
+    // Operator copy names `task-mgr current` and retry `--from-json`, never
+    // export. Write path is `ctx.prd_json_path` only (learning #4237) — never
+    // re-resolve a task_list row after commit. `--from-json` already stored
+    // the canonical flag PATH; default stored remap-then-is_file. `ctx is
+    // None` → sync iff exactly one task_list row (remap-then-is_file).
+    // Empty write path after a registered row must NOT claim "unregistered".
+    let sync_decision = match &resolved_ctx {
+        Some(ctx) if ctx.prd_json_path.as_os_str().is_empty() => {
+            // Empty stored path: either no task_list row for this prefix, or
+            // a row whose remapped/registered paths are not regular files.
+            match locate_prd_json(conn, Some(ctx.prefix.as_str())) {
+                Ok(Some(_)) => SyncDecision::Skip(JsonSyncSkipReason::RegisteredNotAFile),
+                Ok(None) => SyncDecision::Skip(JsonSyncSkipReason::Unregistered),
+                Err(e) => SyncDecision::ResolveErr(e),
+            }
+        }
+        Some(ctx) => SyncDecision::Path(ctx.prd_json_path.clone()),
+        None => match sole_task_list_path(conn) {
+            Ok(Some(registered)) => {
+                let path = match (source_root, worktree_root) {
+                    (Some(src), Some(wt)) => choose_cli_write_path(&registered, src, wt),
+                    _ => cli_write_path(&registered),
+                };
+                if path.as_os_str().is_empty() {
+                    SyncDecision::Skip(JsonSyncSkipReason::RegisteredNotAFile)
+                } else {
+                    SyncDecision::Path(path)
+                }
+            }
+            Ok(None) => SyncDecision::Skip(JsonSyncSkipReason::Unregistered),
+            Err(e) => SyncDecision::ResolveErr(e),
+        },
+    };
+    let prd_path = match sync_decision {
+        SyncDecision::Path(path) => match append_user_story(
             &path,
             &story,
             effective_depended_on_by,
@@ -351,27 +516,16 @@ pub fn add_with_conn(
         ) {
             Ok(()) => Some(path),
             Err(e) => {
-                ui::emit_err(&format!(
-                    "Warning: task {} added to DB but PRD JSON sync failed ({}): {}",
-                    story.id,
-                    path.display(),
-                    e,
-                ));
+                ui::emit_err(&format_json_sync_failure_warning(&story.id, &path, &e));
                 Some(path)
             }
         },
-        Ok(None) => {
-            ui::emit(&format!(
-                "Note: task {} added to DB; no PRD JSON registered in prd_files — skipping file sync",
-                story.id,
-            ));
+        SyncDecision::Skip(reason) => {
+            ui::emit(&format_json_sync_skip_note(&story.id, reason));
             None
         }
-        Err(e) => {
-            ui::emit_err(&format!(
-                "Warning: task {} added to DB; could not locate PRD JSON: {}",
-                story.id, e,
-            ));
+        SyncDecision::ResolveErr(e) => {
+            ui::emit_err(&format_json_sync_resolve_err(&story.id, &e));
             None
         }
     };
@@ -408,137 +562,6 @@ fn resolve_priority(
             None => (0, PrioritySource::AutoEmptyQueue),
         },
         Err(_) => (0, PrioritySource::AutoEmptyQueue),
-    }
-}
-
-/// How the active prefix was resolved.
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ResolutionSource {
-    /// Resolved from `TASK_MGR_ACTIVE_PREFIX` environment variable.
-    EnvVar,
-    /// Resolved because exactly one prefix exists in `prd_metadata`.
-    SinglePrefix,
-    /// Resolved from an explicit `--from-json` flag (reserved for future use).
-    FromJsonFlag,
-    /// Could not resolve: env var absent and DB has zero or 2+ prefixes.
-    None,
-}
-
-impl fmt::Display for ResolutionSource {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ResolutionSource::EnvVar => write!(f, "env"),
-            ResolutionSource::SinglePrefix => write!(f, "single-prefix"),
-            ResolutionSource::FromJsonFlag => write!(f, "from-json"),
-            ResolutionSource::None => write!(f, "none"),
-        }
-    }
-}
-
-/// Resolved context: which prefix is active, how it was found, and which PRD
-/// JSON it maps to. Used by `task-mgr current` and the leading stderr line on
-/// write operations.
-#[derive(Debug, Clone, Serialize)]
-pub struct ResolvedContext {
-    pub prefix: String,
-    pub source: ResolutionSource,
-    pub prd_json_path: PathBuf,
-}
-
-/// Resolve the active prefix and annotate it with source + target PRD path.
-///
-/// Returns `Ok(None)` when the DB has zero or 2+ prefixes and `TASK_MGR_ACTIVE_PREFIX`
-/// is not set — the caller should treat this as "no active PRD" rather than an
-/// error. Propagates `Err` for stale env pins or DB failures.
-pub fn resolve_context(conn: &Connection) -> TaskMgrResult<Option<ResolvedContext>> {
-    let env_value = std::env::var(crate::loop_engine::claude::ACTIVE_PREFIX_ENV).ok();
-    let env_set = env_value.as_deref().is_some_and(|v| !v.is_empty());
-
-    // Delegate all validation logic to resolve_active_prefix (single implementation).
-    let prefix_opt = resolve_active_prefix(conn)?;
-
-    let Some(prefix) = prefix_opt else {
-        return Ok(None);
-    };
-
-    let source = if env_set {
-        ResolutionSource::EnvVar
-    } else {
-        ResolutionSource::SinglePrefix
-    };
-
-    let prd_json_path = locate_prd_json(conn, Some(&prefix))?.unwrap_or_default();
-
-    Ok(Some(ResolvedContext {
-        prefix,
-        source,
-        prd_json_path,
-    }))
-}
-
-/// Returns all non-NULL `task_prefix` values from `prd_metadata`.
-///
-/// Single canonical home for the `WHERE task_prefix IS NOT NULL` query —
-/// callers must not repeat this SQL directly.
-fn load_known_prefixes(conn: &Connection) -> TaskMgrResult<Vec<String>> {
-    let mut stmt =
-        conn.prepare("SELECT task_prefix FROM prd_metadata WHERE task_prefix IS NOT NULL")?;
-    Ok(stmt
-        .query_map([], |row| row.get(0))?
-        .filter_map(|r| r.ok())
-        .collect())
-}
-
-fn prefix_exists_in_metadata(conn: &Connection, prefix: &str) -> TaskMgrResult<bool> {
-    let mut stmt = conn.prepare("SELECT 1 FROM prd_metadata WHERE task_prefix = ? LIMIT 1")?;
-    let found: Option<i64> = stmt
-        .query_row([prefix], |row| row.get(0))
-        .map(Some)
-        .or_else(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => Ok(None),
-            other => Err(other),
-        })?;
-    Ok(found.is_some())
-}
-
-/// Query `prd_metadata` for the active effort prefix.
-///
-/// Resolution order:
-/// 1. If `TASK_MGR_ACTIVE_PREFIX` is set (non-empty), verify the value exists
-///    in `prd_metadata.task_prefix`. Return `Ok(Some(value))` on hit; return
-///    `Err(invalid_state)` when the env value is NOT registered (stale pin —
-///    surfaces typos / cross-PRD leakage immediately). Empty string is treated
-///    as unset.
-/// 2. Env unset/empty → single-prefix fallback: `Ok(Some(prefix))` when
-///    exactly one non-NULL `task_prefix` exists; `Ok(None)` otherwise.
-///
-/// DB errors propagate via `?` — an unexpected failure must not silently
-/// bypass auto-prefixing. `std::env::var` is read exactly once at entry.
-fn resolve_active_prefix(conn: &Connection) -> TaskMgrResult<Option<String>> {
-    let env_value = std::env::var(crate::loop_engine::claude::ACTIVE_PREFIX_ENV).ok();
-    if let Some(env_prefix) = env_value.as_deref().filter(|v| !v.is_empty()) {
-        if prefix_exists_in_metadata(conn, env_prefix)? {
-            return Ok(Some(env_prefix.to_string()));
-        }
-        let known = load_known_prefixes(conn)?;
-        let known_display = if known.is_empty() {
-            "(none registered)".to_string()
-        } else {
-            known.join(", ")
-        };
-        return Err(TaskMgrError::invalid_state(
-            "add",
-            crate::loop_engine::claude::ACTIVE_PREFIX_ENV,
-            format!("a prefix registered in prd_metadata (known: {known_display})"),
-            format!("{env_prefix} (not found in prd_metadata)"),
-        ));
-    }
-    let prefixes = load_known_prefixes(conn)?;
-    if prefixes.len() == 1 {
-        Ok(Some(prefixes.into_iter().next().unwrap()))
-    } else {
-        Ok(None)
     }
 }
 
@@ -635,10 +658,14 @@ fn extract_id_prefix(id: &str) -> Option<&str> {
 /// * Prefix matches the active prefix → OK (same PRD).
 /// * Active prefix unset (caller passed `None`) → refuse with a "no active
 ///   PRD" message so the operator must explicitly opt in to a PRD.
-/// * Foreign prefix registered in `prd_metadata` → refuse with the PRD's
-///   actual path AND both fix commands.
-/// * Foreign prefix not registered anywhere → refuse with a hint pointing at
-///   `task-mgr list --prefix <p>`.
+/// * Foreign prefix registered in `prd_metadata` (known OTHER) → refuse with
+///   the PRD's actual path AND both fix commands.
+/// * Active prefix empty (NULL-prefix / `--no-prefix` pin) and target's first
+///   segment is **not** a registered `prd_metadata.task_prefix` → OK.
+///   Spawn-fixup bodies like `CODE-REVIEW-1` must not be treated as foreign
+///   prefix `CODE` just because empty active ≠ `CODE`.
+/// * Non-empty active prefix + unregistered foreign first segment → refuse
+///   with a hint pointing at `task-mgr list --prefix <p>`.
 ///
 /// This runs BEFORE `conn.unchecked_transaction()` so a refusal can never
 /// leak a stray row or touch the target JSON file. The check only reads
@@ -649,6 +676,9 @@ fn reject_cross_prd_depended_on_by(
     depended_on_by: &[String],
     active_ctx: Option<&ResolvedContext>,
 ) -> TaskMgrResult<()> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let source_root = crate::git::main_repo_root_at(&cwd).unwrap_or_else(|| cwd.clone());
+    let worktree_root = crate::git::worktree_root().unwrap_or_else(|| source_root.clone());
     for target_id in depended_on_by {
         let Some(target_prefix) = extract_id_prefix(target_id) else {
             continue;
@@ -667,272 +697,96 @@ fn reject_cross_prd_depended_on_by(
         if target_prefix == ctx.prefix {
             continue;
         }
-        let foreign_path = locate_prd_json(conn, Some(target_prefix))?;
+        let foreign_path = locate_prd_json(conn, Some(target_prefix))?
+            .map(|stored| resolve_prd_file_path(&stored, &source_root, &worktree_root));
         let active_prefix = &ctx.prefix;
-        return Err(match foreign_path {
-            Some(path) => TaskMgrError::invalid_state(
-                "add",
-                "depended-on-by",
-                format!("a task id belonging to the active PRD (prefix '{active_prefix}')"),
-                format!(
-                    "Refusing: target '{target_id}' lives in PRD {} (prefix {target_prefix}), \
-                     but active prefix is {active_prefix}. \
-                     Fixes: (a) TASK_MGR_ACTIVE_PREFIX={target_prefix} task-mgr add --stdin \
-                     --depended-on-by {target_id} '{{...}}'  (b) task-mgr add --from-json \
-                     tasks/<correct-prd>.json --stdin --depended-on-by {target_id} '{{...}}'",
-                    path.display(),
-                ),
-            ),
-            None => TaskMgrError::invalid_state(
-                "add",
-                "depended-on-by",
-                format!("a task id belonging to the active PRD (prefix '{active_prefix}')"),
-                format!(
-                    "Refusing: target '{target_id}' carries prefix '{target_prefix}', which is \
-                     not registered in any known PRD. Run `task-mgr list --prefix {target_prefix}` \
-                     to find the right id."
-                ),
-            ),
-        });
-    }
-    Ok(())
-}
-
-/// Look up the PRD JSON file path for the currently-active PRD.
-///
-/// When `task_prefix` is provided, finds the PRD JSON via `prd_metadata`.
-/// Falls back to the first registered `task_list` file when prefix is `None`
-/// or the prefix-scoped query finds nothing.
-///
-/// Returns `Ok(None)` when no `task_list` file is registered (valid state:
-/// e.g. the DB was populated programmatically without a source JSON).
-fn locate_prd_json(conn: &Connection, task_prefix: Option<&str>) -> TaskMgrResult<Option<PathBuf>> {
-    if let Some(prefix) = task_prefix {
-        let result: Option<String> = conn
-            .query_row(
-                "SELECT pf.file_path FROM prd_files pf \
-                 JOIN prd_metadata pm ON pf.prd_id = pm.id \
-                 WHERE pf.file_type = 'task_list' AND pm.task_prefix = ? \
-                 LIMIT 1",
-                [prefix],
-                |row| row.get(0),
-            )
-            .map(Some)
-            .or_else(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => Ok(None),
-                other => Err(other),
-            })?;
-        if let Some(path) = result {
-            return Ok(Some(PathBuf::from(path)));
-        }
-    }
-    // Fallback: first registered task_list regardless of prefix.
-    let mut stmt =
-        conn.prepare("SELECT file_path FROM prd_files WHERE file_type = 'task_list' LIMIT 1")?;
-    let path: Option<String> =
-        stmt.query_row([], |row| row.get(0))
-            .map(Some)
-            .or_else(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => Ok(None),
-                other => Err(other),
-            })?;
-    Ok(path.map(PathBuf::from))
-}
-
-/// Append a serialized task to the PRD JSON's `userStories` array, atomically.
-///
-/// Uses a temp-file + rename so a crash mid-write does not corrupt the PRD.
-///
-/// When `depended_on_by` is non-empty, each existing userStories entry matching
-/// one of those ids gets the new task's id pushed into its `dependsOn` array
-/// (creating the array if missing). Targets that aren't found in the JSON are
-/// skipped with a warning — the DB is authoritative.
-/// Strip the active prefix from every string element of the `key` array on a
-/// serialized userStory object, rewriting the DB-prefixed relationship ids into
-/// the unprefixed JSON convention. No-op when the key is absent or not an array.
-fn strip_prefix_in_id_array(
-    obj: &mut serde_json::Map<String, Value>,
-    key: &str,
-    prefix: Option<&str>,
-) {
-    let Some(arr) = obj.get_mut(key).and_then(|v| v.as_array_mut()) else {
-        return;
-    };
-    for elem in arr.iter_mut() {
-        if let Some(id) = elem.as_str() {
-            *elem = Value::String(strip_task_prefix(id, prefix).to_string());
-        }
-    }
-}
-
-fn append_task_to_prd_json(
-    prd_path: &Path,
-    story: &PrdUserStory,
-    depended_on_by: &[String],
-    prefix: Option<&str>,
-) -> TaskMgrResult<()> {
-    // The DB stores prefixed ids (`e474b6f2-CODE-REVIEW-2`) but PRD task-list
-    // JSON stores them unprefixed (`CODE-REVIEW-2`); the importer re-applies the
-    // prefix idempotently. Mirror `prd_reconcile::update_prd_task_passes` and
-    // write/match ids in the JSON's unprefixed convention so the new entry stays
-    // consistent with its siblings and the reverse-link sync actually lands.
-    let base_story_id = strip_task_prefix(&story.id, prefix);
-    let original = fs::read_to_string(prd_path).map_err(|e| {
-        TaskMgrError::invalid_state(
-            "add",
-            "prd file",
-            "readable",
-            format!("{}: {}", prd_path.display(), e),
-        )
-    })?;
-
-    let mut root: Value = serde_json::from_str(&original).map_err(|e| {
-        TaskMgrError::invalid_state(
-            "add",
-            "prd json",
-            "valid JSON object",
-            format!("{}: {}", prd_path.display(), e),
-        )
-    })?;
-
-    let root_obj = root.as_object_mut().ok_or_else(|| {
-        TaskMgrError::invalid_state("add", "prd json", "JSON object at root", "not an object")
-    })?;
-
-    // Reject duplicate IDs already present in the file (defence-in-depth —
-    // DB check would have caught this too, unless someone hand-edited the
-    // JSON out-of-band).
-    if let Some(user_stories) = root_obj.get("userStories").and_then(|v| v.as_array()) {
-        let dup = user_stories.iter().any(|t| {
-            t.get("id")
-                .and_then(|v| v.as_str())
-                .is_some_and(|id| id == story.id || id == base_story_id)
-        });
-        if dup {
-            return Err(TaskMgrError::invalid_state(
-                "add",
-                "task id",
-                "not already present in PRD JSON",
-                format!("{} already in {}", story.id, prd_path.display()),
-            ));
-        }
-    }
-
-    // Serialize the new entry, then rewrite its id-bearing fields into the
-    // unprefixed JSON convention (the struct carries the prefixed DB forms).
-    let mut task_value = serde_json::to_value(story)?;
-    if let Some(obj) = task_value.as_object_mut() {
-        obj.insert("id".to_string(), Value::String(base_story_id.to_string()));
-        for key in ["dependsOn", "synergyWith", "batchWith", "conflictsWith"] {
-            strip_prefix_in_id_array(obj, key, prefix);
-        }
-    }
-
-    let arr = root_obj
-        .entry("userStories")
-        .or_insert_with(|| Value::Array(Vec::new()));
-    let arr = arr.as_array_mut().ok_or_else(|| {
-        TaskMgrError::invalid_state(
-            "add",
-            "userStories",
-            "JSON array",
-            "present but not an array",
-        )
-    })?;
-
-    // Reverse-link updates: for each requested existing task id, find its
-    // entry and push story.id into its dependsOn array (creating if missing).
-    // Missing targets log a warning but don't fail — DB is the source of truth.
-    for existing_id in depended_on_by {
-        // The JSON may carry either convention (originally-authored entries are
-        // unprefixed; entries spawned by an older `add` may be prefixed), so
-        // match on both the prefixed target and its unprefixed base.
-        let base_target = strip_task_prefix(existing_id, prefix);
-        let mut matched = false;
-        for entry in arr.iter_mut() {
-            let Some(obj) = entry.as_object_mut() else {
-                continue;
-            };
-            let is_match = obj
-                .get("id")
-                .and_then(|v| v.as_str())
-                .is_some_and(|id| id == existing_id || id == base_target);
-            if !is_match {
-                continue;
-            }
-            matched = true;
-            let deps_entry = obj
-                .entry("dependsOn".to_string())
-                .or_insert_with(|| Value::Array(Vec::new()));
-            let deps_arr = deps_entry.as_array_mut().ok_or_else(|| {
-                TaskMgrError::invalid_state(
+        match foreign_path {
+            Some(path) => {
+                return Err(TaskMgrError::invalid_state(
                     "add",
-                    "dependsOn",
-                    "JSON array",
-                    format!("{} dependsOn present but not an array", existing_id),
-                )
-            })?;
-            // Push the unprefixed new id; dedup against both forms in case the
-            // array already mixes conventions.
-            let already = deps_arr.iter().any(|v| {
-                v.as_str()
-                    .is_some_and(|s| s == story.id || s == base_story_id)
-            });
-            if !already {
-                deps_arr.push(Value::String(base_story_id.to_string()));
+                    "depended-on-by",
+                    format!("a task id belonging to the active PRD (prefix '{active_prefix}')"),
+                    format!(
+                        "Refusing: target '{target_id}' lives in PRD {} (prefix {target_prefix}), \
+                         but active prefix is {active_prefix}. \
+                         Fixes: (a) TASK_MGR_ACTIVE_PREFIX={target_prefix} task-mgr add --stdin \
+                         --depended-on-by {target_id} '{{...}}'  (b) task-mgr add --from-json \
+                         tasks/<correct-prd>.json --stdin --depended-on-by {target_id} '{{...}}'",
+                        path.display(),
+                    ),
+                ));
             }
-            break;
-        }
-        if !matched {
-            ui::emit_err(&format!(
-                "Warning: --depended-on-by target {} not found in PRD JSON {}; DB updated but JSON dependsOn not synced for that target",
-                existing_id,
-                prd_path.display(),
-            ));
+            None if active_prefix.is_empty() => {
+                // NULL-prefix pin: empty active is not a foreign-prefix match.
+                // Only known OTHER registered prefixes refuse (handled above).
+                continue;
+            }
+            None => {
+                return Err(TaskMgrError::invalid_state(
+                    "add",
+                    "depended-on-by",
+                    format!("a task id belonging to the active PRD (prefix '{active_prefix}')"),
+                    format!(
+                        "Refusing: target '{target_id}' carries prefix '{target_prefix}', which is \
+                         not registered in any known PRD. Run `task-mgr list --prefix {target_prefix}` \
+                         to find the right id."
+                    ),
+                ));
+            }
         }
     }
-
-    arr.push(task_value);
-
-    let pretty = serde_json::to_string_pretty(&root)?;
-    // Preserve trailing newline if original had one.
-    let output = if original.ends_with('\n') {
-        format!("{}\n", pretty)
-    } else {
-        pretty
-    };
-
-    atomic_write(prd_path, &output)?;
     Ok(())
 }
 
-/// Write `content` to `target` atomically (tmp file + rename).
-fn atomic_write(target: &Path, content: &str) -> TaskMgrResult<()> {
-    let parent = target.parent().unwrap_or_else(|| Path::new("."));
-    let tmp_name = match target.file_name() {
-        Some(n) => format!(".{}.task-mgr-add.tmp", n.to_string_lossy()),
-        None => ".task-mgr-add.tmp".to_string(),
+/// Stderr guidance after a best-effort JSON sync miss (US-007 / pin 11).
+/// Names `task-mgr current` and retry `--from-json`; never export.
+fn json_sync_recovery_hint() -> &'static str {
+    "Run `task-mgr current` to inspect the write target, then retry with --from-json <path>"
+}
+
+/// Why post-commit JSON sync was skipped (CLI does not invent a path).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JsonSyncSkipReason {
+    /// No matching `prd_files` task_list row for the active effort.
+    Unregistered,
+    /// A task_list row exists, but neither remapped nor registered path is a
+    /// regular file (auto-review M1 / CODE-FIX-003).
+    RegisteredNotAFile,
+}
+
+/// Post-commit sync branch: write path, skip with reason, or resolve error.
+enum SyncDecision {
+    Path(PathBuf),
+    Skip(JsonSyncSkipReason),
+    ResolveErr(TaskMgrError),
+}
+
+fn format_json_sync_failure_warning(task_id: &str, path: &Path, err: &TaskMgrError) -> String {
+    format!(
+        "Warning: task {task_id} added to DB but PRD JSON sync failed ({}): {err}. {}",
+        path.display(),
+        json_sync_recovery_hint(),
+    )
+}
+
+fn format_json_sync_skip_note(task_id: &str, reason: JsonSyncSkipReason) -> String {
+    let why = match reason {
+        JsonSyncSkipReason::Unregistered => "no PRD JSON registered in prd_files",
+        JsonSyncSkipReason::RegisteredNotAFile => {
+            "registered PRD JSON path is not a regular file on disk"
+        }
     };
-    let tmp_path = parent.join(tmp_name);
-    fs::write(&tmp_path, content).map_err(|e| {
-        TaskMgrError::invalid_state(
-            "add",
-            "prd file write",
-            "successful tmp write",
-            format!("{}: {}", tmp_path.display(), e),
-        )
-    })?;
-    fs::rename(&tmp_path, target).map_err(|e| {
-        // Best-effort cleanup.
-        let _ = fs::remove_file(&tmp_path);
-        TaskMgrError::invalid_state(
-            "add",
-            "prd file rename",
-            "successful rename",
-            format!("{} -> {}: {}", tmp_path.display(), target.display(), e),
-        )
-    })?;
-    Ok(())
+    format!(
+        "Note: task {task_id} added to DB; {why} — skipping file sync. {}",
+        json_sync_recovery_hint(),
+    )
+}
+
+fn format_json_sync_resolve_err(task_id: &str, err: &TaskMgrError) -> String {
+    format!(
+        "Warning: task {task_id} added to DB; could not resolve PRD JSON for sync: {err}. {}",
+        json_sync_recovery_hint(),
+    )
 }
 
 /// Render for `--format text` CLI output.
@@ -1126,7 +980,7 @@ mod tests {
         )
         .unwrap();
         let input = minimal_input("X-SEED-001");
-        let err = add_with_conn(&conn, input, None, &[]).unwrap_err();
+        let err = add_with_conn(&conn, input, None, &[], None).unwrap_err();
         let msg = format!("{}", err);
         assert!(
             msg.contains("X-SEED-001"),
@@ -1152,6 +1006,7 @@ mod tests {
             "{\"id\":\"\",\"title\":\"x\"}",
             None,
             &[],
+            None,
         );
         assert!(err.is_err());
         // And drop conn silently.
@@ -1163,7 +1018,7 @@ mod tests {
         let _iso = isolate_env();
         let conn = memory_db();
         let input = minimal_input("X-FEAT-001");
-        let res = add_with_conn(&conn, input, None, &[]).unwrap();
+        let res = add_with_conn(&conn, input, None, &[], None).unwrap();
         assert_eq!(res.task_id, "X-FEAT-001");
         assert_eq!(res.priority_source, PrioritySource::AutoEmptyQueue);
 
@@ -1189,7 +1044,7 @@ mod tests {
         let mut input = minimal_input("X-FEAT-002");
         input.depends_on = vec!["X-FEAT-001".to_string()];
         input.touches_files = vec!["src/foo.rs".to_string(), "src/bar.rs".to_string()];
-        add_with_conn(&conn, input, None, &[]).unwrap();
+        add_with_conn(&conn, input, None, &[], None).unwrap();
 
         let rel_count: i64 = conn
             .query_row(
@@ -1210,107 +1065,7 @@ mod tests {
         assert_eq!(file_count, 2);
     }
 
-    #[test]
-    fn test_locate_prd_json_returns_none_when_no_file_registered() {
-        let conn = memory_db();
-        let path = locate_prd_json(&conn, None).unwrap();
-        assert!(path.is_none());
-    }
-
-    #[test]
-    fn test_append_task_to_prd_json_adds_to_userstories() {
-        use std::io::Write;
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let initial = r#"{
-  "project": "demo",
-  "userStories": [
-    {"id": "SEED-001", "title": "seed", "priority": 50, "passes": false}
-  ]
-}
-"#;
-        {
-            let mut f = tmp.reopen().unwrap();
-            f.write_all(initial.as_bytes()).unwrap();
-        }
-
-        let story = PrdUserStory {
-            id: "NEW-001".to_string(),
-            title: "new".to_string(),
-            description: None,
-            priority: 5,
-            passes: false,
-            notes: None,
-            acceptance_criteria: vec![],
-            review_scope: None,
-            severity: None,
-            source_review: None,
-            touches_files: vec![],
-            depends_on: vec![],
-            synergy_with: vec![],
-            batch_with: vec![],
-            conflicts_with: vec![],
-            model: None,
-            difficulty: None,
-            escalation_note: None,
-            required_tests: vec![],
-            max_retries: None,
-            requires_human: None,
-            human_review_timeout: None,
-            claims_shared_infra: None,
-        };
-
-        append_task_to_prd_json(tmp.path(), &story, &[], None).unwrap();
-
-        let after = fs::read_to_string(tmp.path()).unwrap();
-        let v: Value = serde_json::from_str(&after).unwrap();
-        let arr = v
-            .get("userStories")
-            .and_then(|v| v.as_array())
-            .expect("userStories array");
-        assert_eq!(arr.len(), 2);
-        assert_eq!(arr[1].get("id").and_then(|v| v.as_str()), Some("NEW-001"));
-        assert_eq!(arr[1].get("priority").and_then(|v| v.as_i64()), Some(5));
-        assert!(after.ends_with('\n'), "trailing newline preserved");
-    }
-
-    #[test]
-    fn test_append_rejects_duplicate_id_in_prd_file() {
-        use std::io::Write;
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let initial =
-            r#"{"userStories":[{"id":"DUP-001","title":"x","priority":50,"passes":false}]}"#;
-        {
-            let mut f = tmp.reopen().unwrap();
-            f.write_all(initial.as_bytes()).unwrap();
-        }
-        let story = PrdUserStory {
-            id: "DUP-001".to_string(),
-            title: "again".to_string(),
-            description: None,
-            priority: 5,
-            passes: false,
-            notes: None,
-            acceptance_criteria: vec![],
-            review_scope: None,
-            severity: None,
-            source_review: None,
-            touches_files: vec![],
-            depends_on: vec![],
-            synergy_with: vec![],
-            batch_with: vec![],
-            conflicts_with: vec![],
-            model: None,
-            difficulty: None,
-            escalation_note: None,
-            required_tests: vec![],
-            max_retries: None,
-            requires_human: None,
-            human_review_timeout: None,
-            claims_shared_infra: None,
-        };
-        let err = append_task_to_prd_json(tmp.path(), &story, &[], None).unwrap_err();
-        assert!(format!("{err}").contains("DUP-001"));
-    }
+    // Append unit tests live in `prd_json.rs` (FEAT-003 move).
 
     fn seed_task(conn: &Connection, id: &str) {
         conn.execute(
@@ -1327,7 +1082,7 @@ mod tests {
         seed_task(&conn, "MILESTONE-1");
 
         let input = minimal_input("NEW-001");
-        add_with_conn(&conn, input, None, &["MILESTONE-1".to_string()]).unwrap();
+        add_with_conn(&conn, input, None, &["MILESTONE-1".to_string()], None).unwrap();
 
         // Reverse row: MILESTONE-1 (existing) dependsOn NEW-001 (new).
         let row_count: i64 = conn
@@ -1361,7 +1116,8 @@ mod tests {
         let conn = memory_db();
         // Do NOT seed NONEXISTENT-ID.
         let input = minimal_input("NEW-002");
-        let err = add_with_conn(&conn, input, None, &["NONEXISTENT-ID".to_string()]).unwrap_err();
+        let err =
+            add_with_conn(&conn, input, None, &["NONEXISTENT-ID".to_string()], None).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("NONEXISTENT-ID"),
@@ -1393,6 +1149,7 @@ mod tests {
             input,
             None,
             &["TARGET-A".to_string(), "TARGET-B".to_string()],
+            None,
         )
         .unwrap();
 
@@ -1409,7 +1166,8 @@ mod tests {
         }
     }
 
-    // --- FEAT-002: resolve_active_prefix env-var awareness ---
+    // Resolver env/prefix tests live in `context.rs` (FEAT-002 move). Keep
+    // seed_prefix here for write-policy / foreign-prefix tests below.
 
     fn seed_prefix(conn: &Connection, id: i64, project: &str, task_prefix: &str) {
         conn.execute(
@@ -1417,100 +1175,6 @@ mod tests {
             rusqlite::params![id, project, task_prefix],
         )
         .unwrap();
-    }
-
-    #[test]
-    fn test_resolve_prefix_env_unset_single_prd_returns_some() {
-        // Regression: existing single-PRD fallback behavior preserved.
-        let _iso = isolate_env();
-        let conn = memory_db();
-        seed_prefix(&conn, 1, "alpha", "A-");
-        let resolved = resolve_active_prefix(&conn).unwrap();
-        assert_eq!(resolved, Some("A-".to_string()));
-    }
-
-    #[test]
-    fn test_resolve_prefix_env_unset_multi_prd_returns_none() {
-        // Regression: ambiguous (multiple) prefixes return None — caller
-        // skips auto-prefixing and relies on caller-supplied IDs.
-        let _iso = isolate_env();
-        let conn = memory_db();
-        seed_prefix(&conn, 1, "alpha", "A-");
-        seed_prefix(&conn, 2, "beta", "B-");
-        let resolved = resolve_active_prefix(&conn).unwrap();
-        assert_eq!(resolved, None);
-    }
-
-    #[test]
-    fn test_resolve_prefix_env_set_matching_multi_prd_returns_pinned() {
-        // Pinning resolves the multi-PRD ambiguity.
-        let _iso = isolate_env();
-        let _set = EnvVarGuard::set(ACTIVE_PREFIX_ENV, "A-");
-        let conn = memory_db();
-        seed_prefix(&conn, 1, "alpha", "A-");
-        seed_prefix(&conn, 2, "beta", "B-");
-        let resolved = resolve_active_prefix(&conn).unwrap();
-        assert_eq!(resolved, Some("A-".to_string()));
-    }
-
-    #[test]
-    fn test_resolve_prefix_env_set_stale_errors_with_known_prefixes() {
-        // Stale pin (set but not registered) must hard-error and the message
-        // must name BOTH the offending value and the registered prefixes
-        // so the operator can spot the typo.
-        let _iso = isolate_env();
-        let _set = EnvVarGuard::set(ACTIVE_PREFIX_ENV, "stale-");
-        let conn = memory_db();
-        seed_prefix(&conn, 1, "alpha", "A-");
-        let err = resolve_active_prefix(&conn).unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains("stale-"), "error must name stale value: {msg}");
-        assert!(msg.contains("A-"), "error must list known prefixes: {msg}");
-    }
-
-    #[test]
-    fn test_resolve_prefix_env_empty_string_treated_as_unset() {
-        // Empty env var must NOT trigger the stale-prefix error path —
-        // shells often export blank values when a variable was deliberately
-        // cleared. Falls through to fallback (multi-PRD → None).
-        let _iso = isolate_env();
-        let _set = EnvVarGuard::set(ACTIVE_PREFIX_ENV, "");
-        let conn = memory_db();
-        seed_prefix(&conn, 1, "alpha", "A-");
-        seed_prefix(&conn, 2, "beta", "B-");
-        let resolved = resolve_active_prefix(&conn).unwrap();
-        assert_eq!(resolved, None);
-    }
-
-    #[test]
-    fn test_resolve_prefix_env_set_with_empty_metadata_errors() {
-        // No PRDs registered + env var set → still stale (no prefix is valid).
-        let _iso = isolate_env();
-        let _set = EnvVarGuard::set(ACTIVE_PREFIX_ENV, "X-");
-        let conn = memory_db();
-        let err = resolve_active_prefix(&conn).unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains("X-"), "error must name stale value: {msg}");
-        assert!(
-            msg.contains("none registered") || msg.contains("not found"),
-            "error must indicate empty/missing prefix set: {msg}"
-        );
-    }
-
-    #[test]
-    fn test_resolve_prefix_naive_passthrough_would_fail_stale_check() {
-        // Known-bad guard: a naive `Ok(Some(env_value))` impl would pass
-        // through unverified. This test pins env to a value that is NOT in
-        // prd_metadata and asserts we get Err — defeating the safety check
-        // by skipping verification must fail this assertion.
-        let _iso = isolate_env();
-        let _set = EnvVarGuard::set(ACTIVE_PREFIX_ENV, "B-");
-        let conn = memory_db();
-        seed_prefix(&conn, 1, "alpha", "A-");
-        assert!(
-            resolve_active_prefix(&conn).is_err(),
-            "must reject pinned prefix not present in prd_metadata"
-        );
     }
 
     // --- FEAT-003: reject_foreign_prefix ---
@@ -1657,7 +1321,7 @@ mod tests {
 
         let mut input = minimal_input("FIX-001");
         input.depends_on = vec!["OTHER-1".to_string()];
-        let res = add_with_conn(&conn, input, None, &[]).unwrap();
+        let res = add_with_conn(&conn, input, None, &[], None).unwrap();
 
         assert_eq!(res.task_id, "A-FIX-001", "task ID must be auto-prefixed");
 
@@ -1692,7 +1356,7 @@ mod tests {
     }
 
     /// Build a `ResolvedContext` for tests without needing the DB lookup
-    /// machinery — locate_prd_json is the only DB-touching side effect.
+    /// machinery — write path is ctx.prd_json_path only (no post-commit locate).
     fn fake_ctx(prefix: &str, prd_path: &str) -> ResolvedContext {
         ResolvedContext {
             prefix: prefix.to_string(),
@@ -1830,6 +1494,7 @@ mod tests {
             input,
             None,
             &["5ba153a7-MILESTONE-FINAL".to_string()],
+            None,
         )
         .unwrap_err();
         let msg = format!("{err}");
@@ -1866,8 +1531,14 @@ mod tests {
         seed_task(&conn, "alpha-NEW-001");
 
         let input = minimal_input("NEW-001");
-        let err =
-            add_with_conn(&conn, input, None, &["beta-MILESTONE-FINAL".to_string()]).unwrap_err();
+        let err = add_with_conn(
+            &conn,
+            input,
+            None,
+            &["beta-MILESTONE-FINAL".to_string()],
+            None,
+        )
+        .unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("Refusing:"),
@@ -1895,6 +1566,7 @@ mod tests {
             input,
             None,
             &["5ba153a7-MILESTONE-FINAL".to_string()],
+            None,
         );
         assert!(
             res.is_ok(),
@@ -1903,5 +1575,517 @@ mod tests {
         );
         let r = res.unwrap();
         assert_eq!(r.task_id, "5ba153a7-NEW-FIX-001");
+    }
+
+    // --- FEAT-004: NULL-prefix --from-json skips apply_prefix AND prefix_id ---
+
+    #[test]
+    fn test_from_json_null_prefix_skips_apply_prefix_and_prefix_id() {
+        let _iso = isolate_env();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file = tmp.path().join("noprefix.json");
+        std::fs::write(
+            &file,
+            r#"{"project":"p","userStories":[{"id":"SEED-001","title":"s","priority":10,"passes":false}]}"#,
+        )
+        .unwrap();
+
+        let conn = memory_db();
+        conn.execute(
+            "INSERT INTO prd_metadata (id, project, task_prefix) VALUES (1, 'p', NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO prd_files (prd_id, file_path, file_type) VALUES (1, ?, 'task_list')",
+            [file.to_str().unwrap()],
+        )
+        .unwrap();
+        seed_task(&conn, "SEED-001");
+
+        let input = minimal_input("FEAT-001");
+        let res =
+            add_with_conn(&conn, input, None, &["SEED-001".to_string()], Some(&file)).unwrap();
+
+        assert_eq!(
+            res.task_id, "FEAT-001",
+            "NULL-prefix pin must NOT produce -FEAT-001"
+        );
+        assert!(
+            !res.task_id.starts_with('-'),
+            "must not call prefix_id(\"\", …)"
+        );
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE id = 'FEAT-001'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+
+        // Reverse link uses the bare depended-on-by id (no prefix_id).
+        let rel: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_relationships \
+                 WHERE task_id = 'SEED-001' AND related_id = 'FEAT-001' AND rel_type = 'dependsOn'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rel, 1);
+
+        // Appended into the pinned file (canonical flag path).
+        let updated: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        let stories = updated["userStories"].as_array().unwrap();
+        assert!(
+            stories.iter().any(|s| s["id"].as_str() == Some("FEAT-001")),
+            "userStories must gain FEAT-001"
+        );
+    }
+
+    // --- CODE-FIX-002: NULL-prefix must not strip 3-segment spawn-fixup ids ---
+
+    #[test]
+    fn test_from_json_null_prefix_preserves_three_segment_ids() {
+        // H1: CODE-FIX-001 on a NULL-prefix pin must stay CODE-FIX-001 in both
+        // DB and JSON (never FIX-001 from id-shape "CODE"). --depended-on-by
+        // CODE-REVIEW-1 must not refuse as foreign prefix CODE.
+        let _iso = isolate_env();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file = tmp.path().join("noprefix.json");
+        std::fs::write(
+            &file,
+            r#"{"project":"p","userStories":[{"id":"CODE-REVIEW-1","title":"r","priority":10,"passes":false}]}"#,
+        )
+        .unwrap();
+
+        let conn = memory_db();
+        conn.execute(
+            "INSERT INTO prd_metadata (id, project, task_prefix) VALUES (1, 'p', NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO prd_files (prd_id, file_path, file_type) VALUES (1, ?, 'task_list')",
+            [file.to_str().unwrap()],
+        )
+        .unwrap();
+        seed_task(&conn, "CODE-REVIEW-1");
+
+        let input = minimal_input("CODE-FIX-001");
+        let res = add_with_conn(
+            &conn,
+            input,
+            None,
+            &["CODE-REVIEW-1".to_string()],
+            Some(&file),
+        )
+        .expect("NULL-prefix pin must accept CODE-REVIEW-1 depended-on-by");
+
+        assert_eq!(
+            res.task_id, "CODE-FIX-001",
+            "DB id must stay unprefixed CODE-FIX-001"
+        );
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE id = 'CODE-FIX-001'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+
+        let rel: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_relationships \
+                 WHERE task_id = 'CODE-REVIEW-1' AND related_id = 'CODE-FIX-001' \
+                   AND rel_type = 'dependsOn'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rel, 1, "reverse dependsOn link must land");
+
+        let updated: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        let stories = updated["userStories"].as_array().unwrap();
+        assert!(
+            stories
+                .iter()
+                .any(|s| s["id"].as_str() == Some("CODE-FIX-001")),
+            "JSON id must be CODE-FIX-001, not FIX-001; got: {updated}"
+        );
+        assert!(
+            !stories.iter().any(|s| s["id"].as_str() == Some("FIX-001")),
+            "must not strip id-shape CODE from CODE-FIX-001"
+        );
+        // Reverse link on the review entry uses the unstripped new id.
+        let review = stories
+            .iter()
+            .find(|s| s["id"].as_str() == Some("CODE-REVIEW-1"))
+            .expect("CODE-REVIEW-1 stays in JSON");
+        let deps = review["dependsOn"].as_array().unwrap();
+        assert!(
+            deps.iter().any(|d| d.as_str() == Some("CODE-FIX-001")),
+            "dependsOn must reference CODE-FIX-001: {review}"
+        );
+    }
+
+    #[test]
+    fn test_from_json_prefixed_pin_still_strips_to_body_in_json() {
+        // Prefixed 8-hex pins stay unchanged: DB gets PREFIX-CODE-FIX-001,
+        // JSON writes the unprefixed body CODE-FIX-001.
+        let _iso = isolate_env();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file = tmp.path().join("prefixed.json");
+        std::fs::write(
+            &file,
+            r#"{"project":"p","taskPrefix":"a410d276","userStories":[{"id":"SEED-001","title":"s","priority":10,"passes":false}]}"#,
+        )
+        .unwrap();
+
+        let conn = memory_db();
+        seed_prefix(&conn, 1, "p", "a410d276");
+        conn.execute(
+            "INSERT INTO prd_files (prd_id, file_path, file_type) VALUES (1, ?, 'task_list')",
+            [file.to_str().unwrap()],
+        )
+        .unwrap();
+        seed_task(&conn, "a410d276-SEED-001");
+
+        let input = minimal_input("CODE-FIX-001");
+        let res =
+            add_with_conn(&conn, input, None, &["SEED-001".to_string()], Some(&file)).unwrap();
+
+        assert_eq!(res.task_id, "a410d276-CODE-FIX-001");
+
+        let updated: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        let stories = updated["userStories"].as_array().unwrap();
+        assert!(
+            stories
+                .iter()
+                .any(|s| s["id"].as_str() == Some("CODE-FIX-001")),
+            "prefixed pin must strip to CODE-FIX-001 in JSON; got: {updated}"
+        );
+        assert!(
+            !stories
+                .iter()
+                .any(|s| s["id"].as_str() == Some("a410d276-CODE-FIX-001")),
+            "JSON must not keep the DB-prefixed id"
+        );
+    }
+
+    #[test]
+    fn cross_prd_check_null_prefix_allows_unregistered_three_segment_target() {
+        let conn = memory_db();
+        let ctx = fake_ctx("", "/tmp/noprefix.json");
+        // CODE is not a registered task_prefix — empty active must not treat
+        // it as a foreign-prefix mismatch.
+        reject_cross_prd_depended_on_by(&conn, &["CODE-REVIEW-1".to_string()], Some(&ctx)).unwrap();
+    }
+
+    #[test]
+    fn cross_prd_check_null_prefix_still_refuses_known_other_prefix() {
+        let conn = memory_db();
+        seed_prefix(&conn, 1, "foreign-project", "5ba153a7");
+        conn.execute(
+            "INSERT INTO prd_files (prd_id, file_path, file_type) VALUES (1, ?, 'task_list')",
+            ["/tmp/foreign-prd.json"],
+        )
+        .unwrap();
+        let ctx = fake_ctx("", "/tmp/noprefix.json");
+
+        let err = reject_cross_prd_depended_on_by(
+            &conn,
+            &["5ba153a7-MILESTONE-FINAL".to_string()],
+            Some(&ctx),
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("Refusing:"), "{msg}");
+        assert!(msg.contains("/tmp/foreign-prd.json"), "{msg}");
+    }
+
+    // --- FEAT-006: add-only ≥2-prefix refuse (write policy; resolver stays Ok(None)) ---
+
+    #[test]
+    fn test_add_refuses_unpinned_multi_prefix_no_db_row() {
+        let _iso = isolate_env();
+        let conn = memory_db();
+        seed_prefix(&conn, 1, "alpha", "A");
+        seed_prefix(&conn, 2, "beta", "B");
+
+        // Resolver probe still Ok(None) — refuse is write-policy only.
+        let ctx = resolve_context(&conn, None, "add").unwrap();
+        assert!(ctx.is_none(), "resolver must stay Ok(None) for 2+ prefixes");
+
+        let err = add_with_conn(&conn, minimal_input("FIX-001"), None, &[], None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("--from-json"),
+            "refuse must name --from-json: {msg}"
+        );
+        assert!(
+            msg.contains("TASK_MGR_ACTIVE_PREFIX"),
+            "refuse must name TASK_MGR_ACTIVE_PREFIX: {msg}"
+        );
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tasks WHERE id = 'FIX-001'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "refused add must not insert a DB row");
+    }
+
+    #[test]
+    fn test_add_zero_prefixes_still_inserts() {
+        // PrefixMode::Disabled / programmatic DB: ctx None AND known.len()==0
+        // → insert OK (known-bad: if ctx.is_none() { refuse } alone).
+        let _iso = isolate_env();
+        let conn = memory_db();
+        assert!(load_known_prefixes(&conn).unwrap().is_empty());
+        assert!(resolve_context(&conn, None, "add").unwrap().is_none());
+
+        let res = add_with_conn(&conn, minimal_input("ZERO-001"), None, &[], None).unwrap();
+        assert_eq!(res.task_id, "ZERO-001");
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE id = 'ZERO-001'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_add_env_pin_among_multi_prefix_proceeds() {
+        let _iso = isolate_env();
+        let _set = EnvVarGuard::set(ACTIVE_PREFIX_ENV, "A");
+        let conn = memory_db();
+        seed_prefix(&conn, 1, "alpha", "A");
+        seed_prefix(&conn, 2, "beta", "B");
+
+        let res = add_with_conn(&conn, minimal_input("FIX-001"), None, &[], None).unwrap();
+        assert_eq!(res.task_id, "A-FIX-001");
+    }
+
+    #[test]
+    fn test_add_depended_on_by_without_pin_multi_prefix_refuses() {
+        // Pin 1: --depended-on-by cannot pin; ≥2 prefixes without flag/env →
+        // same refuse as no-pin (before any reverse-link write).
+        let _iso = isolate_env();
+        let conn = memory_db();
+        seed_prefix(&conn, 1, "alpha", "A");
+        seed_prefix(&conn, 2, "beta", "B");
+        seed_task(&conn, "B-MILESTONE-1");
+
+        let err = add_with_conn(
+            &conn,
+            minimal_input("FIX-001"),
+            None,
+            &["B-MILESTONE-1".to_string()],
+            None,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("--from-json"), "{msg}");
+        assert!(msg.contains("TASK_MGR_ACTIVE_PREFIX"), "{msg}");
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tasks WHERE id = 'FIX-001'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "must refuse before insert");
+    }
+
+    // --- FEAT-007: JSON-sync failure / skip copy (current + --from-json, never export) ---
+
+    #[test]
+    fn add_rs_source_omits_task_mgr_export() {
+        // Build the needle without a contiguous literal so this assert itself
+        // does not create a false-positive grep hit.
+        let needle = format!("{} {}", "task-mgr", "export");
+        let src = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/commands/add.rs"));
+        assert!(
+            !src.contains(&needle),
+            "add.rs comment/warning must not mention {needle}"
+        );
+    }
+
+    fn assert_json_sync_copy_contract(msg: &str) {
+        assert!(
+            msg.contains("task-mgr current"),
+            "must name task-mgr current: {msg}"
+        );
+        assert!(
+            msg.contains("--from-json"),
+            "must name retry --from-json: {msg}"
+        );
+        assert!(!msg.contains("export"), "must not mention export: {msg}");
+        assert!(
+            !msg.contains("locate_prd_json"),
+            "must not name locate_prd_json as the write site: {msg}"
+        );
+    }
+
+    #[test]
+    fn json_sync_failure_warning_names_current_and_from_json_not_export() {
+        let err = TaskMgrError::io_error(
+            "/tmp/missing.json".to_string(),
+            "reading PRD file",
+            std::io::Error::new(std::io::ErrorKind::NotFound, "No such file or directory"),
+        );
+        let msg = format_json_sync_failure_warning("FIX-001", Path::new("/tmp/missing.json"), &err);
+        assert!(msg.contains("PRD JSON sync failed"), "{msg}");
+        assert!(msg.contains("FIX-001"), "{msg}");
+        assert!(msg.contains("/tmp/missing.json"), "{msg}");
+        assert_json_sync_copy_contract(&msg);
+    }
+
+    #[test]
+    fn json_sync_skip_note_names_current_and_from_json_not_export() {
+        let msg = format_json_sync_skip_note("MULTI-001", JsonSyncSkipReason::Unregistered);
+        assert!(msg.contains("skipping file sync"), "{msg}");
+        assert!(msg.contains("MULTI-001"), "{msg}");
+        assert!(
+            msg.contains("no PRD JSON registered in prd_files"),
+            "unregistered reason: {msg}"
+        );
+        assert_json_sync_copy_contract(&msg);
+    }
+
+    #[test]
+    fn json_sync_skip_note_registered_not_a_file_does_not_claim_unregistered() {
+        let msg = format_json_sync_skip_note("MISS-001", JsonSyncSkipReason::RegisteredNotAFile);
+        assert!(msg.contains("skipping file sync"), "{msg}");
+        assert!(msg.contains("MISS-001"), "{msg}");
+        assert!(
+            msg.contains("registered PRD JSON path is not a regular file"),
+            "must explain missing/non-file registered path: {msg}"
+        );
+        assert!(
+            !msg.contains("no PRD JSON registered"),
+            "must not claim prd_files unregistered when a row exists: {msg}"
+        );
+        assert_json_sync_copy_contract(&msg);
+    }
+
+    #[test]
+    fn json_sync_resolve_err_names_current_and_from_json_not_export() {
+        let err = TaskMgrError::invalid_state("add", "prd_files", "readable", "db error");
+        let msg = format_json_sync_resolve_err("ZERO-001", &err);
+        assert!(msg.contains("could not resolve PRD JSON"), "{msg}");
+        assert_json_sync_copy_contract(&msg);
+    }
+
+    #[test]
+    fn json_sync_failure_on_ctx_prd_json_path_does_not_roll_back_db() {
+        // Learning #3440: DB commit first; append Err leaves the row.
+        // Use --from-json so ctx.prd_json_path is the flag PATH even when the
+        // file content cannot be parsed (cli_write_path would empty a missing
+        // default path and hit the skip note instead of sync Err).
+        let _iso = isolate_env();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file = tmp.path().join("bad.json");
+        std::fs::write(&file, "not-valid-json").unwrap();
+
+        let conn = memory_db();
+        conn.execute(
+            "INSERT INTO prd_metadata (id, project, task_prefix) VALUES (1, 'p', NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO prd_files (prd_id, file_path, file_type) VALUES (1, ?, 'task_list')",
+            [file.to_str().unwrap()],
+        )
+        .unwrap();
+
+        let res = add_with_conn(&conn, minimal_input("FIX-001"), None, &[], Some(&file)).unwrap();
+        assert_eq!(res.task_id, "FIX-001");
+        assert_eq!(
+            res.prd_path.as_deref(),
+            Some(file.as_path()),
+            "failed sync still reports the write target path"
+        );
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tasks WHERE id = 'FIX-001'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1, "sync Err must not roll back the DB commit");
+    }
+
+    #[test]
+    fn json_sync_skip_when_ctx_none_still_commits_db() {
+        // ctx is None + zero task_list rows → skip note path; DB insert OK.
+        let _iso = isolate_env();
+        let conn = memory_db();
+        assert!(resolve_context(&conn, None, "add").unwrap().is_none());
+
+        let res = add_with_conn(&conn, minimal_input("SKIP-001"), None, &[], None).unwrap();
+        assert_eq!(res.task_id, "SKIP-001");
+        assert!(res.prd_path.is_none());
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE id = 'SKIP-001'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "skip note path must not roll back the DB commit");
+    }
+
+    #[test]
+    fn json_sync_skip_when_registered_path_missing_still_commits_db() {
+        // Single prefix + prd_files row pointing at a missing path: CLI skip
+        // (no invent) is correct; DB insert must still commit (M1 / CODE-FIX-003).
+        let _iso = isolate_env();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let missing = tmp.path().join("gone.json");
+
+        let conn = memory_db();
+        conn.execute(
+            "INSERT INTO prd_metadata (id, project, task_prefix) VALUES (1, 'p', 'MISS')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO prd_files (prd_id, file_path, file_type) VALUES (1, ?, 'task_list')",
+            [missing.to_str().unwrap()],
+        )
+        .unwrap();
+
+        let ctx = resolve_context(&conn, None, "add")
+            .unwrap()
+            .expect("single prefix");
+        assert!(
+            ctx.prd_json_path.as_os_str().is_empty(),
+            "missing registered path must store empty write target"
+        );
+
+        let res = add_with_conn(&conn, minimal_input("FIX-001"), None, &[], None).unwrap();
+        assert_eq!(res.task_id, "MISS-FIX-001");
+        assert!(res.prd_path.is_none(), "must not invent a sync path");
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE id = 'MISS-FIX-001'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "registered-not-a-file skip must not roll back DB");
     }
 }

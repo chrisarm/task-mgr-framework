@@ -21,7 +21,8 @@ use crate::loop_engine::engine::{BlackoutState, UnavailableRungsMap, active_rung
 use crate::loop_engine::model::{CapabilityTier, Provider, ResolvedModelsConfig};
 use crate::loop_engine::project_config::TierFallback;
 use crate::loop_engine::quota::{
-    AccountLowInput, BucketEval, OnLowAction, QuotaBucket, QuotaEval, UsagePolicy, evaluate_quota,
+    AccountLowInput, BucketEval, OnLowAction, QuotaBucket, QuotaEval, RemainingFloors, UsagePolicy,
+    evaluate_quota,
 };
 use crate::loop_engine::recovery::probe_rate_limit_lifted;
 use crate::loop_engine::runner::RunnerKind;
@@ -38,8 +39,8 @@ use crate::loop_engine::{display, signals};
 /// `account` is `pub` so this is reachable from the integration parity harness
 /// (`tests/reaction_parity.rs`).
 pub struct AccountUsageGateParams<'a> {
-    /// Remaining-percent floor (0–100). Wait when account remaining ≤ this.
-    pub threshold: u8,
+    /// Remaining-percent floors (session/other vs weekly).
+    pub floors: RemainingFloors,
     /// Loop tasks dir — `.stop`-signal polling during the wait.
     pub tasks_dir: &'a Path,
     /// Wait seconds to use when the reset timestamp can't be parsed.
@@ -55,7 +56,7 @@ pub struct AccountUsageGateParams<'a> {
 /// from `usage::check_and_wait`; tests inject a counting closure so they are
 /// hermetic (no OAuth credentials, no usage API, no real `thread::sleep`). A
 /// type alias keeps `clippy::type_complexity` quiet.
-pub type UsageGateFn<'f> = &'f dyn Fn(u8, &Path, u64) -> UsageCheckResult;
+pub type UsageGateFn<'f> = &'f dyn Fn(RemainingFloors, &Path, u64) -> UsageCheckResult;
 
 /// Account-global usage gate (production entry point). Builds the real
 /// `usage::check_and_wait` gate closure and delegates to
@@ -69,17 +70,18 @@ pub type UsageGateFn<'f> = &'f dyn Fn(u8, &Path, u64) -> UsageCheckResult;
 /// three engine files carry `#![deny(deprecated)]`, so this coordinator is its
 /// single legitimate caller; the engine paths route through here instead.
 pub fn account_usage_gate(params: AccountUsageGateParams<'_>) -> UsageCheckResult {
-    let gate = |threshold: u8, tasks_dir: &Path, fallback_wait: u64| -> UsageCheckResult {
-        // Pre-iteration gate has no run-models param on AccountUsageGateParams;
-        // builtins match fetch's provisional snapshot. Post-output banners use
-        // run models via AccountReactionParams (react_to_outputs closure).
-        check_and_wait(
-            threshold,
-            tasks_dir,
-            fallback_wait,
-            crate::loop_engine::model::builtin_resolved_models(),
-        )
-    };
+    let gate =
+        |floors: RemainingFloors, tasks_dir: &Path, fallback_wait: u64| -> UsageCheckResult {
+            // Pre-iteration gate has no run-models param on AccountUsageGateParams;
+            // builtins match fetch's provisional snapshot. Post-output banners use
+            // run models via AccountReactionParams (react_to_outputs closure).
+            check_and_wait(
+                floors,
+                tasks_dir,
+                fallback_wait,
+                crate::loop_engine::model::builtin_resolved_models(),
+            )
+        };
     account_usage_gate_inner(params, &gate)
 }
 
@@ -98,14 +100,14 @@ pub fn account_usage_gate_inner(
     // field to `AccountUsageGateParams` forces this coordinator to account for
     // it before the code compiles.
     let AccountUsageGateParams {
-        threshold,
+        floors,
         tasks_dir,
         fallback_wait,
     } = params;
 
     // Fire the gate EXACTLY once and return its decision unchanged — same usage
     // state ⇒ same UsageCheckResult, independent of the sequential vs wave caller.
-    gate(threshold, tasks_dir, fallback_wait)
+    gate(floors, tasks_dir, fallback_wait)
 }
 
 // ---------------------------------------------------------------------------
@@ -473,8 +475,8 @@ fn model_token_followed_by_limit(lower: &str) -> bool {
 /// Inputs to [`react_to_outputs`] / [`react_to_outputs_inner`]. Destructured
 /// exhaustively (no `..`) by the FEAT-006 body — the single-home parity lock.
 pub struct AccountReactionParams<'a> {
-    /// Usage-API percentage threshold (production wait path only).
-    pub threshold: u8,
+    /// Remaining-percent floors (production wait path only).
+    pub floors: RemainingFloors,
     /// Whether the usage API pre-check is enabled (production wait path only).
     pub usage_enabled: bool,
     /// Whether post-output RateLimit recovery may touch Anthropic account I/O
@@ -528,11 +530,12 @@ pub fn react_to_outputs(
     blackout: &mut BlackoutState,
     unavailable_rungs: &mut UnavailableRungsMap,
 ) -> AccountReaction {
-    // Capture run models in the gate closure — UsageGateFn stays (u8, &Path, u64).
+    // Capture run models in the gate closure — UsageGateFn stays (RemainingFloors, &Path, u64).
     let models = params.models;
-    let usage_gate = |threshold: u8, tasks_dir: &Path, fallback_wait: u64| -> UsageCheckResult {
-        check_and_wait(threshold, tasks_dir, fallback_wait, models)
-    };
+    let usage_gate =
+        |floors: RemainingFloors, tasks_dir: &Path, fallback_wait: u64| -> UsageCheckResult {
+            check_and_wait(floors, tasks_dir, fallback_wait, models)
+        };
     let reset_wait = |wait_secs: u64,
                       tasks_dir: &Path,
                       _fallback_wait: u64,
@@ -543,8 +546,8 @@ pub fn react_to_outputs(
     };
     let probe =
         |permission_mode: &PermissionMode| -> bool { probe_rate_limit_lifted(permission_mode) };
-    let threshold = params.threshold;
-    let load_usage = || load_usage_info_with_threshold(threshold);
+    let floors = params.floors;
+    let load_usage = || load_usage_info_with_threshold(floors);
     react_to_outputs_with_io_seams(
         conn,
         items,
@@ -576,7 +579,7 @@ pub fn react_to_outputs_with_io_seams(
 ) -> AccountReaction {
     // Exhaustive destructure (no `..`) — the single-home parity lock.
     let &AccountReactionParams {
-        threshold,
+        floors,
         usage_enabled,
         anthropic_account_io_allowed,
         tasks_dir,
@@ -637,7 +640,7 @@ pub fn react_to_outputs_with_io_seams(
         // Optional usage-gate first when both Claude allow-flag and env enablement.
         // Rung-scoped phrasing skips this leg (and the early-lift probe below).
         if !rung_scoped && anthropic_account_io_allowed && usage_enabled {
-            match usage_gate(threshold, tasks_dir, fallback_wait) {
+            match usage_gate(floors, tasks_dir, fallback_wait) {
                 UsageCheckResult::StopSignaled => return false,
                 UsageCheckResult::WaitedAndReset => return true,
                 _ => {}
@@ -1620,12 +1623,12 @@ fn account_low_is_amount_only(low: &AccountLowInput, buckets: &[QuotaBucket]) ->
 pub fn evaluate_and_apply_quota(
     buckets: &[QuotaBucket],
     policy: &UsagePolicy,
-    remaining_min: u8,
+    floors: RemainingFloors,
     tier_fallback: Option<&TierFallback>,
     work: &RemainingWorkSnapshot,
     ask_ttl_override: Option<u64>,
 ) -> (QuotaEval, QuotaApplyResult) {
-    let eval = evaluate_quota(buckets, policy, remaining_min);
+    let eval = evaluate_quota(buckets, policy, floors);
     let effective_ttl = ask_ttl_override.unwrap_or(policy.ask_ttl_minutes);
     let applied =
         apply_quota_with_ask_ttl(&eval, buckets, policy, tier_fallback, work, effective_ttl);
@@ -1647,8 +1650,11 @@ pub fn replace_unavailable_rungs(
 /// Inputs to [`account_quota_preflight`] / [`account_quota_preflight_inner`].
 /// Destructured exhaustively (no `..`) — seq/wave parity lock.
 pub struct QuotaPreflightParams<'a> {
-    /// Remaining-percent floor (0–100).
-    pub threshold: u8,
+    /// Remaining-percent floors (session/other vs weekly).
+    pub floors: RemainingFloors,
+    /// CLI horizon overlays (`None` = use `policy`; `Some(0)` present zero).
+    pub wait_if_reset_within_cli: Option<u64>,
+    pub stop_if_reset_beyond_cli: Option<u64>,
     pub tasks_dir: &'a Path,
     /// Database dir (`.task-mgr`) — Ask wait re-reads `usagePolicy` +
     /// `routing.tierFallback` from `config.json` here on the stop-check cadence.
@@ -1700,7 +1706,9 @@ pub struct RunAccountQuotaGateParams<'a> {
     pub models: &'a crate::loop_engine::model::ResolvedModelsConfig,
     pub policy: &'a UsagePolicy,
     pub tier_fallback: Option<&'a TierFallback>,
-    pub threshold: u8,
+    pub floors: RemainingFloors,
+    pub wait_if_reset_within_cli: Option<u64>,
+    pub stop_if_reset_beyond_cli: Option<u64>,
     pub tasks_dir: &'a Path,
     pub db_dir: &'a Path,
     pub fallback_wait: u64,
@@ -1726,8 +1734,8 @@ pub struct RunAccountQuotaGateParams<'a> {
 /// On [`QuotaAccountAction::Stop`], resets `in_progress` → `todo` under
 /// `task_prefix` before returning [`UsageCheckResult::HorizonStopped`].
 pub fn run_account_quota_gate(params: RunAccountQuotaGateParams<'_>) -> UsageCheckResult {
-    let threshold = params.threshold;
-    let load = || load_usage_info_with_threshold(threshold);
+    let floors = params.floors;
+    let load = || load_usage_info_with_threshold(floors);
     run_account_quota_gate_inner(params, &load)
 }
 
@@ -1747,7 +1755,9 @@ pub fn run_account_quota_gate_inner(
         models,
         policy,
         tier_fallback,
-        threshold,
+        floors,
+        wait_if_reset_within_cli,
+        stop_if_reset_beyond_cli,
         tasks_dir,
         db_dir,
         fallback_wait,
@@ -1755,6 +1765,8 @@ pub fn run_account_quota_gate_inner(
         execute_account_action,
         account_quota_stopped,
     } = params;
+    let policy_owned = policy.overlay_horizon(wait_if_reset_within_cli, stop_if_reset_beyond_cli);
+    let policy = &policy_owned;
 
     // Dual predicate (pre-iteration): env off ⇒ no load_usage_info / OAuth GET.
     // Keep proto-channel snapshot; do not document a replace-on-disabled exception.
@@ -1774,15 +1786,14 @@ pub fn run_account_quota_gate_inner(
             // Rebuild banner with run ResolvedModelsConfig (not the provisional
             // builtin snapshot on info.remaining_banner) so frontier→opus pins
             // label both rungs (CODE-FIX-007).
-            if let Some(banner) =
-                remaining_banner_for_run_models(info, models, threshold, Utc::now())
+            if let Some(banner) = remaining_banner_for_run_models(info, models, floors, Utc::now())
             {
                 eprintln!("{banner}");
             } else {
                 eprintln!(
-                    "{}% left (floor {}%)",
+                    "{}% left {}",
                     format_remaining_pct(info.percentage),
-                    threshold
+                    floors.banner_suffix()
                 );
             }
             (
@@ -1800,7 +1811,7 @@ pub fn run_account_quota_gate_inner(
 
     let effective_ttl = ask_ttl_override.unwrap_or(policy.ask_ttl_minutes);
     let (work, horizon_stop) = if let Some(buckets) = buckets {
-        let eval = evaluate_quota(buckets, policy, threshold);
+        let eval = evaluate_quota(buckets, policy, floors);
         let work = compute_remaining_work_snapshot(
             conn,
             task_prefix,
@@ -1829,7 +1840,9 @@ pub fn run_account_quota_gate_inner(
     };
 
     let result = account_quota_preflight(QuotaPreflightParams {
-        threshold,
+        floors,
+        wait_if_reset_within_cli,
+        stop_if_reset_beyond_cli,
         tasks_dir,
         db_dir,
         fallback_wait,
@@ -1878,8 +1891,8 @@ enum PreflightWaitMode<'a> {
 /// `Wait.account_binding` (FR-009). Does **not** close over
 /// [`usage_suggests_lifted`] before apply.
 pub fn account_quota_preflight(params: QuotaPreflightParams<'_>) -> UsageCheckResult {
-    let threshold = params.threshold;
-    let load = || load_usage_info_with_threshold(threshold);
+    let floors = params.floors;
+    let load = || load_usage_info_with_threshold(floors);
     let reset_wait =
         |secs: u64, dir: &Path, _fallback: u64, probe: Option<&dyn Fn() -> bool>| -> bool {
             wait_for_usage_reset(secs, dir, probe)
@@ -1922,7 +1935,9 @@ fn account_quota_preflight_core(
     wait_mode: PreflightWaitMode<'_>,
 ) -> UsageCheckResult {
     let QuotaPreflightParams {
-        threshold,
+        floors,
+        wait_if_reset_within_cli,
+        stop_if_reset_beyond_cli,
         tasks_dir,
         db_dir,
         fallback_wait,
@@ -1938,6 +1953,8 @@ fn account_quota_preflight_core(
         models,
         ask_policy_reeval,
     } = params;
+    let policy_owned = policy.overlay_horizon(wait_if_reset_within_cli, stop_if_reset_beyond_cli);
+    let policy = &policy_owned;
 
     // Env-disabled pre-gate: keep proto-channel snapshot; no evaluate/replace.
     if !execute_account_action {
@@ -1949,7 +1966,7 @@ fn account_quota_preflight_core(
             let (eval, applied) = evaluate_and_apply_quota(
                 buckets,
                 policy,
-                threshold,
+                floors,
                 tier_fallback,
                 work,
                 ask_ttl_override,
@@ -1964,7 +1981,9 @@ fn account_quota_preflight_core(
     };
 
     let ctx = QuotaExecuteCtx {
-        threshold,
+        floors,
+        wait_if_reset_within_cli,
+        stop_if_reset_beyond_cli,
         tasks_dir,
         db_dir,
         fallback_wait,
@@ -1989,7 +2008,7 @@ fn account_quota_preflight_core(
     let Some(remaining) = account_remaining else {
         return UsageCheckResult::Skipped;
     };
-    if remaining > f64::from(threshold) {
+    if remaining > f64::from(floors.other) {
         return UsageCheckResult::BelowThreshold;
     }
     // None = unknown → fallback_wait; Some(0) = ready now (pass through).
@@ -2004,7 +2023,9 @@ fn account_quota_preflight_core(
 }
 
 struct QuotaExecuteCtx<'a, 'm> {
-    threshold: u8,
+    floors: RemainingFloors,
+    wait_if_reset_within_cli: Option<u64>,
+    stop_if_reset_beyond_cli: Option<u64>,
     tasks_dir: &'a Path,
     db_dir: &'a Path,
     fallback_wait: u64,
@@ -2141,8 +2162,17 @@ fn current_ask_wait_outcome(
     match ctx.ask_policy_reeval {
         Some(reeval) => {
             let slice = reeval();
-            ask_wait_tick_from_slice(&slice, buckets, ctx.work, ask_ttl_minutes, initial_allows)
-                .into_outcome_at_deadline()
+            ask_wait_tick_from_slice(
+                &slice,
+                buckets,
+                ctx.work,
+                ask_ttl_minutes,
+                initial_allows,
+                ctx.floors,
+                ctx.wait_if_reset_within_cli,
+                ctx.stop_if_reset_beyond_cli,
+            )
+            .into_outcome_at_deadline()
         }
         // Hermetic Injected path without a re-eval seam: keep the apply-time
         // decision. Production Ask always goes through wait_for_ask_ttl which
@@ -2187,22 +2217,28 @@ impl AskWaitTick {
 /// allowing Proceed → Continue early. Ask/Defer/Wait keep waiting; forbade→allow
 /// while still on the Ask path also Continues early (parity with prior
 /// `tier_fallback_allows` flip).
+#[allow(clippy::too_many_arguments)]
 fn ask_wait_tick_from_slice(
     slice: &AskPolicySlice,
     buckets: &[QuotaBucket],
     work: &RemainingWorkSnapshot,
     ask_ttl_minutes: u64,
     initial_allows: bool,
+    floors: RemainingFloors,
+    wait_if_reset_within_cli: Option<u64>,
+    stop_if_reset_beyond_cli: Option<u64>,
 ) -> AskWaitTick {
-    let floor = slice.usage_policy.remaining_min_percent;
-    let eval = evaluate_quota(buckets, &slice.usage_policy, floor);
+    let policy = slice
+        .usage_policy
+        .overlay_horizon(wait_if_reset_within_cli, stop_if_reset_beyond_cli);
+    let eval = evaluate_quota(buckets, &policy, floors);
     // CLI `--use-other-models-ttl` already resolved into `ask_ttl_minutes` at
     // Ask emit time; keep that effective TTL on re-apply so config 0 + CLI 15
     // cannot flip to Defer mid-wait via a stale askTtlMinutes re-read alone.
     let applied = apply_quota_with_ask_ttl(
         &eval,
         buckets,
-        &slice.usage_policy,
+        &policy,
         slice.tier_fallback.as_ref(),
         work,
         ask_ttl_minutes,
@@ -2347,6 +2383,9 @@ fn wait_for_ask_ttl(
         buckets,
         ask_ttl_minutes,
         initial_allows,
+        ctx.floors,
+        ctx.wait_if_reset_within_cli,
+        ctx.stop_if_reset_beyond_cli,
     )
 }
 
@@ -2366,6 +2405,9 @@ pub(crate) fn wait_for_ask_ttl_inner(
     buckets: &[QuotaBucket],
     ask_ttl_minutes: u64,
     initial_allows: bool,
+    floors: RemainingFloors,
+    wait_if_reset_within_cli: Option<u64>,
+    stop_if_reset_beyond_cli: Option<u64>,
 ) -> AskWaitOutcome {
     if ttl_secs == 0 {
         return AskWaitOutcome::Defer;
@@ -2381,7 +2423,16 @@ pub(crate) fn wait_for_ask_ttl_inner(
         }
 
         let slice = reeval();
-        match ask_wait_tick_from_slice(&slice, buckets, work, ask_ttl_minutes, initial_allows) {
+        match ask_wait_tick_from_slice(
+            &slice,
+            buckets,
+            work,
+            ask_ttl_minutes,
+            initial_allows,
+            floors,
+            wait_if_reset_within_cli,
+            stop_if_reset_beyond_cli,
+        ) {
             AskWaitTick::HorizonStop => {
                 eprintln!("  Ask policy now Stop (usagePolicy); horizon soft-stop...");
                 return AskWaitOutcome::HorizonStop;
@@ -2423,11 +2474,11 @@ fn run_preflight_wait(
             }
         }
         PreflightWaitMode::Production { load, reset_wait } => {
-            let threshold = ctx.threshold;
+            let floors = ctx.floors;
             let models = ctx.models;
             let probe = || {
                 if let Some(info) = load() {
-                    if wait_probe_lifted(&info, threshold, account_binding, models) {
+                    if wait_probe_lifted(&info, floors, account_binding, models) {
                         return true;
                     }
                     if let Some(r) = info.reset_at.as_deref() {
@@ -2810,14 +2861,14 @@ fn format_remaining_pct(remaining: f64) -> String {
 ///
 /// Returns the result of the check-and-wait cycle.
 pub(crate) fn check_and_wait(
-    threshold: u8,
+    floors: RemainingFloors,
     tasks_dir: &Path,
     fallback_wait: u64,
     models: &ResolvedModelsConfig,
 ) -> UsageCheckResult {
-    // Pass live remaining-min into parse so reset_at uses the same floor as
-    // the remaining compare below (not a hardcoded 8).
-    let usage = match load_usage_info_with_threshold(threshold) {
+    // Pass live floors into parse so reset_at uses the same bar as the remaining
+    // compare below (not a hardcoded 8).
+    let usage = match load_usage_info_with_threshold(floors) {
         Some(u) => u,
         None => {
             // Distinguish "no creds" from "API failed" is best-effort: load
@@ -2826,18 +2877,19 @@ pub(crate) fn check_and_wait(
         }
     };
 
-    if let Some(banner) = remaining_banner_for_run_models(&usage, models, threshold, Utc::now()) {
+    if let Some(banner) = remaining_banner_for_run_models(&usage, models, floors, Utc::now()) {
         eprintln!("{banner}");
     } else {
         eprintln!(
-            "{}% left (floor {}%)",
+            "{}% left {}",
             format_remaining_pct(usage.percentage),
-            threshold
+            floors.banner_suffix()
         );
     }
 
-    // Proceed when remaining > floor (old used≥92 ≡ remaining≤8).
-    if usage.percentage > f64::from(threshold) {
+    // Proceed when every account-binding window is above its floor. Org-API
+    // (empty buckets) still uses percentage vs other.
+    if usage_suggests_lifted(&usage, floors, false) {
         return UsageCheckResult::BelowThreshold;
     }
 
@@ -2849,8 +2901,8 @@ pub(crate) fn check_and_wait(
         .unwrap_or(fallback_wait);
 
     let probe = || {
-        if let Some(info) = load_usage_info_with_threshold(threshold) {
-            if usage_suggests_lifted(&info, threshold, false) {
+        if let Some(info) = load_usage_info_with_threshold(floors) {
+            if usage_suggests_lifted(&info, floors, false) {
                 return true;
             }
             if let Some(r) = info.reset_at.as_deref() {
@@ -3581,7 +3633,11 @@ mod tests {
             Some(vec![(Provider::Claude, CapabilityTier::Frontier)]),
         );
         let policy = UsagePolicy::default();
-        let eval = evaluate_quota(std::slice::from_ref(&frontier), &policy, 8);
+        let eval = evaluate_quota(
+            std::slice::from_ref(&frontier),
+            &policy,
+            RemainingFloors::uniform(8),
+        );
         let work = RemainingWorkSnapshot {
             other_rungs_runnable: true,
             max_difficulty: Some("high"),
@@ -3616,7 +3672,11 @@ mod tests {
             }],
             ..UsagePolicy::default()
         };
-        let eval = evaluate_quota(std::slice::from_ref(&frontier), &policy, 8);
+        let eval = evaluate_quota(
+            std::slice::from_ref(&frontier),
+            &policy,
+            RemainingFloors::uniform(8),
+        );
         assert!(
             !eval.account_low.is_empty(),
             "evaluate must emit wait input for explicit scoped wait"
@@ -3671,7 +3731,11 @@ mod tests {
             }],
             ..UsagePolicy::default()
         };
-        let eval = evaluate_quota(std::slice::from_ref(&frontier), &policy, 8);
+        let eval = evaluate_quota(
+            std::slice::from_ref(&frontier),
+            &policy,
+            RemainingFloors::uniform(8),
+        );
         let work = RemainingWorkSnapshot {
             other_rungs_runnable: true,
             max_difficulty: Some("high"),
@@ -3711,7 +3775,11 @@ mod tests {
             }],
             ..UsagePolicy::default()
         };
-        let eval = evaluate_quota(std::slice::from_ref(&frontier), &policy, 8);
+        let eval = evaluate_quota(
+            std::slice::from_ref(&frontier),
+            &policy,
+            RemainingFloors::uniform(8),
+        );
         let work = RemainingWorkSnapshot {
             other_rungs_runnable: true,
             max_difficulty: Some("high"),
@@ -3742,7 +3810,11 @@ mod tests {
             Some(vec![(Provider::Claude, CapabilityTier::Frontier)]),
         );
         let policy = UsagePolicy::default();
-        let eval = evaluate_quota(std::slice::from_ref(&frontier), &policy, 8);
+        let eval = evaluate_quota(
+            std::slice::from_ref(&frontier),
+            &policy,
+            RemainingFloors::uniform(8),
+        );
         let work = RemainingWorkSnapshot {
             other_rungs_runnable: true,
             has_forced: true,
@@ -3782,7 +3854,11 @@ mod tests {
             Some(vec![(Provider::Claude, CapabilityTier::Frontier)]),
         );
         let policy = UsagePolicy::default(); // ask_ttl_minutes = 0 → Defer
-        let eval = evaluate_quota(std::slice::from_ref(&frontier), &policy, 8);
+        let eval = evaluate_quota(
+            std::slice::from_ref(&frontier),
+            &policy,
+            RemainingFloors::uniform(8),
+        );
         let fb = TierFallback {
             max_difficulty: "high".into(),
             include_review: false,
@@ -3810,7 +3886,11 @@ mod tests {
             Some(vec![(Provider::Claude, CapabilityTier::Frontier)]),
         );
         let policy = UsagePolicy::default(); // ask_ttl_minutes = 0
-        let eval = evaluate_quota(std::slice::from_ref(&frontier), &policy, 8);
+        let eval = evaluate_quota(
+            std::slice::from_ref(&frontier),
+            &policy,
+            RemainingFloors::uniform(8),
+        );
         let work = RemainingWorkSnapshot {
             other_rungs_runnable: true,
             max_difficulty: Some("high"),
@@ -3834,7 +3914,11 @@ mod tests {
             ask_ttl_minutes: 15,
             ..UsagePolicy::default()
         };
-        let eval = evaluate_quota(std::slice::from_ref(&frontier), &policy, 8);
+        let eval = evaluate_quota(
+            std::slice::from_ref(&frontier),
+            &policy,
+            RemainingFloors::uniform(8),
+        );
         let work = RemainingWorkSnapshot {
             other_rungs_runnable: true,
             max_difficulty: Some("high"),
@@ -3870,7 +3954,9 @@ mod tests {
         let mut set = HashMap::new();
         let result = account_quota_preflight_inner(
             QuotaPreflightParams {
-                threshold: 8,
+                floors: RemainingFloors::uniform(8),
+                wait_if_reset_within_cli: None,
+                stop_if_reset_beyond_cli: None,
                 tasks_dir: Path::new("/tmp"),
                 db_dir: Path::new("/tmp"),
                 fallback_wait: 300,
@@ -3967,7 +4053,9 @@ mod tests {
         let mut set = HashMap::new();
         let result = account_quota_preflight_inner(
             QuotaPreflightParams {
-                threshold: 8,
+                floors: RemainingFloors::uniform(8),
+                wait_if_reset_within_cli: None,
+                stop_if_reset_beyond_cli: None,
                 tasks_dir: Path::new("/tmp"),
                 db_dir: Path::new("/tmp"),
                 fallback_wait: 300,
@@ -4036,7 +4124,9 @@ mod tests {
         let mut set = HashMap::new();
         let result = account_quota_preflight_inner(
             QuotaPreflightParams {
-                threshold: 8,
+                floors: RemainingFloors::uniform(8),
+                wait_if_reset_within_cli: None,
+                stop_if_reset_beyond_cli: None,
                 tasks_dir: Path::new("/tmp"),
                 db_dir: Path::new("/tmp"),
                 fallback_wait: 300,
@@ -4080,7 +4170,11 @@ mod tests {
             max_difficulty: Some("high"),
             ..RemainingWorkSnapshot::default()
         };
-        let eval = evaluate_quota(std::slice::from_ref(&frontier), &policy, 8);
+        let eval = evaluate_quota(
+            std::slice::from_ref(&frontier),
+            &policy,
+            RemainingFloors::uniform(8),
+        );
         let applied = apply_quota_with_ask_ttl(
             &eval,
             &[frontier],
@@ -4110,7 +4204,11 @@ mod tests {
             max_difficulty: Some("high"),
             ..RemainingWorkSnapshot::default()
         };
-        let eval = evaluate_quota(std::slice::from_ref(&frontier), &policy, 8);
+        let eval = evaluate_quota(
+            std::slice::from_ref(&frontier),
+            &policy,
+            RemainingFloors::uniform(8),
+        );
         let applied =
             apply_quota_with_ask_ttl(&eval, &[frontier], &policy, Some(&factory_fb()), &work, 15);
         assert_eq!(applied.account, QuotaAccountAction::Proceed);
@@ -4148,7 +4246,9 @@ mod tests {
         let mut set = HashMap::new();
         let result = account_quota_preflight_inner(
             QuotaPreflightParams {
-                threshold: 8,
+                floors: RemainingFloors::uniform(8),
+                wait_if_reset_within_cli: None,
+                stop_if_reset_beyond_cli: None,
                 tasks_dir: Path::new("/tmp"),
                 db_dir: Path::new("/tmp"),
                 fallback_wait: 300,
@@ -4221,6 +4321,9 @@ mod tests {
             std::slice::from_ref(&frontier),
             /* ask_ttl_minutes */ 15,
             /* initial_allows */ false,
+            RemainingFloors::uniform(8),
+            None,
+            None,
         );
         assert_eq!(outcome, AskWaitOutcome::Continue);
         assert!(
@@ -4290,6 +4393,9 @@ mod tests {
             std::slice::from_ref(&frontier),
             15,
             false,
+            RemainingFloors::uniform(8),
+            None,
+            None,
         );
         assert_eq!(outcome, AskWaitOutcome::HorizonStop);
         assert_ne!(outcome, AskWaitOutcome::Stopped);
@@ -4331,6 +4437,9 @@ mod tests {
             std::slice::from_ref(&frontier),
             15,
             false,
+            RemainingFloors::uniform(8),
+            None,
+            None,
         );
         assert_eq!(outcome, AskWaitOutcome::Defer);
     }
@@ -4377,7 +4486,9 @@ mod tests {
         let mut set = HashMap::new();
         let result = account_quota_preflight_inner(
             QuotaPreflightParams {
-                threshold: 8,
+                floors: RemainingFloors::uniform(8),
+                wait_if_reset_within_cli: None,
+                stop_if_reset_beyond_cli: None,
                 tasks_dir: Path::new("/tmp"),
                 db_dir: Path::new("/tmp"),
                 fallback_wait: 300,
@@ -4427,7 +4538,9 @@ mod tests {
         let mut set = HashMap::new();
         let result = account_quota_preflight_inner(
             QuotaPreflightParams {
-                threshold: 8,
+                floors: RemainingFloors::uniform(8),
+                wait_if_reset_within_cli: None,
+                stop_if_reset_beyond_cli: None,
                 tasks_dir: Path::new("/tmp"),
                 db_dir: Path::new("/tmp"),
                 fallback_wait: 300,
@@ -4469,7 +4582,9 @@ mod tests {
         let mut set = HashMap::new();
         let result = account_quota_preflight_inner(
             QuotaPreflightParams {
-                threshold: 8,
+                floors: RemainingFloors::uniform(8),
+                wait_if_reset_within_cli: None,
+                stop_if_reset_beyond_cli: None,
                 tasks_dir: Path::new("/tmp"),
                 db_dir: Path::new("/tmp"),
                 fallback_wait: 300,
@@ -4514,7 +4629,9 @@ mod tests {
         let mut set = HashMap::new();
         let result = account_quota_preflight_inner(
             QuotaPreflightParams {
-                threshold: 8,
+                floors: RemainingFloors::uniform(8),
+                wait_if_reset_within_cli: None,
+                stop_if_reset_beyond_cli: None,
                 tasks_dir: Path::new("/tmp"),
                 db_dir: Path::new("/tmp"),
                 fallback_wait: 300,
@@ -4540,7 +4657,11 @@ mod tests {
     fn apply_account_low_3h_waits_capped() {
         let session = pct_bucket("five_hour", "session", 5.0, 3 * 3600, None);
         let policy = UsagePolicy::default();
-        let eval = evaluate_quota(std::slice::from_ref(&session), &policy, 8);
+        let eval = evaluate_quota(
+            std::slice::from_ref(&session),
+            &policy,
+            RemainingFloors::uniform(8),
+        );
         let work = RemainingWorkSnapshot {
             other_rungs_runnable: false,
             ..RemainingWorkSnapshot::default()
@@ -4565,7 +4686,11 @@ mod tests {
         // siblings must not flip the account action to Proceed/Stop.
         let session = pct_bucket("five_hour", "session", 5.0, 3 * 3600, None);
         let policy = UsagePolicy::default();
-        let eval = evaluate_quota(std::slice::from_ref(&session), &policy, 8);
+        let eval = evaluate_quota(
+            std::slice::from_ref(&session),
+            &policy,
+            RemainingFloors::uniform(8),
+        );
         let work = RemainingWorkSnapshot {
             other_rungs_runnable: true,
             ..RemainingWorkSnapshot::default()
@@ -4598,7 +4723,7 @@ mod tests {
         );
         let policy = UsagePolicy::default();
         let buckets = [session, frontier];
-        let eval = evaluate_quota(&buckets, &policy, 8);
+        let eval = evaluate_quota(&buckets, &policy, RemainingFloors::uniform(8));
         let work = RemainingWorkSnapshot {
             other_rungs_runnable: false,
             ..RemainingWorkSnapshot::default()
@@ -4625,7 +4750,11 @@ mod tests {
         for remaining in [5.0_f64, 0.0] {
             let week = pct_bucket("seven_day", "weekly_all", remaining, 6 * 24 * 3600, None);
             let policy = UsagePolicy::default();
-            let eval = evaluate_quota(std::slice::from_ref(&week), &policy, 8);
+            let eval = evaluate_quota(
+                std::slice::from_ref(&week),
+                &policy,
+                RemainingFloors::uniform(8),
+            );
             let work = RemainingWorkSnapshot {
                 other_rungs_runnable: true,
                 max_difficulty: Some("high"),
@@ -4656,7 +4785,11 @@ mod tests {
             Some(vec![(Provider::Claude, CapabilityTier::Frontier)]),
         );
         let policy = UsagePolicy::default();
-        let eval = evaluate_quota(std::slice::from_ref(&frontier), &policy, 8);
+        let eval = evaluate_quota(
+            std::slice::from_ref(&frontier),
+            &policy,
+            RemainingFloors::uniform(8),
+        );
         let work = RemainingWorkSnapshot {
             other_rungs_runnable: false,
             ..RemainingWorkSnapshot::default()
@@ -4680,7 +4813,11 @@ mod tests {
             Some(vec![(Provider::Claude, CapabilityTier::Frontier)]),
         );
         let policy = UsagePolicy::default();
-        let eval = evaluate_quota(std::slice::from_ref(&frontier), &policy, 8);
+        let eval = evaluate_quota(
+            std::slice::from_ref(&frontier),
+            &policy,
+            RemainingFloors::uniform(8),
+        );
         let work = RemainingWorkSnapshot {
             other_rungs_runnable: false,
             ..RemainingWorkSnapshot::default()
@@ -4704,7 +4841,7 @@ mod tests {
         let week = pct_bucket("seven_day", "weekly_all", 5.0, 6 * 24 * 3600, None);
         let policy = UsagePolicy::default();
         let buckets = [session, week];
-        let eval = evaluate_quota(&buckets, &policy, 8);
+        let eval = evaluate_quota(&buckets, &policy, RemainingFloors::uniform(8));
         let work = RemainingWorkSnapshot {
             other_rungs_runnable: false,
             ..RemainingWorkSnapshot::default()
@@ -4735,7 +4872,11 @@ mod tests {
             rungs: None,
         };
         let policy = UsagePolicy::default();
-        let eval = evaluate_quota(std::slice::from_ref(&spend), &policy, 8);
+        let eval = evaluate_quota(
+            std::slice::from_ref(&spend),
+            &policy,
+            RemainingFloors::uniform(8),
+        );
         // Amount > 0 is not amount_exhausted in evaluate → Ignore.
         assert!(eval.account_low.is_empty());
         let spent = QuotaBucket {
@@ -4745,7 +4886,11 @@ mod tests {
             }],
             ..spend
         };
-        let eval = evaluate_quota(std::slice::from_ref(&spent), &policy, 8);
+        let eval = evaluate_quota(
+            std::slice::from_ref(&spent),
+            &policy,
+            RemainingFloors::uniform(8),
+        );
         let work = RemainingWorkSnapshot::default();
         let applied = apply_quota(&eval, &[spent], &policy, Some(&factory_fb()), &work);
         assert_eq!(
@@ -4772,7 +4917,11 @@ mod tests {
             rungs: None,
         };
         let policy = UsagePolicy::default();
-        let eval = evaluate_quota(std::slice::from_ref(&spend), &policy, 8);
+        let eval = evaluate_quota(
+            std::slice::from_ref(&spend),
+            &policy,
+            RemainingFloors::uniform(8),
+        );
         assert!(
             matches!(eval.per_bucket[0].1, BucketEval::AccountLow { .. }),
             "spend dollars 0 must AccountLow"
@@ -4861,7 +5010,7 @@ mod tests {
         let session = pct_bucket("five_hour", "session", 5.0, 6 * 24 * 3600, None);
         let policy = UsagePolicy::default();
         let buckets = [frontier, session];
-        let eval = evaluate_quota(&buckets, &policy, 8);
+        let eval = evaluate_quota(&buckets, &policy, RemainingFloors::uniform(8));
         let work = RemainingWorkSnapshot {
             other_rungs_runnable: false,
             ..RemainingWorkSnapshot::default()
@@ -4897,7 +5046,11 @@ mod tests {
             other_rungs_runnable: false,
             ..RemainingWorkSnapshot::default()
         };
-        let eval = evaluate_quota(std::slice::from_ref(&frontier), &policy, 8);
+        let eval = evaluate_quota(
+            std::slice::from_ref(&frontier),
+            &policy,
+            RemainingFloors::uniform(8),
+        );
         let applied = apply_quota(
             &eval,
             std::slice::from_ref(&frontier),
@@ -4936,7 +5089,9 @@ mod tests {
         let mut set = HashMap::new();
         let result = account_quota_preflight_with_io_seams(
             QuotaPreflightParams {
-                threshold: 8,
+                floors: RemainingFloors::uniform(8),
+                wait_if_reset_within_cli: None,
+                stop_if_reset_beyond_cli: None,
                 tasks_dir: Path::new("/tmp"),
                 db_dir: Path::new("/tmp"),
                 fallback_wait: 300,
@@ -4979,7 +5134,11 @@ mod tests {
             other_rungs_runnable: false,
             ..RemainingWorkSnapshot::default()
         };
-        let eval = evaluate_quota(std::slice::from_ref(&session), &policy, 8);
+        let eval = evaluate_quota(
+            std::slice::from_ref(&session),
+            &policy,
+            RemainingFloors::uniform(8),
+        );
         let applied = apply_quota(
             &eval,
             std::slice::from_ref(&session),
@@ -5004,7 +5163,9 @@ mod tests {
         let mut set = HashMap::new();
         let result = account_quota_preflight_inner(
             QuotaPreflightParams {
-                threshold: 8,
+                floors: RemainingFloors::uniform(8),
+                wait_if_reset_within_cli: None,
+                stop_if_reset_beyond_cli: None,
                 tasks_dir: Path::new("/tmp"),
                 db_dir: Path::new("/tmp"),
                 fallback_wait: 300,
@@ -5052,7 +5213,9 @@ mod tests {
         let mut set = HashMap::new();
         let result = account_quota_preflight_inner(
             QuotaPreflightParams {
-                threshold: 8,
+                floors: RemainingFloors::uniform(8),
+                wait_if_reset_within_cli: None,
+                stop_if_reset_beyond_cli: None,
                 tasks_dir: Path::new("/tmp"),
                 db_dir: Path::new("/tmp"),
                 fallback_wait: 300,
@@ -5096,7 +5259,9 @@ mod tests {
         let past = (chrono::Utc::now() - chrono::Duration::seconds(30)).to_rfc3339();
         let result = account_quota_preflight_inner(
             QuotaPreflightParams {
-                threshold: 8,
+                floors: RemainingFloors::uniform(8),
+                wait_if_reset_within_cli: None,
+                stop_if_reset_beyond_cli: None,
                 tasks_dir: Path::new("/tmp"),
                 db_dir: Path::new("/tmp"),
                 fallback_wait: 300,
@@ -5147,7 +5312,9 @@ mod tests {
         let wait = |_secs: u64| true;
         let a = account_quota_preflight_inner(
             QuotaPreflightParams {
-                threshold: 8,
+                floors: RemainingFloors::uniform(8),
+                wait_if_reset_within_cli: None,
+                stop_if_reset_beyond_cli: None,
                 tasks_dir: Path::new("/tmp"),
                 db_dir: Path::new("/tmp"),
                 fallback_wait: 300,
@@ -5167,7 +5334,9 @@ mod tests {
         );
         let b = account_quota_preflight_inner(
             QuotaPreflightParams {
-                threshold: 8,
+                floors: RemainingFloors::uniform(8),
+                wait_if_reset_within_cli: None,
+                stop_if_reset_beyond_cli: None,
                 tasks_dir: Path::new("/tmp"),
                 db_dir: Path::new("/tmp"),
                 fallback_wait: 300,
@@ -5212,7 +5381,9 @@ mod tests {
         let wait = |_secs: u64| true;
         let result = account_quota_preflight_inner(
             QuotaPreflightParams {
-                threshold: 8,
+                floors: RemainingFloors::uniform(8),
+                wait_if_reset_within_cli: None,
+                stop_if_reset_beyond_cli: None,
                 tasks_dir: Path::new("/tmp"),
                 db_dir: Path::new("/tmp"),
                 fallback_wait: 300,
@@ -5260,7 +5431,9 @@ mod tests {
         let wait = |_secs: u64| true;
         let result = account_quota_preflight_inner(
             QuotaPreflightParams {
-                threshold: 8,
+                floors: RemainingFloors::uniform(8),
+                wait_if_reset_within_cli: None,
+                stop_if_reset_beyond_cli: None,
                 tasks_dir: Path::new("/tmp"),
                 db_dir: Path::new("/tmp"),
                 fallback_wait: 300,
@@ -5301,7 +5474,7 @@ mod tests {
         let models = crate::loop_engine::model::builtin_resolved_models();
         let now = 1_700_000_000u64;
         let params = AccountReactionParams {
-            threshold: 8,
+            floors: RemainingFloors::uniform(8),
             usage_enabled: false,
             anthropic_account_io_allowed: true,
             tasks_dir: Path::new("/tmp"),
@@ -5402,7 +5575,9 @@ mod tests {
         let wait = |_secs: u64| true;
         let result = account_quota_preflight_inner(
             QuotaPreflightParams {
-                threshold: 8,
+                floors: RemainingFloors::uniform(8),
+                wait_if_reset_within_cli: None,
+                stop_if_reset_beyond_cli: None,
                 tasks_dir: Path::new("/tmp"),
                 db_dir: Path::new("/tmp"),
                 fallback_wait: 300,
@@ -5458,7 +5633,9 @@ mod tests {
                 models,
                 policy: &policy,
                 tier_fallback: Some(&fb),
-                threshold: 8,
+                floors: RemainingFloors::uniform(8),
+                wait_if_reset_within_cli: None,
+                stop_if_reset_beyond_cli: None,
                 tasks_dir: Path::new("/tmp"),
                 db_dir: Path::new("/tmp"),
                 fallback_wait: 300,
@@ -5505,7 +5682,9 @@ mod tests {
                 models,
                 policy: &policy,
                 tier_fallback: Some(&fb),
-                threshold: 8,
+                floors: RemainingFloors::uniform(8),
+                wait_if_reset_within_cli: None,
+                stop_if_reset_beyond_cli: None,
                 tasks_dir: Path::new("/tmp"),
                 db_dir: Path::new("/tmp"),
                 fallback_wait: 300,
@@ -5743,7 +5922,7 @@ mod tests {
         ] {
             let buckets = ingest_oauth_value(&live_shaped_oauth_json(), &models);
             let policy = UsagePolicy::default();
-            let eval = evaluate_quota(&buckets, &policy, 8);
+            let eval = evaluate_quota(&buckets, &policy, RemainingFloors::uniform(8));
             assert_eq!(
                 eval.unavailable,
                 vec![(Provider::Claude, CapabilityTier::Frontier)],

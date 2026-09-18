@@ -20,6 +20,8 @@
 
 **Gotcha — two Recovery predicates, not one reset helper.** Loop-exit 17.5/17.6 and overflow rungs 1–3 call `recover_in_progress` (`in_progress → todo` only). Merge-fail calls `reopen_after_merge_fail` (`in_progress|done → todo`). Sharing one helper either reopens an honest `:blocked` at process exit or strands a premature `:done` after a failed slot merge. `resurrect_for_iteration` stays the unguarded escape hatch — do not add `WHERE status = 'in_progress'` to it (learning #4358). Trackers (`pending_slot_tasks`, `last_claimed_task`) drain on `:done` / merge-fail retain only; they are **not** reset authority. See `src/lifecycle/CLAUDE.md` "Recovery verb families".
 
+**Gotcha — sticky path identity (one path → one prefix).** First `PrefixMode::Auto` registration always hashes `md5(branchName:filename)[:8]` and freezes that into `prd_metadata`; JSON `taskPrefix` is not read on first Auto. Re-import / `loop run` restore the registered prefix (do not re-hash). Path-identity twins (relative + absolute `prd_files` for the same live JSON) refuse at init — run `task-mgr doctor` (never `LIMIT 1`, never `archive` to collapse twins). Scoped `--force` soft-archives identity ∪ about-to-apply (`archived_at`); it does not `DELETE FROM tasks` or move JSON files.
+
 ## Subsystem design notes
 
 Module-level CLAUDE.md files (auto-loaded when files in the module are read):
@@ -88,6 +90,7 @@ task-mgr models unset-fallback <provider>
 task-mgr models route <prefix> [--provider <p>] [--tier <t>]   # byIdPrefix forcing
 task-mgr models unroute <prefix>
 task-mgr models set-usage-rule --kind <k>|--id <id> --on-low wait|unavailable|stop|ask|ignore
+task-mgr models set-usage-policy [--remaining-min PCT] [--remaining-min-weekly PCT] [--wait-within-minutes N] [--stop-beyond-hours N]
 task-mgr models set-tier-fallback <low|medium|high> [--include-review[=true|false]] [--include-forced]
 task-mgr models unset-tier-fallback      # writes JSON null (ask opt-out); does NOT delete the key
 ```
@@ -151,12 +154,36 @@ disabling the Claude provider zeroes **all** Anthropic account I/O (load + probe
 See [`src/loop_engine/CLAUDE.md`](src/loop_engine/CLAUDE.md) "Account-global
 reactions".
 
-**Remaining-percent floor (PR-2):** gate unit is remaining 0–100 (not used-percent).
-Precedence: `LOOP_USAGE_REMAINING_MIN` (env) > `usagePolicy.remainingMinPercent`
-(config) > **8**. Old `used ≥ 92` ≡ `remaining ≤ 8`. Legacy `LOOP_USAGE_THRESHOLD`
-hard-errors at loop/batch `preflight_validate_and_probe` (names
-`LOOP_USAGE_REMAINING_MIN`); non-loop commands ignore it. Operator banners use
-`% left` (rung labels like `frontier`, never model ids).
+### Usage floors and horizon (Claude account remaining)
+
+The loop parks **before** a window is empty so leftover credits stay available
+for `/compound`, extract-learnings, and a couple of manual session turns.
+Wait sleeps; it does not spend the reserve. Weekly-all beyond 12h **Stops**
+this PRD (that Stop is the wrap-up hatch).
+
+| Window | Factory floor | Persist | Per-run (does not write config) |
+| --- | --- | --- | --- |
+| Session / other percent | **2% left** | `usagePolicy.remainingMinPercent` | `--usage-remaining-min` |
+| Weekly (`weekly_all` / `weekly_scoped`) | **1% left** | `usagePolicy.remainingMinWeeklyPercent` | `--usage-remaining-min-weekly` |
+| Wait if reset within | **60 min** | `waitIfResetWithinMinutes` | `--wait-if-reset-within` |
+| Stop if reset beyond | **12 h** | `stopIfResetBeyondHours` | `--stop-if-reset-beyond` |
+
+```sh
+task-mgr models show                                          # prints all four knobs
+task-mgr models set-usage-policy --remaining-min 2 --remaining-min-weekly 1
+task-mgr models set-usage-policy --wait-within-minutes 30     # sparse; does not wipe rules
+task-mgr loop run prd.json --yes --usage-remaining-min 2 --wait-if-reset-within 0
+task-mgr how "quota"                                          # same recipes
+```
+
+Precedence — **other**: CLI > `LOOP_USAGE_REMAINING_MIN` > config > 2.
+**Weekly**: CLI > `LOOP_USAGE_REMAINING_MIN_WEEKLY` > config > 1. Independent:
+the other env does **not** change weekly. CLI present `0` is `Some(0)`, not
+omitted. A config that already sets `remainingMinPercent: 8` keeps session at 8;
+weekly becomes 1 unless `remainingMinWeeklyPercent` is set. Legacy
+`LOOP_USAGE_THRESHOLD` hard-errors at loop/batch preflight. Banners print
+`% left` (rung labels like `frontier`, never model ids); split floors print
+`(floor 2% · weekly 1%)`. `task-mgr how "quota"` maps the same surface.
 
 **Ask TTL override (PR-3 / FEAT-006):** `--use-other-models-ttl <minutes>` on
 `task-mgr loop run` and `task-mgr batch run` (nested + deprecated flat).

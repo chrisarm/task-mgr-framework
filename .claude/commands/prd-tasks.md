@@ -19,7 +19,7 @@ You are converting a human-readable PRD into machine-executable task artifacts f
 >
 > 1. **Quality dimensions explicit** — every implementation task carries `qualityDimensions` (one flat list) from PRD section 2.5. The agent must know what "good" looks like, not just what to build.
 > 2. **Edge cases = test cases** — every PRD Known Edge Case becomes an `edgeCases` entry on a TEST-INIT task. 1:1 mapping, no exceptions. Unnamed edge cases get discovered in production.
-> 3. **Scoped per-iteration, full suite at milestones** — iterations run format + type-check + lint + tests scoped to `touchesFiles`. Milestones run the full unscoped suite and fix every failure (including pre-existing). This is what lets iterations move fast without letting the trunk degrade.
+> 3. **Full floor every iteration** — every iteration's quality gate is: run `bash bin/gate` (or the project's declared floor command) - the full suite - before the completion commit and paste its `GATE_OK` line as a `Gate:` trailer; a scoped run is a development convenience, never the pre-commit check. Milestones additionally fix every pre-existing failure so the trunk never degrades.
 > 4. **Project verification skills are the proof** — if the code repo ships a `.claude/skills/verif*` or `.grok/skills/verif*` skill, the loop agent must Read and follow it for covered user-facing changes. Language-level gates (fmt, type-check, lint, scoped tests) are necessary but not sufficient. Do not invent a second harness.
 
 ### Step 1: Read and Parse the PRD
@@ -375,7 +375,7 @@ The agent checks these before starting any task. If the required task in the oth
       "Quality dimensions explicit — qualityDimensions on every task tells you what 'good' looks like",
       "Phase 2 foundation — prefer solutions that lay strong post-launch foundations (1:10+ savings ratio)",
       "Edge cases = test cases — every known edge case must have a corresponding test",
-      "Scoped per-iteration tests, full suite at milestones — milestones must leave the trunk green including pre-existing failures",
+      "Full floor every iteration — every iteration's quality gate is: run `bash bin/gate` (or the project's declared floor command) - the full suite - before the completion commit and paste its `GATE_OK` line as a `Gate:` trailer; a scoped run is a development convenience, never the pre-commit check; milestones must leave the trunk green including pre-existing failures",
       "Ship working code with tests to prove it; handle Option/Result explicitly; avoid unwrap() in production"
     ]
   },
@@ -631,7 +631,7 @@ Optimize for context economy: pull only what's needed, don't dump whole files.
 
 6. **Implement** — single task, code and tests in one coherent change.
 
-7. **Run the scoped quality gate** (see Quality Checks below — scoped tests only, NOT the full suite). If a **Project Verification Skills** entry covers this task, Read that SKILL.md and follow it after the language gate; do not invent a second harness. A green compile/test run is not proof for covered user-facing changes. If the skill is blocked (can't launch, unmet precondition), emit `<promise>BLOCKED</promise>` rather than marking the task done. Fix failures before committing; never commit broken code.
+7. **Run the floor gate** (see Quality Checks below): every iteration's quality gate is: run `bash bin/gate` (or the project's declared floor command) - the full suite - before the completion commit and paste its `GATE_OK` line as a `Gate:` trailer; a scoped run is a development convenience, never the pre-commit check. If a **Project Verification Skills** entry covers this task, Read that SKILL.md and follow it after the language gate; do not invent a second harness. A green compile/test run is not proof for covered user-facing changes. If the skill is blocked (can't launch, unmet precondition), emit `<promise>BLOCKED</promise>` rather than marking the task done. Fix failures before committing; never commit broken code.
 
 8. **Commit**: `feat: <TASK-ID>-completed - [Title]` (or `refactor:`/`fix:`/`test:` as appropriate). Multiple tasks per iteration: `feat: ID1-completed, ID2-completed - [Title]`.
 

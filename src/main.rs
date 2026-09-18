@@ -15,14 +15,15 @@ use task_mgr::cli::{
     WorktreesAction, resolve_batch_command, resolve_loop_command,
 };
 use task_mgr::commands::{
-    LearnParams, LearningsListParams, RecallCmdParams, ReviewOptions, add, apply_learning,
-    audit_setup, auto_unblock_all, begin, cheatsheet, complete, count_resettable_tasks, current,
-    decline_decision_cmd, doctor, end, export, fail, format_doctor_verbose, format_init_verbose,
-    format_next_verbose, format_recall_verbose, get_reviewable_tasks, history, history_detail, how,
-    import_learnings, init, invalidate_learning, irrelevant, learn, list, list_decisions,
-    list_learnings, migrate_all, migrate_down_cmd, migrate_status, migrate_up_cmd, next, recall,
-    reset_all_tasks, reset_tasks, resolve_decision_cmd, revert_decision_cmd, show, skip, stats,
-    unblock, unskip, update, worktrees_list, worktrees_prune, worktrees_remove,
+    InitOpts, LearnParams, LearningsListParams, RecallCmdParams, ReviewOptions, add,
+    apply_learning, audit_setup, auto_unblock_all, begin, cheatsheet, complete,
+    count_resettable_tasks, current, decline_decision_cmd, doctor, end, export, fail,
+    format_doctor_verbose, format_init_verbose, format_next_verbose, format_recall_verbose,
+    get_reviewable_tasks, history, history_detail, how, import_learnings, init_with_opts,
+    invalidate_learning, irrelevant, learn, list, list_decisions, list_learnings, migrate_all,
+    migrate_down_cmd, migrate_status, migrate_up_cmd, next, recall, reset_all_tasks, reset_tasks,
+    resolve_decision_cmd, revert_decision_cmd, show, skip, stats, unblock, unskip, update,
+    worktrees_list, worktrees_prune, worktrees_remove,
 };
 use task_mgr::db::{DbDirSource, LockGuard, ResolvedDbDir, open_connection, resolve_db_dir};
 use task_mgr::handlers::{
@@ -73,7 +74,7 @@ fn resolve_active_prefix_for_logging(db_dir: &Path) -> Option<String> {
         return None;
     }
     let conn = open_connection(db_dir).ok()?;
-    task_mgr::commands::add::resolve_context(&conn)
+    task_mgr::commands::add::resolve_context(&conn, None, "logging")
         .ok()
         .flatten()
         .map(|ctx| ctx.prefix)
@@ -305,7 +306,7 @@ fn dispatch_init_shim(
 
     // Identical call shape to LoopCommand::Init / BatchCommand::Init dispatch arms.
     let _lock = LockGuard::acquire(db_dir)?;
-    let result = init(
+    let result = init_with_opts(
         db_dir,
         &args.from_json,
         args.force,
@@ -313,6 +314,10 @@ fn dispatch_init_shim(
         args.update_existing,
         args.dry_run,
         prefix_mode,
+        InitOpts {
+            source_root: Some(project_root.clone()),
+            worktree_root: Some(project_root),
+        },
     )?;
 
     if verbose {
@@ -824,6 +829,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
             stdin,
             priority,
             depended_on_by,
+            from_json,
         } => {
             let input_json = if let Some(j) = json {
                 j
@@ -842,7 +848,13 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                     "neither provided",
                 ));
             };
-            let result = add(&cli.dir, &input_json, priority, &depended_on_by)?;
+            let result = add(
+                &cli.dir,
+                &input_json,
+                priority,
+                &depended_on_by,
+                from_json.as_deref(),
+            )?;
             output_result(&result, cli.format);
             Ok(())
         }
@@ -899,8 +911,8 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
             Ok(())
         }
 
-        Commands::Current => {
-            let result = current(&cli.dir)?;
+        Commands::Current { from_json } => {
+            let result = current(&cli.dir, from_json.as_deref())?;
             output_result(&result, cli.format);
             Ok(())
         }
@@ -1122,6 +1134,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
             no_auto_review,
             auto_review,
             use_other_models_ttl,
+            usage_overrides,
         } => {
             // Resolve nested-vs-flat into a canonical LoopCommand via the
             // shared helper. Flat-form synthesizes Run and emits a one-line
@@ -1140,6 +1153,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                 no_auto_review,
                 auto_review,
                 use_other_models_ttl,
+                usage_overrides,
             ) {
                 LoopResolve::Nested(child) => child,
                 LoopResolve::Flat(child) => {
@@ -1169,8 +1183,9 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                 } => {
                     let prefix_mode =
                         task_mgr::commands::init::PrefixMode::from_cli_flags(no_prefix, prefix);
+                    let project_root = project_root_for_init(&cli.dir);
                     let _lock = LockGuard::acquire(&cli.dir)?;
-                    let result = init(
+                    let result = init_with_opts(
                         &cli.dir,
                         &[prd_file],
                         force,
@@ -1178,6 +1193,10 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                         update_existing,
                         dry_run,
                         prefix_mode,
+                        InitOpts {
+                            source_root: Some(project_root.clone()),
+                            worktree_root: Some(project_root),
+                        },
                     )?;
                     if !dry_run {
                         stage_global_skills(false);
@@ -1201,6 +1220,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                     no_auto_review,
                     auto_review,
                     use_other_models_ttl,
+                    usage_overrides,
                 } => {
                     let project_root = get_project_root()?;
 
@@ -1212,6 +1232,11 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                     config.cleanup_worktree = cleanup_worktree;
                     config.parallel_slots = parallel;
                     config.use_other_models_ttl = use_other_models_ttl;
+                    config.usage_remaining_min_cli = usage_overrides.usage_remaining_min;
+                    config.usage_remaining_min_weekly_cli =
+                        usage_overrides.usage_remaining_min_weekly;
+                    config.wait_if_reset_within_cli = usage_overrides.wait_if_reset_within;
+                    config.stop_if_reset_beyond_cli = usage_overrides.stop_if_reset_beyond;
 
                     // Auto-review hook needs the PRD path after run_loop consumes
                     // run_config; clone before the move.
@@ -1304,6 +1329,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
             no_auto_review,
             auto_review,
             use_other_models_ttl,
+            usage_overrides,
         } => {
             // Resolve nested-vs-flat into a canonical BatchCommand via the
             // shared helper. Flat-form (cmd: None, !patterns.is_empty()) is
@@ -1319,6 +1345,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                 no_auto_review,
                 auto_review,
                 use_other_models_ttl,
+                usage_overrides,
             ) {
                 BatchResolve::Nested(child) => child,
                 BatchResolve::Flat(child) => {
@@ -1354,8 +1381,9 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                     // thin shell around `init()` keeps the PRD-import path in
                     // one place (commands::init::init).
                     let paths = task_mgr::loop_engine::batch::expand_patterns(&patterns)?;
+                    let project_root = project_root_for_init(&cli.dir);
                     let _lock = LockGuard::acquire(&cli.dir)?;
-                    let result = init(
+                    let result = init_with_opts(
                         &cli.dir,
                         &paths,
                         force,
@@ -1363,6 +1391,10 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                         update_existing,
                         dry_run,
                         prefix_mode,
+                        InitOpts {
+                            source_root: Some(project_root.clone()),
+                            worktree_root: Some(project_root),
+                        },
                     )?;
                     if !dry_run {
                         stage_global_skills(false);
@@ -1383,6 +1415,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                     no_auto_review,
                     auto_review,
                     use_other_models_ttl,
+                    usage_overrides,
                 } => {
                     let project_root = get_project_root()?;
 
@@ -1410,6 +1443,10 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                             auto_review,
                             no_auto_review,
                             use_other_models_ttl,
+                            usage_overrides.usage_remaining_min,
+                            usage_overrides.usage_remaining_min_weekly,
+                            usage_overrides.wait_if_reset_within,
+                            usage_overrides.stop_if_reset_beyond,
                         )
                         .await
                     });
@@ -1490,8 +1527,9 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
             use task_mgr::commands::models::{
                 ListOpts, handle_init, handle_list, handle_route, handle_set_anchor,
                 handle_set_effort, handle_set_enabled, handle_set_fallback, handle_set_tier,
-                handle_set_tier_fallback, handle_set_usage_rule, handle_show, handle_unroute,
-                handle_unset_fallback, handle_unset_tier, handle_unset_tier_fallback,
+                handle_set_tier_fallback, handle_set_usage_policy, handle_set_usage_rule,
+                handle_show, handle_unroute, handle_unset_fallback, handle_unset_tier,
+                handle_unset_tier_fallback,
             };
             match action {
                 ModelsAction::Init {
@@ -1550,6 +1588,20 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                 }
                 ModelsAction::SetUsageRule { kind, id, on_low } => {
                     handle_set_usage_rule(&cli.dir, kind.as_deref(), id.as_deref(), &on_low)?;
+                }
+                ModelsAction::SetUsagePolicy {
+                    remaining_min,
+                    remaining_min_weekly,
+                    wait_within_minutes,
+                    stop_beyond_hours,
+                } => {
+                    handle_set_usage_policy(
+                        &cli.dir,
+                        remaining_min,
+                        remaining_min_weekly,
+                        wait_within_minutes,
+                        stop_beyond_hours,
+                    )?;
                 }
                 ModelsAction::SetTierFallback {
                     difficulty,

@@ -38,11 +38,11 @@ use crate::output::ui;
 
 use checks::{
     find_active_runs_without_end, find_git_reconciliation_tasks, find_orphaned_relationships,
-    find_stale_in_progress_tasks, has_active_loop_lock,
+    find_path_identity_twins, find_stale_in_progress_tasks, has_active_loop_lock,
 };
 use fixes::{
     fix_active_run, fix_git_reconciliation, fix_orphan_branch_prd_remediation,
-    fix_orphaned_relationship, fix_stale_task,
+    fix_orphaned_relationship, fix_path_identity_twin_empty_side, fix_stale_task,
 };
 
 /// Check database health and optionally fix issues.
@@ -179,6 +179,40 @@ pub fn doctor(
         });
     }
 
+    // Path-identity twins: 2+ prd_metadata rows for one task_list file.
+    // `dir` is the DB dir (`.task-mgr`); project roots are its parent.
+    // Identity-helper / DB errors become a report-only issue — do not abort
+    // the rest of doctor.
+    let source_root = dir
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| dir.to_path_buf());
+    let worktree_root = source_root.clone();
+    let (path_twins, path_twin_check_failed) = match find_path_identity_twins(
+        conn,
+        &source_root,
+        &worktree_root,
+    ) {
+        Ok(twins) => (twins, false),
+        Err(e) => {
+            issues.push(Issue {
+                    issue_type: IssueType::PathIdentityTwin,
+                    entity_id: "path_identity_check".to_string(),
+                    description: format!(
+                        "Path-identity twin check failed (left unfixed): {e}. Other doctor checks continue."
+                    ),
+                });
+            (Vec::new(), true)
+        }
+    };
+    for twin in &path_twins {
+        issues.push(Issue {
+            issue_type: IssueType::PathIdentityTwin,
+            entity_id: twin.entity_id(),
+            description: twin.description(),
+        });
+    }
+
     // Apply fixes (or preview what would be fixed in dry-run mode)
     if effective_auto_fix {
         // Fix stale in_progress tasks -> reset to todo
@@ -252,6 +286,28 @@ pub fn doctor(
                 fixed.push(fix);
             }
         }
+
+        // Path-identity twins: DELETE empty-side metadata only. Never archive,
+        // never move JSON, never LIMIT-1 pick among live sides.
+        for twin in &path_twins {
+            for side in twin.autofix_empty_sides() {
+                let pfx = side.prefix.as_deref().unwrap_or("NULL");
+                let fix = Fix {
+                    issue_type: IssueType::PathIdentityTwin,
+                    entity_id: twin.entity_id(),
+                    action: format!(
+                        "Deleted empty-side prd_metadata id={} (prefix '{pfx}'); prd_files cascaded; JSON files untouched",
+                        side.prd_id
+                    ),
+                };
+                if dry_run {
+                    would_fix.push(fix);
+                } else {
+                    fix_path_identity_twin_empty_side(conn, side.prd_id)?;
+                    fixed.push(fix);
+                }
+            }
+        }
     }
 
     let summary = DoctorSummary {
@@ -261,6 +317,11 @@ pub fn doctor(
         orphan_branch_prds: orphan_branch_prds.len(),
         decay_warnings: decay_warnings_list.len(),
         reconciled: reconciliation_tasks.len(),
+        path_identity_twins: if path_twin_check_failed {
+            1
+        } else {
+            path_twins.len()
+        },
         total_issues: issues.len(),
         total_fixed: fixed.len(),
     };

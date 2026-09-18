@@ -5,7 +5,33 @@
 
 use std::path::PathBuf;
 
-use clap::Subcommand;
+use clap::{Args, Subcommand};
+
+/// Per-run usagePolicy overlays (loop/batch run). Omitted → config; present `0`
+/// is `Some(0)`. Does not write `config.json`.
+#[derive(Args, Debug, Clone, Default)]
+pub struct UsageRunOverrides {
+    /// Remaining-percent floor for session / other windows (0–100, factory 2).
+    ///
+    /// Overrides `usagePolicy.remainingMinPercent` for this run only.
+    #[arg(long = "usage-remaining-min", value_name = "PCT")]
+    pub usage_remaining_min: Option<u8>,
+    /// Remaining-percent floor for weekly windows (0–100, factory 1).
+    ///
+    /// Overrides `usagePolicy.remainingMinWeeklyPercent` for this run only.
+    #[arg(long = "usage-remaining-min-weekly", value_name = "PCT")]
+    pub usage_remaining_min_weekly: Option<u8>,
+    /// Wait when a low bucket resets within this many minutes.
+    ///
+    /// Overrides `usagePolicy.waitIfResetWithinMinutes` for this run only.
+    #[arg(long = "wait-if-reset-within", value_name = "MINUTES")]
+    pub wait_if_reset_within: Option<u64>,
+    /// Stop when a low bucket's reset is beyond this many hours.
+    ///
+    /// Overrides `usagePolicy.stopIfResetBeyondHours` for this run only.
+    #[arg(long = "stop-if-reset-beyond", value_name = "HOURS")]
+    pub stop_if_reset_beyond: Option<u64>,
+}
 
 use super::enums::{
     Confidence, FailStatus, LearningOutcome, RunEndStatus, Shell, TaskStatusFilter,
@@ -62,9 +88,11 @@ TASK ID PREFIXING:
     By default, all task IDs are prefixed to prevent cross-phase collisions.
     The prefix is determined in this order:
       1. --prefix flag (highest priority)
-      2. \"taskPrefix\" field in the PRD JSON
-      3. Auto-generated 8-char UUID (written back to JSON for stability)
-    Use --no-prefix to import task IDs exactly as they appear in the JSON.
+      2. Registered path-identity prefix (sticky after first import)
+      3. md5(branchName:filename)[:8] on first Auto registration
+         (written back to JSON for stability)
+    First Auto registration does not read JSON taskPrefix. Use --no-prefix
+    to import task IDs exactly as they appear in the JSON.
 ")]
     Init {
         /// Path to the JSON PRD file(s) to import.
@@ -84,7 +112,8 @@ TASK ID PREFIXING:
         #[arg(long, default_value_t = false)]
         enhance: bool,
 
-        /// Force re-initialization, dropping existing data.
+        /// Force re-initialization: soft-archive identity ∪ about-to-apply
+        /// (sets `archived_at`; does not hard-delete task rows or move JSON).
         ///
         /// Honored only on the deprecated `--from-json` shim path. Project-level
         /// init has no destructive form — `task-mgr init --force` (no
@@ -112,9 +141,9 @@ TASK ID PREFIXING:
         dry_run: bool,
 
         /// Prefix to prepend to all task IDs (e.g., "P3" becomes "P3-FEAT-001").
-        /// Overrides the "taskPrefix" field in the PRD JSON.
-        /// If neither this flag nor the JSON field is set, a short UUID prefix is
-        /// auto-generated and written back to the JSON for stability.
+        /// Highest priority over registered identity and Auto hash.
+        /// Without --prefix, Auto uses sticky registered identity when present,
+        /// otherwise md5(branchName:filename)[:8] (written back to JSON).
         #[arg(long, conflicts_with = "no_prefix")]
         prefix: Option<String>,
 
@@ -617,6 +646,10 @@ EXAMPLES:
     echo '{\"id\":\"CODE-FIX-001\",\"title\":\"Fix race\",\"difficulty\":\"medium\",\"touchesFiles\":[\"src/foo.rs\"]}' \\
       | task-mgr add --stdin
 
+    # Pin an already-registered effort (not an import — distinct from init --from-json)
+    echo '{\"id\":\"CODE-FIX-001\",\"title\":\"Fix race\"}' \\
+      | task-mgr add --stdin --from-json tasks/my-prd.json
+
     # Add from an inline string
     task-mgr add --json '{\"id\":\"REFACTOR-001\",\"title\":\"Split module\"}'
 
@@ -627,6 +660,11 @@ PRIORITY:
     When --priority is absent and the JSON omits \"priority\", the command
     runs the same scoring as `task-mgr next`, reads the top task's priority,
     and assigns (top.priority - 1). Empty queue → 0.
+
+--from-json (pin, not import):
+    Pins writes to an already-registered task_list. Does NOT register a new
+    PRD — run `task-mgr loop init <prd>.json` first. Distinct from
+    `task-mgr init --from-json` (the deprecated import shim).
 ")]
     Add {
         /// Inline JSON string (mutually exclusive with --stdin)
@@ -647,6 +685,15 @@ PRIORITY:
         /// array in the PRD JSON. Repeat the flag for multiple targets.
         #[arg(long = "depended-on-by")]
         depended_on_by: Vec<String>,
+
+        /// Pin this already-registered effort (not an import).
+        ///
+        /// Writes go to PATH. The file must already be a registered `task_list`
+        /// (or its JSON `taskPrefix` must be in `prd_metadata`). Unregistered /
+        /// missing / directory paths are refused. Distinct from
+        /// `init --from-json` / `loop init`, which register a new PRD.
+        #[arg(long = "from-json", value_name = "PATH")]
+        from_json: Option<PathBuf>,
     },
 
     /// Reset task(s) to todo status for re-running
@@ -929,6 +976,9 @@ file is literally called `init` or `run`.
         /// `Some(0)`, not omitted.
         #[arg(long = "use-other-models-ttl", value_name = "MINUTES")]
         use_other_models_ttl: Option<u64>,
+
+        #[command(flatten)]
+        usage_overrides: UsageRunOverrides,
     },
 
     /// Show status dashboard for PRD projects
@@ -1052,6 +1102,9 @@ your PRD file is literally called `init` or `run`.
         /// `Some(0)`, not omitted.
         #[arg(long = "use-other-models-ttl", value_name = "MINUTES")]
         use_other_models_ttl: Option<u64>,
+
+        #[command(flatten)]
+        usage_overrides: UsageRunOverrides,
     },
 
     /// Import learnings from a progress.json or learnings JSON file
@@ -1201,11 +1254,15 @@ GENERATED MAN PAGES:
 
     /// Show the currently resolved active PRD context (prefix, source, target path)
     ///
-    /// Exits 0 in all cases — "no active PRD" is a probe result, not an error.
+    /// Exit 0 for the no-flag probe (including "no active PRD" / ≥2 prefixes).
+    /// Non-zero when `--from-json` is unregistered, missing, or a directory.
     #[command(after_help = "\
 EXAMPLES:
     # Show the active PRD context
     task-mgr current
+
+    # Pin an already-registered effort (not an import — distinct from init --from-json)
+    task-mgr current --from-json tasks/my-prd.json
 
     # Machine-readable (JSON)
     task-mgr --format json current | jq '.context.prefix'
@@ -1216,10 +1273,28 @@ OUTPUT:
     source is one of: env (TASK_MGR_ACTIVE_PREFIX), single-prefix (auto),
     from-json (--from-json flag), or none (ambiguous / empty DB).
 
+    target= is the CLI write path add would use (remap, then existence policy).
+    When neither remapped nor registered path is a regular file: target=(none).
+
     When no PRD can be resolved, prints:
     no active PRD; pass --from-json or set TASK_MGR_ACTIVE_PREFIX
+
+--from-json (pin, not import):
+    Pins the probe to an already-registered task_list. Does NOT register a new
+    PRD — run `task-mgr loop init <prd>.json` first. Distinct from
+    `task-mgr init --from-json` (the deprecated import shim).
 ")]
-    Current,
+    Current {
+        /// Pin this already-registered effort (not an import).
+        ///
+        /// Reports PATH as the write target. The file must already be a
+        /// registered `task_list` (or its JSON `taskPrefix` must be in
+        /// `prd_metadata`). Unregistered / missing / directory paths are
+        /// refused. Distinct from `init --from-json` / `loop init`, which
+        /// register a new PRD.
+        #[arg(long = "from-json", value_name = "PATH")]
+        from_json: Option<PathBuf>,
+    },
 
     /// Manage the task-mgr-fenced block in CLAUDE.md / AGENTS.md
     #[command(after_help = "\
@@ -1347,7 +1422,8 @@ pub enum LoopCommand {
         /// Path to the JSON PRD file to import
         prd_file: PathBuf,
 
-        /// Force re-initialization, dropping existing data
+        /// Force re-initialization: soft-archive identity ∪ about-to-apply
+        /// (sets `archived_at`; does not hard-delete task rows or move JSON).
         #[arg(long, default_value_t = false)]
         force: bool,
 
@@ -1364,6 +1440,10 @@ pub enum LoopCommand {
         dry_run: bool,
 
         /// Prefix to prepend to all task IDs (e.g., "P3" becomes "P3-FEAT-001").
+        /// Highest priority over registered identity and Auto hash.
+        /// Without --prefix: sticky registered identity, else
+        /// md5(branchName:filename)[:8] written back to JSON (first Auto does
+        /// not read JSON taskPrefix).
         #[arg(long, conflicts_with = "no_prefix")]
         prefix: Option<String>,
 
@@ -1434,6 +1514,9 @@ pub enum LoopCommand {
         /// `Some(0)`, not omitted.
         #[arg(long = "use-other-models-ttl", value_name = "MINUTES")]
         use_other_models_ttl: Option<u64>,
+
+        #[command(flatten)]
+        usage_overrides: UsageRunOverrides,
     },
 }
 
@@ -1451,7 +1534,8 @@ pub enum BatchCommand {
         #[arg(required = true)]
         patterns: Vec<String>,
 
-        /// Force re-initialization, dropping existing data
+        /// Force re-initialization: soft-archive identity ∪ about-to-apply
+        /// (sets `archived_at`; does not hard-delete task rows or move JSON).
         #[arg(long, default_value_t = false)]
         force: bool,
 
@@ -1468,6 +1552,10 @@ pub enum BatchCommand {
         dry_run: bool,
 
         /// Prefix to prepend to all task IDs.
+        /// Highest priority over registered identity and Auto hash.
+        /// Without --prefix: sticky registered identity, else
+        /// md5(branchName:filename)[:8] written back to JSON (first Auto does
+        /// not read JSON taskPrefix).
         #[arg(long, conflicts_with = "no_prefix")]
         prefix: Option<String>,
 
@@ -1536,6 +1624,9 @@ pub enum BatchCommand {
         /// `Some(0)`, not omitted.
         #[arg(long = "use-other-models-ttl", value_name = "MINUTES")]
         use_other_models_ttl: Option<u64>,
+
+        #[command(flatten)]
+        usage_overrides: UsageRunOverrides,
     },
 }
 
@@ -1598,6 +1689,7 @@ pub fn resolve_loop_command(
     no_auto_review: bool,
     auto_review: bool,
     use_other_models_ttl: Option<u64>,
+    usage_overrides: UsageRunOverrides,
 ) -> LoopResolve {
     if let Some(child) = cmd {
         return LoopResolve::Nested(child);
@@ -1616,6 +1708,7 @@ pub fn resolve_loop_command(
             no_auto_review,
             auto_review,
             use_other_models_ttl,
+            usage_overrides,
         });
     }
     LoopResolve::PrintHelp
@@ -1637,6 +1730,7 @@ pub fn resolve_batch_command(
     no_auto_review: bool,
     auto_review: bool,
     use_other_models_ttl: Option<u64>,
+    usage_overrides: UsageRunOverrides,
 ) -> BatchResolve {
     if let Some(child) = cmd {
         return BatchResolve::Nested(child);
@@ -1652,6 +1746,7 @@ pub fn resolve_batch_command(
             no_auto_review,
             auto_review,
             use_other_models_ttl,
+            usage_overrides,
         });
     }
     BatchResolve::PrintHelp
@@ -1815,6 +1910,37 @@ EXAMPLES:
         /// Action when the matched bucket is low: wait | unavailable | stop | ask | ignore
         #[arg(long = "on-low")]
         on_low: String,
+    },
+
+    /// Set usagePolicy remaining floors and/or horizon knobs (sparse write)
+    #[command(
+        name = "set-usage-policy",
+        after_help = "\
+EXAMPLES:
+    task-mgr models show
+    task-mgr models set-usage-policy --remaining-min 2 --remaining-min-weekly 1
+    task-mgr models set-usage-policy --wait-within-minutes 30
+    task-mgr models set-usage-policy --stop-beyond-hours 12
+
+Factory defaults: remainingMinPercent=2 (session/other), remainingMinWeeklyPercent=1
+(weekly), waitIfResetWithinMinutes=60, stopIfResetBeyondHours=12. Sparse write —
+omitted flags are left unchanged; rules are never wiped. Per-run overlays live
+on `loop run` / `batch run` (`--usage-remaining-min`, `--wait-if-reset-within`, …).
+"
+    )]
+    SetUsagePolicy {
+        /// Session / other remaining-percent floor (0–100).
+        #[arg(long = "remaining-min", value_name = "PCT")]
+        remaining_min: Option<u8>,
+        /// Weekly remaining-percent floor (0–100).
+        #[arg(long = "remaining-min-weekly", value_name = "PCT")]
+        remaining_min_weekly: Option<u8>,
+        /// Wait if a low bucket resets within this many minutes.
+        #[arg(long = "wait-within-minutes", value_name = "MINUTES")]
+        wait_within_minutes: Option<u64>,
+        /// Stop if a low bucket's reset is beyond this many hours.
+        #[arg(long = "stop-beyond-hours", value_name = "HOURS")]
+        stop_beyond_hours: Option<u64>,
     },
 
     /// Set routing.tierFallback (maxDifficulty + include flags)

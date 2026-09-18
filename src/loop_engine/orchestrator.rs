@@ -176,7 +176,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
         let current_hash = hash_file(&live_prd_file);
         if current_hash != prd_hash {
             ui::emit("PRD file changed, re-importing tasks...");
-            if let Err(e) = crate::commands::init(
+            if let Err(e) = crate::commands::init_with_opts(
                 &run_config.db_dir,
                 &[&live_prd_file],
                 false, // force
@@ -184,6 +184,10 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                 true,  // update_existing
                 false, // dry_run
                 run_config.prefix_mode.clone(),
+                crate::commands::InitOpts {
+                    source_root: Some(run_config.source_root.clone()),
+                    worktree_root: Some(working_root.clone()),
+                },
             ) {
                 tracing::warn!("PRD re-import failed: {} (continuing)", e);
             }
@@ -1191,64 +1195,9 @@ mod tests {
     use crate::loop_engine::detection;
     use crate::loop_engine::test_utils::{EnvGuard, setup_test_db};
 
-    // --- pre_lock_prefix fallback tests ---
-
-    #[test]
-    fn test_pre_lock_prefix_fallback_matches_generate_prefix() {
-        use crate::commands::init::generate_prefix;
-        use crate::loop_engine::status_queries::read_branch_name_from_prd;
-        use std::fs;
-        use tempfile::TempDir;
-
-        let temp_dir = TempDir::new().unwrap();
-        let prd_path = temp_dir.path().join("my-prd.json");
-        // PRD without taskPrefix but with branchName
-        fs::write(
-            &prd_path,
-            r#"{"branchName": "feat/test-branch", "description": "test"}"#,
-        )
-        .unwrap();
-
-        let branch = read_branch_name_from_prd(&prd_path);
-        let filename = prd_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        let fallback = generate_prefix(branch.as_deref(), filename);
-        // Also verify generate_prefix called directly with the same inputs matches
-        let expected = generate_prefix(Some("feat/test-branch"), "my-prd.json");
-        assert_eq!(fallback, expected);
-    }
-
-    #[test]
-    fn test_pre_lock_prefix_uses_task_prefix_when_present() {
-        use crate::loop_engine::status_queries::read_branch_name_from_prd;
-        use std::fs;
-        use tempfile::TempDir;
-
-        let temp_dir = TempDir::new().unwrap();
-        let prd_path = temp_dir.path().join("my-prd.json");
-        fs::write(
-            &prd_path,
-            r#"{"taskPrefix": "abc12345", "branchName": "feat/test"}"#,
-        )
-        .unwrap();
-
-        // When taskPrefix is present, read_task_prefix_from_prd returns it
-        // and or_else branch must not run
-        let task_prefix = crate::loop_engine::status_queries::read_task_prefix_from_prd(&prd_path);
-        assert_eq!(task_prefix, Some("abc12345".to_string()));
-
-        // or_else would only run if task_prefix is None
-        let branch = read_branch_name_from_prd(&prd_path);
-        // verify or_else branch not needed — task_prefix is Some
-        let result = task_prefix.or_else(|| {
-            let b = branch.clone();
-            let filename = prd_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            Some(crate::commands::init::generate_prefix(
-                b.as_deref(),
-                filename,
-            ))
-        });
-        assert_eq!(result, Some("abc12345".to_string()));
-    }
+    // --- pre_lock_prefix sticky tests live in startup::tests (FEAT-002b) ---
+    // Legacy "read JSON taskPrefix / bare generate_prefix" helpers are no longer
+    // the pre_lock path; identity → resolve_sticky_prefix is the SSoT.
 
     // --- on_run_completed tests ---
 

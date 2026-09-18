@@ -852,7 +852,7 @@ pub struct ProjectConfig {
     pub routing: RoutingConfig,
 
     /// Operator usage / quota policy (remaining floor + horizon knobs + rules).
-    /// JSON key `usagePolicy`. Default remaining floor is **8**.
+    /// JSON key `usagePolicy`. Default remaining floors: other **2**, weekly **1**.
     #[serde(default)]
     pub usage_policy: UsagePolicy,
 }
@@ -1066,7 +1066,7 @@ pub fn preflight_validate_and_probe(db_dir: &Path, cfg: &ProjectConfig) -> TaskM
         return Err(TaskMgrError::InvalidConfig {
             field: "LOOP_USAGE_THRESHOLD".to_string(),
             message: "LOOP_USAGE_THRESHOLD is removed; use LOOP_USAGE_REMAINING_MIN \
-                      (remaining-percent floor, default 8) or usagePolicy.remainingMinPercent"
+                      (session/other remaining-percent floor, default 2) or usagePolicy.remainingMinPercent"
                 .to_string(),
         });
     }
@@ -1092,6 +1092,28 @@ pub fn preflight_validate_and_probe(db_dir: &Path, cfg: &ProjectConfig) -> TaskM
                 "LOOP_USAGE_REMAINING_MIN / usagePolicy.remainingMinPercent must be 0–100 \
                  (got {}); remaining-percent floor cannot exceed 100",
                 cfg.usage_policy.remaining_min_percent
+            ),
+        });
+    }
+    if let Ok(raw) = std::env::var("LOOP_USAGE_REMAINING_MIN_WEEKLY")
+        && let Ok(v) = raw.parse::<u16>()
+        && v > 100
+    {
+        return Err(TaskMgrError::InvalidConfig {
+            field: "LOOP_USAGE_REMAINING_MIN_WEEKLY".to_string(),
+            message: format!(
+                "LOOP_USAGE_REMAINING_MIN_WEEKLY must be 0–100 (got {v}); \
+                 remaining-percent floor cannot exceed 100"
+            ),
+        });
+    }
+    if cfg.usage_policy.remaining_min_weekly_percent > 100 {
+        return Err(TaskMgrError::InvalidConfig {
+            field: "LOOP_USAGE_REMAINING_MIN_WEEKLY".to_string(),
+            message: format!(
+                "LOOP_USAGE_REMAINING_MIN_WEEKLY / usagePolicy.remainingMinWeeklyPercent \
+                 must be 0–100 (got {}); remaining-percent floor cannot exceed 100",
+                cfg.usage_policy.remaining_min_weekly_percent
             ),
         });
     }
@@ -1824,6 +1846,47 @@ mod tests {
         .unwrap();
         let config = read_project_config(dir.path());
         assert_eq!(config.usage_policy.remaining_min_percent, 12);
+        assert_eq!(
+            config.usage_policy.remaining_min_weekly_percent, 1,
+            "sparse remainingMinPercent must not change weekly factory 1"
+        );
+    }
+
+    #[test]
+    fn remaining_min_weekly_deserializes_without_changing_other() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{"usagePolicy":{"remainingMinWeeklyPercent":5}}"#,
+        )
+        .unwrap();
+        let config = read_project_config(dir.path());
+        assert_eq!(config.usage_policy.remaining_min_weekly_percent, 5);
+        assert_eq!(config.usage_policy.remaining_min_percent, 2);
+    }
+
+    #[test]
+    fn test_preflight_rejects_usage_policy_remaining_min_weekly_above_100() {
+        let _guard = CLAUDE_BINARY_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _legacy = EnvGuard::remove("LOOP_USAGE_THRESHOLD");
+        let _remaining = EnvGuard::remove("LOOP_USAGE_REMAINING_MIN");
+        let _weekly = EnvGuard::remove("LOOP_USAGE_REMAINING_MIN_WEEKLY");
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{"usagePolicy":{"remainingMinWeeklyPercent":200}}"#,
+        )
+        .unwrap();
+        let cfg = read_project_config(dir.path());
+        let err = preflight_validate_and_probe(dir.path(), &cfg)
+            .expect_err("remainingMinWeeklyPercent=200 must hard-error at preflight");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("LOOP_USAGE_REMAINING_MIN_WEEKLY"),
+            "error must name LOOP_USAGE_REMAINING_MIN_WEEKLY: {msg}"
+        );
     }
 
     #[test]
@@ -1839,7 +1902,8 @@ mod tests {
         assert_eq!(config.usage_policy.wait_if_reset_within_minutes, 60);
         assert_eq!(config.usage_policy.stop_if_reset_beyond_hours, 12);
         assert_eq!(config.usage_policy.ask_ttl_minutes, 0);
-        assert_eq!(config.usage_policy.remaining_min_percent, 8);
+        assert_eq!(config.usage_policy.remaining_min_percent, 2);
+        assert_eq!(config.usage_policy.remaining_min_weekly_percent, 1);
         // Unrelated keys survive via Value round-trip on write paths; read keeps
         // known fields. Re-serialize usagePolicy alone to pin camelCase defaults.
         let v = serde_json::to_value(&config.usage_policy).unwrap();

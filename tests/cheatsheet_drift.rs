@@ -105,6 +105,10 @@ fn extract_recipe_calls(content: &str) -> Vec<RecipeCall> {
                     "unset-fallback",
                     "route",
                     "unroute",
+                    "set-usage-rule",
+                    "set-usage-policy",
+                    "set-tier-fallback",
+                    "unset-tier-fallback",
                 ],
             ),
             (
@@ -375,21 +379,42 @@ fn drift_synthetic_set_status_reference_is_rejected() {
 
 #[test]
 fn drift_cheatsheet_stdout_never_contains_forbidden_anchors() {
-    // AC: "Negative: the strings `set-status`, `add --from-json`,
-    // `recall --top-k`, `learnings show <N>` MUST NOT appear in
-    // `task-mgr cheatsheet` stdout (assert with grep)".
+    // Negative: these strings MUST NOT appear in cheatsheet stdout.
+    // `add --from-json` was removed from this list in FEAT-008 once
+    // clap accepted the pin flag (it is now a curated recipe).
     let stdout = cheatsheet().content;
-    for anchor in [
-        "set-status",
-        "add --from-json",
-        "recall --top-k",
-        "learnings show ",
-    ] {
+    for anchor in ["set-status", "recall --top-k", "learnings show "] {
         assert!(
             !stdout.contains(anchor),
             "cheatsheet stdout contains forbidden anchor {anchor:?}; full content:\n{stdout}"
         );
     }
+}
+
+#[test]
+fn drift_curated_recipes_document_add_from_json_pin() {
+    // FEAT-008: recipe mentions add --from-json; extractor must parse
+    // the from-json flag so the clap flag-drift check covers it.
+    let calls = extract_recipe_calls(CURATED_RECIPES);
+    let add = calls
+        .iter()
+        .find(|c| c.path == "add")
+        .expect("CURATED_RECIPES must mention `task-mgr add`");
+    assert!(
+        add.flags.iter().any(|f| f == "from-json"),
+        "extractor must parse --from-json from the add recipe; got flags={:?}",
+        add.flags
+    );
+    assert!(
+        add.flags.iter().any(|f| f == "stdin"),
+        "add recipe must keep --stdin; got flags={:?}",
+        add.flags
+    );
+    assert!(
+        add.flags.iter().any(|f| f == "depended-on-by"),
+        "add recipe must keep --depended-on-by; got flags={:?}",
+        add.flags
+    );
 }
 
 #[test]

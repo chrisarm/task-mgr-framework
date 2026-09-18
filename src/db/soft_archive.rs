@@ -4,7 +4,7 @@
 //! `runs` for a given PRD task prefix. Both the archive command and
 //! `init --force` reimport use this helper to avoid duplicating SQL.
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::TaskMgrResult;
 use crate::db::prefix::make_like_pattern;
@@ -74,6 +74,216 @@ pub fn soft_archive_by_prefix(conn: &Connection, prefix: &str) -> TaskMgrResult<
     )
     .map_err(crate::TaskMgrError::DatabaseError)?;
 
+    Ok(())
+}
+
+/// Soft-archive a PRD's live data by task prefix (no `DELETE FROM tasks`).
+///
+/// Mirrors `archive_prd_data` semantics used by `task-mgr archive` and the
+/// prefix-scoped `init --force` hatch:
+/// 1. soft-archive run_tasks / key_decisions / runs
+/// 2. hard-delete task_relationships and task_files for the prefix
+/// 3. `UPDATE tasks SET archived_at` for live `{prefix}-%` rows
+/// 4. hard-delete `prd_files` + `prd_metadata` when `prd_id` is known (or looked up)
+/// 5. clear stale `global_state` pointers; reset counters when no live tasks remain
+///
+/// Returns the number of tasks soft-archived. Idempotent for already-archived rows.
+pub fn archive_prd_by_prefix(
+    conn: &Connection,
+    prefix: &str,
+    prd_id: Option<i64>,
+) -> TaskMgrResult<usize> {
+    let pattern = make_like_pattern(prefix);
+
+    let resolved_prd_id: Option<i64> = match prd_id {
+        Some(id) => Some(id),
+        None => conn
+            .query_row(
+                "SELECT id FROM prd_metadata WHERE task_prefix = ?1",
+                [prefix],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(crate::TaskMgrError::DatabaseError)?,
+    };
+
+    soft_archive_by_prefix(conn, prefix)?;
+
+    conn.execute(
+        "DELETE FROM task_relationships \
+         WHERE task_id LIKE ? ESCAPE '\\' OR related_id LIKE ? ESCAPE '\\'",
+        rusqlite::params![pattern, pattern],
+    )
+    .map_err(crate::TaskMgrError::DatabaseError)?;
+
+    conn.execute(
+        "DELETE FROM task_files WHERE task_id LIKE ? ESCAPE '\\'",
+        rusqlite::params![pattern],
+    )
+    .map_err(crate::TaskMgrError::DatabaseError)?;
+
+    let archived = conn
+        .execute(
+            "UPDATE tasks SET archived_at = datetime('now') \
+             WHERE id LIKE ? ESCAPE '\\' AND archived_at IS NULL",
+            rusqlite::params![pattern],
+        )
+        .map_err(crate::TaskMgrError::DatabaseError)?;
+
+    if let Some(id) = resolved_prd_id {
+        // prd_files before prd_metadata (FK ordering — learning [1505])
+        let _ = conn.execute(
+            "DELETE FROM prd_files WHERE prd_id = ?",
+            rusqlite::params![id],
+        );
+        conn.execute(
+            "DELETE FROM prd_metadata WHERE id = ?",
+            rusqlite::params![id],
+        )
+        .map_err(crate::TaskMgrError::DatabaseError)?;
+    }
+
+    conn.execute(
+        "UPDATE global_state SET last_task_id = NULL \
+         WHERE id = 1 AND last_task_id IS NOT NULL \
+         AND NOT EXISTS ( \
+             SELECT 1 FROM tasks \
+             WHERE tasks.id = global_state.last_task_id \
+             AND tasks.archived_at IS NULL \
+         )",
+        [],
+    )
+    .map_err(crate::TaskMgrError::DatabaseError)?;
+
+    conn.execute(
+        "UPDATE global_state SET last_run_id = NULL \
+         WHERE id = 1 AND last_run_id IS NOT NULL \
+         AND NOT EXISTS ( \
+             SELECT 1 FROM runs \
+             WHERE runs.run_id = global_state.last_run_id \
+             AND runs.archived_at IS NULL \
+         )",
+        [],
+    )
+    .map_err(crate::TaskMgrError::DatabaseError)?;
+
+    let remaining: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tasks WHERE archived_at IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(crate::TaskMgrError::DatabaseError)?;
+
+    if remaining == 0 {
+        conn.execute(
+            "UPDATE global_state \
+             SET iteration_counter = 0, last_task_id = NULL, last_run_id = NULL, \
+                 updated_at = datetime('now') \
+             WHERE id = 1",
+            [],
+        )
+        .map_err(crate::TaskMgrError::DatabaseError)?;
+    }
+
+    Ok(archived)
+}
+
+/// Soft-archive live tasks whose ids do not match any of `preserve_prefixes`.
+///
+/// Used for NULL-prefix identity in the `--force` union when LIKE `{prefix}-%`
+/// cannot target bare / unprefixed ids. Hard-deletes those tasks' relationships
+/// and files; does **not** `DELETE FROM tasks`.
+pub fn archive_unprefixed_live_tasks(
+    conn: &Connection,
+    preserve_prefixes: &[String],
+) -> TaskMgrResult<usize> {
+    // Build "id NOT LIKE p-% AND ..." for every preserve prefix; empty → all live.
+    let mut sql =
+        String::from("UPDATE tasks SET archived_at = datetime('now') WHERE archived_at IS NULL");
+    let patterns: Vec<String> = preserve_prefixes
+        .iter()
+        .map(|p| make_like_pattern(p))
+        .collect();
+    for _ in &patterns {
+        sql.push_str(" AND id NOT LIKE ? ESCAPE '\\'");
+    }
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(crate::TaskMgrError::DatabaseError)?;
+    let params: Vec<&dyn rusqlite::types::ToSql> = patterns
+        .iter()
+        .map(|p| p as &dyn rusqlite::types::ToSql)
+        .collect();
+    let archived = stmt
+        .execute(params.as_slice())
+        .map_err(crate::TaskMgrError::DatabaseError)?;
+
+    // Child tables for newly archived unprefixed rows (and any already archived).
+    // Scope: tasks that are archived and do not match preserve prefixes.
+    let mut del_files = String::from(
+        "DELETE FROM task_files WHERE task_id IN (\
+         SELECT id FROM tasks WHERE archived_at IS NOT NULL",
+    );
+    let mut del_rels = String::from(
+        "DELETE FROM task_relationships WHERE task_id IN (\
+         SELECT id FROM tasks WHERE archived_at IS NOT NULL",
+    );
+    for _ in &patterns {
+        del_files.push_str(" AND id NOT LIKE ? ESCAPE '\\'");
+        del_rels.push_str(" AND id NOT LIKE ? ESCAPE '\\'");
+    }
+    del_files.push(')');
+    del_rels.push(')');
+
+    let mut stmt_files = conn
+        .prepare(&del_files)
+        .map_err(crate::TaskMgrError::DatabaseError)?;
+    stmt_files
+        .execute(params.as_slice())
+        .map_err(crate::TaskMgrError::DatabaseError)?;
+
+    let mut stmt_rels = conn
+        .prepare(&del_rels)
+        .map_err(crate::TaskMgrError::DatabaseError)?;
+    stmt_rels
+        .execute(params.as_slice())
+        .map_err(crate::TaskMgrError::DatabaseError)?;
+
+    // Soft-archive run_tasks for those same task ids
+    let mut rt_sql = String::from(
+        "UPDATE run_tasks SET archived_at = datetime('now') \
+         WHERE archived_at IS NULL AND task_id IN (\
+         SELECT id FROM tasks WHERE archived_at IS NOT NULL",
+    );
+    for _ in &patterns {
+        rt_sql.push_str(" AND id NOT LIKE ? ESCAPE '\\'");
+    }
+    rt_sql.push(')');
+    let mut stmt_rt = conn
+        .prepare(&rt_sql)
+        .map_err(crate::TaskMgrError::DatabaseError)?;
+    stmt_rt
+        .execute(params.as_slice())
+        .map_err(crate::TaskMgrError::DatabaseError)?;
+
+    Ok(archived)
+}
+
+/// Drop `prd_files` then `prd_metadata` for the given ids (FK order).
+pub fn drop_prd_rows(conn: &Connection, prd_ids: &[i64]) -> TaskMgrResult<()> {
+    for id in prd_ids {
+        let _ = conn.execute(
+            "DELETE FROM prd_files WHERE prd_id = ?",
+            rusqlite::params![id],
+        );
+        conn.execute(
+            "DELETE FROM prd_metadata WHERE id = ?",
+            rusqlite::params![id],
+        )
+        .map_err(crate::TaskMgrError::DatabaseError)?;
+    }
     Ok(())
 }
 
