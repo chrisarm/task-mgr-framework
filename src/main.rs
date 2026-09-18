@@ -1122,6 +1122,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
             no_auto_review,
             auto_review,
             use_other_models_ttl,
+            usage_overrides,
         } => {
             // Resolve nested-vs-flat into a canonical LoopCommand via the
             // shared helper. Flat-form synthesizes Run and emits a one-line
@@ -1140,6 +1141,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                 no_auto_review,
                 auto_review,
                 use_other_models_ttl,
+                usage_overrides,
             ) {
                 LoopResolve::Nested(child) => child,
                 LoopResolve::Flat(child) => {
@@ -1201,6 +1203,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                     no_auto_review,
                     auto_review,
                     use_other_models_ttl,
+                    usage_overrides,
                 } => {
                     let project_root = get_project_root()?;
 
@@ -1212,6 +1215,11 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                     config.cleanup_worktree = cleanup_worktree;
                     config.parallel_slots = parallel;
                     config.use_other_models_ttl = use_other_models_ttl;
+                    config.usage_remaining_min_cli = usage_overrides.usage_remaining_min;
+                    config.usage_remaining_min_weekly_cli =
+                        usage_overrides.usage_remaining_min_weekly;
+                    config.wait_if_reset_within_cli = usage_overrides.wait_if_reset_within;
+                    config.stop_if_reset_beyond_cli = usage_overrides.stop_if_reset_beyond;
 
                     // Auto-review hook needs the PRD path after run_loop consumes
                     // run_config; clone before the move.
@@ -1304,6 +1312,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
             no_auto_review,
             auto_review,
             use_other_models_ttl,
+            usage_overrides,
         } => {
             // Resolve nested-vs-flat into a canonical BatchCommand via the
             // shared helper. Flat-form (cmd: None, !patterns.is_empty()) is
@@ -1319,6 +1328,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                 no_auto_review,
                 auto_review,
                 use_other_models_ttl,
+                usage_overrides,
             ) {
                 BatchResolve::Nested(child) => child,
                 BatchResolve::Flat(child) => {
@@ -1383,6 +1393,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                     no_auto_review,
                     auto_review,
                     use_other_models_ttl,
+                    usage_overrides,
                 } => {
                     let project_root = get_project_root()?;
 
@@ -1410,6 +1421,10 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                             auto_review,
                             no_auto_review,
                             use_other_models_ttl,
+                            usage_overrides.usage_remaining_min,
+                            usage_overrides.usage_remaining_min_weekly,
+                            usage_overrides.wait_if_reset_within,
+                            usage_overrides.stop_if_reset_beyond,
                         )
                         .await
                     });
@@ -1490,8 +1505,9 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
             use task_mgr::commands::models::{
                 ListOpts, handle_init, handle_list, handle_route, handle_set_anchor,
                 handle_set_effort, handle_set_enabled, handle_set_fallback, handle_set_tier,
-                handle_set_tier_fallback, handle_set_usage_rule, handle_show, handle_unroute,
-                handle_unset_fallback, handle_unset_tier, handle_unset_tier_fallback,
+                handle_set_tier_fallback, handle_set_usage_policy, handle_set_usage_rule,
+                handle_show, handle_unroute, handle_unset_fallback, handle_unset_tier,
+                handle_unset_tier_fallback,
             };
             match action {
                 ModelsAction::Init {
@@ -1550,6 +1566,20 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                 }
                 ModelsAction::SetUsageRule { kind, id, on_low } => {
                     handle_set_usage_rule(&cli.dir, kind.as_deref(), id.as_deref(), &on_low)?;
+                }
+                ModelsAction::SetUsagePolicy {
+                    remaining_min,
+                    remaining_min_weekly,
+                    wait_within_minutes,
+                    stop_beyond_hours,
+                } => {
+                    handle_set_usage_policy(
+                        &cli.dir,
+                        remaining_min,
+                        remaining_min_weekly,
+                        wait_within_minutes,
+                        stop_beyond_hours,
+                    )?;
                 }
                 ModelsAction::SetTierFallback {
                     difficulty,

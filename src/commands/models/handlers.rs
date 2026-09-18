@@ -25,6 +25,10 @@
 //!   `routing.byIdPrefix`.
 //! - `set-usage-rule --kind/--id --on-low` — append/replace a
 //!   `usagePolicy.rules` entry.
+//! - `set-usage-policy` — sparse write of remaining floors (factory other **2** /
+//!   weekly **1**) and horizon (`waitIfResetWithinMinutes` 60 /
+//!   `stopIfResetBeyondHours` 12). At least one flag required; does not wipe
+//!   `rules`.
 //! - `set-tier-fallback <low|medium|high> [--include-review] [--include-forced]`
 //!   / `unset-tier-fallback` — write `routing.tierFallback` (unset = JSON
 //!   `null`, never key deletion).
@@ -636,6 +640,74 @@ pub fn handle_set_usage_rule(
     Ok(())
 }
 
+/// `task-mgr models set-usage-policy` — sparse write of remaining floors and
+/// horizon knobs. At least one flag required. Does not touch `rules`.
+pub fn handle_set_usage_policy(
+    db_dir: &Path,
+    remaining_min: Option<u8>,
+    remaining_min_weekly: Option<u8>,
+    wait_within_minutes: Option<u64>,
+    stop_beyond_hours: Option<u64>,
+) -> io::Result<()> {
+    reject_legacy_project_config(db_dir)?;
+    if remaining_min.is_none()
+        && remaining_min_weekly.is_none()
+        && wait_within_minutes.is_none()
+        && stop_beyond_hours.is_none()
+    {
+        return Err(config_err(
+            "set-usage-policy requires at least one of --remaining-min, \
+             --remaining-min-weekly, --wait-within-minutes, --stop-beyond-hours",
+        ));
+    }
+    if remaining_min.is_some_and(|v| v > 100) {
+        return Err(config_err("usagePolicy.remainingMinPercent must be 0–100"));
+    }
+    if remaining_min_weekly.is_some_and(|v| v > 100) {
+        return Err(config_err(
+            "usagePolicy.remainingMinWeeklyPercent must be 0–100",
+        ));
+    }
+
+    let mut value = read_config_value(db_dir)?;
+    let mut wrote = Vec::new();
+    if let Some(v) = remaining_min {
+        set_json_path(
+            &mut value,
+            &["usagePolicy", "remainingMinPercent"],
+            Some(serde_json::json!(v)),
+        )?;
+        wrote.push(format!("remainingMinPercent={v}"));
+    }
+    if let Some(v) = remaining_min_weekly {
+        set_json_path(
+            &mut value,
+            &["usagePolicy", "remainingMinWeeklyPercent"],
+            Some(serde_json::json!(v)),
+        )?;
+        wrote.push(format!("remainingMinWeeklyPercent={v}"));
+    }
+    if let Some(v) = wait_within_minutes {
+        set_json_path(
+            &mut value,
+            &["usagePolicy", "waitIfResetWithinMinutes"],
+            Some(serde_json::json!(v)),
+        )?;
+        wrote.push(format!("waitIfResetWithinMinutes={v}"));
+    }
+    if let Some(v) = stop_beyond_hours {
+        set_json_path(
+            &mut value,
+            &["usagePolicy", "stopIfResetBeyondHours"],
+            Some(serde_json::json!(v)),
+        )?;
+        wrote.push(format!("stopIfResetBeyondHours={v}"));
+    }
+    validate_and_write(db_dir, &value)?;
+    ui::emit_data(&format!("Set usagePolicy {}", wrote.join(" ")));
+    Ok(())
+}
+
 /// `task-mgr models set-tier-fallback <low|medium|high> [--include-review]
 /// [--include-forced]`. Omitted flags keep struct defaults
 /// (`includeReview: true`, `includeForced: false`).
@@ -807,8 +879,9 @@ pub fn handle_show_to<W: io::Write>(
     if check_opt_in().is_ok()
         && let Some(info) = load_usage_info()
     {
-        let floor = cfg.usage_policy.remaining_min_percent;
-        if let Some(banner) = remaining_banner_for_run_models(&info, &resolved, floor, Utc::now()) {
+        let floors = cfg.usage_policy.floors();
+        if let Some(banner) = remaining_banner_for_run_models(&info, &resolved, floors, Utc::now())
+        {
             writeln!(writer)?;
             writeln!(writer, "remaining (live): {banner}")?;
         }
@@ -1016,6 +1089,11 @@ fn render_usage_policy<W: io::Write>(writer: &mut W, policy: &UsagePolicy) -> io
         writer,
         "  remainingMinPercent: {}",
         policy.remaining_min_percent
+    )?;
+    writeln!(
+        writer,
+        "  remainingMinWeeklyPercent: {}",
+        policy.remaining_min_weekly_percent
     )?;
     writeln!(
         writer,
@@ -1739,6 +1817,41 @@ mod tests {
         assert!(msg.contains("CONFIG ERROR"), "{msg}");
         assert!(msg.contains("wait"), "must name accepted set: {msg}");
         assert!(msg.contains("unavailable"), "{msg}");
+    }
+
+    #[test]
+    fn set_usage_policy_sparse_write_and_requires_a_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{"version":1,"embeddingModel":"x","usagePolicy":{"rules":[{"kind":"session","onLow":"wait"}]}}"#,
+        )
+        .unwrap();
+        let err = handle_set_usage_policy(dir.path(), None, None, None, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("CONFIG ERROR"), "{msg}");
+        assert!(msg.contains("--remaining-min"), "{msg}");
+
+        handle_set_usage_policy(dir.path(), None, None, Some(30), None).unwrap();
+        let v = read_value(dir.path());
+        assert_eq!(v["usagePolicy"]["waitIfResetWithinMinutes"], 30);
+        assert!(
+            v["usagePolicy"]["rules"]
+                .as_array()
+                .is_some_and(|r| r.len() == 1),
+            "must not wipe rules: {:?}",
+            v["usagePolicy"]["rules"]
+        );
+        assert_eq!(v["embeddingModel"], "x");
+        assert!(
+            v["usagePolicy"].get("remainingMinPercent").is_none(),
+            "omitted remainingMinPercent must not be written"
+        );
+        handle_set_usage_policy(dir.path(), Some(2), Some(1), None, None).unwrap();
+        let v = read_value(dir.path());
+        assert_eq!(v["usagePolicy"]["remainingMinPercent"], 2);
+        assert_eq!(v["usagePolicy"]["remainingMinWeeklyPercent"], 1);
+        assert_eq!(v["usagePolicy"]["waitIfResetWithinMinutes"], 30);
     }
 
     #[test]

@@ -270,6 +270,7 @@ fn set_usage_rule_and_tier_fallback_round_trip_via_cli() {
     let show = sb.stdout_of(&["models", "show"]);
     assert!(show.contains("usagePolicy:"), "{show}");
     assert!(show.contains("remainingMinPercent:"), "{show}");
+    assert!(show.contains("remainingMinWeeklyPercent:"), "{show}");
     assert!(show.contains("tierFallback:"), "{show}");
     assert!(show.contains("maxDifficulty=high"), "{show}");
     assert!(

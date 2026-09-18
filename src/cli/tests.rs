@@ -2299,6 +2299,7 @@ fn test_loop_with_prd_file_and_yes() {
             no_auto_review,
             auto_review,
             use_other_models_ttl: _,
+            usage_overrides: _,
         } => {
             // Flat-form deprecated shim: cmd is None, fields populate the parent
             assert!(cmd.is_none(), "flat form should not produce a nested cmd");
@@ -2732,6 +2733,7 @@ fn test_loop_flat_form_dispatch_synthesizes_run() {
         no_auto_review,
         auto_review,
         use_other_models_ttl,
+        usage_overrides,
     } = cli.command
     else {
         panic!("Expected Loop command");
@@ -2750,6 +2752,7 @@ fn test_loop_flat_form_dispatch_synthesizes_run() {
         no_auto_review,
         auto_review,
         use_other_models_ttl,
+        usage_overrides,
     );
     match resolved {
         LoopResolve::Flat(LoopCommand::Run {
@@ -2786,6 +2789,7 @@ fn test_loop_run_canonical_no_deprecation_marker() {
         no_auto_review,
         auto_review,
         use_other_models_ttl,
+        usage_overrides,
     } = cli.command
     else {
         panic!("Expected Loop command");
@@ -2804,6 +2808,7 @@ fn test_loop_run_canonical_no_deprecation_marker() {
         no_auto_review,
         auto_review,
         use_other_models_ttl,
+        usage_overrides,
     );
     assert!(
         matches!(resolved, LoopResolve::Nested(LoopCommand::Run { .. })),
@@ -2829,6 +2834,7 @@ fn test_loop_no_args_resolves_to_print_help() {
         no_auto_review,
         auto_review,
         use_other_models_ttl,
+        usage_overrides,
     } = cli.command
     else {
         panic!("Expected Loop command");
@@ -2847,6 +2853,7 @@ fn test_loop_no_args_resolves_to_print_help() {
         no_auto_review,
         auto_review,
         use_other_models_ttl,
+        usage_overrides,
     );
     assert!(matches!(resolved, LoopResolve::PrintHelp));
 }
@@ -2972,6 +2979,7 @@ fn test_batch_flat_form_dispatch_synthesizes_run() {
         no_auto_review,
         auto_review,
         use_other_models_ttl,
+        usage_overrides,
     } = cli.command
     else {
         panic!("Expected Batch command");
@@ -2987,6 +2995,7 @@ fn test_batch_flat_form_dispatch_synthesizes_run() {
         no_auto_review,
         auto_review,
         use_other_models_ttl,
+        usage_overrides,
     );
     match resolved {
         BatchResolve::Flat(BatchCommand::Run {
@@ -3019,6 +3028,7 @@ fn test_batch_run_canonical_no_deprecation_marker() {
         no_auto_review,
         auto_review,
         use_other_models_ttl,
+        usage_overrides,
     } = cli.command
     else {
         panic!("Expected Batch command");
@@ -3034,6 +3044,7 @@ fn test_batch_run_canonical_no_deprecation_marker() {
         no_auto_review,
         auto_review,
         use_other_models_ttl,
+        usage_overrides,
     );
     assert!(
         matches!(resolved, BatchResolve::Nested(BatchCommand::Run { .. })),
@@ -3055,6 +3066,7 @@ fn test_batch_no_args_resolves_to_print_help() {
         no_auto_review,
         auto_review,
         use_other_models_ttl,
+        usage_overrides,
     } = cli.command
     else {
         panic!("Expected Batch command");
@@ -3070,6 +3082,7 @@ fn test_batch_no_args_resolves_to_print_help() {
         no_auto_review,
         auto_review,
         use_other_models_ttl,
+        usage_overrides,
     );
     assert!(matches!(resolved, BatchResolve::PrintHelp));
 }
@@ -3713,6 +3726,7 @@ fn test_loop_flat_form_auto_review_threaded() {
         no_auto_review,
         auto_review,
         use_other_models_ttl,
+        usage_overrides,
     } = cli.command
     else {
         panic!("Expected Loop command");
@@ -3731,6 +3745,7 @@ fn test_loop_flat_form_auto_review_threaded() {
         no_auto_review,
         auto_review,
         use_other_models_ttl,
+        usage_overrides,
     );
     match resolved {
         LoopResolve::Flat(LoopCommand::Run {
@@ -3788,6 +3803,33 @@ fn test_loop_run_use_other_models_ttl_zero_is_some() {
             ..
         } => {}
         other => panic!("expected Some(0), not omitted; got {other:?}"),
+    }
+}
+
+#[test]
+fn test_loop_run_wait_if_reset_within_zero_is_some() {
+    let cli = Cli::parse_from([
+        "task-mgr",
+        "loop",
+        "run",
+        "tasks/foo.json",
+        "--wait-if-reset-within",
+        "0",
+    ]);
+    match cli.command {
+        Commands::Loop {
+            cmd: Some(LoopCommand::Run {
+                usage_overrides, ..
+            }),
+            ..
+        } => {
+            assert_eq!(
+                usage_overrides.wait_if_reset_within,
+                Some(0),
+                "present zero must not be omitted"
+            );
+        }
+        other => panic!("expected wait-if-reset-within Some(0); got {other:?}"),
     }
 }
 
@@ -3853,6 +3895,7 @@ fn test_loop_flat_use_other_models_ttl_threads_through_resolve() {
         no_auto_review,
         auto_review,
         use_other_models_ttl,
+        usage_overrides,
     } = cli.command
     else {
         panic!("Expected Loop");
@@ -3872,6 +3915,7 @@ fn test_loop_flat_use_other_models_ttl_threads_through_resolve() {
         no_auto_review,
         auto_review,
         use_other_models_ttl,
+        usage_overrides,
     );
     match resolved {
         LoopResolve::Flat(LoopCommand::Run {

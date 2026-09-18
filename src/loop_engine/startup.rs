@@ -988,19 +988,33 @@ pub(crate) fn initialize_loop(
     if run_config.config.usage_check_enabled && !usage_check_enabled {
         ui::emit("Skipping Claude usage/OAuth pre-check (Claude provider disabled)");
     }
-    // Precedence: LOOP_USAGE_REMAINING_MIN (env) > usagePolicy.remainingMinPercent > 8.
+    // Floors: CLI > env > usagePolicy > factory 2 / 1. Horizon CLI overlays
+    // stay Option so Ask-wait re-eval can re-apply them after a disk re-read.
     let env_remaining = std::env::var("LOOP_USAGE_REMAINING_MIN")
         .ok()
         .and_then(|v| v.parse::<u8>().ok());
-    let remaining_min = crate::loop_engine::config::resolve_usage_remaining_min(
-        env_remaining,
-        project_config.usage_policy.remaining_min_percent,
-    );
+    let env_weekly = std::env::var("LOOP_USAGE_REMAINING_MIN_WEEKLY")
+        .ok()
+        .and_then(|v| v.parse::<u8>().ok());
+    let floors = crate::loop_engine::quota::RemainingFloors {
+        other: crate::loop_engine::config::resolve_remaining_floor(
+            run_config.config.usage_remaining_min_cli,
+            env_remaining,
+            project_config.usage_policy.remaining_min_percent,
+        ),
+        weekly: crate::loop_engine::config::resolve_remaining_floor(
+            run_config.config.usage_remaining_min_weekly_cli,
+            env_weekly,
+            project_config.usage_policy.remaining_min_weekly_percent,
+        ),
+    };
     let usage_params = UsageParams {
         enabled: usage_check_enabled,
-        threshold: remaining_min,
+        floors,
         fallback_wait: run_config.config.usage_fallback_wait,
         ask_ttl_override: run_config.config.use_other_models_ttl,
+        wait_if_reset_within_cli: run_config.config.wait_if_reset_within_cli,
+        stop_if_reset_beyond_cli: run_config.config.stop_if_reset_beyond_cli,
     };
 
     Ok(LoopInitContext {

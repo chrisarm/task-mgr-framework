@@ -5,7 +5,33 @@
 
 use std::path::PathBuf;
 
-use clap::Subcommand;
+use clap::{Args, Subcommand};
+
+/// Per-run usagePolicy overlays (loop/batch run). Omitted → config; present `0`
+/// is `Some(0)`. Does not write `config.json`.
+#[derive(Args, Debug, Clone, Default)]
+pub struct UsageRunOverrides {
+    /// Remaining-percent floor for session / other windows (0–100, factory 2).
+    ///
+    /// Overrides `usagePolicy.remainingMinPercent` for this run only.
+    #[arg(long = "usage-remaining-min", value_name = "PCT")]
+    pub usage_remaining_min: Option<u8>,
+    /// Remaining-percent floor for weekly windows (0–100, factory 1).
+    ///
+    /// Overrides `usagePolicy.remainingMinWeeklyPercent` for this run only.
+    #[arg(long = "usage-remaining-min-weekly", value_name = "PCT")]
+    pub usage_remaining_min_weekly: Option<u8>,
+    /// Wait when a low bucket resets within this many minutes.
+    ///
+    /// Overrides `usagePolicy.waitIfResetWithinMinutes` for this run only.
+    #[arg(long = "wait-if-reset-within", value_name = "MINUTES")]
+    pub wait_if_reset_within: Option<u64>,
+    /// Stop when a low bucket's reset is beyond this many hours.
+    ///
+    /// Overrides `usagePolicy.stopIfResetBeyondHours` for this run only.
+    #[arg(long = "stop-if-reset-beyond", value_name = "HOURS")]
+    pub stop_if_reset_beyond: Option<u64>,
+}
 
 use super::enums::{
     Confidence, FailStatus, LearningOutcome, RunEndStatus, Shell, TaskStatusFilter,
@@ -929,6 +955,9 @@ file is literally called `init` or `run`.
         /// `Some(0)`, not omitted.
         #[arg(long = "use-other-models-ttl", value_name = "MINUTES")]
         use_other_models_ttl: Option<u64>,
+
+        #[command(flatten)]
+        usage_overrides: UsageRunOverrides,
     },
 
     /// Show status dashboard for PRD projects
@@ -1052,6 +1081,9 @@ your PRD file is literally called `init` or `run`.
         /// `Some(0)`, not omitted.
         #[arg(long = "use-other-models-ttl", value_name = "MINUTES")]
         use_other_models_ttl: Option<u64>,
+
+        #[command(flatten)]
+        usage_overrides: UsageRunOverrides,
     },
 
     /// Import learnings from a progress.json or learnings JSON file
@@ -1434,6 +1466,9 @@ pub enum LoopCommand {
         /// `Some(0)`, not omitted.
         #[arg(long = "use-other-models-ttl", value_name = "MINUTES")]
         use_other_models_ttl: Option<u64>,
+
+        #[command(flatten)]
+        usage_overrides: UsageRunOverrides,
     },
 }
 
@@ -1536,6 +1571,9 @@ pub enum BatchCommand {
         /// `Some(0)`, not omitted.
         #[arg(long = "use-other-models-ttl", value_name = "MINUTES")]
         use_other_models_ttl: Option<u64>,
+
+        #[command(flatten)]
+        usage_overrides: UsageRunOverrides,
     },
 }
 
@@ -1598,6 +1636,7 @@ pub fn resolve_loop_command(
     no_auto_review: bool,
     auto_review: bool,
     use_other_models_ttl: Option<u64>,
+    usage_overrides: UsageRunOverrides,
 ) -> LoopResolve {
     if let Some(child) = cmd {
         return LoopResolve::Nested(child);
@@ -1616,6 +1655,7 @@ pub fn resolve_loop_command(
             no_auto_review,
             auto_review,
             use_other_models_ttl,
+            usage_overrides,
         });
     }
     LoopResolve::PrintHelp
@@ -1637,6 +1677,7 @@ pub fn resolve_batch_command(
     no_auto_review: bool,
     auto_review: bool,
     use_other_models_ttl: Option<u64>,
+    usage_overrides: UsageRunOverrides,
 ) -> BatchResolve {
     if let Some(child) = cmd {
         return BatchResolve::Nested(child);
@@ -1652,6 +1693,7 @@ pub fn resolve_batch_command(
             no_auto_review,
             auto_review,
             use_other_models_ttl,
+            usage_overrides,
         });
     }
     BatchResolve::PrintHelp
@@ -1815,6 +1857,37 @@ EXAMPLES:
         /// Action when the matched bucket is low: wait | unavailable | stop | ask | ignore
         #[arg(long = "on-low")]
         on_low: String,
+    },
+
+    /// Set usagePolicy remaining floors and/or horizon knobs (sparse write)
+    #[command(
+        name = "set-usage-policy",
+        after_help = "\
+EXAMPLES:
+    task-mgr models show
+    task-mgr models set-usage-policy --remaining-min 2 --remaining-min-weekly 1
+    task-mgr models set-usage-policy --wait-within-minutes 30
+    task-mgr models set-usage-policy --stop-beyond-hours 12
+
+Factory defaults: remainingMinPercent=2 (session/other), remainingMinWeeklyPercent=1
+(weekly), waitIfResetWithinMinutes=60, stopIfResetBeyondHours=12. Sparse write —
+omitted flags are left unchanged; rules are never wiped. Per-run overlays live
+on `loop run` / `batch run` (`--usage-remaining-min`, `--wait-if-reset-within`, …).
+"
+    )]
+    SetUsagePolicy {
+        /// Session / other remaining-percent floor (0–100).
+        #[arg(long = "remaining-min", value_name = "PCT")]
+        remaining_min: Option<u8>,
+        /// Weekly remaining-percent floor (0–100).
+        #[arg(long = "remaining-min-weekly", value_name = "PCT")]
+        remaining_min_weekly: Option<u8>,
+        /// Wait if a low bucket resets within this many minutes.
+        #[arg(long = "wait-within-minutes", value_name = "MINUTES")]
+        wait_within_minutes: Option<u64>,
+        /// Stop if a low bucket's reset is beyond this many hours.
+        #[arg(long = "stop-beyond-hours", value_name = "HOURS")]
+        stop_beyond_hours: Option<u64>,
     },
 
     /// Set routing.tierFallback (maxDifficulty + include flags)

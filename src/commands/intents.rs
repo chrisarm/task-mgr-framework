@@ -169,6 +169,27 @@ pub const INTENTS: &[(&[&str], &str)] = &[
          - `task-mgr loop init <prd>.json --append --update-existing` to sync\n\
          - Emit `<task-status>` tags to change status from inside a loop\n",
     ),
+    // 12. Claude usage floors / quota remaining
+    (
+        &["quota"],
+        "## Claude usage floors and horizon\n\
+         \n\
+         Factory: session/other **2% left**, weekly **1% left**. Horizon: wait if\n\
+         reset ≤ 60 min; stop if reset > 12 h. That leaves a sliver for wrap-up\n\
+         (`/compound`) and a couple of manual session turns after the loop parks.\n\
+         \n\
+         ```\n\
+         task-mgr models show\n\
+         task-mgr models set-usage-policy --remaining-min 2 --remaining-min-weekly 1\n\
+         task-mgr models set-usage-policy --wait-within-minutes 30\n\
+         task-mgr loop run <prd>.json --yes --usage-remaining-min 2 --wait-if-reset-within 0\n\
+         ```\n\
+         \n\
+         Persist with `set-usage-policy` (sparse; does not wipe `rules`). Per-run\n\
+         flags on `loop run` / `batch run` do not write config.json. Present `0`\n\
+         is `Some(0)`, not omitted. `LOOP_USAGE_REMAINING_MIN` overrides session/\n\
+         other only; `LOOP_USAGE_REMAINING_MIN_WEEKLY` overrides weekly.\n",
+    ),
 ];
 
 /// Match `query` against [`INTENTS`] using case-insensitive substring
@@ -233,6 +254,17 @@ mod tests {
         assert!(
             recipe.contains("task-mgr current"),
             "recipe must point at task-mgr current: {recipe}"
+        );
+    }
+
+    #[test]
+    fn match_quota_hits_usage_floor_recipe() {
+        let m = match_intents("quota");
+        assert!(!m.is_empty());
+        let recipe = INTENTS[m[0]].1;
+        assert!(
+            recipe.contains("set-usage-policy"),
+            "quota recipe must name set-usage-policy: {recipe}"
         );
     }
 

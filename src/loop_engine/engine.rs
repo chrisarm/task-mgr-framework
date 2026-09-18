@@ -100,10 +100,9 @@ pub(crate) const AUTO_MODE_DEPRECATION_HINT: &str = concat!(
 pub struct UsageParams {
     /// Whether Claude-account usage/OAuth pre-checking is enabled.
     pub enabled: bool,
-    /// Remaining-percent floor (0–100). Wait when account remaining ≤ this.
-    /// Default **8** (old used≥92 ≡ remaining≤8). Field name kept for call-site
-    /// stability; semantics are remaining-min, not used-percent.
-    pub threshold: u8,
+    /// Remaining-percent floors (session/other vs weekly). Default factory
+    /// other 2 / weekly 1.
+    pub floors: crate::loop_engine::quota::RemainingFloors,
     /// Fallback wait time in seconds when no reset time is available.
     pub fallback_wait: u64,
     /// CLI `--use-other-models-ttl` override (`None` = use config
@@ -111,6 +110,10 @@ pub struct UsageParams {
     /// `effective_ttl = ask_ttl_override.unwrap_or(policy.ask_ttl_minutes)`
     /// **before** apply — LoopConfig + execute-only is the known-bad.
     pub ask_ttl_override: Option<u64>,
+    /// CLI `--wait-if-reset-within` (`None` = config; `Some(0)` present zero).
+    pub wait_if_reset_within_cli: Option<u64>,
+    /// CLI `--stop-if-reset-beyond` (`None` = config; `Some(0)` present zero).
+    pub stop_if_reset_beyond_cli: Option<u64>,
 }
 
 impl UsageParams {
@@ -118,9 +121,11 @@ impl UsageParams {
     pub fn disabled() -> Self {
         Self {
             enabled: false,
-            threshold: 8,
+            floors: crate::loop_engine::quota::RemainingFloors::factory(),
             fallback_wait: 300,
             ask_ttl_override: None,
+            wait_if_reset_within_cli: None,
+            stop_if_reset_beyond_cli: None,
         }
     }
 }

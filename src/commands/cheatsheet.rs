@@ -65,7 +65,8 @@ pub const CURATED_RECIPES: &str = "## Common Recipes\n\
 - Run multiple PRDs: `task-mgr batch init '<glob>'` then `task-mgr batch run '<glob>' --yes`\n\
 - List architectural decisions: `task-mgr decisions list`\n\
 - Ratify a decision: `task-mgr decisions resolve <id> <letter>`\n\
-- Inspect the active PRD context: `task-mgr current`\n";
+- Inspect the active PRD context: `task-mgr current`\n\
+- Inspect / set Claude usage floors: `task-mgr models show` then `task-mgr models set-usage-policy --remaining-min 2 --remaining-min-weekly 1`\n";
 
 /// State-inspection paragraph rendered as the trailing section.
 ///

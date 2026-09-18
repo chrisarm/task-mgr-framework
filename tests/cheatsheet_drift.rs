@@ -105,6 +105,10 @@ fn extract_recipe_calls(content: &str) -> Vec<RecipeCall> {
                     "unset-fallback",
                     "route",
                     "unroute",
+                    "set-usage-rule",
+                    "set-usage-policy",
+                    "set-tier-fallback",
+                    "unset-tier-fallback",
                 ],
             ),
             (
