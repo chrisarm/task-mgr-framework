@@ -1,9 +1,16 @@
 //! Shared PRD JSON write chokepoint: unique tmp + rename, and append.
 //!
-//! CONTRACT-003 / pin 12: one process-local `unique_tmp_path` (pid + counter +
-//! nanos) shared by `append_user_story` and `prd_reconcile` writers. Existing
-//! stories are Value-mutated only — never deserialized through `PrdUserStory`
-//! (unknown keys must survive). This module must not import `commands::add`.
+//! Pin 12 / PR-1 write chokepoint: one process-local `unique_tmp_path` (pid +
+//! counter + nanos) shared by `append_user_story` and `prd_reconcile` writers.
+//! Existing stories are Value-mutated only — never deserialized through
+//! `PrdUserStory` (unknown keys must survive). This module must not import
+//! `commands::add` or `commands::update`.
+//!
+//! **PR-2 CONTRACT-001:** `patch_user_story` (FEAT-002) is the update JSON
+//! merge chokepoint — skip overlay `id`, write `dependsOn` unprefixed via
+//! `strip_prefix_in_id_array`, forward `command: &str` into every
+//! `invalid_state`. Full contract: `## CONTRACT-001` in
+//! `tasks/progress-a8855e28.txt` (see also `src/commands/CLAUDE.md`).
 
 use std::fs;
 use std::path::{Path, PathBuf};
