@@ -109,3 +109,33 @@ Hard rules (do not re-derive):
 Full copy-pasteable signatures, SQL shapes, empty-prefix `prd_id` rule,
 and `--all` LIMIT 1 live under `## CONTRACT-001` in
 `tasks/progress-c3c1c195.txt`.
+
+## PR-3 export overwrite-guard / `--force` dump (CONTRACT-002)
+
+`task-mgr export --to-json PATH` onto a registered `task_list` (pin-19
+live-path pair) always requires `--force`, even when scoped to that PRD.
+`--force` is a lossy pretty `ExportedPrd` dump (`unique_tmp_path` +
+rename), not a merge. `LockGuard` is acquired **inside** `export()` only,
+after `dest.is_file()`, before identity re-check and write. Missing dest
+→ no lock. Dest is the `--to-json` PATH (never `cli_write_path`).
+
+Hard rules (do not re-derive):
+
+- Guard uses `find_registered_by_path_identity` only — **not** match (a).
+  Stray same-`taskPrefix` copies are not registered.
+- Same-PRD dest and `--all` onto a registered path still need `--force`.
+- Directory dest → error before dump. Dest exists + identity miss → lock
+  then write without `--force`.
+- `write_json_atomic` (dest and `--learnings-file`) uses
+  `prd_json::unique_tmp_path`, never `with_extension("json.tmp")`.
+- `main.rs` Export arm forwards `ExportOpts` only — **never**
+  `LockGuard::acquire` (non-reentrant flock). Match `add()`: lock inside
+  the command after validation / existence check.
+- Coupling: `prd_json` does not import `export`; `export` does not import
+  `add` / `update`; no `preflight_from_json_path` from export.
+- Refuse copy: `invalid_state("export", …)` naming `--force` and
+  dump-not-merge; dest bytes identical; no serialize-then-refuse.
+  Operator UX via `ui::emit` / `ui::emit_err`, never tracing.
+
+Full algorithm, edge table, known-bad discriminators, and grep checklist
+live under `## CONTRACT-002` in `tasks/progress-c3c1c195.txt`.
