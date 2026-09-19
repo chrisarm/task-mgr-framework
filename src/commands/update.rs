@@ -3,9 +3,11 @@
 //! - FEAT-003: Value-only whitelist validator (`validate_update_overlay`).
 //! - FEAT-004: `update_with_conn` — partial `UPDATE tasks`, scoped `dependsOn`
 //!   delete, JSON-only refuse vs mixed pin 11, `patch_user_story` persist.
+//! - FEAT-005: clap + `update()` pin/write-policy wrapper (`default_prd_roots`
+//!   → `resolve_context_with_roots`; shared `preflight_from_json_path` /
+//!   `refuse_unpinned_write`). Does **not** `use commands::add`.
 //!
-//! Clap / pin-order / `update()` roots wrapper is FEAT-005. Never call
-//! `import::update_task` or `delete_task_relationships`.
+//! Never call `import::update_task` or `delete_task_relationships`.
 //!
 //! Full contracts: `## CONTRACT-001` / `002` / `003` in `tasks/progress-a8855e28.txt`.
 
@@ -13,8 +15,14 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 use rusqlite::types::Value as SqlValue;
+use serde::Serialize;
 use serde_json::{Map, Value};
 
+use crate::commands::context::{
+    ResolvedContext, choose_cli_write_path, cli_write_path, default_prd_roots,
+    preflight_from_json_path, refuse_unpinned_write, resolve_context_with_roots,
+    sole_task_list_path,
+};
 use crate::commands::init::import::{delete_task_files, insert_relationship, insert_task_file};
 use crate::commands::init::prefix_id;
 use crate::commands::prd_json::patch_user_story;
@@ -415,8 +423,10 @@ fn optional_outcome(obj: &Map<String, Value>, key: &str) -> TaskMgrResult<Option
 // FEAT-004: load-merge-write (`update_with_conn`)
 // ---------------------------------------------------------------------------
 
-/// Result of a successful `update_with_conn` (CONTRACT-001).
-#[derive(Debug, Clone)]
+/// Result of a successful `task-mgr update` (CONTRACT-001).
+///
+/// Distinct from [`crate::commands::run::UpdateResult`] (run-session).
+#[derive(Debug, Clone, Serialize)]
 pub struct UpdateResult {
     pub task_id: String,
     /// Overlay keys that caused a DB and/or JSON write (JSON camelCase).
@@ -425,11 +435,158 @@ pub struct UpdateResult {
     pub prd_path: Option<PathBuf>,
 }
 
+/// Entry point for `task-mgr update`.
+///
+/// Pin order matches add (CONTRACT-001 / FEAT-005):
+/// 1. `--from-json` missing/directory via [`preflight_from_json_path`] **before**
+///    overlay parse
+/// 2. Parse overlay JSON (+ validate)
+/// 3. `LockGuard` + open conn
+/// 4. [`default_prd_roots`] → [`resolve_context_with_roots`] (not bare
+///    [`crate::commands::context::resolve_context`])
+/// 5. [`refuse_unpinned_write`] before the write txn
+///
+/// Does **not** import `commands::add`. `--from-json` never inserts
+/// `prd_files` / `prd_metadata`.
+pub fn update(
+    db_dir: &Path,
+    input_json: &str,
+    from_json: Option<&Path>,
+) -> TaskMgrResult<UpdateResult> {
+    if let Some(path) = from_json {
+        preflight_from_json_path(path, "update")?;
+    }
+
+    let input: Value = serde_json::from_str(input_json).map_err(|e| {
+        TaskMgrError::invalid_state(
+            "update",
+            "input JSON",
+            "valid overlay JSON object (fields: id, whitelist keys)",
+            format!("parse error: {e}"),
+        )
+    })?;
+    // Validate before lock when possible (CONTRACT-002 call order).
+    validate_update_overlay(&input)?;
+
+    let _lock = crate::db::LockGuard::acquire(db_dir)?;
+    let conn = crate::db::open_connection(db_dir)?;
+    let (source_root, worktree_root) = default_prd_roots(db_dir);
+
+    update_with_conn_in(
+        &conn,
+        &input,
+        from_json,
+        Some(&source_root),
+        Some(&worktree_root),
+    )
+}
+
+/// Testable variant with an already-open connection (in-memory / fixture DBs).
+///
+/// Resolves pin + write path the same way as [`update`], then merges via
+/// [`update_with_conn`]. Pass `None` roots only for pure in-memory tests that
+/// do not exercise remap.
+pub fn update_with_roots(
+    conn: &Connection,
+    input: &Value,
+    from_json: Option<&Path>,
+    source_root: Option<&Path>,
+    worktree_root: Option<&Path>,
+) -> TaskMgrResult<UpdateResult> {
+    update_with_conn_in(conn, input, from_json, source_root, worktree_root)
+}
+
+fn update_with_conn_in(
+    conn: &Connection,
+    input: &Value,
+    from_json: Option<&Path>,
+    source_root: Option<&Path>,
+    worktree_root: Option<&Path>,
+) -> TaskMgrResult<UpdateResult> {
+    let resolved_ctx =
+        resolve_context_with_roots(conn, from_json, "update", source_root, worktree_root)?;
+    refuse_unpinned_write(conn, &resolved_ctx, "update")?;
+
+    // Emit resolved-context line as the FIRST stderr output (same as add).
+    if let Some(ref ctx) = resolved_ctx {
+        let target = if ctx.prd_json_path.as_os_str().is_empty() {
+            "(none)".to_string()
+        } else {
+            ctx.prd_json_path.display().to_string()
+        };
+        ui::emit(&format!(
+            "→ active prefix={}  source={}  target={}",
+            ctx.prefix, ctx.source, target,
+        ));
+    }
+
+    let (write_path, prefix) =
+        resolve_update_write_target(conn, &resolved_ctx, source_root, worktree_root)?;
+
+    update_with_conn(conn, input, write_path.as_deref(), &prefix)
+}
+
+/// Choose JSON write path + prefix after pin resolution.
+///
+/// - `Some(ctx)` → `ctx.prd_json_path` only (`--from-json` = canonical PATH;
+///   default = remap-then-`is_file()` already stored). Empty OsStr → no path.
+/// - `None` → [`sole_task_list_path`] then [`choose_cli_write_path`] when roots
+///   known, else [`cli_write_path`]. Empty prefix (zero-prefix / `--no-prefix`).
+fn resolve_update_write_target(
+    conn: &Connection,
+    resolved_ctx: &Option<ResolvedContext>,
+    source_root: Option<&Path>,
+    worktree_root: Option<&Path>,
+) -> TaskMgrResult<(Option<PathBuf>, String)> {
+    match resolved_ctx {
+        Some(ctx) => {
+            let path = if ctx.prd_json_path.as_os_str().is_empty() {
+                None
+            } else {
+                Some(ctx.prd_json_path.clone())
+            };
+            Ok((path, ctx.prefix.clone()))
+        }
+        None => {
+            let path = match sole_task_list_path(conn)? {
+                Some(registered) => {
+                    let chosen = match (source_root, worktree_root) {
+                        (Some(src), Some(wt)) => choose_cli_write_path(&registered, src, wt),
+                        _ => cli_write_path(&registered),
+                    };
+                    if chosen.as_os_str().is_empty() {
+                        None
+                    } else {
+                        Some(chosen)
+                    }
+                }
+                None => None,
+            };
+            Ok((path, String::new()))
+        }
+    }
+}
+
+/// Format text output for a successful update.
+pub fn format_text(result: &UpdateResult) -> String {
+    let fields = if result.fields_updated.is_empty() {
+        "(none)".to_string()
+    } else {
+        result.fields_updated.join(", ")
+    };
+    let mut out = format!("Updated task {} (fields: {})", result.task_id, fields);
+    if let Some(p) = &result.prd_path {
+        out.push_str(&format!("\nSynced into PRD JSON: {}", p.display()));
+    } else {
+        out.push_str("\nPRD JSON: no file synced (DB-only or skipped)");
+    }
+    out
+}
+
 /// Load-merge-write given an already-resolved write path and prefix.
 ///
-/// FEAT-005 owns clap / `default_prd_roots` / `resolve_context_with_roots` and
-/// passes the resolved path + prefix here. Empty `prefix` skips `prefix_id`
-/// (learning #5597). `write_path` of `None` or empty OsStr means no JSON target.
+/// Empty `prefix` skips `prefix_id` (learning #5597). `write_path` of `None`
+/// or empty OsStr means no JSON target.
 ///
 /// Never calls `import::update_task` or `delete_task_relationships`.
 pub fn update_with_conn(
@@ -1730,5 +1887,250 @@ mod tests {
         );
         assert_eq!(entry["title"].as_str(), Some("Keep"));
         assert_eq!(entry["priority"].as_i64(), Some(9));
+    }
+
+    // -----------------------------------------------------------------------
+    // FEAT-005: pin / write-policy wrapper (update_with_roots)
+    // -----------------------------------------------------------------------
+
+    use crate::commands::context::{
+        load_known_prefixes, preflight_from_json_path, refuse_unpinned_write, resolve_context,
+    };
+    use crate::loop_engine::claude::ACTIVE_PREFIX_ENV;
+
+    struct EnvVarGuard {
+        name: &'static str,
+        prior: Option<String>,
+    }
+    impl EnvVarGuard {
+        fn unset(name: &'static str) -> Self {
+            let prior = std::env::var(name).ok();
+            unsafe { std::env::remove_var(name) };
+            Self { name, prior }
+        }
+    }
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.prior {
+                Some(v) => unsafe { std::env::set_var(self.name, v) },
+                None => unsafe { std::env::remove_var(self.name) },
+            }
+        }
+    }
+
+    /// Field order load-bearing: restore env before releasing the mutex.
+    struct EnvIsolation {
+        _env: EnvVarGuard,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+    fn isolate_env() -> EnvIsolation {
+        let lock = crate::ENV_PREFIX_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let env = EnvVarGuard::unset(ACTIVE_PREFIX_ENV);
+        EnvIsolation {
+            _env: env,
+            _lock: lock,
+        }
+    }
+
+    fn seed_prefix(conn: &Connection, id: i64, project: &str, prefix: &str) {
+        conn.execute(
+            "INSERT INTO prd_metadata (id, project, task_prefix) VALUES (?, ?, ?)",
+            rusqlite::params![id, project, prefix],
+        )
+        .unwrap();
+    }
+
+    fn seed_task_list(conn: &Connection, prd_id: i64, path: &Path) {
+        conn.execute(
+            "INSERT INTO prd_files (prd_id, file_path, file_type) VALUES (?, ?, 'task_list')",
+            rusqlite::params![prd_id, path.to_str().unwrap()],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn directory_from_json_fails_before_parse_names_update() {
+        // canonicalize on a dir succeeds — preflight is_file must run first.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let err = preflight_from_json_path(tmp.path(), "update").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Invalid state for update"),
+            "directory preflight must name update (not add): {msg}"
+        );
+        assert!(
+            msg.contains("not a regular file") || msg.contains("directory"),
+            "{msg}"
+        );
+        // Garbage overlay would also fail parse — prove we never get there
+        // when calling update() with a directory pin.
+        let db_dir = tmp.path().join(".task-mgr");
+        fs::create_dir_all(&db_dir).unwrap();
+        // open_connection needs a migrated db; use update() only for the
+        // preflight short-circuit (before parse / before open).
+        let err = update(
+            &db_dir,
+            "this is not json {{{",
+            Some(tmp.path()), // directory
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Invalid state for update"),
+            "update() directory pin must name update: {msg}"
+        );
+        assert!(
+            !msg.contains("parse error"),
+            "directory must fail before overlay parse: {msg}"
+        );
+    }
+
+    #[test]
+    fn refuse_ge2_unpinned_names_update_no_db_write() {
+        let _iso = isolate_env();
+        let conn = memory_db();
+        seed_prefix(&conn, 1, "alpha", "A");
+        seed_prefix(&conn, 2, "beta", "B");
+        seed_task(&conn, "A-FEAT-001", "t", 1, "todo");
+
+        assert!(resolve_context(&conn, None, "update").unwrap().is_none());
+        refuse_unpinned_write(&conn, &None, "update").unwrap_err();
+
+        let err = update_with_roots(
+            &conn,
+            &json!({"id": "FEAT-001", "notes": "x"}),
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Invalid state for update"),
+            "≥2 refuse must name update: {msg}"
+        );
+        assert!(msg.contains("--from-json"), "{msg}");
+        let notes: Option<String> = conn
+            .query_row("SELECT notes FROM tasks WHERE id = 'A-FEAT-001'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(notes.as_deref(), Some("seed-notes"), "must not write");
+    }
+
+    #[test]
+    fn zero_prefix_update_unprefixed_id_ok() {
+        let _iso = isolate_env();
+        let conn = memory_db();
+        assert!(load_known_prefixes(&conn).unwrap().is_empty());
+        seed_task(&conn, "FEAT-080", "t", 1, "todo");
+
+        let res = update_with_roots(
+            &conn,
+            &json!({"id": "FEAT-080", "notes": "zero"}),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(res.task_id, "FEAT-080");
+        let notes: Option<String> = conn
+            .query_row("SELECT notes FROM tasks WHERE id = 'FEAT-080'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(notes.as_deref(), Some("zero"));
+    }
+
+    #[test]
+    fn unregistered_from_json_after_parse_names_loop_init() {
+        let _iso = isolate_env();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file = tmp.path().join("orphan.json");
+        write_prd(&file, r#"{"taskPrefix":"ORPHAN","userStories":[]}"#);
+        let conn = memory_db();
+        seed_task(&conn, "ORPHAN-FEAT-001", "t", 1, "todo");
+
+        // Overlay is valid — error is registration, after parse, before write.
+        let err = update_with_roots(
+            &conn,
+            &json!({"id": "FEAT-001", "notes": "x"}),
+            Some(file.as_path()),
+            Some(tmp.path()),
+            Some(tmp.path()),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Invalid state for update"),
+            "unregistered must name update: {msg}"
+        );
+        assert!(
+            msg.contains("loop init"),
+            "unregistered must name loop init: {msg}"
+        );
+        let notes: Option<String> = conn
+            .query_row(
+                "SELECT notes FROM tasks WHERE id = 'ORPHAN-FEAT-001'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(notes.as_deref(), Some("seed-notes"));
+    }
+
+    #[test]
+    fn from_json_writes_canonical_path_not_remapped() {
+        let _iso = isolate_env();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tasks = tmp.path().join("tasks");
+        fs::create_dir_all(&tasks).unwrap();
+        let file = tasks.join("prd.json");
+        write_prd(
+            &file,
+            r#"{"taskPrefix":"PIN","userStories":[{"id":"FEAT-090","title":"t","priority":1,"passes":false}]}"#,
+        );
+        let conn = memory_db();
+        seed_prefix(&conn, 1, "pin", "PIN");
+        seed_task_list(&conn, 1, &file);
+        seed_task(&conn, "PIN-FEAT-090", "t", 1, "todo");
+
+        let res = update_with_roots(
+            &conn,
+            &json!({"id": "FEAT-090", "notes": "pinned"}),
+            Some(file.as_path()),
+            Some(tmp.path()),
+            Some(tmp.path()),
+        )
+        .unwrap();
+        let expected = file.canonicalize().unwrap();
+        assert_eq!(
+            res.prd_path.as_ref().map(|p| p.canonicalize().unwrap()),
+            Some(expected),
+            "--from-json must write the canonical flag PATH"
+        );
+        // Must not insert extra prd_files / prd_metadata rows.
+        let n_meta: i64 = conn
+            .query_row("SELECT COUNT(*) FROM prd_metadata", [], |r| r.get(0))
+            .unwrap();
+        let n_files: i64 = conn
+            .query_row("SELECT COUNT(*) FROM prd_files", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n_meta, 1);
+        assert_eq!(n_files, 1);
+    }
+
+    #[test]
+    fn format_text_mentions_fields_and_sync() {
+        let text = format_text(&UpdateResult {
+            task_id: "FEAT-001".into(),
+            fields_updated: vec!["notes".into()],
+            prd_path: Some(PathBuf::from("tasks/x.json")),
+        });
+        assert!(text.contains("FEAT-001"), "{text}");
+        assert!(text.contains("notes"), "{text}");
+        assert!(text.contains("tasks/x.json"), "{text}");
     }
 }

@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::commands::context::{
-    choose_cli_write_path, cli_write_path, load_known_prefixes, locate_prd_json,
-    sole_task_list_path,
+    choose_cli_write_path, cli_write_path, default_prd_roots, load_known_prefixes, locate_prd_json,
+    preflight_from_json_path, refuse_unpinned_write, sole_task_list_path,
 };
 use crate::commands::init::import::{
     DEPRECATED_RELATIONSHIPS_WARNING, insert_relationship, insert_task, insert_task_file,
@@ -195,7 +195,7 @@ pub fn add(
     // before parse). Full registration still runs via resolve_context below
     // (needs the DB) and still precedes any write transaction.
     if let Some(path) = from_json {
-        preflight_from_json_path(path)?;
+        preflight_from_json_path(path, "add")?;
     }
 
     let input: AddTaskInput = serde_json::from_str(input_json).map_err(|e| {
@@ -237,54 +237,6 @@ pub fn add(
         Some(&source_root),
         Some(&worktree_root),
     )
-}
-
-/// Same fallback as [`crate::commands::init::InitOpts::resolve_roots`].
-fn default_prd_roots(db_dir: &Path) -> (PathBuf, PathBuf) {
-    let source_root = crate::git::main_repo_root_at(db_dir)
-        .or_else(|| db_dir.parent().map(|p| p.to_path_buf()))
-        .unwrap_or_else(|| db_dir.to_path_buf());
-    let worktree_root = std::env::current_dir()
-        .ok()
-        .filter(|cwd| crate::git::is_inside_worktree_at(cwd).unwrap_or(false))
-        .unwrap_or_else(|| source_root.clone());
-    (source_root, worktree_root)
-}
-
-/// Filesystem-only preflight for `--from-json`: missing and non-file paths
-/// fail before input JSON parse. Registration matching stays in
-/// `resolve_context` (needs DB) but still before any write transaction.
-fn preflight_from_json_path(path: &Path) -> TaskMgrResult<()> {
-    let meta = match std::fs::metadata(path) {
-        Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(TaskMgrError::invalid_state(
-                "add",
-                "--from-json",
-                "an existing regular file path to a registered task_list",
-                format!("path does not exist: {}", path.display()),
-            ));
-        }
-        Err(e) => {
-            return Err(TaskMgrError::io_error(
-                path.display().to_string(),
-                "reading --from-json path metadata",
-                e,
-            ));
-        }
-    };
-    if !meta.file_type().is_file() {
-        return Err(TaskMgrError::invalid_state(
-            "add",
-            "--from-json",
-            "a regular file (already-registered task_list)",
-            format!(
-                "path is not a regular file (directory or special): {}",
-                path.display()
-            ),
-        ));
-    }
-    Ok(())
 }
 
 /// Testable variant that takes an already-open connection (used by unit tests
@@ -348,25 +300,8 @@ fn add_with_conn_in(
         worktree_root,
     )?;
 
-    // Add-only write policy (CONTRACT-002 / FEAT-006): refuse unpinned writes
-    // when ≥2 non-NULL prefixes are registered. Keep this OUT of
-    // resolve_context so `current` stays an Ok(None) probe. Do NOT fold into
-    // `if ctx.is_none()` alone — that breaks zero-prefix / --no-prefix insert.
-    if resolved_ctx.is_none() {
-        let known = load_known_prefixes(conn)?;
-        if known.len() >= 2 {
-            return Err(TaskMgrError::invalid_state(
-                "add",
-                "--from-json / TASK_MGR_ACTIVE_PREFIX",
-                "pin via --from-json or TASK_MGR_ACTIVE_PREFIX",
-                format!(
-                    "{} registered prefixes ({}), none selected",
-                    known.len(),
-                    known.join(", ")
-                ),
-            ));
-        }
-    }
+    // Write-only ≥2 refuse (shared with update). Keep OUT of resolve_context.
+    refuse_unpinned_write(conn, &resolved_ctx, "add")?;
 
     // Emit resolved-context line as the FIRST stderr output, before any write
     // or downstream warning. Agents can read stderr line 1 to learn which PRD

@@ -696,6 +696,55 @@ PRIORITY:
         from_json: Option<PathBuf>,
     },
 
+    /// Update whitelist fields on an existing task (overlay JSON).
+    ///
+    /// Load-merge-write: patches DB columns for present whitelist keys and
+    /// syncs the active PRD JSON. Never sets `status` / `passes` / `priority`
+    /// / `archived_at` — use lifecycle commands / `<task-status>` for those.
+    /// Distinct from `task-mgr run update` (run-session progress).
+    #[command(after_help = "\
+EXAMPLES:
+    # Patch notes from a pipe (preferred for loop agents)
+    echo '{\"id\":\"FEAT-001\",\"notes\":\"updated\"}' \\
+      | task-mgr update --stdin
+
+    # Pin an already-registered effort (not an import — distinct from init --from-json)
+    echo '{\"id\":\"CLARIFY-001\",\"humanReviewOutcome\":{\"resolvedAt\":\"2026-09-19\",\"resolvedBy\":\"op\"}}' \\
+      | task-mgr update --stdin --from-json tasks/my-prd.json
+
+    # Inline overlay
+    task-mgr update --json '{\"id\":\"FEAT-001\",\"notes\":\"x\"}'
+
+OVERLAY:
+    Required lookup key: \"id\". Whitelist fields only (title, notes,
+    humanReviewOutcome, dependsOn, …). Top-level status/passes are hard
+    errors (lifecycle SSoT). Unknown keys are hard errors.
+
+--from-json (pin, not import):
+    Pins writes to an already-registered task_list. Does NOT register a new
+    PRD — run `task-mgr loop init <prd>.json` first. Distinct from
+    `task-mgr init --from-json` (the deprecated import shim) and from
+    `task-mgr run update` (run-session).
+")]
+    Update {
+        /// Inline JSON string (mutually exclusive with --stdin)
+        #[arg(long, conflicts_with = "stdin")]
+        json: Option<String>,
+
+        /// Read JSON from stdin
+        #[arg(long, default_value_t = false)]
+        stdin: bool,
+
+        /// Pin this already-registered effort (not an import).
+        ///
+        /// Writes go to PATH. The file must already be a registered `task_list`
+        /// (or its JSON `taskPrefix` must be in `prd_metadata`). Unregistered /
+        /// missing / directory paths are refused. Distinct from
+        /// `init --from-json` / `loop init`, which register a new PRD.
+        #[arg(long = "from-json", value_name = "PATH")]
+        from_json: Option<PathBuf>,
+    },
+
     /// Reset task(s) to todo status for re-running
     Reset {
         /// Task ID(s) to reset (omit for --all)

@@ -859,6 +859,36 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
             Ok(())
         }
 
+        Commands::Update {
+            json,
+            stdin,
+            from_json,
+        } => {
+            let input_json = if let Some(j) = json {
+                j
+            } else if stdin {
+                use std::io::Read;
+                let mut buf = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut buf)
+                    .map_err(|e| TaskMgrError::io_error("stdin", "reading JSON input", e))?;
+                buf
+            } else {
+                return Err(TaskMgrError::invalid_state(
+                    "update",
+                    "input",
+                    "either --json or --stdin",
+                    "neither provided",
+                ));
+            };
+            // Path-qualified: `commands::update` fn is run-session; task overlay
+            // lives in the `commands::update` module.
+            let result =
+                task_mgr::commands::update::update(&cli.dir, &input_json, from_json.as_deref())?;
+            output_result(&result, cli.format);
+            Ok(())
+        }
+
         Commands::Reset { task_ids, all, yes } => {
             if all {
                 let _lock = LockGuard::acquire(&cli.dir)?;
