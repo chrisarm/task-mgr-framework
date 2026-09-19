@@ -29,25 +29,29 @@ static WRONG_SUBCOMMAND_HINTS: &[(&str, &str)] = &[
          \x20 task-mgr irrelevant <id> --reason '...'",
     ),
     (
-        "update",
-        "hint: task-mgr has no `update` subcommand yet. Edit the JSON in the worktree, then:\n\
-         \x20 task-mgr loop init <prd>.json --append --update-existing",
-    ),
-    (
         "edit",
-        "hint: task-mgr has no `edit` subcommand yet. Edit the JSON in the worktree, then:\n\
-         \x20 task-mgr loop init <prd>.json --append --update-existing",
+        "hint: task-mgr has no `edit` subcommand. Patch fields with overlay JSON:\n\
+         \x20 echo '{\"id\":\"TASK-001\",\"notes\":\"...\"}' | task-mgr update --stdin\n\
+         \x20 Pin with --from-json <prd>.json when ≥2 prefixes are registered.",
     ),
     (
         "change",
-        "hint: task-mgr has no `change` subcommand. Edit the JSON in the worktree, then:\n\
-         \x20 task-mgr loop init <prd>.json --append --update-existing",
+        "hint: task-mgr has no `change` subcommand. Patch fields with overlay JSON:\n\
+         \x20 echo '{\"id\":\"TASK-001\",\"notes\":\"...\"}' | task-mgr update --stdin\n\
+         \x20 Pin with --from-json <prd>.json when ≥2 prefixes are registered.",
     ),
 ];
 
 /// Hints for wrong flags or sub-arguments on known top-level subcommands.
 /// (top_level_subcommand, wrong_flag_or_arg, hint_message)
 static WRONG_ARG_HINTS: &[(&str, &str, &str)] = &[
+    (
+        "update",
+        "--title",
+        "hint: `task-mgr update` takes overlay JSON via `--stdin`/`--json`, not `--title`.\n\
+         \x20 Put `id` and whitelist fields in the object:\n\
+         \x20 echo '{\"id\":\"FOO-1\",\"title\":\"x\"}' | task-mgr update --stdin",
+    ),
     (
         "recall",
         "--top-k",
@@ -199,13 +203,46 @@ mod tests {
     }
 
     #[test]
-    fn update_hint_references_loop_init_workflow() {
+    fn update_is_not_a_wrong_subcommand_hint() {
+        // `update` is a real command — argv starting with it must never claim
+        // "has no update subcommand" or point at loop-init JSON editing.
         let argv: Vec<String> = ["task-mgr", "update", "FOO-1", "--title", "x"]
             .iter()
             .map(|s| s.to_string())
             .collect();
         let hint = lookup_hint(&argv).unwrap();
-        assert!(hint.contains("loop init") || hint.contains("--append"));
+        assert!(
+            !hint.contains("has no `update` subcommand"),
+            "update exists; must not say missing: {hint}"
+        );
+        assert!(
+            !hint.contains("loop init") && !hint.contains("Edit the JSON"),
+            "must not point at hand-edit + loop init: {hint}"
+        );
+        assert!(
+            hint.contains("--stdin") || hint.contains("--json"),
+            "positional/--title path must point at overlay: {hint}"
+        );
+        assert!(
+            hint.contains("id"),
+            "overlay hint must mention id in the object: {hint}"
+        );
+    }
+
+    #[test]
+    fn edit_and_change_point_at_update_stdin() {
+        for name in ["edit", "change"] {
+            let argv: Vec<String> = ["task-mgr", name].iter().map(|s| s.to_string()).collect();
+            let hint = lookup_hint(&argv).unwrap();
+            assert!(
+                hint.contains("update --stdin"),
+                "{name} must point at update --stdin: {hint}"
+            );
+            assert!(
+                !hint.contains("loop init") && !hint.contains("Edit the JSON"),
+                "{name} must not point at hand-edit + loop init: {hint}"
+            );
+        }
     }
 
     #[test]

@@ -22,6 +22,37 @@ fn mtime(path: &std::path::Path) -> SystemTime {
 // ─── templates ────────────────────────────────────────────────────────────
 
 #[test]
+fn clarify_block_uses_update_stdin_not_hand_edit() {
+    // FEAT-006: CLARIFY resolution pipes {id, humanReviewOutcome} to
+    // update --stdin; never tell agents to Edit the JSON for that field.
+    assert!(
+        WORKFLOW_TEMPLATE.contains("update --stdin"),
+        "workflow template must document update --stdin"
+    );
+    let clarify = WORKFLOW_TEMPLATE
+        .split("### Human-in-the-loop CLARIFY tasks")
+        .nth(1)
+        .and_then(|rest| rest.split("### ").next())
+        .expect("CLARIFY section must exist");
+    assert!(
+        clarify.contains("update --stdin"),
+        "CLARIFY section must name update --stdin"
+    );
+    assert!(
+        clarify.contains("complete"),
+        "CLARIFY section must name complete after update"
+    );
+    assert!(
+        clarify.contains("humanReviewOutcome"),
+        "CLARIFY section must keep the outcome field example"
+    );
+    assert!(
+        !clarify.contains("Edit") && !clarify.contains("loop init"),
+        "CLARIFY must not tell agents to Edit JSON or loop-init the outcome: {clarify}"
+    );
+}
+
+#[test]
 fn full_template_strictly_contains_workflow_template() {
     // Acceptance: "Unit test: `full` profile strictly contains `workflow`
     // profile content (use length comparison + grep for a workflow-only

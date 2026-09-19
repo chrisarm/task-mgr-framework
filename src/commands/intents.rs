@@ -166,10 +166,28 @@ pub const INTENTS: &[(&[&str], &str)] = &[
          iteration and may revert your edit). Use the CLI subcommands instead:\n\
          \n\
          - `task-mgr add --stdin` to add new tasks\n\
-         - `task-mgr loop init <prd>.json --append --update-existing` to sync\n\
+         - `task-mgr update --stdin` to patch whitelist fields (overlay with `id`)\n\
+         - `task-mgr loop init <prd>.json --append --update-existing` for bulk sync\n\
          - Emit `<task-status>` tags to change status from inside a loop\n",
     ),
-    // 12. Claude usage floors / quota remaining
+    // 12. Resolve a CLARIFY / human-review task
+    (
+        &["clarify"],
+        "## Resolve a CLARIFY task\n\
+         \n\
+         Pipe `{id, humanReviewOutcome}` to `task-mgr update --stdin`, then complete:\n\
+         \n\
+         ```\n\
+         echo '{\"id\":\"CLARIFY-001\",\"humanReviewOutcome\":{...}}' \\\n\
+           | task-mgr update --stdin --from-json tasks/<prd>.json\n\
+         task-mgr complete <clarify-id>\n\
+         ```\n\
+         \n\
+         Pin with `--from-json` when ≥2 prefixes are registered. Downstream field\n\
+         patches in the same resolution also use `update --stdin` — never hand-edit\n\
+         the JSON for `humanReviewOutcome`.\n",
+    ),
+    // 13. Claude usage floors / quota remaining
     (
         &["quota"],
         "## Claude usage floors and horizon\n\

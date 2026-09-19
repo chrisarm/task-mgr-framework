@@ -264,12 +264,14 @@ This block is managed by `task-mgr enhance` — edits inside the
 
 ### Mid-loop JSON sync
 
-When the task-list JSON changes mid-effort (adding tasks, editing
-descriptions, recording human-review outcomes), NEVER run bare
-`task-mgr init --from-json <prd>.json` — it wipes `status`, `started_at`,
-and `completed_at` for every task in the list.
+When the task-list JSON changes mid-effort (adding tasks, bulk description
+edits), NEVER run bare `task-mgr init --from-json <prd>.json` — it wipes
+`status`, `started_at`, and `completed_at` for every task in the list.
+For single-field patches (including `humanReviewOutcome`), use
+`task-mgr update --stdin` instead of re-import.
 
-Correct incremental sync (`task-mgr loop init` is the canonical form):
+Correct incremental sync for bulk add/refresh (`task-mgr loop init` is
+the canonical form):
 
 ```sh
 task-mgr loop init <prd>.json --append --update-existing --dry-run  # preview
@@ -284,25 +286,26 @@ in-progress loop.
 ### Human-in-the-loop CLARIFY tasks
 
 When a task requires human sign-off (`requires_human: true`), the loop
-emits `<promise>BLOCKED</promise>` until resolution. On resolution,
-embed a machine-readable `humanReviewOutcome` block directly in the
-JSON task entry:
+emits `<promise>BLOCKED</promise>` until resolution. On resolution, pipe
+an overlay with `id` + `humanReviewOutcome` to `task-mgr update --stdin`
+(add `--from-json tasks/<prd>.json` when pinning), then complete:
 
-```json
-"humanReviewOutcome": {
+```sh
+echo '{"id":"CLARIFY-001","humanReviewOutcome":{
   "resolvedAt": "YYYY-MM-DD",
   "resolvedBy": "<name>",
   "confirmedValues": { },
   "deltasFromProposed": [ ],
   "additionalRequirements": [ ]
-}
+}}' | task-mgr update --stdin --from-json tasks/<prd>.json
+task-mgr complete CLARIFY-001
 ```
 
-Then update downstream task entries in the SAME commit — their embedded
-rate-limit / threshold / flag values must match the confirmed outcome,
-or the loop will implement the proposed (wrong) value. Sync with
-`task-mgr loop init <prd>.json --append --update-existing`, then
-`task-mgr complete <clarify-task-id>`.
+Downstream task field updates in the same resolution also go through
+`task-mgr update --stdin` (whitelist overlay with `id`) — never hand-edit
+the JSON. Their embedded rate-limit / threshold / flag values must match
+the confirmed outcome, or the loop will implement the proposed (wrong)
+value.
 
 ### Spawn-fixup PRD targeting
 
@@ -356,7 +359,6 @@ yourself.
 | `task-mgr run end` | End a run session |
 | `task-mgr export` | Export database state to JSON |
 | `task-mgr doctor` | Check database health and fix stale state |
-| `task-mgr doctor` orphan branch PRD | Remediate with `task-mgr archive --branch <branch>` after verifying the PRD is stale |
 | `task-mgr skip` | Skip one or more tasks intentionally (defer for later without marking as failed) |
 | `task-mgr irrelevant` | Mark one or more tasks as irrelevant (no longer needed due to changed requireme… |
 | `task-mgr learn` | Record a learning from a task outcome |
@@ -367,6 +369,7 @@ yourself.
 | `task-mgr unblock` | Return a blocked task to todo status for retry |
 | `task-mgr unskip` | Return a skipped task to todo status for retry |
 | `task-mgr add` | Add a single task from JSON (stdin or --json) |
+| `task-mgr update` | Update whitelist fields on an existing task (overlay JSON) |
 | `task-mgr reset` | Reset task(s) to todo status for re-running |
 | `task-mgr stats` | Show progress summary (task counts, completion rate, learnings) |
 | `task-mgr history` | Show run history |
@@ -420,6 +423,10 @@ yourself.
 | `task-mgr models unset-fallback` | Remove a provider's fallback target |
 | `task-mgr models route` | Add or replace a routing.byIdPrefix forced route |
 | `task-mgr models unroute` | Remove a routing.byIdPrefix route |
+| `task-mgr models set-usage-rule` | Append or replace a usagePolicy.rules entry (per-bucket onLow) |
+| `task-mgr models set-usage-policy` | Set usagePolicy remaining floors and/or horizon knobs (sparse write) |
+| `task-mgr models set-tier-fallback` | Set routing.tierFallback (maxDifficulty + include flags) |
+| `task-mgr models unset-tier-fallback` | Clear routing.tierFallback to JSON null (ask opt-out; does NOT delete the key) |
 | `task-mgr current` | Show the currently resolved active PRD context (prefix, source, target path) |
 | `task-mgr enhance` | Manage the task-mgr-fenced block in CLAUDE.md / AGENTS.md |
 | `task-mgr enhance agents` | Write or update the marker-fenced workflow block in target files |
