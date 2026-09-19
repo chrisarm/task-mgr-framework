@@ -92,6 +92,10 @@ pub struct AddTaskInput {
     pub human_review_timeout: Option<u32>,
     #[serde(default)]
     pub claims_shared_infra: Option<bool>,
+    /// CLARIFY human-review resolution payload (CONTRACT-003). JSON-only —
+    /// copied into `PrdUserStory` so spawned CLARIFY rows do not drop the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_review_outcome: Option<Value>,
 }
 
 impl AddTaskInput {
@@ -146,6 +150,7 @@ impl AddTaskInput {
             requires_human: self.requires_human,
             human_review_timeout: self.human_review_timeout,
             claims_shared_infra: self.claims_shared_infra,
+            human_review_outcome: self.human_review_outcome,
         }
     }
 }
@@ -907,7 +912,37 @@ mod tests {
             requires_human: None,
             human_review_timeout: None,
             claims_shared_infra: None,
+            human_review_outcome: None,
         }
+    }
+
+    #[test]
+    fn test_add_task_input_copies_human_review_outcome_into_story() {
+        let json = r#"{
+            "id": "CLARIFY-001",
+            "title": "Confirm floor",
+            "requiresHuman": true,
+            "humanReviewOutcome": {
+                "resolvedAt": "2026-09-18",
+                "resolvedBy": "operator",
+                "confirmedValues": {"floor": 2},
+                "deltasFromProposed": [],
+                "additionalRequirements": []
+            }
+        }"#;
+        let input: AddTaskInput = serde_json::from_str(json).expect("deserialize AddTaskInput");
+        assert!(
+            input.human_review_outcome.is_some(),
+            "AddTaskInput must keep humanReviewOutcome"
+        );
+        let story = input.into_prd_user_story(1);
+        let value = serde_json::to_value(&story).expect("serialize story");
+        assert!(
+            value.get("humanReviewOutcome").is_some(),
+            "into_prd_user_story must copy humanReviewOutcome so spawned CLARIFY rows keep it"
+        );
+        assert_eq!(value["humanReviewOutcome"]["resolvedBy"], "operator");
+        assert_eq!(value["humanReviewOutcome"]["confirmedValues"]["floor"], 2);
     }
 
     #[test]

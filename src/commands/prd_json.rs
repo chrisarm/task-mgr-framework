@@ -269,6 +269,7 @@ mod tests {
             requires_human: None,
             human_review_timeout: None,
             claims_shared_infra: None,
+            human_review_outcome: None,
         }
     }
 
