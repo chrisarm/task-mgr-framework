@@ -8,7 +8,7 @@ Agents cannot change task fields without hand-editing `tasks/*.json` or going th
 
 Goal: agents can patch whitelist fields (including `humanReviewOutcome`) without editing JSON and without touching `tasks.status`.
 
-**This list ships PR-2 only.** PR-1 (looping / assumed at merge) already shipped the remapper, `commands/context.rs`, `commands/prd_json.rs`, and add/current `--from-json`. PR-3 is export scoping + remaining docs. Do not implement those.
+**This list ships PR-2 only.** PR-1 **is this tree** (`120c5a2` / squash `3fc38b4` / GitHub #43): remapper, `commands/context.rs`, `commands/prd_json.rs`, and add/current `--from-json` already exist here. Do **not** look for a looping PR-1 worktree. PR-3 is export scoping + remaining docs. Do not implement those.
 
 ---
 
@@ -54,7 +54,25 @@ Pins (do not rewrite; **1–21 verbatim from the ledger** — same 21 as PR-1. P
 20. Do not ship the multi-prefix refuse before clap has `--from-json` (docs already tell agents to pass it). PR-1 ships both together.
 21. Out of scope: claim-scoped short `<task-status>` ids; a generic `set-status` command; `add --from-json` creating/registering a new PRD; rewriting historical `tasks/*-prompt.md`; changing DB anchoring (main checkout `.task-mgr` from a worktree stays); MCP task wrappers; putting `priority` on the update whitelist.
 
-Architect fold (encode on the matching FEAT, not a new phase): JSON-only overlay cannot `Ok` skip; merge skips overlay `id` and writes `dependsOn` unprefixed; type/null table fail-closed bound to `PrdUserStory` field types; `dependsOn` DELETE is `rel_type = 'dependsOn'` only; pin order matches add (directory `is_file()` **before** parse); regenerate managed `CLAUDE.md` via `task-mgr enhance agents`; flip `context.rs` add-only refuse comments to **write-only**.
+Architect fold (encode on the matching FEAT, not a new phase): JSON-only overlay cannot `Ok` skip; merge skips overlay `id` and writes `dependsOn` unprefixed; type/null table fail-closed bound to `PrdUserStory` field types — split `claimsSharedInfra` (bool|null), `humanReviewTimeout` (u32|null), `reviewScope` (JSON value|null) from string scalars; `dependsOn` DELETE is `rel_type = 'dependsOn'` only; pin order matches add (directory `is_file()` **before** parse via extracted `preflight_from_json_path(path, command)`); write-path is `default_prd_roots` → `resolve_context_with_roots` (not bare `resolve_context`); `ctx is None` → `sole_task_list_path` then `choose_cli_write_path` when roots known; leftover `"add"` includes **preflight** as well as `atomic_write`; mixed overlay + empty write path is pin 11; regenerate managed `CLAUDE.md` via `task-mgr enhance agents`; flip `context.rs` add-only refuse comments **and** `sole_task_list_path` rustdoc to **write-only**; US-007 follows `live_worktree_file_exists_writes_worktree_main_unchanged` (keep `add_from_worktree_root_lands_in_main_db` green — DB anchoring only); US-008 clones `.claude/skills/verify-task-mgr/features/add-and-current-from-json.md` (file **is on HEAD**).
+
+---
+
+## Write-path / preflight law (PR-1 is this tree — read every iteration)
+
+Grep **symbols**. Do not freeze `file:NNN`.
+
+- **`add(..., from_json)` exists.** `preflight_from_json_path` is **private in `add.rs` and hardcodes `"add"`** — extract `preflight_from_json_path(path, command: &str)` **next to** `refuse_unpinned_write` in `context.rs`. Add and update both call it. Update must **not** import `add`. Directory/missing errors on the update path must say `"update"`.
+- **Write-path callers** (`add` today, `update` in this PR): `default_prd_roots(db_dir)` → `resolve_context_with_roots(conn, from_json, "update", Some(&source_root), Some(&worktree_root))`. Do **not** document or call bare `resolve_context` as the write-path (TempDir / `--dir` relative `prd_files` remap onto the developer checkout).
+- **`ctx is None`:** `sole_task_list_path` then **`choose_cli_write_path` when roots are known**, else `cli_write_path`. `cli_write_path` is the live-git probe; `choose_cli_write_path` is the testable one.
+- **`default_prd_roots` is still private in `add.rs`** — ACCEPTED residual: copy the same `InitOpts::resolve_roots` fallback into `update.rs` **or** extract next to context helpers; do **not** `use commands::add`.
+- **`atomic_write` leftover `"add"`** must be parameterized. **`strip_prefix_in_id_array` is private** — promote to `pub(crate)` if needed; do not duplicate.
+- **JSON-only overlay** + missing path / patch `Err` → `invalid_state`. **Mixed overlay** + empty path → pin 11 skip/warn (DB committed; never `export`; never `invalid_state` rollback).
+- **Pin order matches add:** missing/directory **before** overlay parse; unregistered / ≥2 refuse **after** parse, before the write txn. Do not open a second connection only to beat parse.
+- **Empty `ctx.prefix`:** skip `apply_prefix` **and** `prefix_id`.
+- **`--from-json PATH` always writes that PATH** (never remapped away). `--from-json` never registers.
+- **`refuse_unpinned_write`** stays **outside** `resolve_context` (current stays a probe). Flip rustdoc from add-only to **write-only**.
+- **Do not implement PR-3.**
 
 ---
 
@@ -87,7 +105,9 @@ Non-negotiables: tests drive implementation; satisfy every `qualityDimensions` e
 - JSON-only overlay (`id` + `humanReviewOutcome` only, including `null` remove) returning `Ok` with a skip note when the file cannot be patched
 - A `tasks.human_review_outcome` column or any new migration
 - Copying overlay `id` onto the JSON story, or writing prefixed `dependsOn` ids (must use `strip_prefix_in_id_array`)
-- `invalid_state` command-name leftover `"add"` on the update / `patch_user_story` / `atomic_write` path
+- `invalid_state` command-name leftover `"add"` on the update / `patch_user_story` / `atomic_write` / `preflight_from_json_path` path (HEAD helper is private in add.rs and hardcodes `"add"` — extract with `command: &str`)
+- `update` importing `commands::add` (copy `InitOpts::resolve_roots` / `default_prd_roots` fallback, or extract next to context helpers)
+- Documenting or calling bare `resolve_context` as the write-path resolver. Write-path is `default_prd_roots(db_dir)` → `resolve_context_with_roots(..., "update", Some(&source_root), Some(&worktree_root))`; `ctx is None` → `sole_task_list_path` then `choose_cli_write_path` when roots known, else `cli_write_path`
 - Putting ≥2 refuse inside `resolve_context` (breaks `current` probe)
 - `if ctx.is_none() { refuse }` (breaks `--no-prefix` / 0-prefix)
 - `apply_prefix("")` or `prefix_id("", id)` on empty prefix (lookup id `-FEAT-001`)
@@ -98,12 +118,14 @@ Non-negotiables: tests drive implementation; satisfy every `qualityDimensions` e
 - JSON-sync failure copy (mixed overlay) naming `task-mgr export`
 - `prd_json` importing `add` or `update`; `context` importing `prd_json` write helpers
 - Hand-editing inside `TASK_MGR:BEGIN/END` instead of `task-mgr enhance agents` after the template rewrite
-- Leaving `context.rs` rustdoc saying ≥2 refuse is add-only
+- Leaving `context.rs` rustdoc saying ≥2 refuse is add-only, or leaving `sole_task_list_path` rustdoc as add-only
 - Putting `priority` on the update whitelist; a `set-status` command; claim-scoped short `<task-status>` ids; MCP wrappers; changing DB anchoring
 - Rewriting historical `tasks/*-prompt.md`; changing `init::import::update_task` SQL
 - Positional `task-mgr update <id> --title/--notes` flag-per-field CLI
 - Schema-validating inner `humanReviewOutcome` keys (opaque `Value`)
 - Two `--no-prefix` inits as ≥2-prefix sandbox proof (that is 0 prefixes)
+- Treating `--no-prefix` as the JSON-only `invalid_state` (no `task_list`) case — `--no-prefix` with one `task_list` must succeed; JSON-only refuse is missing/empty write path
+- Claiming in-tree `CLAUDE.md` from verify-task-mgr sandbox `--dir` artifacts (that proof is checkout after FEAT-006)
 - Driving verify-task-mgr on a task before the feature file exists; claiming worktree live-path via that harness; driving `loop run` / `batch run`
 - Inventing a second verification harness; treating compile/unit tests as proof for clap/overlay-reject/CLARIFY
 - Manual edits to `tasks/*.json` for status (use task-mgr CLI / task-status tags)
@@ -129,7 +151,7 @@ These apply to **every** implementation task in this PRD — the task-level `acc
 - No `tasks.human_review_outcome` column and no new migration
 - Existing `tests/worktree_db_resolution.rs` add DB-anchoring tests stay green
 - Clap parse tests live in `src/cli/tests.rs` and are run with `cargo test -p task-mgr cli::` (not `cargo test --test cli_tests`)
-- Later FEATs grep symbols (`refuse_unpinned_write`, `preflight_from_json_path`, `sole_task_list_path`, `cli_write_path`, `strip_prefix_in_id_array`, `resolve_context`, `into_prd_user_story`, `atomic_write`) — do not freeze `add.rs:NNN` line numbers from authoring
+- Later FEATs grep symbols (`refuse_unpinned_write`, `preflight_from_json_path`, `sole_task_list_path`, `choose_cli_write_path`, `cli_write_path`, `default_prd_roots`, `strip_prefix_in_id_array`, `resolve_context_with_roots`, `into_prd_user_story`, `atomic_write`) — do not freeze `file:NNN` line numbers from authoring
 - User-facing update/overlay-reject/CLARIFY proof is FEAT-008 + REVIEW-001 via `.claude/skills/verify-task-mgr/SKILL.md` (compile/unit tests alone are not proof for those stories). FEAT-001–007 keep rust tests only — no skill drive
 
 ---
@@ -138,7 +160,7 @@ These apply to **every** implementation task in this PRD — the task-level `acc
 
 **Never read or edit `tasks/*.json` directly.** PRDs are thousands of lines; loading one wastes a huge amount of context and editing corrupts loop-engine state. Everything the agent needs about this iteration's task is embedded in `## Current Task`; everything PRD-wide that matters for implementation (Priority Philosophy, Prohibited Outcomes, Global Acceptance Criteria, Key Learnings, CLAUDE.md Excerpts, Data Flow Contracts, Project Verification Skills, Key Context) is already embedded in **this prompt file** — that is the authoritative copy. If something here looks inconsistent with the JSON, trust this file and surface the discrepancy.
 
-Do **not** edit `tasks/prd-agent-task-ops-pr2.md`, `tasks/prd-goal-agent-task-ops-ux-ledger.md`, `tasks/prd-agent-task-ops-pr1.md`, or later PR-3 files. Do **not** edit the looping PR-1 worktree.
+Do **not** edit `tasks/prd-agent-task-ops-pr2.md`, `tasks/prd-goal-agent-task-ops-ux-ledger.md`, `tasks/prd-agent-task-ops-pr1.md`, or later PR-3 files. PR-1 is already this tree — do not hunt a worktree or re-ship remapper/add clap.
 
 ### Getting your PRD's task prefix
 
@@ -310,7 +332,7 @@ This repo ships a project-level verification skill. Language-level gates (fmt, t
 - **`verify-task-mgr`** — `.claude/skills/verify-task-mgr/SKILL.md`
   Drive the task-mgr CLI the way an operator would — isolated --dir + HOME sandbox, no PATH binary, no checkout .task-mgr. Use to prove init/import, task lifecycle, learnings, models routing, or status/doctor after a user-facing CLI change.
   Feature map: `.claude/skills/verify-task-mgr/features/README.md`
-  **This PRD maps to:** `update-and-human-review-outcome` (FEAT-008 writes the feature file then drives it; REVIEW-001 re-drives). FEAT-001–007 keep rust tests only — no skill drive. Worktree live-path is **not** this skill (FEAT-007 rust tests). ≥2-prefix refuse in the sandbox requires two `loop init`s **without** `--no-prefix` (distinct `taskPrefix`); do not use two `--no-prefix` copies of `sample_prd`.
+  **This PRD maps to:** `update-and-human-review-outcome` (FEAT-008 **clones** `features/add-and-current-from-json.md` — file **is on HEAD** — then drives it; REVIEW-001 re-drives). FEAT-001–007 keep rust tests only — no skill drive. Worktree live-path is **not** this skill (FEAT-007 rust tests following `live_worktree_file_exists_writes_worktree_main_unchanged` + `test_from_json_relative_prd_files_worktree_registered`; keep `add_from_worktree_root_lands_in_main_db` green — DB anchoring only). ≥2-prefix refuse in the sandbox requires two `loop init`s **without** `--no-prefix` (distinct `taskPrefix`); do not use two `--no-prefix` copies of `sample_prd`. `--no-prefix` update **succeeds** when exactly one `task_list` is registered — it is **not** the JSON-only `invalid_state` case. JSON-only refuse is missing/empty write path (registered tasks, no usable `task_list` file). In-tree `CLAUDE.md` fenced-block proof is the **checkout** file after FEAT-006 `task-mgr enhance agents` — sandbox `--dir` artifacts cannot prove it. Keep clone traps: absolute sandbox paths; strip `taskPrefix` before `--no-prefix`; helper unsets `TASK_MGR_ACTIVE_PREFIX`.
 
 **Per-iteration:** if this task is FEAT-008, REVIEW-001, or a FIX / WIRE-FIX spawned from them, Read that SKILL.md (and `features/update-and-human-review-outcome.md` if listed) and drive that recipe after the scoped language gate. Capture evidence where the skill says. A green compile/test run is not proof. Do **not** drive the skill on FEAT-001–007. FEAT-008 must **create** the feature file before it drives.
 
@@ -336,7 +358,11 @@ New code must be reachable from production — CODE-REVIEW-1 verifies. Most comm
 - FEAT-003 `pub mod update` missing so `update.rs` is an orphan file; or FEAT-003 landing SQL/JSON writer that belongs in FEAT-004
 - Overlay `difficulty`/`estimatedEffort` copied as-is so both keys remain on the JSON story (must write canonical `estimatedEffort` and remove leftover `difficulty`; DB `SET difficulty` is FEAT-004)
 - `refuse_unpinned_write` extracted but update skips the call
+- `preflight_from_json_path` still private in `add.rs` hardcoding `"add"` — update missing/directory errors say `"add"`
+- Bare `resolve_context` used as the write-path (no `default_prd_roots` / `resolve_context_with_roots` / `choose_cli_write_path`)
+- `update.rs` `use crate::commands::add` instead of copying `InitOpts::resolve_roots` fallback
 - Enhance template rewritten but in-tree `CLAUDE.md` not regenerated
+- `sole_task_list_path` rustdoc still says add-only so update skips the helper
 
 ---
 
@@ -491,6 +517,7 @@ These are pre-distilled learnings relevant to this PRD. Treat them as authoritat
 - **[5597]** Empty/NULL prefix must skip **both** `apply_prefix` and `prefix_id` (else `-FEAT-001`).
 - **[5601]** Resolve PRD JSON path once onto `ctx`; never re-locate after commit.
 - **[5602]** / **[5596]** `--from-json` is a pin; keep the canonical PATH; never remap it away; never register.
+- **[5581]** `resolve_context` pin: flag→env→single prefix→`Ok(None)` for 0 **and** 2+; ≥2 refuse is write-only at the caller, not inside the resolver.
 - **[4237]** / **[4441]** / **[3240]** Worktree cwd: write the live copy when it exists; DB stays main `.task-mgr`.
 - **[3126]** Pre-flight validation before opening a write transaction.
 - **[1252]** PRD JSON key is `userStories`, not `tasks`.
@@ -584,21 +611,21 @@ pub human_review_outcome: Option<Value>
 | --- | --- | --- | --- |
 | `title` | `title: String` | non-empty string | null, empty, non-string |
 | `description`/`notes`/`model`/`escalationNote`/`severity`/`sourceReview`/`estimatedEffort` | `Option<String>` (`difficulty` for effort) | string or `null` (clears) | wrong type |
-| `humanReviewTimeout` | `human_review_timeout: Option<u32>` | integer or `null` (clears) | wrong type |
-| `claimsSharedInfra` | `claims_shared_infra: Option<bool>` | bool or `null` (clears) | wrong type |
-| `reviewScope` | `review_scope: Option<Value>` | any JSON or `null` (clears) | — |
+| `humanReviewTimeout` | `human_review_timeout: Option<u32>` | unsigned integer or `null` (clears) | negative, float, string, bool, array, object |
+| `claimsSharedInfra` | `claims_shared_infra: Option<bool>` | bool or `null` (clears) | string (`"true"`), number, array, object |
+| `reviewScope` | `review_scope: Option<Value>` | JSON value or `null` (clears); do not `as_str()` | — |
 | `dependsOn`/`touchesFiles`/`acceptanceCriteria`/`requiredTests` | `Vec<String>` | array of strings (`[]` clears) | `null`, non-array, non-string element |
 | `requiresHuman` | `requires_human: Option<bool>` | JSON bool | `null`, non-bool |
 | `maxRetries` | `max_retries: Option<i32>` | integer | `null` (column NOT NULL; do not default to 3), non-integer |
 | `humanReviewOutcome` | `human_review_outcome: Option<Value>` | object or `null` (null removes JSON key) | array, string, number, bool |
 
-**`ResolvedContext.prd_json_path`** — PR-1 write path. Mixed: after DB commit, `patch_user_story(&ctx.prd_json_path, …)` only. JSON-only: same path, but `Err` if empty/`patch` fails. `ctx is None` → `sole_task_list_path` then `cli_write_path` — no second `locate_prd_json`.
+**`ResolvedContext.prd_json_path`** — PR-1 write path from `resolve_context_with_roots` + `db_dir` roots (not bare `resolve_context`). Mixed: after DB commit, `patch_user_story(&ctx.prd_json_path, …)` only. JSON-only: same path, but `Err` if empty/`patch` fails. Mixed + empty path: pin 11 skip/warn. `ctx is None` → `sole_task_list_path` then **`choose_cli_write_path` when roots known**, else `cli_write_path` — no second `locate_prd_json`.
 
 **Tmp name** — `.{basename}.{pid}-{n}-{nanos}.tmp`. `prd_json::unique_tmp_path`; same-dir rename.
 
-**`invalid_state` command** — `&str` parameter. `"update"` on this command's path; `atomic_write(target, content, command)`.
+**`invalid_state` command** — `&str` parameter. `"update"` on this command's path; `atomic_write(target, content, command)`; `preflight_from_json_path(path, command)`.
 
-**HEAD extraction targets (do not cite memory; grep symbols):** `src/commands/init/import.rs` `update_task` / `delete_task_relationships` / `delete_task_files` / `insert_relationship`; `src/commands/init/parse.rs` `PrdUserStory`; `src/commands/add.rs` `AddTaskInput` / `into_prd_user_story`; PR-1 `src/commands/prd_json.rs` `unique_tmp_path` / `append_user_story` / `atomic_write` / `strip_prefix_in_id_array`; PR-1 `src/commands/context.rs` `resolve_context` / `sole_task_list_path` / `cli_write_path` / `preflight_from_json_path`; `src/cli/error_recovery.rs` `WRONG_SUBCOMMAND_HINTS`; `src/cli/commands.rs` `Commands::Add` (PR-1 adds `from_json` — Update is new). Main HEAD today has no `update.rs`.
+**HEAD extraction targets (do not cite memory; grep symbols — PR-1 is this tree):** `src/commands/init/import.rs` `update_task` / `delete_task_relationships` / `delete_task_files` / `insert_relationship`; `src/commands/init/parse.rs` `PrdUserStory`; `src/commands/add.rs` `AddTaskInput` / `into_prd_user_story` / **private** `preflight_from_json_path` (hardcodes `"add"`) / **private** `default_prd_roots` / inlined ≥2 refuse; `src/commands/prd_json.rs` `unique_tmp_path` / `append_user_story` / **private** `atomic_write` (hardcodes `"add"`) / **private** `strip_prefix_in_id_array`; `src/commands/context.rs` `resolve_context` **and** `resolve_context_with_roots` / `sole_task_list_path` / `choose_cli_write_path` / `cli_write_path` (`refuse_unpinned_write` and `preflight_from_json_path` are **absent** — extract them here); `src/cli/error_recovery.rs` `WRONG_SUBCOMMAND_HINTS`; `src/cli/commands.rs` `Commands::Add` `--from-json` (pin help) — **no** `Commands::Update`; `RunAction::Update` is run-session only. `src/commands/update.rs` is **absent**. `.claude/skills/verify-task-mgr/features/add-and-current-from-json.md` **is on HEAD**.
 
 ---
 
@@ -610,16 +637,23 @@ pub human_review_outcome: Option<Value>
 - FEAT-003: `pub mod update` in `commands/mod.rs`; validator only — no SQL/JSON writer.
 - Grep `prd_json.rs` for `use crate::commands::add` / `use crate::commands::update` → zero hits.
 - Grep `atomic_write` — takes `command: &str`; update path errors say `"update"`.
+- Grep `preflight_from_json_path` — lives in `context.rs` with `command: &str`; update missing/directory errors say `"update"` (not leftover `"add"` from HEAD `add.rs`).
+- Grep `update.rs` for `use crate::commands::add` → zero hits.
+- Write-path: `default_prd_roots` → `resolve_context_with_roots`; `ctx is None` uses `choose_cli_write_path` when roots known. Do not call bare `resolve_context` as the write-path.
 - Grep `apply_prefix` / `prefix_id` in `update.rs`: not called when prefix is empty.
-- Grep `context.rs` refuse comments: **write-only**, not add-only.
+- Grep `context.rs` refuse comments **and** `sole_task_list_path` rustdoc: **write-only**, not add-only.
 - Grep `WRONG_SUBCOMMAND_HINTS`: no `update` row; `edit`/`change` name `update --stdin`; `set-status` unchanged.
-- After FEAT-006: `task-mgr enhance agents` has been run; fenced `CLAUDE.md` contains `update --stdin` and does not tell agents to `Edit` JSON for `humanReviewOutcome`.
+- After FEAT-006: `task-mgr enhance agents` has been run; checkout fenced `CLAUDE.md` contains `update --stdin` and does not tell agents to `Edit` JSON for `humanReviewOutcome`. FEAT-008 sandbox `--dir` artifacts do **not** prove that file.
 - `update --help` contains **pin**, not import, for `--from-json`.
 - `PRAGMA table_info(tasks)` / migrations: no `human_review_outcome`.
 - Directory `--from-json`: `is_file()` / `preflight_from_json_path` **before** overlay parse.
 - Clap parse tests: `cargo test -p task-mgr cli::` (not `cargo test --test cli_tests` for `src/cli/tests.rs`).
-- Later tasks grep symbols, not frozen `add.rs:NNN` line numbers.
+- Later tasks grep symbols, not frozen `file:NNN` line numbers.
 - ≥2-prefix sandbox: two prefixed `loop init`s, not `--no-prefix` twice.
+- `--no-prefix` update **succeeds** (one `task_list`). JSON-only `invalid_state` is missing/empty write path — do not use `--no-prefix` as that case.
+- FEAT-008 clones `features/add-and-current-from-json.md` (on HEAD); do not invent a recipe; do not list the clone source in `touchesFiles`.
+- FEAT-007 follows `live_worktree_file_exists_writes_worktree_main_unchanged` + relative-`prd_files` pin; keep `add_from_worktree_root_lands_in_main_db` green (DB anchoring only).
+- `task-mgr update --help` vs `task-mgr run update --help` stay distinct clap paths.
 
 ---
 
