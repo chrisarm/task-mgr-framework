@@ -67,8 +67,6 @@ pub(crate) fn strip_prefix_in_id_array(
 
 /// Overlay keys that `patch_user_story` may merge onto an existing story.
 /// Lookup-only `id` is intentionally absent — merge skips it.
-/// Production caller lands in FEAT-004 (`update`); keep until then.
-#[allow(dead_code)]
 const PATCH_WHITELIST: &[&str] = &[
     "title",
     "description",
@@ -256,9 +254,6 @@ pub(crate) fn append_user_story(
 ///   caller/validator reject — not handled here).
 /// - `dependsOn` is rewritten unprefixed via [`strip_prefix_in_id_array`].
 /// - Extra keys already on the story survive.
-///
-/// Production caller lands in FEAT-004 (`update`); keep until then.
-#[allow(dead_code)]
 pub(crate) fn patch_user_story(
     prd_path: &Path,
     story_id: &str,
