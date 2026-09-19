@@ -25,32 +25,9 @@ use crate::commands::context::{
 };
 use crate::commands::init::import::{delete_task_files, insert_relationship, insert_task_file};
 use crate::commands::init::prefix_id;
-use crate::commands::prd_json::patch_user_story;
+use crate::commands::prd_json::{OVERLAY_WHITELIST, patch_user_story};
 use crate::output::ui;
 use crate::{TaskMgrError, TaskMgrResult};
-
-/// JSON camelCase whitelist + lookup `id` (CONTRACT-002).
-const OVERLAY_WHITELIST: &[&str] = &[
-    "title",
-    "description",
-    "notes",
-    "acceptanceCriteria",
-    "touchesFiles",
-    "dependsOn",
-    "estimatedEffort",
-    "difficulty",
-    "model",
-    "escalationNote",
-    "requiredTests",
-    "maxRetries",
-    "requiresHuman",
-    "humanReviewTimeout",
-    "claimsSharedInfra",
-    "reviewScope",
-    "severity",
-    "sourceReview",
-    "humanReviewOutcome",
-];
 
 /// Present overlay value that may be JSON `null` (clear) or a typed value.
 ///
@@ -954,6 +931,52 @@ mod tests {
             msg.contains(needle),
             "expected message to contain {needle:?}, got: {msg}"
         );
+    }
+
+    /// Validator unknown-key / `overlay_keys_updated` must track the merge SSoT
+    /// in `prd_json::OVERLAY_WHITELIST` (learning #5747 / #5750). A second
+    /// literal array in `update.rs` would reintroduce silent drift.
+    #[test]
+    fn overlay_whitelist_validator_matches_merge_ssot() {
+        // CONTRACT-002 membership freeze (19 keys). `id` is lookup-only and
+        // intentionally absent from the merge list.
+        const EXPECTED: &[&str] = &[
+            "title",
+            "description",
+            "notes",
+            "acceptanceCriteria",
+            "touchesFiles",
+            "dependsOn",
+            "estimatedEffort",
+            "difficulty",
+            "model",
+            "escalationNote",
+            "requiredTests",
+            "maxRetries",
+            "requiresHuman",
+            "humanReviewTimeout",
+            "claimsSharedInfra",
+            "reviewScope",
+            "severity",
+            "sourceReview",
+            "humanReviewOutcome",
+        ];
+        let merge = crate::commands::prd_json::OVERLAY_WHITELIST;
+        // Same import used by validate_update_overlay / overlay_keys_updated.
+        let validator = OVERLAY_WHITELIST;
+        assert_eq!(
+            validator, merge,
+            "validator-visible whitelist drifted from prd_json merge SSoT"
+        );
+        assert_eq!(
+            merge, EXPECTED,
+            "whitelist membership drifted from CONTRACT-002 (review before changing)"
+        );
+        assert!(
+            !merge.contains(&"id"),
+            "id must remain lookup-only / skipped on merge"
+        );
+        assert_eq!(merge.len(), 19);
     }
 
     #[test]

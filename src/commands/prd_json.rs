@@ -65,9 +65,12 @@ pub(crate) fn strip_prefix_in_id_array(
     }
 }
 
-/// Overlay keys that `patch_user_story` may merge onto an existing story.
-/// Lookup-only `id` is intentionally absent — merge skips it.
-const PATCH_WHITELIST: &[&str] = &[
+/// Overlay keys `patch_user_story` may merge and `update` accepts (CONTRACT-002).
+///
+/// Single SSoT for merge + validator unknown-key / `overlay_keys_updated`
+/// (learning #5750). Lookup-only `id` is intentionally absent — merge skips
+/// it; the validator requires `id` separately.
+pub(crate) const OVERLAY_WHITELIST: &[&str] = &[
     "title",
     "description",
     "notes",
@@ -320,7 +323,7 @@ pub(crate) fn patch_user_story(
             .or_else(|| overlay_obj.get("difficulty"))
             .cloned();
 
-        for key in PATCH_WHITELIST {
+        for key in OVERLAY_WHITELIST {
             if *key == "estimatedEffort" || *key == "difficulty" {
                 continue;
             }
