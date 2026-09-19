@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-09-18
+
 ### Changed
 - **Breaking:** `task-mgr export` defaults to the **active PRD only** (scoped
   dump). Pass `--all` to restore the previous dump-all behavior (all unarchived
@@ -14,15 +16,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   requires `--force`. Export remains a **lossy dump** (no `taskPrefix`, status
   collapsed to `passes`, extra keys stripped) — `--force` is not a merge.
   Prefer an unregistered dump path, or pin scope with `--from-json`.
+- Overwrite-guard identity is dest-bound: an absolute `--to-json` at a
+  linked worktree live JSON requires `--force` even when cwd is main.
 
 ### Notes
 - Residual (not a code story): after merge, copy spawn-fixup / `add` /
   `update` / export recipes into `~/.claude/docs/task-mgr-best-practices.md`.
   That file is **not** in this repo — do not vendor a copy here.
-
-## [0.3.3] - 2026-09-18
-
-Version bump on `feat/agent-task-ops-pr3`.
 
 ## [0.3.2] - 2026-09-08
 

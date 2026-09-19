@@ -123,6 +123,11 @@ Hard rules (do not re-derive):
 
 - Guard uses `find_registered_by_path_identity` only — **not** match (a).
   Stray same-`taskPrefix` copies are not registered.
+- Dest identity roots come from [`prd_roots_for_dest_identity`](context.rs)
+  (`worktree_root` from dest_canon when dest is in a linked worktree). Do
+  **not** pass cwd-only [`default_prd_roots`] into the dest probe — from
+  main cwd an absolute `--to-json` at a worktree live JSON would miss
+  pin-19 (c) and overwrite without `--force`.
 - Same-PRD dest and `--all` onto a registered path still need `--force`.
 - Directory dest → error before dump. Dest exists + identity miss → lock
   then write without `--force`.
