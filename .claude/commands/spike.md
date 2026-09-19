@@ -94,7 +94,7 @@ Now that you have data from the thin slice:
 
 Only when the spike concludes that a foundational abstraction will be used by 2+ other tasks:
 
-1. Create a `CONTRACT-xxx` task via `task-mgr add --stdin` (or give the user the exact JSON to paste).
+1. Create a `CONTRACT-xxx` task via `task-mgr add --stdin --from-json tasks/<prd>.json` (or give the user the exact JSON to paste). Pin with `--from-json` when a PRD is already registered.
 2. The task must contain:
    - Precise interface / data shape / error model / ownership.
    - All discovered edge cases + invariants.
@@ -164,7 +164,7 @@ This is what `/compound` will later read to answer "Did we run the experiment we
 **Recommended default hand-off** (most common case):
 
 1. If you emitted a `CONTRACT-xxx`:
-   - Run the exact `task-mgr add --stdin` command (or paste the JSON) so the contract task exists in the DB.
+   - Run the exact `task-mgr add --stdin --from-json tasks/<prd>.json` command (or paste the JSON) so the contract task exists in the DB.
    - Immediately run the task generator for the PRD (`/plan-tasks` preferred for lean work, or light `/prd-tasks`).
    - The generator will automatically see the early CONTRACT task and wire `dependsOn` edges correctly.
 

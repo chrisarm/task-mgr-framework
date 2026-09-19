@@ -12,6 +12,8 @@ Convert a markdown PRD into JSON task list and prompt file for task-mgr loop exe
 ## Instructions
 
 > **Canonical reference:** `~/.claude/docs/task-mgr-best-practices.md` — planning flow, CLI, mid-loop JSON sync, spawn-fixup targeting, model routing (`task-mgr models route`), and gotchas. This skill adds PRD→JSON conversion steps on top of that base.
+>
+> **CLI (embed in the generated prompt):** `--from-json` pins an already-registered PRD (never registers). Spawn: `task-mgr add --stdin --from-json tasks/<prd>.json --depended-on-by <milestone>`. Patch (including `humanReviewOutcome`): `task-mgr update --stdin --from-json tasks/<prd>.json`. Bulk sync: `task-mgr loop init <prd>.json --append --update-existing` — never bare `init --from-json`. Export default is the active PRD; registered dest needs `--force` (lossy dump). Never hand-edit JSON.
 
 You are converting a human-readable PRD into machine-executable task artifacts for the Claude Loop autonomous agent system.
 
@@ -574,7 +576,7 @@ Use `$PREFIX` in every CLI call below so you stay scoped to this PRD. If a later
 | Inspect this iteration's task          | `task-mgr show <TASK-ID>` using the task ID from `## Current Task`                                                                                                                 |
 | List remaining tasks (debug only)      | `task-mgr list --prefix $PREFIX --status todo`                                                                                                                                    |
 | Recall learnings relevant to a task    | `task-mgr recall --for-task $PREFIX-TASK-ID` (also: `--query <text>`, `--tag <tag>`)                                                                                              |
-| Add a follow-up task (review spawns)   | `echo '{...}' \| task-mgr add --stdin --depended-on-by MILESTONE-N` — priority auto-computed; DB + PRD JSON updated atomically                                                   |
+| Add a follow-up task (review spawns)   | `echo '{...}' \| task-mgr add --stdin --from-json tasks/{{FEATURE_NAME}}.json --depended-on-by MILESTONE-N` — pin + atomic DB+JSON sync                                                   |
 | Mark status                            | Emit `<task-status>$PREFIX-TASK-ID:done</task-status>` (statuses: `done`, `failed`, `skipped`, `irrelevant`, `blocked`) — loop engine routes through `task-mgr` and syncs the JSON |
 
 If you genuinely need a top-level PRD field that's not surfaced per-task (rare — e.g., cross-PRD `requires[]`), pull it with `jq`, never a full Read:
@@ -794,7 +796,7 @@ echo '{
   "acceptanceCriteria": ["Issue resolved", "No new warnings"],
   "priority": 14,
   "touchesFiles": ["affected/file.rs"]
-}' | task-mgr add --stdin --depended-on-by MILESTONE-1
+}' | task-mgr add --stdin --from-json tasks/{{FEATURE_NAME}}.json --depended-on-by MILESTONE-1
 ```
 
 `--depended-on-by` wires the new task into the milestone's `dependsOn` AND syncs the PRD JSON atomically — don't edit the JSON yourself. When a **Project Verification Skills** entry covers the issue, set `verifyCommand` to that skill's drive (the helper or recipe the SKILL.md names), not a unit-test invocation. Commit with `chore: <REVIEW-ID> - Add <FIX|REFACTOR> tasks`, then emit `<task-status><REVIEW-ID>:done</task-status>`. If no issues found, emit the status with a one-line "No issues found" in the progress file.
@@ -1068,11 +1070,11 @@ All review tasks share this structure. Vary per the table below.
   "description": "<what the review analyzes>",
   "acceptanceCriteria": [
     "<type-specific criteria>",
-    "Any issues found have corresponding <FIX-PREFIX>-xxx tasks added via task-mgr add --stdin"
+    "Any issues found have corresponding <FIX-PREFIX>-xxx tasks added via task-mgr add --stdin --from-json"
   ],
   "priority": <P>,
   "estimatedEffort": "high",
-  "notes": "For each issue: `echo '{...}' | task-mgr add --stdin --depended-on-by <MILESTONE>` — atomic DB+JSON sync, no manual edit. If no issues, emit `<task-status><REVIEW-ID>:done</task-status>` with a one-line progress note.",
+  "notes": "For each issue: `echo '{...}' | task-mgr add --stdin --from-json tasks/<prd>.json --depended-on-by <MILESTONE>` — pin + atomic DB+JSON sync, no manual edit. If no issues, emit `<task-status><REVIEW-ID>:done</task-status>` with a one-line progress note.",
   "dependsOn": [<see table>]
 }
 ```

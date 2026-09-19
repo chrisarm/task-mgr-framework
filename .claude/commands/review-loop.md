@@ -18,7 +18,7 @@ Backward-looking review of code produced by a completed autonomous loop run. Che
 /review-loop tasks/prd-<feature>.md
 ```
 
-> **Canonical reference:** `~/.claude/docs/task-mgr-best-practices.md` — worktree discipline, spawn-fixup targeting (`task-mgr add --stdin`), and post-loop `/compound` flow.
+> **Canonical reference:** `~/.claude/docs/task-mgr-best-practices.md` — worktree discipline, spawn-fixup targeting (`task-mgr add --stdin --from-json tasks/<prd>.json`), and post-loop `/compound` flow.
 
 ## What This Does
 
@@ -177,7 +177,7 @@ Decision tree based on findings:
   If "compound", invoke as above. If "wait", stop and print: "Address the high findings, re-run `/review-loop`, to lead up to `/compound`."
 
 - **Any critical findings** → **do NOT invoke `/compound`**. Print:
-  > Critical findings above block merge. Address them (typically by spawning `CODE-FIX` tasks via `task-mgr add --stdin --depended-on-by MILESTONE-FINAL` and re-running the loop), then re-run `/review-loop`. `/compound` best run after the review is clean — capturing learnings from unresolved critical issues risks baking wrong wisdom into CLAUDE.md.
+  > Critical findings above block merge. Address them (typically by spawning `CODE-FIX` tasks via `task-mgr add --stdin --from-json tasks/<prd>.json --depended-on-by MILESTONE-FINAL` and re-running the loop), then re-run `/review-loop`. `/compound` best run after the review is clean — capturing learnings from unresolved critical issues risks baking wrong wisdom into CLAUDE.md.
 
 **Rationale for the gate**: `/compound` writes to CLAUDE.md and the learnings DB. Capturing "wisdom" from a broken implementation poisons future PRDs. Clean review first, then compound.
 

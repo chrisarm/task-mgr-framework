@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+- `task-mgr init` stages `~/.claude/docs/task-mgr-best-practices.md` (add/update `--from-json`, `update --stdin`, scoped export). Slash-command skills (`prd-tasks`, `plan-tasks`, `spike`, `review-loop`) pin spawn-fixups with `--from-json`.
+
 ## [0.3.3] - 2026-09-18
 
 ### Changed
