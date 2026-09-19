@@ -21,6 +21,13 @@ Hard rules (do not re-derive):
   `resolve_context_with_roots(..., "update", Some(&source_root), Some(&worktree_root))`.
   Do not import `commands::add`; do not use bare `resolve_context` as the
   write-path resolver. Every `invalid_state` on this path names `"update"`.
+- `preflight_from_json_path(path, command: &str)` and `refuse_unpinned_write`
+  live in `context.rs`. Add and update both call them. Reusing add's old
+  private preflight ships leftover `"add"` on missing/directory pins.
+- Overlay clap is `Commands::Update`. `pub use run::update` is run-session
+  only. Dispatch overlay via `commands::update::update` — never the re-export.
+- Merge/unknown-key whitelist SSoT is `prd_json::OVERLAY_WHITELIST` (one
+  `pub(crate)` const). Do not keep a second literal array in `update.rs`.
 
 Full copy-pasteable signatures, partial-UPDATE column list, and the
 JSON-only vs mixed failure split live under `## CONTRACT-001` in
@@ -65,6 +72,9 @@ Hard rules (do not re-derive):
   during DB SET (success, not a missing bind).
 - JSON-only overlay persist is `patch_user_story` or `invalid_state` —
   never `Ok` skip (split with CONTRACT-001). Mixed overlays stay pin 11.
+- JSON-only `invalid_state` is missing/empty write path — **not**
+  `--no-prefix` (that still has a `task_list`). verify-task-mgr sandboxes
+  are not linked worktrees; live-path stays rust tests.
 
 Full field attrs, add-copy, no-column rule, and persist split live under
 `## CONTRACT-003` in `tasks/progress-a8855e28.txt`.
