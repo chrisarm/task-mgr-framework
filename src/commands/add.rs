@@ -1786,7 +1786,7 @@ mod tests {
         assert!(msg.contains("/tmp/foreign-prd.json"), "{msg}");
     }
 
-    // --- FEAT-006: add-only ≥2-prefix refuse (write policy; resolver stays Ok(None)) ---
+    // --- FEAT-006: write-only ≥2-prefix refuse (add and update; resolver stays Ok(None)) ---
 
     #[test]
     fn test_add_refuses_unpinned_multi_prefix_no_db_row() {
