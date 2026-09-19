@@ -1568,9 +1568,9 @@ fn test_export_module_has_no_task_prefix_is_null() {
 // ---------------------------------------------------------------------------
 
 const ACTIVE_PREFIX_ENV: &str = "TASK_MGR_ACTIVE_PREFIX";
-static ENV_PREFIX_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Clears leaked loop `TASK_MGR_ACTIVE_PREFIX` for resolve_context-sensitive tests.
+/// Uses crate-level `ENV_PREFIX_MUTEX` so export/current/add/context tests serialize together.
 struct EnvIsolation {
     _lock: std::sync::MutexGuard<'static, ()>,
     prior: Option<String>,
@@ -1578,7 +1578,9 @@ struct EnvIsolation {
 
 impl EnvIsolation {
     fn new() -> Self {
-        let lock = ENV_PREFIX_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let lock = crate::ENV_PREFIX_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let prior = std::env::var(ACTIVE_PREFIX_ENV).ok();
         unsafe { std::env::remove_var(ACTIVE_PREFIX_ENV) };
         Self { _lock: lock, prior }
