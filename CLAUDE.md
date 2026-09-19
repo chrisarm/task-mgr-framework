@@ -28,7 +28,7 @@ Module-level CLAUDE.md files (auto-loaded when files in the module are read):
 
 - [`src/lifecycle/CLAUDE.md`](src/lifecycle/CLAUDE.md) — status mutation SSoT, lifecycle verbs (incl. per-id `recover_in_progress` / `reopen_after_merge_fail`), five hard invariants, FR-006 site→verb mapping table
 - [`src/loop_engine/CLAUDE.md`](src/loop_engine/CLAUDE.md) — overflow recovery, auto-review, parallel slots, merge-back conflict resolution, shared iteration pipeline
-- [`src/commands/CLAUDE.md`](src/commands/CLAUDE.md) — PR-2 `task-mgr update` load-merge-write SSoT (CONTRACT-001) + overlay whitelist/reject (CONTRACT-002); full text in `tasks/progress-a8855e28.txt`
+- [`src/commands/CLAUDE.md`](src/commands/CLAUDE.md) — PR-2 `task-mgr update` load-merge-write SSoT (CONTRACT-001) + overlay whitelist/reject (CONTRACT-002) + `humanReviewOutcome` JSON-only (CONTRACT-003); full text in `tasks/progress-a8855e28.txt`
 - [`src/commands/curate/CLAUDE.md`](src/commands/curate/CLAUDE.md) — Ollama embeddings, reranker, dedup dismissals, session cleanup
 - [`src/commands/next/CLAUDE.md`](src/commands/next/CLAUDE.md) — soft-dep guard for milestone scheduling
 - [`src/learnings/CLAUDE.md`](src/learnings/CLAUDE.md) — LearningWriter chokepoint, supersession, recall scoring

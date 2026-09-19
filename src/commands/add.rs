@@ -40,6 +40,11 @@ pub use crate::commands::context::{ResolutionSource, ResolvedContext, resolve_co
 /// minimal inputs work (priority is auto-computed; absent `passes` means
 /// `false` → status `todo`). Anything not supplied here is carried through
 /// as the default when the struct is converted into a full `PrdUserStory`.
+///
+/// **PR-2 CONTRACT-003:** must carry `human_review_outcome: Option<Value>`
+/// (JSON `humanReviewOutcome`) and copy it in `into_prd_user_story` so a
+/// spawned CLARIFY row does not drop the key. JSON-only — no DB column.
+/// Full contract: `## CONTRACT-003` in `tasks/progress-a8855e28.txt`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AddTaskInput {

@@ -48,3 +48,23 @@ Hard rules (do not re-derive):
 
 Full whitelist, validation order, and type/null table live under
 `## CONTRACT-002` in `tasks/progress-a8855e28.txt`.
+
+## PR-2 humanReviewOutcome JSON-only (CONTRACT-003)
+
+`humanReviewOutcome` is a JSON-only CLARIFY payload: `Option<Value>` on
+both `PrdUserStory` and `AddTaskInput` (serde camelCase;
+`default` + `skip_serializing_if = "Option::is_none"`).
+`into_prd_user_story` must copy it so spawned CLARIFY rows do not drop the
+key. Opaque object — do not schema-validate inner keys.
+
+Hard rules (do not re-derive):
+
+- **No** `tasks.human_review_outcome` column, migration, or `models::Task`
+  field (pin 17). `PRAGMA table_info(tasks)` must never list it.
+- `init::import::update_task` SQL stays unchanged — the field rides unused
+  during DB SET (success, not a missing bind).
+- JSON-only overlay persist is `patch_user_story` or `invalid_state` —
+  never `Ok` skip (split with CONTRACT-001). Mixed overlays stay pin 11.
+
+Full field attrs, add-copy, no-column rule, and persist split live under
+`## CONTRACT-003` in `tasks/progress-a8855e28.txt`.

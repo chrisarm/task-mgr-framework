@@ -17,6 +17,12 @@ use serde_json::Value;
 /// in `commands/update` (PR-2 CONTRACT-002); do not validate overlays by
 /// `from_value::<PrdUserStory>`. Full whitelist + type/null table:
 /// `## CONTRACT-002` in `tasks/progress-a8855e28.txt`.
+///
+/// **PR-2 CONTRACT-003:** `human_review_outcome: Option<Value>` (JSON
+/// `humanReviewOutcome`) is JSON-only — no DB column, not on `models::Task`,
+/// opaque (do not schema-validate inner keys). `AddTaskInput` must mirror +
+/// copy via `into_prd_user_story`. Full contract: `## CONTRACT-003` in
+/// `tasks/progress-a8855e28.txt`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PrdUserStory {
