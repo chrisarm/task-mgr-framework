@@ -46,8 +46,8 @@ pub struct CheatsheetResult {
 /// verified by `tests/cheatsheet_drift.rs` against clap's known
 /// subcommand + flag set, so a typo or stale command name here fails CI.
 ///
-/// Maintainers: keep the entry count under 16 to stay inside the budget,
-/// and prefer the `task-mgr <subcommand>` form (in backticks) so the
+/// Maintainers: keep the entry count under 18 to stay inside the ≤30-line
+/// budget, and prefer the `task-mgr <subcommand>` form (in backticks) so the
 /// drift parser can lift it.
 pub const CURATED_RECIPES: &str = "## Common Recipes\n\
 \n\
@@ -55,6 +55,7 @@ pub const CURATED_RECIPES: &str = "## Common Recipes\n\
 - List tasks: `task-mgr list` (filter with `--status` / `--prefix` / `--task-type`)\n\
 - Pick and claim the next eligible task: `task-mgr next --claim`\n\
 - Add a fixup / follow-up task: pipe JSON to `task-mgr add --stdin --from-json tasks/<prd>.json --depended-on-by <id>`\n\
+- Patch a task overlay: pipe JSON to `task-mgr update --stdin --from-json tasks/<prd>.json`\n\
 - Mark status from a loop iteration: emit `<task-status>TASK-ID:done</task-status>` (done / failed / skipped / irrelevant / blocked)\n\
 - Mark status outside the loop: `task-mgr complete <id>` (also: `task-mgr fail`, `task-mgr skip`, `task-mgr unblock`, `task-mgr unskip`, `task-mgr reset`)\n\
 - Record a learning: `task-mgr learn --outcome <success|failure|workaround|pattern> --title \"...\"`\n\
@@ -63,6 +64,7 @@ pub const CURATED_RECIPES: &str = "## Common Recipes\n\
 - Initialize from a PRD JSON: `task-mgr loop init <prd>.json` (mid-loop sync: add `--append --update-existing`)\n\
 - Run the autonomous loop: `task-mgr loop run <prd>.json --yes`\n\
 - Run multiple PRDs: `task-mgr batch init '<glob>'` then `task-mgr batch run '<glob>' --yes`\n\
+- Export DB→JSON: `task-mgr export --to-json <path>` (default = active PRD; dump-all: `task-mgr export --all --to-json <path>`; registered dest: `task-mgr export --from-json tasks/<prd>.json --to-json tasks/<prd>.json --force`)\n\
 - List architectural decisions: `task-mgr decisions list`\n\
 - Ratify a decision: `task-mgr decisions resolve <id> <letter>`\n\
 - Inspect the active PRD context: `task-mgr current`\n\
@@ -195,6 +197,49 @@ mod tests {
             CURATED_RECIPES.contains("--depended-on-by"),
             "CURATED_RECIPES must keep --stdin --depended-on-by on add"
         );
+    }
+
+    #[test]
+    fn curated_recipes_include_update_and_export() {
+        assert!(
+            CURATED_RECIPES.contains("task-mgr update --stdin --from-json"),
+            "CURATED_RECIPES must document update --stdin --from-json"
+        );
+        assert!(
+            CURATED_RECIPES.contains("task-mgr export --to-json"),
+            "CURATED_RECIPES must document export --to-json"
+        );
+        assert!(
+            CURATED_RECIPES.contains("default = active PRD"),
+            "export recipe must state default = active PRD"
+        );
+        assert!(
+            CURATED_RECIPES.contains("--all"),
+            "export recipe must mention --all dump-all"
+        );
+        assert!(
+            CURATED_RECIPES.contains("--force"),
+            "export recipe must mention --force for registered dest"
+        );
+    }
+
+    #[test]
+    fn curated_recipes_pin11_no_json_sync_via_export() {
+        // Pin 11: JSON-sync failure copy names `task-mgr current` + retry
+        // --from-json, never export. Keep recovery phrasing out of recipes.
+        let lower = CURATED_RECIPES.to_lowercase();
+        for bad in [
+            "recover via export",
+            "json sync via export",
+            "json-sync via export",
+            "recover with export",
+            "sync fail",
+        ] {
+            assert!(
+                !lower.contains(bad),
+                "CURATED_RECIPES must not teach JSON-sync recovery via export; found {bad:?}"
+            );
+        }
     }
 
     #[test]
