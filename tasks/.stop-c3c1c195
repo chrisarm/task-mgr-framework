@@ -1,0 +1,1 @@
+operator: stop file so current iteration can finish and the loop can close normally
