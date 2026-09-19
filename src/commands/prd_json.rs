@@ -50,7 +50,7 @@ pub(crate) fn unique_tmp_path(prd_path: &Path) -> PathBuf {
 /// Strip the active prefix from every string element of the `key` array on a
 /// serialized userStory object, rewriting the DB-prefixed relationship ids into
 /// the unprefixed JSON convention. No-op when the key is absent or not an array.
-fn strip_prefix_in_id_array(
+pub(crate) fn strip_prefix_in_id_array(
     obj: &mut serde_json::Map<String, Value>,
     key: &str,
     prefix: Option<&str>,
@@ -64,6 +64,32 @@ fn strip_prefix_in_id_array(
         }
     }
 }
+
+/// Overlay keys that `patch_user_story` may merge onto an existing story.
+/// Lookup-only `id` is intentionally absent — merge skips it.
+/// Production caller lands in FEAT-004 (`update`); keep until then.
+#[allow(dead_code)]
+const PATCH_WHITELIST: &[&str] = &[
+    "title",
+    "description",
+    "notes",
+    "acceptanceCriteria",
+    "touchesFiles",
+    "dependsOn",
+    "estimatedEffort",
+    "difficulty",
+    "model",
+    "escalationNote",
+    "requiredTests",
+    "maxRetries",
+    "requiresHuman",
+    "humanReviewTimeout",
+    "claimsSharedInfra",
+    "reviewScope",
+    "severity",
+    "sourceReview",
+    "humanReviewOutcome",
+];
 
 /// Append one user story to the PRD JSON's `userStories` array, atomically.
 ///
@@ -211,16 +237,148 @@ pub(crate) fn append_user_story(
         pretty
     };
 
-    atomic_write(prd_path, &output)?;
+    atomic_write(prd_path, &output, "add")?;
+    Ok(())
+}
+
+/// Patch one existing `userStories[]` entry by Value-merge (CONTRACT-001).
+///
+/// Locates the story by prefixed or unprefixed `story_id` (same as
+/// [`append_user_story`]), merges whitelist keys from `overlay` onto the
+/// existing Value object (never `from_value::<PrdUserStory>`), and writes via
+/// [`atomic_write`] with `command` forwarded into every `invalid_state`.
+///
+/// Merge rules:
+/// - Overlay `id` is skipped — the JSON story's `id` stays byte-identical.
+/// - `humanReviewOutcome: null` removes the key; a present object replaces.
+/// - Either `difficulty` or `estimatedEffort` writes canonical
+///   `estimatedEffort` and removes leftover `difficulty` (both present is a
+///   caller/validator reject — not handled here).
+/// - `dependsOn` is rewritten unprefixed via [`strip_prefix_in_id_array`].
+/// - Extra keys already on the story survive.
+///
+/// Production caller lands in FEAT-004 (`update`); keep until then.
+#[allow(dead_code)]
+pub(crate) fn patch_user_story(
+    prd_path: &Path,
+    story_id: &str,
+    overlay: &Value,
+    prefix: Option<&str>,
+    command: &str,
+) -> TaskMgrResult<()> {
+    let base_story_id = strip_task_prefix(story_id, prefix);
+    let original = fs::read_to_string(prd_path).map_err(|e| {
+        TaskMgrError::invalid_state(
+            command,
+            "prd file",
+            "readable",
+            format!("{}: {}", prd_path.display(), e),
+        )
+    })?;
+
+    let mut root: Value = serde_json::from_str(&original).map_err(|e| {
+        TaskMgrError::invalid_state(
+            command,
+            "prd json",
+            "valid JSON object",
+            format!("{}: {}", prd_path.display(), e),
+        )
+    })?;
+
+    let root_obj = root.as_object_mut().ok_or_else(|| {
+        TaskMgrError::invalid_state(command, "prd json", "JSON object at root", "not an object")
+    })?;
+
+    let arr = root_obj
+        .get_mut("userStories")
+        .and_then(|v| v.as_array_mut())
+        .ok_or_else(|| {
+            TaskMgrError::invalid_state(
+                command,
+                "userStories",
+                "JSON array",
+                "missing or not an array",
+            )
+        })?;
+
+    let mut matched = false;
+    for entry in arr.iter_mut() {
+        let Some(obj) = entry.as_object_mut() else {
+            continue;
+        };
+        let is_match = obj
+            .get("id")
+            .and_then(|v| v.as_str())
+            .is_some_and(|id| id == story_id || id == base_story_id);
+        if !is_match {
+            continue;
+        }
+        matched = true;
+
+        let overlay_obj = overlay.as_object().ok_or_else(|| {
+            TaskMgrError::invalid_state(command, "overlay", "JSON object", "not an object")
+        })?;
+
+        // Effort alias: either overlay key → canonical estimatedEffort; drop leftover difficulty.
+        let effort_value = overlay_obj
+            .get("estimatedEffort")
+            .or_else(|| overlay_obj.get("difficulty"))
+            .cloned();
+
+        for key in PATCH_WHITELIST {
+            if *key == "estimatedEffort" || *key == "difficulty" {
+                continue;
+            }
+            let Some(value) = overlay_obj.get(*key) else {
+                continue;
+            };
+            if *key == "humanReviewOutcome" && value.is_null() {
+                obj.remove("humanReviewOutcome");
+                continue;
+            }
+            obj.insert((*key).to_string(), value.clone());
+        }
+
+        if let Some(effort) = effort_value {
+            obj.insert("estimatedEffort".to_string(), effort);
+            obj.remove("difficulty");
+        }
+
+        if overlay_obj.contains_key("dependsOn") {
+            strip_prefix_in_id_array(obj, "dependsOn", prefix);
+        }
+        break;
+    }
+
+    if !matched {
+        return Err(TaskMgrError::invalid_state(
+            command,
+            "userStory",
+            format!("story id {story_id} present in {}", prd_path.display()),
+            "not found",
+        ));
+    }
+
+    let pretty = serde_json::to_string_pretty(&root)?;
+    let output = if original.ends_with('\n') {
+        format!("{}\n", pretty)
+    } else {
+        pretty
+    };
+
+    atomic_write(prd_path, &output, command)?;
     Ok(())
 }
 
 /// Write `content` to `target` atomically via [`unique_tmp_path`] + rename.
-fn atomic_write(target: &Path, content: &str) -> TaskMgrResult<()> {
+///
+/// `command` is forwarded into every `invalid_state` so update/patch errors
+/// cannot say `"add"`. [`append_user_story`] keeps passing `"add"`.
+fn atomic_write(target: &Path, content: &str, command: &str) -> TaskMgrResult<()> {
     let tmp_path = unique_tmp_path(target);
     fs::write(&tmp_path, content).map_err(|e| {
         TaskMgrError::invalid_state(
-            "add",
+            command,
             "prd file write",
             "successful tmp write",
             format!("{}: {}", tmp_path.display(), e),
@@ -230,7 +388,7 @@ fn atomic_write(target: &Path, content: &str) -> TaskMgrResult<()> {
         // Best-effort cleanup.
         let _ = fs::remove_file(&tmp_path);
         TaskMgrError::invalid_state(
-            "add",
+            command,
             "prd file rename",
             "successful rename",
             format!("{} -> {}: {}", tmp_path.display(), target.display(), e),
@@ -448,5 +606,270 @@ mod tests {
                 .any(|v| v.as_str() == Some("e474b6f2-FEAT-1")),
             "prefixed form must not remain on new story dependsOn"
         );
+    }
+
+    fn write_prd(tmp: &tempfile::NamedTempFile, content: &str) {
+        let mut f = tmp.reopen().unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+    }
+
+    fn read_story(prd_path: &Path, id: &str) -> Value {
+        let after: Value = serde_json::from_str(&fs::read_to_string(prd_path).unwrap()).unwrap();
+        after["userStories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["id"].as_str() == Some(id))
+            .cloned()
+            .unwrap_or_else(|| panic!("story {id} not found"))
+    }
+
+    fn assert_invalid_state_command(err: &TaskMgrError, expected_command: &str) {
+        match err {
+            TaskMgrError::InvalidState { resource_type, .. } => {
+                assert_eq!(
+                    resource_type, expected_command,
+                    "invalid_state command must be {expected_command:?}; got {resource_type:?}"
+                );
+            }
+            other => panic!("expected InvalidState, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_patch_notes_preserves_extra_keys_and_id() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        write_prd(
+            &tmp,
+            r#"{
+  "userStories": [
+    {
+      "id": "FEAT-001",
+      "title": "seed",
+      "priority": 50,
+      "passes": false,
+      "customAgentKey": "keep-me",
+      "notes": "old"
+    }
+  ]
+}
+"#,
+        );
+
+        let overlay = serde_json::json!({
+            "id": "SHOULD-NOT-APPLY",
+            "notes": "new notes"
+        });
+        patch_user_story(tmp.path(), "FEAT-001", &overlay, None, "update").unwrap();
+
+        let entry = read_story(tmp.path(), "FEAT-001");
+        assert_eq!(entry["id"].as_str(), Some("FEAT-001"));
+        assert_eq!(entry["notes"].as_str(), Some("new notes"));
+        assert_eq!(entry["title"].as_str(), Some("seed"));
+        assert_eq!(entry["priority"].as_i64(), Some(50));
+        assert_eq!(entry["customAgentKey"].as_str(), Some("keep-me"));
+        let after = fs::read_to_string(tmp.path()).unwrap();
+        assert!(after.ends_with('\n'), "trailing newline preserved");
+    }
+
+    #[test]
+    fn test_patch_skips_overlay_id_prefixed_and_unprefixed_seed() {
+        // Prefixed seed + prefixed lookup (append-style match on full id).
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        write_prd(
+            &tmp,
+            r#"{"userStories":[{"id":"a8855e28-FEAT-002","title":"seed","priority":1,"passes":false}]}"#,
+        );
+
+        let overlay = serde_json::json!({
+            "id": "a8855e28-OTHER",
+            "notes": "patched"
+        });
+        patch_user_story(
+            tmp.path(),
+            "a8855e28-FEAT-002",
+            &overlay,
+            Some("a8855e28"),
+            "update",
+        )
+        .unwrap();
+
+        let after: Value = serde_json::from_str(&fs::read_to_string(tmp.path()).unwrap()).unwrap();
+        let entry = &after["userStories"][0];
+        assert_eq!(
+            entry["id"].as_str(),
+            Some("a8855e28-FEAT-002"),
+            "story id must stay byte-identical to the seeded value"
+        );
+        assert_eq!(entry["notes"].as_str(), Some("patched"));
+
+        // Unprefixed seed + prefixed lookup (append-style match on stripped base).
+        let tmp2 = tempfile::NamedTempFile::new().unwrap();
+        write_prd(
+            &tmp2,
+            r#"{"userStories":[{"id":"FEAT-003","title":"seed","priority":1,"passes":false}]}"#,
+        );
+        let overlay2 = serde_json::json!({"id": "a8855e28-FEAT-003", "notes": "n2"});
+        patch_user_story(
+            tmp2.path(),
+            "a8855e28-FEAT-003",
+            &overlay2,
+            Some("a8855e28"),
+            "update",
+        )
+        .unwrap();
+        let entry2 = read_story(tmp2.path(), "FEAT-003");
+        assert_eq!(entry2["id"].as_str(), Some("FEAT-003"));
+        assert_eq!(entry2["notes"].as_str(), Some("n2"));
+    }
+
+    #[test]
+    fn test_patch_depends_on_written_unprefixed() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        write_prd(
+            &tmp,
+            r#"{"userStories":[{"id":"FEAT-010","title":"seed","priority":1,"passes":false}]}"#,
+        );
+
+        let overlay = serde_json::json!({
+            "id": "FEAT-010",
+            "dependsOn": ["a8855e28-CONTRACT-001", "a8855e28-FEAT-001"]
+        });
+        patch_user_story(
+            tmp.path(),
+            "a8855e28-FEAT-010",
+            &overlay,
+            Some("a8855e28"),
+            "update",
+        )
+        .unwrap();
+
+        let entry = read_story(tmp.path(), "FEAT-010");
+        let deps = entry["dependsOn"].as_array().expect("dependsOn array");
+        assert_eq!(
+            deps,
+            &vec![
+                Value::String("CONTRACT-001".into()),
+                Value::String("FEAT-001".into())
+            ]
+        );
+        assert!(
+            deps.iter()
+                .all(|v| !v.as_str().unwrap_or("").starts_with("a8855e28-")),
+            "prefixed forms must not remain; got {deps:?}"
+        );
+    }
+
+    #[test]
+    fn test_patch_human_review_outcome_null_removes_object_replaces() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        write_prd(
+            &tmp,
+            r#"{
+  "userStories": [
+    {
+      "id": "CLARIFY-001",
+      "title": "seed",
+      "priority": 1,
+      "passes": false,
+      "humanReviewOutcome": {"resolvedAt": "2026-01-01", "resolvedBy": "old"}
+    }
+  ]
+}
+"#,
+        );
+
+        let replace = serde_json::json!({
+            "id": "CLARIFY-001",
+            "humanReviewOutcome": {
+                "resolvedAt": "2026-09-19",
+                "resolvedBy": "operator",
+                "confirmedValues": {"floor": 2}
+            }
+        });
+        patch_user_story(tmp.path(), "CLARIFY-001", &replace, None, "update").unwrap();
+        let entry = read_story(tmp.path(), "CLARIFY-001");
+        assert_eq!(
+            entry["humanReviewOutcome"]["resolvedBy"].as_str(),
+            Some("operator")
+        );
+        assert_eq!(
+            entry["humanReviewOutcome"]["confirmedValues"]["floor"].as_i64(),
+            Some(2)
+        );
+
+        let remove = serde_json::json!({
+            "id": "CLARIFY-001",
+            "humanReviewOutcome": null
+        });
+        patch_user_story(tmp.path(), "CLARIFY-001", &remove, None, "update").unwrap();
+        let entry = read_story(tmp.path(), "CLARIFY-001");
+        assert!(
+            entry.get("humanReviewOutcome").is_none(),
+            "null must remove the key; got {entry}"
+        );
+    }
+
+    #[test]
+    fn test_patch_effort_alias_writes_estimated_effort_removes_difficulty() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        write_prd(
+            &tmp,
+            r#"{"userStories":[{"id":"FEAT-020","title":"seed","priority":1,"passes":false,"difficulty":"low"}]}"#,
+        );
+
+        let overlay = serde_json::json!({
+            "id": "FEAT-020",
+            "estimatedEffort": "high"
+        });
+        patch_user_story(tmp.path(), "FEAT-020", &overlay, None, "update").unwrap();
+        let entry = read_story(tmp.path(), "FEAT-020");
+        assert_eq!(entry["estimatedEffort"].as_str(), Some("high"));
+        assert!(
+            entry.get("difficulty").is_none(),
+            "leftover difficulty must be removed; got {entry}"
+        );
+
+        // difficulty-only overlay also canonicalizes.
+        let tmp2 = tempfile::NamedTempFile::new().unwrap();
+        write_prd(
+            &tmp2,
+            r#"{"userStories":[{"id":"FEAT-021","title":"seed","priority":1,"passes":false,"difficulty":"low"}]}"#,
+        );
+        let overlay2 = serde_json::json!({"id": "FEAT-021", "difficulty": "high"});
+        patch_user_story(tmp2.path(), "FEAT-021", &overlay2, None, "update").unwrap();
+        let entry2 = read_story(tmp2.path(), "FEAT-021");
+        assert_eq!(entry2["estimatedEffort"].as_str(), Some("high"));
+        assert!(entry2.get("difficulty").is_none());
+    }
+
+    #[test]
+    fn test_patch_story_not_found_uses_update_command() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        write_prd(
+            &tmp,
+            r#"{"userStories":[{"id":"FEAT-001","title":"seed","priority":1,"passes":false}]}"#,
+        );
+
+        let overlay = serde_json::json!({"id": "MISSING-001", "notes": "x"});
+        let err =
+            patch_user_story(tmp.path(), "MISSING-001", &overlay, None, "update").unwrap_err();
+        assert_invalid_state_command(&err, "update");
+        assert!(format!("{err}").contains("MISSING-001") || format!("{err}").contains("not found"));
+    }
+
+    #[test]
+    fn test_patch_unreadable_path_invalid_state_command_is_update() {
+        let missing = std::env::temp_dir().join(format!(
+            "task-mgr-patch-missing-{}-{}.json",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let overlay = serde_json::json!({"id": "FEAT-001", "notes": "x"});
+        let err = patch_user_story(&missing, "FEAT-001", &overlay, None, "update").unwrap_err();
+        assert_invalid_state_command(&err, "update");
     }
 }
