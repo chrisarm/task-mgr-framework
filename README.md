@@ -86,8 +86,10 @@ task-mgr complete US-001 --run-id "$RUN_ID" --commit abc123
 # If a task is blocked
 task-mgr fail US-002 --error "Missing dependency" --run-id "$RUN_ID"
 
-# Export state for crash recovery (do this after every iteration)
-task-mgr export --to-json tasks/my-project.json
+# Optional: dump the active (or pinned) PRD to an unregistered path.
+# Export is a lossy dump — never point --to-json at a live tasks/*.json
+# without --force (and prefer not to; DB + add/update keep the task-list in sync).
+task-mgr export --from-json tasks/my-project.json --to-json /tmp/my-project-dump.json
 
 # End the session
 task-mgr run end --run-id "$RUN_ID" --status completed
@@ -523,7 +525,8 @@ while true; do
     # Execute agent with task context...
 
     task-mgr complete "$TASK_ID" --run-id "$RUN_ID"
-    task-mgr export --to-json prd.json  # crash recovery
+    # Optional dump to an unregistered path (DB is SSoT; do not smash the live PRD)
+    task-mgr export --from-json prd.json --to-json /tmp/prd-dump.json
 done
 task-mgr run end --run-id "$RUN_ID" --status completed
 ```

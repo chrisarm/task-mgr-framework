@@ -469,10 +469,10 @@ The per-file budget (1500 chars) prevents one large file from consuming the enti
 
 Recovery operates at multiple levels:
 
-1. **Iteration level**: Export PRD JSON after every iteration. If the process crashes, the next run picks up from the exported state.
+1. **Iteration level**: The Rust loop persists task-list JSON via `prd_reconcile` / `add` / `update` (DB commits first; JSON sync is best-effort). It does **not** call `export()`. Operator `task-mgr export --to-json` onto a registered `task_list` is a lossy dump and always requires `--force`; prefer an unregistered dump path, or pin scope with `--from-json`.
 2. **Run level**: `doctor --auto-fix` resets stale `in_progress` tasks to `todo`. Run cleanup in a trap handler records run end status.
 3. **Crash backoff**: Exponential backoff (30s * 2^n, capped at 2^20) prevents thundering herd on transient API failures.
-4. **Signal handling**: Ctrl+C triggers graceful shutdown (finish current operation, export state, end run). Double Ctrl+C forces immediate exit.
+4. **Signal handling**: Ctrl+C triggers graceful shutdown (finish current operation, end run). Double Ctrl+C forces immediate exit.
 
 ### Steering and interactive control
 

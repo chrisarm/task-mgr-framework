@@ -68,8 +68,11 @@ The typical integration follows this lifecycle:
 │     │     - Blocked: task-mgr fail TASK_ID --error "reason"   │ │
 │     │     - Skip:    task-mgr skip TASK_ID --reason "reason"  │ │
 │     │                                                         │ │
-│     │  d. Export state for crash recovery:                    │ │
-│     │     task-mgr export --to-json prd.json                  │ │
+│     │  d. Optional dump (unregistered path only):             │ │
+│     │     task-mgr export --from-json prd.json \              │ │
+│     │       --to-json /tmp/prd-dump.json                      │ │
+│     │     (DB is SSoT; never smash live tasks/*.json without  │ │
+│     │      --force — and --force is a lossy dump, not merge)  │ │
 │     └─────────────────────────────────────────────────────────┘ │
 │                              ↑                                  │
 │                              └── repeat until done/max iters    │
@@ -79,7 +82,7 @@ The typical integration follows this lifecycle:
 ┌─────────────────────────────────────────────────────────────────┐
 │  4. END RUN                                                     │
 │     task-mgr run end --run-id $RUN_ID --status completed        │
-│     task-mgr export --to-json prd.json                          │
+│     # optional: export --from-json prd.json --to-json /tmp/...  │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -202,14 +205,26 @@ task-mgr reset US-001
 task-mgr reset --all --yes
 ```
 
-### Export for Crash Recovery
+### Export (lossy dump — not JSON sync)
+
+`task-mgr export` dumps a scoped `ExportedPrd` (no `taskPrefix`, status
+collapsed to `passes`, extra keys stripped). Prefer an **unregistered**
+`--to-json` path. Overwriting a registered `task_list` always requires
+`--force` (still a dump, not a merge). Pin scope with `--from-json`;
+`--all` restores dump-all. Live task-list persistence is `add` /
+`update` / loop `prd_reconcile` — do **not** recover a missed JSON sync
+via export.
 
 ```bash
-# Export current state back to PRD JSON
-task-mgr export --to-json tasks/project.json
+# Scoped dump to an unregistered path (preferred)
+task-mgr export --from-json tasks/project.json --to-json /tmp/project-dump.json
 
-# Also export learnings separately
-task-mgr export --to-json tasks/project.json --learnings-file tasks/learnings.json
+# Also dump learnings alongside (dest still unregistered)
+task-mgr export --from-json tasks/project.json \
+  --to-json /tmp/project-dump.json --learnings-file /tmp/learnings-backup.json
+
+# WARNING: --force onto a registered task-list is a lossy smash (not a merge)
+# task-mgr export --from-json tasks/project.json --to-json tasks/project.json --force
 ```
 
 ### Recording Learnings
@@ -367,17 +382,20 @@ if git log --oneline -1 | grep -q "\[$CURRENT_TASK_ID\]"; then
 fi
 ```
 
-**Export After Every Iteration** (lines 509-512):
+**Optional dump after iteration** (retarget away from `$PRD_FILE`):
 ```bash
-# CRITICAL: Export state after every iteration for crash recovery
-task-mgr --dir "$TASK_MGR_DIR" export --to-json "$PRD_FILE"
+# Dump to an unregistered path — never --to-json "$PRD_FILE" without --force,
+# and do not add --force onto the live PRD (lossy smash). DB + doctor recover.
+DUMP="/tmp/task-mgr-dump-$(basename "$PRD_FILE")"
+task-mgr --dir "$TASK_MGR_DIR" export --from-json "$PRD_FILE" --to-json "$DUMP"
 ```
 
-**Cleanup Trap** (lines 140-166):
+**Cleanup Trap** (optional dump; do not smash `$PRD_FILE`):
 ```bash
 cleanup() {
-  # Export state on any exit
-  task-mgr export --to-json "$PRD_FILE" 2>/dev/null || true
+  # Optional dump to an unregistered path (never --force onto "$PRD_FILE")
+  local dump="/tmp/task-mgr-dump-$(basename "${PRD_FILE:-prd.json}")"
+  task-mgr export --from-json "$PRD_FILE" --to-json "$dump" 2>/dev/null || true
 
   # End run with appropriate status
   local status="aborted"
@@ -421,7 +439,9 @@ task-mgr export --to-json /dev/null --learnings-file learnings-backup.json
 
 ### Recovering from Crashes
 
-The export-after-every-iteration pattern ensures minimal data loss:
+The database is the source of truth. Loop / CLI persistence (`prd_reconcile`,
+`add`, `update`) keeps the registered task-list in sync best-effort; do **not**
+recover a missed JSON sync by exporting onto the live PRD.
 
 1. Crash occurs mid-iteration
 2. Restart the loop
@@ -617,17 +637,19 @@ task-mgr recall --query "error"
 task-mgr recall --for-task US-001 --limit 10
 ```
 
-### Export Not Updating PRD
+### Export Refuses a Registered Dest
 
-**Cause**: Export may fail silently in cleanup.
+**Cause**: `export --to-json` onto a registered `task_list` always requires
+`--force`. Without it the command refuses (export is a lossy dump, not a
+merge). Silent `|| true` cleanup that targeted the live PRD used to hide this.
 
 **Solution**:
 ```bash
-# Run export explicitly with error output
-task-mgr export --to-json tasks/project.json
+# Prefer an unregistered dump path
+task-mgr export --from-json tasks/project.json --to-json /tmp/project-dump.json
 
-# Check file was updated
-ls -la tasks/project.json
+# Or opt in to a lossy overwrite of the registered file (strips extra keys)
+task-mgr export --from-json tasks/project.json --to-json tasks/project.json --force
 ```
 
 ## Helper Scripts
