@@ -1348,7 +1348,8 @@
         "FEAT-012",
         "CODE-REVIEW-1",
         "REFACTOR-REVIEW-FINAL",
-        "CODE-FIX-001"
+        "CODE-FIX-001",
+        "CODE-FIX-002"
       ],
       "description": "Milestone. Full unscoped quality gate. Drive export-scoped-and-force. Leave the trunk green including pre-existing failures.",
       "estimatedEffort": "high",
@@ -1408,6 +1409,25 @@
       "touchesFiles": [
         "tests/prompt_sequential_snapshot.rs",
         "tests/snapshots/prompt_sequential_v1.txt"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "find_registered_by_path_identity for dest uses worktree_root derived from dest_canon (cwd fallback only when dest is not in a linked worktree)",
+        "From main cwd, export --to-json <worktree>/tasks/<prd>.json without --force refuses; dest bytes unchanged",
+        "Existing cwd=worktree dest tests still pass",
+        "--to-json PATH is never remapped away"
+      ],
+      "description": "High from auto-review: overwrite-guard identity is cwd-bound.\n\nDecision (operator): resolve worktree_root from dest_canon (cwd remains fallback when dest is not inside a linked worktree). Pin 19 (c) must treat an absolute --to-json at a linked worktree live JSON as registered even when cwd is main or /tmp.\n\nDo not use default_prd_roots(dir) alone for the dest identity probe — that helper's worktree_root is cwd-only (context.rs:525-533). Export may keep default_prd_roots for other path math; the dest-exists identity call must pass dest-derived roots.\n\nAdd rust test in tests/worktree_export_dest.rs: cwd=main, --to-json = worktree JSON, no --force → refuse, dest bytes identical. Existing cwd=worktree tests stay green.\n\nDo not remap --to-json away. Do not fold Medium /tmp dump into this task.",
+      "estimatedEffort": "medium",
+      "id": "CODE-FIX-002",
+      "passes": true,
+      "priority": 0,
+      "title": "Dest identity uses dest worktree root, not cwd",
+      "touchesFiles": [
+        "src/commands/export/mod.rs",
+        "src/commands/context.rs",
+        "tests/worktree_export_dest.rs"
       ]
     }
   ]
