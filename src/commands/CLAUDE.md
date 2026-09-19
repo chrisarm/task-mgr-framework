@@ -78,3 +78,34 @@ Hard rules (do not re-derive):
 
 Full field attrs, add-copy, no-column rule, and persist split live under
 `## CONTRACT-003` in `tasks/progress-a8855e28.txt`.
+
+## PR-3 scoped export dump (CONTRACT-001)
+
+`task-mgr export` dumps a **scoped** `ExportedPrd` (lossy: no `taskPrefix`,
+status collapsed to `passes`). Default source is the active prefix;
+`--from-json` pins an already-registered **source** (never the dest);
+`--all` restores today's all-unarchived + `prd_metadata ORDER BY id ASC
+LIMIT 1`.
+
+Hard rules (do not re-derive):
+
+- `load_tasks(conn, prefix: Option<&str>)` — `None` / empty → all
+  unarchived (no LIKE); non-empty → `archived_at IS NULL AND id LIKE ?
+  ESCAPE '\'` via `db::prefix::make_like_pattern` (trailing dash).
+- `load_prd_metadata` scopes: `Unscoped` (`LIMIT 1`), `NamedPrefix`
+  (`WHERE task_prefix = ?`), `ByPrdId` (empty-prefix `--from-json` —
+  identity-matched `prd_files.prd_id`). **Grep `export/`: no `WHERE
+  task_prefix IS NULL`.**
+- Promote `find_registered_by_path_identity` to
+  `Option<(prd_id, prefix)>`. Match (a) stays separate; empty-prefix
+  metadata uses pin-19 identity `prd_id`, not `IS NULL`.
+- `ExportOpts { to_json, with_progress, learnings_file, from_json, all,
+  force }`. Scope selection ignores env when `--all`; never write
+  `ctx.prd_json_path`. `Ok(None)` from `resolve_context` is the
+  no-active error (names `--from-json` / `--all` / `current`).
+- Overwrite-guard / `--force` / `LockGuard` / `unique_tmp` → PR-3
+  CONTRACT-002 (same progress log).
+
+Full copy-pasteable signatures, SQL shapes, empty-prefix `prd_id` rule,
+and `--all` LIMIT 1 live under `## CONTRACT-001` in
+`tasks/progress-c3c1c195.txt`.
