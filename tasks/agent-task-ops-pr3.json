@@ -1,0 +1,1393 @@
+{
+  "branchName": "feat/agent-task-ops-pr3",
+  "description": "PR-3 only of agent-task-ops-ux: export default = active PRD, --all restores today's dump, --force dump (not merge) onto a registered task_list with LockGuard inside export(), scoped metadata + trailing-dash LIKE, clap --from-json pin / --all / --force, task_ops .userStories[] + add --from-json + update one-liner, enhance/intents/cheatsheet/README/INTEGRATION/QUICKSTART/ARCHITECTURE/CHANGELOG alignment, claude-loop.sh smash callers removed or retargeted, worktree dest rust tests, verify-task-mgr feature + drive. Do not re-ship remapper/add clap or implement the update writer.",
+  "globalAcceptanceCriteria": {
+    "description": "These criteria apply to ALL implementation tasks",
+    "criteria": [
+      "No warnings in `cargo check` output",
+      "No warnings in `cargo clippy -- -D warnings` (per-iteration). `--all-targets` is REVIEW-001 only",
+      "`cargo fmt --check` passes",
+      "Scoped tests for touched modules pass",
+      "No unwrap() on filesystem or SQLite in new production paths (export/)",
+      "Operator refuse/--force copy uses `ui::emit` / `ui::emit_err` (CONTRACT-LOG-001), never tracing",
+      "Do not re-ship PR-1 remapper / add clap / current --from-json, and do not implement PR-2 update.rs / overlay whitelist",
+      "Grep later FEATs for symbols (`load_prd_metadata`, `load_tasks`, `write_json_atomic`, `find_registered_by_path_identity`, `unique_tmp_path`, `resolve_context`) \u2014 do not freeze `file:NNN` from the PRD-input table (HEAD is 120c5a2; table may describe older trees)",
+      "Clap parse tests live in `src/cli/tests.rs` and are run with `cargo test -p task-mgr cli::` (not `cargo test --test cli_tests`)",
+      "User-facing export/docs proof is FEAT-012 + REVIEW-001 via `.claude/skills/verify-task-mgr/SKILL.md` feature `export-scoped-and-force` (compile/unit tests alone are not proof for those stories). FEAT-001\u2013011 keep rust tests / docs greps only \u2014 no skill drive except FEAT-011 creating the recipe",
+      "Existing `tests/worktree_db_resolution.rs` DB-anchoring tests stay green"
+    ]
+  },
+  "mergeStrategy": "Merge to main after REVIEW-001 passes. Squash commits optional. Assumes PR-1 public surface (this tree: context.rs, prd_json.rs, add/current --from-json, unique_tmp_path, paths_identify) and PR-2 `task-mgr update --stdin` + enhance CLARIFY at merge \u2014 do not re-ship remapper/add clap or implement the update writer. Do not loop this PR from the authoring session.",
+  "prdFile": "prd-agent-task-ops-pr3.md",
+  "priorityPhilosophy": {
+    "description": "Hierarchy of what matters most when implementing tasks",
+    "hierarchy": [
+      "1. PLAN \u2014 Anticipate edge cases before coding",
+      "2. PHASE 2 FOUNDATION \u2014 ~1 day now to save ~2+ weeks later (1:10+ ratio); we are pre-launch, foundations compound",
+      "3. FUNCTIONING CODE \u2014 Pragmatic, reliable, wired in per plan",
+      "4. CORRECTNESS \u2014 Compiles, type-checks, scoped tests pass deterministically",
+      "5. CODE QUALITY \u2014 Clean code, qualityDimensions satisfied, no warnings",
+      "6. POLISH \u2014 Docs, formatting, minor improvements"
+    ],
+    "principles": [
+      "Quality dimensions explicit \u2014 qualityDimensions on every task tells you what 'good' looks like",
+      "Phase 2 foundation \u2014 scoped dump + --force dump (not merge) is the only substrate that stops smash of sibling PRDs and JSON-only humanReviewOutcome",
+      "Edge cases = test cases \u2014 every PR-3 known edge case must have a corresponding test",
+      "Scoped per-iteration tests, full suite at REVIEW-001 \u2014 REVIEW must leave the trunk green including pre-existing failures",
+      "Pins 8\u20139 / 18\u201319 (export) and the docs/prompt slice of 1, 11, 13, 21 are law; do not reimplement remapper, add clap, or task-mgr update",
+      "Ship working code with tests to prove it; handle Option/Result explicitly; avoid unwrap() in production"
+    ]
+  },
+  "prohibitedOutcomes": [
+    "Re-shipping PR-1 remapper / add --from-json clap / current --from-json, or implementing PR-2 update.rs / overlay whitelist / humanReviewOutcome field",
+    "LockGuard in main.rs Export arm AND inside export() (non-reentrant flock deadlock)",
+    "Calling add::preflight_from_json_path from export (errors say add; coupling forbids export -> add)",
+    "WHERE task_prefix IS NULL for empty-prefix metadata (two --no-prefix inits stamp the wrong row)",
+    "Empty prefix LIKE '-%'",
+    "Using refuse_unpinned_write for export default (wrong copy; current stays a probe)",
+    "Dest write via cli_write_path / remapping --to-json PATH",
+    "Overwrite-guard using match (a) instead of pin-19 find_registered_by_path_identity",
+    "Skipping --force when dest is the same PRD (lossy smash of extra keys / humanReviewOutcome)",
+    "--force as a Value-merge / PrdUserStory round-trip of dest",
+    "Adding taskPrefix or extra keys to ExportedPrd so dump is 'safe' without --force",
+    "Making --all a JSON array of PRDs or dropping LIMIT 1",
+    "Default dest = ctx.prd_json_path when --to-json omitted",
+    "JSON-sync failure copy naming task-mgr export (pin 11)",
+    "jq .tasks[] left in task_ops",
+    "Adding --force onto scripts/claude-loop.sh $PRD_FILE",
+    "Calling export() from the Rust loop engine",
+    "Copying or editing ~/.claude/docs/task-mgr-best-practices.md into this repo",
+    "Rewriting historical tasks/*-prompt.md",
+    "Dropping enhance spawn-fixup form (a); restoring hand-edit + loop init CLARIFY if PR-2 already rewrote it",
+    "Re-adding add --from-json to the cheatsheet forbidden list",
+    "Two --no-prefix inits as >=2-prefix sandbox proof",
+    "Driving verify-task-mgr on a task before the feature file exists; claiming worktree live-path via that harness; driving loop run / batch run",
+    "Inventing a second verification harness; treating compile/unit tests as proof for scoped export / --force / --all / default error",
+    "Sharing CLI overwrite-guard / exists() into loop startup (pin 15)",
+    "Changing DB anchoring; MCP wrappers; a set-status command; claim-scoped short <task-status> ids; putting priority on the update whitelist",
+    "Manual edits to tasks/*.json for status (use task-mgr CLI / task-status tags)",
+    "unwrap() on filesystem or SQLite in export unless a prior invariant makes it unreachable",
+    "tracing for operator-facing refuse/--force copy (use ui::emit / ui::emit_err)",
+    "Tests that only assert 'no crash' or check type without verifying content"
+  ],
+  "project": "task-mgr",
+  "requires": [],
+  "reviewGuidelines": {
+    "priorityGuidelines": {
+      "critical": "1-10: Blocks further work, fix immediately",
+      "high": "11-20: Fix before phase completion",
+      "low": "51-99: Defer to hardening phase",
+      "medium": "21-50: Fix in current phase if time permits"
+    }
+  },
+  "userStories": [
+    {
+      "id": "CONTRACT-001",
+      "title": "Define scoped export dump + matching metadata + identity prd_id",
+      "taskType": "contract",
+      "description": "Design-only. Record CONTRACT-001 so FEAT-001/002/003/010/012 cannot drift: default dump is the active prefix; --from-json pins source (never dest); --all is today's all-unarchived + prd_metadata ORDER BY id ASC LIMIT 1; named metadata WHERE task_prefix = ?; empty-prefix --from-json metadata WHERE id = identity-matched prd_files.prd_id; task filter trailing-dash LIKE via db::prefix; empty prefix must not LIKE '-%'; grep export/ has no WHERE task_prefix IS NULL. Promote find_registered_by_path_identity to return (prd_id, prefix). Do not write production code.",
+      "acceptanceCriteria": [
+        "Precise interface: load_tasks(conn, prefix: Option<&str>) \u2014 None = all unarchived; Some(p) non-empty => archived_at IS NULL AND id LIKE ? ESCAPE '\\' with db::prefix::make_like_pattern(p); empty string treated as None. load_prd_metadata: --all/unscoped keeps ORDER BY id ASC LIMIT 1; named prefix WHERE task_prefix = ?; empty-prefix pin WHERE id = ? with prd_id from identity match of the pin path. find_registered_by_path_identity (or pub(crate) sibling) returns Option<(prd_id: i64, prefix: Option<String>)>. export::ExportOpts { to_json, with_progress, learnings_file, from_json, all, force }. Scope selection: --all ignores env/single-prefix; --from-json => resolve_context(conn, path, \"export\"); else resolve_context(conn, None, \"export\") \u2014 Ok(None) is the no-active error (not this contract's overwrite-guard). Do not write ctx.prd_json_path",
+        "Edge cases: two prefixes + lower-id metadata still stamps A's row when pinned to A; two --no-prefix inits + pin B uses B's prd_id not LIMIT 1 / IS NULL; empty prefix must not LIKE '-%' and must not WHERE task_prefix IS NULL; archived rows excluded; prefix '_' wildcard (P_1); --all LIMIT 1 unchanged; FE vs FEAT trailing dash",
+        "Invariants: ExportedPrd still has no taskPrefix field (lossy on purpose). --all stays today's dump (all unarchived + LIMIT 1), not a multi-PRD array. Empty prefix = no LIKE clause. Identity helper is pin-19 (b)+(c) after source_root.join; match (a) is a separate prefix OR used by --from-json registration, not metadata lookup for empty-prefix",
+        "Known-bad discriminators: (1) WHERE task_prefix IS NULL for empty-prefix metadata \u2014 two --no-prefix inits stamp the wrong project/branchName; (2) format!(\"{prefix}-%\") without ESCAPE \u2014 P_1 matches P11; (3) starts_with(prefix) without trailing dash \u2014 FE matches FEAT-001; (4) Some(\"\") formatted as '-%'",
+        "Failure modes: missing prd_metadata row => same project: \"unknown\" defaults as today; sqlite errors propagate; resolve_context unregistered/missing/directory is FEAT-003",
+        "Alternatives considered: rejected --all as a JSON array of PRDs (pin 8 restore today's dump); rejected default dest = ctx.prd_json_path (hidden smash)",
+        "Downstream impact: FEAT-001 (SQL + identity prd_id), FEAT-002 (ExportOpts wiring), FEAT-003 (clap / no-active), FEAT-010 (worktree dest uses identity Some), FEAT-012 (sandbox scoped dump)",
+        "Contract text recorded: full copy-pasteable signatures, SQL shapes, empty-prefix prd_id rule, and --all LIMIT 1 under ## CONTRACT-001"
+      ],
+      "priority": 0,
+      "estimatedEffort": "high",
+      "touchesFiles": [
+        "src/commands/export/prd.rs",
+        "src/commands/export/mod.rs",
+        "src/commands/context.rs"
+      ],
+      "dependsOn": [],
+      "qualityDimensions": [
+        "Pins 8/9/18 are law: default = active PRD; --all = today's dump; registered dest always needs --force (lossy dump, not merge)",
+        "Reuse resolve_context / paths_identify / find_registered_by_path_identity / unique_tmp_path; do not reimplement remap or add exists() to startup",
+        "export must not import add/update or call preflight_from_json_path; prd_json must not import export; main.rs Export arm must not LockGuard::acquire",
+        "Do not call refuse_unpinned_write for export default (wrong copy; current stays a probe)",
+        "Grep symbols (load_prd_metadata, load_tasks, write_json_atomic, find_registered_by_path_identity, unique_tmp_path) \u2014 do not freeze file:NNN from the PRD-input table",
+        "Operator refuse/--force copy uses ui::emit / ui::emit_err (CONTRACT-LOG-001), never tracing",
+        "No unwrap() on filesystem or SQLite in export unless a prior invariant makes it unreachable",
+        "Reuse db::prefix::{make_like_pattern, prefix_and}; trailing-dash LIKE + ESCAPE '\\'",
+        "Comments explain why (lossy dump => --force even for same-PRD; --all keeps LIMIT 1; dest is --to-json not ctx.prd_json_path)",
+        "Do not add taskPrefix / extra keys / humanReviewOutcome to ExportedPrd",
+        "Do not deserialize dest to PrdUserStory; serialize ExportedPrd only",
+        "Pin 11 copy must never name export as JSON-sync recovery"
+      ],
+      "notes": "Architecture seed (do not re-expand). HEAD 120c5a2: load_prd_metadata is always ORDER BY id ASC LIMIT 1; load_tasks is all archived_at IS NULL; find_registered_by_path_identity is private in context.rs and returns Option<Option<String>> (prefix only) \u2014 SELECT pf.file_path, pm.task_prefix, no prd_id. match_registered_from_json maps identity to prefix-only; keep match (a) separate. Learning [2588]: do not hide a wrong prefix filter behind unwrap_or of all rows. Learning [5654]/[5689]: pin-19 stays git::paths_identify; callers consume. Learning [5605]: dual-PRD fixtures need unique story ids. Do not implement overwrite-guard here (CONTRACT-002).",
+      "edgeCases": [
+        "Two prefixes + lower-id metadata: pin A stamps A's row even if B.id is smaller",
+        "Two --no-prefix inits + pin B: metadata is B's prd_id, not LIMIT 1 / IS NULL",
+        "Empty prefix must not LIKE '-%' and must not WHERE task_prefix IS NULL",
+        "Archived rows excluded in scoped and --all",
+        "Prefix '_' wildcard: seed P_1; only those ids (make_like_pattern, not naive format)",
+        "--all LIMIT 1 unchanged (not empty-prefix prd_id lookup)",
+        "Task id FEAT-001 vs prefix FE: FE-% does not match FEAT-001"
+      ],
+      "invariants": [
+        "ExportedPrd has no taskPrefix field",
+        "grep export/: no WHERE task_prefix IS NULL",
+        "Empty string prefix is treated as None for LIKE"
+      ],
+      "failureModes": [
+        {
+          "cause": "Empty-prefix metadata uses WHERE task_prefix IS NULL",
+          "expectedBehavior": "Two --no-prefix fixture fails; contract forbids the SQL"
+        },
+        {
+          "cause": "LIKE without trailing dash or ESCAPE",
+          "expectedBehavior": "P_1 / FE vs FEAT units fail"
+        }
+      ],
+      "passes": false,
+      "requiresHuman": false,
+      "modifiesBehavior": false
+    },
+    {
+      "id": "CONTRACT-002",
+      "title": "Define export overwrite-guard + --force dump + LockGuard inside export()",
+      "taskType": "contract",
+      "description": "Design-only. Record CONTRACT-002 so FEAT-002/003/010/012 cannot deadlock or smash: --to-json onto a registered task_list (pin-19 live-path pair) always requires --force even when scoped to that PRD; --force is a lossy ExportedPrd dump (unique_tmp_path + rename), not a merge; LockGuard acquired inside export() only after dest.is_file(), before identity re-check and write; main.rs only forwards ExportOpts; missing dest => no lock; dest is the --to-json PATH (never cli_write_path). Do not write production code.",
+      "acceptanceCriteria": [
+        "Precise interface: overwrite-guard runs inside export() after dest.is_file() + LockGuard, then find_registered_by_path_identity on dest (file_type = 'task_list', pin-19 live-path pair including source_root.join). Some => require --force. Missing dest: write without --force, no lock. Dest exists but identity miss (e.g. /tmp/dump.json): lock then write without --force. Directory dest => error, no dump. write_json_atomic (dest and --learnings-file) uses prd_json::unique_tmp_path, not with_extension(\"json.tmp\"). export::export(dir, &ExportOpts) -> TaskMgrResult<ExportResult>",
+        "Edge cases: same-PRD dest still needs --force; --all onto a registered path still needs --force; worktree remapped copy of a task_list hits identity; dest is main registered path from worktree cwd writes the PATH given; stray same-taskPrefix copy is NOT registered (match (a) is not the guard); relative prd_files + dest tasks/foo.json joins then canonicalize/remap; concurrent add vs --force dump uses distinct tmp + lock",
+        "Invariants: --force is full replace of dest with pretty ExportedPrd; extra keys / taskPrefix do not survive; do not read dest as Value / PrdUserStory. --to-json PATH is never remapped. LockGuard is not acquired in main.rs on the Export arm. Never lock in both (non-reentrant flock on tasks.db.lock). prd_json does not import export. export does not import add/update",
+        "Known-bad discriminators: (1) LockGuard in main.rs AND export() \u2014 hang / LockError; (2) guard uses match (a) \u2014 stray same-prefix copy requires --force or live path misses; (3) dest via cli_write_path \u2014 writes the worktree copy when the operator named main; (4) --force Value-merges dest so extra keys survive \u2014 pin 18 forbids; (5) skipping --force when scoped to the same PRD \u2014 lossy smash of humanReviewOutcome",
+        "Failure modes: dest-registered without --force => invalid_state(\"export\", ...) naming --force and dump-not-merge; dest bytes identical; no serialize-then-refuse. Directory dest errors before dump. unique_tmp collision: pid-counter-nanos distinct",
+        "Alternatives considered: rejected keep dump-all default and only --force when dest registered (pin 8); rejected --force as merge (pin 18)",
+        "Downstream impact: FEAT-002 (implement guard + ExportOpts + library All), FEAT-003 (clap --force / dispatch no lock), FEAT-010 (worktree dest), FEAT-012 (sandbox --force refuse)",
+        "Contract text recorded: lock site, identity-not-match-(a), unique_tmp, dest=--to-json under ## CONTRACT-002"
+      ],
+      "priority": 1,
+      "estimatedEffort": "high",
+      "touchesFiles": [
+        "src/commands/export/mod.rs",
+        "src/main.rs",
+        "src/commands/context.rs",
+        "src/commands/prd_json.rs"
+      ],
+      "dependsOn": [],
+      "qualityDimensions": [
+        "Pins 8/9/18 are law: default = active PRD; --all = today's dump; registered dest always needs --force (lossy dump, not merge)",
+        "Reuse resolve_context / paths_identify / find_registered_by_path_identity / unique_tmp_path; do not reimplement remap or add exists() to startup",
+        "export must not import add/update or call preflight_from_json_path; prd_json must not import export; main.rs Export arm must not LockGuard::acquire",
+        "Do not call refuse_unpinned_write for export default (wrong copy; current stays a probe)",
+        "Grep symbols (load_prd_metadata, load_tasks, write_json_atomic, find_registered_by_path_identity, unique_tmp_path) \u2014 do not freeze file:NNN from the PRD-input table",
+        "Operator refuse/--force copy uses ui::emit / ui::emit_err (CONTRACT-LOG-001), never tracing",
+        "No unwrap() on filesystem or SQLite in export unless a prior invariant makes it unreachable",
+        "Reuse db::prefix::{make_like_pattern, prefix_and}; trailing-dash LIKE + ESCAPE '\\'",
+        "Comments explain why (lossy dump => --force even for same-PRD; --all keeps LIMIT 1; dest is --to-json not ctx.prd_json_path)",
+        "Do not add taskPrefix / extra keys / humanReviewOutcome to ExportedPrd",
+        "Do not deserialize dest to PrdUserStory; serialize ExportedPrd only",
+        "Pin 11 copy must never name export as JSON-sync recovery"
+      ],
+      "notes": "Architecture seed. HEAD 120c5a2: export() is 4-arg dump-all, write_json_atomic uses path.with_extension(\"json.tmp\"), main.rs Export arm has no lock (keep it that way). add() locks inside add.rs after validation, not main.rs \u2014 export matches that site. Learning [5577]/[2667]/[4564]/[1562]: unique tmp same-dir rename. Pin 18: same LockGuard as add IF dest is a live PRD \u2014 missing dest => no lock.",
+      "edgeCases": [
+        "Same-PRD dest still needs --force (lossy)",
+        "Missing dest: no --force, no lock, create",
+        "Dest exists but identity miss (/tmp/dump.json): write without --force (lock then miss)",
+        "Dest is a directory: error; no dump",
+        "--all --to-json onto a registered path still requires --force",
+        "LockGuard in main.rs AND export(): deadlock / LockError \u2014 lock only inside export()",
+        "write_json_atomic .json.tmp collision: unique_tmp_path",
+        "Dest remapped via cli_write_path: forbidden; grep export/ empty",
+        "Overwrite-guard uses match (a): forbidden; pin-19 only",
+        "ExportedPrd round-trip through PrdUserStory: do not",
+        "Adding taskPrefix to ExportedPrd to avoid --force: forbidden",
+        "Dest is worktree remapped copy of a task_list: identity hits; write that PATH",
+        "Relative prd_files (tasks/foo.json) + dest tasks/foo.json: --force",
+        "Concurrent add vs --force dump: distinct tmp; LockGuard inside export() on dest.is_file()"
+      ],
+      "invariants": [
+        "LockGuard only inside export() after dest.is_file(); missing dest => no lock",
+        "Dest write is --to-json PATH, never cli_write_path",
+        "--force is dump not merge; extra keys gone"
+      ],
+      "failureModes": [
+        {
+          "cause": "Dual LockGuard acquire",
+          "expectedBehavior": "Contract forbids main.rs lock; dual-lock unit / grep Export arm"
+        },
+        {
+          "cause": "Guard skipped because dump is scoped to that PRD",
+          "expectedBehavior": "Extra-key seed survives without --force \u2014 test must fail that design"
+        }
+      ],
+      "passes": false,
+      "requiresHuman": false,
+      "modifiesBehavior": false
+    },
+    {
+      "id": "FEAT-001",
+      "title": "Promote identity prd_id + implement scoped load_tasks / load_prd_metadata",
+      "taskType": "implementation",
+      "description": "Implement CONTRACT-001 internals on HEAD: promote find_registered_by_path_identity to pub(crate) returning (prd_id, prefix); keep match_registered_from_json prefix-only by mapping; change load_tasks / load_prd_metadata to take scope. export() stays the HEAD 4-arg dump-all (patch its load_* call sites only). Unit-test SQL here; two-prefix CLI is FEAT-003. ExportOpts / clap / LockGuard / unique_tmp wait for FEAT-002.",
+      "acceptanceCriteria": [
+        "load_tasks(conn, prefix: Option<&str>) \u2014 None = all unarchived (today). Some(p) if p is non-empty => archived_at IS NULL AND id LIKE ? ESCAPE '\\' with db::prefix::make_like_pattern(p) (or prefix_and). Empty string treated as None (do not LIKE '-%')",
+        "load_prd_metadata: --all / unscoped keeps ORDER BY id ASC LIMIT 1. Named prefix => WHERE task_prefix = ?. Empty-prefix --from-json => WHERE id = ? with prd_id from the identity match of the pin path. Grep export/: no WHERE task_prefix IS NULL",
+        "Promote find_registered_by_path_identity (or a pub(crate) sibling) to return Option<(prd_id: i64, prefix: Option<String>)> \u2014 HEAD returns prefix only. SELECT must include pf.prd_id. match_registered_from_json still exposes prefix-only to resolve_context (do not fold match (a) into the identity helper)",
+        "Two prefixed inits, load_tasks(Some(prefixA)): exported ids all start with '{A}-'; none start with '{B}-'. load_prd_metadata named A: project/branchName from A's row even if B has a lower prd_metadata.id (dual-PRD fixtures use unique story ids \u2014 learning #5605)",
+        "Two --no-prefix inits (distinct project / branchName), identity match of file B: metadata is B's row (prd_id), not A's (LIMIT 1 / IS NULL would pick the wrong one)",
+        "--all helpers on a two-prefix DB: task count = A+B unarchived; metadata = ORDER BY id LIMIT 1 (today; not empty-prefix prd_id lookup)",
+        "Archived rows excluded in both modes (seed one archived; it is absent)",
+        "Prefix '_' wildcard: seed prefix P_1; only those ids (unit on make_like_pattern, not naive format!(\"{prefix}-%\"))",
+        "ExportedPrd still has no taskPrefix field (lossy on purpose)",
+        "CONTRACT: serde_json::from_value / to_string_pretty of ExportedPrd succeeds; do not round-trip dest through PrdUserStory",
+        "export() still 4-arg dump-all: (dir, to_json, with_progress, learnings_file). Call load_tasks(&conn, None) and unscoped load_prd_metadata (ORDER BY id ASC LIMIT 1). Do not change export() arity, clap, LockGuard, or write_json_atomic in this task. No ExportOpts"
+      ],
+      "priority": 3,
+      "estimatedEffort": "medium",
+      "touchesFiles": [
+        "src/commands/context.rs",
+        "src/commands/export/prd.rs",
+        "src/commands/export/mod.rs",
+        "src/commands/export/tests.rs"
+      ],
+      "dependsOn": [
+        "CONTRACT-001"
+      ],
+      "modifiesBehavior": true,
+      "qualityDimensions": [
+        "Pins 8/9/18 are law: default = active PRD; --all = today's dump; registered dest always needs --force (lossy dump, not merge)",
+        "Reuse resolve_context / paths_identify / find_registered_by_path_identity / unique_tmp_path; do not reimplement remap or add exists() to startup",
+        "export must not import add/update or call preflight_from_json_path; prd_json must not import export; main.rs Export arm must not LockGuard::acquire",
+        "Do not call refuse_unpinned_write for export default (wrong copy; current stays a probe)",
+        "Grep symbols (load_prd_metadata, load_tasks, write_json_atomic, find_registered_by_path_identity, unique_tmp_path) \u2014 do not freeze file:NNN from the PRD-input table",
+        "Operator refuse/--force copy uses ui::emit / ui::emit_err (CONTRACT-LOG-001), never tracing",
+        "No unwrap() on filesystem or SQLite in export unless a prior invariant makes it unreachable",
+        "Reuse db::prefix::{make_like_pattern, prefix_and}; trailing-dash LIKE + ESCAPE '\\'",
+        "Comments explain why (lossy dump => --force even for same-PRD; --all keeps LIMIT 1; dest is --to-json not ctx.prd_json_path)",
+        "Do not add taskPrefix / extra keys / humanReviewOutcome to ExportedPrd",
+        "Do not deserialize dest to PrdUserStory; serialize ExportedPrd only",
+        "Pin 11 copy must never name export as JSON-sync recovery"
+      ],
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/commands/export/mod.rs",
+            "line": 0,
+            "usage": "4-arg dump-all export(); write_json_atomic .json.tmp",
+            "impact": "NEEDS_REVIEW",
+            "mitigation": "This task: keep 4-arg dump-all; call load_tasks(&conn, None) + unscoped load_prd_metadata (LIMIT 1). ExportOpts / unique_tmp_path are FEAT-002"
+          },
+          {
+            "file": "src/commands/export/prd.rs",
+            "line": 0,
+            "usage": "load_prd_metadata LIMIT 1 always; load_tasks all unarchived",
+            "impact": "BREAKS",
+            "mitigation": "prefix LIKE + matching metadata; LIMIT 1 only on --all"
+          },
+          {
+            "file": "src/main.rs",
+            "line": 0,
+            "usage": "Commands::Export 3 fields; no lock",
+            "impact": "OK",
+            "mitigation": "FEAT-001 does not change export() arity or main.rs. FEAT-002 forwards ExportOpts from still-3-field clap"
+          },
+          {
+            "file": "src/cli/tests.rs",
+            "line": 0,
+            "usage": "four Commands::Export { to_json, with_progress, learnings_file } matches",
+            "impact": "BREAKS",
+            "mitigation": "US-003 / FEAT-003; cargo test -p task-mgr cli::"
+          },
+          {
+            "file": "tests/import_export.rs",
+            "line": 0,
+            "usage": "export::export(dir, path, false, None) after PrefixMode::Disabled; dest new exported.json",
+            "impact": "BREAKS",
+            "mitigation": "pass All; dest stays new file so --force not required"
+          },
+          {
+            "file": "tests/human_review_cli.rs",
+            "line": 0,
+            "usage": "CLI export --to-json exported.json after --no-prefix init",
+            "impact": "BREAKS",
+            "mitigation": "pass --all; dest stays a new file"
+          },
+          {
+            "file": "scripts/claude-loop.sh",
+            "line": 0,
+            "usage": "export --to-json \"$PRD_FILE\" || true (cleanup / per-iteration / final)",
+            "impact": "BREAKS",
+            "mitigation": "FEAT-009 remove or retarget; never --force onto $PRD_FILE"
+          },
+          {
+            "file": "src/loop_engine/prompt_sections/task_ops.rs",
+            "line": 0,
+            "usage": "jq .tasks[]",
+            "impact": "BREAKS",
+            "mitigation": "FEAT-004 .userStories[]; trim to < 2048"
+          },
+          {
+            "file": "src/loop_engine/**",
+            "line": 0,
+            "usage": "no export::export caller (prd_reconcile persists)",
+            "impact": "OK",
+            "mitigation": "do not add a loop export() call"
+          }
+        ],
+        "semanticDistinctions": [
+          {
+            "context": "init --from-json",
+            "currentBehavior": "registers PRD",
+            "requiredBehavior": "Keep: unchanged (export --from-json is pin, not import)"
+          },
+          {
+            "context": "add/update/current --from-json",
+            "currentBehavior": "PR-1/PR-2 pin dest/context",
+            "requiredBehavior": "Keep unchanged; export --from-json pins SOURCE only; dest is --to-json"
+          },
+          {
+            "context": "resolve_context Ok(None)",
+            "currentBehavior": "current stays a probe (exit 0)",
+            "requiredBehavior": "export errors unless --all (names --from-json / --all / task-mgr current); do not reuse refuse_unpinned_write"
+          },
+          {
+            "context": "LockGuard add vs export",
+            "currentBehavior": "add locks inside add(); main.rs Export arm unlocked",
+            "requiredBehavior": "export matches add: lock inside export() after dest.is_file(); main.rs stays unlocked"
+          }
+        ]
+      },
+      "notes": "dependsOn CONTRACT-001. Learning [2588]/[5654]/[5689]/[5605]. HEAD identity is private and prefix-only; match_registered_from_json calls it after match (a). Reuse db::prefix::prefix_and \u2014 do not duplicate LIKE escaping. export/mod.rs is a call-site patch only so cargo check stays green after load_* signatures change: keep 4-arg dump-all. Do not implement overwrite-guard, clap, LockGuard, unique_tmp, or ExportOpts (FEAT-002/003). Do not re-ship remap. Follow verify-task-mgr only on FEAT-012 / REVIEW-001.",
+      "edgeCases": [
+        "Two prefixes + lower-id metadata",
+        "Two --no-prefix inits + pin B",
+        "Empty prefix must not IS NULL / LIKE '-%'",
+        "Archived rows excluded",
+        "_ in prefix (P_1)",
+        "--all LIMIT 1 unchanged",
+        "FE vs FEAT trailing dash"
+      ],
+      "invariants": [
+        "grep export/: no WHERE task_prefix IS NULL",
+        "Empty string prefix => no LIKE",
+        "Identity returns prd_id; match (a) stays separate"
+      ],
+      "failureModes": [
+        {
+          "cause": "Some(\"\") formatted as '-%'",
+          "expectedBehavior": "Empty-prefix unit fails; treat as None"
+        }
+      ],
+      "passes": false,
+      "requiresHuman": false
+    },
+    {
+      "id": "FEAT-002",
+      "title": "ExportOpts + overwrite-guard + LockGuard + unique_tmp + library All",
+      "taskType": "implementation",
+      "description": "Replace 4-arg export() with ExportOpts. Wire CONTRACT-001 scope selection plus CONTRACT-002 overwrite-guard, LockGuard inside export() after dest.is_file(), and unique_tmp_path. Update in-tree library callers that used PrefixMode::Disabled + export(dir, path, false, None) to pass all: true; dest stays a new file so force is not required. Clap stays 3-field; main.rs forwards ExportOpts { from_json: None, all: false, force: false, \u2026 } from that clap. Do not grow clap (FEAT-003). Do not batchWith FEAT-003.",
+      "acceptanceCriteria": [
+        "export::export(dir, &ExportOpts) with { to_json, with_progress, learnings_file, from_json, all, force }. --all => today's dump (load_tasks None + LIMIT 1 metadata). --from-json => resolve_context(conn, path, \"export\") then scoped dump; do not write ctx.prd_json_path. Else resolve_context(conn, None, \"export\"); Some(ctx) non-empty prefix => scoped; Ok(None) => invalid_state(\"export\", ...) naming --from-json / --all / task-mgr current (FEAT-003 CLI copy must match; library may return the same error)",
+        "Dest exists + find_registered_by_path_identity hits a task_list row + no force => invalid_state(\"export\", ...) naming --force and dump not a merge. Dest bytes identical. No serialize-then-refuse",
+        "Same dest + force => dest replaced with pretty ExportedPrd. Extra key seeded on the previous file is gone. taskPrefix absent. LockGuard acquired inside export() after dest.is_file(), before identity re-check and write",
+        "Dest does not exist => write without force (create); no LockGuard. Dest exists but identity miss (/tmp/dump.json) => write without force. Dest is a directory => error; no dump",
+        "--to-json PATH is the write target (never remapped via cli_write_path). Unit: grep export/ for cli_write_path is empty. Grep export/: no invalid_state command-name \"add\". Do not call preflight_from_json_path",
+        "--force is not a merge: do not read dest as Value / PrdUserStory to preserve keys. Dest + learnings writes use prd_json::unique_tmp_path (not with_extension(\"json.tmp\")). prd_json does not import export. export does not import add/update",
+        "all: true --to-json onto a registered path still requires force",
+        "Grep: LockGuard is not acquired in main.rs on the Export arm (FEAT-003 must keep this). export() is the only acquire site for this command. Never lock in both",
+        "Library PrefixMode::Disabled callers pass All; dest is a new exported.json so force is not required. Update: src/commands/export/tests.rs, tests/import_export.rs, tests/model_fields_round_trip.rs, tests/e2e_loop.rs, tests/prd_max_retries_round_trip.rs, src/commands/import_learnings/tests.rs. Do not keep a silent smash default on the library function that disagrees with the CLI",
+        "Empty-prefix from_json pin: dump all unarchived tasks; metadata WHERE id = identity-matched prd_id; do not LIKE '-%'",
+        "Grep src/loop_engine: no new export::export call",
+        "main.rs Export arm still matches Commands::Export { to_json, with_progress, learnings_file } (do not grow clap). Forward ExportOpts { to_json, with_progress, learnings_file, from_json: None, all: false, force: false }. No LockGuard on the Export arm. Do not batchWith FEAT-003"
+      ],
+      "priority": 4,
+      "estimatedEffort": "high",
+      "touchesFiles": [
+        "src/commands/export/mod.rs",
+        "src/commands/export/tests.rs",
+        "src/main.rs",
+        "tests/import_export.rs",
+        "tests/model_fields_round_trip.rs",
+        "tests/e2e_loop.rs",
+        "tests/prd_max_retries_round_trip.rs",
+        "src/commands/import_learnings/tests.rs"
+      ],
+      "dependsOn": [
+        "CONTRACT-001",
+        "CONTRACT-002",
+        "FEAT-001"
+      ],
+      "modifiesBehavior": true,
+      "qualityDimensions": [
+        "Pins 8/9/18 are law: default = active PRD; --all = today's dump; registered dest always needs --force (lossy dump, not merge)",
+        "Reuse resolve_context / paths_identify / find_registered_by_path_identity / unique_tmp_path; do not reimplement remap or add exists() to startup",
+        "export must not import add/update or call preflight_from_json_path; prd_json must not import export; main.rs Export arm must not LockGuard::acquire",
+        "Do not call refuse_unpinned_write for export default (wrong copy; current stays a probe)",
+        "Grep symbols (load_prd_metadata, load_tasks, write_json_atomic, find_registered_by_path_identity, unique_tmp_path) \u2014 do not freeze file:NNN from the PRD-input table",
+        "Operator refuse/--force copy uses ui::emit / ui::emit_err (CONTRACT-LOG-001), never tracing",
+        "No unwrap() on filesystem or SQLite in export unless a prior invariant makes it unreachable",
+        "Reuse db::prefix::{make_like_pattern, prefix_and}; trailing-dash LIKE + ESCAPE '\\'",
+        "Comments explain why (lossy dump => --force even for same-PRD; --all keeps LIMIT 1; dest is --to-json not ctx.prd_json_path)",
+        "Do not add taskPrefix / extra keys / humanReviewOutcome to ExportedPrd",
+        "Do not deserialize dest to PrdUserStory; serialize ExportedPrd only",
+        "Pin 11 copy must never name export as JSON-sync recovery"
+      ],
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/commands/export/mod.rs",
+            "line": 0,
+            "usage": "4-arg dump-all export(); write_json_atomic .json.tmp",
+            "impact": "BREAKS",
+            "mitigation": "ExportOpts; default CLI scoped; unique_tmp_path"
+          },
+          {
+            "file": "src/commands/export/prd.rs",
+            "line": 0,
+            "usage": "load_prd_metadata LIMIT 1 always; load_tasks all unarchived",
+            "impact": "BREAKS",
+            "mitigation": "prefix LIKE + matching metadata; LIMIT 1 only on --all"
+          },
+          {
+            "file": "src/main.rs",
+            "line": 0,
+            "usage": "Commands::Export 3 fields; no lock",
+            "impact": "BREAKS",
+            "mitigation": "This task: forward ExportOpts { from_json: None, all: false, force: false, ... } from still-3-field clap; no LockGuard; do not grow clap. FEAT-003 grows clap"
+          },
+          {
+            "file": "src/cli/tests.rs",
+            "line": 0,
+            "usage": "four Commands::Export { to_json, with_progress, learnings_file } matches",
+            "impact": "BREAKS",
+            "mitigation": "US-003 / FEAT-003; cargo test -p task-mgr cli::"
+          },
+          {
+            "file": "tests/import_export.rs",
+            "line": 0,
+            "usage": "export::export(dir, path, false, None) after PrefixMode::Disabled; dest new exported.json",
+            "impact": "BREAKS",
+            "mitigation": "pass All; dest stays new file so --force not required"
+          },
+          {
+            "file": "tests/human_review_cli.rs",
+            "line": 0,
+            "usage": "CLI export --to-json exported.json after --no-prefix init",
+            "impact": "BREAKS",
+            "mitigation": "pass --all; dest stays a new file"
+          },
+          {
+            "file": "scripts/claude-loop.sh",
+            "line": 0,
+            "usage": "export --to-json \"$PRD_FILE\" || true (cleanup / per-iteration / final)",
+            "impact": "BREAKS",
+            "mitigation": "FEAT-009 remove or retarget; never --force onto $PRD_FILE"
+          },
+          {
+            "file": "src/loop_engine/prompt_sections/task_ops.rs",
+            "line": 0,
+            "usage": "jq .tasks[]",
+            "impact": "BREAKS",
+            "mitigation": "FEAT-004 .userStories[]; trim to < 2048"
+          },
+          {
+            "file": "src/loop_engine/**",
+            "line": 0,
+            "usage": "no export::export caller (prd_reconcile persists)",
+            "impact": "OK",
+            "mitigation": "do not add a loop export() call"
+          }
+        ],
+        "semanticDistinctions": [
+          {
+            "context": "init --from-json",
+            "currentBehavior": "registers PRD",
+            "requiredBehavior": "Keep: unchanged (export --from-json is pin, not import)"
+          },
+          {
+            "context": "add/update/current --from-json",
+            "currentBehavior": "PR-1/PR-2 pin dest/context",
+            "requiredBehavior": "Keep unchanged; export --from-json pins SOURCE only; dest is --to-json"
+          },
+          {
+            "context": "resolve_context Ok(None)",
+            "currentBehavior": "current stays a probe (exit 0)",
+            "requiredBehavior": "export errors unless --all (names --from-json / --all / task-mgr current); do not reuse refuse_unpinned_write"
+          },
+          {
+            "context": "LockGuard add vs export",
+            "currentBehavior": "add locks inside add(); main.rs Export arm unlocked",
+            "requiredBehavior": "export matches add: lock inside export() after dest.is_file(); main.rs stays unlocked"
+          }
+        ]
+      },
+      "notes": "dependsOn CONTRACT-001, CONTRACT-002, FEAT-001. Learning [5577]/[2667]/[4564]/[1562]/[2588]. One conn inside export(); dest-registered without force exits before serializing tasks. --with-progress / --learnings-file stay DB-global. Clap field growth is FEAT-003 (cli/tests.rs will not compile until that task). CLI --no-prefix export sites (tests/human_review_cli.rs, tests/model_fields_cli.rs, tests/cli_tests.rs test_export_roundtrip) are out of this iteration \u2014 FEAT-003 owns --all on those call sites; do not restore a smash default on the library to keep them green. Do not implement update.rs. Follow verify-task-mgr only on FEAT-012 / REVIEW-001.",
+      "edgeCases": [
+        "Same-PRD dest still needs --force",
+        "Missing dest (no lock)",
+        "Unregistered existing file (lock then identity miss)",
+        "Directory dest",
+        "--all onto live path",
+        "unique tmp",
+        "Dual-lock hang",
+        "Library export after PrefixMode::Disabled => All; dest new file",
+        "Stray copy with same taskPrefix: overwrite-guard does not fire",
+        "Unregistered --from-json: resolve_context(..., \"export\") names loop init; dest unchanged; errors do not say add",
+        "Missing / directory --from-json through resolve_context(..., \"export\")",
+        "ExportedPrd must not go through PrdUserStory"
+      ],
+      "invariants": [
+        "Lock only inside export() after dest.is_file()",
+        "grep export/: no cli_write_path; no invalid_state(\"add\"",
+        "unique_tmp_path scheme .{base}.{pid}-{n}-{nanos}.tmp"
+      ],
+      "failureModes": [
+        {
+          "cause": "export imports add::preflight_from_json_path",
+          "expectedBehavior": "Errors say add; coupling budget fails \u2014 grep must catch"
+        }
+      ],
+      "passes": false,
+      "requiresHuman": false
+    },
+    {
+      "id": "FEAT-003",
+      "title": "Clap --from-json / --all / --force + no-active error + CLI --no-prefix --all",
+      "taskType": "implementation",
+      "description": "Grow Commands::Export with from_json / all / force. --all conflicts with --from-json. --from-json help says pin, not import. main.rs only forwards ExportOpts (no LockGuard). No-active invalid_state names --from-json / --all / task-mgr current. CLI --no-prefix export tests pass --all; dest stays a new file.",
+      "acceptanceCriteria": [
+        "Commands::Export { to_json, with_progress, learnings_file, from_json: Option<PathBuf>, all: bool, force: bool }. --all conflicts with --from-json. --to-json still required. Help: --from-json pin this already-registered effort, not import. Distinct from init --from-json",
+        "main.rs dispatch only forwards ExportOpts (to_json / with_progress / learnings_file / from_json / all / force). No LockGuard in the Export arm",
+        "--from-json missing / directory / unregistered: all go through resolve_context(conn, from_json, \"export\") before dump. Copy for unregistered names loop init. Do not call preflight_from_json_path. If a helper is extracted, it lives in context.rs with a command parameter. Grep export/: no \"add\" in invalid_state command-name",
+        "No --from-json, no --all, resolve_context None => invalid_state(\"export\", ...) naming --from-json / --all / task-mgr current. Zero-prefix DBs: same error on default; --all succeeds. Do not call refuse_unpinned_write",
+        "--all --from-json X: clap parse failure (cargo test -p task-mgr cli::). Existing four Export clap tests updated for the new fields; new tests for --from-json, --all, --force, and the conflict",
+        "--from-json does not insert prd_files / prd_metadata rows. Flag vs env mismatch: flag wins (resolve_context already notes); dest still --to-json",
+        "CLI callers after --no-prefix pass --all; dest stays a new file so --force is not required: tests/human_review_cli.rs (export --to-json exported.json sites), tests/model_fields_cli.rs, tests/cli_tests.rs test_export_roundtrip (setup_initialized_tempdir uses --no-prefix). Grep symbols, do not freeze file:NNN",
+        "Two prefixed loop inits (without --no-prefix), no env, no --from-json, no --all: export --to-json /tmp/out.json non-zero; dest not created (or unchanged); stderr names --from-json, --all, and task-mgr current. Do not prove this with two --no-prefix inits",
+        "cargo test -p task-mgr cli:: (not cargo test --test cli_tests) for clap unit tests"
+      ],
+      "priority": 5,
+      "estimatedEffort": "high",
+      "touchesFiles": [
+        "src/cli/commands.rs",
+        "src/cli/tests.rs",
+        "src/main.rs",
+        "tests/human_review_cli.rs",
+        "tests/model_fields_cli.rs",
+        "tests/cli_tests.rs"
+      ],
+      "dependsOn": [
+        "CONTRACT-001",
+        "CONTRACT-002",
+        "FEAT-002"
+      ],
+      "modifiesBehavior": true,
+      "qualityDimensions": [
+        "Pins 8/9/18 are law: default = active PRD; --all = today's dump; registered dest always needs --force (lossy dump, not merge)",
+        "Reuse resolve_context / paths_identify / find_registered_by_path_identity / unique_tmp_path; do not reimplement remap or add exists() to startup",
+        "export must not import add/update or call preflight_from_json_path; prd_json must not import export; main.rs Export arm must not LockGuard::acquire",
+        "Do not call refuse_unpinned_write for export default (wrong copy; current stays a probe)",
+        "Grep symbols (load_prd_metadata, load_tasks, write_json_atomic, find_registered_by_path_identity, unique_tmp_path) \u2014 do not freeze file:NNN from the PRD-input table",
+        "Operator refuse/--force copy uses ui::emit / ui::emit_err (CONTRACT-LOG-001), never tracing",
+        "No unwrap() on filesystem or SQLite in export unless a prior invariant makes it unreachable",
+        "Reuse db::prefix::{make_like_pattern, prefix_and}; trailing-dash LIKE + ESCAPE '\\'",
+        "Comments explain why (lossy dump => --force even for same-PRD; --all keeps LIMIT 1; dest is --to-json not ctx.prd_json_path)",
+        "Do not add taskPrefix / extra keys / humanReviewOutcome to ExportedPrd",
+        "Do not deserialize dest to PrdUserStory; serialize ExportedPrd only",
+        "Pin 11 copy must never name export as JSON-sync recovery"
+      ],
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/commands/export/mod.rs",
+            "line": 0,
+            "usage": "4-arg dump-all export(); write_json_atomic .json.tmp",
+            "impact": "BREAKS",
+            "mitigation": "ExportOpts; default CLI scoped; unique_tmp_path"
+          },
+          {
+            "file": "src/commands/export/prd.rs",
+            "line": 0,
+            "usage": "load_prd_metadata LIMIT 1 always; load_tasks all unarchived",
+            "impact": "BREAKS",
+            "mitigation": "prefix LIKE + matching metadata; LIMIT 1 only on --all"
+          },
+          {
+            "file": "src/main.rs",
+            "line": 0,
+            "usage": "Commands::Export 3 fields; no lock",
+            "impact": "BREAKS",
+            "mitigation": "forward ExportOpts only; do not add LockGuard on Export arm"
+          },
+          {
+            "file": "src/cli/tests.rs",
+            "line": 0,
+            "usage": "four Commands::Export { to_json, with_progress, learnings_file } matches",
+            "impact": "BREAKS",
+            "mitigation": "US-003 / FEAT-003; cargo test -p task-mgr cli::"
+          },
+          {
+            "file": "tests/import_export.rs",
+            "line": 0,
+            "usage": "export::export(dir, path, false, None) after PrefixMode::Disabled; dest new exported.json",
+            "impact": "BREAKS",
+            "mitigation": "pass All; dest stays new file so --force not required"
+          },
+          {
+            "file": "tests/human_review_cli.rs",
+            "line": 0,
+            "usage": "CLI export --to-json exported.json after --no-prefix init",
+            "impact": "BREAKS",
+            "mitigation": "pass --all; dest stays a new file"
+          },
+          {
+            "file": "scripts/claude-loop.sh",
+            "line": 0,
+            "usage": "export --to-json \"$PRD_FILE\" || true (cleanup / per-iteration / final)",
+            "impact": "BREAKS",
+            "mitigation": "FEAT-009 remove or retarget; never --force onto $PRD_FILE"
+          },
+          {
+            "file": "src/loop_engine/prompt_sections/task_ops.rs",
+            "line": 0,
+            "usage": "jq .tasks[]",
+            "impact": "BREAKS",
+            "mitigation": "FEAT-004 .userStories[]; trim to < 2048"
+          },
+          {
+            "file": "src/loop_engine/**",
+            "line": 0,
+            "usage": "no export::export caller (prd_reconcile persists)",
+            "impact": "OK",
+            "mitigation": "do not add a loop export() call"
+          }
+        ],
+        "semanticDistinctions": [
+          {
+            "context": "init --from-json",
+            "currentBehavior": "registers PRD",
+            "requiredBehavior": "Keep: unchanged (export --from-json is pin, not import)"
+          },
+          {
+            "context": "add/update/current --from-json",
+            "currentBehavior": "PR-1/PR-2 pin dest/context",
+            "requiredBehavior": "Keep unchanged; export --from-json pins SOURCE only; dest is --to-json"
+          },
+          {
+            "context": "resolve_context Ok(None)",
+            "currentBehavior": "current stays a probe (exit 0)",
+            "requiredBehavior": "export errors unless --all (names --from-json / --all / task-mgr current); do not reuse refuse_unpinned_write"
+          },
+          {
+            "context": "LockGuard add vs export",
+            "currentBehavior": "add locks inside add(); main.rs Export arm unlocked",
+            "requiredBehavior": "export matches add: lock inside export() after dest.is_file(); main.rs stays unlocked"
+          }
+        ]
+      },
+      "notes": "dependsOn CONTRACT-001, CONTRACT-002, FEAT-002. Learning [5596]: --from-json is a pin, not an import. Learning [5642]: grep treating --from-json as a flag can false-positive. Clap tests live in src/cli/tests.rs \u2014 cargo test -p task-mgr cli::. Library PrefixMode::Disabled => All is FEAT-002, not this bullet. Do not implement update clap. Follow verify-task-mgr only on FEAT-012 / REVIEW-001.",
+      "edgeCases": [
+        ">=2 vs 0-prefix default error names three tokens",
+        "clap conflict --all --from-json",
+        "directory --from-json says export not add",
+        "unregistered names loop init",
+        "cli:: tests compile after field growth",
+        "human_review_cli.rs / model_fields_cli.rs / cli_tests.rs --all; dest new file",
+        "Two --no-prefix inits as >=2-prefix proof: forbidden (that is 0 prefixes)",
+        "--from-json does not register a PRD",
+        "Flag vs env mismatch: flag wins; dest is --to-json"
+      ],
+      "invariants": [
+        "main.rs Export arm does not LockGuard::acquire",
+        "invalid_state command-name is export",
+        "--all conflicts --from-json"
+      ],
+      "failureModes": [
+        {
+          "cause": "Clap tests still match 3-field Export",
+          "expectedBehavior": "cli:: does not compile until updated"
+        }
+      ],
+      "passes": false,
+      "requiresHuman": false
+    },
+    {
+      "id": "FEAT-004",
+      "title": "Align task_ops: .userStories[] + add --from-json + update one-liner (<2048)",
+      "taskType": "implementation",
+      "description": "Trim and rewrite the injected task_ops section so agents jq .userStories[], pin add with --from-json, and see a task-mgr update --stdin one-liner (cite PR-2; do not re-specify overlay reject). Stay under 2048 bytes. Keep every phrase test_section_contains_critical_phrases / test_section_uses_correct_path already asserts. Do not tell agents to recover JSON-sync via export.",
+      "acceptanceCriteria": [
+        "jq example uses .userStories[] (not .tasks[]) \u2014 learning #1252 / #4114 / #3332",
+        "Add example includes --from-json tasks/<prd>.json (and still --stdin / --depended-on-by / 'in response to a milestone')",
+        "One-liner for task-mgr update --stdin (cite tasks/prd-agent-task-ops-pr2.md: overlay JSON with id + whitelist fields; pin with --from-json when >=2 prefixes). Do not re-specify overlay reject rules here. Do not implement src/commands/update.rs",
+        "task_ops_section().len() < 2048. Trim existing prose as needed. Keep every phrase test_section_contains_critical_phrases / test_section_uses_correct_path already asserts (MUST NOT read or edit, past the model window, task-mgr show, NEVER, next --claim, ## Current Task, jq, task-mgr add --stdin, <task-status>, --depended-on-by, in response to a milestone, all five statuses, tasks/*.json and not .task-mgr/tasks/)",
+        "New asserts: contains .userStories[], --from-json, task-mgr update; does not contain .tasks[]; does not tell agents to recover JSON-sync via export",
+        "Suggested trim (implementer may vary, budget is the gate): drop 'For anything else \u2026 task-mgr --help'; fold priority sentence; keep the jq example to one line"
+      ],
+      "priority": 6,
+      "estimatedEffort": "medium",
+      "touchesFiles": [
+        "src/loop_engine/prompt_sections/task_ops.rs"
+      ],
+      "dependsOn": [],
+      "qualityDimensions": [
+        "Spawn-fixup form (a) stays; do not rewrite historical tasks/*-prompt.md",
+        "Do not re-implement task-mgr update; name update --stdin only (PR-2 at merge)",
+        "If PR-2 already rewrote enhance CLARIFY to update --stdin, do not redo it; after enhance agents it must survive",
+        "Cheatsheet already has add --from-json (PR-1); do not re-forbid it",
+        "task_ops jq is .userStories[] not .tasks[]; budget < 2048; keep existing critical-phrase asserts",
+        "~/.claude/docs/task-mgr-best-practices.md is not in this repo \u2014 CHANGELOG residual only",
+        "scripts/claude-loop.sh: remove or retarget $PRD_FILE dumps; never add --force onto $PRD_FILE",
+        "Do not add export() to the Rust loop engine",
+        "JSON-sync recovery copy still names current + retry --from-json, never export"
+      ],
+      "notes": "US-004. HEAD task_ops still has jq .tasks[] and no --from-json on add (budget test at test_section_size_within_budget). Learning [1252]/[4114]/[3332]/[3756]/[5615]/[1561]. PR-2 update may still be absent on this checkout \u2014 name the command anyway (author-ahead); do not stub a fake writer. Do not drive verify-task-mgr here (unit test on the section string).",
+      "edgeCases": [
+        "2027 bytes + two one-liners overflow 2048",
+        ".tasks[] leftover",
+        "pin 11 export sneaking in as JSON-sync recovery copy"
+      ],
+      "invariants": [
+        "task_ops_section().len() < 2048",
+        "does not contain .tasks[]",
+        "does not name export as JSON-sync recovery"
+      ],
+      "failureModes": [
+        {
+          "cause": "Only the add line is edited and jq stays .tasks[]",
+          "expectedBehavior": "Negative assert .tasks[] fails"
+        }
+      ],
+      "passes": false,
+      "requiresHuman": false,
+      "modifiesBehavior": false
+    },
+    {
+      "id": "FEAT-005",
+      "title": "Enhance cheat-sheet add --from-json; keep spawn-fixup (a); survive PR-2 CLARIFY",
+      "taskType": "implementation",
+      "description": "Add --from-json to the enhance CLI cheat sheet add example. Spawn-fixup form (a) stays. Do not redo PR-2 CLARIFY. After task-mgr enhance agents, the regenerated fenced block still has form (a) and (if PR-2 already rewrote it) update --stdin; it must not restore hand-edit + loop init as the field-write path.",
+      "acceptanceCriteria": [
+        "Enhance spawn-fixup form (a) --from-json tasks/<correct-prd>.json stays (already true after PR-1). Do not drop it. Do not rewrite historical tasks/*-prompt.md",
+        "Enhance CLI cheat sheet add example includes --from-json (HEAD template add example still has no --from-json). After the template rewrite, run task-mgr enhance agents (do not hand-edit inside TASK_MGR:BEGIN/END)",
+        "Do not redo PR-2's CLARIFY block. If templates already contain update --stdin CLARIFY (PR-2 at merge), leave that block. If this checkout still has embed-in-JSON + loop init CLARIFY because PR-2 has not landed, do not convert it here (do not implement update.rs) \u2014 only remaining prompt/cheatsheet/task_ops work lives on FEAT-004/006/007",
+        "Grep the regenerated fenced block: still contains spawn-fixup (a) --from-json tasks/<correct-prd>.json. If PR-2 already put update --stdin in the template, the fenced block still contains update --stdin and does not tell agents to embed humanReviewOutcome by hand-editing JSON and loop init --append --update-existing as the field-write path"
+      ],
+      "priority": 7,
+      "estimatedEffort": "medium",
+      "touchesFiles": [
+        "src/commands/enhance/templates.rs",
+        "CLAUDE.md"
+      ],
+      "dependsOn": [],
+      "qualityDimensions": [
+        "Spawn-fixup form (a) stays; do not rewrite historical tasks/*-prompt.md",
+        "Do not re-implement task-mgr update; name update --stdin only (PR-2 at merge)",
+        "If PR-2 already rewrote enhance CLARIFY to update --stdin, do not redo it; after enhance agents it must survive",
+        "Cheatsheet already has add --from-json (PR-1); do not re-forbid it",
+        "task_ops jq is .userStories[] not .tasks[]; budget < 2048; keep existing critical-phrase asserts",
+        "~/.claude/docs/task-mgr-best-practices.md is not in this repo \u2014 CHANGELOG residual only",
+        "scripts/claude-loop.sh: remove or retarget $PRD_FILE dumps; never add --force onto $PRD_FILE",
+        "Do not add export() to the Rust loop engine",
+        "JSON-sync recovery copy still names current + retry --from-json, never export"
+      ],
+      "notes": "US-005 slice. HEAD CLAUDE.md managed block still has hand-edit humanReviewOutcome CLARIFY \u2014 that is PR-2's FEAT-006. Pipeline override: assume PR-2 public surface at merge; if PR-2 already rewrote this, only remaining prompt/cheatsheet/task_ops. Never hand-edit inside TASK_MGR:BEGIN/END.",
+      "edgeCases": [
+        "form (a) dropped",
+        "Second enhance agents reverts PR-2 CLARIFY to hand-edit + loop init"
+      ],
+      "invariants": [
+        "Spawn-fixup (a) remains after enhance agents",
+        "No hand-edit inside TASK_MGR markers"
+      ],
+      "failureModes": [
+        {
+          "cause": "Hand-edit CLAUDE.md fenced block",
+          "expectedBehavior": "Next enhance agents clobbers; AC requires CLI regenerate"
+        }
+      ],
+      "passes": false,
+      "requiresHuman": false,
+      "modifiesBehavior": false
+    },
+    {
+      "id": "FEAT-006",
+      "title": "Intents where/land + view active treat --from-json as a real pin",
+      "taskType": "implementation",
+      "description": "Update intents 'where will my add land' and 'view active' so examples show task-mgr current --from-json tasks/<prd>.json as a real pin (and/or add --from-json). how.rs / intents.rs tests: those queries contain --from-json.",
+      "acceptanceCriteria": [
+        "Intents 'where will my add land': recipe shows task-mgr current --from-json tasks/<prd>.json as a real pin (and/or add --from-json). how.rs / intents.rs tests: query 'where will my add land' contains --from-json",
+        "Intents 'view active': example includes task-mgr current --from-json tasks/<prd>.json. Query 'view active' still matches; recipe still lists from-json (--from-json flag) as a real source",
+        "Do not rewrite the intents JSON-recipe update line if PR-2 already added it; do not implement update.rs here",
+        "Pin 11: these recipes must not tell agents to recover JSON-sync via export"
+      ],
+      "priority": 8,
+      "estimatedEffort": "low",
+      "touchesFiles": [
+        "src/commands/intents.rs",
+        "src/commands/how.rs",
+        "tests/cli_tests.rs"
+      ],
+      "dependsOn": [
+        "FEAT-003"
+      ],
+      "qualityDimensions": [
+        "Spawn-fixup form (a) stays; do not rewrite historical tasks/*-prompt.md",
+        "Do not re-implement task-mgr update; name update --stdin only (PR-2 at merge)",
+        "If PR-2 already rewrote enhance CLARIFY to update --stdin, do not redo it; after enhance agents it must survive",
+        "Cheatsheet already has add --from-json (PR-1); do not re-forbid it",
+        "task_ops jq is .userStories[] not .tasks[]; budget < 2048; keep existing critical-phrase asserts",
+        "~/.claude/docs/task-mgr-best-practices.md is not in this repo \u2014 CHANGELOG residual only",
+        "scripts/claude-loop.sh: remove or retarget $PRD_FILE dumps; never add --force onto $PRD_FILE",
+        "Do not add export() to the Rust loop engine",
+        "JSON-sync recovery copy still names current + retry --from-json, never export"
+      ],
+      "notes": "HEAD where/land and view active mention from-json in prose but examples are bare task-mgr current. how.rs where_will_my_add_land_points_at_task_mgr_current must grow a --from-json assert. cli_tests.rs also drives how 'where will my add land'. Learning [2236]/[5596].",
+      "edgeCases": [
+        "where/land recipe still bare current without the flag",
+        "view active stops matching after copy change",
+        "pin 11 export as recovery"
+      ],
+      "invariants": [
+        "Recipes contain --from-json as a real flag",
+        "JSON-sync recovery never names export"
+      ],
+      "failureModes": [
+        {
+          "cause": "Prose mentions from-json but example stays bare current",
+          "expectedBehavior": "Test requires the flag token in the recipe body"
+        }
+      ],
+      "passes": false,
+      "requiresHuman": false,
+      "modifiesBehavior": false
+    },
+    {
+      "id": "FEAT-007",
+      "title": "Cheatsheet update --stdin --from-json + export --force recipes",
+      "taskType": "implementation",
+      "description": "On the PR-1 baseline (add --from-json already present), add an update recipe (update --stdin --from-json) and an export recipe (default = active PRD; --all restores dump-all; registered dest needs --force). Stay <=30 curated lines. Still forbids set-status, recall --top-k, learnings show. Do not re-add add --from-json to the forbidden list.",
+      "acceptanceCriteria": [
+        "Cheatsheet CURATED_RECIPES gains an update recipe (`task-mgr update --stdin --from-json`) and an export recipe (default = active PRD; `--all` restores dump-all; registered dest needs `--force`). Do not re-specify overlay whitelist",
+        "Stay <=30 curated lines (existing unit). Still forbids set-status, recall --top-k, learnings show. Do not re-add add --from-json to the forbidden list. Existing curated_recipes_include_add_from_json_pin stays green",
+        "If Commands::Update is absent on this binary, still name `task-mgr update --stdin --from-json` in curated prose; only emit clap-parsed flag tokens that exist on this binary (cheatsheet_drift is the gate). Export `--force` / `--all` / `--from-json` tokens are in-scope (FEAT-003). Do not invent Update clap flags",
+        "Pin 11: cheatsheet must not tell operators to recover JSON-sync via export"
+      ],
+      "priority": 9,
+      "estimatedEffort": "medium",
+      "touchesFiles": [
+        "src/commands/cheatsheet.rs",
+        "tests/cheatsheet_drift.rs"
+      ],
+      "dependsOn": [
+        "FEAT-003"
+      ],
+      "qualityDimensions": [
+        "Spawn-fixup form (a) stays; do not rewrite historical tasks/*-prompt.md",
+        "Do not re-implement task-mgr update; name update --stdin only (PR-2 at merge)",
+        "If PR-2 already rewrote enhance CLARIFY to update --stdin, do not redo it; after enhance agents it must survive",
+        "Cheatsheet already has add --from-json (PR-1); do not re-forbid it",
+        "task_ops jq is .userStories[] not .tasks[]; budget < 2048; keep existing critical-phrase asserts",
+        "~/.claude/docs/task-mgr-best-practices.md is not in this repo \u2014 CHANGELOG residual only",
+        "scripts/claude-loop.sh: remove or retarget $PRD_FILE dumps; never add --force onto $PRD_FILE",
+        "Do not add export() to the Rust loop engine",
+        "JSON-sync recovery copy still names current + retry --from-json, never export"
+      ],
+      "notes": "PR-1 already flipped forbidden add --from-json and added the recipe. This PR adds update + export. CURATED_RECIPES comment says keep entry count under 16 to stay in budget \u2014 adding two bullets is OK if <=30 lines. Name update --stdin --from-json in prose even if Commands::Update is absent; cheatsheet_drift may only see flag tokens clap already parses (export --force/--all/--from-json in-scope; Update flags only if the variant exists). Do not implement update.rs. Learning [2236].",
+      "edgeCases": [
+        "cheatsheet line budget >30",
+        "re-adding add --from-json to forbidden list",
+        "drift CI fails because update clap is absent (PR-2 not merged)"
+      ],
+      "invariants": [
+        "CURATED_RECIPES.lines().count() <= 30",
+        "forbidden list is set-status / recall --top-k / learnings show only"
+      ],
+      "failureModes": [
+        {
+          "cause": "Update recipe added while clap has no Update variant",
+          "expectedBehavior": "cheatsheet_drift fails; land after PR-2 or omit the update flag tokens until then"
+        }
+      ],
+      "passes": false,
+      "requiresHuman": false,
+      "modifiesBehavior": false
+    },
+    {
+      "id": "FEAT-008",
+      "title": "Rewrite operator smash recipes + ARCHITECTURE + CHANGELOG residual",
+      "taskType": "implementation",
+      "description": "Rewrite README / INTEGRATION / QUICKSTART smash dests (live tasks/*.json / $PRD_FILE) so dest is an unregistered dump path, or the command includes --force AND a lossy-dump warning. Prefer --from-json when showing a scoped dump. Correct ARCHITECTURE 'Export PRD JSON after every iteration' to prd_reconcile / add / update; do not add export() to the Rust loop. CHANGELOG [Unreleased]: breaking default + --force + --all; residual note to copy recipes into ~/.claude/docs/task-mgr-best-practices.md \u2014 do not copy that file into the repo.",
+      "acceptanceCriteria": [
+        "Rewrite smash recipes: README.md (tasks/my-project.json and crash-recovery prd.json), docs/INTEGRATION.md (prd.json / $PRD_FILE / tasks/project.json dests), docs/QUICKSTART.md export dest. Either dest is an unregistered dump path, or the command includes --force AND a lossy-dump warning. Prefer --from-json when showing a scoped dump. Grep those files: no unguarded `export --to-json tasks/` live-path smash without --force",
+        "docs/ARCHITECTURE.md 'Export PRD JSON after every iteration': correct to loop persistence via prd_reconcile / add / update; operator export --to-json onto a registered task_list requires --force. Do not add an export() call to the Rust loop",
+        "CHANGELOG.md [Unreleased]: breaking export default + --force; --all restores dump-all. Residual note (not a code story): operator should copy spawn-fixup / add / update / export recipes into ~/.claude/docs/task-mgr-best-practices.md after merge \u2014 do not implement a copy of that file in this repo",
+        "Pin 11: rewritten docs must not tell operators to recover JSON-sync via export. Pin 21: do not rewrite historical tasks/*-prompt.md"
+      ],
+      "priority": 10,
+      "estimatedEffort": "medium",
+      "touchesFiles": [
+        "README.md",
+        "docs/INTEGRATION.md",
+        "docs/QUICKSTART.md",
+        "docs/ARCHITECTURE.md",
+        "CHANGELOG.md"
+      ],
+      "dependsOn": [
+        "FEAT-003"
+      ],
+      "qualityDimensions": [
+        "Spawn-fixup form (a) stays; do not rewrite historical tasks/*-prompt.md",
+        "Do not re-implement task-mgr update; name update --stdin only (PR-2 at merge)",
+        "If PR-2 already rewrote enhance CLARIFY to update --stdin, do not redo it; after enhance agents it must survive",
+        "Cheatsheet already has add --from-json (PR-1); do not re-forbid it",
+        "task_ops jq is .userStories[] not .tasks[]; budget < 2048; keep existing critical-phrase asserts",
+        "~/.claude/docs/task-mgr-best-practices.md is not in this repo \u2014 CHANGELOG residual only",
+        "scripts/claude-loop.sh: remove or retarget $PRD_FILE dumps; never add --force onto $PRD_FILE",
+        "Do not add export() to the Rust loop engine",
+        "JSON-sync recovery copy still names current + retry --from-json, never export"
+      ],
+      "notes": "US-005 docs slice (not claude-loop.sh \u2014 that is FEAT-009). Grep export --to-json in those files; do not freeze README:NNN. Learning [1561]/[5615]. Best-practices.md is NOT in this repo.",
+      "edgeCases": [
+        "CLI export --to-json prd.json left in README",
+        "ARCHITECTURE invents a loop export() call",
+        "CHANGELOG residual vs implementing best-practices.md in-tree",
+        "Historical tasks/*-prompt.md rewritten",
+        "pin 11 export as JSON-sync recovery in docs"
+      ],
+      "invariants": [
+        "No in-tree copy of ~/.claude/docs/task-mgr-best-practices.md",
+        "src/loop_engine still has no export::export caller"
+      ],
+      "failureModes": [
+        {
+          "cause": "Docs add --force onto live tasks/<prd>.json without lossy warning",
+          "expectedBehavior": "AC requires dump-not-merge warning when dest is a task_list"
+        }
+      ],
+      "passes": false,
+      "requiresHuman": false,
+      "modifiesBehavior": false
+    },
+    {
+      "id": "FEAT-009",
+      "title": "Retarget or remove claude-loop.sh $PRD_FILE export smash callers",
+      "taskType": "implementation",
+      "description": "scripts/claude-loop.sh is the live smash caller ARCHITECTURE describes. Remove or retarget the three export --to-json \"$PRD_FILE\" calls (cleanup / per-iteration / final). Do not add --force onto $PRD_FILE. If retargeted, dest is an unregistered dump path and the same lossy-dump warning as INTEGRATION applies.",
+      "acceptanceCriteria": [
+        "scripts/claude-loop.sh: remove or retarget the three `export --to-json \"$PRD_FILE\"` calls (cleanup, per-iteration, final). Do not add --force onto $PRD_FILE",
+        "If retargeted, dest is an unregistered dump path and the same lossy-dump warning as INTEGRATION applies",
+        "Grep: no `export --to-json \"$PRD_FILE\"` remains in scripts/claude-loop.sh",
+        "Do not add export() to the Rust loop engine to 'make ARCHITECTURE true'"
+      ],
+      "priority": 11,
+      "estimatedEffort": "low",
+      "touchesFiles": [
+        "scripts/claude-loop.sh"
+      ],
+      "dependsOn": [
+        "FEAT-008"
+      ],
+      "qualityDimensions": [
+        "Spawn-fixup form (a) stays; do not rewrite historical tasks/*-prompt.md",
+        "Do not re-implement task-mgr update; name update --stdin only (PR-2 at merge)",
+        "If PR-2 already rewrote enhance CLARIFY to update --stdin, do not redo it; after enhance agents it must survive",
+        "Cheatsheet already has add --from-json (PR-1); do not re-forbid it",
+        "task_ops jq is .userStories[] not .tasks[]; budget < 2048; keep existing critical-phrase asserts",
+        "~/.claude/docs/task-mgr-best-practices.md is not in this repo \u2014 CHANGELOG residual only",
+        "scripts/claude-loop.sh: remove or retarget $PRD_FILE dumps; never add --force onto $PRD_FILE",
+        "Do not add export() to the Rust loop engine",
+        "JSON-sync recovery copy still names current + retry --from-json, never export"
+      ],
+      "notes": "Architect High fold. HEAD three sites run export --to-json \"$PRD_FILE\" 2>/dev/null || true \u2014 after the breaking default those fail (registered dest, no --force) and crash recovery silently dies. Adding --force reopens pin 9. Grep the string, do not freeze :164.",
+      "edgeCases": [
+        "claude-loop.sh leftover export --to-json \"$PRD_FILE\"",
+        "--force onto $PRD_FILE",
+        "|| true hides the new refuse if dest stays the live PRD"
+      ],
+      "invariants": [
+        "Grep scripts/claude-loop.sh: no export --to-json \"$PRD_FILE\""
+      ],
+      "failureModes": [
+        {
+          "cause": "Add --force onto $PRD_FILE",
+          "expectedBehavior": "Pin 9 violated; AC forbids it"
+        }
+      ],
+      "passes": false,
+      "requiresHuman": false,
+      "modifiesBehavior": false
+    },
+    {
+      "id": "FEAT-010",
+      "title": "Worktree dest identity rust tests for export --to-json",
+      "taskType": "implementation",
+      "description": "Live-path tests following tests/worktree_db_resolution.rs (spawn git worktree add); not the verify-task-mgr sandbox. --to-json of the worktree task-list counts as a registered dest (--force required); write that PATH (never remapped away); main JSON unchanged; DB still main-repo .task-mgr.",
+      "acceptanceCriteria": [
+        "Live-path tests following tests/worktree_db_resolution.rs (spawn git worktree add); not the verify-task-mgr sandbox",
+        "Worktree file exists + --to-json <worktree>/tasks/foo.json without --force => refuse; worktree bytes identical; main JSON identical",
+        "Same dest + --force => worktree file replaced (lossy); main JSON unchanged (--to-json was the worktree PATH, never remapped away)",
+        "--to-json of an unregistered path from worktree cwd => no --force",
+        "DB anchoring unchanged: rows still in main-repo .task-mgr",
+        "--from-json of the worktree file (registered via pin 19 (c)) scopes the source; dest is still --to-json"
+      ],
+      "priority": 12,
+      "estimatedEffort": "high",
+      "touchesFiles": [
+        "tests/worktree_export_dest.rs"
+      ],
+      "dependsOn": [
+        "CONTRACT-002",
+        "FEAT-002",
+        "FEAT-003"
+      ],
+      "qualityDimensions": [
+        "Pins 8/9/18 are law: default = active PRD; --all = today's dump; registered dest always needs --force (lossy dump, not merge)",
+        "Reuse resolve_context / paths_identify / find_registered_by_path_identity / unique_tmp_path; do not reimplement remap or add exists() to startup",
+        "export must not import add/update or call preflight_from_json_path; prd_json must not import export; main.rs Export arm must not LockGuard::acquire",
+        "Do not call refuse_unpinned_write for export default (wrong copy; current stays a probe)",
+        "Grep symbols (load_prd_metadata, load_tasks, write_json_atomic, find_registered_by_path_identity, unique_tmp_path) \u2014 do not freeze file:NNN from the PRD-input table",
+        "Operator refuse/--force copy uses ui::emit / ui::emit_err (CONTRACT-LOG-001), never tracing",
+        "No unwrap() on filesystem or SQLite in export unless a prior invariant makes it unreachable",
+        "Reuse db::prefix::{make_like_pattern, prefix_and}; trailing-dash LIKE + ESCAPE '\\'",
+        "Comments explain why (lossy dump => --force even for same-PRD; --all keeps LIMIT 1; dest is --to-json not ctx.prd_json_path)",
+        "Do not add taskPrefix / extra keys / humanReviewOutcome to ExportedPrd",
+        "Do not deserialize dest to PrdUserStory; serialize ExportedPrd only",
+        "Pin 11 copy must never name export as JSON-sync recovery"
+      ],
+      "notes": "US-006. touchesFiles is tests/worktree_export_dest.rs only. Follow tests/worktree_db_resolution.rs as a read-only pattern (spawn git worktree add); do not edit it. Learning [5654]/[4237]. Existing worktree_db_resolution.rs DB-anchoring tests stay green. Do not claim these cases via verify-task-mgr (sandboxes are not linked worktrees).",
+      "edgeCases": [
+        "worktree dest vs main dest",
+        "--from-json source vs --to-json dest",
+        "DB still main checkout",
+        "Dest is worktree remapped copy of a task_list",
+        "Dest is main registered path, cwd is worktree: writes the PATH given; --force if that PATH identifies"
+      ],
+      "invariants": [
+        "--to-json PATH is never remapped",
+        "DB rows remain in main-repo .task-mgr"
+      ],
+      "failureModes": [
+        {
+          "cause": "Dest run through cli_write_path",
+          "expectedBehavior": "Main JSON smashed or worktree missed; US-006 --force-on-worktree-path fails"
+        }
+      ],
+      "passes": false,
+      "requiresHuman": false,
+      "modifiesBehavior": false
+    },
+    {
+      "id": "FEAT-011",
+      "title": "Create verify-task-mgr feature recipe export-scoped-and-force",
+      "taskType": "implementation",
+      "description": "Create .claude/skills/verify-task-mgr/features/export-scoped-and-force.md following features/README.md (Sub-features, How to get to it, Driving it, Gotchas) BEFORE any drive AC. Link it from features/README.md. Do not drive the skill in this task.",
+      "acceptanceCriteria": [
+        "Create .claude/skills/verify-task-mgr/features/export-scoped-and-force.md following features/README.md (H1 + one paragraph, then exactly four H2: Sub-features, How to get to it (user POV), Driving it with verify-task-mgr, Gotchas). Link it from features/README.md",
+        "Recipe covers: single-prefix default dump to a new file; --to-json onto the registered PRD path without --force refuses (dest unchanged); --force replaces dest (lossy: no taskPrefix); --all on a two-prefix DB dumps both; default export with >=2 prefixes and no pin errors naming --from-json, --all, and current; --all --from-json clap-fails; --from-json pin dumps only that prefix; zero-prefix DB default errors (same three names), --all works; export --help says pin. >=2-prefix proof is two loop inits without --no-prefix",
+        "Gotchas: helper unsets TASK_MGR_ACTIVE_PREFIX; do not prove >=2 with two --no-prefix; dest-new-file vs dest-registered; worktree dest-identity is FEAT-010 rust tests not this harness; do not drive loop run / batch run; task_ops is a unit test not this harness",
+        "This task does not drive the skill (drive is FEAT-012). Compile/unit tests alone do not satisfy US-007 \u2014 they are not this story either"
+      ],
+      "priority": 12,
+      "estimatedEffort": "medium",
+      "touchesFiles": [
+        ".claude/skills/verify-task-mgr/features/export-scoped-and-force.md",
+        ".claude/skills/verify-task-mgr/features/README.md"
+      ],
+      "dependsOn": [
+        "FEAT-003"
+      ],
+      "qualityDimensions": [
+        "Pins 8/9/18 are law: default = active PRD; --all = today's dump; registered dest always needs --force (lossy dump, not merge)",
+        "Reuse resolve_context / paths_identify / find_registered_by_path_identity / unique_tmp_path; do not reimplement remap or add exists() to startup",
+        "export must not import add/update or call preflight_from_json_path; prd_json must not import export; main.rs Export arm must not LockGuard::acquire",
+        "Do not call refuse_unpinned_write for export default (wrong copy; current stays a probe)",
+        "Grep symbols (load_prd_metadata, load_tasks, write_json_atomic, find_registered_by_path_identity, unique_tmp_path) \u2014 do not freeze file:NNN from the PRD-input table",
+        "Operator refuse/--force copy uses ui::emit / ui::emit_err (CONTRACT-LOG-001), never tracing",
+        "No unwrap() on filesystem or SQLite in export unless a prior invariant makes it unreachable",
+        "Reuse db::prefix::{make_like_pattern, prefix_and}; trailing-dash LIKE + ESCAPE '\\'",
+        "Comments explain why (lossy dump => --force even for same-PRD; --all keeps LIMIT 1; dest is --to-json not ctx.prd_json_path)",
+        "Do not add taskPrefix / extra keys / humanReviewOutcome to ExportedPrd",
+        "Do not deserialize dest to PrdUserStory; serialize ExportedPrd only",
+        "Pin 11 copy must never name export as JSON-sync recovery",
+        "Feature file names only user paths, stable handles, required state, commands, and observable proof",
+        "Follow add-and-current-from-json.md as the shape; do not invent a second harness"
+      ],
+      "notes": "US-007 create-then-drive split. Skill path: .claude/skills/verify-task-mgr/SKILL.md. H=.claude/skills/verify-task-mgr/scripts/verify-task-mgr. Learning [5641] pin-init JSON spacing; [5642] grep --from-json. Priority 12 matches FEAT-010 (different files; no write conflict).",
+      "edgeCases": [
+        "Skill-drive before feature file exists \u2014 this task creates only",
+        "Helper unsets TASK_MGR_ACTIVE_PREFIX",
+        ">=2-prefix proof is two prefixed inits, never --no-prefix twice",
+        "dest-new-file vs dest-registered"
+      ],
+      "invariants": [
+        "Feature file exists before FEAT-012 drive",
+        "No loop run / batch run in the recipe"
+      ],
+      "failureModes": [
+        {
+          "cause": "Drive AC placed on this task",
+          "expectedBehavior": "PRD forbids drive before the file exists; split is the mitigation"
+        }
+      ],
+      "passes": false,
+      "requiresHuman": false,
+      "modifiesBehavior": false
+    },
+    {
+      "id": "CODE-REVIEW-1",
+      "title": "Review scoped export, overwrite-guard, clap, docs wiring, and contracts",
+      "taskType": "review",
+      "description": "Review remapper-reuse, identity prd_id, ExportOpts, LockGuard site, clap pin help, library All callers, task_ops budget, enhance/intents/cheatsheet/docs/claude-loop, worktree dest tests, and the verify feature file. Spawn CODE-FIX / WIRE-FIX via task-mgr add --stdin --from-json tasks/agent-task-ops-pr3.json --depended-on-by REVIEW-001.",
+      "acceptanceCriteria": [
+        "Grep export/: no cli_write_path; no WHERE task_prefix IS NULL; no invalid_state command-name add; no preflight_from_json_path; write_json_atomic uses unique_tmp_path",
+        "Grep main.rs Export arm: no LockGuard::acquire. Lock only inside export() after dest.is_file()",
+        "Grep src/loop_engine: no export::export call. Grep scripts/claude-loop.sh: no export --to-json \"$PRD_FILE\"",
+        "task_ops.len() < 2048; contains .userStories[]; does not contain .tasks[]; does not name export as JSON-sync recovery",
+        "Enhance fenced block still has spawn-fixup (a); if PR-2 CLARIFY is update --stdin it survived enhance agents",
+        "qualityDimensions met; unwrap()/error propagation/injection reviewed; CONTRACT-001/002 respected; no remapper rewrite; no update.rs writer",
+        "Any issues found have corresponding CODE-FIX-xxx / WIRE-FIX-xxx tasks added via task-mgr add --stdin --from-json tasks/agent-task-ops-pr3.json --depended-on-by REVIEW-001",
+        "When a verif* skill covers the issue, set verifyCommand to that skill's drive, not a unit-test invocation"
+      ],
+      "priority": 13,
+      "estimatedEffort": "high",
+      "touchesFiles": [
+        "src/commands/export/mod.rs",
+        "src/commands/export/prd.rs",
+        "src/commands/context.rs",
+        "src/cli/commands.rs",
+        "src/main.rs",
+        "src/loop_engine/prompt_sections/task_ops.rs",
+        "scripts/claude-loop.sh"
+      ],
+      "dependsOn": [
+        "CONTRACT-001",
+        "CONTRACT-002",
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "FEAT-005",
+        "FEAT-006",
+        "FEAT-007",
+        "FEAT-008",
+        "FEAT-009",
+        "FEAT-010",
+        "FEAT-011"
+      ],
+      "qualityDimensions": [
+        "Pins 8/9/18 are law: default = active PRD; --all = today's dump; registered dest always needs --force (lossy dump, not merge)",
+        "Reuse resolve_context / paths_identify / find_registered_by_path_identity / unique_tmp_path; do not reimplement remap or add exists() to startup",
+        "export must not import add/update or call preflight_from_json_path; prd_json must not import export; main.rs Export arm must not LockGuard::acquire",
+        "Do not call refuse_unpinned_write for export default (wrong copy; current stays a probe)",
+        "Grep symbols (load_prd_metadata, load_tasks, write_json_atomic, find_registered_by_path_identity, unique_tmp_path) \u2014 do not freeze file:NNN from the PRD-input table",
+        "Operator refuse/--force copy uses ui::emit / ui::emit_err (CONTRACT-LOG-001), never tracing",
+        "No unwrap() on filesystem or SQLite in export unless a prior invariant makes it unreachable",
+        "Reuse db::prefix::{make_like_pattern, prefix_and}; trailing-dash LIKE + ESCAPE '\\'",
+        "Comments explain why (lossy dump => --force even for same-PRD; --all keeps LIMIT 1; dest is --to-json not ctx.prd_json_path)",
+        "Do not add taskPrefix / extra keys / humanReviewOutcome to ExportedPrd",
+        "Do not deserialize dest to PrdUserStory; serialize ExportedPrd only",
+        "Pin 11 copy must never name export as JSON-sync recovery",
+        "Spawn-fixup form (a) stays; do not rewrite historical tasks/*-prompt.md",
+        "Do not re-implement task-mgr update; name update --stdin only (PR-2 at merge)",
+        "If PR-2 already rewrote enhance CLARIFY to update --stdin, do not redo it; after enhance agents it must survive",
+        "Cheatsheet already has add --from-json (PR-1); do not re-forbid it",
+        "task_ops jq is .userStories[] not .tasks[]; budget < 2048; keep existing critical-phrase asserts",
+        "~/.claude/docs/task-mgr-best-practices.md is not in this repo \u2014 CHANGELOG residual only",
+        "scripts/claude-loop.sh: remove or retarget $PRD_FILE dumps; never add --force onto $PRD_FILE",
+        "Do not add export() to the Rust loop engine",
+        "JSON-sync recovery copy still names current + retry --from-json, never export"
+      ],
+      "notes": "For each issue: echo '{...}' | task-mgr add --stdin --from-json tasks/agent-task-ops-pr3.json --depended-on-by REVIEW-001. If no issues, emit <task-status>CODE-REVIEW-1:done</task-status> with a one-line progress note. Do not implement. estimatedEffort high; review-class is frontier-forced.",
+      "passes": false,
+      "requiresHuman": false,
+      "modifiesBehavior": false
+    },
+    {
+      "id": "FEAT-012",
+      "title": "Drive verify-task-mgr export-scoped-and-force sandbox proof",
+      "taskType": "implementation",
+      "description": "Drive .claude/skills/verify-task-mgr/SKILL.md feature export-scoped-and-force after the recipe exists and export clap/guard ship. Capture artifacts. Compile/unit tests alone are not proof. Worktree dest cases are FEAT-010.",
+      "acceptanceCriteria": [
+        "Drive via .claude/skills/verify-task-mgr/SKILL.md feature export-scoped-and-force (Read SKILL.md + features/export-scoped-and-force.md). H=.claude/skills/verify-task-mgr/scripts/verify-task-mgr. launch, sandbox-new, doctor isolation ok before drive",
+        "Proof artifacts kept under .claude/skills/verify-task-mgr/artifacts/<run-id>/: single-prefix default dump to a new file (task count = that PRD); --to-json onto the registered PRD path without --force is non-zero and dest unchanged; --force replaces dest (lossy: no taskPrefix); --all on a two-prefix DB dumps both prefixes' tasks; default export with >=2 prefixes and no pin is non-zero and names --from-json, --all, and current; --all --from-json clap-fails; --from-json pin dumps only that prefix; zero-prefix DB default errors (same three names), --all works; export --help says pin. >=2-prefix proof is two loop inits without --no-prefix",
+        "Worktree dest-identity cases are not claimed via this harness (FEAT-010 rust tests). Do not drive loop run / batch run. task_ops not in this harness (unit test)",
+        "Compile/unit tests alone do not satisfy this story. After cleanup, artifacts still exist. Drive <skill-path> feature export-scoped-and-force per SKILL.md; evidence captured"
+      ],
+      "priority": 14,
+      "estimatedEffort": "high",
+      "touchesFiles": [
+        ".claude/skills/verify-task-mgr/features/export-scoped-and-force.md"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-011",
+        "CODE-REVIEW-1"
+      ],
+      "qualityDimensions": [
+        "Pins 8/9/18 are law: default = active PRD; --all = today's dump; registered dest always needs --force (lossy dump, not merge)",
+        "Reuse resolve_context / paths_identify / find_registered_by_path_identity / unique_tmp_path; do not reimplement remap or add exists() to startup",
+        "export must not import add/update or call preflight_from_json_path; prd_json must not import export; main.rs Export arm must not LockGuard::acquire",
+        "Do not call refuse_unpinned_write for export default (wrong copy; current stays a probe)",
+        "Grep symbols (load_prd_metadata, load_tasks, write_json_atomic, find_registered_by_path_identity, unique_tmp_path) \u2014 do not freeze file:NNN from the PRD-input table",
+        "Operator refuse/--force copy uses ui::emit / ui::emit_err (CONTRACT-LOG-001), never tracing",
+        "No unwrap() on filesystem or SQLite in export unless a prior invariant makes it unreachable",
+        "Reuse db::prefix::{make_like_pattern, prefix_and}; trailing-dash LIKE + ESCAPE '\\'",
+        "Comments explain why (lossy dump => --force even for same-PRD; --all keeps LIMIT 1; dest is --to-json not ctx.prd_json_path)",
+        "Do not add taskPrefix / extra keys / humanReviewOutcome to ExportedPrd",
+        "Do not deserialize dest to PrdUserStory; serialize ExportedPrd only",
+        "Pin 11 copy must never name export as JSON-sync recovery",
+        "Follow SKILL.md literally; do not invent a second harness",
+        "Helper injects --dir and isolated HOME; do not use PATH task-mgr"
+      ],
+      "notes": "US-007 drive. Drive SKILL.md; do not edit it. Keep/update the feature file only if the drive proves a recipe hole. Helper unsets TASK_MGR_ACTIVE_PREFIX. Learning [5641]/[5642]. If you cannot launch or a precondition fails, emit <promise>BLOCKED</promise> rather than marking done.",
+      "edgeCases": [
+        "helper unsets TASK_MGR_ACTIVE_PREFIX",
+        ">=2-prefix proof is two prefixed inits",
+        "create recipe then drive",
+        "dest-new-file vs dest-registered"
+      ],
+      "invariants": [
+        "Artifacts survive cleanup",
+        "No worktree claims via this harness"
+      ],
+      "failureModes": [
+        {
+          "cause": "Two --no-prefix inits used as >=2 proof",
+          "expectedBehavior": "Default error never fires; recipe gotcha forbids it"
+        }
+      ],
+      "passes": false,
+      "requiresHuman": false,
+      "modifiesBehavior": false
+    },
+    {
+      "id": "REFACTOR-REVIEW-FINAL",
+      "title": "Final refactor review of export scope/guard and docs alignment",
+      "taskType": "review",
+      "description": "Full-context pass: DRY, complexity, coupling budget (export \u219b add; prd_json \u219b export; startup \u219b overwrite-guard; main.rs \u219b LockGuard on Export), clarity, contract fidelity.",
+      "acceptanceCriteria": [
+        "Coupling budget holds: export does not import add/update; prd_json does not import export; startup does not call overwrite-guard; main.rs Export arm does not LockGuard::acquire; --from-json does not call init / register_prd_files",
+        "No duplicate LIKE escaping; identity not reimplemented in export/; unique_tmp_path not copied",
+        "Docs/prompt surfaces tell the same pin / --force / .userStories[] story without pin 11 naming export",
+        "Any issues found have corresponding REFACTOR-xxx tasks added via task-mgr add --stdin --from-json tasks/agent-task-ops-pr3.json --depended-on-by REVIEW-001"
+      ],
+      "priority": 70,
+      "estimatedEffort": "high",
+      "touchesFiles": [
+        "src/commands/export/mod.rs",
+        "src/commands/export/prd.rs",
+        "src/commands/context.rs",
+        "src/loop_engine/prompt_sections/task_ops.rs"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "FEAT-005",
+        "FEAT-006",
+        "FEAT-007",
+        "FEAT-008",
+        "FEAT-009",
+        "FEAT-010",
+        "FEAT-011",
+        "FEAT-012",
+        "CODE-REVIEW-1"
+      ],
+      "qualityDimensions": [
+        "Pins 8/9/18 are law: default = active PRD; --all = today's dump; registered dest always needs --force (lossy dump, not merge)",
+        "Reuse resolve_context / paths_identify / find_registered_by_path_identity / unique_tmp_path; do not reimplement remap or add exists() to startup",
+        "export must not import add/update or call preflight_from_json_path; prd_json must not import export; main.rs Export arm must not LockGuard::acquire",
+        "Do not call refuse_unpinned_write for export default (wrong copy; current stays a probe)",
+        "Grep symbols (load_prd_metadata, load_tasks, write_json_atomic, find_registered_by_path_identity, unique_tmp_path) \u2014 do not freeze file:NNN from the PRD-input table",
+        "Operator refuse/--force copy uses ui::emit / ui::emit_err (CONTRACT-LOG-001), never tracing",
+        "No unwrap() on filesystem or SQLite in export unless a prior invariant makes it unreachable",
+        "Reuse db::prefix::{make_like_pattern, prefix_and}; trailing-dash LIKE + ESCAPE '\\'",
+        "Comments explain why (lossy dump => --force even for same-PRD; --all keeps LIMIT 1; dest is --to-json not ctx.prd_json_path)",
+        "Do not add taskPrefix / extra keys / humanReviewOutcome to ExportedPrd",
+        "Do not deserialize dest to PrdUserStory; serialize ExportedPrd only",
+        "Pin 11 copy must never name export as JSON-sync recovery",
+        "Spawn-fixup form (a) stays; do not rewrite historical tasks/*-prompt.md",
+        "Do not re-implement task-mgr update; name update --stdin only (PR-2 at merge)",
+        "If PR-2 already rewrote enhance CLARIFY to update --stdin, do not redo it; after enhance agents it must survive",
+        "Cheatsheet already has add --from-json (PR-1); do not re-forbid it",
+        "task_ops jq is .userStories[] not .tasks[]; budget < 2048; keep existing critical-phrase asserts",
+        "~/.claude/docs/task-mgr-best-practices.md is not in this repo \u2014 CHANGELOG residual only",
+        "scripts/claude-loop.sh: remove or retarget $PRD_FILE dumps; never add --force onto $PRD_FILE",
+        "Do not add export() to the Rust loop engine",
+        "JSON-sync recovery copy still names current + retry --from-json, never export"
+      ],
+      "notes": "If no issues, emit status with a one-line progress note. Do not implement.",
+      "passes": false,
+      "requiresHuman": false,
+      "modifiesBehavior": false
+    },
+    {
+      "id": "REVIEW-001",
+      "title": "Final gate: full suite + mapped verify-task-mgr drive",
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "description": "Milestone. Full unscoped quality gate. Drive export-scoped-and-force. Leave the trunk green including pre-existing failures.",
+      "acceptanceCriteria": [
+        "Full unscoped suite green: cargo fmt --check && cargo check && cargo clippy --all-targets -- -D warnings && cargo test (including pre-existing failures \u2014 fix or spawn FIX via add --stdin --from-json tasks/agent-task-ops-pr3.json --depended-on-by REVIEW-001)",
+        "Drive verify-task-mgr feature export-scoped-and-force per SKILL.md; every listed sub-feature is proven or reported skipped (not verified via a sibling path). Artifacts kept",
+        "Success metrics from the PRD hold: two-prefix default error names three tokens; --from-json A scopes tasks+metadata; --all restores dump-all LIMIT 1; clap conflict; registered dest needs --force; --force is lossy; worktree dest rust tests; zero-prefix default errors and --all dumps; task_ops < 2048 with .userStories[]; how where/land contains --from-json; spawn-fixup (a) and PR-2 update --stdin CLARIFY still in fenced block if PR-2 landed",
+        "Grep guards: export/ no cli_write_path / no WHERE task_prefix IS NULL / no invalid_state add; main.rs Export arm no LockGuard; claude-loop.sh no export --to-json \"$PRD_FILE\"; no in-tree best-practices.md copy; no historical tasks/*-prompt.md rewrites",
+        "Any remaining issues spawned as FIX via task-mgr add --stdin --from-json tasks/agent-task-ops-pr3.json --depended-on-by REVIEW-001; do not edit tasks/*.json by hand"
+      ],
+      "priority": 99,
+      "estimatedEffort": "high",
+      "touchesFiles": [
+        "src/commands/export/mod.rs",
+        "src/cli/commands.rs",
+        ".claude/skills/verify-task-mgr/features/export-scoped-and-force.md",
+        "scripts/claude-loop.sh"
+      ],
+      "dependsOn": [
+        "CONTRACT-001",
+        "CONTRACT-002",
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "FEAT-005",
+        "FEAT-006",
+        "FEAT-007",
+        "FEAT-008",
+        "FEAT-009",
+        "FEAT-010",
+        "FEAT-011",
+        "FEAT-012",
+        "CODE-REVIEW-1",
+        "REFACTOR-REVIEW-FINAL"
+      ],
+      "qualityDimensions": [
+        "Pins 8/9/18 are law: default = active PRD; --all = today's dump; registered dest always needs --force (lossy dump, not merge)",
+        "Reuse resolve_context / paths_identify / find_registered_by_path_identity / unique_tmp_path; do not reimplement remap or add exists() to startup",
+        "export must not import add/update or call preflight_from_json_path; prd_json must not import export; main.rs Export arm must not LockGuard::acquire",
+        "Do not call refuse_unpinned_write for export default (wrong copy; current stays a probe)",
+        "Grep symbols (load_prd_metadata, load_tasks, write_json_atomic, find_registered_by_path_identity, unique_tmp_path) \u2014 do not freeze file:NNN from the PRD-input table",
+        "Operator refuse/--force copy uses ui::emit / ui::emit_err (CONTRACT-LOG-001), never tracing",
+        "No unwrap() on filesystem or SQLite in export unless a prior invariant makes it unreachable",
+        "Reuse db::prefix::{make_like_pattern, prefix_and}; trailing-dash LIKE + ESCAPE '\\'",
+        "Comments explain why (lossy dump => --force even for same-PRD; --all keeps LIMIT 1; dest is --to-json not ctx.prd_json_path)",
+        "Do not add taskPrefix / extra keys / humanReviewOutcome to ExportedPrd",
+        "Do not deserialize dest to PrdUserStory; serialize ExportedPrd only",
+        "Pin 11 copy must never name export as JSON-sync recovery",
+        "Spawn-fixup form (a) stays; do not rewrite historical tasks/*-prompt.md",
+        "Do not re-implement task-mgr update; name update --stdin only (PR-2 at merge)",
+        "If PR-2 already rewrote enhance CLARIFY to update --stdin, do not redo it; after enhance agents it must survive",
+        "Cheatsheet already has add --from-json (PR-1); do not re-forbid it",
+        "task_ops jq is .userStories[] not .tasks[]; budget < 2048; keep existing critical-phrase asserts",
+        "~/.claude/docs/task-mgr-best-practices.md is not in this repo \u2014 CHANGELOG residual only",
+        "scripts/claude-loop.sh: remove or retarget $PRD_FILE dumps; never add --force onto $PRD_FILE",
+        "Do not add export() to the Rust loop engine",
+        "JSON-sync recovery copy still names current + retry --from-json, never export"
+      ],
+      "notes": "REVIEW-001 is the milestone. timeoutSecs 1800. Review-class => frontier-forced. Do not implement new features here unless fixing gate failures.",
+      "passes": false,
+      "requiresHuman": false,
+      "modifiesBehavior": false
+    }
+  ]
+}
