@@ -35,24 +35,22 @@ re-reads.
 (statuses: `done`, `failed`, `skipped`, `irrelevant`, `blocked`). The loop
 engine parses these and applies them via `task-mgr`.
 - **Look up another task**: ALWAYS prefer `task-mgr show <task-id>` (or
-`task-mgr list` / `task-mgr next`) — these cover almost every read. Only
-as a last resort, if the CLI can't give you what you need, use `jq` to pull
-just the field(s) — e.g.
-`jq '.tasks[]|select(.id=="FEAT-007")|{id,title,acceptanceCriteria}' tasks/<prd>.json`.
+`task-mgr list` / `task-mgr next`). Last resort: `jq` for a field slice —
+e.g. `jq '.userStories[]|select(.id=="FEAT-007")|{id,title,acceptanceCriteria}' tasks/<prd>.json`.
 Never `cat`, `Read`, or `grep` the whole file.
 - **List tasks / check status**: `task-mgr list`, `task-mgr next`.
-- **Add a new task** (review fix / refactor / follow-up): pipe a single task
-JSON to `task-mgr add --stdin`. Example:
+- **Add a new task** (review fix / refactor / follow-up): pipe JSON to
+`task-mgr add --stdin` (pin with `--from-json tasks/<prd>.json`; priority
+is auto-computed). Example:
 
       echo '{"id":"CODE-FIX-001","title":"Fix race in X","difficulty":"medium","touchesFiles":["src/foo.rs"],"dependsOn":[]}' \\
-        | task-mgr add --stdin
+        | task-mgr add --stdin --from-json tasks/<prd>.json
 
-Priority is auto-computed; omit for lower priority.
 - **Fix in response to a milestone**: pass `--depended-on-by <id>`.
-- **Auto-prefix**: loop exports `TASK_MGR_ACTIVE_PREFIX`; bare IDs are
+- **Update whitelist fields**: overlay JSON with `id` + fields →
+`task-mgr update --stdin` (pin with `--from-json` when ≥2 prefixes).
+- **Auto-prefix**: loop sets `TASK_MGR_ACTIVE_PREFIX`; bare IDs are
 auto-prefixed to the active PRD. Cross-PRD IDs are rejected.
-- For anything else (dependencies, status queries, etc.), use the `task-mgr`
-CLI — see `task-mgr --help`.
 
 ## Relevant Learnings
 
