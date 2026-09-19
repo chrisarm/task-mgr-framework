@@ -1069,3 +1069,311 @@ fn test_export_round_trips_completed_by_provider() {
         "completedByProvider must not appear in JSON for NULL row"
     );
 }
+
+// ============================================================================
+// FEAT-001: scoped load_tasks / load_prd_metadata + identity prd_id
+// ============================================================================
+
+fn seed_task(conn: &rusqlite::Connection, id: &str, title: &str) {
+    conn.execute(
+        "INSERT INTO tasks (id, title, status) VALUES (?, ?, 'todo')",
+        rusqlite::params![id, title],
+    )
+    .unwrap();
+}
+
+fn seed_prd_meta(
+    conn: &rusqlite::Connection,
+    id: i64,
+    project: &str,
+    branch: Option<&str>,
+    task_prefix: Option<&str>,
+) {
+    conn.execute(
+        "INSERT INTO prd_metadata (id, project, branch_name, task_prefix) VALUES (?, ?, ?, ?)",
+        rusqlite::params![id, project, branch, task_prefix],
+    )
+    .unwrap();
+}
+
+fn seed_task_list_file(conn: &rusqlite::Connection, prd_id: i64, file_path: &std::path::Path) {
+    conn.execute(
+        "INSERT INTO prd_files (prd_id, file_path, file_type) VALUES (?, ?, 'task_list')",
+        rusqlite::params![prd_id, file_path.to_str().unwrap()],
+    )
+    .unwrap();
+}
+
+#[test]
+fn test_load_tasks_scoped_two_prefixes() {
+    // Dual-PRD fixtures need unique story ids (learning #5605).
+    let temp_dir = TempDir::new().unwrap();
+    let mut conn = open_connection(temp_dir.path()).unwrap();
+    create_schema(&conn).unwrap();
+    run_migrations(&mut conn).unwrap();
+
+    seed_prd_meta(&conn, 1, "project-b", Some("branch-b"), Some("B"));
+    seed_prd_meta(&conn, 2, "project-a", Some("branch-a"), Some("A"));
+    seed_task(&conn, "A-001", "A task");
+    seed_task(&conn, "A-002", "A task 2");
+    seed_task(&conn, "B-001", "B task");
+
+    let scoped = prd::load_tasks(&conn, Some("A")).unwrap();
+    assert_eq!(scoped.len(), 2);
+    assert!(scoped.iter().all(|t| t.id.starts_with("A-")));
+    assert!(scoped.iter().all(|t| !t.id.starts_with("B-")));
+
+    let meta_a = prd::load_prd_metadata(&conn, prd::MetadataScope::NamedPrefix("A")).unwrap();
+    assert_eq!(meta_a.project, "project-a");
+    assert_eq!(meta_a.branch_name.as_deref(), Some("branch-a"));
+}
+
+#[test]
+fn test_load_prd_metadata_by_prd_id_two_no_prefix() {
+    // Two --no-prefix inits: LIMIT 1 / IS NULL would stamp the wrong row.
+    let temp_dir = TempDir::new().unwrap();
+    let mut conn = open_connection(temp_dir.path()).unwrap();
+    create_schema(&conn).unwrap();
+    run_migrations(&mut conn).unwrap();
+
+    let file_a = temp_dir.path().join("a.json");
+    let file_b = temp_dir.path().join("b.json");
+    fs::write(&file_a, r#"{"project":"proj-a","userStories":[]}"#).unwrap();
+    fs::write(&file_b, r#"{"project":"proj-b","userStories":[]}"#).unwrap();
+    let canon_b = file_b.canonicalize().unwrap();
+
+    // A gets lower id so LIMIT 1 would pick A.
+    seed_prd_meta(&conn, 1, "proj-a", Some("branch-a"), None);
+    seed_prd_meta(&conn, 2, "proj-b", Some("branch-b"), None);
+    seed_task_list_file(&conn, 1, &file_a.canonicalize().unwrap());
+    seed_task_list_file(&conn, 2, &canon_b);
+
+    let hit = crate::commands::context::find_registered_by_path_identity(
+        &conn,
+        &canon_b,
+        Some(temp_dir.path()),
+        Some(temp_dir.path()),
+    )
+    .unwrap()
+    .expect("file B must identity-match");
+    assert_eq!(hit.0, 2);
+    assert_eq!(hit.1, None);
+
+    let meta_b = prd::load_prd_metadata(&conn, prd::MetadataScope::ByPrdId(hit.0)).unwrap();
+    assert_eq!(meta_b.project, "proj-b");
+    assert_eq!(meta_b.branch_name.as_deref(), Some("branch-b"));
+
+    // Unscoped still LIMIT 1 → A's row.
+    let unscoped = prd::load_prd_metadata(&conn, prd::MetadataScope::Unscoped).unwrap();
+    assert_eq!(unscoped.project, "proj-a");
+}
+
+#[test]
+fn test_load_all_helpers_two_prefix_db() {
+    let temp_dir = TempDir::new().unwrap();
+    let mut conn = open_connection(temp_dir.path()).unwrap();
+    create_schema(&conn).unwrap();
+    run_migrations(&mut conn).unwrap();
+
+    seed_prd_meta(&conn, 1, "project-a", Some("branch-a"), Some("A"));
+    seed_prd_meta(&conn, 2, "project-b", Some("branch-b"), Some("B"));
+    seed_task(&conn, "A-001", "A");
+    seed_task(&conn, "B-001", "B");
+    seed_task(&conn, "B-002", "B2");
+
+    let all = prd::load_tasks(&conn, None).unwrap();
+    assert_eq!(all.len(), 3, "--all helpers: task count = A+B unarchived");
+
+    let meta = prd::load_prd_metadata(&conn, prd::MetadataScope::Unscoped).unwrap();
+    assert_eq!(
+        meta.project, "project-a",
+        "--all metadata stays ORDER BY id LIMIT 1"
+    );
+}
+
+#[test]
+fn test_load_tasks_excludes_archived_scoped_and_all() {
+    let temp_dir = TempDir::new().unwrap();
+    let mut conn = open_connection(temp_dir.path()).unwrap();
+    create_schema(&conn).unwrap();
+    run_migrations(&mut conn).unwrap();
+
+    seed_task(&conn, "A-001", "live");
+    seed_task(&conn, "A-002", "archived");
+    seed_task(&conn, "B-001", "other");
+    conn.execute(
+        "UPDATE tasks SET archived_at = datetime('now') WHERE id = 'A-002'",
+        [],
+    )
+    .unwrap();
+
+    let scoped = prd::load_tasks(&conn, Some("A")).unwrap();
+    assert_eq!(scoped.len(), 1);
+    assert_eq!(scoped[0].id, "A-001");
+
+    let all = prd::load_tasks(&conn, None).unwrap();
+    assert_eq!(all.len(), 2);
+    assert!(all.iter().all(|t| t.id != "A-002"));
+}
+
+#[test]
+fn test_load_tasks_prefix_underscore_uses_make_like_pattern() {
+    // Naive format!("{prefix}-%") for P_1 matches P11 / PA1 via LIKE '_'.
+    let temp_dir = TempDir::new().unwrap();
+    let mut conn = open_connection(temp_dir.path()).unwrap();
+    create_schema(&conn).unwrap();
+    run_migrations(&mut conn).unwrap();
+
+    seed_task(&conn, "P_1-001", "literal underscore");
+    seed_task(&conn, "P11-001", "would match naive");
+    seed_task(&conn, "PA1-001", "would also match naive");
+
+    assert_eq!(
+        crate::db::prefix::make_like_pattern("P_1"),
+        "P\\_1-%",
+        "must escape underscore"
+    );
+
+    let scoped = prd::load_tasks(&conn, Some("P_1")).unwrap();
+    assert_eq!(scoped.len(), 1);
+    assert_eq!(scoped[0].id, "P_1-001");
+}
+
+#[test]
+fn test_load_tasks_empty_string_treated_as_none() {
+    let temp_dir = TempDir::new().unwrap();
+    let mut conn = open_connection(temp_dir.path()).unwrap();
+    create_schema(&conn).unwrap();
+    run_migrations(&mut conn).unwrap();
+
+    seed_task(&conn, "A-001", "a");
+    seed_task(&conn, "B-001", "b");
+
+    let empty = prd::load_tasks(&conn, Some("")).unwrap();
+    let none = prd::load_tasks(&conn, None).unwrap();
+    assert_eq!(empty.len(), 2, "empty string must not LIKE '-%'");
+    assert_eq!(empty.len(), none.len());
+}
+
+#[test]
+fn test_load_tasks_trailing_dash_fe_vs_feat() {
+    let temp_dir = TempDir::new().unwrap();
+    let mut conn = open_connection(temp_dir.path()).unwrap();
+    create_schema(&conn).unwrap();
+    run_migrations(&mut conn).unwrap();
+
+    seed_task(&conn, "FE-001", "fe");
+    seed_task(&conn, "FEAT-001", "feat");
+
+    let fe = prd::load_tasks(&conn, Some("FE")).unwrap();
+    assert_eq!(fe.len(), 1);
+    assert_eq!(fe[0].id, "FE-001");
+}
+
+#[test]
+fn test_exported_prd_has_no_task_prefix_field_and_serde_round_trips() {
+    let prd = ExportedPrd {
+        project: "p".to_string(),
+        branch_name: Some("main".to_string()),
+        description: None,
+        priority_philosophy: None,
+        global_acceptance_criteria: None,
+        review_guidelines: None,
+        model: None,
+        default_max_retries: None,
+        user_stories: vec![],
+    };
+
+    let pretty = serde_json::to_string_pretty(&prd).unwrap();
+    assert!(
+        !pretty.contains("taskPrefix") && !pretty.contains("task_prefix"),
+        "ExportedPrd must stay lossy (no taskPrefix): {pretty}"
+    );
+
+    let value = serde_json::to_value(&prd).unwrap();
+    let back: ExportedPrd = serde_json::from_value(value).unwrap();
+    assert_eq!(back.project, "p");
+    assert_eq!(back.branch_name.as_deref(), Some("main"));
+
+    // Do not round-trip through PrdUserStory — Value / ExportedPrd only.
+    let _again: ExportedPrd = serde_json::from_str(&pretty).unwrap();
+}
+
+#[test]
+fn test_export_dir_still_four_arg_dump_all() {
+    // Arity / dump-all call sites: two prefixes still dump everything via export().
+    let temp_dir = TempDir::new().unwrap();
+    let mut conn = open_connection(temp_dir.path()).unwrap();
+    create_schema(&conn).unwrap();
+    run_migrations(&mut conn).unwrap();
+    drop(conn);
+
+    let a = temp_dir.path().join("a.json");
+    let b = temp_dir.path().join("b.json");
+    fs::write(
+        &a,
+        r#"{"project":"proj-a","branchName":"ba","userStories":[
+            {"id":"A-STORY-001","title":"A","priority":1,"passes":false}
+        ]}"#,
+    )
+    .unwrap();
+    fs::write(
+        &b,
+        r#"{"project":"proj-b","branchName":"bb","userStories":[
+            {"id":"B-STORY-001","title":"B","priority":1,"passes":false}
+        ]}"#,
+    )
+    .unwrap();
+
+    init::init(
+        temp_dir.path(),
+        &[&a],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Explicit("A".into()),
+    )
+    .unwrap();
+    init::init(
+        temp_dir.path(),
+        &[&b],
+        false,
+        true, // append — keep both prefixes in one DB
+        false,
+        false,
+        PrefixMode::Explicit("B".into()),
+    )
+    .unwrap();
+
+    let export_path = temp_dir.path().join("exported.json");
+    let result = export(temp_dir.path(), &export_path, false, None).unwrap();
+    assert_eq!(result.tasks_exported, 2);
+
+    let exported: ExportedPrd =
+        serde_json::from_str(&fs::read_to_string(&export_path).unwrap()).unwrap();
+    // Unscoped LIMIT 1 → first registered metadata (A).
+    assert_eq!(exported.project, "proj-a");
+    let ids: Vec<_> = exported
+        .user_stories
+        .iter()
+        .map(|s| s.id.as_str())
+        .collect();
+    assert!(ids.iter().any(|id| id.starts_with("A-")));
+    assert!(ids.iter().any(|id| id.starts_with("B-")));
+}
+
+#[test]
+fn test_export_module_has_no_task_prefix_is_null() {
+    // Grep invariant: export/ must not use WHERE task_prefix IS NULL.
+    let export_src = concat!(
+        include_str!("prd.rs"),
+        include_str!("mod.rs"),
+        include_str!("progress.rs"),
+    );
+    let lowered = export_src.to_ascii_lowercase();
+    assert!(
+        !lowered.contains("task_prefix is null"),
+        "export/ must not use WHERE task_prefix IS NULL"
+    );
+}

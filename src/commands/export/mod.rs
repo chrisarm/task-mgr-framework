@@ -33,7 +33,7 @@ use crate::{TaskMgrError, TaskMgrResult};
 // Re-export public types
 pub use prd::{ExportedPrd, ExportedUserStory};
 
-use prd::{load_prd_metadata, load_tasks};
+use prd::{MetadataScope, load_prd_metadata, load_tasks};
 use progress::{export_progress, load_learnings};
 
 /// Result of the export command.
@@ -77,11 +77,9 @@ pub fn export(
 ) -> TaskMgrResult<ExportResult> {
     let conn = open_connection(dir)?;
 
-    // Load PRD metadata
-    let metadata = load_prd_metadata(&conn)?;
-
-    // Load all tasks ordered by ID for determinism
-    let tasks = load_tasks(&conn)?;
+    // Dump-all (FEAT-001): scoped selection / ExportOpts arrive in FEAT-002.
+    let metadata = load_prd_metadata(&conn, MetadataScope::Unscoped)?;
+    let tasks = load_tasks(&conn, None)?;
     let tasks_exported = tasks.len();
 
     // Build the exported PRD

@@ -3,12 +3,14 @@
 //! This module handles exporting tasks and metadata back to PRD JSON format.
 
 use std::collections::HashMap;
+use std::str::FromStr;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::TaskMgrResult;
+use crate::db::prefix::prefix_and;
 use crate::models::TaskStatus;
 
 /// Task-relationship map loaded from the database.
@@ -106,73 +108,130 @@ pub(crate) struct PrdMetadata {
     pub default_max_retries: Option<i32>,
 }
 
-/// Load PRD metadata from the database.
-pub(crate) fn load_prd_metadata(conn: &Connection) -> TaskMgrResult<PrdMetadata> {
-    // Check if metadata exists
-    let count: i32 = conn.query_row("SELECT COUNT(*) FROM prd_metadata", [], |row| row.get(0))?;
-
-    if count == 0 {
-        // Return defaults if no metadata
-        return Ok(PrdMetadata {
-            project: "unknown".to_string(),
-            branch_name: None,
-            description: None,
-            priority_philosophy: None,
-            global_acceptance_criteria: None,
-            review_guidelines: None,
-            default_model: None,
-            default_max_retries: None,
-        });
-    }
-
-    conn.query_row(
-        r#"SELECT project, branch_name, description,
-           priority_philosophy, global_acceptance_criteria, review_guidelines,
-           default_model, default_max_retries
-           FROM prd_metadata ORDER BY id ASC LIMIT 1"#,
-        [],
-        |row| {
-            let project: String = row.get("project")?;
-            let branch_name: Option<String> = row.get("branch_name")?;
-            let description: Option<String> = row.get("description")?;
-            let priority_str: Option<String> = row.get("priority_philosophy")?;
-            let global_str: Option<String> = row.get("global_acceptance_criteria")?;
-            let review_str: Option<String> = row.get("review_guidelines")?;
-            let default_model: Option<String> = row.get("default_model")?;
-            let default_max_retries: Option<i32> = row.get("default_max_retries")?;
-
-            // Parse JSON strings back to Values
-            let priority_philosophy = priority_str.and_then(|s| serde_json::from_str(&s).ok());
-            let global_acceptance_criteria = global_str.and_then(|s| serde_json::from_str(&s).ok());
-            let review_guidelines = review_str.and_then(|s| serde_json::from_str(&s).ok());
-
-            Ok(PrdMetadata {
-                project,
-                branch_name,
-                description,
-                priority_philosophy,
-                global_acceptance_criteria,
-                review_guidelines,
-                default_model,
-                default_max_retries,
-            })
-        },
-    )
-    .map_err(Into::into)
+/// How to pick the single `prd_metadata` row stamped onto [`ExportedPrd`].
+///
+/// Empty-prefix `--from-json` uses [`MetadataScope::ByPrdId`] with the
+/// identity-matched `prd_files.prd_id`. **Forbidden:** `WHERE task_prefix
+/// IS NULL` (SQLite UNIQUE allows multiple NULLs).
+pub(crate) enum MetadataScope<'a> {
+    /// `--all` / unscoped: `ORDER BY id ASC LIMIT 1` (today's dump).
+    Unscoped,
+    /// Named active / `--from-json` prefix: `WHERE task_prefix = ?`.
+    /// Constructed by FEAT-002 scope selection (export stays dump-all here).
+    #[allow(dead_code)]
+    NamedPrefix(&'a str),
+    /// Empty-prefix `--from-json` pin: `WHERE id = ?`.
+    /// Constructed by FEAT-002 scope selection (export stays dump-all here).
+    #[allow(dead_code)]
+    ByPrdId(i64),
 }
 
-/// Load all tasks with their files and relationships.
-pub(crate) fn load_tasks(conn: &Connection) -> TaskMgrResult<Vec<ExportedUserStory>> {
-    // Load all tasks ordered by ID
-    let mut stmt = conn.prepare(
+fn unknown_prd_metadata() -> PrdMetadata {
+    PrdMetadata {
+        project: "unknown".to_string(),
+        branch_name: None,
+        description: None,
+        priority_philosophy: None,
+        global_acceptance_criteria: None,
+        review_guidelines: None,
+        default_model: None,
+        default_max_retries: None,
+    }
+}
+
+fn map_prd_metadata_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PrdMetadata> {
+    let project: String = row.get("project")?;
+    let branch_name: Option<String> = row.get("branch_name")?;
+    let description: Option<String> = row.get("description")?;
+    let priority_str: Option<String> = row.get("priority_philosophy")?;
+    let global_str: Option<String> = row.get("global_acceptance_criteria")?;
+    let review_str: Option<String> = row.get("review_guidelines")?;
+    let default_model: Option<String> = row.get("default_model")?;
+    let default_max_retries: Option<i32> = row.get("default_max_retries")?;
+
+    let priority_philosophy = priority_str.and_then(|s| serde_json::from_str(&s).ok());
+    let global_acceptance_criteria = global_str.and_then(|s| serde_json::from_str(&s).ok());
+    let review_guidelines = review_str.and_then(|s| serde_json::from_str(&s).ok());
+
+    Ok(PrdMetadata {
+        project,
+        branch_name,
+        description,
+        priority_philosophy,
+        global_acceptance_criteria,
+        review_guidelines,
+        default_model,
+        default_max_retries,
+    })
+}
+
+const PRD_METADATA_COLS: &str = r#"project, branch_name, description,
+           priority_philosophy, global_acceptance_criteria, review_guidelines,
+           default_model, default_max_retries"#;
+
+/// Load PRD metadata from the database for the given scope.
+///
+/// Missing row → same `project: "unknown"` defaults as an empty table.
+pub(crate) fn load_prd_metadata(
+    conn: &Connection,
+    scope: MetadataScope<'_>,
+) -> TaskMgrResult<PrdMetadata> {
+    let row = match scope {
+        MetadataScope::Unscoped => {
+            let count: i32 =
+                conn.query_row("SELECT COUNT(*) FROM prd_metadata", [], |row| row.get(0))?;
+            if count == 0 {
+                return Ok(unknown_prd_metadata());
+            }
+            conn.query_row(
+                &format!("SELECT {PRD_METADATA_COLS} FROM prd_metadata ORDER BY id ASC LIMIT 1"),
+                [],
+                map_prd_metadata_row,
+            )
+            .map(Some)?
+        }
+        MetadataScope::NamedPrefix(prefix) => conn
+            .query_row(
+                &format!("SELECT {PRD_METADATA_COLS} FROM prd_metadata WHERE task_prefix = ?"),
+                [prefix],
+                map_prd_metadata_row,
+            )
+            .optional()?,
+        MetadataScope::ByPrdId(prd_id) => conn
+            .query_row(
+                &format!("SELECT {PRD_METADATA_COLS} FROM prd_metadata WHERE id = ?"),
+                [prd_id],
+                map_prd_metadata_row,
+            )
+            .optional()?,
+    };
+
+    Ok(row.unwrap_or_else(unknown_prd_metadata))
+}
+
+/// Load tasks with their files and relationships.
+///
+/// - `None` / empty string → all unarchived (`archived_at IS NULL`), no LIKE.
+/// - `Some(p)` with non-empty `p` → `archived_at IS NULL AND id LIKE ? ESCAPE
+///   '\'` via [`prefix_and`] / [`crate::db::prefix::make_like_pattern`].
+pub(crate) fn load_tasks(
+    conn: &Connection,
+    prefix: Option<&str>,
+) -> TaskMgrResult<Vec<ExportedUserStory>> {
+    // Empty string must not become LIKE '-%'.
+    let effective = prefix.filter(|p| !p.is_empty());
+    let (clause, like_pat) = prefix_and(effective);
+    let sql = format!(
         r#"SELECT id, title, description, priority, status, notes,
            acceptance_criteria, review_scope, severity, source_review,
            model, difficulty, escalation_note, max_retries,
            requires_human, human_review_timeout, completed_by_provider
-           FROM tasks WHERE archived_at IS NULL ORDER BY id"#,
-    )?;
+           FROM tasks WHERE archived_at IS NULL {clause} ORDER BY id"#
+    );
 
-    let task_rows = stmt.query_map([], |row| {
+    let mut stmt = conn.prepare(&sql)?;
+
+    let map_row = |row: &rusqlite::Row<'_>| {
         let id: String = row.get("id")?;
         let title: String = row.get("title")?;
         let description: Option<String> = row.get("description")?;
@@ -224,7 +283,12 @@ pub(crate) fn load_tasks(conn: &Connection) -> TaskMgrResult<Vec<ExportedUserSto
             human_review_timeout,
             completed_by_provider,
         ))
-    })?;
+    };
+
+    let task_rows: Vec<_> = match like_pat.as_deref() {
+        Some(pat) => stmt.query_map(params![pat], map_row)?.collect(),
+        None => stmt.query_map([], map_row)?.collect(),
+    };
 
     // Load all files into a map
     let files_map = load_all_task_files(conn)?;
@@ -345,6 +409,3 @@ pub(crate) fn load_all_relationships(conn: &Connection) -> TaskMgrResult<Relatio
 
     Ok(depends_on)
 }
-
-// Import FromStr implementations from models
-use std::str::FromStr;

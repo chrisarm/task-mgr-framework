@@ -258,7 +258,11 @@ fn match_registered_from_json(
     }
 
     // Match (b)+(c): path identity against registered task_list rows.
-    find_registered_by_path_identity(conn, canon, source_root, worktree_root)
+    // Keep prefix-only at this layer — do not fold match (a) into identity.
+    Ok(
+        find_registered_by_path_identity(conn, canon, source_root, worktree_root)?
+            .map(|(_prd_id, prefix)| prefix),
+    )
 }
 
 /// Best-effort `taskPrefix` from the JSON file root. Parse failures / missing
@@ -272,14 +276,19 @@ fn read_json_task_prefix(path: &Path) -> Option<String> {
     }
 }
 
-/// Pin-19 path identity against every `task_list` row. Returns the matched
-/// row's `task_prefix` (`None` when the column is NULL).
-fn find_registered_by_path_identity(
+/// Pin-19 path identity against every `task_list` row.
+///
+/// Returns matched `(prd_files.prd_id, task_prefix)`. `task_prefix` is `None`
+/// when the column is NULL (`--no-prefix` / empty prefix). Match (a) (JSON
+/// `taskPrefix` ∈ known prefixes) is **not** this function —
+/// [`match_registered_from_json`] keeps (a) OR identity and still exposes
+/// prefix-only to [`resolve_context`].
+pub(crate) fn find_registered_by_path_identity(
     conn: &Connection,
     flag_canon: &Path,
     source_root: Option<&Path>,
     worktree_root: Option<&Path>,
-) -> TaskMgrResult<Option<Option<String>>> {
+) -> TaskMgrResult<Option<(i64, Option<String>)>> {
     let source_root = source_root
         .map(Path::to_path_buf)
         .or_else(main_repo_root)
@@ -290,18 +299,19 @@ fn find_registered_by_path_identity(
         .or_else(|| source_root.clone());
 
     let mut stmt = conn.prepare(
-        "SELECT pf.file_path, pm.task_prefix FROM prd_files pf \
+        "SELECT pf.prd_id, pf.file_path, pm.task_prefix FROM prd_files pf \
          JOIN prd_metadata pm ON pf.prd_id = pm.id \
          WHERE pf.file_type = 'task_list'",
     )?;
     let rows = stmt.query_map([], |row| {
-        let path: String = row.get(0)?;
-        let prefix: Option<String> = row.get(1)?;
-        Ok((PathBuf::from(path), prefix))
+        let prd_id: i64 = row.get(0)?;
+        let path: String = row.get(1)?;
+        let prefix: Option<String> = row.get(2)?;
+        Ok((prd_id, PathBuf::from(path), prefix))
     })?;
 
     for row in rows {
-        let (registered, prefix) = row?;
+        let (prd_id, registered, prefix) = row?;
 
         // Absolute registered path: canonicalize equality is sufficient and
         // does not depend on git roots (covers TempDir init fixtures).
@@ -311,21 +321,21 @@ fn find_registered_by_path_identity(
                 .ok()
                 .is_some_and(|r| r == flag_canon)
         {
-            return Ok(Some(prefix));
+            return Ok(Some((prd_id, prefix)));
         }
 
         if let (Some(src), Some(wt)) = (&source_root, &worktree) {
             let src = src.canonicalize().unwrap_or_else(|_| src.clone());
             let wt = wt.canonicalize().unwrap_or_else(|_| wt.clone());
             if paths_identify(flag_canon, &registered, &src, &wt) {
-                return Ok(Some(prefix));
+                return Ok(Some((prd_id, prefix)));
             }
         } else if !registered.is_absolute() {
             // Non-git cwd fallback for relative rows (best-effort).
             if let Ok(cwd) = std::env::current_dir() {
                 let cwd = cwd.canonicalize().unwrap_or(cwd);
                 if paths_identify(flag_canon, &registered, &cwd, &cwd) {
-                    return Ok(Some(prefix));
+                    return Ok(Some((prd_id, prefix)));
                 }
             }
         }
