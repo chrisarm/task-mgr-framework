@@ -85,7 +85,7 @@ pub use enhance::{
     enhance_agents, enhance_show, enhance_strip, format_text as format_enhance_text,
     templates::EnhanceProfile,
 };
-pub use export::{ExportResult, export, format_text as format_export_text};
+pub use export::{ExportOpts, ExportResult, export, format_text as format_export_text};
 pub use fail::{FailResult, TaskFailResult, fail, format_text as format_fail_text};
 pub use history::{
     HistoryResult, RunDetailResult, RunSummary, TaskAttempt,

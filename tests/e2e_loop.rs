@@ -11,6 +11,7 @@ use std::fs;
 use tempfile::TempDir;
 
 use task_mgr::cli::{Confidence, FailStatus, LearningOutcome};
+use task_mgr::commands::export::ExportOpts;
 use task_mgr::commands::{
     LearnParams, begin, complete, doctor, end, export, fail, init, learn, next,
 };
@@ -108,7 +109,18 @@ fn test_full_loop_cycle() {
 
     // Step 5: Export after iteration
     let export_path = temp_dir.path().join("exported.json");
-    let export_result = export::export(temp_dir.path(), &export_path, false, None).unwrap();
+    let export_result = export::export(
+        temp_dir.path(),
+        &ExportOpts {
+            to_json: &export_path,
+            with_progress: false,
+            learnings_file: None,
+            from_json: None,
+            all: true,
+            force: false,
+        },
+    )
+    .unwrap();
     assert!(export_result.tasks_exported > 0);
 
     // Verify the completed task has passes: true in export
@@ -221,7 +233,18 @@ fn test_failure_flow_with_learning() {
     // Export and verify passes is still false
     let export_path = temp_dir.path().join("exported.json");
     drop(conn);
-    export::export(temp_dir.path(), &export_path, false, None).unwrap();
+    export::export(
+        temp_dir.path(),
+        &ExportOpts {
+            to_json: &export_path,
+            with_progress: false,
+            learnings_file: None,
+            from_json: None,
+            all: true,
+            force: false,
+        },
+    )
+    .unwrap();
 
     let exported_json = fs::read_to_string(&export_path).unwrap();
     let exported: Value = serde_json::from_str(&exported_json).unwrap();
@@ -385,7 +408,18 @@ fn test_crash_recovery_via_export() {
 
     // Export after this iteration (critical for crash recovery)
     let export_path = temp_dir.path().join("iteration_1.json");
-    export::export(temp_dir.path(), &export_path, false, None).unwrap();
+    export::export(
+        temp_dir.path(),
+        &ExportOpts {
+            to_json: &export_path,
+            with_progress: false,
+            learnings_file: None,
+            from_json: None,
+            all: true,
+            force: false,
+        },
+    )
+    .unwrap();
 
     // Simulate crash: create a new temp directory (simulating fresh start)
     let recovery_dir = TempDir::new().unwrap();
@@ -496,7 +530,18 @@ fn test_multiple_iterations_respect_dependencies() {
 
             // Export after each iteration
             let export_path = temp_dir.path().join(format!("iter_{}.json", iteration));
-            export::export(temp_dir.path(), &export_path, false, None).unwrap();
+            export::export(
+                temp_dir.path(),
+                &ExportOpts {
+                    to_json: &export_path,
+                    with_progress: false,
+                    learnings_file: None,
+                    from_json: None,
+                    all: true,
+                    force: false,
+                },
+            )
+            .unwrap();
 
             // Verify export reflects completion
             let exported_json = fs::read_to_string(&export_path).unwrap();
@@ -776,7 +821,18 @@ fn test_full_feedback_loop_lifecycle() {
     // Step 10: Verify export reflects all tasks complete
     drop(conn);
     let export_path = temp_dir.path().join("final-export.json");
-    export::export(temp_dir.path(), &export_path, false, None).unwrap();
+    export::export(
+        temp_dir.path(),
+        &ExportOpts {
+            to_json: &export_path,
+            with_progress: false,
+            learnings_file: None,
+            from_json: None,
+            all: true,
+            force: false,
+        },
+    )
+    .unwrap();
 
     let exported_json = fs::read_to_string(&export_path).unwrap();
     let exported: Value = serde_json::from_str(&exported_json).unwrap();

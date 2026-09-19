@@ -15,7 +15,7 @@ use task_mgr::cli::{
     WorktreesAction, resolve_batch_command, resolve_loop_command,
 };
 use task_mgr::commands::{
-    InitOpts, LearnParams, LearningsListParams, RecallCmdParams, ReviewOptions, add,
+    ExportOpts, InitOpts, LearnParams, LearningsListParams, RecallCmdParams, ReviewOptions, add,
     apply_learning, audit_setup, auto_unblock_all, begin, cheatsheet, complete,
     count_resettable_tasks, current, decline_decision_cmd, doctor, end, export, fail,
     format_doctor_verbose, format_init_verbose, format_next_verbose, format_recall_verbose,
@@ -603,7 +603,19 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
             with_progress,
             learnings_file,
         } => {
-            let result = export(&cli.dir, &to_json, with_progress, learnings_file.as_deref())?;
+            // Forward ExportOpts only. NEVER LockGuard::acquire here (FEAT-003
+            // grows clap fields; lock stays inside export() after dest.is_file()).
+            let result = export(
+                &cli.dir,
+                &ExportOpts {
+                    to_json: &to_json,
+                    with_progress,
+                    learnings_file: learnings_file.as_deref(),
+                    from_json: None,
+                    all: false,
+                    force: false,
+                },
+            )?;
             output_result(&result, cli.format);
             Ok(())
         }

@@ -7,6 +7,7 @@ use serde_json::Value;
 use std::fs;
 use tempfile::TempDir;
 
+use task_mgr::commands::export::ExportOpts;
 use task_mgr::commands::{complete, export, init};
 use task_mgr::db::open_connection;
 
@@ -53,7 +54,18 @@ fn test_import_export_round_trip() {
 
     // Export to a new file
     let export_path = temp_dir.path().join("exported.json");
-    let export_result = export::export(temp_dir.path(), &export_path, false, None).unwrap();
+    let export_result = export::export(
+        temp_dir.path(),
+        &ExportOpts {
+            to_json: &export_path,
+            with_progress: false,
+            learnings_file: None,
+            from_json: None,
+            all: true,
+            force: false,
+        },
+    )
+    .unwrap();
     assert_eq!(
         export_result.tasks_exported, init_result.tasks_imported,
         "Exported task count should match imported count"
@@ -155,7 +167,18 @@ fn test_import_modify_export() {
 
     // Export
     let export_path = temp_dir.path().join("modified.json");
-    export::export(temp_dir.path(), &export_path, false, None).unwrap();
+    export::export(
+        temp_dir.path(),
+        &ExportOpts {
+            to_json: &export_path,
+            with_progress: false,
+            learnings_file: None,
+            from_json: None,
+            all: true,
+            force: false,
+        },
+    )
+    .unwrap();
 
     // Read exported and verify the task is now passes: true
     let exported_json = fs::read_to_string(&export_path).unwrap();
@@ -236,7 +259,18 @@ fn test_import_with_force_replaces_data() {
 
     // Export and verify the modification was replaced
     let export_path = temp_dir.path().join("after_force.json");
-    export::export(temp_dir.path(), &export_path, false, None).unwrap();
+    export::export(
+        temp_dir.path(),
+        &ExportOpts {
+            to_json: &export_path,
+            with_progress: false,
+            learnings_file: None,
+            from_json: None,
+            all: true,
+            force: false,
+        },
+    )
+    .unwrap();
 
     let exported_json = fs::read_to_string(&export_path).unwrap();
     assert!(
@@ -266,8 +300,30 @@ fn test_export_sorts_arrays_deterministically() {
     let export_path1 = temp_dir.path().join("export1.json");
     let export_path2 = temp_dir.path().join("export2.json");
 
-    export::export(temp_dir.path(), &export_path1, false, None).unwrap();
-    export::export(temp_dir.path(), &export_path2, false, None).unwrap();
+    export::export(
+        temp_dir.path(),
+        &ExportOpts {
+            to_json: &export_path1,
+            with_progress: false,
+            learnings_file: None,
+            from_json: None,
+            all: true,
+            force: false,
+        },
+    )
+    .unwrap();
+    export::export(
+        temp_dir.path(),
+        &ExportOpts {
+            to_json: &export_path2,
+            with_progress: false,
+            learnings_file: None,
+            from_json: None,
+            all: true,
+            force: false,
+        },
+    )
+    .unwrap();
 
     // Read both exports
     let json1 = fs::read_to_string(&export_path1).unwrap();
@@ -301,7 +357,18 @@ fn test_relationships_preserved_in_round_trip() {
     )
     .unwrap();
     let export_path = temp_dir.path().join("exported.json");
-    export::export(temp_dir.path(), &export_path, false, None).unwrap();
+    export::export(
+        temp_dir.path(),
+        &ExportOpts {
+            to_json: &export_path,
+            with_progress: false,
+            learnings_file: None,
+            from_json: None,
+            all: true,
+            force: false,
+        },
+    )
+    .unwrap();
 
     // Read exported
     let exported_json = fs::read_to_string(&export_path).unwrap();
@@ -370,7 +437,18 @@ fn test_touches_files_preserved_in_round_trip() {
     )
     .unwrap();
     let export_path = temp_dir.path().join("exported.json");
-    export::export(temp_dir.path(), &export_path, false, None).unwrap();
+    export::export(
+        temp_dir.path(),
+        &ExportOpts {
+            to_json: &export_path,
+            with_progress: false,
+            learnings_file: None,
+            from_json: None,
+            all: true,
+            force: false,
+        },
+    )
+    .unwrap();
 
     // Read exported
     let exported_json = fs::read_to_string(&export_path).unwrap();
@@ -436,7 +514,18 @@ fn test_acceptance_criteria_preserved_in_round_trip() {
     )
     .unwrap();
     let export_path = temp_dir.path().join("exported.json");
-    export::export(temp_dir.path(), &export_path, false, None).unwrap();
+    export::export(
+        temp_dir.path(),
+        &ExportOpts {
+            to_json: &export_path,
+            with_progress: false,
+            learnings_file: None,
+            from_json: None,
+            all: true,
+            force: false,
+        },
+    )
+    .unwrap();
 
     // Read exported
     let exported_json = fs::read_to_string(&export_path).unwrap();

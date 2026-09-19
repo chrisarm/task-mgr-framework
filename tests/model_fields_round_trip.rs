@@ -12,6 +12,7 @@ use task_mgr::loop_engine::model::{HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL};
 
 mod common;
 use common::render_fixture_tmpl;
+use task_mgr::commands::export::ExportOpts;
 
 fn import_and_export(fixture_name: &str) -> (TempDir, Value) {
     let temp_dir = TempDir::new().unwrap();
@@ -29,7 +30,18 @@ fn import_and_export(fixture_name: &str) -> (TempDir, Value) {
     .unwrap();
 
     let export_path = temp_dir.path().join("exported.json");
-    export::export(temp_dir.path(), &export_path, false, None).unwrap();
+    export::export(
+        temp_dir.path(),
+        &ExportOpts {
+            to_json: &export_path,
+            with_progress: false,
+            learnings_file: None,
+            from_json: None,
+            all: true,
+            force: false,
+        },
+    )
+    .unwrap();
 
     let exported_json = fs::read_to_string(&export_path).unwrap();
     let exported: Value = serde_json::from_str(&exported_json).unwrap();
@@ -499,7 +511,18 @@ fn test_full_pipeline_reimport_exported_json() {
 
     // Export
     let export_path = temp_dir.path().join("exported.json");
-    export::export(temp_dir.path(), &export_path, false, None).unwrap();
+    export::export(
+        temp_dir.path(),
+        &ExportOpts {
+            to_json: &export_path,
+            with_progress: false,
+            learnings_file: None,
+            from_json: None,
+            all: true,
+            force: false,
+        },
+    )
+    .unwrap();
 
     // Re-import the exported file into a fresh DB
     let temp_dir2 = TempDir::new().unwrap();
@@ -516,7 +539,18 @@ fn test_full_pipeline_reimport_exported_json() {
 
     // Export again
     let export_path2 = temp_dir2.path().join("re-exported.json");
-    export::export(temp_dir2.path(), &export_path2, false, None).unwrap();
+    export::export(
+        temp_dir2.path(),
+        &ExportOpts {
+            to_json: &export_path2,
+            with_progress: false,
+            learnings_file: None,
+            from_json: None,
+            all: true,
+            force: false,
+        },
+    )
+    .unwrap();
 
     // Compare both exports - they should be identical
     let json1 = fs::read_to_string(&export_path).unwrap();

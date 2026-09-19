@@ -14,6 +14,7 @@ use serde_json::Value;
 use std::fs;
 use tempfile::TempDir;
 
+use task_mgr::commands::export::ExportOpts;
 use task_mgr::commands::{export, init};
 use task_mgr::db::open_connection;
 
@@ -41,7 +42,18 @@ fn import_and_export(fixture_name: &str) -> (TempDir, Value) {
     .unwrap();
 
     let export_path = temp_dir.path().join("exported.json");
-    export::export(temp_dir.path(), &export_path, false, None).unwrap();
+    export::export(
+        temp_dir.path(),
+        &ExportOpts {
+            to_json: &export_path,
+            with_progress: false,
+            learnings_file: None,
+            from_json: None,
+            all: true,
+            force: false,
+        },
+    )
+    .unwrap();
 
     let exported_json = fs::read_to_string(&export_path).unwrap();
     let exported: Value = serde_json::from_str(&exported_json).unwrap();
@@ -300,7 +312,18 @@ fn test_default_max_retries_omitted_when_not_set() {
     .unwrap();
 
     let export_path = temp_dir.path().join("exported.json");
-    export::export(temp_dir.path(), &export_path, false, None).unwrap();
+    export::export(
+        temp_dir.path(),
+        &ExportOpts {
+            to_json: &export_path,
+            with_progress: false,
+            learnings_file: None,
+            from_json: None,
+            all: true,
+            force: false,
+        },
+    )
+    .unwrap();
 
     let exported_json = fs::read_to_string(&export_path).unwrap();
     assert!(
@@ -393,7 +416,18 @@ fn test_full_pipeline_reimport_preserves_max_retries() {
 
     // First export
     let export1_path = temp_dir1.path().join("export1.json");
-    export::export(temp_dir1.path(), &export1_path, false, None).unwrap();
+    export::export(
+        temp_dir1.path(),
+        &ExportOpts {
+            to_json: &export1_path,
+            with_progress: false,
+            learnings_file: None,
+            from_json: None,
+            all: true,
+            force: false,
+        },
+    )
+    .unwrap();
 
     // Second import from first export (simulates crash-recovery)
     let temp_dir2 = TempDir::new().unwrap();
@@ -410,7 +444,18 @@ fn test_full_pipeline_reimport_preserves_max_retries() {
 
     // Second export
     let export2_path = temp_dir2.path().join("export2.json");
-    export::export(temp_dir2.path(), &export2_path, false, None).unwrap();
+    export::export(
+        temp_dir2.path(),
+        &ExportOpts {
+            to_json: &export2_path,
+            with_progress: false,
+            learnings_file: None,
+            from_json: None,
+            all: true,
+            force: false,
+        },
+    )
+    .unwrap();
 
     // Compare both exports for max_retries fields
     let json1: Value = serde_json::from_str(&fs::read_to_string(&export1_path).unwrap()).unwrap();
@@ -483,7 +528,18 @@ fn test_partial_max_retries_resolution() {
     .unwrap();
 
     let export_path = temp_dir.path().join("exported.json");
-    export::export(temp_dir.path(), &export_path, false, None).unwrap();
+    export::export(
+        temp_dir.path(),
+        &ExportOpts {
+            to_json: &export_path,
+            with_progress: false,
+            learnings_file: None,
+            from_json: None,
+            all: true,
+            force: false,
+        },
+    )
+    .unwrap();
 
     let exported: Value = serde_json::from_str(&fs::read_to_string(&export_path).unwrap()).unwrap();
     let stories = exported

@@ -71,7 +71,18 @@ fn test_export_basic() {
 
     // Export
     let export_path = temp_dir.path().join("exported.json");
-    let result = export(temp_dir.path(), &export_path, false, None).unwrap();
+    let result = export(
+        temp_dir.path(),
+        &ExportOpts {
+            to_json: &export_path,
+            with_progress: false,
+            learnings_file: None,
+            from_json: None,
+            all: true,
+            force: false,
+        },
+    )
+    .unwrap();
 
     assert_eq!(result.tasks_exported, 2);
     assert!(result.progress_file.is_none());
@@ -97,7 +108,18 @@ fn test_export_with_progress() {
     .unwrap();
 
     let export_path = temp_dir.path().join("exported.json");
-    let result = export(temp_dir.path(), &export_path, true, None).unwrap();
+    let result = export(
+        temp_dir.path(),
+        &ExportOpts {
+            to_json: &export_path,
+            with_progress: true,
+            learnings_file: None,
+            from_json: None,
+            all: true,
+            force: false,
+        },
+    )
+    .unwrap();
 
     assert_eq!(result.tasks_exported, 2);
     assert!(result.progress_file.is_some());
@@ -127,7 +149,18 @@ fn test_export_with_learnings_file() {
 
     let export_path = temp_dir.path().join("exported.json");
     let learnings_path = temp_dir.path().join("learnings.json");
-    let result = export(temp_dir.path(), &export_path, false, Some(&learnings_path)).unwrap();
+    let result = export(
+        temp_dir.path(),
+        &ExportOpts {
+            to_json: &export_path,
+            with_progress: false,
+            learnings_file: Some(&learnings_path),
+            from_json: None,
+            all: true,
+            force: false,
+        },
+    )
+    .unwrap();
 
     assert!(result.learnings_file.is_some());
     assert!(learnings_path.exists());
@@ -151,7 +184,18 @@ fn test_export_preserves_metadata() {
     .unwrap();
 
     let export_path = temp_dir.path().join("exported.json");
-    export(temp_dir.path(), &export_path, false, None).unwrap();
+    export(
+        temp_dir.path(),
+        &ExportOpts {
+            to_json: &export_path,
+            with_progress: false,
+            learnings_file: None,
+            from_json: None,
+            all: true,
+            force: false,
+        },
+    )
+    .unwrap();
 
     // Read and verify exported JSON
     let exported_json = fs::read_to_string(&export_path).unwrap();
@@ -184,7 +228,18 @@ fn test_export_maps_status_to_passes() {
     .unwrap();
 
     let export_path = temp_dir.path().join("exported.json");
-    export(temp_dir.path(), &export_path, false, None).unwrap();
+    export(
+        temp_dir.path(),
+        &ExportOpts {
+            to_json: &export_path,
+            with_progress: false,
+            learnings_file: None,
+            from_json: None,
+            all: true,
+            force: false,
+        },
+    )
+    .unwrap();
 
     let exported_json = fs::read_to_string(&export_path).unwrap();
     let exported: ExportedPrd = serde_json::from_str(&exported_json).unwrap();
@@ -224,7 +279,18 @@ fn test_export_sorts_arrays_alphabetically() {
     .unwrap();
 
     let export_path = temp_dir.path().join("exported.json");
-    export(temp_dir.path(), &export_path, false, None).unwrap();
+    export(
+        temp_dir.path(),
+        &ExportOpts {
+            to_json: &export_path,
+            with_progress: false,
+            learnings_file: None,
+            from_json: None,
+            all: true,
+            force: false,
+        },
+    )
+    .unwrap();
 
     let exported_json = fs::read_to_string(&export_path).unwrap();
     let exported: ExportedPrd = serde_json::from_str(&exported_json).unwrap();
@@ -256,7 +322,18 @@ fn test_export_tasks_ordered_by_id() {
     .unwrap();
 
     let export_path = temp_dir.path().join("exported.json");
-    export(temp_dir.path(), &export_path, false, None).unwrap();
+    export(
+        temp_dir.path(),
+        &ExportOpts {
+            to_json: &export_path,
+            with_progress: false,
+            learnings_file: None,
+            from_json: None,
+            all: true,
+            force: false,
+        },
+    )
+    .unwrap();
 
     let exported_json = fs::read_to_string(&export_path).unwrap();
     let exported: ExportedPrd = serde_json::from_str(&exported_json).unwrap();
@@ -274,7 +351,18 @@ fn test_export_empty_database() {
     run_migrations(&mut conn).unwrap();
 
     let export_path = temp_dir.path().join("exported.json");
-    let result = export(temp_dir.path(), &export_path, false, None).unwrap();
+    let result = export(
+        temp_dir.path(),
+        &ExportOpts {
+            to_json: &export_path,
+            with_progress: false,
+            learnings_file: None,
+            from_json: None,
+            all: true,
+            force: false,
+        },
+    )
+    .unwrap();
 
     assert_eq!(result.tasks_exported, 0);
     assert!(export_path.exists());
@@ -303,7 +391,18 @@ fn test_export_preserves_relationships() {
     .unwrap();
 
     let export_path = temp_dir.path().join("exported.json");
-    export(temp_dir.path(), &export_path, false, None).unwrap();
+    export(
+        temp_dir.path(),
+        &ExportOpts {
+            to_json: &export_path,
+            with_progress: false,
+            learnings_file: None,
+            from_json: None,
+            all: true,
+            force: false,
+        },
+    )
+    .unwrap();
 
     let exported_json = fs::read_to_string(&export_path).unwrap();
     let exported: ExportedPrd = serde_json::from_str(&exported_json).unwrap();
@@ -335,7 +434,18 @@ fn test_export_preserves_acceptance_criteria() {
     .unwrap();
 
     let export_path = temp_dir.path().join("exported.json");
-    export(temp_dir.path(), &export_path, false, None).unwrap();
+    export(
+        temp_dir.path(),
+        &ExportOpts {
+            to_json: &export_path,
+            with_progress: false,
+            learnings_file: None,
+            from_json: None,
+            all: true,
+            force: false,
+        },
+    )
+    .unwrap();
 
     let exported_json = fs::read_to_string(&export_path).unwrap();
     let exported: ExportedPrd = serde_json::from_str(&exported_json).unwrap();
@@ -396,9 +506,18 @@ fn test_atomic_write() {
     let content = fs::read_to_string(&path).unwrap();
     assert!(content.contains("\"key\": \"value\""));
 
-    // Temp file should not exist
-    let tmp_path = path.with_extension("json.tmp");
-    assert!(!tmp_path.exists());
+    // unique_tmp_path temps are renamed away; no leftover .*.tmp beside dest.
+    let parent = path.parent().unwrap();
+    let leftovers: Vec<_> = fs::read_dir(parent)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".tmp"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "no leftover tmp files after atomic write: {leftovers:?}"
+    );
 }
 
 #[test]
@@ -482,7 +601,18 @@ fn test_round_trip_preserves_model_fields() {
 
     // Export
     let export_path = temp_dir.path().join("exported.json");
-    export(temp_dir.path(), &export_path, false, None).unwrap();
+    export(
+        temp_dir.path(),
+        &ExportOpts {
+            to_json: &export_path,
+            with_progress: false,
+            learnings_file: None,
+            from_json: None,
+            all: true,
+            force: false,
+        },
+    )
+    .unwrap();
 
     // Re-parse exported JSON
     let exported_json = fs::read_to_string(&export_path).unwrap();
@@ -544,7 +674,18 @@ fn test_round_trip_model_fields_omitted_from_json_when_none() {
     .unwrap();
 
     let export_path = temp_dir.path().join("exported.json");
-    export(temp_dir.path(), &export_path, false, None).unwrap();
+    export(
+        temp_dir.path(),
+        &ExportOpts {
+            to_json: &export_path,
+            with_progress: false,
+            learnings_file: None,
+            from_json: None,
+            all: true,
+            force: false,
+        },
+    )
+    .unwrap();
 
     // Verify that None fields are omitted from JSON output (skip_serializing_if)
     let exported_json = fs::read_to_string(&export_path).unwrap();
@@ -602,7 +743,18 @@ fn test_export_preserves_model_fields_in_json_format() {
     .unwrap();
 
     let export_path = temp_dir.path().join("exported.json");
-    export(temp_dir.path(), &export_path, false, None).unwrap();
+    export(
+        temp_dir.path(),
+        &ExportOpts {
+            to_json: &export_path,
+            with_progress: false,
+            learnings_file: None,
+            from_json: None,
+            all: true,
+            force: false,
+        },
+    )
+    .unwrap();
 
     // Verify JSON uses camelCase keys (from serde rename_all)
     let exported_json = fs::read_to_string(&export_path).unwrap();
@@ -909,7 +1061,18 @@ fn test_export_round_trips_requires_human_field() {
     .unwrap();
 
     let export_path = temp_dir.path().join("exported.json");
-    export(temp_dir.path(), &export_path, false, None).unwrap();
+    export(
+        temp_dir.path(),
+        &ExportOpts {
+            to_json: &export_path,
+            with_progress: false,
+            learnings_file: None,
+            from_json: None,
+            all: true,
+            force: false,
+        },
+    )
+    .unwrap();
 
     let exported_json = fs::read_to_string(&export_path).unwrap();
     let exported: prd::ExportedPrd = serde_json::from_str(&exported_json).unwrap();
@@ -1037,7 +1200,18 @@ fn test_export_round_trips_completed_by_provider() {
     drop(conn);
 
     let export_path = temp_dir.path().join("exported.json");
-    export(temp_dir.path(), &export_path, false, None).unwrap();
+    export(
+        temp_dir.path(),
+        &ExportOpts {
+            to_json: &export_path,
+            with_progress: false,
+            learnings_file: None,
+            from_json: None,
+            all: true,
+            force: false,
+        },
+    )
+    .unwrap();
 
     let exported_json = fs::read_to_string(&export_path).unwrap();
     let exported: prd::ExportedPrd = serde_json::from_str(&exported_json).unwrap();
@@ -1300,8 +1474,8 @@ fn test_exported_prd_has_no_task_prefix_field_and_serde_round_trips() {
 }
 
 #[test]
-fn test_export_dir_still_four_arg_dump_all() {
-    // Arity / dump-all call sites: two prefixes still dump everything via export().
+fn test_export_all_two_prefixes_dump_all() {
+    // all: true → today's dump even with two prefixes (no active error).
     let temp_dir = TempDir::new().unwrap();
     let mut conn = open_connection(temp_dir.path()).unwrap();
     create_schema(&conn).unwrap();
@@ -1347,7 +1521,18 @@ fn test_export_dir_still_four_arg_dump_all() {
     .unwrap();
 
     let export_path = temp_dir.path().join("exported.json");
-    let result = export(temp_dir.path(), &export_path, false, None).unwrap();
+    let result = export(
+        temp_dir.path(),
+        &ExportOpts {
+            to_json: &export_path,
+            with_progress: false,
+            learnings_file: None,
+            from_json: None,
+            all: true,
+            force: false,
+        },
+    )
+    .unwrap();
     assert_eq!(result.tasks_exported, 2);
 
     let exported: ExportedPrd =
@@ -1375,5 +1560,395 @@ fn test_export_module_has_no_task_prefix_is_null() {
     assert!(
         !lowered.contains("task_prefix is null"),
         "export/ must not use WHERE task_prefix IS NULL"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// FEAT-002: ExportOpts + overwrite-guard + scope selection
+// ---------------------------------------------------------------------------
+
+const ACTIVE_PREFIX_ENV: &str = "TASK_MGR_ACTIVE_PREFIX";
+static ENV_PREFIX_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Clears leaked loop `TASK_MGR_ACTIVE_PREFIX` for resolve_context-sensitive tests.
+struct EnvIsolation {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    prior: Option<String>,
+}
+
+impl EnvIsolation {
+    fn new() -> Self {
+        let lock = ENV_PREFIX_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var(ACTIVE_PREFIX_ENV).ok();
+        unsafe { std::env::remove_var(ACTIVE_PREFIX_ENV) };
+        Self { _lock: lock, prior }
+    }
+}
+
+impl Drop for EnvIsolation {
+    fn drop(&mut self) {
+        match &self.prior {
+            Some(v) => unsafe { std::env::set_var(ACTIVE_PREFIX_ENV, v) },
+            None => unsafe { std::env::remove_var(ACTIVE_PREFIX_ENV) },
+        }
+    }
+}
+
+fn opts_all(to_json: &std::path::Path) -> ExportOpts<'_> {
+    ExportOpts {
+        to_json,
+        with_progress: false,
+        learnings_file: None,
+        from_json: None,
+        all: true,
+        force: false,
+    }
+}
+
+fn seed_two_prefix_db(temp_dir: &TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
+    let mut conn = open_connection(temp_dir.path()).unwrap();
+    create_schema(&conn).unwrap();
+    run_migrations(&mut conn).unwrap();
+    drop(conn);
+
+    let a = temp_dir.path().join("a.json");
+    let b = temp_dir.path().join("b.json");
+    fs::write(
+        &a,
+        r#"{"project":"proj-a","branchName":"ba","extraKeepMe":true,"userStories":[
+            {"id":"A-STORY-001","title":"A","priority":1,"passes":false}
+        ]}"#,
+    )
+    .unwrap();
+    fs::write(
+        &b,
+        r#"{"project":"proj-b","branchName":"bb","userStories":[
+            {"id":"B-STORY-001","title":"B","priority":1,"passes":false}
+        ]}"#,
+    )
+    .unwrap();
+
+    init::init(
+        temp_dir.path(),
+        &[&a],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Explicit("A".into()),
+    )
+    .unwrap();
+    init::init(
+        temp_dir.path(),
+        &[&b],
+        false,
+        true,
+        false,
+        false,
+        PrefixMode::Explicit("B".into()),
+    )
+    .unwrap();
+    (a, b)
+}
+
+#[test]
+fn test_export_registered_dest_without_force_refuses_bytes_identical() {
+    let temp_dir = TempDir::new().unwrap();
+    let (a, _b) = seed_two_prefix_db(&temp_dir);
+    let before = fs::read(&a).unwrap();
+
+    let err = export(
+        temp_dir.path(),
+        &ExportOpts {
+            to_json: &a,
+            with_progress: false,
+            learnings_file: None,
+            from_json: Some(&a),
+            all: false,
+            force: false,
+        },
+    )
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("--force") && msg.to_lowercase().contains("dump"),
+        "refuse must name --force and dump-not-merge: {msg}"
+    );
+    assert_eq!(
+        fs::read(&a).unwrap(),
+        before,
+        "dest bytes must be identical"
+    );
+}
+
+#[test]
+fn test_export_registered_dest_with_force_replaces_lossy() {
+    let temp_dir = TempDir::new().unwrap();
+    let (a, _b) = seed_two_prefix_db(&temp_dir);
+    // Seed an extra key that must disappear after --force dump.
+    let seeded = r#"{"project":"proj-a","branchName":"ba","extraKeepMe":true,"taskPrefix":"A","userStories":[]}"#;
+    fs::write(&a, seeded).unwrap();
+
+    export(
+        temp_dir.path(),
+        &ExportOpts {
+            to_json: &a,
+            with_progress: false,
+            learnings_file: None,
+            from_json: Some(&a),
+            all: false,
+            force: true,
+        },
+    )
+    .unwrap();
+
+    let after = fs::read_to_string(&a).unwrap();
+    assert!(
+        !after.contains("extraKeepMe"),
+        "force dump must not preserve extra keys: {after}"
+    );
+    assert!(
+        !after.contains("taskPrefix"),
+        "ExportedPrd must stay lossy (no taskPrefix): {after}"
+    );
+    let exported: ExportedPrd = serde_json::from_str(&after).unwrap();
+    assert_eq!(exported.project, "proj-a");
+    assert_eq!(exported.user_stories.len(), 1);
+}
+
+#[test]
+fn test_export_all_onto_registered_still_requires_force() {
+    let temp_dir = TempDir::new().unwrap();
+    let (a, _b) = seed_two_prefix_db(&temp_dir);
+    let before = fs::read(&a).unwrap();
+
+    let err = export(
+        temp_dir.path(),
+        &ExportOpts {
+            to_json: &a,
+            with_progress: false,
+            learnings_file: None,
+            from_json: None,
+            all: true,
+            force: false,
+        },
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("--force"));
+    assert_eq!(fs::read(&a).unwrap(), before);
+}
+
+#[test]
+fn test_export_missing_dest_creates_without_force() {
+    let temp_dir = TempDir::new().unwrap();
+    let json_path = temp_dir.path().join("prd.json");
+    fs::write(&json_path, create_test_prd()).unwrap();
+    init::init(
+        temp_dir.path(),
+        &[&json_path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Disabled,
+    )
+    .unwrap();
+
+    let dest = temp_dir.path().join("new-export.json");
+    assert!(!dest.exists());
+    export(temp_dir.path(), &opts_all(&dest)).unwrap();
+    assert!(dest.is_file());
+}
+
+#[test]
+fn test_export_identity_miss_existing_file_writes_without_force() {
+    let temp_dir = TempDir::new().unwrap();
+    let json_path = temp_dir.path().join("prd.json");
+    fs::write(&json_path, create_test_prd()).unwrap();
+    init::init(
+        temp_dir.path(),
+        &[&json_path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Disabled,
+    )
+    .unwrap();
+
+    // Unregistered existing file (identity miss) — lock then write, no force.
+    let dump = temp_dir.path().join("dump.json");
+    fs::write(&dump, r#"{"scratch":true}"#).unwrap();
+    export(temp_dir.path(), &opts_all(&dump)).unwrap();
+    let after = fs::read_to_string(&dump).unwrap();
+    assert!(!after.contains("scratch"));
+    let exported: ExportedPrd = serde_json::from_str(&after).unwrap();
+    assert_eq!(exported.user_stories.len(), 2);
+}
+
+#[test]
+fn test_export_directory_dest_errors() {
+    let temp_dir = TempDir::new().unwrap();
+    let json_path = temp_dir.path().join("prd.json");
+    fs::write(&json_path, create_test_prd()).unwrap();
+    init::init(
+        temp_dir.path(),
+        &[&json_path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Disabled,
+    )
+    .unwrap();
+
+    let dir_dest = temp_dir.path().join("outdir");
+    fs::create_dir(&dir_dest).unwrap();
+    let err = export(temp_dir.path(), &opts_all(&dir_dest)).unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("directory"),
+        "directory dest must error: {err}"
+    );
+}
+
+#[test]
+fn test_export_no_active_prd_errors_naming_flags() {
+    let _env = EnvIsolation::new();
+    let temp_dir = TempDir::new().unwrap();
+    let (_a, _b) = seed_two_prefix_db(&temp_dir);
+    let dest = temp_dir.path().join("out.json");
+    let err = export(
+        temp_dir.path(),
+        &ExportOpts {
+            to_json: &dest,
+            with_progress: false,
+            learnings_file: None,
+            from_json: None,
+            all: false,
+            force: false,
+        },
+    )
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("--from-json") && msg.contains("--all") && msg.contains("task-mgr current"),
+        "no-active must name --from-json / --all / task-mgr current: {msg}"
+    );
+    assert!(!dest.exists(), "refuse must not create dest");
+}
+
+#[test]
+fn test_export_from_json_scopes_to_pin_prefix() {
+    let temp_dir = TempDir::new().unwrap();
+    let (a, _b) = seed_two_prefix_db(&temp_dir);
+    let dest = temp_dir.path().join("scoped.json");
+    let result = export(
+        temp_dir.path(),
+        &ExportOpts {
+            to_json: &dest,
+            with_progress: false,
+            learnings_file: None,
+            from_json: Some(&a),
+            all: false,
+            force: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(result.tasks_exported, 1);
+    let exported: ExportedPrd = serde_json::from_str(&fs::read_to_string(&dest).unwrap()).unwrap();
+    assert_eq!(exported.project, "proj-a");
+    assert!(
+        exported.user_stories.iter().all(|s| s.id.starts_with("A-")),
+        "from-json pin must dump only A: {:?}",
+        exported.user_stories
+    );
+}
+
+#[test]
+fn test_export_empty_prefix_from_json_uses_by_prd_id() {
+    // Do NOT use two PrefixMode::Disabled inits — insert_prd_metadata's
+    // `SELECT … WHERE task_prefix IS NULL` collapses twins (prohibited proof).
+    // Seed distinct NULL-prefix rows + prd_files like FEAT-001.
+    let _env = EnvIsolation::new();
+    let temp_dir = TempDir::new().unwrap();
+    let mut conn = open_connection(temp_dir.path()).unwrap();
+    create_schema(&conn).unwrap();
+    run_migrations(&mut conn).unwrap();
+
+    let a = temp_dir.path().join("empty-a.json");
+    let b = temp_dir.path().join("empty-b.json");
+    fs::write(
+        &a,
+        r#"{"project":"empty-a","branchName":"ba","userStories":[]}"#,
+    )
+    .unwrap();
+    fs::write(
+        &b,
+        r#"{"project":"empty-b","branchName":"bb","userStories":[]}"#,
+    )
+    .unwrap();
+    let canon_a = a.canonicalize().unwrap();
+    let canon_b = b.canonicalize().unwrap();
+
+    seed_prd_meta(&conn, 1, "empty-a", Some("ba"), None);
+    seed_prd_meta(&conn, 2, "empty-b", Some("bb"), None);
+    seed_task_list_file(&conn, 1, &canon_a);
+    seed_task_list_file(&conn, 2, &canon_b);
+    seed_task(&conn, "US-001", "A");
+    seed_task(&conn, "US-002", "B");
+    drop(conn);
+
+    let dest = temp_dir.path().join("pin-b.json");
+    export(
+        temp_dir.path(),
+        &ExportOpts {
+            to_json: &dest,
+            with_progress: false,
+            learnings_file: None,
+            from_json: Some(&b),
+            all: false,
+            force: false,
+        },
+    )
+    .unwrap();
+
+    let exported: ExportedPrd = serde_json::from_str(&fs::read_to_string(&dest).unwrap()).unwrap();
+    // Empty-prefix: all unarchived tasks; metadata = B via identity prd_id.
+    assert_eq!(exported.project, "empty-b");
+    assert_eq!(exported.branch_name.as_deref(), Some("bb"));
+    assert_eq!(exported.user_stories.len(), 2);
+}
+
+#[test]
+fn test_export_module_grep_invariants() {
+    let export_src = concat!(
+        include_str!("prd.rs"),
+        include_str!("mod.rs"),
+        include_str!("progress.rs"),
+    );
+    assert!(
+        !export_src.contains("cli_write_path"),
+        "export/ must not call cli_write_path"
+    );
+    assert!(
+        !export_src.contains("preflight_from_json_path"),
+        "export/ must not call preflight_from_json_path"
+    );
+    assert!(
+        !export_src.contains("invalid_state(\n            \"add\"")
+            && !export_src.contains("invalid_state(\"add\""),
+        "export/ must not use invalid_state command-name \"add\""
+    );
+    assert!(
+        !export_src.contains("with_extension(\"json.tmp\")"),
+        "write_json_atomic must use unique_tmp_path, not with_extension(json.tmp)"
+    );
+    assert!(
+        export_src.contains("unique_tmp_path"),
+        "write_json_atomic must use prd_json::unique_tmp_path"
+    );
+    assert!(
+        !export_src.contains("commands::add") && !export_src.contains("commands::update"),
+        "export must not import add/update"
     );
 }

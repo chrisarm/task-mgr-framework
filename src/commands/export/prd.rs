@@ -117,12 +117,8 @@ pub(crate) enum MetadataScope<'a> {
     /// `--all` / unscoped: `ORDER BY id ASC LIMIT 1` (today's dump).
     Unscoped,
     /// Named active / `--from-json` prefix: `WHERE task_prefix = ?`.
-    /// Constructed by FEAT-002 scope selection (export stays dump-all here).
-    #[allow(dead_code)]
     NamedPrefix(&'a str),
     /// Empty-prefix `--from-json` pin: `WHERE id = ?`.
-    /// Constructed by FEAT-002 scope selection (export stays dump-all here).
-    #[allow(dead_code)]
     ByPrdId(i64),
 }
 
