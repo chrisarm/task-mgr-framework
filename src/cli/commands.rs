@@ -310,6 +310,38 @@ EXAMPLES:
     },
 
     /// Export database state to JSON
+    ///
+    /// Default dump is the active PRD only. Pass `--all` for today's full-DB
+    /// dump, or `--from-json PATH` to pin an already-registered effort as the
+    /// dump **source** (dest is always `--to-json`). Overwriting a registered
+    /// `task_list` requires `--force` (lossy dump, not a merge).
+    #[command(after_help = "\
+EXAMPLES:
+    # Scoped dump of the active PRD to a new file
+    task-mgr export --to-json /tmp/active-dump.json
+
+    # Pin an already-registered effort as the dump source (not an import)
+    task-mgr export --from-json tasks/my-prd.json --to-json /tmp/my-dump.json
+
+    # Today's dump: all unarchived tasks + first prd_metadata row
+    task-mgr export --all --to-json /tmp/full-dump.json
+
+    # Overwrite a registered task-list (opt-in; lossy dump, not a merge)
+    task-mgr export --from-json tasks/my-prd.json --to-json tasks/my-prd.json --force
+
+--from-json (pin, not import):
+    Pins the dump **source** to an already-registered task_list. Does NOT
+    register a new PRD — run `task-mgr loop init <prd>.json` first. Dest is
+    still `--to-json PATH` (never remapped). Distinct from
+    `task-mgr init --from-json` (the deprecated import shim).
+
+--all:
+    Restores today's unscoped dump. Conflicts with `--from-json`.
+
+--force:
+    Required when `--to-json` is a registered task_list. Export is a lossy
+    dump (strips extra keys / taskPrefix), not a merge.
+")]
     Export {
         /// Path to write the JSON PRD file
         #[arg(long = "to-json", required = true)]
@@ -322,6 +354,26 @@ EXAMPLES:
         /// Export learnings to a separate file
         #[arg(long = "learnings-file")]
         learnings_file: Option<PathBuf>,
+
+        /// Pin this already-registered effort as the dump source (not an import).
+        ///
+        /// Selects which PRD's tasks/metadata to dump. Dest remains `--to-json`.
+        /// The file must already be a registered `task_list` (or its JSON
+        /// `taskPrefix` must be in `prd_metadata`). Unregistered / missing /
+        /// directory paths are refused. Distinct from `init --from-json` /
+        /// `loop init`, which register a new PRD.
+        #[arg(long = "from-json", value_name = "PATH", conflicts_with = "all")]
+        from_json: Option<PathBuf>,
+
+        /// Dump all unarchived tasks (today's unscoped export). Conflicts with
+        /// `--from-json`.
+        #[arg(long, default_value_t = false, conflicts_with = "from_json")]
+        all: bool,
+
+        /// Opt-in overwrite of a registered task-list destination (lossy dump,
+        /// not a merge).
+        #[arg(long, default_value_t = false)]
+        force: bool,
     },
 
     /// Check database health and fix stale state

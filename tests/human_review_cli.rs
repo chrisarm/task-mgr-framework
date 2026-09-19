@@ -208,7 +208,12 @@ fn test_export_preserves_requires_human_and_timeout() {
 
     Command::new(cargo_bin("task-mgr"))
         .args(["--dir", temp_dir.path().to_str().unwrap()])
-        .args(["export", "--to-json", export_path.to_str().unwrap()])
+        .args([
+            "export",
+            "--all",
+            "--to-json",
+            export_path.to_str().unwrap(),
+        ])
         .assert()
         .success();
 
@@ -245,7 +250,12 @@ fn test_export_omits_requires_human_for_regular_task() {
 
     Command::new(cargo_bin("task-mgr"))
         .args(["--dir", temp_dir.path().to_str().unwrap()])
-        .args(["export", "--to-json", export_path.to_str().unwrap()])
+        .args([
+            "export",
+            "--all",
+            "--to-json",
+            export_path.to_str().unwrap(),
+        ])
         .assert()
         .success();
 
@@ -286,7 +296,12 @@ fn test_full_round_trip_requires_human() {
     // Phase 2: Export from first DB
     Command::new(cargo_bin("task-mgr"))
         .args(["--dir", temp_dir1.path().to_str().unwrap()])
-        .args(["export", "--to-json", export_path.to_str().unwrap()])
+        .args([
+            "export",
+            "--all",
+            "--to-json",
+            export_path.to_str().unwrap(),
+        ])
         .assert()
         .success();
 
@@ -308,7 +323,12 @@ fn test_full_round_trip_requires_human() {
     let export_path2 = temp_dir2.path().join("re-exported.json");
     Command::new(cargo_bin("task-mgr"))
         .args(["--dir", temp_dir2.path().to_str().unwrap()])
-        .args(["export", "--to-json", export_path2.to_str().unwrap()])
+        .args([
+            "export",
+            "--all",
+            "--to-json",
+            export_path2.to_str().unwrap(),
+        ])
         .assert()
         .success();
 

@@ -602,18 +602,21 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
             to_json,
             with_progress,
             learnings_file,
+            from_json,
+            all,
+            force,
         } => {
-            // Forward ExportOpts only. NEVER LockGuard::acquire here (FEAT-003
-            // grows clap fields; lock stays inside export() after dest.is_file()).
+            // Forward ExportOpts only. NEVER LockGuard::acquire here —
+            // lock stays inside export() after dest.is_file() (CONTRACT-002).
             let result = export(
                 &cli.dir,
                 &ExportOpts {
                     to_json: &to_json,
                     with_progress,
                     learnings_file: learnings_file.as_deref(),
-                    from_json: None,
-                    all: false,
-                    force: false,
+                    from_json: from_json.as_deref(),
+                    all,
+                    force,
                 },
             )?;
             output_result(&result, cli.format);

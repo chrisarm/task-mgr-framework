@@ -183,7 +183,12 @@ fn test_export_preserves_model_fields() {
 
     Command::new(cargo_bin("task-mgr"))
         .args(["--dir", temp_dir.path().to_str().unwrap()])
-        .args(["export", "--to-json", export_path.to_str().unwrap()])
+        .args([
+            "export",
+            "--all",
+            "--to-json",
+            export_path.to_str().unwrap(),
+        ])
         .assert()
         .success();
 
@@ -251,7 +256,12 @@ fn test_export_omits_null_model_fields() {
 
     Command::new(cargo_bin("task-mgr"))
         .args(["--dir", temp_dir.path().to_str().unwrap()])
-        .args(["export", "--to-json", export_path.to_str().unwrap()])
+        .args([
+            "export",
+            "--all",
+            "--to-json",
+            export_path.to_str().unwrap(),
+        ])
         .assert()
         .success();
 
@@ -312,7 +322,12 @@ fn test_reimport_preserves_model_fields() {
     let export_path = temp_dir.path().join("after_reimport.json");
     Command::new(cargo_bin("task-mgr"))
         .args(["--dir", temp_dir.path().to_str().unwrap()])
-        .args(["export", "--to-json", export_path.to_str().unwrap()])
+        .args([
+            "export",
+            "--all",
+            "--to-json",
+            export_path.to_str().unwrap(),
+        ])
         .assert()
         .success();
 
@@ -359,7 +374,12 @@ fn test_full_cli_round_trip() {
     // Phase 2: Export from first DB
     Command::new(cargo_bin("task-mgr"))
         .args(["--dir", temp_dir1.path().to_str().unwrap()])
-        .args(["export", "--to-json", export_path.to_str().unwrap()])
+        .args([
+            "export",
+            "--all",
+            "--to-json",
+            export_path.to_str().unwrap(),
+        ])
         .assert()
         .success();
 
@@ -381,7 +401,12 @@ fn test_full_cli_round_trip() {
     let export_path2 = temp_dir2.path().join("re-exported.json");
     Command::new(cargo_bin("task-mgr"))
         .args(["--dir", temp_dir2.path().to_str().unwrap()])
-        .args(["export", "--to-json", export_path2.to_str().unwrap()])
+        .args([
+            "export",
+            "--all",
+            "--to-json",
+            export_path2.to_str().unwrap(),
+        ])
         .assert()
         .success();
 
