@@ -12,6 +12,8 @@ Generate a task list and prompt directly from a plan or description, skipping th
 ## Instructions
 
 > **Canonical reference:** `~/.claude/docs/task-mgr-best-practices.md` — planning flow, CLI, mid-loop JSON sync, spawn-fixup targeting, model routing (`task-mgr models route`), and gotchas. This skill adds lean task-generation steps on top of that base.
+>
+> **CLI (embed in the generated prompt):** `--from-json` pins an already-registered PRD. Spawn: `task-mgr add --stdin --from-json tasks/<prd>.json --depended-on-by REVIEW-001`. Patch: `task-mgr update --stdin --from-json tasks/<prd>.json`. Bulk sync: `task-mgr loop init <prd>.json --append --update-existing` — never bare `init --from-json`. Export onto a registered dest needs `--force`. Never hand-edit JSON.
 
 You are generating a lean, executable task list for the Claude Loop agent system. This skill combines planning and task generation into one step — no intermediate PRD artifact.
 
@@ -539,7 +541,7 @@ The agent checks these before starting any task. If the required task hasn't pas
       "estimatedEffort": "high",
       "passes": false,
       "timeoutSecs": 1800,
-      "notes": "If issues found: `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001` for each (priority 50-97) — atomic DB+JSON sync, no manual JSON edit. If no issues, invoke /simplify on any ugly touchpoint, then emit `<task-status>REFACTOR-001:done</task-status>` with a one-line progress note.",
+      "notes": "If issues found: `echo '{...}' | task-mgr add --stdin --from-json tasks/<prd>.json --depended-on-by REVIEW-001` for each (priority 50-97) — atomic DB+JSON sync, no manual JSON edit. If no issues, invoke /simplify on any ugly touchpoint, then emit `<task-status>REFACTOR-001:done</task-status>` with a one-line progress note.",
       "qualityDimensions": ["DRY across modules", "Single-responsibility functions", "Pattern consistency with existing code"],
       "touchesFiles": ["all modified files"],
       "dependsOn": ["all FEAT-xxx"]
@@ -566,7 +568,7 @@ The agent checks these before starting any task. If the required task hasn't pas
       "estimatedEffort": "high",
       "passes": false,
       "timeoutSecs": 1800,
-      "notes": "Spawn fixes via `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001` — DB + JSON synced atomically, no manual edit. If no issues: emit `<task-status>REVIEW-001:done</task-status>` with 'Clean review' note. Review remaining tasks — if implementation changed APIs, data structures, or assumptions, update task descriptions/criteria to match (via `task-mgr init --from-json ... --append --update-existing`).",
+      "notes": "Spawn fixes via `echo '{...}' | task-mgr add --stdin --from-json tasks/<prd>.json --depended-on-by REVIEW-001` — pin + atomic DB+JSON sync, no manual edit. If no issues: emit `<task-status>REVIEW-001:done</task-status>` with 'Clean review' note. Review remaining tasks — if implementation changed APIs, data structures, or assumptions, patch via `task-mgr update --stdin --from-json tasks/<prd>.json` or bulk-sync with `task-mgr loop init ... --append --update-existing`.",
       "qualityDimensions": ["No unwrap in production", "All new code wired to production entry point", "Full suite green including pre-existing"],
       "touchesFiles": ["all modified files"],
       "dependsOn": ["all FEAT-xxx", "REFACTOR-001"]
@@ -745,7 +747,7 @@ Use `$PREFIX` in every CLI call below so you stay scoped to this task list.
 | Inspect this iteration's task           | `task-mgr show <TASK-ID>` using the task ID from `## Current Task`                                                                                                                 |
 | List remaining tasks (debug only)       | `task-mgr list --prefix $PREFIX --status todo`                                                                                                                                    |
 | Recall learnings relevant to a task     | `task-mgr recall --for-task $PREFIX-TASK-ID` (also: `--query <text>`, `--tag <tag>`)                                                                                              |
-| Add a follow-up task (review spawns)    | `echo '{...}' \| task-mgr add --stdin --depended-on-by REVIEW-001` — priority auto-computed; DB + PRD JSON updated atomically                                                    |
+| Add a follow-up task (review spawns)    | `echo '{...}' \| task-mgr add --stdin --from-json tasks/<prd>.json --depended-on-by REVIEW-001` — pin + atomic DB+JSON sync                                                    |
 | Mark status                             | Emit `<task-status>$PREFIX-TASK-ID:done</task-status>` (statuses: `done`, `failed`, `skipped`, `irrelevant`, `blocked`) — loop engine routes through `task-mgr` and syncs the JSON |
 
 If you genuinely need a top-level field that's not surfaced per-task (rare — e.g., cross-PRD `requires[]`), pull it with `jq`, never a full Read:
@@ -940,7 +942,7 @@ echo '{
   "acceptanceCriteria": ["Issue resolved", "No new warnings"],
   "priority": 60,
   "touchesFiles": ["affected/file.rs"]
-}' | task-mgr add --stdin --depended-on-by REVIEW-001
+}' | task-mgr add --stdin --from-json tasks/<prd>.json --depended-on-by REVIEW-001
 ```
 
 `--depended-on-by` wires the new task into REVIEW-001's `dependsOn` AND syncs the PRD JSON atomically — don't edit the JSON yourself. When a **Project Verification Skills** entry covers the issue, set `verifyCommand` to that skill's drive (the helper or recipe the SKILL.md names), not a unit-test invocation. Commit with `chore: <REVIEW-ID> - Add <FIX|REFACTOR> tasks`, then emit `<task-status><REVIEW-ID>:done</task-status>`. If no issues found, emit the status with a one-line "No issues found" in the progress file.

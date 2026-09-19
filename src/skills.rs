@@ -40,6 +40,9 @@ pub struct EmbeddedSkill {
     pub content: &'static str,
 }
 
+/// Canonical operator doc staged to `~/.claude/docs/task-mgr-best-practices.md`.
+pub const BEST_PRACTICES_DOC: &str = include_str!("../.claude/docs/task-mgr-best-practices.md");
+
 /// All skill files managed by task-mgr. Adding a `.md` file to
 /// `.claude/commands/` requires adding an entry here — enforced by
 /// `registry_matches_commands_directory`.
@@ -205,6 +208,19 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     })
 }
 
+const BEST_PRACTICES_STEM: &str = "task-mgr-best-practices";
+
+/// Idempotently write [`BEST_PRACTICES_DOC`] into `docs_dir` as
+/// `task-mgr-best-practices.md`. Same manifest-guard as [`stage_skills`]
+/// (file `.task-mgr-docs.json` in that directory).
+pub fn stage_best_practices(docs_dir: &Path, force: bool) -> StageOutcome {
+    let one = [EmbeddedSkill {
+        name: BEST_PRACTICES_STEM,
+        content: BEST_PRACTICES_DOC,
+    }];
+    stage_registry(docs_dir, &one, force, ".task-mgr-docs.json")
+}
+
 /// Idempotently write the embedded skills into `commands_dir`.
 ///
 /// Never follows or replaces symlinks, never touches files whose names are
@@ -212,17 +228,26 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// in [`StageOutcome::errors`] for the caller to surface (staging is
 /// best-effort by contract).
 pub fn stage_skills(commands_dir: &Path, force: bool) -> StageOutcome {
+    stage_registry(commands_dir, EMBEDDED_SKILLS, force, MANIFEST_FILE)
+}
+
+fn stage_registry(
+    dir: &Path,
+    items: &[EmbeddedSkill],
+    force: bool,
+    manifest_file: &str,
+) -> StageOutcome {
     let mut outcome = StageOutcome::default();
 
-    if let Err(e) = fs::create_dir_all(commands_dir) {
+    if let Err(e) = fs::create_dir_all(dir) {
         outcome.errors.push(format!(
             "cannot write to {} ({e}); skipped staging",
-            commands_dir.display()
+            dir.display()
         ));
         return outcome;
     }
 
-    let manifest_path = commands_dir.join(MANIFEST_FILE);
+    let manifest_path = dir.join(manifest_file);
     let mut manifest = match fs::read(&manifest_path) {
         Ok(bytes) => match serde_json::from_slice::<Manifest>(&bytes) {
             Ok(m) => m,
@@ -244,8 +269,8 @@ pub fn stage_skills(commands_dir: &Path, force: bool) -> StageOutcome {
     manifest.version = 1;
 
     let mut manifest_dirty = false;
-    for skill in EMBEDDED_SKILLS {
-        let path = commands_dir.join(format!("{}.md", skill.name));
+    for skill in items {
+        let path = dir.join(format!("{}.md", skill.name));
 
         if is_symlink(&path) {
             outcome.skipped_symlink.push(skill.name);
@@ -352,6 +377,22 @@ mod tests {
         let names = expected_skill_names();
         assert!(names.contains(&"prd-tasks"));
         assert_eq!(names.len(), EMBEDDED_SKILLS.len());
+    }
+
+    #[test]
+    #[test]
+    fn best_practices_doc_is_nonempty_and_stages() {
+        assert!(BEST_PRACTICES_DOC.contains("task-mgr update --stdin"));
+        assert!(BEST_PRACTICES_DOC.contains("--from-json"));
+        assert!(BEST_PRACTICES_DOC.contains("--force"));
+        let dir = TempDir::new().unwrap();
+        let outcome = stage_best_practices(dir.path(), false);
+        assert_eq!(outcome.installed, vec!["task-mgr-best-practices"]);
+        let on_disk = fs::read_to_string(dir.path().join("task-mgr-best-practices.md")).unwrap();
+        assert_eq!(on_disk, BEST_PRACTICES_DOC);
+        let again = stage_best_practices(dir.path(), false);
+        assert!(again.installed.is_empty());
+        assert_eq!(again.up_to_date, vec!["task-mgr-best-practices"]);
     }
 
     #[test]

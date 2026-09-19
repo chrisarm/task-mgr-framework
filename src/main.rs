@@ -105,7 +105,8 @@ fn stage_global_skills(force_skills: bool) {
         ));
         return;
     };
-    let dir = PathBuf::from(home).join(".claude").join("commands");
+    let claude = PathBuf::from(home).join(".claude");
+    let dir = claude.join("commands");
     let outcome = task_mgr::skills::stage_skills(&dir, force_skills);
 
     for err in &outcome.errors {
@@ -170,6 +171,25 @@ fn stage_global_skills(force_skills: bool) {
             "Staged skills to ~/.claude/commands/: {}",
             parts.join(", ")
         ));
+    }
+
+    let docs_dir = claude.join("docs");
+    let docs = task_mgr::skills::stage_best_practices(&docs_dir, force_skills);
+    for err in &docs.errors {
+        ui::emit_err(&ui::yellow(&format!("warning: docs: {err}")));
+    }
+    for name in &docs.overwrote_modified {
+        ui::emit_err(&format!("overwrote {name}.md (local copy differed)"));
+    }
+    if !docs.skipped_modified.is_empty() {
+        ui::emit_err(&ui::yellow(
+            "warning: ~/.claude/docs/task-mgr-best-practices.md differs from the bundled copy.\n  \
+             Kept your copy. To replace it: task-mgr init --force-skills",
+        ));
+    }
+    let docs_refreshed = docs.refreshed.len() + docs.overwrote_modified.len();
+    if !docs.installed.is_empty() || docs_refreshed > 0 {
+        ui::emit("Staged ~/.claude/docs/task-mgr-best-practices.md");
     }
 }
 
