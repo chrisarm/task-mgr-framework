@@ -53,6 +53,31 @@ fn clarify_block_uses_update_stdin_not_hand_edit() {
 }
 
 #[test]
+fn cheat_sheet_add_example_includes_from_json_and_keeps_spawn_fixup_a() {
+    // FEAT-005: CLI cheat sheet add example pins with --from-json; spawn-fixup
+    // form (a) stays; do not regress the PR-2 CLARIFY update --stdin path.
+    let cheat = WORKFLOW_TEMPLATE
+        .split("### CLI cheat sheet")
+        .nth(1)
+        .and_then(|rest| rest.split("### ").next())
+        .expect("CLI cheat sheet section must exist");
+    assert!(
+        cheat.contains("task-mgr add --stdin --from-json"),
+        "cheat sheet add example must include --from-json: {cheat}"
+    );
+
+    let spawn = WORKFLOW_TEMPLATE
+        .split("### Spawn-fixup PRD targeting")
+        .nth(1)
+        .and_then(|rest| rest.split("### ").next())
+        .expect("Spawn-fixup section must exist");
+    assert!(
+        spawn.contains("--from-json tasks/<correct-prd>.json"),
+        "spawn-fixup form (a) must stay: {spawn}"
+    );
+}
+
+#[test]
 fn full_template_strictly_contains_workflow_template() {
     // Acceptance: "Unit test: `full` profile strictly contains `workflow`
     // profile content (use length comparison + grep for a workflow-only

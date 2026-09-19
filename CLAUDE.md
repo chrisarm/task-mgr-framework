@@ -243,7 +243,7 @@ This block is managed by `task-mgr enhance` — edits inside the
 
   ```sh
   echo '{"id":"CODE-FIX-001","title":"Fix race","difficulty":"medium","touchesFiles":["src/foo.rs"]}' \
-    | task-mgr add --stdin
+    | task-mgr add --stdin --from-json tasks/<prd>.json
   ```
 
   Priority is auto-computed (top-task priority minus one). Pass
