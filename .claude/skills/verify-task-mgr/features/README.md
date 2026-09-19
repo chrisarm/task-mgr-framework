@@ -50,3 +50,4 @@ Keep implementation details out of the map. Name only user paths, stable handles
 - [Status and doctor](./status-and-doctor.md) covers the status dashboard, health check, and the skipped live-loop path.
 - [Add and current `--from-json` pin](./add-and-current-from-json.md) covers pin (not import) on `add`/`current`, refuse paths, ≥2-prefix unpinned refuse, and zero-prefix insert.
 - [Update and `humanReviewOutcome`](./update-and-human-review-outcome.md) covers `update` load-merge-write, overlay reject, JSON-only `humanReviewOutcome`, `--from-json` pin, ≥2-prefix unpinned refuse, `--no-prefix` succeeds, and empty-path JSON-only `invalid_state`.
+- [Export scoped and `--force`](./export-scoped-and-force.md) covers active-PRD default dump, `--from-json` source pin, `--all` unscoped dump, registered-dest refuse / `--force` lossy overwrite, ≥2-prefix and zero-prefix no-active errors, and `--all --from-json` clap conflict.
