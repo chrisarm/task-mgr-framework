@@ -49,3 +49,4 @@ Keep implementation details out of the map. Name only user paths, stable handles
 - [Models routing](./models-routing.md) covers `models init`, `show`, offline `list`, and `set-anchor`.
 - [Status and doctor](./status-and-doctor.md) covers the status dashboard, health check, and the skipped live-loop path.
 - [Add and current `--from-json` pin](./add-and-current-from-json.md) covers pin (not import) on `add`/`current`, refuse paths, ≥2-prefix unpinned refuse, and zero-prefix insert.
+- [Update and `humanReviewOutcome`](./update-and-human-review-outcome.md) covers `update` load-merge-write, overlay reject, JSON-only `humanReviewOutcome`, `--from-json` pin, ≥2-prefix unpinned refuse, `--no-prefix` succeeds, and empty-path JSON-only `invalid_state`.
