@@ -14,6 +14,8 @@
 //! 4. DB anchoring unchanged: rows stay in main-repo `.task-mgr`.
 //! 5. `--from-json` of the worktree file scopes the dump **source**; dest
 //!    remains the `--to-json` PATH.
+//! 6. cwd=main, `--to-json` = worktree live JSON, no `--force` → refuse
+//!    (dest-derived worktree_root, not cwd-bound identity).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -193,6 +195,58 @@ fn worktree_registered_dest_without_force_refuses_bytes_identical() {
         std::fs::read(&main_prd).unwrap(),
         main_before,
         "main JSON must be unchanged after refuse"
+    );
+    assert_task_in_db(&repo.path().join(".task-mgr"), "LIVE-SEED-001");
+    assert!(
+        !wt.join(".task-mgr").exists(),
+        "DB must stay on main-repo .task-mgr"
+    );
+}
+
+/// CODE-FIX-002: from main cwd, absolute `--to-json` at a linked worktree
+/// live JSON must still hit pin-19 (c) via dest-derived worktree_root.
+#[test]
+fn main_cwd_to_json_worktree_registered_dest_without_force_refuses() {
+    let (repo, main_prd) = setup_repo_with_registered_prd();
+    let wt_parent = TempDir::new().unwrap();
+    let wt = add_worktree(repo.path(), wt_parent.path(), "exp-main-cwd");
+    let wt_prd = wt.join("tasks/foo.json");
+    assert!(wt_prd.is_file(), "worktree must carry tasks/foo.json");
+
+    std::fs::write(&wt_prd, LIVE_PRD_JSON).unwrap();
+    let wt_before = std::fs::read(&wt_prd).unwrap();
+    let main_before = std::fs::read(&main_prd).unwrap();
+
+    // cwd = main checkout; --to-json = absolute worktree live JSON.
+    let (stdout, stderr, status) = run_export(
+        repo.path(),
+        &[
+            "--to-json",
+            wt_prd.to_str().unwrap(),
+            "--from-json",
+            wt_prd.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        !status.success(),
+        "main cwd + worktree registered dest without --force must refuse: \
+         stdout={stdout} stderr={stderr}"
+    );
+    let err = format!("{stdout}{stderr}");
+    assert!(
+        err.contains("--force") && err.to_lowercase().contains("dump"),
+        "refuse must name --force and dump-not-merge: {err}"
+    );
+
+    assert_eq!(
+        std::fs::read(&wt_prd).unwrap(),
+        wt_before,
+        "worktree dest bytes must be identical after refuse from main cwd"
+    );
+    assert_eq!(
+        std::fs::read(&main_prd).unwrap(),
+        main_before,
+        "main JSON must be unchanged after refuse from main cwd"
     );
     assert_task_in_db(&repo.path().join(".task-mgr"), "LIVE-SEED-001");
     assert!(

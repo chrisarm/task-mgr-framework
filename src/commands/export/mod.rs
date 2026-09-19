@@ -28,7 +28,8 @@ use std::path::Path;
 use serde::Serialize;
 
 use crate::commands::context::{
-    default_prd_roots, find_registered_by_path_identity, resolve_context_with_roots,
+    default_prd_roots, find_registered_by_path_identity, prd_roots_for_dest_identity,
+    resolve_context_with_roots,
 };
 use crate::commands::prd_json::unique_tmp_path;
 use crate::db::LockGuard;
@@ -103,6 +104,9 @@ pub fn export(dir: &Path, opts: &ExportOpts<'_>) -> TaskMgrResult<ExportResult> 
 
     // Overwrite-guard: lock only when dest already exists as a file.
     // Refuse registered dest without --force BEFORE serializing tasks.
+    // Dest identity uses dest-derived worktree_root (not cwd-only
+    // default_prd_roots) so absolute --to-json at a linked worktree live
+    // JSON still hits pin-19 (c) when cwd is main.
     let _lock = if dest.is_file() {
         let lock = LockGuard::acquire(dir)?;
         let dest_canon = fs::canonicalize(dest).map_err(|e| {
@@ -111,11 +115,12 @@ pub fn export(dir: &Path, opts: &ExportOpts<'_>) -> TaskMgrResult<ExportResult> 
                 format!("Failed to canonicalize {}: {}", dest.display(), e),
             ))
         })?;
+        let (dest_source_root, dest_worktree_root) = prd_roots_for_dest_identity(dir, &dest_canon);
         let registered = find_registered_by_path_identity(
             &conn,
             &dest_canon,
-            Some(&source_root),
-            Some(&worktree_root),
+            Some(&dest_source_root),
+            Some(&dest_worktree_root),
         )?;
         if registered.is_some() && !opts.force {
             return Err(TaskMgrError::invalid_state(

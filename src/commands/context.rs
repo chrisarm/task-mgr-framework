@@ -3,7 +3,8 @@
 //! Owns `ResolvedContext`, `ResolutionSource`, `resolve_context`,
 //! `resolve_active_prefix`, `locate_prd_json`, `load_known_prefixes`, the
 //! pin-19 path identity helper (`paths_identify`), and write-only helpers
-//! [`refuse_unpinned_write`] / [`preflight_from_json_path`] / [`default_prd_roots`].
+//! [`refuse_unpinned_write`] / [`preflight_from_json_path`] / [`default_prd_roots`] /
+//! [`prd_roots_for_dest_identity`].
 //! `--from-json` registration is `(a)` JSON `taskPrefix` ∈ `prd_metadata`
 //! **OR** pin-19 `(b)/(c)`.
 //!
@@ -522,6 +523,10 @@ pub(crate) fn preflight_from_json_path(path: &Path, command: &str) -> TaskMgrRes
 /// Shared by write-path callers (`add` / `update`) so TempDir / `--dir`
 /// relative `prd_files` resolve against the project, not the developer
 /// checkout. Do not `use commands::add` from update — call this instead.
+///
+/// `worktree_root` is **cwd-bound**: linked only when cwd itself is inside a
+/// linked worktree. Export dest overwrite-guard must not use this alone for
+/// the identity probe — see [`prd_roots_for_dest_identity`].
 pub(crate) fn default_prd_roots(db_dir: &Path) -> (PathBuf, PathBuf) {
     let source_root = crate::git::main_repo_root_at(db_dir)
         .or_else(|| db_dir.parent().map(|p| p.to_path_buf()))
@@ -530,6 +535,28 @@ pub(crate) fn default_prd_roots(db_dir: &Path) -> (PathBuf, PathBuf) {
         .ok()
         .filter(|cwd| crate::git::is_inside_worktree_at(cwd).unwrap_or(false))
         .unwrap_or_else(|| source_root.clone());
+    (source_root, worktree_root)
+}
+
+/// Roots for export `--to-json` dest overwrite-guard identity (pin 19).
+///
+/// `source_root` matches [`default_prd_roots`]. `worktree_root` is derived
+/// from `dest_canon` when that path lives in a linked worktree, so an
+/// absolute `--to-json` at a worktree live JSON still hits pin-19 (c) when
+/// cwd is main or elsewhere. When dest is not in a linked worktree, falls
+/// back to the cwd-based root from [`default_prd_roots`].
+///
+/// `dest_canon` must already be canonicalized (export does this after
+/// `dest.is_file()`). Probe uses the file's parent directory because git
+/// `current_dir` requires a directory.
+pub(crate) fn prd_roots_for_dest_identity(db_dir: &Path, dest_canon: &Path) -> (PathBuf, PathBuf) {
+    let (source_root, cwd_worktree_root) = default_prd_roots(db_dir);
+    let probe = dest_canon.parent().unwrap_or(dest_canon);
+    let worktree_root = if crate::git::is_inside_worktree_at(probe).unwrap_or(false) {
+        crate::git::worktree_root_at(probe).unwrap_or(cwd_worktree_root)
+    } else {
+        cwd_worktree_root
+    };
     (source_root, worktree_root)
 }
 
