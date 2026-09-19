@@ -2862,7 +2862,8 @@ fn test_how_where_will_my_add_land_points_at_current() {
         .env_remove("TASK_MGR_ACTIVE_PREFIX")
         .assert()
         .success()
-        .stdout(predicate::str::contains("task-mgr current"));
+        .stdout(predicate::str::contains("task-mgr current"))
+        .stdout(predicate::str::contains("--from-json"));
 }
 
 #[test]

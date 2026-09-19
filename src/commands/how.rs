@@ -124,6 +124,26 @@ mod tests {
             "recipe must point at task-mgr current: {}",
             r.content,
         );
+        assert!(
+            r.content.contains("--from-json"),
+            "recipe must treat --from-json as a real pin: {}",
+            r.content,
+        );
+    }
+
+    #[test]
+    fn view_active_shows_from_json_pin() {
+        let r = how(Some("view active"));
+        assert!(
+            r.content.contains("task-mgr current --from-json"),
+            "recipe must show current --from-json pin: {}",
+            r.content,
+        );
+        assert!(
+            r.content.contains("--from-json"),
+            "recipe must list from-json as a real source: {}",
+            r.content,
+        );
     }
 
     #[test]
