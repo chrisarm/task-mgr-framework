@@ -11,6 +11,18 @@ use serde_json::Value;
 /// into the PRD JSON on disk. `skip_serializing_if` attributes mirror the
 /// `#[serde(default)]` attributes on the `Deserialize` side so a task that
 /// comes in minimal goes out minimal.
+///
+/// **Do not** add `deny_unknown_fields` — old PRDs carry extra keys that must
+/// survive import. `task-mgr update` overlay reject is a separate Value walk
+/// in `commands/update` (PR-2 CONTRACT-002); do not validate overlays by
+/// `from_value::<PrdUserStory>`. Full whitelist + type/null table:
+/// `## CONTRACT-002` in `tasks/progress-a8855e28.txt`.
+///
+/// **PR-2 CONTRACT-003:** `human_review_outcome: Option<Value>` (JSON
+/// `humanReviewOutcome`) is JSON-only — no DB column, not on `models::Task`,
+/// opaque (do not schema-validate inner keys). `AddTaskInput` must mirror +
+/// copy via `into_prd_user_story`. Full contract: `## CONTRACT-003` in
+/// `tasks/progress-a8855e28.txt`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PrdUserStory {
@@ -75,6 +87,11 @@ pub struct PrdUserStory {
     /// Maps to `tasks.claims_shared_infra` (INTEGER DEFAULT NULL).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claims_shared_infra: Option<bool>,
+    /// CLARIFY human-review resolution payload (CONTRACT-003). JSON-only —
+    /// never a `tasks` column bind. Opaque object; do not schema-validate
+    /// inner keys. Absent → key omitted on serialize.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_review_outcome: Option<Value>,
 }
 
 #[cfg(test)]
@@ -216,6 +233,54 @@ mod tests {
         let story = parse_story(&json);
         assert_eq!(story.requires_human, Some(true));
         assert_eq!(story.human_review_timeout, Some(120));
+    }
+
+    // ---- humanReviewOutcome (CONTRACT-003) ----
+
+    #[test]
+    fn test_prd_story_human_review_outcome_round_trips() {
+        let json = minimal_story(
+            r#","humanReviewOutcome": {
+                "resolvedAt": "2026-09-18",
+                "resolvedBy": "operator",
+                "confirmedValues": {"floor": 2},
+                "deltasFromProposed": [],
+                "additionalRequirements": []
+            }"#,
+        );
+        let story = parse_story(&json);
+        let outcome = story
+            .human_review_outcome
+            .as_ref()
+            .expect("outcome present after deserialize");
+        assert_eq!(outcome["resolvedBy"], "operator");
+        assert_eq!(outcome["confirmedValues"]["floor"], 2);
+
+        let value = serde_json::to_value(&story).expect("serialize");
+        assert!(
+            value.get("humanReviewOutcome").is_some(),
+            "serialize must keep humanReviewOutcome"
+        );
+        assert_eq!(value["humanReviewOutcome"]["resolvedBy"], "operator");
+    }
+
+    #[test]
+    fn test_prd_story_human_review_outcome_absent_omits_key() {
+        let json = minimal_story("");
+        let story = parse_story(&json);
+        assert!(story.human_review_outcome.is_none());
+        let value = serde_json::to_value(&story).expect("serialize");
+        assert!(
+            value.get("humanReviewOutcome").is_none(),
+            "absent outcome must omit the key (skip_serializing_if)"
+        );
+    }
+
+    #[test]
+    fn test_prd_story_human_review_outcome_null_deserializes_none() {
+        let json = minimal_story(r#","humanReviewOutcome": null"#);
+        let story = parse_story(&json);
+        assert!(story.human_review_outcome.is_none());
     }
 }
 

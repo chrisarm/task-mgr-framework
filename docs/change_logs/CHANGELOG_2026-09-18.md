@@ -43,3 +43,32 @@ task-mgr models show
 task-mgr how "quota"
 task-mgr models set-usage-policy --remaining-min 2 --remaining-min-weekly 1
 ```
+
+## Agent task-ops UX PR-2 — `task-mgr update` + `humanReviewOutcome`
+
+**Branch**: `feat/agent-task-ops-pr2`
+**PRD**: `tasks/prd-agent-task-ops-pr2.md`
+
+### What shipped
+
+`task-mgr update --stdin` / `--json` is a real load-merge-write command.
+Notes-only overlays do not clobber `priority`, `title`, `status`, or
+`archived_at`. `status` / `passes` and unknown keys hard-error. CLARIFY
+`humanReviewOutcome` lives only in the task-list JSON (no DB column) and
+survives `loop init --append --update-existing`. Same `--from-json` pin as
+add. Hints and the managed CLAUDE.md block point at `update --stdin` then
+`complete`.
+
+### Why it matters
+
+Agents can patch whitelist fields (including CLARIFY outcomes) without
+hand-editing `tasks/*.json` and without going through a full-row re-import
+that clears archive state.
+
+### Breaking changes
+
+- `task-mgr update` is no longer a missing-subcommand hint. `edit` / `change`
+  recover to `update --stdin`. Run-session remains `task-mgr run update`.
+- Overlay `passes` / `status` are rejected (use lifecycle / `<task-status>`).
+
+---

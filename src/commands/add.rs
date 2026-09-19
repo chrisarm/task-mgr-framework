@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::commands::context::{
-    choose_cli_write_path, cli_write_path, load_known_prefixes, locate_prd_json,
-    sole_task_list_path,
+    choose_cli_write_path, cli_write_path, default_prd_roots, load_known_prefixes, locate_prd_json,
+    preflight_from_json_path, refuse_unpinned_write, sole_task_list_path,
 };
 use crate::commands::init::import::{
     DEPRECATED_RELATIONSHIPS_WARNING, insert_relationship, insert_task, insert_task_file,
@@ -40,6 +40,11 @@ pub use crate::commands::context::{ResolutionSource, ResolvedContext, resolve_co
 /// minimal inputs work (priority is auto-computed; absent `passes` means
 /// `false` → status `todo`). Anything not supplied here is carried through
 /// as the default when the struct is converted into a full `PrdUserStory`.
+///
+/// **PR-2 CONTRACT-003:** must carry `human_review_outcome: Option<Value>`
+/// (JSON `humanReviewOutcome`) and copy it in `into_prd_user_story` so a
+/// spawned CLARIFY row does not drop the key. JSON-only — no DB column.
+/// Full contract: `## CONTRACT-003` in `tasks/progress-a8855e28.txt`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AddTaskInput {
@@ -87,6 +92,10 @@ pub struct AddTaskInput {
     pub human_review_timeout: Option<u32>,
     #[serde(default)]
     pub claims_shared_infra: Option<bool>,
+    /// CLARIFY human-review resolution payload (CONTRACT-003). JSON-only —
+    /// copied into `PrdUserStory` so spawned CLARIFY rows do not drop the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_review_outcome: Option<Value>,
 }
 
 impl AddTaskInput {
@@ -141,6 +150,7 @@ impl AddTaskInput {
             requires_human: self.requires_human,
             human_review_timeout: self.human_review_timeout,
             claims_shared_infra: self.claims_shared_infra,
+            human_review_outcome: self.human_review_outcome,
         }
     }
 }
@@ -185,7 +195,7 @@ pub fn add(
     // before parse). Full registration still runs via resolve_context below
     // (needs the DB) and still precedes any write transaction.
     if let Some(path) = from_json {
-        preflight_from_json_path(path)?;
+        preflight_from_json_path(path, "add")?;
     }
 
     let input: AddTaskInput = serde_json::from_str(input_json).map_err(|e| {
@@ -227,54 +237,6 @@ pub fn add(
         Some(&source_root),
         Some(&worktree_root),
     )
-}
-
-/// Same fallback as [`crate::commands::init::InitOpts::resolve_roots`].
-fn default_prd_roots(db_dir: &Path) -> (PathBuf, PathBuf) {
-    let source_root = crate::git::main_repo_root_at(db_dir)
-        .or_else(|| db_dir.parent().map(|p| p.to_path_buf()))
-        .unwrap_or_else(|| db_dir.to_path_buf());
-    let worktree_root = std::env::current_dir()
-        .ok()
-        .filter(|cwd| crate::git::is_inside_worktree_at(cwd).unwrap_or(false))
-        .unwrap_or_else(|| source_root.clone());
-    (source_root, worktree_root)
-}
-
-/// Filesystem-only preflight for `--from-json`: missing and non-file paths
-/// fail before input JSON parse. Registration matching stays in
-/// `resolve_context` (needs DB) but still before any write transaction.
-fn preflight_from_json_path(path: &Path) -> TaskMgrResult<()> {
-    let meta = match std::fs::metadata(path) {
-        Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(TaskMgrError::invalid_state(
-                "add",
-                "--from-json",
-                "an existing regular file path to a registered task_list",
-                format!("path does not exist: {}", path.display()),
-            ));
-        }
-        Err(e) => {
-            return Err(TaskMgrError::io_error(
-                path.display().to_string(),
-                "reading --from-json path metadata",
-                e,
-            ));
-        }
-    };
-    if !meta.file_type().is_file() {
-        return Err(TaskMgrError::invalid_state(
-            "add",
-            "--from-json",
-            "a regular file (already-registered task_list)",
-            format!(
-                "path is not a regular file (directory or special): {}",
-                path.display()
-            ),
-        ));
-    }
-    Ok(())
 }
 
 /// Testable variant that takes an already-open connection (used by unit tests
@@ -338,25 +300,8 @@ fn add_with_conn_in(
         worktree_root,
     )?;
 
-    // Add-only write policy (CONTRACT-002 / FEAT-006): refuse unpinned writes
-    // when ≥2 non-NULL prefixes are registered. Keep this OUT of
-    // resolve_context so `current` stays an Ok(None) probe. Do NOT fold into
-    // `if ctx.is_none()` alone — that breaks zero-prefix / --no-prefix insert.
-    if resolved_ctx.is_none() {
-        let known = load_known_prefixes(conn)?;
-        if known.len() >= 2 {
-            return Err(TaskMgrError::invalid_state(
-                "add",
-                "--from-json / TASK_MGR_ACTIVE_PREFIX",
-                "pin via --from-json or TASK_MGR_ACTIVE_PREFIX",
-                format!(
-                    "{} registered prefixes ({}), none selected",
-                    known.len(),
-                    known.join(", ")
-                ),
-            ));
-        }
-    }
+    // Write-only ≥2 refuse (shared with update). Keep OUT of resolve_context.
+    refuse_unpinned_write(conn, &resolved_ctx, "add")?;
 
     // Emit resolved-context line as the FIRST stderr output, before any write
     // or downstream warning. Agents can read stderr line 1 to learn which PRD
@@ -902,7 +847,37 @@ mod tests {
             requires_human: None,
             human_review_timeout: None,
             claims_shared_infra: None,
+            human_review_outcome: None,
         }
+    }
+
+    #[test]
+    fn test_add_task_input_copies_human_review_outcome_into_story() {
+        let json = r#"{
+            "id": "CLARIFY-001",
+            "title": "Confirm floor",
+            "requiresHuman": true,
+            "humanReviewOutcome": {
+                "resolvedAt": "2026-09-18",
+                "resolvedBy": "operator",
+                "confirmedValues": {"floor": 2},
+                "deltasFromProposed": [],
+                "additionalRequirements": []
+            }
+        }"#;
+        let input: AddTaskInput = serde_json::from_str(json).expect("deserialize AddTaskInput");
+        assert!(
+            input.human_review_outcome.is_some(),
+            "AddTaskInput must keep humanReviewOutcome"
+        );
+        let story = input.into_prd_user_story(1);
+        let value = serde_json::to_value(&story).expect("serialize story");
+        assert!(
+            value.get("humanReviewOutcome").is_some(),
+            "into_prd_user_story must copy humanReviewOutcome so spawned CLARIFY rows keep it"
+        );
+        assert_eq!(value["humanReviewOutcome"]["resolvedBy"], "operator");
+        assert_eq!(value["humanReviewOutcome"]["confirmedValues"]["floor"], 2);
     }
 
     #[test]
@@ -1811,7 +1786,7 @@ mod tests {
         assert!(msg.contains("/tmp/foreign-prd.json"), "{msg}");
     }
 
-    // --- FEAT-006: add-only ≥2-prefix refuse (write policy; resolver stays Ok(None)) ---
+    // --- FEAT-006: write-only ≥2-prefix refuse (add and update; resolver stays Ok(None)) ---
 
     #[test]
     fn test_add_refuses_unpinned_multi_prefix_no_db_row() {

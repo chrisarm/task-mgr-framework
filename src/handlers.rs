@@ -75,6 +75,10 @@ macro_rules! impl_text_formattable {
 }
 
 impl_text_formattable!(crate::commands::AddResult, crate::commands::format_add_text);
+impl_text_formattable!(
+    crate::commands::update::UpdateResult,
+    crate::commands::update::format_text
+);
 impl_text_formattable!(CheatsheetResult, format_cheatsheet_text);
 impl_text_formattable!(CurrentResult, format_current_text);
 impl_text_formattable!(HowResult, format_how_text);

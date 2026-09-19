@@ -72,12 +72,14 @@ This block is managed by `task-mgr enhance` — edits inside the
 
 ### Mid-loop JSON sync
 
-When the task-list JSON changes mid-effort (adding tasks, editing
-descriptions, recording human-review outcomes), NEVER run bare
-`task-mgr init --from-json <prd>.json` — it wipes `status`, `started_at`,
-and `completed_at` for every task in the list.
+When the task-list JSON changes mid-effort (adding tasks, bulk description
+edits), NEVER run bare `task-mgr init --from-json <prd>.json` — it wipes
+`status`, `started_at`, and `completed_at` for every task in the list.
+For single-field patches (including `humanReviewOutcome`), use
+`task-mgr update --stdin` instead of re-import.
 
-Correct incremental sync (`task-mgr loop init` is the canonical form):
+Correct incremental sync for bulk add/refresh (`task-mgr loop init` is
+the canonical form):
 
 ```sh
 task-mgr loop init <prd>.json --append --update-existing --dry-run  # preview
@@ -92,25 +94,26 @@ in-progress loop.
 ### Human-in-the-loop CLARIFY tasks
 
 When a task requires human sign-off (`requires_human: true`), the loop
-emits `<promise>BLOCKED</promise>` until resolution. On resolution,
-embed a machine-readable `humanReviewOutcome` block directly in the
-JSON task entry:
+emits `<promise>BLOCKED</promise>` until resolution. On resolution, pipe
+an overlay with `id` + `humanReviewOutcome` to `task-mgr update --stdin`
+(add `--from-json tasks/<prd>.json` when pinning), then complete:
 
-```json
-"humanReviewOutcome": {
+```sh
+echo '{"id":"CLARIFY-001","humanReviewOutcome":{
   "resolvedAt": "YYYY-MM-DD",
   "resolvedBy": "<name>",
   "confirmedValues": { },
   "deltasFromProposed": [ ],
   "additionalRequirements": [ ]
-}
+}}' | task-mgr update --stdin --from-json tasks/<prd>.json
+task-mgr complete CLARIFY-001
 ```
 
-Then update downstream task entries in the SAME commit — their embedded
-rate-limit / threshold / flag values must match the confirmed outcome,
-or the loop will implement the proposed (wrong) value. Sync with
-`task-mgr loop init <prd>.json --append --update-existing`, then
-`task-mgr complete <clarify-task-id>`.
+Downstream task field updates in the same resolution also go through
+`task-mgr update --stdin` (whitelist overlay with `id`) — never hand-edit
+the JSON. Their embedded rate-limit / threshold / flag values must match
+the confirmed outcome, or the loop will implement the proposed (wrong)
+value.
 
 ### Spawn-fixup PRD targeting
 

@@ -57,6 +57,7 @@ pub mod show;
 pub mod skip;
 pub mod stats;
 pub mod unblock;
+pub mod update;
 pub mod worktrees;
 
 pub use add::{AddResult, AddTaskInput, PrioritySource, add, format_text as format_add_text};

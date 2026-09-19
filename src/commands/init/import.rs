@@ -879,7 +879,26 @@ mod tests {
             requires_human,
             human_review_timeout: None,
             claims_shared_infra: None,
+            human_review_outcome: None,
         }
+    }
+
+    /// CONTRACT-003: humanReviewOutcome is JSON-only — never a tasks column.
+    #[test]
+    fn test_tasks_table_has_no_human_review_outcome_column() {
+        let (_temp_dir, conn) = setup_db();
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(tasks)")
+            .expect("pragma prepare");
+        let names: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("pragma query")
+            .map(|r| r.expect("row"))
+            .collect();
+        assert!(
+            !names.iter().any(|n| n == "human_review_outcome"),
+            "tasks must not grow a human_review_outcome column; got columns: {names:?}"
+        );
     }
 
     /// insert_task stores requires_human=1 when story.requires_human = Some(true).

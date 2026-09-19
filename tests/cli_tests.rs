@@ -2858,7 +2858,15 @@ fn test_wrong_name_and_flag_hints() {
         },
         Case {
             args: &["update", "FOO-1", "--title", "x"],
-            expected_hint_substr: "hint: task-mgr has no `update` subcommand",
+            expected_hint_substr: "hint: `task-mgr update` takes overlay JSON via `--stdin`/`--json`",
+        },
+        Case {
+            args: &["edit"],
+            expected_hint_substr: "hint: task-mgr has no `edit` subcommand",
+        },
+        Case {
+            args: &["change"],
+            expected_hint_substr: "update --stdin",
         },
     ];
 
@@ -2921,9 +2929,9 @@ fn test_recall_top_k_hint_suggests_limit() {
         .stderr(predicate::str::contains("--limit"));
 }
 
-/// `update` hint must reference the JSON-edit + loop-init workflow.
+/// `update … --title` must hint at overlay `--stdin`/`--json`, not "no update".
 #[test]
-fn test_update_hint_references_loop_init() {
+fn test_update_title_flag_hints_overlay_stdin() {
     let output = Command::new(cargo_bin("task-mgr"))
         .args(["update", "FOO-1", "--title", "x"])
         .env_remove("TASK_MGR_ACTIVE_PREFIX")
@@ -2935,9 +2943,42 @@ fn test_update_hint_references_loop_init() {
 
     let stderr = String::from_utf8_lossy(&output);
     assert!(
-        stderr.contains("loop init") || stderr.contains("--append"),
-        "update hint should reference loop-init workflow, got:\n{stderr}"
+        !stderr.contains("has no `update` subcommand"),
+        "update exists; must not say missing, got:\n{stderr}"
     );
+    assert!(
+        !stderr.contains("loop init") && !stderr.contains("Edit the JSON"),
+        "must not point at hand-edit + loop init, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("--stdin") || stderr.contains("--json"),
+        "must point at overlay --stdin/--json, got:\n{stderr}"
+    );
+}
+
+/// `edit` / `change` must point at `update --stdin`, not hand-edit + loop init.
+#[test]
+fn test_edit_and_change_hints_point_at_update_stdin() {
+    for name in ["edit", "change"] {
+        let output = Command::new(cargo_bin("task-mgr"))
+            .args([name])
+            .env_remove("TASK_MGR_ACTIVE_PREFIX")
+            .assert()
+            .failure()
+            .get_output()
+            .stderr
+            .clone();
+
+        let stderr = String::from_utf8_lossy(&output);
+        assert!(
+            stderr.contains("update --stdin"),
+            "{name} hint must mention update --stdin, got:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("loop init") && !stderr.contains("Edit the JSON"),
+            "{name} must not point at hand-edit + loop init, got:\n{stderr}"
+        );
+    }
 }
 
 /// Negative: random unknown flag (`--foo`) must produce NO `hint:` line.

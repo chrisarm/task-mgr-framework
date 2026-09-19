@@ -173,6 +173,21 @@ mod tests {
     }
 
     #[test]
+    fn clarify_intent_points_at_update_stdin_then_complete() {
+        let r = how(Some("clarify"));
+        assert!(
+            r.content.contains("update --stdin"),
+            "clarify recipe must name update --stdin: {}",
+            r.content,
+        );
+        assert!(
+            r.content.contains("complete"),
+            "clarify recipe must name complete: {}",
+            r.content,
+        );
+    }
+
+    #[test]
     fn deterministic_across_repeated_calls() {
         let r1 = how(Some("sync json"));
         let r2 = how(Some("sync json"));

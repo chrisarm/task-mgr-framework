@@ -1,13 +1,15 @@
 //! Shared pin / active-PRD context resolver (CONTRACT-002).
 //!
 //! Owns `ResolvedContext`, `ResolutionSource`, `resolve_context`,
-//! `resolve_active_prefix`, `locate_prd_json`, `load_known_prefixes`, and the
-//! pin-19 path identity helper (`paths_identify`). `--from-json` registration
-//! is `(a)` JSON `taskPrefix` ∈ `prd_metadata` **OR** pin-19 `(b)/(c)`.
+//! `resolve_active_prefix`, `locate_prd_json`, `load_known_prefixes`, the
+//! pin-19 path identity helper (`paths_identify`), and write-only helpers
+//! [`refuse_unpinned_write`] / [`preflight_from_json_path`] / [`default_prd_roots`].
+//! `--from-json` registration is `(a)` JSON `taskPrefix` ∈ `prd_metadata`
+//! **OR** pin-19 `(b)/(c)`.
 //!
 //! `resolve_context` keeps `Ok(None)` for **both** 0 and 2+ prefixes (so
-//! `current` stays a probe). The ≥2-prefix refuse is **add-only** (FEAT-006)
-//! and must never live here.
+//! `current` stays a probe). The ≥2-prefix refuse is **write-only** (add and
+//! update) via [`refuse_unpinned_write`] — never inside `resolve_context`.
 
 use std::fmt;
 use std::fs;
@@ -70,15 +72,21 @@ pub struct ResolvedContext {
     pub prd_json_path: PathBuf,
 }
 
-/// Shared pin / active-PRD resolver for add, current, and later update/export.
+/// Shared pin / active-PRD resolver for add, current, update, and export.
 ///
 /// Precedence (CONTRACT-002): flag → env → exactly one non-NULL prefix →
 /// `Ok(None)`. `Ok(None)` covers **both** 0 and 2+ prefixes (probe). The ≥2
-/// refuse is add-only write policy and must not live here.
+/// refuse is **write-only** policy ([`refuse_unpinned_write`]) and must not
+/// live here — `current` stays an `Ok(None)` probe.
 ///
 /// `command` is the `invalid_state` command-name for every `Err` this function
 /// (and its helpers) returns — never hardcode `"add"`. Logging / probe callers
 /// pass `from_json: None`.
+///
+/// **Write-path callers** (`add` / `update`) must use
+/// [`resolve_context_with_roots`] with [`default_prd_roots`] — do not call
+/// bare `resolve_context` as the write-path resolver (TempDir / `--dir`
+/// relative `prd_files` would remap onto the developer checkout).
 pub fn resolve_context(
     conn: &Connection,
     from_json: Option<&Path>,
@@ -88,11 +96,12 @@ pub fn resolve_context(
 }
 
 /// Like [`resolve_context`], but `prd_files` reads use explicit project roots
-/// (same pair as [`crate::commands::init::InitOpts::resolve_roots`]).
+/// (same pair as [`default_prd_roots`] / [`crate::commands::init::InitOpts::resolve_roots`]).
 ///
-/// `add` / `current` pass `db_dir`-derived roots so TempDir fixtures and
-/// source-root-relative `prd_files` rows resolve; cwd git roots would remap
-/// those rows onto the developer checkout.
+/// Write-path callers (`add` / `update`) pass `db_dir`-derived roots so TempDir
+/// fixtures and source-root-relative `prd_files` rows resolve; cwd git roots
+/// would remap those rows onto the developer checkout. Probe callers
+/// (`current`) may pass `None` roots.
 pub fn resolve_context_with_roots(
     conn: &Connection,
     from_json: Option<&Path>,
@@ -327,8 +336,8 @@ fn find_registered_by_path_identity(
 /// Returns all non-NULL `task_prefix` values from `prd_metadata`.
 ///
 /// Single canonical home for the `WHERE task_prefix IS NOT NULL` query —
-/// callers must not repeat this SQL directly. Used by the add-only ≥2 refuse
-/// predicate (FEAT-006).
+/// callers must not repeat this SQL directly. Used by the **write-only** ≥2
+/// refuse predicate ([`refuse_unpinned_write`]) for add and update.
 pub(crate) fn load_known_prefixes(conn: &Connection) -> TaskMgrResult<Vec<String>> {
     let mut stmt =
         conn.prepare("SELECT task_prefix FROM prd_metadata WHERE task_prefix IS NOT NULL")?;
@@ -397,7 +406,7 @@ pub(crate) fn resolve_active_prefix(
 /// Look up the registered `task_list` path for a known prefix.
 ///
 /// Prefix-scoped only — no `LIMIT 1` fallback on miss (FEAT-004b / learning
-/// #2236). Sole-row lookup for the add `ctx is None` path lives in
+/// #2236). Sole-row lookup for the write-path `ctx is None` case lives in
 /// [`sole_task_list_path`]. Callers that need the CLI write target must run
 /// the result through [`cli_write_path`] / [`choose_cli_write_path`].
 ///
@@ -427,10 +436,98 @@ pub(crate) fn locate_prd_json(
     Ok(result.map(PathBuf::from))
 }
 
+/// Write-only ≥2-prefix refuse (add **and** update).
+///
+/// Predicate: `ctx.is_none() && load_known_prefixes().len() >= 2`. Keep this
+/// **outside** [`resolve_context`] so `current` stays an `Ok(None)` probe.
+/// Do **not** fold into `if ctx.is_none()` alone — that breaks zero-prefix /
+/// `--no-prefix` writes (known.len() == 0).
+///
+/// `command` is the `invalid_state` command-name (`"add"` / `"update"`).
+pub(crate) fn refuse_unpinned_write(
+    conn: &Connection,
+    ctx: &Option<ResolvedContext>,
+    command: &str,
+) -> TaskMgrResult<()> {
+    if ctx.is_none() {
+        let known = load_known_prefixes(conn)?;
+        if known.len() >= 2 {
+            return Err(TaskMgrError::invalid_state(
+                command,
+                "--from-json / TASK_MGR_ACTIVE_PREFIX",
+                "pin via --from-json or TASK_MGR_ACTIVE_PREFIX",
+                format!(
+                    "{} registered prefixes ({}), none selected",
+                    known.len(),
+                    known.join(", ")
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Filesystem-only preflight for `--from-json`: missing and non-file paths
+/// fail **before** overlay / input JSON parse.
+///
+/// Registration matching stays in [`resolve_context_with_roots`] (needs DB)
+/// but still precedes any write transaction. `command` is forwarded into every
+/// `invalid_state` — never hardcode `"add"` (update missing/directory errors
+/// must say `"update"`).
+pub(crate) fn preflight_from_json_path(path: &Path, command: &str) -> TaskMgrResult<()> {
+    let meta = match fs::metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(TaskMgrError::invalid_state(
+                command,
+                "--from-json",
+                "an existing regular file path to a registered task_list",
+                format!("path does not exist: {}", path.display()),
+            ));
+        }
+        Err(e) => {
+            return Err(TaskMgrError::io_error(
+                path.display().to_string(),
+                "reading --from-json path metadata",
+                e,
+            ));
+        }
+    };
+    if !meta.file_type().is_file() {
+        return Err(TaskMgrError::invalid_state(
+            command,
+            "--from-json",
+            "a regular file (already-registered task_list)",
+            format!(
+                "path is not a regular file (directory or special): {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Same fallback as [`crate::commands::init::InitOpts::resolve_roots`].
+///
+/// Shared by write-path callers (`add` / `update`) so TempDir / `--dir`
+/// relative `prd_files` resolve against the project, not the developer
+/// checkout. Do not `use commands::add` from update — call this instead.
+pub(crate) fn default_prd_roots(db_dir: &Path) -> (PathBuf, PathBuf) {
+    let source_root = crate::git::main_repo_root_at(db_dir)
+        .or_else(|| db_dir.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| db_dir.to_path_buf());
+    let worktree_root = std::env::current_dir()
+        .ok()
+        .filter(|cwd| crate::git::is_inside_worktree_at(cwd).unwrap_or(false))
+        .unwrap_or_else(|| source_root.clone());
+    (source_root, worktree_root)
+}
+
 /// Exactly one registered `task_list` row, or `None`.
 ///
-/// Used only on the add `ctx is None` path (zero non-NULL prefixes /
-/// `--no-prefix`): JSON sync iff count == 1. Never a prefix-miss fallback.
+/// Write-only: used on the `ctx is None` JSON-sync path for add **and**
+/// update (zero non-NULL prefixes / `--no-prefix`): sync iff count == 1 and
+/// the chosen write path is a regular file. Never a prefix-miss fallback.
 pub(crate) fn sole_task_list_path(conn: &Connection) -> TaskMgrResult<Option<PathBuf>> {
     let mut stmt = conn.prepare("SELECT file_path FROM prd_files WHERE file_type = 'task_list'")?;
     let paths: Vec<PathBuf> = stmt
@@ -596,7 +693,8 @@ mod tests {
     #[test]
     fn test_resolve_prefix_env_unset_multi_prd_returns_none() {
         // Resolver probe: 2+ prefixes → Ok(None). Write-policy refuse is
-        // FEAT-006 (add-only) and must not live here.
+        // refuse_unpinned_write (write-only: add and update) and must not
+        // live inside resolve_context.
         let _iso = isolate_env();
         let conn = memory_db();
         seed_prefix(&conn, 1, "alpha", "A-");
@@ -929,6 +1027,69 @@ mod tests {
             msg.contains("not a registered task_list"),
             "unregistered copy: {msg}"
         );
+    }
+
+    #[test]
+    fn test_preflight_from_json_path_names_command() {
+        let tmp = TempDir::new().unwrap();
+        // Missing
+        let missing = tmp.path().join("nope.json");
+        let err = preflight_from_json_path(&missing, "update").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Invalid state for update"),
+            "missing must name update: {msg}"
+        );
+        assert!(msg.contains("does not exist"), "{msg}");
+
+        // Directory (canonicalize would succeed — is_file before parse)
+        let err = preflight_from_json_path(tmp.path(), "update").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Invalid state for update"),
+            "directory must name update: {msg}"
+        );
+        assert!(
+            msg.contains("not a regular file") || msg.contains("directory"),
+            "{msg}"
+        );
+
+        // Regular file OK
+        let file = tmp.path().join("ok.json");
+        fs::write(&file, "{}").unwrap();
+        preflight_from_json_path(&file, "update").expect("regular file must pass");
+    }
+
+    #[test]
+    fn test_refuse_unpinned_write_ge2_only() {
+        let _iso = isolate_env();
+        let conn = memory_db();
+
+        // 0 prefixes + ctx None → allow
+        refuse_unpinned_write(&conn, &None, "update").expect("0-prefix must allow");
+
+        seed_prefix(&conn, 1, "alpha", "A-");
+        // 1 prefix + ctx None → allow (single-prefix would normally resolve,
+        // but refuse itself only gates ≥2)
+        refuse_unpinned_write(&conn, &None, "update").expect("1-prefix must allow");
+
+        seed_prefix(&conn, 2, "beta", "B-");
+        let err = refuse_unpinned_write(&conn, &None, "update").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Invalid state for update"),
+            "≥2 refuse must name update: {msg}"
+        );
+        assert!(msg.contains("--from-json"), "{msg}");
+        assert!(msg.contains("TASK_MGR_ACTIVE_PREFIX"), "{msg}");
+
+        // Pinned ctx → allow even with ≥2
+        let pinned = Some(ResolvedContext {
+            prefix: "A-".to_string(),
+            source: ResolutionSource::EnvVar,
+            prd_json_path: PathBuf::new(),
+        });
+        refuse_unpinned_write(&conn, &pinned, "update").expect("pinned must allow");
     }
 
     #[test]

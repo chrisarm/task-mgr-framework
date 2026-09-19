@@ -558,3 +558,198 @@ fn live_current_from_json_registered_and_unregistered() {
         "unregistered copy must name loop init: {err}"
     );
 }
+
+// =============================================================================
+// FEAT-007: CLI write-path live worktree matrix for `task-mgr update`
+// =============================================================================
+// Pattern mirrors FEAT-005 add/current live tests above — not
+// `add_from_worktree_root_lands_in_main_db` (DB anchoring only).
+
+/// Overlay payload for `task-mgr update --stdin` (mixed notes → DB + JSON).
+fn update_payload(id: &str, notes: &str) -> String {
+    serde_json::json!({
+        "id": id,
+        "notes": notes,
+    })
+    .to_string()
+}
+
+/// Run `task-mgr update --stdin <payload>` with the given cwd and subcommand args.
+///
+/// `extra_args` are placed **after** `update` (subcommand flags like
+/// `--from-json`), unlike global flags such as `--dir`.
+fn run_update(
+    cwd: &Path,
+    payload: &str,
+    extra_args: &[&str],
+) -> (String, String, std::process::ExitStatus) {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut cmd = Command::new(task_mgr_bin());
+    cmd.current_dir(cwd)
+        .arg("update")
+        .args(extra_args)
+        .arg("--stdin")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env_remove("TASK_MGR_DIR")
+        .env_remove("TASK_MGR_ACTIVE_PREFIX");
+
+    let mut child = cmd.spawn().expect("spawn task-mgr update");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(payload.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().expect("wait task-mgr update");
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status,
+    )
+}
+
+/// Assert `<dir>/tasks.db` has `notes` for the given task id.
+fn assert_task_notes_in_db(db_dir: &Path, id: &str, notes: &str) {
+    let conn = rusqlite::Connection::open(db_dir.join("tasks.db"))
+        .unwrap_or_else(|e| panic!("expected DB at {}: {e}", db_dir.join("tasks.db").display()));
+    let got: Option<String> = conn
+        .query_row("SELECT notes FROM tasks WHERE id = ?1", [id], |row| {
+            row.get(0)
+        })
+        .unwrap_or_else(|e| panic!("expected task {id} in {}: {e}", db_dir.display()));
+    assert_eq!(
+        got.as_deref(),
+        Some(notes),
+        "expected notes={notes:?} for {id} in {}",
+        db_dir.join("tasks.db").display()
+    );
+}
+
+#[test]
+fn live_main_checkout_update_write_path_unchanged() {
+    let (repo, main_prd) = setup_repo_with_registered_prd();
+    let before = std::fs::read_to_string(&main_prd).unwrap();
+    let marker = "upd-main-001";
+
+    let (_stdout, stderr, status) =
+        run_update(repo.path(), &update_payload("SEED-001", marker), &[]);
+    assert!(status.success(), "update from main failed: {stderr}");
+    assert_task_notes_in_db(&repo.path().join(".task-mgr"), "LIVE-SEED-001", marker);
+
+    let after = std::fs::read_to_string(&main_prd).unwrap();
+    assert_ne!(before, after, "main JSON must receive the patch");
+    assert!(
+        after.contains(marker),
+        "main JSON must contain update notes marker"
+    );
+}
+
+#[test]
+fn live_worktree_file_exists_update_writes_worktree_main_unchanged() {
+    let (repo, main_prd) = setup_repo_with_registered_prd();
+    let wt_parent = TempDir::new().unwrap();
+    let wt = add_worktree(repo.path(), wt_parent.path(), "upd-wp-exists");
+    let wt_prd = wt.join("tasks/foo.json");
+    assert!(wt_prd.is_file(), "worktree must carry tasks/foo.json");
+
+    let main_before = std::fs::read_to_string(&main_prd).unwrap();
+    let marker = "upd-wt-exists";
+
+    let (_o, stderr, status) = run_update(&wt, &update_payload("SEED-001", marker), &[]);
+    assert!(status.success(), "update from worktree failed: {stderr}");
+    assert_task_notes_in_db(&repo.path().join(".task-mgr"), "LIVE-SEED-001", marker);
+    assert!(
+        !wt.join(".task-mgr").exists(),
+        "DB must stay on main-repo .task-mgr"
+    );
+
+    let main_after = std::fs::read_to_string(&main_prd).unwrap();
+    assert_eq!(
+        main_before, main_after,
+        "main JSON bytes must be unchanged when worktree copy exists"
+    );
+    let wt_after = std::fs::read_to_string(&wt_prd).unwrap();
+    assert!(
+        wt_after.contains(marker),
+        "worktree JSON must receive the patch"
+    );
+}
+
+#[test]
+fn live_worktree_only_main_exists_update_writes_main_no_invent() {
+    let (repo, main_prd) = setup_repo_with_registered_prd();
+    let wt_parent = TempDir::new().unwrap();
+    let wt = add_worktree(repo.path(), wt_parent.path(), "upd-wp-main-only");
+    let wt_prd = wt.join("tasks/foo.json");
+    assert!(wt_prd.is_file());
+    // Only main file remains — no invent / basename search into the worktree.
+    std::fs::remove_file(&wt_prd).unwrap();
+    assert!(!wt_prd.exists());
+
+    let main_before = std::fs::read_to_string(&main_prd).unwrap();
+    let marker = "upd-fallback-main";
+
+    let (_o, stderr, status) = run_update(&wt, &update_payload("SEED-001", marker), &[]);
+    assert!(status.success(), "update fallback-to-main failed: {stderr}");
+    assert_task_notes_in_db(&repo.path().join(".task-mgr"), "LIVE-SEED-001", marker);
+
+    let main_after = std::fs::read_to_string(&main_prd).unwrap();
+    assert_ne!(main_before, main_after, "main JSON must receive the write");
+    assert!(
+        main_after.contains(marker),
+        "main JSON must contain update notes marker"
+    );
+    assert!(
+        !wt_prd.exists(),
+        "must not invent/create the remapped worktree path"
+    );
+    assert!(
+        !wt.join("foo.json").exists(),
+        "must not basename-search invent foo.json at worktree root"
+    );
+}
+
+#[test]
+fn live_update_from_json_writes_flag_path_not_remapped() {
+    // `--from-json PATH` always patches that PATH (never remapped away),
+    // including a worktree path registered via relative prd_files + identity.
+    let (repo, main_prd) = setup_repo_with_registered_prd();
+    let wt_parent = TempDir::new().unwrap();
+    let wt = add_worktree(repo.path(), wt_parent.path(), "upd-from-json-pin");
+    let wt_prd = wt.join("tasks/foo.json");
+    assert!(wt_prd.is_file());
+
+    let main_before = std::fs::read_to_string(&main_prd).unwrap();
+    let marker = "upd-from-json-pin";
+
+    // Pin the worktree copy while cwd is main — write must stay on flag PATH.
+    let (_o, stderr, status) = run_update(
+        repo.path(),
+        &update_payload("SEED-001", marker),
+        &["--from-json", wt_prd.to_str().unwrap()],
+    );
+    assert!(
+        status.success(),
+        "update --from-json worktree path failed: {stderr}"
+    );
+    assert_task_notes_in_db(&repo.path().join(".task-mgr"), "LIVE-SEED-001", marker);
+    assert!(
+        !wt.join(".task-mgr").exists(),
+        "DB must stay on main-repo .task-mgr"
+    );
+
+    let main_after = std::fs::read_to_string(&main_prd).unwrap();
+    assert_eq!(
+        main_before, main_after,
+        "main JSON must be unchanged when --from-json pins the worktree path"
+    );
+    let wt_after = std::fs::read_to_string(&wt_prd).unwrap();
+    assert!(
+        wt_after.contains(marker),
+        "flag PATH (worktree JSON) must receive the patch"
+    );
+}

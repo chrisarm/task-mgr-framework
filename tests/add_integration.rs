@@ -2,6 +2,7 @@ use serde_json::Value;
 use std::fs;
 use task_mgr::commands::add::add;
 use task_mgr::commands::init::{PrefixMode, init};
+use task_mgr::commands::update::update;
 use tempfile::TempDir;
 
 const ACTIVE_PREFIX_ENV: &str = "TASK_MGR_ACTIVE_PREFIX";
@@ -1059,6 +1060,133 @@ fn test_from_json_relative_prd_files_worktree_registered() {
         result.prd_path.as_ref().map(|p| p.canonicalize().unwrap()),
         Some(wt_prd.canonicalize().unwrap()),
         "write target must be the worktree flag path (never remapped away)"
+    );
+}
+
+#[test]
+fn test_update_from_json_relative_prd_files_worktree_registered() {
+    // FEAT-007: same relative `prd_files` + worktree `--from-json` pin as
+    // `test_from_json_relative_prd_files_worktree_registered`, for update.
+    // Write target stays the flag PATH (never remapped away). DB stays on the
+    // main checkout path passed as db_dir (library init style).
+    let _env = EnvIsolation::new();
+
+    let main = TempDir::new().unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(main.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let _ = std::process::Command::new("git")
+        .args(["config", "user.email", "test@example.com"])
+        .current_dir(main.path())
+        .status();
+    let _ = std::process::Command::new("git")
+        .args(["config", "user.name", "test"])
+        .current_dir(main.path())
+        .status();
+    fs::create_dir_all(main.path().join("tasks")).unwrap();
+    let main_prd = main.path().join("tasks/foo.json");
+    fs::write(
+        &main_prd,
+        r#"{"project":"wt","taskPrefix":"WT","userStories":[{"id":"SEED-001","title":"s","priority":10,"passes":false}]}"#,
+    )
+    .unwrap();
+    let _ = std::process::Command::new("git")
+        .args(["add", "."])
+        .current_dir(main.path())
+        .status();
+    let _ = std::process::Command::new("git")
+        .args(["commit", "-m", "init"])
+        .current_dir(main.path())
+        .status();
+
+    init(
+        main.path(),
+        &[&main_prd],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Explicit("WT".to_string()),
+    )
+    .unwrap();
+
+    // Force the registered row to the init-shaped relative form the AC names.
+    let conn = rusqlite::Connection::open(main.path().join("tasks.db")).unwrap();
+    conn.execute(
+        "UPDATE prd_files SET file_path = 'tasks/foo.json' WHERE file_type = 'task_list'",
+        [],
+    )
+    .unwrap();
+    let stored: String = conn
+        .query_row(
+            "SELECT file_path FROM prd_files WHERE file_type = 'task_list'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        stored, "tasks/foo.json",
+        "identity tests must seed relative tasks/foo.json, not a bare basename"
+    );
+
+    let wt_parent = TempDir::new().unwrap();
+    let wt_path = wt_parent.path().join("wt");
+    assert!(
+        std::process::Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                "-b",
+                "feat/update-from-json-pin",
+                wt_path.to_str().unwrap(),
+            ])
+            .current_dir(main.path())
+            .status()
+            .unwrap()
+            .success(),
+        "worktree add must succeed"
+    );
+
+    let wt_prd = wt_path.join("tasks/foo.json");
+    assert!(wt_prd.is_file(), "worktree must have tasks/foo.json");
+
+    let main_before = fs::read_to_string(&main_prd).unwrap();
+    let marker = "upd-rel-prd-files-pin";
+    let overlay = serde_json::json!({"id": "SEED-001", "notes": marker}).to_string();
+    let result = update(main.path(), &overlay, Some(wt_prd.as_path()))
+        .expect("relative prd_files + worktree --from-json must be registered for update");
+    assert_eq!(result.task_id, "WT-SEED-001");
+    assert_eq!(
+        result.prd_path.as_ref().map(|p| p.canonicalize().unwrap()),
+        Some(wt_prd.canonicalize().unwrap()),
+        "write target must be the worktree flag path (never remapped away)"
+    );
+
+    // Re-open so we see the writer connection's commit (WAL).
+    let conn = rusqlite::Connection::open(main.path().join("tasks.db")).unwrap();
+    let notes: Option<String> = conn
+        .query_row(
+            "SELECT notes FROM tasks WHERE id = 'WT-SEED-001'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(notes.as_deref(), Some(marker));
+
+    let main_after = fs::read_to_string(&main_prd).unwrap();
+    assert_eq!(
+        main_before, main_after,
+        "main JSON must be unchanged when --from-json pins the worktree path"
+    );
+    let wt_after = fs::read_to_string(&wt_prd).unwrap();
+    assert!(
+        wt_after.contains(marker),
+        "worktree JSON must receive the patch"
     );
 }
 
