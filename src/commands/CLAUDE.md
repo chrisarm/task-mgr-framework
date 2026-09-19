@@ -25,3 +25,26 @@ Hard rules (do not re-derive):
 Full copy-pasteable signatures, partial-UPDATE column list, and the
 JSON-only vs mixed failure split live under `## CONTRACT-001` in
 `tasks/progress-a8855e28.txt`.
+
+## PR-2 overlay whitelist + reject (CONTRACT-002)
+
+`task-mgr update` overlays are `serde_json::Value` objects validated in
+`update.rs` (not `init::parse`). Validation order is load-bearing:
+top-level `status`/`passes` (any value) → lifecycle `invalid_state("update", …)`
+→ other unknown keys (name **all**) → type/null table bound to named
+`PrdUserStory` fields (fail-closed; do not reuse serde defaults).
+
+Hard rules (do not re-derive):
+
+- Whitelist + lookup `id` only; `priority` / `synergyWith` / `batchWith` /
+  `conflictsWith` / `newId` / `renameTo` are unknown (not “coming soon”).
+- Both `estimatedEffort` and `difficulty` → ambiguous hard-error; either
+  alone SETs `difficulty` and JSON-patches as `estimatedEffort`.
+- Overlay `requiresHuman` / `maxRetries` are stricter than serde `Option`
+  (`null` rejects; no default-to-3). Nested `passes` inside
+  `humanReviewOutcome` is allowed; top-level `passes` is not.
+- Do **not** set `deny_unknown_fields` on `PrdUserStory` (breaks old PRD
+  import). Do **not** `from_value::<PrdUserStory>(overlay)`.
+
+Full whitelist, validation order, and type/null table live under
+`## CONTRACT-002` in `tasks/progress-a8855e28.txt`.

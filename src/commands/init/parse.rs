@@ -11,6 +11,12 @@ use serde_json::Value;
 /// into the PRD JSON on disk. `skip_serializing_if` attributes mirror the
 /// `#[serde(default)]` attributes on the `Deserialize` side so a task that
 /// comes in minimal goes out minimal.
+///
+/// **Do not** add `deny_unknown_fields` — old PRDs carry extra keys that must
+/// survive import. `task-mgr update` overlay reject is a separate Value walk
+/// in `commands/update` (PR-2 CONTRACT-002); do not validate overlays by
+/// `from_value::<PrdUserStory>`. Full whitelist + type/null table:
+/// `## CONTRACT-002` in `tasks/progress-a8855e28.txt`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PrdUserStory {
