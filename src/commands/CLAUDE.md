@@ -78,3 +78,69 @@ Hard rules (do not re-derive):
 
 Full field attrs, add-copy, no-column rule, and persist split live under
 `## CONTRACT-003` in `tasks/progress-a8855e28.txt`.
+
+## PR-3 scoped export dump (CONTRACT-001)
+
+`task-mgr export` dumps a **scoped** `ExportedPrd` (lossy: no `taskPrefix`,
+status collapsed to `passes`). Default source is the active prefix;
+`--from-json` pins an already-registered **source** (never the dest);
+`--all` restores today's all-unarchived + `prd_metadata ORDER BY id ASC
+LIMIT 1`.
+
+Hard rules (do not re-derive):
+
+- `load_tasks(conn, prefix: Option<&str>)` — `None` / empty → all
+  unarchived (no LIKE); non-empty → `archived_at IS NULL AND id LIKE ?
+  ESCAPE '\'` via `db::prefix::make_like_pattern` (trailing dash).
+- `load_prd_metadata` scopes: `Unscoped` (`LIMIT 1`), `NamedPrefix`
+  (`WHERE task_prefix = ?`), `ByPrdId` (empty-prefix `--from-json` —
+  identity-matched `prd_files.prd_id`). **Grep `export/`: no `WHERE
+  task_prefix IS NULL`.**
+- Promote `find_registered_by_path_identity` to
+  `Option<(prd_id, prefix)>`. Match (a) stays separate; empty-prefix
+  metadata uses pin-19 identity `prd_id`, not `IS NULL`.
+- `ExportOpts { to_json, with_progress, learnings_file, from_json, all,
+  force }`. Scope selection ignores env when `--all`; never write
+  `ctx.prd_json_path`. `Ok(None)` from `resolve_context` is the
+  no-active error (names `--from-json` / `--all` / `current`).
+- Overwrite-guard / `--force` / `LockGuard` / `unique_tmp` → PR-3
+  CONTRACT-002 (same progress log).
+
+Full copy-pasteable signatures, SQL shapes, empty-prefix `prd_id` rule,
+and `--all` LIMIT 1 live under `## CONTRACT-001` in
+`tasks/progress-c3c1c195.txt`.
+
+## PR-3 export overwrite-guard / `--force` dump (CONTRACT-002)
+
+`task-mgr export --to-json PATH` onto a registered `task_list` (pin-19
+live-path pair) always requires `--force`, even when scoped to that PRD.
+`--force` is a lossy pretty `ExportedPrd` dump (`unique_tmp_path` +
+rename), not a merge. `LockGuard` is acquired **inside** `export()` only,
+after `dest.is_file()`, before identity re-check and write. Missing dest
+→ no lock. Dest is the `--to-json` PATH (never `cli_write_path`).
+
+Hard rules (do not re-derive):
+
+- Guard uses `find_registered_by_path_identity` only — **not** match (a).
+  Stray same-`taskPrefix` copies are not registered.
+- Dest identity roots come from [`prd_roots_for_dest_identity`](context.rs)
+  (`worktree_root` from dest_canon when dest is in a linked worktree). Do
+  **not** pass cwd-only [`default_prd_roots`] into the dest probe — from
+  main cwd an absolute `--to-json` at a worktree live JSON would miss
+  pin-19 (c) and overwrite without `--force`.
+- Same-PRD dest and `--all` onto a registered path still need `--force`.
+- Directory dest → error before dump. Dest exists + identity miss → lock
+  then write without `--force`.
+- `write_json_atomic` (dest and `--learnings-file`) uses
+  `prd_json::unique_tmp_path`, never `with_extension("json.tmp")`.
+- `main.rs` Export arm forwards `ExportOpts` only — **never**
+  `LockGuard::acquire` (non-reentrant flock). Match `add()`: lock inside
+  the command after validation / existence check.
+- Coupling: `prd_json` does not import `export`; `export` does not import
+  `add` / `update`; no `preflight_from_json_path` from export.
+- Refuse copy: `invalid_state("export", …)` naming `--force` and
+  dump-not-merge; dest bytes identical; no serialize-then-refuse.
+  Operator UX via `ui::emit` / `ui::emit_err`, never tracing.
+
+Full algorithm, edge table, known-bad discriminators, and grep checklist
+live under `## CONTRACT-002` in `tasks/progress-c3c1c195.txt`.

@@ -124,12 +124,14 @@ pub const INTENTS: &[(&[&str], &str)] = &[
         "## Where will my next `add` land?\n\
          \n\
          ```\n\
-         task-mgr current\n\
+         task-mgr current --from-json tasks/<prd>.json   # pin + probe target\n\
+         task-mgr add --stdin --from-json tasks/<prd>.json\n\
          ```\n\
          \n\
          Prints the active prefix, how it was resolved (env / single-prefix /\n\
-         from-json / none), and the target PRD JSON path. Run this before any\n\
-         `task-mgr add` if you have more than one PRD registered.\n",
+         from-json / none), and the target PRD JSON path. When ≥2 prefixes are\n\
+         registered, pin with `--from-json` (or `TASK_MGR_ACTIVE_PREFIX`) so the\n\
+         write lands on the intended PRD — do not recover via `export`.\n",
     ),
     // 9. Switch active PRD
     (
@@ -149,7 +151,8 @@ pub const INTENTS: &[(&[&str], &str)] = &[
         "## View the currently active PRD\n\
          \n\
          ```\n\
-         task-mgr current                              # text\n\
+         task-mgr current --from-json tasks/<prd>.json   # pin as a real source\n\
+         task-mgr current                              # text (env / single-prefix)\n\
          task-mgr --format json current | jq '.context'\n\
          ```\n\
          \n\
@@ -272,6 +275,21 @@ mod tests {
         assert!(
             recipe.contains("task-mgr current"),
             "recipe must point at task-mgr current: {recipe}"
+        );
+        assert!(
+            recipe.contains("--from-json"),
+            "recipe must treat --from-json as a real pin: {recipe}"
+        );
+    }
+
+    #[test]
+    fn match_view_active_shows_from_json_pin() {
+        let m = match_intents("view active");
+        assert!(!m.is_empty());
+        let recipe = INTENTS[m[0]].1;
+        assert!(
+            recipe.contains("task-mgr current --from-json"),
+            "recipe must show current --from-json pin: {recipe}"
         );
     }
 

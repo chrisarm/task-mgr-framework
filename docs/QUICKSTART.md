@@ -310,7 +310,10 @@ task-mgr recall --for-task TASK-005             # Find relevant learnings
 task-mgr learnings                              # List all learnings
 
 # Maintenance
-task-mgr export --to-json tasks/feature.json    # Export DB to JSON
+# Dump active/pinned PRD to an unregistered path (lossy; no taskPrefix / extra keys).
+# Overwriting a registered task-list requires --force (still a dump, not a merge):
+#   task-mgr export --from-json tasks/feature.json --to-json tasks/feature.json --force
+task-mgr export --from-json tasks/feature.json --to-json /tmp/feature-dump.json
 task-mgr review                                 # Review blocked/skipped tasks
 task-mgr stats                                  # Progress summary
 ```

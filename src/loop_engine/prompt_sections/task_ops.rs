@@ -36,7 +36,8 @@ pub fn task_ops_spec() -> SectionSpec {
 /// The exact markdown section text to inject.
 ///
 /// Tells the loop agent: never edit tasks/*.json directly; use <task-status> tags
-/// to update status and `task-mgr add --stdin` to create new tasks.
+/// to update status, `task-mgr add --stdin --from-json` to create tasks, and
+/// `task-mgr update --stdin` for whitelist field overlays.
 pub(crate) fn task_ops_section() -> &'static str {
     "## Task lifecycle — CLI only, never read or edit the JSON\n\
      \n\
@@ -52,24 +53,22 @@ pub(crate) fn task_ops_section() -> &'static str {
        (statuses: `done`, `failed`, `skipped`, `irrelevant`, `blocked`). The loop\n\
        engine parses these and applies them via `task-mgr`.\n\
      - **Look up another task**: ALWAYS prefer `task-mgr show <task-id>` (or\n\
-       `task-mgr list` / `task-mgr next`) — these cover almost every read. Only\n\
-       as a last resort, if the CLI can't give you what you need, use `jq` to pull\n\
-       just the field(s) — e.g.\n\
-       `jq '.tasks[]|select(.id==\"FEAT-007\")|{id,title,acceptanceCriteria}' tasks/<prd>.json`.\n\
+       `task-mgr list` / `task-mgr next`). Last resort: `jq` for a field slice —\n\
+       e.g. `jq '.userStories[]|select(.id==\"FEAT-007\")|{id,title,acceptanceCriteria}' tasks/<prd>.json`.\n\
        Never `cat`, `Read`, or `grep` the whole file.\n\
      - **List tasks / check status**: `task-mgr list`, `task-mgr next`.\n\
-     - **Add a new task** (review fix / refactor / follow-up): pipe a single task\n\
-       JSON to `task-mgr add --stdin`. Example:\n\
+     - **Add a new task** (review fix / refactor / follow-up): pipe JSON to\n\
+       `task-mgr add --stdin` (pin with `--from-json tasks/<prd>.json`; priority\n\
+       is auto-computed). Example:\n\
      \n\
      \u{20}     echo '{\"id\":\"CODE-FIX-001\",\"title\":\"Fix race in X\",\"difficulty\":\"medium\",\"touchesFiles\":[\"src/foo.rs\"],\"dependsOn\":[]}' \\\\\n\
-     \u{20}       | task-mgr add --stdin\n\
+     \u{20}       | task-mgr add --stdin --from-json tasks/<prd>.json\n\
      \n\
-       Priority is auto-computed; omit for lower priority.\n\
      - **Fix in response to a milestone**: pass `--depended-on-by <id>`.\n\
-     - **Auto-prefix**: loop exports `TASK_MGR_ACTIVE_PREFIX`; bare IDs are\n\
+     - **Update whitelist fields**: overlay JSON with `id` + fields →\n\
+       `task-mgr update --stdin` (pin with `--from-json` when ≥2 prefixes).\n\
+     - **Auto-prefix**: loop sets `TASK_MGR_ACTIVE_PREFIX`; bare IDs are\n\
        auto-prefixed to the active PRD. Cross-PRD IDs are rejected.\n\
-     - For anything else (dependencies, status queries, etc.), use the `task-mgr`\n\
-       CLI — see `task-mgr --help`.\n\
      \n"
 }
 
@@ -189,6 +188,32 @@ mod tests {
         assert!(
             !section.contains(".task-mgr/tasks/"),
             "must NOT reference '.task-mgr/tasks/' — user-corrected path"
+        );
+    }
+
+    #[test]
+    fn test_section_teaches_user_stories_pin_and_update() {
+        let section = task_ops_section();
+        assert!(
+            section.contains(".userStories[]"),
+            "jq example must use .userStories[] (PRD JSON key; learnings #1252/#4114/#3332)"
+        );
+        assert!(
+            !section.contains(".tasks[]"),
+            "jq example must not use .tasks[] — that key does not exist on PRD JSON"
+        );
+        assert!(
+            section.contains("--from-json"),
+            "add/update examples must teach --from-json pinning"
+        );
+        assert!(
+            section.contains("task-mgr update"),
+            "section must name task-mgr update for whitelist overlays"
+        );
+        // Pin 11: JSON-sync failure copy names current + retry --from-json, never export.
+        assert!(
+            !section.contains("task-mgr export") && !section.contains("via export"),
+            "section must not tell agents to recover JSON-sync via export"
         );
     }
 

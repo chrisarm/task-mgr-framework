@@ -553,13 +553,21 @@ fn test_database_isolation() {
 
 #[test]
 fn test_export_roundtrip() {
+    // setup_initialized_tempdir uses --no-prefix → zero non-NULL prefixes;
+    // default export refuses (no active PRD). Pass --all; dest is a new file
+    // so --force is not required.
     let temp_dir = setup_initialized_tempdir();
     let export_path = temp_dir.path().join("exported.json");
 
     // Export
     Command::new(cargo_bin("task-mgr"))
         .args(["--dir", temp_dir.path().to_str().unwrap()])
-        .args(["export", "--to-json", export_path.to_str().unwrap()])
+        .args([
+            "export",
+            "--all",
+            "--to-json",
+            export_path.to_str().unwrap(),
+        ])
         .assert()
         .success();
 
@@ -600,6 +608,89 @@ fn test_export_roundtrip() {
     let json2: Value = serde_json::from_str(&String::from_utf8(output2).unwrap()).unwrap();
     let tasks2 = json2.get("tasks").and_then(|v| v.as_array()).unwrap();
     assert_eq!(tasks2.len(), 7, "Re-imported should have same task count");
+}
+
+/// FEAT-003 AC: two prefixed `loop init`s (without `--no-prefix`), no env /
+/// `--from-json` / `--all` → default export refuses; dest untouched; stderr
+/// names `--from-json`, `--all`, and `task-mgr current`.
+///
+/// Do **not** prove ≥2-prefix refuse with two `--no-prefix` inits.
+#[test]
+fn test_export_two_prefixed_loop_inits_refuses_without_pin() {
+    let temp_dir = TempDir::new().unwrap();
+    let dir = temp_dir.path().to_str().unwrap();
+    let tasks_dir = temp_dir.path().join("tasks");
+    fs::create_dir_all(&tasks_dir).unwrap();
+
+    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let a_dest = tasks_dir.join("prd_a.json");
+    let b_dest = tasks_dir.join("prd_b.json");
+    fs::copy(
+        manifest_dir.join("tests/fixtures/prd_p1_alpha.json"),
+        &a_dest,
+    )
+    .unwrap();
+    fs::copy(
+        manifest_dir.join("tests/fixtures/prd_p2_beta.json"),
+        &b_dest,
+    )
+    .unwrap();
+
+    // Project init (no PRD import), then two prefixed loop inits.
+    Command::new(cargo_bin("task-mgr"))
+        .env("HOME", dir)
+        .env_remove("TASK_MGR_ACTIVE_PREFIX")
+        .args(["--dir", dir])
+        .arg("init")
+        .assert()
+        .success();
+
+    Command::new(cargo_bin("task-mgr"))
+        .env("HOME", dir)
+        .env_remove("TASK_MGR_ACTIVE_PREFIX")
+        .args(["--dir", dir])
+        .args(["loop", "init", "--prefix", "A", a_dest.to_str().unwrap()])
+        .assert()
+        .success();
+
+    Command::new(cargo_bin("task-mgr"))
+        .env("HOME", dir)
+        .env_remove("TASK_MGR_ACTIVE_PREFIX")
+        .args(["--dir", dir])
+        .args([
+            "loop",
+            "init",
+            "--append",
+            "--prefix",
+            "B",
+            b_dest.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let out = temp_dir.path().join("out.json");
+    // Sentinel so we can prove dest is unchanged (not created-then-deleted).
+    // Prefer "not created" — assert !exists after refuse.
+    assert!(!out.exists());
+
+    let assert = Command::new(cargo_bin("task-mgr"))
+        .env_remove("TASK_MGR_ACTIVE_PREFIX")
+        .args(["--dir", dir])
+        .args(["export", "--to-json", out.to_str().unwrap()])
+        .assert()
+        .failure();
+
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(
+        stderr.contains("--from-json")
+            && stderr.contains("--all")
+            && stderr.contains("task-mgr current"),
+        "no-active refuse must name --from-json / --all / task-mgr current, got:\n{stderr}"
+    );
+    assert!(
+        !out.exists(),
+        "refuse must not create dest; out exists unexpectedly"
+    );
 }
 
 // ============================================================================
@@ -2771,7 +2862,8 @@ fn test_how_where_will_my_add_land_points_at_current() {
         .env_remove("TASK_MGR_ACTIVE_PREFIX")
         .assert()
         .success()
-        .stdout(predicate::str::contains("task-mgr current"));
+        .stdout(predicate::str::contains("task-mgr current"))
+        .stdout(predicate::str::contains("--from-json"));
 }
 
 #[test]

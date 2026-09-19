@@ -13,7 +13,7 @@ use super::{
     ImportLearningsResult, compute_dedup_key, format_text, import_learnings, parse_learnings,
 };
 use crate::cli::Cli;
-use crate::commands::export::export as export_cmd;
+use crate::commands::export::{ExportOpts, export as export_cmd};
 use crate::commands::init::{PrefixMode, init};
 use crate::db::migrations;
 use crate::db::open_connection;
@@ -1207,8 +1207,18 @@ fn test_e2e_init_learn_export_import_roundtrip() {
     // 3. Export with --learnings-file (simulates `export --learnings-file`)
     let export_json = src_dir.path().join("export.json");
     let learnings_file = src_dir.path().join("learnings.json");
-    let export_result =
-        export_cmd(src_dir.path(), &export_json, false, Some(&learnings_file)).unwrap();
+    let export_result = export_cmd(
+        src_dir.path(),
+        &ExportOpts {
+            to_json: &export_json,
+            with_progress: false,
+            learnings_file: Some(&learnings_file),
+            from_json: None,
+            all: true,
+            force: false,
+        },
+    )
+    .unwrap();
     assert_eq!(export_result.learnings_exported, Some(1));
 
     // 4. Import to fresh DB (simulates `import-learnings --from-json`)
@@ -1323,7 +1333,18 @@ fn test_e2e_export_import_roundtrip_with_reset_stats() {
     // 2. Export
     let export_json = src_dir.path().join("export.json");
     let learnings_file = src_dir.path().join("learnings.json");
-    export_cmd(src_dir.path(), &export_json, false, Some(&learnings_file)).unwrap();
+    export_cmd(
+        src_dir.path(),
+        &ExportOpts {
+            to_json: &export_json,
+            with_progress: false,
+            learnings_file: Some(&learnings_file),
+            from_json: None,
+            all: true,
+            force: false,
+        },
+    )
+    .unwrap();
 
     // 3. Import with --reset-stats to fresh DB
     let (dst_dir, dst_conn) = setup_test_db();

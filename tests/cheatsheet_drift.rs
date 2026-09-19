@@ -418,6 +418,49 @@ fn drift_curated_recipes_document_add_from_json_pin() {
 }
 
 #[test]
+fn drift_curated_recipes_document_update_stdin_from_json() {
+    // FEAT-007: update --stdin --from-json recipe; extractor must parse
+    // both flags so the clap flag-drift check covers them.
+    let calls = extract_recipe_calls(CURATED_RECIPES);
+    let update = calls
+        .iter()
+        .find(|c| c.path == "update")
+        .expect("CURATED_RECIPES must mention `task-mgr update`");
+    assert!(
+        update.flags.iter().any(|f| f == "stdin"),
+        "update recipe must include --stdin; got flags={:?}",
+        update.flags
+    );
+    assert!(
+        update.flags.iter().any(|f| f == "from-json"),
+        "update recipe must include --from-json; got flags={:?}",
+        update.flags
+    );
+}
+
+#[test]
+fn drift_curated_recipes_document_export_force_all_from_json() {
+    // FEAT-007: export recipe covers default active, --all dump-all, and
+    // registered-dest --force; extractor must see those clap tokens.
+    let calls = extract_recipe_calls(CURATED_RECIPES);
+    let exports: Vec<_> = calls.iter().filter(|c| c.path == "export").collect();
+    assert!(
+        !exports.is_empty(),
+        "CURATED_RECIPES must mention `task-mgr export`"
+    );
+    let all_flags: Vec<&str> = exports
+        .iter()
+        .flat_map(|c| c.flags.iter().map(|f| f.as_str()))
+        .collect();
+    for required in ["to-json", "all", "force", "from-json"] {
+        assert!(
+            all_flags.contains(&required),
+            "export recipes must include --{required}; got flags={all_flags:?}"
+        );
+    }
+}
+
+#[test]
 fn drift_curated_recipes_under_thirty_lines() {
     // qualityDimensions: "curated recipes <= 30 lines".
     let line_count = CURATED_RECIPES.lines().count();

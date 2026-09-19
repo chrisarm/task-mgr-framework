@@ -731,7 +731,7 @@ fn test_run_end_aborted() {
     }
 }
 
-// Export command tests
+// Export command tests (FEAT-003: from_json / all / force)
 #[test]
 fn test_export_basic() {
     let cli = Cli::parse_from(["task-mgr", "export", "--to-json", "output.json"]);
@@ -740,10 +740,16 @@ fn test_export_basic() {
             to_json,
             with_progress,
             learnings_file,
+            from_json,
+            all,
+            force,
         } => {
             assert_eq!(to_json, PathBuf::from("output.json"));
             assert!(!with_progress);
             assert!(learnings_file.is_none());
+            assert!(from_json.is_none());
+            assert!(!all);
+            assert!(!force);
         }
         _ => panic!("Expected Export command"),
     }
@@ -763,10 +769,16 @@ fn test_export_with_progress() {
             to_json,
             with_progress,
             learnings_file,
+            from_json,
+            all,
+            force,
         } => {
             assert_eq!(to_json, PathBuf::from("output.json"));
             assert!(with_progress);
             assert!(learnings_file.is_none());
+            assert!(from_json.is_none());
+            assert!(!all);
+            assert!(!force);
         }
         _ => panic!("Expected Export command"),
     }
@@ -787,10 +799,16 @@ fn test_export_with_learnings_file() {
             to_json,
             with_progress,
             learnings_file,
+            from_json,
+            all,
+            force,
         } => {
             assert_eq!(to_json, PathBuf::from("output.json"));
             assert!(!with_progress);
             assert_eq!(learnings_file, Some(PathBuf::from("learnings.json")));
+            assert!(from_json.is_none());
+            assert!(!all);
+            assert!(!force);
         }
         _ => panic!("Expected Export command"),
     }
@@ -806,19 +824,151 @@ fn test_export_with_all_options() {
         "--with-progress",
         "--learnings-file",
         "learnings.json",
+        "--from-json",
+        "tasks/my-prd.json",
+        "--force",
     ]);
     match cli.command {
         Commands::Export {
             to_json,
             with_progress,
             learnings_file,
+            from_json,
+            all,
+            force,
         } => {
             assert_eq!(to_json, PathBuf::from("prd.json"));
             assert!(with_progress);
             assert_eq!(learnings_file, Some(PathBuf::from("learnings.json")));
+            assert_eq!(from_json, Some(PathBuf::from("tasks/my-prd.json")));
+            assert!(!all);
+            assert!(force);
         }
         _ => panic!("Expected Export command"),
     }
+}
+
+#[test]
+fn test_export_from_json_parses_path() {
+    let cli = Cli::parse_from([
+        "task-mgr",
+        "export",
+        "--to-json",
+        "out.json",
+        "--from-json",
+        "tasks/my-prd.json",
+    ]);
+    match cli.command {
+        Commands::Export {
+            to_json,
+            from_json,
+            all,
+            force,
+            ..
+        } => {
+            assert_eq!(to_json, PathBuf::from("out.json"));
+            assert_eq!(from_json, Some(PathBuf::from("tasks/my-prd.json")));
+            assert!(!all);
+            assert!(!force);
+        }
+        other => panic!("expected Export, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_export_all_flag() {
+    let cli = Cli::parse_from(["task-mgr", "export", "--to-json", "out.json", "--all"]);
+    match cli.command {
+        Commands::Export {
+            to_json,
+            from_json,
+            all,
+            force,
+            ..
+        } => {
+            assert_eq!(to_json, PathBuf::from("out.json"));
+            assert!(from_json.is_none());
+            assert!(all);
+            assert!(!force);
+        }
+        other => panic!("expected Export, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_export_force_flag() {
+    let cli = Cli::parse_from(["task-mgr", "export", "--to-json", "out.json", "--force"]);
+    match cli.command {
+        Commands::Export {
+            to_json,
+            from_json,
+            all,
+            force,
+            ..
+        } => {
+            assert_eq!(to_json, PathBuf::from("out.json"));
+            assert!(from_json.is_none());
+            assert!(!all);
+            assert!(force);
+        }
+        other => panic!("expected Export, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_export_all_conflicts_with_from_json() {
+    let result = Cli::try_parse_from([
+        "task-mgr",
+        "export",
+        "--to-json",
+        "out.json",
+        "--all",
+        "--from-json",
+        "tasks/x.json",
+    ]);
+    assert!(
+        result.is_err(),
+        "--all and --from-json must conflict at clap parse"
+    );
+}
+
+#[test]
+fn test_export_from_json_help_says_pin_not_import() {
+    let mut cmd = Cli::command();
+    let export = cmd
+        .find_subcommand_mut("export")
+        .expect("export subcommand");
+    let help = export.render_long_help().to_string();
+    assert!(
+        help.to_lowercase().contains("pin") || help.contains("already-registered"),
+        "export --from-json help must say pin / already-registered, got:\n{help}"
+    );
+    let from_json_help = export
+        .get_arguments()
+        .find(|a| a.get_long() == Some("from-json"))
+        .map(|a| {
+            format!(
+                "{} {}",
+                a.get_help().map(|h| h.to_string()).unwrap_or_default(),
+                a.get_long_help().map(|h| h.to_string()).unwrap_or_default()
+            )
+        })
+        .unwrap_or_default();
+    assert!(
+        from_json_help.to_lowercase().contains("pin")
+            || from_json_help.contains("already-registered"),
+        "--from-json arg help must say pin: {from_json_help}"
+    );
+    assert!(
+        !from_json_help.to_lowercase().contains("import a prd")
+            && !from_json_help.to_lowercase().contains("import the"),
+        "--from-json on export must not read as import: {from_json_help}"
+    );
+    // Dest stays --to-json; pin is dump source.
+    assert!(
+        help.contains("--to-json") || from_json_help.contains("--to-json"),
+        "export help should keep --to-json as dest: {help}"
+    );
 }
 
 // Doctor command tests

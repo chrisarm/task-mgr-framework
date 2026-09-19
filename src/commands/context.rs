@@ -3,7 +3,8 @@
 //! Owns `ResolvedContext`, `ResolutionSource`, `resolve_context`,
 //! `resolve_active_prefix`, `locate_prd_json`, `load_known_prefixes`, the
 //! pin-19 path identity helper (`paths_identify`), and write-only helpers
-//! [`refuse_unpinned_write`] / [`preflight_from_json_path`] / [`default_prd_roots`].
+//! [`refuse_unpinned_write`] / [`preflight_from_json_path`] / [`default_prd_roots`] /
+//! [`prd_roots_for_dest_identity`].
 //! `--from-json` registration is `(a)` JSON `taskPrefix` ∈ `prd_metadata`
 //! **OR** pin-19 `(b)/(c)`.
 //!
@@ -258,7 +259,11 @@ fn match_registered_from_json(
     }
 
     // Match (b)+(c): path identity against registered task_list rows.
-    find_registered_by_path_identity(conn, canon, source_root, worktree_root)
+    // Keep prefix-only at this layer — do not fold match (a) into identity.
+    Ok(
+        find_registered_by_path_identity(conn, canon, source_root, worktree_root)?
+            .map(|(_prd_id, prefix)| prefix),
+    )
 }
 
 /// Best-effort `taskPrefix` from the JSON file root. Parse failures / missing
@@ -272,14 +277,19 @@ fn read_json_task_prefix(path: &Path) -> Option<String> {
     }
 }
 
-/// Pin-19 path identity against every `task_list` row. Returns the matched
-/// row's `task_prefix` (`None` when the column is NULL).
-fn find_registered_by_path_identity(
+/// Pin-19 path identity against every `task_list` row.
+///
+/// Returns matched `(prd_files.prd_id, task_prefix)`. `task_prefix` is `None`
+/// when the column is NULL (`--no-prefix` / empty prefix). Match (a) (JSON
+/// `taskPrefix` ∈ known prefixes) is **not** this function —
+/// [`match_registered_from_json`] keeps (a) OR identity and still exposes
+/// prefix-only to [`resolve_context`].
+pub(crate) fn find_registered_by_path_identity(
     conn: &Connection,
     flag_canon: &Path,
     source_root: Option<&Path>,
     worktree_root: Option<&Path>,
-) -> TaskMgrResult<Option<Option<String>>> {
+) -> TaskMgrResult<Option<(i64, Option<String>)>> {
     let source_root = source_root
         .map(Path::to_path_buf)
         .or_else(main_repo_root)
@@ -290,18 +300,19 @@ fn find_registered_by_path_identity(
         .or_else(|| source_root.clone());
 
     let mut stmt = conn.prepare(
-        "SELECT pf.file_path, pm.task_prefix FROM prd_files pf \
+        "SELECT pf.prd_id, pf.file_path, pm.task_prefix FROM prd_files pf \
          JOIN prd_metadata pm ON pf.prd_id = pm.id \
          WHERE pf.file_type = 'task_list'",
     )?;
     let rows = stmt.query_map([], |row| {
-        let path: String = row.get(0)?;
-        let prefix: Option<String> = row.get(1)?;
-        Ok((PathBuf::from(path), prefix))
+        let prd_id: i64 = row.get(0)?;
+        let path: String = row.get(1)?;
+        let prefix: Option<String> = row.get(2)?;
+        Ok((prd_id, PathBuf::from(path), prefix))
     })?;
 
     for row in rows {
-        let (registered, prefix) = row?;
+        let (prd_id, registered, prefix) = row?;
 
         // Absolute registered path: canonicalize equality is sufficient and
         // does not depend on git roots (covers TempDir init fixtures).
@@ -311,21 +322,21 @@ fn find_registered_by_path_identity(
                 .ok()
                 .is_some_and(|r| r == flag_canon)
         {
-            return Ok(Some(prefix));
+            return Ok(Some((prd_id, prefix)));
         }
 
         if let (Some(src), Some(wt)) = (&source_root, &worktree) {
             let src = src.canonicalize().unwrap_or_else(|_| src.clone());
             let wt = wt.canonicalize().unwrap_or_else(|_| wt.clone());
             if paths_identify(flag_canon, &registered, &src, &wt) {
-                return Ok(Some(prefix));
+                return Ok(Some((prd_id, prefix)));
             }
         } else if !registered.is_absolute() {
             // Non-git cwd fallback for relative rows (best-effort).
             if let Ok(cwd) = std::env::current_dir() {
                 let cwd = cwd.canonicalize().unwrap_or(cwd);
                 if paths_identify(flag_canon, &registered, &cwd, &cwd) {
-                    return Ok(Some(prefix));
+                    return Ok(Some((prd_id, prefix)));
                 }
             }
         }
@@ -512,6 +523,10 @@ pub(crate) fn preflight_from_json_path(path: &Path, command: &str) -> TaskMgrRes
 /// Shared by write-path callers (`add` / `update`) so TempDir / `--dir`
 /// relative `prd_files` resolve against the project, not the developer
 /// checkout. Do not `use commands::add` from update — call this instead.
+///
+/// `worktree_root` is **cwd-bound**: linked only when cwd itself is inside a
+/// linked worktree. Export dest overwrite-guard must not use this alone for
+/// the identity probe — see [`prd_roots_for_dest_identity`].
 pub(crate) fn default_prd_roots(db_dir: &Path) -> (PathBuf, PathBuf) {
     let source_root = crate::git::main_repo_root_at(db_dir)
         .or_else(|| db_dir.parent().map(|p| p.to_path_buf()))
@@ -520,6 +535,28 @@ pub(crate) fn default_prd_roots(db_dir: &Path) -> (PathBuf, PathBuf) {
         .ok()
         .filter(|cwd| crate::git::is_inside_worktree_at(cwd).unwrap_or(false))
         .unwrap_or_else(|| source_root.clone());
+    (source_root, worktree_root)
+}
+
+/// Roots for export `--to-json` dest overwrite-guard identity (pin 19).
+///
+/// `source_root` matches [`default_prd_roots`]. `worktree_root` is derived
+/// from `dest_canon` when that path lives in a linked worktree, so an
+/// absolute `--to-json` at a worktree live JSON still hits pin-19 (c) when
+/// cwd is main or elsewhere. When dest is not in a linked worktree, falls
+/// back to the cwd-based root from [`default_prd_roots`].
+///
+/// `dest_canon` must already be canonicalized (export does this after
+/// `dest.is_file()`). Probe uses the file's parent directory because git
+/// `current_dir` requires a directory.
+pub(crate) fn prd_roots_for_dest_identity(db_dir: &Path, dest_canon: &Path) -> (PathBuf, PathBuf) {
+    let (source_root, cwd_worktree_root) = default_prd_roots(db_dir);
+    let probe = dest_canon.parent().unwrap_or(dest_canon);
+    let worktree_root = if crate::git::is_inside_worktree_at(probe).unwrap_or(false) {
+        crate::git::worktree_root_at(probe).unwrap_or(cwd_worktree_root)
+    } else {
+        cwd_worktree_root
+    };
     (source_root, worktree_root)
 }
 

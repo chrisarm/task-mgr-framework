@@ -72,3 +72,24 @@ that clears archive state.
 - Overlay `passes` / `status` are rejected (use lifecycle / `<task-status>`).
 
 ---
+
+## Agent task-ops UX PR-3 — scoped export + `--force` dump
+
+**Branch**: `feat/agent-task-ops-pr3`
+**PRD**: `tasks/prd-agent-task-ops-pr3.md`
+
+### What shipped
+
+`task-mgr export --to-json` defaults to the active PRD. `--all` restores
+dump-all. Overwriting a registered task-list requires `--force` (lossy dump,
+not a merge). Dest identity is dest-bound so a worktree JSON is still
+protected when cwd is main. Docs, `task_ops`, cheatsheet, and `claude-loop.sh`
+no longer smash `"$PRD_FILE"`.
+
+### Breaking changes
+
+- Default export is scoped, not dump-all.
+- Registered dest without `--force` refuses.
+
+---
+
