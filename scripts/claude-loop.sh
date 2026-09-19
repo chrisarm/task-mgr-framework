@@ -158,10 +158,12 @@ cleanup() {
   echo ""
   echo "Cleaning up..."
 
-  # Export current state to JSON for crash recovery
+  # Optional dump to an unregistered path (never --force onto "$PRD_FILE";
+  # export is a lossy dump, not a merge — DB + doctor recover the live PRD)
   if [ -n "$PRD_FILE" ]; then
-    echo "Exporting state to $PRD_FILE..."
-    task-mgr --dir "$TASK_MGR_DIR" export --to-json "$PRD_FILE" 2>/dev/null || true
+    local dump="/tmp/task-mgr-dump-$(basename "$PRD_FILE")"
+    echo "Dumping state to $dump (lossy export; not smashing $PRD_FILE)..."
+    task-mgr --dir "$TASK_MGR_DIR" export --from-json "$PRD_FILE" --to-json "$dump" 2>/dev/null || true
   fi
 
   # End the run if we started one
@@ -528,9 +530,12 @@ ${prompt_content}"
       task-mgr --dir "$TASK_MGR_DIR" run update --run-id "$RUN_ID" --last-commit "$last_commit_hash" --last-files "$LAST_FILES" 2>/dev/null || true
     fi
 
-    # Export after every iteration for crash recovery
+    # Optional dump after every iteration — unregistered path only.
+    # Never --to-json "$PRD_FILE" without --force, and do not add --force onto
+    # the live PRD (lossy smash). DB + doctor recover.
     if [ -n "$PRD_FILE" ]; then
-      task-mgr --dir "$TASK_MGR_DIR" export --to-json "$PRD_FILE" 2>/dev/null || true
+      local dump="/tmp/task-mgr-dump-$(basename "$PRD_FILE")"
+      task-mgr --dir "$TASK_MGR_DIR" export --from-json "$PRD_FILE" --to-json "$dump" 2>/dev/null || true
     fi
 
     echo "Iteration $i complete. Continuing..."
@@ -546,10 +551,12 @@ ${prompt_content}"
   fi
   echo "======================================================"
 
-  # Final export
+  # Final dump to an unregistered path (never --force onto "$PRD_FILE";
+  # export is a lossy dump, not a merge)
   if [ -n "$PRD_FILE" ]; then
-    echo "Final export to $PRD_FILE"
-    task-mgr --dir "$TASK_MGR_DIR" export --to-json "$PRD_FILE" 2>/dev/null || true
+    local dump="/tmp/task-mgr-dump-$(basename "$PRD_FILE")"
+    echo "Final dump to $dump (lossy export; not smashing $PRD_FILE)"
+    task-mgr --dir "$TASK_MGR_DIR" export --from-json "$PRD_FILE" --to-json "$dump" 2>/dev/null || true
   fi
 }
 
