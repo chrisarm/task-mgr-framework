@@ -10,6 +10,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::SystemTime;
 
 use super::guidance::SessionGuidance;
 use super::{DEADLINE_FILE_PREFIX, PAUSE_FILE, STOP_FILE};
@@ -211,6 +212,103 @@ pub fn pause_file_path(tasks_dir: &Path, prefix: Option<&str>) -> PathBuf {
     }
 }
 
+/// Directories watched for operator stop/pause files.
+///
+/// `canonical` uses the existing single-dir rule with no mtime gate.
+/// `extras` honor only prefix stop/pause (inner loop) or global stop (batch),
+/// and only when the file mtime is strictly after `started_at`.
+///
+/// `started_at` is captured once by the caller (process entry); these helpers
+/// never call [`SystemTime::now`].
+#[derive(Debug, Clone)]
+pub struct SignalLocations {
+    pub canonical: PathBuf,
+    pub extras: Vec<PathBuf>,
+    pub started_at: SystemTime,
+}
+
+/// True when `path`'s modified time is strictly after `started_at`.
+///
+/// Equal timestamps are stale. Missing or unreadable metadata is not a signal
+/// (logged via tracing; never panics).
+fn file_mtime_strictly_after(path: &Path, started_at: SystemTime) -> bool {
+    match fs::metadata(path).and_then(|m| m.modified()) {
+        Ok(mtime) => mtime > started_at,
+        Err(e) => {
+            tracing::warn!(
+                "could not read mtime for {}: {}; treating as no signal",
+                path.display(),
+                e
+            );
+            false
+        }
+    }
+}
+
+/// Multi-directory stop predicate for an inner loop.
+///
+/// Canonical: [`check_stop_signal`] (prefix file, else global `.stop`) with no
+/// mtime gate. Extras: only `.stop-<prefix>` whose mtime is strictly after
+/// `locations.started_at`. Global files in extras and `prefix: None` extras are
+/// ignored.
+pub fn stop_requested(locations: &SignalLocations, prefix: Option<&str>) -> bool {
+    if check_stop_signal(&locations.canonical, prefix) {
+        return true;
+    }
+    let Some(p) = prefix else {
+        return false;
+    };
+    let name = format!("{STOP_FILE}-{p}");
+    for dir in &locations.extras {
+        let path = dir.join(&name);
+        if path.exists() && file_mtime_strictly_after(&path, locations.started_at) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Multi-directory pause predicate for an inner loop.
+///
+/// Canonical: [`check_pause_signal`] (prefix file, else global `.pause`) with no
+/// mtime gate. Extras: only `.pause-<prefix>` whose mtime is strictly after
+/// `locations.started_at`. Global files in extras and `prefix: None` extras are
+/// ignored.
+pub fn pause_requested(locations: &SignalLocations, prefix: Option<&str>) -> bool {
+    if check_pause_signal(&locations.canonical, prefix) {
+        return true;
+    }
+    let Some(p) = prefix else {
+        return false;
+    };
+    let name = format!("{PAUSE_FILE}-{p}");
+    for dir in &locations.extras {
+        let path = dir.join(&name);
+        if path.exists() && file_mtime_strictly_after(&path, locations.started_at) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Batch between-PRD stop predicate (global `.stop` only).
+///
+/// Canonical: global `.stop` exists (no mtime gate). Extras: global `.stop`
+/// whose mtime is strictly after `locations.started_at`. Prefix stop files in
+/// extras are ignored.
+pub fn batch_stop_requested(locations: &SignalLocations) -> bool {
+    if locations.canonical.join(STOP_FILE).exists() {
+        return true;
+    }
+    for dir in &locations.extras {
+        let path = dir.join(STOP_FILE);
+        if path.exists() && file_mtime_strictly_after(&path, locations.started_at) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Handle a human review checkpoint after a `requires_human` task completes.
 ///
 /// Displays a banner with `task_id`, `task_title`, and optional `task_notes`,
@@ -371,6 +469,8 @@ pub(crate) fn read_lines_with_timeout<R: io::BufRead + Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::{File, FileTimes};
+    use std::time::Duration;
     use tempfile::TempDir;
 
     // --- File signal tests ---
@@ -718,6 +818,190 @@ mod tests {
         // cleanup with a prefix when no matching files exist must not panic
         let temp_dir = TempDir::new().unwrap();
         cleanup_signal_files_for_prefix(temp_dir.path(), Some("P1"));
+    }
+
+    // --- SignalLocations multi-dir predicates (FEAT-001) ---
+
+    fn epoch_plus(secs: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    fn write_with_mtime(path: &Path, mtime: SystemTime) {
+        fs::write(path, b"").unwrap();
+        let file = File::options().write(true).open(path).unwrap();
+        file.set_times(FileTimes::new().set_modified(mtime))
+            .unwrap();
+    }
+
+    fn locations(canonical: &Path, extras: &[&Path], started_at: SystemTime) -> SignalLocations {
+        SignalLocations {
+            canonical: canonical.to_path_buf(),
+            extras: extras.iter().map(|p| p.to_path_buf()).collect(),
+            started_at,
+        }
+    }
+
+    #[test]
+    fn stop_requested_canonical_prefix_or_global_ignores_mtime() {
+        let canonical = TempDir::new().unwrap();
+        let started = epoch_plus(1_000);
+        // Stale mtime (before started_at) still counts in canonical.
+        write_with_mtime(&canonical.path().join(".stop-P1"), epoch_plus(500));
+        let locs = locations(canonical.path(), &[], started);
+        assert!(stop_requested(&locs, Some("P1")));
+
+        let canonical2 = TempDir::new().unwrap();
+        write_with_mtime(&canonical2.path().join(STOP_FILE), epoch_plus(100));
+        let locs2 = locations(canonical2.path(), &[], started);
+        assert!(stop_requested(&locs2, Some("P1")));
+        assert!(stop_requested(&locs2, None));
+    }
+
+    #[test]
+    fn pause_requested_canonical_prefix_or_global_ignores_mtime() {
+        let canonical = TempDir::new().unwrap();
+        let started = epoch_plus(1_000);
+        write_with_mtime(&canonical.path().join(".pause-P1"), epoch_plus(500));
+        let locs = locations(canonical.path(), &[], started);
+        assert!(pause_requested(&locs, Some("P1")));
+
+        let canonical2 = TempDir::new().unwrap();
+        write_with_mtime(&canonical2.path().join(PAUSE_FILE), epoch_plus(100));
+        let locs2 = locations(canonical2.path(), &[], started);
+        assert!(pause_requested(&locs2, Some("P1")));
+        assert!(pause_requested(&locs2, None));
+    }
+
+    #[test]
+    fn stop_and_pause_requested_extra_prefix_strictly_after_started_at() {
+        let canonical = TempDir::new().unwrap();
+        let extra = TempDir::new().unwrap();
+        let started = epoch_plus(1_000);
+        write_with_mtime(&extra.path().join(".stop-P1"), epoch_plus(1_001));
+        write_with_mtime(&extra.path().join(".pause-P1"), epoch_plus(1_002));
+        let locs = locations(canonical.path(), &[extra.path()], started);
+        assert!(stop_requested(&locs, Some("P1")));
+        assert!(pause_requested(&locs, Some("P1")));
+    }
+
+    #[test]
+    fn extra_prefix_mtime_before_or_equal_started_at_is_not_signal() {
+        let canonical = TempDir::new().unwrap();
+        let extra = TempDir::new().unwrap();
+        let started = epoch_plus(1_000);
+
+        // Before started_at
+        write_with_mtime(&extra.path().join(".stop-P1"), epoch_plus(999));
+        write_with_mtime(&extra.path().join(".pause-P1"), epoch_plus(900));
+        let locs = locations(canonical.path(), &[extra.path()], started);
+        assert!(!stop_requested(&locs, Some("P1")));
+        assert!(!pause_requested(&locs, Some("P1")));
+
+        // Equal to started_at (known-bad for >= ): must stay false for both
+        write_with_mtime(&extra.path().join(".stop-P1"), started);
+        write_with_mtime(&extra.path().join(".pause-P1"), started);
+        let locs_eq = locations(canonical.path(), &[extra.path()], started);
+        assert!(
+            !stop_requested(&locs_eq, Some("P1")),
+            "mtime == started_at must not stop"
+        );
+        assert!(
+            !pause_requested(&locs_eq, Some("P1")),
+            "mtime == started_at must not pause"
+        );
+    }
+
+    #[test]
+    fn other_prefix_in_canonical_or_extra_does_not_stop_p() {
+        let canonical = TempDir::new().unwrap();
+        let extra = TempDir::new().unwrap();
+        let started = epoch_plus(1_000);
+        write_with_mtime(&canonical.path().join(".stop-OTHER"), epoch_plus(2_000));
+        write_with_mtime(&extra.path().join(".stop-OTHER"), epoch_plus(2_000));
+        let locs = locations(canonical.path(), &[extra.path()], started);
+        assert!(!stop_requested(&locs, Some("P1")));
+    }
+
+    #[test]
+    fn global_stop_or_pause_in_extra_ignored_by_inner_predicates() {
+        let canonical = TempDir::new().unwrap();
+        let extra = TempDir::new().unwrap();
+        let started = epoch_plus(1_000);
+        write_with_mtime(&extra.path().join(STOP_FILE), epoch_plus(2_000));
+        write_with_mtime(&extra.path().join(PAUSE_FILE), epoch_plus(2_000));
+        let locs = locations(canonical.path(), &[extra.path()], started);
+        assert!(!stop_requested(&locs, Some("P1")));
+        assert!(!stop_requested(&locs, None));
+        assert!(!pause_requested(&locs, Some("P1")));
+        assert!(!pause_requested(&locs, None));
+    }
+
+    #[test]
+    fn batch_stop_requested_canonical_global_no_mtime_extra_strict_after() {
+        let started = epoch_plus(1_000);
+
+        // Canonical global .stop with stale mtime still stops.
+        let canonical = TempDir::new().unwrap();
+        write_with_mtime(&canonical.path().join(STOP_FILE), epoch_plus(100));
+        let locs = locations(canonical.path(), &[], started);
+        assert!(batch_stop_requested(&locs));
+
+        // Extra global .stop only when mtime > started_at.
+        let canonical2 = TempDir::new().unwrap();
+        let extra = TempDir::new().unwrap();
+        write_with_mtime(&extra.path().join(STOP_FILE), epoch_plus(1_001));
+        let locs_fresh = locations(canonical2.path(), &[extra.path()], started);
+        assert!(batch_stop_requested(&locs_fresh));
+
+        write_with_mtime(&extra.path().join(STOP_FILE), started);
+        let locs_eq = locations(canonical2.path(), &[extra.path()], started);
+        assert!(!batch_stop_requested(&locs_eq));
+
+        write_with_mtime(&extra.path().join(STOP_FILE), epoch_plus(999));
+        let locs_stale = locations(canonical2.path(), &[extra.path()], started);
+        assert!(!batch_stop_requested(&locs_stale));
+    }
+
+    #[test]
+    fn batch_stop_requested_ignores_prefix_files_in_extras() {
+        let canonical = TempDir::new().unwrap();
+        let extra = TempDir::new().unwrap();
+        let started = epoch_plus(1_000);
+        write_with_mtime(&extra.path().join(".stop-P1"), epoch_plus(2_000));
+        let locs = locations(canonical.path(), &[extra.path()], started);
+        assert!(!batch_stop_requested(&locs));
+    }
+
+    #[test]
+    fn stop_and_batch_predicates_use_caller_started_at_not_clock() {
+        // Fixed started_at; two calls agree. Helpers must not sample SystemTime::now().
+        let canonical = TempDir::new().unwrap();
+        let extra = TempDir::new().unwrap();
+        let started = epoch_plus(1_000);
+        write_with_mtime(&extra.path().join(".stop-P1"), epoch_plus(1_500));
+        write_with_mtime(&extra.path().join(STOP_FILE), epoch_plus(1_500));
+        let locs = locations(canonical.path(), &[extra.path()], started);
+        assert_eq!(
+            stop_requested(&locs, Some("P1")),
+            stop_requested(&locs, Some("P1"))
+        );
+        assert_eq!(batch_stop_requested(&locs), batch_stop_requested(&locs));
+        // A later started_at makes the same files stale.
+        let locs_later = locations(canonical.path(), &[extra.path()], epoch_plus(2_000));
+        assert!(!stop_requested(&locs_later, Some("P1")));
+        assert!(!batch_stop_requested(&locs_later));
+    }
+
+    #[test]
+    fn unreadable_extra_path_is_not_a_signal() {
+        let canonical = TempDir::new().unwrap();
+        let started = epoch_plus(1_000);
+        // Point extras at a path that is not a directory — join + exists is false.
+        let missing = canonical.path().join("does-not-exist");
+        let locs = locations(canonical.path(), &[&missing], started);
+        assert!(!stop_requested(&locs, Some("P1")));
+        assert!(!pause_requested(&locs, Some("P1")));
+        assert!(!batch_stop_requested(&locs));
     }
 
     // --- handle_human_review tests (require FEAT-004) ---

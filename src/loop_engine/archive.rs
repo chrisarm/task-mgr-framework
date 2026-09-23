@@ -587,10 +587,10 @@ struct DiscoveredArchiveFiles {
 
 fn path_keys(path: &Path) -> Vec<PathBuf> {
     let mut keys = vec![path.to_path_buf()];
-    if let Ok(canon) = path.canonicalize() {
-        if canon != path {
-            keys.push(canon);
-        }
+    if let Ok(canon) = path.canonicalize()
+        && canon != path
+    {
+        keys.push(canon);
     }
     keys
 }
