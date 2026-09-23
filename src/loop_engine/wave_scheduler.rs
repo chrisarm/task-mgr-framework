@@ -1612,7 +1612,7 @@ mod tests {
     };
     use crate::loop_engine::prompt::slot::{SlotPromptBundle, SlotPromptParams};
     use crate::loop_engine::runner::RunnerKind;
-    use crate::loop_engine::signals::SignalFlag;
+    use crate::loop_engine::signals::{SignalFlag, SignalLocations};
     use crate::loop_engine::test_utils::{
         get_task_status, insert_relationship, insert_run, insert_task, insert_task_file,
         setup_git_repo, setup_test_db,
@@ -1622,7 +1622,15 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime};
+
+    fn test_signal_locations(tasks_dir: &Path) -> SignalLocations {
+        SignalLocations {
+            canonical: tasks_dir.to_path_buf(),
+            extras: vec![],
+            started_at: SystemTime::UNIX_EPOCH,
+        }
+    }
 
     /// Opt every task out of the FEAT-003 buildy shared-infra heuristic.
     fn opt_out_buildy(conn: &Connection) {
@@ -1728,6 +1736,7 @@ mod tests {
             prd_path,
             progress_path,
             tasks_dir,
+            signal_locations: test_signal_locations(tasks_dir),
             external_repo_path: None,
             external_git_scan_depth: 50,
             inter_iteration_delay: Duration::ZERO,
@@ -2463,6 +2472,7 @@ mod tests {
                 prd_path: &prd,
                 progress_path: &progress,
                 tasks_dir: tmp.path(),
+                signal_locations: test_signal_locations(tmp.path()),
                 external_repo_path: None,
                 external_git_scan_depth: 50,
                 inter_iteration_delay: Duration::from_millis(500),
@@ -2723,6 +2733,7 @@ mod tests {
                 prd_path,
                 progress_path,
                 tasks_dir: source_root,
+                signal_locations: test_signal_locations(source_root),
                 external_repo_path: None,
                 external_git_scan_depth: 50,
                 inter_iteration_delay: Duration::ZERO,

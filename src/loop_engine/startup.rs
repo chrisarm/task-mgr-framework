@@ -43,7 +43,10 @@ use crate::loop_engine::git_reconcile::reconcile_external_git_completions;
 use crate::loop_engine::model;
 use crate::loop_engine::prd_reconcile::{hash_file, read_prd_metadata, reconcile_passes_with_db};
 use crate::loop_engine::project_config::ProjectConfig;
-use crate::loop_engine::signals::SignalFlag;
+use crate::loop_engine::signals::{
+    SignalFlag, SignalLocations, build_signal_locations, emit_stop_watch_paths,
+    sweep_stale_extra_prefix_stops,
+};
 use crate::loop_engine::status_queries::read_prd_hints;
 use crate::loop_engine::worktree;
 use crate::output::ui;
@@ -108,6 +111,8 @@ pub(crate) struct LoopInitContext {
     pub(crate) permission_mode: PermissionMode,
     /// Usage-API monitoring parameters.
     pub(crate) usage_params: UsageParams,
+    /// Multi-directory stop/pause watch set for this run (process-start clock).
+    pub(crate) signal_locations: SignalLocations,
 }
 
 /// Expected global skills for task-mgr loop workflows.
@@ -959,7 +964,18 @@ pub(crate) fn initialize_loop(
         ui::emit(&format!("[verbose] Permission mode: {}", permission_mode));
     }
 
-    // Step 15.5: Print session banner
+    // Step 15.5: Build signal locations from pre-remap tasks_dir (canonical),
+    // then print session banner. Absolute watch paths are emitted after the box.
+    // started_at comes from LoopRunConfig (process entry); do not call now() here.
+    let signal_locations = build_signal_locations(
+        paths.tasks_dir.clone(),
+        &run_config.source_root,
+        actual_worktree_path.as_deref(),
+        run_config.started_at,
+    );
+    // FEAT-003 writes the prefix run record immediately before this sweep.
+    sweep_stale_extra_prefix_stops(&signal_locations, task_prefix.as_deref());
+
     let branch_display = branch_name.as_deref().unwrap_or("(unknown)");
     let db_path = run_config.db_dir.join("tasks.db");
     let banner_hints = display::SessionBannerHints {
@@ -975,6 +991,7 @@ pub(crate) fn initialize_loop(
         run_config.config.hours,
         Some(&banner_hints),
     );
+    emit_stop_watch_paths(&signal_locations);
 
     // Step 15.6: Print auto-mode availability hint if applicable.
     // Fires when LOOP_AUTO_MODE_AVAILABLE=true and user is NOT already in Auto mode.
@@ -1061,6 +1078,7 @@ pub(crate) fn initialize_loop(
         steering,
         permission_mode,
         usage_params,
+        signal_locations,
     })
 }
 

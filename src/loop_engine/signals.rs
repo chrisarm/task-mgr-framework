@@ -67,12 +67,14 @@ pub fn cleanup_signal_files_for_prefix(tasks_dir: &Path, prefix: Option<&str>) {
 /// Handle a pause signal: display banner, read multi-line stdin, accumulate guidance.
 ///
 /// Reads lines from stdin until an empty line is entered. The collected text
-/// is added to `session_guidance` with the current iteration tag. The `.pause`
-/// file is deleted after the interaction.
+/// is added to `session_guidance` with the current iteration tag. The pause
+/// file that matched ([`pause_requested`] order: canonical prefix, canonical
+/// global, then a fresh extra-dir prefix file) is deleted after the interaction
+/// so the next iteration does not pause again.
 ///
 /// Returns `true` if guidance was provided, `false` if user just resumed.
 pub fn handle_pause(
-    tasks_dir: &Path,
+    locations: &SignalLocations,
     iteration: u32,
     session_guidance: &mut SessionGuidance,
     prefix: Option<&str>,
@@ -87,7 +89,7 @@ pub fn handle_pause(
     ui::emit("╚══════════════════════════════════════════╝\n");
 
     let lines = read_lines_with_timeout(io::BufReader::new(io::stdin()), None);
-    let _ = fs::remove_file(pause_file_path(tasks_dir, prefix));
+    remove_matching_pause_file(locations, prefix);
 
     let text = lines.join("\n");
     let has_guidance = !text.trim().is_empty();
@@ -100,6 +102,39 @@ pub fn handle_pause(
     }
 
     has_guidance
+}
+
+/// Delete the pause file [`pause_requested`] would have matched (first hit).
+fn remove_matching_pause_file(locations: &SignalLocations, prefix: Option<&str>) {
+    if let Some(p) = prefix {
+        let prefix_path = locations.canonical.join(format!("{PAUSE_FILE}-{p}"));
+        if prefix_path.exists() {
+            if let Err(e) = fs::remove_file(&prefix_path) {
+                tracing::warn!("could not remove {}: {}", prefix_path.display(), e);
+            }
+            return;
+        }
+    }
+    let global = locations.canonical.join(PAUSE_FILE);
+    if global.exists() {
+        if let Err(e) = fs::remove_file(&global) {
+            tracing::warn!("could not remove {}: {}", global.display(), e);
+        }
+        return;
+    }
+    let Some(p) = prefix else {
+        return;
+    };
+    let name = format!("{PAUSE_FILE}-{p}");
+    for dir in &locations.extras {
+        let path = dir.join(&name);
+        if path.exists() && file_mtime_strictly_after(&path, locations.started_at) {
+            if let Err(e) = fs::remove_file(&path) {
+                tracing::warn!("could not remove {}: {}", path.display(), e);
+            }
+            return;
+        }
+    }
 }
 
 /// Shared signal flag for SIGINT/SIGTERM detection.
@@ -307,6 +342,171 @@ pub fn batch_stop_requested(locations: &SignalLocations) -> bool {
         }
     }
     false
+}
+
+/// Launch `tasks/` candidate: `cwd` when its final component is `tasks`, else
+/// `cwd/tasks`. Does not create the directory.
+pub fn launch_tasks_candidate(cwd: &Path) -> PathBuf {
+    if cwd.file_name().is_some_and(|n| n == "tasks") {
+        cwd.to_path_buf()
+    } else {
+        cwd.join("tasks")
+    }
+}
+
+/// Build [`SignalLocations`] for a loop or batch between-PRD check.
+///
+/// `canonical` is kept as provided (no mtime gate). Extra candidates, after
+/// canonicalize: launch tasks dir, `worktree/tasks` when `Some`, and
+/// `git::main_repo_root_at(source_root)/tasks` when `Some`. A missing directory,
+/// canonicalize error, or path equal to canonical is omitted — startup is never
+/// aborted for those. Slot worktrees are not passed here.
+///
+/// Uses `std::env::current_dir()` for the launch candidate; tests should call
+/// [`build_signal_locations_with_cwd`] with an explicit cwd.
+pub fn build_signal_locations(
+    canonical: PathBuf,
+    source_root: &Path,
+    actual_worktree_path: Option<&Path>,
+    started_at: SystemTime,
+) -> SignalLocations {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| source_root.to_path_buf());
+    build_signal_locations_with_cwd(
+        canonical,
+        source_root,
+        actual_worktree_path,
+        started_at,
+        &cwd,
+    )
+}
+
+/// Same as [`build_signal_locations`] with an explicit launch cwd (testable).
+pub fn build_signal_locations_with_cwd(
+    canonical: PathBuf,
+    source_root: &Path,
+    actual_worktree_path: Option<&Path>,
+    started_at: SystemTime,
+    cwd: &Path,
+) -> SignalLocations {
+    let mut raw: Vec<PathBuf> = Vec::with_capacity(3);
+    raw.push(launch_tasks_candidate(cwd));
+    if let Some(wt) = actual_worktree_path {
+        raw.push(wt.join("tasks"));
+    }
+    if let Some(main) = crate::git::main_repo_root_at(source_root) {
+        raw.push(main.join("tasks"));
+    }
+
+    let canonical_key = fs::canonicalize(&canonical).unwrap_or_else(|_| canonical.clone());
+    let mut extras = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for cand in raw {
+        let Ok(canon) = fs::canonicalize(&cand) else {
+            continue;
+        };
+        if canon == canonical_key {
+            continue;
+        }
+        if seen.insert(canon.clone()) {
+            extras.push(canon);
+        }
+    }
+
+    SignalLocations {
+        canonical,
+        extras,
+        started_at,
+    }
+}
+
+/// At loop start: delete each extra-dir `.stop-<prefix>` whose mtime is before
+/// or equal to `locations.started_at`. Emits a warning that names the absolute
+/// path, says it predates this process and would have been ignored, and tells
+/// the operator how to stop now. A failed delete still warns and does not abort.
+///
+/// Leaves canonical prefix files, global `.stop`, pause files, and other
+/// prefixes alone. Does not call [`SystemTime::now`].
+pub fn sweep_stale_extra_prefix_stops(locations: &SignalLocations, prefix: Option<&str>) {
+    let Some(p) = prefix else {
+        return;
+    };
+    let name = format!("{STOP_FILE}-{p}");
+    for dir in &locations.extras {
+        let path = dir.join(&name);
+        if !path.exists() {
+            continue;
+        }
+        let mtime = match fs::metadata(&path).and_then(|m| m.modified()) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(
+                    "could not read mtime for stale-stop candidate {}: {}; leaving in place",
+                    path.display(),
+                    e
+                );
+                continue;
+            }
+        };
+        if mtime > locations.started_at {
+            continue;
+        }
+        let abs = path.display().to_string();
+        let canonical_stop = locations
+            .canonical
+            .join(format!("{STOP_FILE}-{p}"))
+            .display()
+            .to_string();
+        let remove_err = fs::remove_file(&path).err();
+        let lead = if remove_err.is_some() {
+            format!(
+                "Stale stop file {abs} predates this process and would have been ignored \
+(could not delete it)"
+            )
+        } else {
+            format!(
+                "Removed stale stop file {abs} because it predates this process and would have been ignored"
+            )
+        };
+        ui::emit(&format!(
+            "{lead}. To stop this run, use `task-mgr loop stop --prefix {p}` or create the file again at {abs} or at {canonical_stop}."
+        ));
+        if let Some(e) = remove_err {
+            tracing::warn!("failed to delete stale stop {abs}: {e}");
+        }
+    }
+}
+
+/// Exit cleanup for one extra directory: delete `.stop-<prefix>` and
+/// `.pause-<prefix>` only. Leaves a global `.stop` / `.pause` that lives only
+/// in that extra. Never call [`cleanup_signal_files_for_prefix`] on an extra
+/// (that helper also removes globals).
+///
+/// When two same-prefix loops share an extra dir, the first to exit may remove
+/// the shared prefix files; there is no refcount.
+pub fn cleanup_extra_prefix_signals(extra_dir: &Path, prefix: Option<&str>) {
+    let Some(p) = prefix else {
+        return;
+    };
+    for name in [format!("{STOP_FILE}-{p}"), format!("{PAUSE_FILE}-{p}")] {
+        let path = extra_dir.join(name);
+        if path.exists()
+            && let Err(e) = fs::remove_file(&path)
+        {
+            tracing::warn!("could not remove {}: {}", path.display(), e);
+        }
+    }
+}
+
+/// Emit absolute canonical + extra stop-watch directories as untruncated stderr
+/// lines (after the session banner box).
+pub fn emit_stop_watch_paths(locations: &SignalLocations) {
+    ui::emit(&format!(
+        "Stop watch (canonical): {}",
+        locations.canonical.display()
+    ));
+    for extra in &locations.extras {
+        ui::emit(&format!("Stop watch (extra): {}", extra.display()));
+    }
 }
 
 /// Handle a human review checkpoint after a `requires_human` task completes.
@@ -1002,6 +1202,180 @@ mod tests {
         assert!(!stop_requested(&locs, Some("P1")));
         assert!(!pause_requested(&locs, Some("P1")));
         assert!(!batch_stop_requested(&locs));
+    }
+
+    // --- build / sweep / extra cleanup (FEAT-002) ---
+
+    #[test]
+    fn launch_tasks_candidate_uses_cwd_when_named_tasks() {
+        let tmp = TempDir::new().unwrap();
+        let tasks = tmp.path().join("tasks");
+        fs::create_dir_all(&tasks).unwrap();
+        assert_eq!(launch_tasks_candidate(&tasks), tasks);
+        assert_eq!(launch_tasks_candidate(tmp.path()), tmp.path().join("tasks"));
+    }
+
+    #[test]
+    fn build_signal_locations_drops_missing_equal_canonical_and_dedups() {
+        let root = TempDir::new().unwrap();
+        let canonical = root.path().join("canonical_tasks");
+        fs::create_dir_all(&canonical).unwrap();
+        let launch = root.path().join("launch").join("tasks");
+        fs::create_dir_all(&launch).unwrap();
+        let missing_parent = root.path().join("no_such");
+        // worktree candidate exists
+        let wt = root.path().join("wt");
+        let wt_tasks = wt.join("tasks");
+        fs::create_dir_all(&wt_tasks).unwrap();
+
+        let started = epoch_plus(1_000);
+        // cwd = launch parent so launch candidate is launch/tasks
+        let locs = build_signal_locations_with_cwd(
+            canonical.clone(),
+            missing_parent.as_path(), // main_repo_root_at → None
+            Some(wt.as_path()),
+            started,
+            launch.parent().unwrap(),
+        );
+        assert_eq!(locs.canonical, canonical);
+        assert_eq!(locs.started_at, started);
+        let canon_launch = fs::canonicalize(&launch).unwrap();
+        let canon_wt = fs::canonicalize(&wt_tasks).unwrap();
+        assert!(locs.extras.contains(&canon_launch));
+        assert!(locs.extras.contains(&canon_wt));
+        assert_eq!(locs.extras.len(), 2);
+
+        // When launch equals canonical, it is dropped from extras.
+        let locs_eq = build_signal_locations_with_cwd(
+            launch.clone(),
+            missing_parent.as_path(),
+            None,
+            started,
+            launch.parent().unwrap(),
+        );
+        assert!(
+            locs_eq.extras.is_empty(),
+            "canonical twin must stay out of extras: {:?}",
+            locs_eq.extras
+        );
+    }
+
+    #[test]
+    fn build_signal_locations_omits_canonicalize_error_without_abort() {
+        let root = TempDir::new().unwrap();
+        let canonical = root.path().join("c");
+        fs::create_dir_all(&canonical).unwrap();
+        let started = epoch_plus(500);
+        // cwd points at a path whose tasks/ child does not exist → omitted.
+        let locs = build_signal_locations_with_cwd(
+            canonical.clone(),
+            root.path().join("not-a-git-repo").as_path(),
+            Some(root.path().join("missing-wt").as_path()),
+            started,
+            root.path().join("also-missing").as_path(),
+        );
+        assert_eq!(locs.canonical, canonical);
+        assert!(locs.extras.is_empty());
+    }
+
+    #[test]
+    fn known_bad_prd_parent_a_worktree_parent_b_keeps_a_as_canonical() {
+        // Building canonical from the post-remap worktree PRD parent would drop
+        // the mtime gate on a directory the loop does not watch as canonical.
+        let root = TempDir::new().unwrap();
+        let prd_parent_a = root.path().join("source").join("tasks");
+        let worktree_b = root.path().join("worktree");
+        let worktree_tasks_b = worktree_b.join("tasks");
+        fs::create_dir_all(&prd_parent_a).unwrap();
+        fs::create_dir_all(&worktree_tasks_b).unwrap();
+        let started = epoch_plus(42);
+        let locs = build_signal_locations_with_cwd(
+            prd_parent_a.clone(),
+            root.path().join("not-git").as_path(),
+            Some(worktree_b.as_path()),
+            started,
+            root.path().join("elsewhere").as_path(), // no launch tasks/
+        );
+        assert_eq!(
+            locs.canonical, prd_parent_a,
+            "canonical must stay resolve_paths tasks_dir (A), not worktree PRD parent (B)"
+        );
+        let canon_b = fs::canonicalize(&worktree_tasks_b).unwrap();
+        assert!(
+            locs.extras.contains(&canon_b),
+            "worktree tasks (B) must be an mtime-gated extra, got {:?}",
+            locs.extras
+        );
+    }
+
+    #[test]
+    fn sweep_stale_extra_prefix_stops_deletes_stale_only() {
+        let canonical = TempDir::new().unwrap();
+        let extra = TempDir::new().unwrap();
+        let started = epoch_plus(1_000);
+        let stale = extra.path().join(".stop-P1");
+        let fresh = extra.path().join(".stop-OTHER");
+        let global = extra.path().join(STOP_FILE);
+        let pause = extra.path().join(".pause-P1");
+        let canon_stop = canonical.path().join(".stop-P1");
+        write_with_mtime(&stale, epoch_plus(500));
+        write_with_mtime(&fresh, epoch_plus(500));
+        write_with_mtime(&global, epoch_plus(500));
+        write_with_mtime(&pause, epoch_plus(500));
+        write_with_mtime(&canon_stop, epoch_plus(500));
+
+        let locs = locations(canonical.path(), &[extra.path()], started);
+        sweep_stale_extra_prefix_stops(&locs, Some("P1"));
+
+        assert!(!stale.exists(), "stale extra .stop-P1 must be deleted");
+        assert!(fresh.exists(), "other prefix must remain");
+        assert!(global.exists(), "extra global .stop must remain");
+        assert!(pause.exists(), "pause must remain");
+        assert!(canon_stop.exists(), "canonical .stop-P1 must remain");
+    }
+
+    #[test]
+    fn sweep_leaves_fresh_extra_prefix_stop() {
+        let canonical = TempDir::new().unwrap();
+        let extra = TempDir::new().unwrap();
+        let started = epoch_plus(1_000);
+        let fresh = extra.path().join(".stop-P1");
+        write_with_mtime(&fresh, epoch_plus(1_001));
+        let locs = locations(canonical.path(), &[extra.path()], started);
+        sweep_stale_extra_prefix_stops(&locs, Some("P1"));
+        assert!(fresh.exists());
+    }
+
+    #[test]
+    fn cleanup_extra_prefix_signals_removes_prefix_only() {
+        let extra = TempDir::new().unwrap();
+        fs::write(extra.path().join(".stop-P1"), b"").unwrap();
+        fs::write(extra.path().join(".pause-P1"), b"").unwrap();
+        fs::write(extra.path().join(STOP_FILE), b"").unwrap();
+        fs::write(extra.path().join(PAUSE_FILE), b"").unwrap();
+        fs::write(extra.path().join(".stop-OTHER"), b"").unwrap();
+
+        cleanup_extra_prefix_signals(extra.path(), Some("P1"));
+
+        assert!(!extra.path().join(".stop-P1").exists());
+        assert!(!extra.path().join(".pause-P1").exists());
+        assert!(extra.path().join(STOP_FILE).exists());
+        assert!(extra.path().join(PAUSE_FILE).exists());
+        assert!(extra.path().join(".stop-OTHER").exists());
+    }
+
+    #[test]
+    fn remove_matching_pause_file_clears_extra_prefix_pause() {
+        let canonical = TempDir::new().unwrap();
+        let extra = TempDir::new().unwrap();
+        let started = epoch_plus(1_000);
+        let pause = extra.path().join(".pause-P1");
+        write_with_mtime(&pause, epoch_plus(1_500));
+        let locs = locations(canonical.path(), &[extra.path()], started);
+        assert!(pause_requested(&locs, Some("P1")));
+        remove_matching_pause_file(&locs, Some("P1"));
+        assert!(!pause.exists());
+        assert!(!pause_requested(&locs, Some("P1")));
     }
 
     // --- handle_human_review tests (require FEAT-004) ---
