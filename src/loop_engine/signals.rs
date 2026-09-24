@@ -272,13 +272,24 @@ pub struct SignalLocations {
     pub started_at: SystemTime,
 }
 
+/// Read a file's modified time. Shared by freshness predicates and the stale
+/// extra-dir stop sweep so the metadata path cannot drift.
+fn read_file_mtime(path: &Path) -> std::io::Result<SystemTime> {
+    fs::metadata(path).and_then(|m| m.modified())
+}
+
+/// True when `mtime` is strictly after `started_at`. Equal timestamps are stale.
+fn mtime_strictly_after(mtime: SystemTime, started_at: SystemTime) -> bool {
+    mtime > started_at
+}
+
 /// True when `path`'s modified time is strictly after `started_at`.
 ///
 /// Equal timestamps are stale. Missing or unreadable metadata is not a signal
 /// (logged via tracing; never panics).
 fn file_mtime_strictly_after(path: &Path, started_at: SystemTime) -> bool {
-    match fs::metadata(path).and_then(|m| m.modified()) {
-        Ok(mtime) => mtime > started_at,
+    match read_file_mtime(path) {
+        Ok(mtime) => mtime_strictly_after(mtime, started_at),
         Err(e) => {
             tracing::warn!(
                 "could not read mtime for {}: {}; treating as no signal",
@@ -464,12 +475,14 @@ fn emit_stale_stop_sweep_notice(
 }
 
 /// Delete one extra-dir `.stop-<prefix>` when mtime ≤ `started_at`, then notify.
+///
+/// Unreadable metadata leaves the file in place (distinct from the predicate
+/// path, which treats unreadable as "no signal").
 fn sweep_one_stale_extra_stop(path: &Path, started_at: SystemTime, prefix: &str, canonical: &Path) {
     if !path.exists() {
         return;
     }
-    let mtime = match fs::metadata(path).and_then(|m| m.modified()) {
-        Ok(m) => m,
+    match read_file_mtime(path) {
         Err(e) => {
             tracing::warn!(
                 "could not read mtime for stale-stop candidate {}: {}; leaving in place",
@@ -478,9 +491,8 @@ fn sweep_one_stale_extra_stop(path: &Path, started_at: SystemTime, prefix: &str,
             );
             return;
         }
-    };
-    if mtime > started_at {
-        return;
+        Ok(mtime) if mtime_strictly_after(mtime, started_at) => return,
+        Ok(_) => {}
     }
     let remove_err = fs::remove_file(path).err();
     emit_stale_stop_sweep_notice(path, prefix, canonical, remove_err);
