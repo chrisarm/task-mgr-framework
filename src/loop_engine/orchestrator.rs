@@ -109,6 +109,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
         steering,
         mut permission_mode,
         usage_params,
+        signal_locations,
     } = match startup::initialize_loop(&mut run_config) {
         Ok(init) => init,
         Err(early_exit) => return early_exit,
@@ -242,6 +243,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                 prd_path: paths.prd_file.as_path(),
                 progress_path: paths.progress_file.as_path(),
                 tasks_dir: paths.tasks_dir.as_path(),
+                signal_locations: signal_locations.clone(),
                 external_repo_path: external_repo_path.as_deref(),
                 external_git_scan_depth: run_config.config.external_git_scan_depth,
                 inter_iteration_delay,
@@ -316,6 +318,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
             db_dir: &run_config.db_dir,
             project_root: &working_root,
             tasks_dir: &paths.tasks_dir,
+            signal_locations: signal_locations.clone(),
             iteration,
             max_iterations,
             run_id: &run_id,
@@ -821,6 +824,15 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
     // Step 21: Cleanup
     deadline::cleanup_deadline(&paths.tasks_dir, &prd_basename);
     signals::cleanup_signal_files_for_prefix(&paths.tasks_dir, task_prefix.as_deref());
+    // Extra dirs: prefix stop/pause only. Do not call cleanup_signal_files_for_prefix
+    // on an extra (that also deletes globals). Two same-prefix loops sharing an
+    // extra may race on these files — no refcount.
+    for extra in &signal_locations.extras {
+        signals::cleanup_extra_prefix_signals(extra, task_prefix.as_deref());
+    }
+    // After signal cleanup: drop the prefix run record. Inner loop step 21 must
+    // NOT delete batch.json (batch owns that for the whole run_batch lifetime).
+    signals::delete_loop_run_record(&run_config.db_dir, task_prefix.as_deref());
 
     // Step 21.4: Slot worktree cleanup (parallel mode only).
     // Removes ephemeral slot worktrees (slots 1+) and their branches. Slot 0

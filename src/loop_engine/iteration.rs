@@ -96,8 +96,8 @@ pub fn run_iteration(
         });
     }
 
-    // Step 1: Check file-based signals
-    if signals::check_stop_signal(params.tasks_dir, params.task_prefix) {
+    // Step 1: Check file-based signals (canonical + fresh extra-dir prefix files)
+    if signals::stop_requested(&params.signal_locations, params.task_prefix) {
         ui::emit("Stop signal detected (.stop file found)");
         return Ok(IterationResult {
             outcome: IterationOutcome::Empty,
@@ -115,9 +115,9 @@ pub fn run_iteration(
         });
     }
 
-    if signals::check_pause_signal(params.tasks_dir, params.task_prefix) {
+    if signals::pause_requested(&params.signal_locations, params.task_prefix) {
         signals::handle_pause(
-            params.tasks_dir,
+            &params.signal_locations,
             params.iteration,
             &mut ctx.session_guidance,
             params.task_prefix,

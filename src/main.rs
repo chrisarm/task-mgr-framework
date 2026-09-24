@@ -1333,6 +1333,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                         chain_base: None,
                         prefix_mode: task_mgr::commands::init::PrefixMode::Auto,
                         inherited_unavailable_rungs: Default::default(),
+                        started_at: std::time::SystemTime::now(),
                     };
 
                     let rt = tokio::runtime::Builder::new_current_thread()
@@ -1364,6 +1365,13 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                     );
 
                     process::exit(loop_result.exit_code);
+                }
+                LoopCommand::Stop { prefix } => {
+                    // No LockGuard — stop must work while the loop holds the lock.
+                    // cli.dir is already resolve_db_dir'd (main-repo anchored).
+                    let written = task_mgr::loop_engine::signals::loop_stop(&cli.dir, &prefix)?;
+                    ui::emit_data(&written.display().to_string());
+                    Ok(())
                 }
             }
         }

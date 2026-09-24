@@ -956,6 +956,7 @@ fn test_run_loop_with_mock_claude() {
         chain_base: None,
         prefix_mode: task_mgr::commands::init::PrefixMode::Auto,
         inherited_unavailable_rungs: Default::default(),
+        started_at: std::time::SystemTime::now(),
     };
 
     // Run the loop

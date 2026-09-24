@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- `task-mgr loop stop --prefix <prefix>` writes the stop file the running loop actually watches. A prefix stop file created after process start is also honored in the launch `tasks/` directory, the feature worktree `tasks/`, and the main checkout `tasks/`. A stale extra-dir prefix file is removed at start with instructions to create a fresh one. A batch that honors `.task-mgr/tasks/.stop` deletes that file so the next batch is not stopped by it.
+
 ### Changed
 - `task-mgr init` stages `~/.claude/docs/task-mgr-best-practices.md` (add/update `--from-json`, `update --stdin`, scoped export). Slash-command skills (`prd-tasks`, `plan-tasks`, `spike`, `review-loop`) pin spawn-fixups with `--from-json`.
 

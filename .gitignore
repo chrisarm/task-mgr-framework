@@ -30,6 +30,17 @@ task-mgr
 # Branch tracking state
 tasks/.last-branch
 
+# Loop operator signal files (stop / pause / pid) — do not commit
+tasks/.stop
+tasks/.stop-*
+tasks/.pause
+tasks/.pause-*
+tasks/.loop-pid-*
+.task-mgr/tasks/.stop
+.task-mgr/tasks/.stop-*
+.task-mgr/tasks/.pause
+.task-mgr/tasks/.pause-*
+
 # Debug/logs
 *.log
 # Quality-gate scratch output (cargo test/clippy redirected for grep)

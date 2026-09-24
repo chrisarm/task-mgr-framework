@@ -55,14 +55,13 @@ pub fn print_session_banner(
 pub struct SessionBannerHints<'a> {
     /// Path to the task-mgr database file shown in the banner.
     pub db_path: &'a std::path::Path,
-    /// Optional task-prefix; when `Some("P1")` the stop-file hint shows `.stop-P1`.
+    /// Optional task-prefix; when `Some("P1")` the Stop row shows
+    /// `task-mgr loop stop --prefix P1`.
     pub prefix: Option<&'a str>,
     /// Optional active worktree path; when `None` the worktree line is omitted.
     pub worktree_path: Option<&'a std::path::Path>,
-    /// Directory where `.stop` and `.pause` signal files are read from.
-    /// When `Some`, the Stop/Pause hints display a path relative to cwd
-    /// (e.g. `tasks/.stop-P1`) so the operator doesn't have to guess where
-    /// to drop the file. When `None`, the legacy bare-filename hint is used.
+    /// Directory used for the Pause hint path (may stay truncated). Absolute
+    /// stop-watch dirs are emitted after the banner box, not from this field.
     pub tasks_dir: Option<&'a std::path::Path>,
 }
 
@@ -137,16 +136,12 @@ pub fn format_session_banner(
             width = db_width
         ));
 
-        // Stop hint
-        let stop_name = match h.prefix {
-            Some(p) => format!(".stop-{}", p),
-            None => ".stop".to_string(),
+        // Stop hint — command fits the box; absolute watch dirs are emitted
+        // after print_session_banner returns (not rendered here).
+        let stop_hint = match h.prefix {
+            Some(p) => format!("task-mgr loop stop --prefix {p}"),
+            None => "task-mgr loop stop --prefix <prefix>".to_string(),
         };
-        let stop_display = match h.tasks_dir {
-            Some(dir) => shorten_path_for_display(&dir.join(&stop_name)),
-            None => stop_name,
-        };
-        let stop_hint = format!("touch {} to stop", stop_display);
         let stop_width = inner - "  Stop: ".len();
         lines.push(format!(
             "║  Stop: {:<width$}║",
@@ -619,9 +614,9 @@ mod tests {
     }
 
     #[test]
-    fn test_format_session_banner_with_tasks_dir_shows_stop_pause_relative() {
+    fn test_format_session_banner_with_tasks_dir_shows_stop_command_and_pause_relative() {
         use std::path::Path;
-        // Use short paths and a short prefix so the Stop/Pause hint survives
+        // Use short paths and a short prefix so the Pause hint survives
         // the MIN_WIDTH (48-col) truncation when no terminal is detected.
         let db = Path::new("/x/db.db");
         let tasks_dir = Path::new("/x/t");
@@ -633,19 +628,24 @@ mod tests {
         };
         let banner = format_session_banner("prd.json", "main", 5, None, Some(&hints));
         assert!(
-            banner.contains("/x/t/.stop-P1"),
-            "Stop hint must include tasks_dir prefix, got:\n{}",
+            banner.contains("task-mgr loop stop --prefix P1"),
+            "Stop row must be the loop-stop command, got:\n{}",
+            banner
+        );
+        assert!(
+            !banner.contains("/x/t/.stop-P1"),
+            "format_session_banner must not render absolute stop paths, got:\n{}",
             banner
         );
         assert!(
             banner.contains("/x/t/.pause-P1"),
-            "Pause hint must include tasks_dir prefix, got:\n{}",
+            "Pause hint may keep tasks_dir-relative path, got:\n{}",
             banner
         );
     }
 
     #[test]
-    fn test_format_session_banner_with_prefix_uses_stop_prefix_hint() {
+    fn test_format_session_banner_with_prefix_uses_stop_command() {
         use std::path::Path;
         let db = Path::new("/tmp/tasks.db");
         let hints = SessionBannerHints {
@@ -657,14 +657,14 @@ mod tests {
         let banner =
             format_session_banner(".task-mgr/tasks/prd.json", "main", 10, None, Some(&hints));
         assert!(
-            banner.contains(".stop-P1"),
-            "Banner with prefix 'P1' must contain '.stop-P1' in stop-file hint, got:\n{}",
+            banner.contains("task-mgr loop stop --prefix P1"),
+            "Banner with prefix 'P1' must contain loop-stop command, got:\n{}",
             banner
         );
     }
 
     #[test]
-    fn test_format_session_banner_without_prefix_uses_plain_stop_hint() {
+    fn test_format_session_banner_without_prefix_uses_stop_command_placeholder() {
         use std::path::Path;
         let db = Path::new("/tmp/tasks.db");
         let hints = SessionBannerHints {
@@ -675,16 +675,18 @@ mod tests {
         };
         let banner =
             format_session_banner(".task-mgr/tasks/prd.json", "main", 5, None, Some(&hints));
-        // Must contain ".stop" but NOT ".stop-" (no prefix suffix)
         assert!(
-            banner.contains(".stop"),
-            "Banner without prefix must contain '.stop' hint, got:\n{}",
+            banner.contains("task-mgr loop stop --prefix"),
+            "Banner without prefix must still show loop-stop command, got:\n{}",
             banner
         );
+        let stop_line = banner
+            .lines()
+            .find(|l| l.contains("Stop:"))
+            .expect("Stop row present");
         assert!(
-            !banner.contains(".stop-"),
-            "Banner without prefix must NOT contain '.stop-<prefix>', got:\n{}",
-            banner
+            !stop_line.contains("touch "),
+            "Stop row must not use touch-path hint, got:\n{stop_line}"
         );
     }
 

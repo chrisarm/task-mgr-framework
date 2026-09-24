@@ -698,6 +698,25 @@ never touch shared per-cwd dirs (e.g. Grok's `prompt_history.jsonl`).
 `WORKAROUND(grok-cli-no-persistence-off)` markers tag the cleanup sites so
 future upstream fixes are a one-grep removal.
 
+## Stop / pause signal locations
+
+Canonical stop/pause dir is `resolve_paths(...).tasks_dir` (PRD parent before
+worktree remap — never `paths.prd_file.parent()` after remap). Extra dirs
+(launch `tasks/`, feature worktree `tasks/`, main-repo `tasks/`) honor
+prefix-only `.stop-<prefix>` / `.pause-<prefix>` with mtime **strictly after**
+the one process-start `SystemTime` (equal is stale); a candidate that
+canonicalizes to the canonical path is not an extra. At start, a stale
+extra-dir prefix stop is deleted with a recreate warning
+(`task-mgr loop stop --prefix` or rewrite at that absolute / canonical path).
+Exit cleanup on extras deletes `.stop-<prefix>` and `.pause-<prefix>` only —
+never call `cleanup_signal_files_for_prefix` on an extra (that would also drop
+a global `.stop` there). Batch between-PRD global `.stop` lives in
+`db_dir/tasks`, a separate directory from the inner-loop canonical; do not
+collapse check_stop / SignalLocations back to one directory. When the
+between-PRD check honors that canonical `.stop`, `consume_batch_canonical_stop`
+unlinks it before the batch returns. Leaving it stops the next batch. Extras
+and `.pause` stay. A failed unlink still stops the batch.
+
 ## Iteration pipeline (shared)
 
 Sequential (`run_iteration`) and parallel-wave (`run_slot_iteration` +
