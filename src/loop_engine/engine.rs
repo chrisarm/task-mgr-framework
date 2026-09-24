@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use rusqlite::Connection;
 
@@ -12,7 +12,7 @@ use crate::loop_engine::model;
 use crate::loop_engine::progress;
 use crate::loop_engine::project_config::{self, ModelsConfig, RoutingConfig};
 use crate::loop_engine::runner::{RunnerKind, runner_kind_for};
-use crate::loop_engine::signals::SignalFlag;
+use crate::loop_engine::signals::{SignalFlag, SignalLocations};
 use crate::loop_engine::stale::StaleTracker;
 use crate::models::RunStatus;
 
@@ -158,8 +158,11 @@ pub struct IterationParams<'a> {
     pub db_dir: &'a Path,
     /// Git repository root (for source scanning, monitoring)
     pub project_root: &'a Path,
-    /// Tasks directory (for signal files)
+    /// Tasks directory (for signal files and other path math)
     pub tasks_dir: &'a Path,
+    /// Multi-directory stop/pause locations for this run (process-start clock).
+    /// Owned so each iteration can carry a cheap clone of the run-scoped value.
+    pub signal_locations: SignalLocations,
     /// Current iteration number (1-based)
     pub iteration: u32,
     /// Maximum number of iterations
@@ -833,6 +836,9 @@ pub struct WaveIterationParams<'a> {
     pub prd_path: &'a Path,
     pub progress_path: &'a Path,
     pub tasks_dir: &'a Path,
+    /// Multi-directory stop locations for wave preflight (same process-start clock).
+    /// Owned so wave test fixtures can build params without an extra borrow.
+    pub signal_locations: SignalLocations,
     pub external_repo_path: Option<&'a Path>,
     pub external_git_scan_depth: usize,
     pub inter_iteration_delay: Duration,
@@ -1063,6 +1069,10 @@ pub struct LoopRunConfig {
     /// copies into `IterationContext.unavailable_rungs` at start; receiver
     /// filters with [`active_rungs`].
     pub inherited_unavailable_rungs: UnavailableRungsMap,
+    /// Process-start clock for stop/pause mtime gates. Captured once before
+    /// `run_loop` / `run_batch`; copied onto every inner [`SignalLocations`].
+    /// `run_loop` and the stale sweep must not call [`SystemTime::now`].
+    pub started_at: SystemTime,
 }
 
 /// Dispatch a list of `<task-status>` side-band updates.

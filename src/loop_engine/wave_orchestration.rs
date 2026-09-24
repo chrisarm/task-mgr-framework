@@ -63,7 +63,7 @@ pub(super) fn wave_preflight_check(
             rate_limited_retry: false,
         });
     }
-    if signals::check_stop_signal(params.tasks_dir, params.task_prefix) {
+    if signals::stop_requested(&params.signal_locations, params.task_prefix) {
         ui::emit("Stop signal detected (.stop file found)");
         return Some(WaveOutcome {
             tasks_completed: 0,

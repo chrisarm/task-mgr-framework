@@ -5,6 +5,7 @@
 //! Checks `.stop` signal between PRD executions.
 
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use crate::commands::init::PrefixMode;
 use crate::error::{TaskMgrError, TaskMgrResult};
@@ -12,7 +13,9 @@ use crate::loop_engine::auto_review::{self, Decision};
 use crate::loop_engine::config::LoopConfig;
 use crate::loop_engine::engine::{self, LoopResult, LoopRunConfig};
 use crate::loop_engine::project_config::{preflight_validate_and_probe, read_project_config};
-use crate::loop_engine::signals;
+use crate::loop_engine::signals::{
+    BatchRunRecordGuard, batch_stop_requested, build_signal_locations, consume_batch_canonical_stop,
+};
 use crate::loop_engine::status_queries;
 use crate::loop_engine::worktree;
 use crate::output::ui;
@@ -502,6 +505,10 @@ pub async fn run_batch(
     wait_if_reset_within_cli: Option<u64>,
     stop_if_reset_beyond_cli: Option<u64>,
 ) -> BatchResult {
+    // One process-start clock for every inner loop and the between-PRD check.
+    // Do not call SystemTime::now() again at run_loop entry or beside sweeps.
+    let started_at = SystemTime::now();
+
     // Cached once at the top of run_batch — matches the run-level config caching
     // convention (CLAUDE.md): mid-loop edits to .task-mgr/config.json do NOT take
     // effect; operators must restart to apply config changes.
@@ -612,8 +619,31 @@ pub async fn run_batch(
         return batch_fail_early();
     }
 
-    // Step 4: Resolve tasks dir for .stop signal checking
-    let tasks_dir = dir.join("tasks");
+    // Step 4: Batch between-PRD signal locations.
+    // Canonical is db_dir/tasks (.task-mgr/tasks). Extras use launch / main
+    // checkout tasks (no feature worktree at batch level). Do not sweep stale
+    // extra-dir global .stop files at batch start.
+    let batch_signal_locations =
+        build_signal_locations(dir.join("tasks"), project_root, None, started_at);
+
+    // FEAT-003: batch.json lives for the whole run_batch, not each inner step 21.
+    // Guard deletes the record when run_batch returns (including early breaks).
+    let cwd = std::env::current_dir().unwrap_or_else(|_| project_root.to_path_buf());
+    let main_checkout = crate::git::main_repo_root_at(project_root);
+    let _batch_run_record = match BatchRunRecordGuard::write(
+        dir,
+        &batch_signal_locations,
+        &cwd,
+        main_checkout.as_deref(),
+    ) {
+        Ok(guard) => Some(guard),
+        Err(e) => {
+            tracing::warn!(
+                "could not write batch run record: {e}; loop stop may not find this batch"
+            );
+            None
+        }
+    };
 
     // Chain tracking: advances to loop_result.branch_name after each successful PRD.
     // Starts as None so the first PRD branches from HEAD.
@@ -640,8 +670,12 @@ pub async fn run_batch(
     for (i, (prd_file, prompt_file)) in pairs.iter().enumerate() {
         // Check .stop signal before each PRD (covers files placed between runs,
         // or before the batch even starts its first PRD).
-        if signals::check_stop_signal(&tasks_dir, None) {
+        if batch_stop_requested(&batch_signal_locations) {
             ui::emit("Stop signal detected, skipping remaining PRDs");
+            // Canonical .task-mgr/tasks/.stop must not outlive the batch that
+            // honored it (next batch would skip every PRD). Extras / .pause
+            // are left alone; unlink failure still stops (warn via tracing).
+            consume_batch_canonical_stop(&batch_signal_locations);
             push_remaining_skipped(&mut results, &pairs, i, &mut skipped);
             break;
         }
@@ -693,6 +727,7 @@ pub async fn run_batch(
             chain_base: chain_base_snapshot.clone(),
             prefix_mode,
             inherited_unavailable_rungs: inherited_unavailable_rungs.clone(),
+            started_at,
         };
 
         let loop_result = engine::run_loop(run_config).await;
@@ -1103,12 +1138,29 @@ mod tests {
 
     #[test]
     fn test_stop_signal_detected_between_prds() {
-        // Verify that check_stop_signal works with .stop file
-        let temp_dir = TempDir::new().expect("create temp dir");
-        assert!(!signals::check_stop_signal(temp_dir.path(), None));
+        use crate::loop_engine::signals::{
+            SignalLocations, batch_stop_requested, check_stop_signal, consume_batch_canonical_stop,
+        };
+        use std::time::{Duration, SystemTime};
 
+        // Single-dir predicate still works for canonical global .stop.
+        let temp_dir = TempDir::new().expect("create temp dir");
+        assert!(!check_stop_signal(temp_dir.path(), None));
         fs::write(temp_dir.path().join(STOP_FILE), "").expect("create stop");
-        assert!(signals::check_stop_signal(temp_dir.path(), None));
+        assert!(check_stop_signal(temp_dir.path(), None));
+
+        // Between-PRD helper: canonical global, no mtime gate.
+        let locs = SignalLocations {
+            canonical: temp_dir.path().to_path_buf(),
+            extras: vec![],
+            started_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_000),
+        };
+        assert!(batch_stop_requested(&locs));
+        // Honoring the stop consumes the canonical file so a later batch
+        // does not skip every PRD.
+        consume_batch_canonical_stop(&locs);
+        assert!(!temp_dir.path().join(STOP_FILE).exists());
+        assert!(!batch_stop_requested(&locs));
     }
 
     // --- cleanup_worktree_after_prd tests ---

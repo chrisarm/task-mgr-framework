@@ -40,6 +40,14 @@ pub fn format_text(result: &ArchiveResult) -> String {
         format_skipped_prd(&mut out, skip);
     }
 
+    if !result.warnings.is_empty() {
+        out.push_str("Warnings:\n");
+        for warning in &result.warnings {
+            out.push_str(&format!("  {warning}\n"));
+        }
+        out.push('\n');
+    }
+
     // Aggregate summary
     let archived_count = result.prds_archived.len();
     out.push_str(&format!(
@@ -130,6 +138,7 @@ mod tests {
             message: message.to_string(),
             prds_archived,
             prds_skipped,
+            warnings: Vec::new(),
         }
     }
 
@@ -392,6 +401,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_format_text_lists_missing_file_warnings() {
+        let mut result = make_result(
+            vec![ArchivedItem {
+                source: "project-a.json".to_string(),
+                destination: "archive/2026-03-04-branch-a/project-a.json".to_string(),
+            }],
+            vec![PrdArchiveSummary {
+                prd_id: 1,
+                project: "project-a".to_string(),
+                task_prefix: "PA".to_string(),
+                archive_folder: "2026-03-04-branch-a".to_string(),
+                files_archived: 1,
+                tasks_archived: 1,
+            }],
+            vec![],
+            false,
+            "",
+            0,
+        );
+        result.warnings = vec![
+            "missing file 'tasks/project-a-prompt.md' (resolved to '/tmp/tasks/project-a-prompt.md')"
+                .to_string(),
+        ];
+        let text = format_text(&result);
+        assert!(text.contains("Warnings:"));
+        assert!(text.contains("missing file 'tasks/project-a-prompt.md'"));
+        assert!(text.contains("Moved project-a.json"));
+        assert!(text.contains("Summary: 1 of 1 PRD(s) archived"));
+    }
+
     // Legacy compatibility: existing tests that use the old ArchiveResult shape
     // (prds_archived/prds_skipped empty) still work via the empty-PRD path.
     #[test]
@@ -407,6 +447,7 @@ mod tests {
             message: "legacy message".to_string(),
             prds_archived: Vec::new(),
             prds_skipped: Vec::new(),
+            warnings: Vec::new(),
         };
         let text = format_text(&result);
         // With no per-PRD data, falls through to empty path showing message

@@ -1619,6 +1619,18 @@ pub enum LoopCommand {
         #[command(flatten)]
         usage_overrides: UsageRunOverrides,
     },
+
+    /// Request a graceful stop of a live `loop run` / `batch run` for a prefix.
+    ///
+    /// Reads `{db_dir}/loop-runs/<prefix>.json` (or `batch.json`), verifies the
+    /// recorded pid is alive with a `task-mgr` + `loop`/`batch` + `run` argv,
+    /// and writes the one canonical stop file for that situation. Does not take
+    /// the database lock. Does not spawn a loop.
+    Stop {
+        /// PRD task prefix whose live run should stop (e.g. `0400e2ee`)
+        #[arg(long)]
+        prefix: String,
+    },
 }
 
 /// Subcommands under `task-mgr batch`.

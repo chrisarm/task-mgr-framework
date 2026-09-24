@@ -33,6 +33,8 @@ pub struct ArchiveResult {
     pub prds_archived: Vec<PrdArchiveSummary>,
     /// Per-PRD skip reasons for PRDs that were not archived
     pub prds_skipped: Vec<PrdSkipReason>,
+    /// Registered files that were not on disk. Archive continues without them.
+    pub warnings: Vec<String>,
 }
 
 /// Summary of a single PRD that was successfully archived.
@@ -77,8 +79,21 @@ enum PrdArchiveOutcome {
     Archived {
         summary: PrdArchiveSummary,
         items: Vec<ArchivedItem>,
+        warnings: Vec<String>,
     },
     Skipped(PrdSkipReason),
+}
+
+/// A `prd_files` row whose resolved path was not on disk.
+struct MissingArchiveFile {
+    stored: String,
+    resolved: PathBuf,
+}
+
+#[derive(Debug)]
+enum RelocateOutcome {
+    Moved,
+    Missing,
 }
 
 /// Process a single PRD: check completion, move files, count tasks, clear DB.
@@ -121,7 +136,7 @@ fn archive_single_prd(
     };
     let archive_dir = tasks_dir.join("archive").join(&archive_folder_name);
 
-    let files_to_archive = discover_archivable_files(
+    let discovered = discover_archivable_files(
         conn,
         tasks_dir,
         source_root,
@@ -129,34 +144,30 @@ fn archive_single_prd(
         prd.id,
         &prd.project,
     )?;
-    let mut items: Vec<ArchivedItem> = Vec::new();
-    let mut move_sources: Vec<PathBuf> = Vec::new();
-    for source in &files_to_archive {
-        let file_name = source
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        if file_name == "progress.txt"
-            || (file_name.starts_with("progress-") && file_name.ends_with(".txt"))
-        {
-            continue;
-        }
-        // Display relative to source_root when possible; never re-join onto
-        // `.task-mgr/tasks` for move (stored paths are source-root-relative).
-        let display_source = source
-            .strip_prefix(source_root)
-            .or_else(|_| source.strip_prefix(tasks_dir))
-            .unwrap_or(source)
-            .display()
-            .to_string();
-        items.push(ArchivedItem {
-            source: display_source,
-            destination: format!("archive/{}/{}", archive_folder_name, file_name),
-        });
-        move_sources.push(source.clone());
-    }
+    let mut warnings: Vec<String> = discovered
+        .missing
+        .iter()
+        .map(format_missing_archive_file)
+        .collect();
+    // Progress logs stay in place. Duplicate `prd_files` rows for one live
+    // path are collapsed in discovery so the second rename cannot fail ENOENT
+    // after the first move.
+    let candidates: Vec<PathBuf> = discovered
+        .present
+        .into_iter()
+        .filter(|source| !is_progress_log(source))
+        .collect();
 
+    let mut items: Vec<ArchivedItem> = Vec::new();
     let task_count = if dry_run {
+        for source in &candidates {
+            items.push(archived_item(
+                source,
+                source_root,
+                tasks_dir,
+                &archive_folder_name,
+            ));
+        }
         let like_pattern = make_like_pattern(prefix);
         conn.query_row(
             "SELECT COUNT(*) FROM tasks WHERE id LIKE ? ESCAPE '\\' AND archived_at IS NULL",
@@ -164,7 +175,7 @@ fn archive_single_prd(
             |row| Ok(row.get::<_, i64>(0)? as usize),
         )?
     } else {
-        if !items.is_empty() {
+        if !candidates.is_empty() {
             fs::create_dir_all(&archive_dir).map_err(|e| {
                 crate::TaskMgrError::io_error(
                     archive_dir.display().to_string(),
@@ -172,15 +183,24 @@ fn archive_single_prd(
                     e,
                 )
             })?;
-            for source in &move_sources {
+            for source in &candidates {
                 let dest = archive_dir.join(source.file_name().unwrap_or_default());
-                fs::rename(source, &dest).map_err(|e| {
-                    crate::TaskMgrError::io_error(
-                        source.display().to_string(),
-                        "moving file to archive",
-                        e,
-                    )
-                })?;
+                match relocate_archive_file(source, &dest)? {
+                    RelocateOutcome::Moved => {
+                        items.push(archived_item(
+                            source,
+                            source_root,
+                            tasks_dir,
+                            &archive_folder_name,
+                        ));
+                    }
+                    RelocateOutcome::Missing => {
+                        warnings.push(format_missing_archive_file(&MissingArchiveFile {
+                            stored: source.display().to_string(),
+                            resolved: source.clone(),
+                        }));
+                    }
+                }
             }
         }
         archive_prd_data(conn, prd.id, prefix)?
@@ -196,7 +216,66 @@ fn archive_single_prd(
             tasks_archived: task_count,
         },
         items,
+        warnings,
     })
+}
+
+/// Display path for a file that was (or would be) moved into the archive folder.
+fn archived_item(
+    source: &Path,
+    source_root: &Path,
+    tasks_dir: &Path,
+    archive_folder_name: &str,
+) -> ArchivedItem {
+    let file_name = source
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    // Display relative to source_root when possible; never re-join onto
+    // `.task-mgr/tasks` for move (stored paths are source-root-relative).
+    let display_source = source
+        .strip_prefix(source_root)
+        .or_else(|_| source.strip_prefix(tasks_dir))
+        .unwrap_or(source)
+        .display()
+        .to_string();
+    ArchivedItem {
+        source: display_source,
+        destination: format!("archive/{archive_folder_name}/{file_name}"),
+    }
+}
+
+fn is_progress_log(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    name == "progress.txt" || (name.starts_with("progress-") && name.ends_with(".txt"))
+}
+
+fn format_missing_archive_file(file: &MissingArchiveFile) -> String {
+    let resolved = file.resolved.display().to_string();
+    if file.stored == resolved {
+        format!("missing file '{resolved}'")
+    } else {
+        format!("missing file '{}' (resolved to '{resolved}')", file.stored)
+    }
+}
+
+/// Move `source` into the archive folder.
+///
+/// `NotFound` is a skipped file (already gone, or a duplicate row whose first
+/// move removed it), not a failed archive. Other I/O errors still abort.
+fn relocate_archive_file(source: &Path, dest: &Path) -> TaskMgrResult<RelocateOutcome> {
+    match fs::rename(source, dest) {
+        Ok(()) => Ok(RelocateOutcome::Moved),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(RelocateOutcome::Missing),
+        Err(e) => Err(crate::TaskMgrError::io_error(
+            source.display().to_string(),
+            "moving file to archive",
+            e,
+        )),
+    }
 }
 
 /// Run the archive command.
@@ -207,7 +286,9 @@ fn archive_single_prd(
 ///
 /// For each matching PRD: skips PRDs with NULL task_prefix or incomplete
 /// tasks; archives completed PRDs by moving their files to
-/// `tasks/archive/YYYY-MM-DD-<branch>/` and clearing DB data. Extracts
+/// `tasks/archive/YYYY-MM-DD-<branch>/` and clearing DB data. A registered
+/// file that is not on disk is reported in [`ArchiveResult::warnings`] and
+/// skipped; remaining files and later PRDs are still archived. Extracts
 /// learnings from `progress.txt` once after all PRDs are processed (only
 /// when at least one PRD was archived). Never moves `progress.txt`.
 pub fn run_archive(
@@ -241,6 +322,7 @@ pub fn run_archive(
             message,
             prds_archived: Vec::new(),
             prds_skipped: Vec::new(),
+            warnings: Vec::new(),
         });
     }
 
@@ -256,6 +338,7 @@ pub fn run_archive(
     let mut archived_items: Vec<ArchivedItem> = Vec::new();
     let mut prds_archived: Vec<PrdArchiveSummary> = Vec::new();
     let mut prds_skipped: Vec<PrdSkipReason> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
     let mut total_tasks_archived: usize = 0;
 
     for prd in &all_prds {
@@ -268,10 +351,15 @@ pub fn run_archive(
             &date_str,
             dry_run,
         )? {
-            PrdArchiveOutcome::Archived { summary, items } => {
+            PrdArchiveOutcome::Archived {
+                summary,
+                items,
+                warnings: prd_warnings,
+            } => {
                 total_tasks_archived += summary.tasks_archived;
                 prds_archived.push(summary);
                 archived_items.extend(items);
+                warnings.extend(prd_warnings);
             }
             PrdArchiveOutcome::Skipped(reason) => {
                 prds_skipped.push(reason);
@@ -323,6 +411,7 @@ pub fn run_archive(
         message,
         prds_archived,
         prds_skipped,
+        warnings,
     })
 }
 
@@ -402,6 +491,8 @@ fn strip_branch_prefix(branch: &str) -> String {
 /// — never `tasks_dir.join(stored)` for source-root-relative rows (that would
 /// look under `.task-mgr/tasks` and miss project `tasks/*.json`).
 /// Falls back to project-name-based guessing under `tasks_dir` for pre-v6 DBs.
+/// Guessed names that are absent are not warnings — only registered `prd_files`
+/// rows that resolve to nothing are returned in [`DiscoveredArchiveFiles::missing`].
 fn discover_archivable_files(
     conn: &rusqlite::Connection,
     tasks_dir: &Path,
@@ -409,33 +500,69 @@ fn discover_archivable_files(
     worktree_root: &Path,
     prd_id: i64,
     project: &str,
-) -> TaskMgrResult<Vec<PathBuf>> {
-    let mut files = Vec::new();
+) -> TaskMgrResult<DiscoveredArchiveFiles> {
+    let mut present = Vec::new();
+    let mut missing = Vec::new();
+    // Keys of files we will move. A second row for the same inode must not be
+    // moved again (the first rename deletes the source).
+    let mut present_keys = std::collections::HashSet::new();
 
     // Try prd_files table first (v6+ databases)
     let prd_file_paths = query_prd_files(conn, prd_id)?;
 
     if !prd_file_paths.is_empty() {
         for stored in &prd_file_paths {
-            let path = crate::commands::init::import::resolve_prd_file_path(
+            let resolved = crate::commands::init::import::resolve_prd_file_path(
                 Path::new(stored),
                 source_root,
                 worktree_root,
             );
-            if path.exists() {
-                files.push(path);
-                continue;
-            }
-            // Legacy pre-FEAT-001 rows: basename (or path) under `.task-mgr/tasks`.
-            // Never use this join as the primary strategy for source-root-relative
-            // storage (`tasks/foo.json` → `.task-mgr/tasks/tasks/foo.json` misses).
-            let legacy = tasks_dir.join(stored);
-            if legacy != path && legacy.exists() {
-                files.push(legacy);
+            let chosen = if resolved.exists() {
+                Some(resolved.clone())
+            } else {
+                // Legacy pre-FEAT-001 rows: basename (or path) under `.task-mgr/tasks`.
+                // Never use this join as the primary strategy for source-root-relative
+                // storage (`tasks/foo.json` → `.task-mgr/tasks/tasks/foo.json` misses).
+                let legacy = tasks_dir.join(stored);
+                if legacy != resolved && legacy.exists() {
+                    Some(legacy)
+                } else {
+                    None
+                }
+            };
+            match chosen {
+                Some(path) => {
+                    if path_keys_overlap(&present_keys, &path) {
+                        continue;
+                    }
+                    for key in path_keys(&path) {
+                        present_keys.insert(key);
+                    }
+                    missing.retain(|item: &MissingArchiveFile| {
+                        !path_keys_overlap(&present_keys, &item.resolved)
+                    });
+                    present.push(path);
+                }
+                None => {
+                    if is_progress_log(Path::new(stored)) || is_progress_log(&resolved) {
+                        continue;
+                    }
+                    if path_keys_overlap(&present_keys, &resolved) {
+                        continue;
+                    }
+                    if missing.iter().any(|item| item.resolved == resolved) {
+                        continue;
+                    }
+                    missing.push(MissingArchiveFile {
+                        stored: stored.clone(),
+                        resolved,
+                    });
+                }
             }
         }
     } else {
-        // Fallback: guess from project name (pre-v6 databases)
+        // Fallback: guess from project name (pre-v6 databases). Absent guesses
+        // are normal and stay silent.
         let candidates = vec![
             format!("{}.json", project),
             format!("{}-prompt.md", project),
@@ -445,12 +572,31 @@ fn discover_archivable_files(
         for candidate in &candidates {
             let path = tasks_dir.join(candidate);
             if path.exists() {
-                files.push(path);
+                present.push(path);
             }
         }
     }
 
-    Ok(files)
+    Ok(DiscoveredArchiveFiles { present, missing })
+}
+
+struct DiscoveredArchiveFiles {
+    present: Vec<PathBuf>,
+    missing: Vec<MissingArchiveFile>,
+}
+
+fn path_keys(path: &Path) -> Vec<PathBuf> {
+    let mut keys = vec![path.to_path_buf()];
+    if let Ok(canon) = path.canonicalize()
+        && canon != path
+    {
+        keys.push(canon);
+    }
+    keys
+}
+
+fn path_keys_overlap(seen: &std::collections::HashSet<PathBuf>, path: &Path) -> bool {
+    path_keys(path).iter().any(|key| seen.contains(key))
 }
 
 /// Query the prd_files table for file paths scoped to a specific PRD.
@@ -746,9 +892,11 @@ mod tests {
         let files =
             discover_archivable_files(&conn, tasks_dir, tasks_dir, tasks_dir, 1, "my-project")
                 .unwrap();
-        assert_eq!(files.len(), 3);
+        assert_eq!(files.present.len(), 3);
+        assert!(files.missing.is_empty());
 
         let filenames: Vec<String> = files
+            .present
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
             .collect();
@@ -767,7 +915,8 @@ mod tests {
         let files =
             discover_archivable_files(&conn, dir.path(), dir.path(), dir.path(), 1, "nonexistent")
                 .unwrap();
-        assert!(files.is_empty());
+        assert!(files.present.is_empty());
+        assert!(files.missing.is_empty());
     }
 
     #[test]
@@ -783,6 +932,7 @@ mod tests {
             message: "test".to_string(),
             prds_archived: Vec::new(),
             prds_skipped: Vec::new(),
+            warnings: Vec::new(),
         };
 
         assert_eq!(result.archived.len(), 1);
@@ -930,6 +1080,101 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM prd_metadata", [], |row| row.get(0))
             .unwrap();
         assert_eq!(metadata_count, 0);
+    }
+
+    /// A missing registered file is a warning, not a failed archive.
+    /// Sibling files still move, duplicate rows for one live file move once,
+    /// and a later completed PRD is still archived.
+    #[test]
+    fn test_run_archive_missing_file_warns_and_continues() {
+        let dir = TempDir::new().unwrap();
+        let conn = setup_db(dir.path());
+        insert_prd(&conn, 1, "project-a", "feat/branch-a", Some("PA"));
+        insert_prd(&conn, 2, "project-b", "feat/branch-b", Some("PB"));
+        insert_task(&conn, "PA-001", "Done", 1, "done");
+        insert_task(&conn, "PB-001", "Done", 1, "done");
+
+        let tasks_dir = dir.path().join("tasks");
+        fs::create_dir_all(&tasks_dir).unwrap();
+        let json_path = tasks_dir.join("project-a.json");
+        fs::write(&json_path, "{}").unwrap();
+        fs::write(tasks_dir.join("project-b.json"), "{}").unwrap();
+        // Same live JSON registered twice (basename + absolute), plus a prompt
+        // that is not on disk — the failure from `archive --all`.
+        insert_prd_file(&conn, 1, "project-a.json", "task_list");
+        insert_prd_file(&conn, 1, &json_path.display().to_string(), "task_list");
+        insert_prd_file(&conn, 1, "project-a-prompt.md", "prompt");
+        insert_prd_file(&conn, 2, "project-b.json", "task_list");
+        drop(conn);
+
+        let result = run_archive(dir.path(), false, None).unwrap();
+
+        assert_eq!(result.prds_archived.len(), 2, "both completed PRDs archive");
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("project-a-prompt.md")),
+            "missing prompt is warned: {:?}",
+            result.warnings
+        );
+        let a_moves: Vec<_> = result
+            .archived
+            .iter()
+            .filter(|item| item.source.contains("project-a.json"))
+            .collect();
+        assert_eq!(
+            a_moves.len(),
+            1,
+            "duplicate json rows move once: {:?}",
+            result.archived
+        );
+        assert!(!json_path.exists(), "json was moved");
+        assert!(!tasks_dir.join("project-b.json").exists());
+
+        let archived_a = result
+            .prds_archived
+            .iter()
+            .find(|prd| prd.task_prefix == "PA")
+            .unwrap();
+        assert_eq!(archived_a.files_archived, 1);
+        assert_eq!(archived_a.tasks_archived, 1);
+        assert_eq!(result.tasks_archived, 2);
+
+        let text = format_text(&result);
+        assert!(text.contains("Warnings:"));
+        assert!(text.contains("project-a-prompt.md"));
+        assert!(text.contains("project-b.json"));
+    }
+
+    #[test]
+    fn test_relocate_archive_file_missing_source_is_not_an_error() {
+        let dir = TempDir::new().unwrap();
+        let archive = dir.path().join("archive");
+        fs::create_dir(&archive).unwrap();
+        let source = dir.path().join("gone.md");
+        let dest = archive.join("gone.md");
+        match relocate_archive_file(&source, &dest).unwrap() {
+            RelocateOutcome::Missing => {}
+            RelocateOutcome::Moved => panic!("expected missing"),
+        }
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn test_relocate_archive_file_other_io_errors_still_fail() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("keep.md");
+        fs::write(&source, "x").unwrap();
+        let dest = dir.path().join("dest-dir");
+        fs::create_dir(&dest).unwrap();
+        let err = relocate_archive_file(&source, &dest).unwrap_err();
+        assert!(source.exists(), "source stays when rename fails");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("moving file to archive"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[test]
@@ -1143,12 +1388,14 @@ mod tests {
                 .unwrap();
 
         let filenames: Vec<String> = files
+            .present
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
             .collect();
 
         // Should find prd_files entries, NOT project-name-based guesses
-        assert_eq!(files.len(), 3);
+        assert_eq!(files.present.len(), 3);
+        assert!(files.missing.is_empty());
         assert!(filenames.contains(&"prd-model-phase1.json".to_string()));
         assert!(filenames.contains(&"prd-model-phase1-prompt.md".to_string()));
         assert!(filenames.contains(&"prd-model-selection.md".to_string()));
@@ -2136,6 +2383,7 @@ mod tests {
                 project: "project-b".to_string(),
                 reason: "Not fully completed".to_string(),
             }],
+            warnings: vec!["missing file 'gone.md'".to_string()],
         };
 
         let json = serde_json::to_string(&result).expect("serialization must succeed");
@@ -2147,6 +2395,8 @@ mod tests {
         assert!(json.contains("\"dry_run\":false"));
         assert!(json.contains("\"prds_archived\""));
         assert!(json.contains("\"prds_skipped\""));
+        assert!(json.contains("\"warnings\""));
+        assert!(json.contains("missing file 'gone.md'"));
         assert!(json.contains("\"task_prefix\":\"PA\""));
         assert!(json.contains("\"prd_id\":2"));
         assert!(json.contains("\"reason\":\"Not fully completed\""));
