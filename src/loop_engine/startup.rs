@@ -45,7 +45,7 @@ use crate::loop_engine::prd_reconcile::{hash_file, read_prd_metadata, reconcile_
 use crate::loop_engine::project_config::ProjectConfig;
 use crate::loop_engine::signals::{
     SignalFlag, SignalLocations, build_signal_locations, emit_stop_watch_paths,
-    sweep_stale_extra_prefix_stops,
+    sweep_stale_extra_prefix_stops, write_loop_run_record,
 };
 use crate::loop_engine::status_queries::read_prd_hints;
 use crate::loop_engine::worktree;
@@ -973,7 +973,26 @@ pub(crate) fn initialize_loop(
         actual_worktree_path.as_deref(),
         run_config.started_at,
     );
-    // FEAT-003 writes the prefix run record immediately before this sweep.
+    // FEAT-003: persist the prefix run record BEFORE the stale sweep so
+    // `task-mgr loop stop --prefix` can see this run while the warning names it.
+    // Early Err after this point may leave the file; the next successful start
+    // overwrites it — do not delete on the error path.
+    if let Some(ref p) = task_prefix {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| run_config.source_root.clone());
+        let main_checkout = crate::git::main_repo_root_at(&run_config.source_root);
+        if let Err(e) = write_loop_run_record(
+            &run_config.db_dir,
+            p,
+            &signal_locations,
+            &cwd,
+            actual_worktree_path.as_deref(),
+            main_checkout.as_deref(),
+        ) {
+            tracing::warn!(
+                "could not write loop run record for prefix {p}: {e}; loop stop may not find this run"
+            );
+        }
+    }
     sweep_stale_extra_prefix_stops(&signal_locations, task_prefix.as_deref());
 
     let branch_display = branch_name.as_deref().unwrap_or("(unknown)");

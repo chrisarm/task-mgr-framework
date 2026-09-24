@@ -44,6 +44,7 @@ verify-task-mgr — isolated harness for the task-mgr CLI
   cleanup                Remove the sandbox this run created. Keeps artifacts/.
 
 Never pass --dir yourself; the helper injects it. Never run loop run / batch run
+(loop stop --prefix is allowed; it does not spawn)
 through this helper. Evidence lives in .claude/skills/verify-task-mgr/artifacts/<run-id>/.
 EOF
 }
@@ -147,7 +148,15 @@ assert_not_loop_run() {
       fi
       die "refusing '$cmd run' (spawns agent CLIs and git worktrees). See SKILL.md."
     fi
-    if [[ -n "$sub" && "$sub" != "init" ]]; then
+    # Nested safe subcommands: init (import only) and loop stop (writes a stop
+    # file from a run record; never spawns). batch has no stop nested command.
+    if [[ "$sub" == "init" ]]; then
+      return 0
+    fi
+    if [[ "$cmd" == "loop" && "$sub" == "stop" ]]; then
+      return 0
+    fi
+    if [[ -n "$sub" ]]; then
       die "refusing flat '$cmd $sub' (that is $cmd run). Use '$cmd init' only."
     fi
   fi

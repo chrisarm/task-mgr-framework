@@ -830,6 +830,9 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
     for extra in &signal_locations.extras {
         signals::cleanup_extra_prefix_signals(extra, task_prefix.as_deref());
     }
+    // After signal cleanup: drop the prefix run record. Inner loop step 21 must
+    // NOT delete batch.json (batch owns that for the whole run_batch lifetime).
+    signals::delete_loop_run_record(&run_config.db_dir, task_prefix.as_deref());
 
     // Step 21.4: Slot worktree cleanup (parallel mode only).
     // Removes ephemeral slot worktrees (slots 1+) and their branches. Slot 0

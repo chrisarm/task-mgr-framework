@@ -85,7 +85,7 @@ Stable handles (use these, not table row numbers):
 | Product stdout vs stderr | Data (`list` JSON, `models show` text) → stdout. Deprecation notices, skill staging, `Initialized .task-mgr/.` hint → stderr. Capture both. |
 | DB side effect | `$H sql 'SELECT id, status, priority FROM tasks ORDER BY priority, id'` and `$H snapshot-db <name>`. |
 
-The helper **refuses** `loop run`, `batch run`, and the deprecated flat `loop <prd>` / `batch <glob>` forms (those *are* run). Autonomous loop spawn is not a default verification path: it creates git worktrees under the operator's clone and launches Claude/Grok/Codex. Prove `loop init` + `status` instead. `loop run --help` is the safe probe.
+The helper **refuses** `loop run`, `batch run`, and the deprecated flat `loop <prd>` / `batch <glob>` forms (those *are* run). Autonomous loop spawn is not a default verification path: it creates git worktrees under the operator's clone and launches Claude/Grok/Codex. Prove `loop init` + `status` instead. `loop run --help` is the safe probe. Nested `loop stop --prefix` is allowed (writes a stop file from a run record; never spawns).
 
 Read `features/README.md` and drive the feature file for the change under test. A proof that uses one convenient entry point is incomplete when that file lists others.
 

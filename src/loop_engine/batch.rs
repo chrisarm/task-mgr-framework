@@ -13,7 +13,9 @@ use crate::loop_engine::auto_review::{self, Decision};
 use crate::loop_engine::config::LoopConfig;
 use crate::loop_engine::engine::{self, LoopResult, LoopRunConfig};
 use crate::loop_engine::project_config::{preflight_validate_and_probe, read_project_config};
-use crate::loop_engine::signals::{batch_stop_requested, build_signal_locations};
+use crate::loop_engine::signals::{
+    BatchRunRecordGuard, batch_stop_requested, build_signal_locations,
+};
 use crate::loop_engine::status_queries;
 use crate::loop_engine::worktree;
 use crate::output::ui;
@@ -623,6 +625,25 @@ pub async fn run_batch(
     // extra-dir global .stop files at batch start.
     let batch_signal_locations =
         build_signal_locations(dir.join("tasks"), project_root, None, started_at);
+
+    // FEAT-003: batch.json lives for the whole run_batch, not each inner step 21.
+    // Guard deletes the record when run_batch returns (including early breaks).
+    let cwd = std::env::current_dir().unwrap_or_else(|_| project_root.to_path_buf());
+    let main_checkout = crate::git::main_repo_root_at(project_root);
+    let _batch_run_record = match BatchRunRecordGuard::write(
+        dir,
+        &batch_signal_locations,
+        &cwd,
+        main_checkout.as_deref(),
+    ) {
+        Ok(guard) => Some(guard),
+        Err(e) => {
+            tracing::warn!(
+                "could not write batch run record: {e}; loop stop may not find this batch"
+            );
+            None
+        }
+    };
 
     // Chain tracking: advances to loop_result.branch_name after each successful PRD.
     // Starts as None so the first PRD branches from HEAD.

@@ -5,16 +5,25 @@
 /// 2. **UNIX signals**: SIGINT (Ctrl+C) and SIGTERM via `Arc<AtomicBool>`
 ///
 /// Session guidance accumulation lives in [`super::guidance`].
+///
+/// Run records under `{db_dir}/loop-runs/` and `task-mgr loop stop --prefix`
+/// also live here (FEAT-003).
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
 
 use super::guidance::SessionGuidance;
 use super::{DEADLINE_FILE_PREFIX, PAUSE_FILE, STOP_FILE};
+use crate::db::prefix::validate_prefix;
 use crate::output::ui;
+use crate::{TaskMgrError, TaskMgrResult};
 
 /// Check if a stop signal exists for the given session.
 ///
@@ -507,6 +516,387 @@ pub fn emit_stop_watch_paths(locations: &SignalLocations) {
     for extra in &locations.extras {
         ui::emit(&format!("Stop watch (extra): {}", extra.display()));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Run records + `task-mgr loop stop --prefix` (FEAT-003)
+// ---------------------------------------------------------------------------
+
+/// Directory holding live loop/batch run records: `{db_dir}/loop-runs/`.
+pub fn loop_runs_dir(db_dir: &Path) -> PathBuf {
+    db_dir.join("loop-runs")
+}
+
+/// Path for a prefix loop run record. Validates `prefix` before joining.
+pub fn loop_run_record_path(db_dir: &Path, prefix: &str) -> Result<PathBuf, String> {
+    validate_prefix(prefix)?;
+    Ok(loop_runs_dir(db_dir).join(format!("{prefix}.json")))
+}
+
+/// Path for the batch run record (`batch.json`).
+pub fn batch_run_record_path(db_dir: &Path) -> PathBuf {
+    loop_runs_dir(db_dir).join("batch.json")
+}
+
+/// Kind of process that wrote a run record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RunRecordKind {
+    Loop,
+    Batch,
+}
+
+/// Persisted snapshot of a live `loop run` / `batch run` for `loop stop`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunRecord {
+    pub pid: u32,
+    pub kind: RunRecordKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    /// Seconds since UNIX epoch when the process captured `started_at`.
+    pub started_at_unix_secs: u64,
+    pub canonical_tasks_dir: PathBuf,
+    pub cwd: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub main_checkout: Option<PathBuf>,
+    #[serde(default)]
+    pub extra_tasks_dirs: Vec<PathBuf>,
+}
+
+fn system_time_unix_secs(t: SystemTime) -> u64 {
+    t.duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn ensure_loop_runs_dir(db_dir: &Path) -> io::Result<PathBuf> {
+    let dir = loop_runs_dir(db_dir);
+    fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+fn write_run_record_file(path: &Path, record: &RunRecord) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_vec_pretty(record)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    fs::write(path, json)
+}
+
+/// Write `{db_dir}/loop-runs/<prefix>.json` for a live loop. Overwrites any
+/// leftover record from an earlier failed start. Call before the stale
+/// extra-dir sweep so `loop stop` can see this run.
+pub fn write_loop_run_record(
+    db_dir: &Path,
+    prefix: &str,
+    locations: &SignalLocations,
+    cwd: &Path,
+    worktree: Option<&Path>,
+    main_checkout: Option<&Path>,
+) -> io::Result<()> {
+    validate_prefix(prefix).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let _ = ensure_loop_runs_dir(db_dir)?;
+    let path = loop_runs_dir(db_dir).join(format!("{prefix}.json"));
+    let record = RunRecord {
+        pid: std::process::id(),
+        kind: RunRecordKind::Loop,
+        prefix: Some(prefix.to_string()),
+        started_at_unix_secs: system_time_unix_secs(locations.started_at),
+        canonical_tasks_dir: locations.canonical.clone(),
+        cwd: cwd.to_path_buf(),
+        worktree: worktree.map(Path::to_path_buf),
+        main_checkout: main_checkout.map(Path::to_path_buf),
+        extra_tasks_dirs: locations.extras.clone(),
+    };
+    write_run_record_file(&path, &record)
+}
+
+/// Write `{db_dir}/loop-runs/batch.json` at `run_batch` start.
+pub fn write_batch_run_record(
+    db_dir: &Path,
+    locations: &SignalLocations,
+    cwd: &Path,
+    main_checkout: Option<&Path>,
+) -> io::Result<()> {
+    let _ = ensure_loop_runs_dir(db_dir)?;
+    let path = batch_run_record_path(db_dir);
+    let record = RunRecord {
+        pid: std::process::id(),
+        kind: RunRecordKind::Batch,
+        prefix: None,
+        started_at_unix_secs: system_time_unix_secs(locations.started_at),
+        canonical_tasks_dir: locations.canonical.clone(),
+        cwd: cwd.to_path_buf(),
+        worktree: None,
+        main_checkout: main_checkout.map(Path::to_path_buf),
+        extra_tasks_dirs: locations.extras.clone(),
+    };
+    write_run_record_file(&path, &record)
+}
+
+/// Delete the prefix loop run record after orchestrator signal cleanup (step 21).
+/// Missing file is fine (early Err residual, or already removed).
+pub fn delete_loop_run_record(db_dir: &Path, prefix: Option<&str>) {
+    let Some(p) = prefix else {
+        return;
+    };
+    let Ok(path) = loop_run_record_path(db_dir, p) else {
+        return;
+    };
+    if path.exists()
+        && let Err(e) = fs::remove_file(&path)
+    {
+        tracing::warn!("could not remove loop run record {}: {}", path.display(), e);
+    }
+}
+
+/// Delete `batch.json` when `run_batch` returns (every exit path).
+pub fn delete_batch_run_record(db_dir: &Path) {
+    let path = batch_run_record_path(db_dir);
+    if path.exists()
+        && let Err(e) = fs::remove_file(&path)
+    {
+        tracing::warn!(
+            "could not remove batch run record {}: {}",
+            path.display(),
+            e
+        );
+    }
+}
+
+/// RAII guard that deletes `batch.json` when dropped.
+pub struct BatchRunRecordGuard {
+    db_dir: PathBuf,
+}
+
+impl BatchRunRecordGuard {
+    /// Write the batch record and return a guard that deletes it on drop.
+    pub fn write(
+        db_dir: &Path,
+        locations: &SignalLocations,
+        cwd: &Path,
+        main_checkout: Option<&Path>,
+    ) -> io::Result<Self> {
+        write_batch_run_record(db_dir, locations, cwd, main_checkout)?;
+        Ok(Self {
+            db_dir: db_dir.to_path_buf(),
+        })
+    }
+}
+
+impl Drop for BatchRunRecordGuard {
+    fn drop(&mut self) {
+        delete_batch_run_record(&self.db_dir);
+    }
+}
+
+fn load_run_record(path: &Path) -> Option<RunRecord> {
+    let bytes = fs::read(path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// True when some argv element's final path component is exactly `task-mgr`
+/// and other elements are the separate tokens (`loop` AND `run`) OR
+/// (`batch` AND `run`). Not a substring. A single `loop-run` token fails.
+/// Flat `task-mgr loop <prd>` (no `run`) fails closed.
+pub fn cmdline_qualifies_as_loop_or_batch_run(argv: &[OsString]) -> bool {
+    let has_task_mgr = argv.iter().any(|arg| {
+        Path::new(arg)
+            .file_name()
+            .is_some_and(|name| name == OsStr::new("task-mgr"))
+    });
+    if !has_task_mgr {
+        return false;
+    }
+    let has = |tok: &str| argv.iter().any(|a| a.as_os_str() == OsStr::new(tok));
+    (has("loop") && has("run")) || (has("batch") && has("run"))
+}
+
+/// Split `/proc/<pid>/cmdline` bytes on NUL into argv elements.
+pub fn parse_proc_cmdline(raw: &[u8]) -> Vec<OsString> {
+    raw.split(|b| *b == 0)
+        .filter(|part| !part.is_empty())
+        .map(|part| OsString::from_vec(part.to_vec()))
+        .collect()
+}
+
+/// Read `/proc/<pid>/cmdline` and parse into argv. `None` on I/O error.
+pub fn read_proc_cmdline(pid: u32) -> Option<Vec<OsString>> {
+    let raw = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    Some(parse_proc_cmdline(&raw))
+}
+
+/// `kill(pid, 0) == 0` — process exists and is visible to us.
+pub fn pid_is_alive(pid: u32) -> bool {
+    // SAFETY: kill with signal 0 is a existence/permission probe; no signal delivered.
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+fn record_is_live<FAlive, FCmd>(record: &RunRecord, is_alive: &FAlive, read_cmdline: &FCmd) -> bool
+where
+    FAlive: Fn(u32) -> bool,
+    FCmd: Fn(u32) -> Option<Vec<OsString>>,
+{
+    if !is_alive(record.pid) {
+        return false;
+    }
+    match read_cmdline(record.pid) {
+        Some(argv) => cmdline_qualifies_as_loop_or_batch_run(&argv),
+        None => false,
+    }
+}
+
+fn emit_candidate_dirs(record: &RunRecord) {
+    ui::emit_err(&format!(
+        "Candidate stop directory (canonical): {}",
+        record.canonical_tasks_dir.display()
+    ));
+    for extra in &record.extra_tasks_dirs {
+        ui::emit_err(&format!(
+            "Candidate stop directory (extra): {}",
+            extra.display()
+        ));
+    }
+}
+
+fn stop_file_for_prefix_record(record: &RunRecord, prefix: &str) -> PathBuf {
+    record
+        .canonical_tasks_dir
+        .join(format!("{STOP_FILE}-{prefix}"))
+}
+
+fn stop_file_for_batch_record(record: &RunRecord) -> PathBuf {
+    record.canonical_tasks_dir.join(STOP_FILE)
+}
+
+/// Write the stop file, then re-check the pid. If the process is no longer a
+/// trusted live target, unlink **only** `written` and return an error.
+fn write_stop_and_recheck<FAlive, FCmd>(
+    written: &Path,
+    record: &RunRecord,
+    is_alive: &FAlive,
+    read_cmdline: &FCmd,
+) -> TaskMgrResult<PathBuf>
+where
+    FAlive: Fn(u32) -> bool,
+    FCmd: Fn(u32) -> Option<Vec<OsString>>,
+{
+    if let Some(parent) = written.parent() {
+        fs::create_dir_all(parent).map_err(|e| {
+            TaskMgrError::io_error(parent.display().to_string(), "creating stop parent dir", e)
+        })?;
+    }
+    fs::write(written, b"").map_err(|e| {
+        TaskMgrError::io_error(written.display().to_string(), "writing stop file", e)
+    })?;
+
+    if record_is_live(record, is_alive, read_cmdline) {
+        return Ok(written.to_path_buf());
+    }
+
+    // Pid died (or cmdline no longer qualifies) between check and write —
+    // unlink only the path this command wrote. Canonical files have no mtime
+    // gate, so a stale stop would halt a future run.
+    if let Err(e) = fs::remove_file(written) {
+        tracing::warn!(
+            "could not unlink stop file after dead-pid recheck {}: {}",
+            written.display(),
+            e
+        );
+    }
+    Err(TaskMgrError::InvalidState {
+        resource_type: "Loop run".to_string(),
+        id: record.pid.to_string(),
+        expected: "still-alive task-mgr loop/batch run".to_string(),
+        actual: "process exited or cmdline no longer qualifies after stop write; \
+                 removed the stop file this command created"
+            .to_string(),
+    })
+}
+
+/// Operator `task-mgr loop stop --prefix <prefix>` (production `/proc` + kill 0).
+///
+/// Resolves records under `{db_dir}/loop-runs/`. A live prefix record writes
+/// `.stop-<prefix>` in that record's canonical dir. With no live prefix record,
+/// a live `batch.json` writes global `.stop` there. Never writes relative to
+/// the caller's cwd when no record is live.
+pub fn loop_stop(db_dir: &Path, prefix: &str) -> TaskMgrResult<PathBuf> {
+    loop_stop_with(db_dir, prefix, pid_is_alive, read_proc_cmdline)
+}
+
+/// Testable `loop stop` with injectable liveness and cmdline readers.
+pub fn loop_stop_with<FAlive, FCmd>(
+    db_dir: &Path,
+    prefix: &str,
+    is_alive: FAlive,
+    read_cmdline: FCmd,
+) -> TaskMgrResult<PathBuf>
+where
+    FAlive: Fn(u32) -> bool,
+    FCmd: Fn(u32) -> Option<Vec<OsString>>,
+{
+    // validate_prefix BEFORE any Path::join involving the prefix.
+    if let Err(msg) = validate_prefix(prefix) {
+        return Err(TaskMgrError::InvalidConfig {
+            field: "prefix".to_string(),
+            message: msg,
+        });
+    }
+
+    let prefix_path = loop_runs_dir(db_dir).join(format!("{prefix}.json"));
+    let batch_path = batch_run_record_path(db_dir);
+
+    let prefix_record = load_run_record(&prefix_path);
+    if let Some(ref rec) = prefix_record
+        && record_is_live(rec, &is_alive, &read_cmdline)
+    {
+        let written = stop_file_for_prefix_record(rec, prefix);
+        return write_stop_and_recheck(&written, rec, &is_alive, &read_cmdline);
+    }
+
+    let batch_record = load_run_record(&batch_path);
+    if let Some(ref rec) = batch_record
+        && record_is_live(rec, &is_alive, &read_cmdline)
+    {
+        let written = stop_file_for_batch_record(rec);
+        return write_stop_and_recheck(&written, rec, &is_alive, &read_cmdline);
+    }
+
+    // Fail closed: no live target. Print candidate dirs from any readable
+    // records; never create a stop file under the caller's cwd.
+    ui::emit_err(&format!(
+        "No live loop or batch run found for prefix '{prefix}' under {}.",
+        loop_runs_dir(db_dir).display()
+    ));
+    if let Some(ref rec) = prefix_record {
+        ui::emit_err(&format!(
+            "Prefix record at {} exists but pid {} is not a live task-mgr loop/batch run.",
+            prefix_path.display(),
+            rec.pid
+        ));
+        emit_candidate_dirs(rec);
+    } else {
+        ui::emit_err(&format!("No prefix record at {}.", prefix_path.display()));
+    }
+    if let Some(ref rec) = batch_record {
+        ui::emit_err(&format!(
+            "Batch record at {} exists but pid {} is not a live task-mgr batch/loop run.",
+            batch_path.display(),
+            rec.pid
+        ));
+        emit_candidate_dirs(rec);
+    } else {
+        ui::emit_err(&format!("No batch record at {}.", batch_path.display()));
+    }
+
+    Err(TaskMgrError::NotFound {
+        resource_type: "Live loop/batch run".to_string(),
+        id: prefix.to_string(),
+    })
 }
 
 /// Handle a human review checkpoint after a `requires_human` task completes.
@@ -1538,5 +1928,355 @@ mod tests {
             "Banner must include task title"
         );
         // notes=None: must not panic and should not include a notes section with garbage
+    }
+
+    // --- Run records + loop stop (FEAT-003) ---
+
+    fn argv(parts: &[&str]) -> Vec<OsString> {
+        parts.iter().map(OsString::from).collect()
+    }
+
+    fn write_test_record(db_dir: &Path, name: &str, record: &RunRecord) {
+        let dir = loop_runs_dir(db_dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        fs::write(path, serde_json::to_vec_pretty(record).unwrap()).unwrap();
+    }
+
+    fn sample_loop_record(canonical: &Path, pid: u32) -> RunRecord {
+        RunRecord {
+            pid,
+            kind: RunRecordKind::Loop,
+            prefix: Some("P1".to_string()),
+            started_at_unix_secs: 1_700_000_000,
+            canonical_tasks_dir: canonical.to_path_buf(),
+            cwd: PathBuf::from("/tmp/cwd"),
+            worktree: Some(PathBuf::from("/tmp/wt")),
+            main_checkout: Some(PathBuf::from("/tmp/main")),
+            extra_tasks_dirs: vec![PathBuf::from("/tmp/extra/tasks")],
+        }
+    }
+
+    fn sample_batch_record(canonical: &Path, pid: u32) -> RunRecord {
+        RunRecord {
+            pid,
+            kind: RunRecordKind::Batch,
+            prefix: None,
+            started_at_unix_secs: 1_700_000_000,
+            canonical_tasks_dir: canonical.to_path_buf(),
+            cwd: PathBuf::from("/tmp/cwd"),
+            worktree: None,
+            main_checkout: Some(PathBuf::from("/tmp/main")),
+            extra_tasks_dirs: vec![],
+        }
+    }
+
+    #[test]
+    fn cmdline_qualifies_task_mgr_loop_run() {
+        assert!(cmdline_qualifies_as_loop_or_batch_run(&argv(&[
+            "/usr/bin/task-mgr",
+            "loop",
+            "run",
+            "prd.json"
+        ])));
+        assert!(cmdline_qualifies_as_loop_or_batch_run(&argv(&[
+            "/usr/bin/task-mgr",
+            "batch",
+            "run",
+            "tasks/*.json"
+        ])));
+    }
+
+    #[test]
+    fn cmdline_rejects_list_helper_flat_and_substring() {
+        // Known-bad: kill -0 + substring "task-mgr" would accept these.
+        assert!(!cmdline_qualifies_as_loop_or_batch_run(&argv(&[
+            "/usr/bin/task-mgr",
+            "list"
+        ])));
+        assert!(!cmdline_qualifies_as_loop_or_batch_run(&argv(&[
+            "/opt/task-mgr-helper",
+            "loop",
+            "run"
+        ])));
+        assert!(!cmdline_qualifies_as_loop_or_batch_run(&argv(&[
+            "/opt/not-task-mgr",
+            "loop",
+            "run"
+        ])));
+        assert!(!cmdline_qualifies_as_loop_or_batch_run(&argv(&[
+            "/opt/task-mgr-wrapper/loop",
+            "run"
+        ])));
+        assert!(!cmdline_qualifies_as_loop_or_batch_run(&argv(&[
+            "task-mgr loop-run"
+        ])));
+        // Deprecated flat form: no separate `run` token.
+        assert!(!cmdline_qualifies_as_loop_or_batch_run(&argv(&[
+            "/usr/bin/task-mgr",
+            "loop",
+            "prd.json"
+        ])));
+        assert!(!cmdline_qualifies_as_loop_or_batch_run(&argv(&[
+            "/usr/bin/task-mgr",
+            "loop",
+            "stop",
+            "--prefix",
+            "P1"
+        ])));
+    }
+
+    #[test]
+    fn parse_proc_cmdline_splits_on_nul() {
+        let raw = b"/usr/bin/task-mgr\0loop\0run\0prd.json\0";
+        let parts = parse_proc_cmdline(raw);
+        assert_eq!(
+            parts,
+            argv(&["/usr/bin/task-mgr", "loop", "run", "prd.json"])
+        );
+    }
+
+    #[test]
+    fn loop_stop_live_prefix_writes_prefix_stop_not_global() {
+        let tmp = TempDir::new().unwrap();
+        let db_dir = tmp.path().join(".task-mgr");
+        let canonical = tmp.path().join("tasks");
+        fs::create_dir_all(&canonical).unwrap();
+        let pid = std::process::id();
+        write_test_record(&db_dir, "P1.json", &sample_loop_record(&canonical, pid));
+        // Also plant a batch record — live prefix must win and must not write global.
+        let batch_canonical = db_dir.join("tasks");
+        fs::create_dir_all(&batch_canonical).unwrap();
+        write_test_record(
+            &db_dir,
+            "batch.json",
+            &sample_batch_record(&batch_canonical, pid),
+        );
+
+        let good = argv(&["/usr/bin/task-mgr", "loop", "run"]);
+        let written = loop_stop_with(&db_dir, "P1", |_| true, |_| Some(good.clone())).unwrap();
+
+        assert_eq!(written, canonical.join(".stop-P1"));
+        assert!(written.exists());
+        assert!(
+            !batch_canonical.join(".stop").exists(),
+            "live prefix must not create global .stop even when batch.json is present"
+        );
+        assert!(
+            !tmp.path().join("tasks").join(".stop").exists()
+                || written == canonical.join(".stop-P1"),
+            "must not invent a cwd-relative global stop"
+        );
+    }
+
+    #[test]
+    fn loop_stop_dead_pid_creates_no_file() {
+        let tmp = TempDir::new().unwrap();
+        let db_dir = tmp.path().join(".task-mgr");
+        let canonical = tmp.path().join("tasks");
+        fs::create_dir_all(&canonical).unwrap();
+        write_test_record(
+            &db_dir,
+            "P1.json",
+            &sample_loop_record(&canonical, 9_999_999),
+        );
+
+        let good = argv(&["/usr/bin/task-mgr", "loop", "run"]);
+        let err = loop_stop_with(&db_dir, "P1", |_| false, |_| Some(good.clone())).unwrap_err();
+        assert!(!canonical.join(".stop-P1").exists());
+        assert!(
+            matches!(err, TaskMgrError::NotFound { .. }),
+            "dead pid must fail closed: {err}"
+        );
+    }
+
+    #[test]
+    fn loop_stop_rejects_list_and_helper_cmdlines() {
+        let tmp = TempDir::new().unwrap();
+        let db_dir = tmp.path().join(".task-mgr");
+        let canonical = tmp.path().join("tasks");
+        fs::create_dir_all(&canonical).unwrap();
+        let pid = std::process::id();
+        write_test_record(&db_dir, "P1.json", &sample_loop_record(&canonical, pid));
+
+        for bad in [
+            argv(&["/usr/bin/task-mgr", "list"]),
+            argv(&["/opt/task-mgr-helper", "loop", "run"]),
+            argv(&["/opt/not-task-mgr", "loop", "run"]),
+            argv(&["task-mgr loop-run"]),
+            argv(&["/usr/bin/task-mgr", "loop", "prd.json"]),
+        ] {
+            let err = loop_stop_with(&db_dir, "P1", |_| true, {
+                let bad = bad.clone();
+                move |_| Some(bad.clone())
+            })
+            .unwrap_err();
+            assert!(
+                !canonical.join(".stop-P1").exists(),
+                "bad cmdline {:?} must create no file; err={err}",
+                bad
+            );
+        }
+    }
+
+    #[test]
+    fn loop_stop_recheck_unlinks_only_written_path() {
+        let tmp = TempDir::new().unwrap();
+        let db_dir = tmp.path().join(".task-mgr");
+        let canonical = tmp.path().join("tasks");
+        fs::create_dir_all(&canonical).unwrap();
+        let pid = std::process::id();
+        write_test_record(&db_dir, "P1.json", &sample_loop_record(&canonical, pid));
+
+        // Pre-existing stop/pause files that must survive a failed recheck unlink.
+        let other_stop = canonical.join(".stop-OTHER");
+        let pause = canonical.join(".pause-P1");
+        let global = canonical.join(".stop");
+        fs::write(&other_stop, b"").unwrap();
+        fs::write(&pause, b"").unwrap();
+        fs::write(&global, b"").unwrap();
+
+        let good = argv(&["/usr/bin/task-mgr", "loop", "run"]);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let err = loop_stop_with(
+            &db_dir,
+            "P1",
+            |_| true,
+            |_| {
+                // First call (pre-write) qualifies; second (recheck) looks dead.
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    Some(good.clone())
+                } else {
+                    Some(argv(&["/usr/bin/task-mgr", "list"]))
+                }
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            !canonical.join(".stop-P1").exists(),
+            "recheck failure must unlink the path this command wrote"
+        );
+        assert!(other_stop.exists(), "must not unlink other prefix stop");
+        assert!(pause.exists(), "must not unlink pause file");
+        assert!(global.exists(), "must not unlink global stop");
+        assert!(
+            matches!(err, TaskMgrError::InvalidState { .. }),
+            "recheck fail is InvalidState: {err}"
+        );
+    }
+
+    #[test]
+    fn loop_stop_invalid_prefix_before_path_join() {
+        let tmp = TempDir::new().unwrap();
+        let db_dir = tmp.path().join(".task-mgr");
+        // No loop-runs dir — invalid prefix must fail before creating anything.
+        for bad in ["../x", "", "has/slash", "has space"] {
+            let err = loop_stop_with(db_dir.as_path(), bad, |_| true, |_| None).unwrap_err();
+            assert!(
+                matches!(err, TaskMgrError::InvalidConfig { .. }),
+                "prefix {bad:?} must be InvalidConfig: {err}"
+            );
+            assert!(
+                !loop_runs_dir(&db_dir).exists(),
+                "invalid prefix must not create loop-runs/"
+            );
+            assert!(
+                !tmp.path().join("tasks").exists(),
+                "invalid prefix must not create tasks/ under tmp"
+            );
+        }
+    }
+
+    #[test]
+    fn loop_stop_batch_only_writes_global_stop() {
+        let tmp = TempDir::new().unwrap();
+        let db_dir = tmp.path().join(".task-mgr");
+        let batch_canonical = db_dir.join("tasks");
+        fs::create_dir_all(&batch_canonical).unwrap();
+        let pid = std::process::id();
+        write_test_record(
+            &db_dir,
+            "batch.json",
+            &sample_batch_record(&batch_canonical, pid),
+        );
+
+        let good = argv(&["/usr/bin/task-mgr", "batch", "run"]);
+        let written = loop_stop_with(&db_dir, "P1", |_| true, |_| Some(good.clone())).unwrap();
+
+        assert_eq!(written, batch_canonical.join(".stop"));
+        assert!(written.exists());
+        assert!(
+            !batch_canonical.join(".stop-P1").exists(),
+            "batch-only must not invent a prefix stop file"
+        );
+    }
+
+    #[test]
+    fn loop_stop_no_record_creates_nothing_in_cwd() {
+        let tmp = TempDir::new().unwrap();
+        let db_dir = tmp.path().join(".task-mgr");
+        fs::create_dir_all(&db_dir).unwrap();
+        let cwd_tasks = tmp.path().join("tasks");
+        fs::create_dir_all(&cwd_tasks).unwrap();
+
+        let err = loop_stop_with(&db_dir, "P1", |_| true, |_| None).unwrap_err();
+        assert!(matches!(err, TaskMgrError::NotFound { .. }));
+        assert!(!cwd_tasks.join(".stop").exists());
+        assert!(!cwd_tasks.join(".stop-P1").exists());
+        assert!(!db_dir.join("tasks").join(".stop").exists());
+    }
+
+    #[test]
+    fn write_and_delete_loop_run_record_round_trip() {
+        let tmp = TempDir::new().unwrap();
+        let db_dir = tmp.path().join(".task-mgr");
+        let canonical = tmp.path().join("tasks");
+        fs::create_dir_all(&canonical).unwrap();
+        let locs = SignalLocations {
+            canonical: canonical.clone(),
+            extras: vec![tmp.path().join("extra/tasks")],
+            started_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(42),
+        };
+        write_loop_run_record(
+            &db_dir,
+            "P1",
+            &locs,
+            Path::new("/tmp/cwd"),
+            Some(Path::new("/tmp/wt")),
+            Some(Path::new("/tmp/main")),
+        )
+        .unwrap();
+        let path = loop_run_record_path(&db_dir, "P1").unwrap();
+        assert!(path.exists());
+        let loaded: RunRecord = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(loaded.kind, RunRecordKind::Loop);
+        assert_eq!(loaded.prefix.as_deref(), Some("P1"));
+        assert_eq!(loaded.canonical_tasks_dir, canonical);
+        assert_eq!(loaded.started_at_unix_secs, 42);
+
+        delete_loop_run_record(&db_dir, Some("P1"));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn batch_run_record_guard_deletes_on_drop() {
+        let tmp = TempDir::new().unwrap();
+        let db_dir = tmp.path().join(".task-mgr");
+        let canonical = db_dir.join("tasks");
+        fs::create_dir_all(&canonical).unwrap();
+        let locs = SignalLocations {
+            canonical,
+            extras: vec![],
+            started_at: SystemTime::UNIX_EPOCH,
+        };
+        let path = batch_run_record_path(&db_dir);
+        {
+            let _guard =
+                BatchRunRecordGuard::write(&db_dir, &locs, Path::new("/tmp/cwd"), None).unwrap();
+            assert!(path.exists());
+        }
+        assert!(!path.exists(), "Drop must delete batch.json");
     }
 }
