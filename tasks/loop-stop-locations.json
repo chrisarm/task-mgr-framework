@@ -1,10 +1,17 @@
 {
-  "version": "1.0",
-  "project": "task-mgr",
   "branchName": "feat/loop-stop-locations",
-  "prdFile": "loop-stop-locations.md",
   "description": "Let a running loop notice a prefix stop file in the launch tasks dir, the feature worktree, or the main checkout, and add task-mgr loop stop so operators do not guess the directory.",
-  "requires": [],
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "Rust: No warnings in `cargo check` output",
+      "Rust: No warnings in `cargo clippy` output",
+      "Rust: All tests pass with `cargo test`",
+      "Rust: `cargo fmt --check` passes",
+      "No breaking changes to existing APIs unless explicitly required"
+    ],
+    "description": "These criteria apply to ALL implementation tasks"
+  },
+  "prdFile": "loop-stop-locations.md",
   "priorityPhilosophy": {
     "description": "Hierarchy of what matters most when implementing tasks",
     "hierarchy": [
@@ -35,22 +42,11 @@
     "Treating flat task-mgr loop <prd> argv as a live loop-stop target",
     "Conflating operator stop with HorizonStopped"
   ],
-  "globalAcceptanceCriteria": {
-    "description": "These criteria apply to ALL implementation tasks",
-    "criteria": [
-      "Rust: No warnings in `cargo check` output",
-      "Rust: No warnings in `cargo clippy` output",
-      "Rust: All tests pass with `cargo test`",
-      "Rust: `cargo fmt --check` passes",
-      "No breaking changes to existing APIs unless explicitly required"
-    ]
-  },
+  "project": "task-mgr",
+  "requires": [],
+  "taskPrefix": "0400e2ee",
   "userStories": [
     {
-      "id": "FEAT-001",
-      "title": "SignalLocations stop and pause helper",
-      "taskType": "implementation",
-      "description": "Add SignalLocations and stop/pause predicates in signals.rs. check_stop_signal(tasks_dir, prefix) stays the single-directory predicate and keeps its current tests.\n\nDO: canonical dir uses the existing rule (prefix file, else global .stop / .pause) with no mtime gate. extras honor only .stop-<prefix> / .pause-<prefix>, and only when the file mtime is strictly after the started_at argument. A separate batch predicate honors global .stop in canonical with no mtime gate and global .stop in extras only when mtime is strictly after started_at. started_at is an argument the caller captured once. This helper compares metadata mtime to that value and does not call SystemTime::now().\nDO NOT: change check_stop_signal's signature. Do not thread this type into reactions/account.rs, UsageGateFn, or ResetWaitFn. Do not treat mtime equal to started_at as fresh. Do not honor a global file in extras on the inner-loop predicate. Do not scan git worktree list. Do not sample the clock inside the helper.\n\nKnown-bad: a helper that calls exists() on extras with no mtime check would stop a new loop because of yesterday's file in the main checkout.",
       "acceptanceCriteria": [
         "Positive: stop_requested returns true when canonical contains .stop-<prefix> or global .stop, including when the file mtime is before started_at. pause_requested does the same for .pause-<prefix> and global .pause. An extra dir makes pause_requested true only for .pause-<prefix> whose mtime is strictly after started_at, using the same strict-after mtime helper as stop_requested",
         "Positive: stop_requested returns true when an extra dir contains .stop-<prefix> whose mtime is strictly after started_at",
@@ -63,15 +59,8 @@
         "Negative: stop_requested and batch_stop_requested take started_at from the caller and do not call SystemTime::now()",
         "Known-bad: if extras used >= started_at, a file stamped in the same second as process start would stop or pause the run; the test sets mtime equal to started_at and expects false for both the prefix stop file and the prefix pause file"
       ],
-      "priority": 1,
-      "estimatedEffort": "medium",
-      "passes": false,
-      "notes": "Reuse STOP_FILE and PAUSE_FILE from src/loop_engine/mod.rs. Compare file modified time from std::fs::metadata with the passed SystemTime; a missing mtime or unreadable file is not a signal (log via tracing, do not panic). Learning [623]: tasks_dir is the PRD parent, not project root. Learning [1885]: this helper only answers 'is there a file'; exit codes stay at the callers. Do not add a SignalLocations field to IterationParams in this task. The process-start clock is captured by FEAT-002 and passed in; equal timestamps are stale.",
-      "qualityDimensions": [
-        "Existing single-dir tests pass unchanged",
-        "Mtime rule is strict-after and lives only in the new helper",
-        "Prefix isolation is the same known-bad discriminator already used for P1 vs P2"
-      ],
+      "dependsOn": [],
+      "description": "Add SignalLocations and stop/pause predicates in signals.rs. check_stop_signal(tasks_dir, prefix) stays the single-directory predicate and keeps its current tests.\n\nDO: canonical dir uses the existing rule (prefix file, else global .stop / .pause) with no mtime gate. extras honor only .stop-<prefix> / .pause-<prefix>, and only when the file mtime is strictly after the started_at argument. A separate batch predicate honors global .stop in canonical with no mtime gate and global .stop in extras only when mtime is strictly after started_at. started_at is an argument the caller captured once. This helper compares metadata mtime to that value and does not call SystemTime::now().\nDO NOT: change check_stop_signal's signature. Do not thread this type into reactions/account.rs, UsageGateFn, or ResetWaitFn. Do not treat mtime equal to started_at as fresh. Do not honor a global file in extras on the inner-loop predicate. Do not scan git worktree list. Do not sample the clock inside the helper.\n\nKnown-bad: a helper that calls exists() on extras with no mtime check would stop a new loop because of yesterday's file in the main checkout.",
       "edgeCases": [
         "Extra prefix file mtime equal to started_at: not a stop",
         "Extra prefix file mtime strictly after started_at: stop",
@@ -80,24 +69,31 @@
         "Unreadable extra path: not a stop, no panic",
         "Helper does not call SystemTime::now(); two calls with the same started_at agree"
       ],
+      "estimatedEffort": "medium",
       "failureModes": [
         {
           "cause": "metadata() fails on an extra-dir stop file",
           "expectedBehavior": "Treat as no signal and continue; do not abort the predicate with Err"
         }
       ],
+      "id": "FEAT-001",
+      "modifiesBehavior": false,
+      "notes": "Reuse STOP_FILE and PAUSE_FILE from src/loop_engine/mod.rs. Compare file modified time from std::fs::metadata with the passed SystemTime; a missing mtime or unreadable file is not a signal (log via tracing, do not panic). Learning [623]: tasks_dir is the PRD parent, not project root. Learning [1885]: this helper only answers 'is there a file'; exit codes stay at the callers. Do not add a SignalLocations field to IterationParams in this task. The process-start clock is captured by FEAT-002 and passed in; equal timestamps are stale.",
+      "passes": true,
+      "priority": 1,
+      "qualityDimensions": [
+        "Existing single-dir tests pass unchanged",
+        "Mtime rule is strict-after and lives only in the new helper",
+        "Prefix isolation is the same known-bad discriminator already used for P1 vs P2"
+      ],
+      "taskType": "implementation",
+      "title": "SignalLocations stop and pause helper",
       "touchesFiles": [
         "src/loop_engine/signals.rs",
         "tests/multi_prd_lifecycle.rs"
-      ],
-      "dependsOn": [],
-      "modifiesBehavior": false
+      ]
     },
     {
-      "id": "FEAT-002",
-      "title": "Watch launch, worktree, and main checkout at loop boundaries",
-      "taskType": "implementation",
-      "description": "Build SignalLocations once per loop and once per batch, and consult stop_requested only at the iteration, wave, and batch-between-PRD boundaries.\n\nDO: Loop canonical is ResolvedPaths.tasks_dir from resolve_paths, captured before startup remaps paths.prd_file onto the worktree copy. Extras, deduped after canonicalize: launch tasks dir (cwd if its final component is tasks, else cwd/tasks); actual_worktree_path/tasks when Some (not slot worktrees); git::main_repo_root_at(source_root)/tasks when Some. After canonicalize, drop a candidate that is missing, whose canonicalize fails, or that equals canonical. A path that is also canonical keeps the no-mtime rule and is not an extra. canonicalize failure does not abort startup. Batch between-PRD canonical is db_dir.join(\"tasks\") (this is .task-mgr/tasks). Batch extras use the same three roots and batch_stop_requested. Capture started_at once with SystemTime::now() before entering run_loop or run_batch (standalone: the loop-run arm in main.rs; batch: the start of run_batch). Store it on LoopRunConfig. run_batch calls engine::run_loop in-process and copies that same SystemTime onto every inner config and every inner SignalLocations. Do not call SystemTime::now() at run_loop entry or next to the sweep. handle_pause deletes the pause file that matched, including an extra-dir copy. On exit, delete only .stop-<prefix> and .pause-<prefix> from each extra. cleanup_signal_files_for_prefix still owns the canonical dir, including its global files. Do not call cleanup_signal_files_for_prefix on an extra. Banner Stop line inside the box is the command task-mgr loop stop --prefix <prefix>. After print_session_banner returns, ui::emit the canonical and extra absolute paths as untruncated stderr lines. Do not add those paths to format_session_banner.\nDO NOT: pass SignalLocations into wait_for_usage_reset, wait_for_ask_ttl_inner, transient_backoff_wait, UsageGateFn, ResetWaitFn, or account param structs. Do not add <root>/.task-mgr/tasks as an extra just because it exists. Do not recompute canonical from the remapped prd_file. Do not call git rev-parse yourself; use git::main_repo_root_at(source_root). Do not add a pause check to wave preflight. At loop start, after started_at is captured and the prefix run record is written, delete only this prefix's extra-dir .stop-<prefix> when its mtime is before or equal to that same started_at. ui::emit (not tracing-only) names the absolute path, says it was removed because it predates this process and would have been ignored, and tells the operator to run task-mgr loop stop --prefix <prefix> or create the file again at that same absolute path or at <canonical>/.stop-<prefix>. Do not delete a canonical prefix file, a global .stop, a .pause-<prefix>, or another prefix's stop file in that sweep. A failed delete still warns and does not abort startup. Do not sweep stale extra-dir global files at batch start. Do not delete a global .stop outside the canonical dir on exit. Do not abort an iteration that has already started. The in-progress iteration finishes, then the loop exits 0. Do not conflate operator stop with HorizonStopped. The Pause row inside the box may stay truncated.\n\nCallers affected: iteration.rs step 1, wave_orchestration.rs wave_preflight_check, batch.rs between-PRD check, display.rs print_session_banner call site (not format_session_banner's box), orchestrator.rs step 21, signals.rs handle_pause, LoopRunConfig in engine.rs, the LoopRunConfig literals in main.rs and batch.rs. Account waits are intentionally not callers.",
       "acceptanceCriteria": [
         "Positive: iteration and wave preflight call stop_requested with the loop locations and the task prefix; a matching extra-dir prefix file is honored at the next iteration or wave boundary, the in-progress iteration finishes, and the loop exits 0 with operator_stopped / was_stopped and reason stop signal. This is not HorizonStopped",
         "Negative: account.rs still calls check_stop_signal(tasks_dir, None) at the four existing sites; no new parameter on those wait functions, UsageGateFn, ResetWaitFn, or account param structs",
@@ -116,18 +112,10 @@
         "Known-bad: building canonical from the post-remap worktree PRD parent would drop the mtime gate on a directory the loop does not watch today; a test with PRD parent A and worktree copy parent B must keep A as canonical",
         "Failure mode: main_repo_root_at returns None — extras are launch and worktree only; the loop still runs"
       ],
-      "priority": 2,
-      "estimatedEffort": "high",
-      "passes": false,
-      "notes": "Learning [623]: tasks_dir derives from the PRD parent (resolve_paths, env.rs). Learning [2798]: the loop reads the worktree copy of the PRD; that copy is not the signal directory. Learning [1885]: operator stop stays exit 0; SIGINT stays 130. Learning [5558], [5567], and [5469]: operator stop stays distinct from HorizonStopped; do not retarget account waits. Learning [5835]: do not treat process cwd as the worktree root. Data contract: LoopRunConfig.started_at (src/loop_engine/engine.rs) is copied into SignalLocations.started_at. Construction sites that must set the field from the one process-start clock: src/main.rs loop-run arm, src/loop_engine/batch.rs (one value, every inner config), tests/e2e_loop.rs, tests/worktree_lifecycle_integration.rs. Tests may pass a fixed SystemTime; they must not call now() beside the sweep. Update display.rs tests that assert a cwd-relative .stop-P1 inside the box; assert the command inside the box and the absolute paths only on the ui::emit lines after print_session_banner. Slot worktrees (…-slot-N) are not candidates. One loop per database: the first of two same-prefix loops to exit may delete the shared extra-dir prefix file; document that next to the cleanup call, do not add a lock. Accepted residual: prefix stop does not interrupt an account wait. Do not file a task to thread SignalLocations into those waits.",
-      "qualityDimensions": [
-        "Stop is observed at the next iteration or wave boundary, not mid-spawn, and exits 0 rather than HorizonStopped",
-        "Account-wait signatures are untouched",
-        "One process-start SystemTime is shared by every inner SignalLocations",
-        "The Stop command fits the 110-column box; absolute paths are untruncated ui::emit lines after the box, not inside format_session_banner",
-        "Extras are never passed to cleanup_signal_files_for_prefix",
-        "Candidate construction is pure enough to unit test without a live loop"
+      "dependsOn": [
+        "FEAT-001"
       ],
+      "description": "Build SignalLocations once per loop and once per batch, and consult stop_requested only at the iteration, wave, and batch-between-PRD boundaries.\n\nDO: Loop canonical is ResolvedPaths.tasks_dir from resolve_paths, captured before startup remaps paths.prd_file onto the worktree copy. Extras, deduped after canonicalize: launch tasks dir (cwd if its final component is tasks, else cwd/tasks); actual_worktree_path/tasks when Some (not slot worktrees); git::main_repo_root_at(source_root)/tasks when Some. After canonicalize, drop a candidate that is missing, whose canonicalize fails, or that equals canonical. A path that is also canonical keeps the no-mtime rule and is not an extra. canonicalize failure does not abort startup. Batch between-PRD canonical is db_dir.join(\"tasks\") (this is .task-mgr/tasks). Batch extras use the same three roots and batch_stop_requested. Capture started_at once with SystemTime::now() before entering run_loop or run_batch (standalone: the loop-run arm in main.rs; batch: the start of run_batch). Store it on LoopRunConfig. run_batch calls engine::run_loop in-process and copies that same SystemTime onto every inner config and every inner SignalLocations. Do not call SystemTime::now() at run_loop entry or next to the sweep. handle_pause deletes the pause file that matched, including an extra-dir copy. On exit, delete only .stop-<prefix> and .pause-<prefix> from each extra. cleanup_signal_files_for_prefix still owns the canonical dir, including its global files. Do not call cleanup_signal_files_for_prefix on an extra. Banner Stop line inside the box is the command task-mgr loop stop --prefix <prefix>. After print_session_banner returns, ui::emit the canonical and extra absolute paths as untruncated stderr lines. Do not add those paths to format_session_banner.\nDO NOT: pass SignalLocations into wait_for_usage_reset, wait_for_ask_ttl_inner, transient_backoff_wait, UsageGateFn, ResetWaitFn, or account param structs. Do not add <root>/.task-mgr/tasks as an extra just because it exists. Do not recompute canonical from the remapped prd_file. Do not call git rev-parse yourself; use git::main_repo_root_at(source_root). Do not add a pause check to wave preflight. At loop start, after started_at is captured and the prefix run record is written, delete only this prefix's extra-dir .stop-<prefix> when its mtime is before or equal to that same started_at. ui::emit (not tracing-only) names the absolute path, says it was removed because it predates this process and would have been ignored, and tells the operator to run task-mgr loop stop --prefix <prefix> or create the file again at that same absolute path or at <canonical>/.stop-<prefix>. Do not delete a canonical prefix file, a global .stop, a .pause-<prefix>, or another prefix's stop file in that sweep. A failed delete still warns and does not abort startup. Do not sweep stale extra-dir global files at batch start. Do not delete a global .stop outside the canonical dir on exit. Do not abort an iteration that has already started. The in-progress iteration finishes, then the loop exits 0. Do not conflate operator stop with HorizonStopped. The Pause row inside the box may stay truncated.\n\nCallers affected: iteration.rs step 1, wave_orchestration.rs wave_preflight_check, batch.rs between-PRD check, display.rs print_session_banner call site (not format_session_banner's box), orchestrator.rs step 21, signals.rs handle_pause, LoopRunConfig in engine.rs, the LoopRunConfig literals in main.rs and batch.rs. Account waits are intentionally not callers.",
       "edgeCases": [
         "cwd already named tasks: that directory is the launch candidate, not cwd/tasks/tasks",
         "main_repo_root_at returns None: that candidate is omitted",
@@ -141,6 +129,7 @@
         "Same stale file but the delete fails: warning still printed, startup continues, file remains ignored",
         "File created after batch process start, during PRD 1, is still a stop for PRD 2"
       ],
+      "estimatedEffort": "high",
       "failureModes": [
         {
           "cause": "git::main_repo_root_at returns None",
@@ -159,6 +148,21 @@
           "expectedBehavior": "Exit cleanup may remove the extra-dir prefix stop and pause files; do not try to refcount them; do not call cleanup_signal_files_for_prefix on the extra"
         }
       ],
+      "id": "FEAT-002",
+      "modifiesBehavior": true,
+      "notes": "Learning [623]: tasks_dir derives from the PRD parent (resolve_paths, env.rs). Learning [2798]: the loop reads the worktree copy of the PRD; that copy is not the signal directory. Learning [1885]: operator stop stays exit 0; SIGINT stays 130. Learning [5558], [5567], and [5469]: operator stop stays distinct from HorizonStopped; do not retarget account waits. Learning [5835]: do not treat process cwd as the worktree root. Data contract: LoopRunConfig.started_at (src/loop_engine/engine.rs) is copied into SignalLocations.started_at. Construction sites that must set the field from the one process-start clock: src/main.rs loop-run arm, src/loop_engine/batch.rs (one value, every inner config), tests/e2e_loop.rs, tests/worktree_lifecycle_integration.rs. Tests may pass a fixed SystemTime; they must not call now() beside the sweep. Update display.rs tests that assert a cwd-relative .stop-P1 inside the box; assert the command inside the box and the absolute paths only on the ui::emit lines after print_session_banner. Slot worktrees (…-slot-N) are not candidates. One loop per database: the first of two same-prefix loops to exit may delete the shared extra-dir prefix file; document that next to the cleanup call, do not add a lock. Accepted residual: prefix stop does not interrupt an account wait. Do not file a task to thread SignalLocations into those waits.",
+      "passes": true,
+      "priority": 2,
+      "qualityDimensions": [
+        "Stop is observed at the next iteration or wave boundary, not mid-spawn, and exits 0 rather than HorizonStopped",
+        "Account-wait signatures are untouched",
+        "One process-start SystemTime is shared by every inner SignalLocations",
+        "The Stop command fits the 110-column box; absolute paths are untruncated ui::emit lines after the box, not inside format_session_banner",
+        "Extras are never passed to cleanup_signal_files_for_prefix",
+        "Candidate construction is pure enough to unit test without a live loop"
+      ],
+      "taskType": "implementation",
+      "title": "Watch launch, worktree, and main checkout at loop boundaries",
       "touchesFiles": [
         "src/loop_engine/signals.rs",
         "src/loop_engine/iteration.rs",
@@ -171,15 +175,9 @@
         "src/main.rs",
         "tests/e2e_loop.rs",
         "tests/worktree_lifecycle_integration.rs"
-      ],
-      "dependsOn": ["FEAT-001"],
-      "modifiesBehavior": true
+      ]
     },
     {
-      "id": "FEAT-003",
-      "title": "loop stop command and run records",
-      "taskType": "implementation",
-      "description": "Persist a run record next to the database the loop opened, and add nested task-mgr loop stop --prefix.\n\nDO: Write {db_dir}/loop-runs/<prefix>.json when a loop starts, before the stale extra-dir prefix sweep, and delete it at orchestrator step 21 after signal cleanup. The sweep warning names loop stop; the record must already exist so that command can see this run. Write {db_dir}/loop-runs/batch.json at run_batch start and delete it when run_batch returns, not at each inner step 21. Record pid, kind, prefix (loop record only), started-at, canonical tasks dir, cwd, worktree, main checkout, and extra tasks dirs. loop stop is a nested LoopCommand::Stop only. It resolves the db dir with resolve_db_dir (same as other subcommands). validate_prefix before joining the prefix into a filename. Do not take LockGuard. Trust a record only when that pid is alive and /proc/<pid>/cmdline, split on NUL, has some element's final path component exactly task-mgr, plus other elements that are the separate tokens loop and run, or batch and run. Not a substring. Not a longer final component. A live prefix record writes .stop-<prefix> in that record's canonical dir and does not write a global .stop. No live prefix record plus a live batch record writes global .stop in the batch record's canonical dir (.task-mgr/tasks). After the write, re-check the pid. If the pid died, unlink only the path this command just wrote. Missing record or rejected pid: non-zero exit, print candidate dirs, create nothing. Add LoopCommand::Stop and handle it in main.rs match resolved. Add .claude/skills/verify-task-mgr/features/loop-stop.md and a README row. The recipe must not invoke loop run or batch run (the helper refuses those). Prove help, missing-record refusal, and invalid-prefix refusal. Report the live-loop path skipped.\nDO NOT: take LockGuard. Do not add flat-form flags or grow resolve_loop_command's argument list. Do not write a file relative to the caller's cwd when the record is missing. Do not accept a cmdline whose final component is not exactly task-mgr, or that lacks the separate tokens (task-mgr list, task-mgr loop stop, and deprecated flat task-mgr loop <prd> do not qualify). Do not special-case the flat form into a live target. Do not unlink any stop file other than the path this command wrote. Do not hand-edit the fenced command reference in CLAUDE.md. Early initialize_loop Err paths may leave a prefix run record; overwrite it on the next successful start. Do not add a failure-path deleter for that residual.\n\nCallers affected: new match arm in src/main.rs; LoopCommand in src/cli/commands.rs. The running loop is not a caller of this command.",
       "acceptanceCriteria": [
         "Positive: with a run record whose pid is the test process and whose cmdline is stubbed as /usr/bin/task-mgr loop run (final component exactly task-mgr, separate tokens loop and run), loop stop --prefix P creates <canonical>/.stop-P and prints that absolute path",
         "Negative: a dead pid creates no file",
@@ -198,17 +196,10 @@
         "Failure mode: the process exits between the check and the write — unlink only the path this command wrote, because canonical files have no mtime gate",
         "Accepted residual: an early initialize_loop Err may leave {db_dir}/loop-runs/<prefix>.json. The next successful start overwrites it. Do not add a task to delete it on the error path"
       ],
-      "priority": 3,
-      "estimatedEffort": "high",
-      "passes": false,
-      "notes": "Learning [5620] and [5595]: commit the feature source, the feature markdown, and this task's code; do not hand-edit other PRD JSON. .task-mgr/* already gitignores loop-runs/ because !.task-mgr/tasks/ is the only re-include. Cmdline check belongs in a function that takes the raw argv bytes so tests do not need /proc. Match: some element's file_name() is exactly task-mgr, and other elements are loop and run, or batch and run. Feature map contract is in .claude/skills/verify-task-mgr/features/README.md (four H2 sections: Sub-features, How to get to it, Driving it with verify-task-mgr, Gotchas). Prove help, missing-record refusal, and invalid-prefix refusal. Report the live-loop path skipped because the harness refuses loop run and batch run. Accepted residuals: flat task-mgr loop <prd> fails closed (no run token); a prefix run record left by an early initialize_loop Err is overwritten on the next successful start. Do not file tasks to change either.",
-      "qualityDimensions": [
-        "Fail closed: no record, bad prefix, or wrong cmdline writes nothing",
-        "The file written is the record's canonical path, never the operator cwd",
-        "Pid identity is final path component exactly task-mgr plus separate argv tokens, not a substring",
-        "A dead pid unlinks only the path this command wrote",
-        "verify-task-mgr recipe never spawns loop run"
+      "dependsOn": [
+        "FEAT-002"
       ],
+      "description": "Persist a run record next to the database the loop opened, and add nested task-mgr loop stop --prefix.\n\nDO: Write {db_dir}/loop-runs/<prefix>.json when a loop starts, before the stale extra-dir prefix sweep, and delete it at orchestrator step 21 after signal cleanup. The sweep warning names loop stop; the record must already exist so that command can see this run. Write {db_dir}/loop-runs/batch.json at run_batch start and delete it when run_batch returns, not at each inner step 21. Record pid, kind, prefix (loop record only), started-at, canonical tasks dir, cwd, worktree, main checkout, and extra tasks dirs. loop stop is a nested LoopCommand::Stop only. It resolves the db dir with resolve_db_dir (same as other subcommands). validate_prefix before joining the prefix into a filename. Do not take LockGuard. Trust a record only when that pid is alive and /proc/<pid>/cmdline, split on NUL, has some element's final path component exactly task-mgr, plus other elements that are the separate tokens loop and run, or batch and run. Not a substring. Not a longer final component. A live prefix record writes .stop-<prefix> in that record's canonical dir and does not write a global .stop. No live prefix record plus a live batch record writes global .stop in the batch record's canonical dir (.task-mgr/tasks). After the write, re-check the pid. If the pid died, unlink only the path this command just wrote. Missing record or rejected pid: non-zero exit, print candidate dirs, create nothing. Add LoopCommand::Stop and handle it in main.rs match resolved. Add .claude/skills/verify-task-mgr/features/loop-stop.md and a README row. The recipe must not invoke loop run or batch run (the helper refuses those). Prove help, missing-record refusal, and invalid-prefix refusal. Report the live-loop path skipped.\nDO NOT: take LockGuard. Do not add flat-form flags or grow resolve_loop_command's argument list. Do not write a file relative to the caller's cwd when the record is missing. Do not accept a cmdline whose final component is not exactly task-mgr, or that lacks the separate tokens (task-mgr list, task-mgr loop stop, and deprecated flat task-mgr loop <prd> do not qualify). Do not special-case the flat form into a live target. Do not unlink any stop file other than the path this command wrote. Do not hand-edit the fenced command reference in CLAUDE.md. Early initialize_loop Err paths may leave a prefix run record; overwrite it on the next successful start. Do not add a failure-path deleter for that residual.\n\nCallers affected: new match arm in src/main.rs; LoopCommand in src/cli/commands.rs. The running loop is not a caller of this command.",
       "edgeCases": [
         "Record pid dead: no file, non-zero exit",
         "Record pid alive but argv is task-mgr list: no file",
@@ -218,6 +209,7 @@
         "Prefix record and batch record both live: write only the prefix file",
         "Only batch.json live: write global .stop in .task-mgr/tasks"
       ],
+      "estimatedEffort": "high",
       "failureModes": [
         {
           "cause": "Record JSON is missing or unreadable",
@@ -228,6 +220,20 @@
           "expectedBehavior": "Unlink only that written path before returning; leave every other stop and pause file"
         }
       ],
+      "id": "FEAT-003",
+      "modifiesBehavior": true,
+      "notes": "Learning [5620] and [5595]: commit the feature source, the feature markdown, and this task's code; do not hand-edit other PRD JSON. .task-mgr/* already gitignores loop-runs/ because !.task-mgr/tasks/ is the only re-include. Cmdline check belongs in a function that takes the raw argv bytes so tests do not need /proc. Match: some element's file_name() is exactly task-mgr, and other elements are loop and run, or batch and run. Feature map contract is in .claude/skills/verify-task-mgr/features/README.md (four H2 sections: Sub-features, How to get to it, Driving it with verify-task-mgr, Gotchas). Prove help, missing-record refusal, and invalid-prefix refusal. Report the live-loop path skipped because the harness refuses loop run and batch run. Accepted residuals: flat task-mgr loop <prd> fails closed (no run token); a prefix run record left by an early initialize_loop Err is overwritten on the next successful start. Do not file tasks to change either.",
+      "passes": true,
+      "priority": 3,
+      "qualityDimensions": [
+        "Fail closed: no record, bad prefix, or wrong cmdline writes nothing",
+        "The file written is the record's canonical path, never the operator cwd",
+        "Pid identity is final path component exactly task-mgr plus separate argv tokens, not a substring",
+        "A dead pid unlinks only the path this command wrote",
+        "verify-task-mgr recipe never spawns loop run"
+      ],
+      "taskType": "implementation",
+      "title": "loop stop command and run records",
       "touchesFiles": [
         "src/cli/commands.rs",
         "src/main.rs",
@@ -236,15 +242,9 @@
         "src/loop_engine/signals.rs",
         ".claude/skills/verify-task-mgr/features/loop-stop.md",
         ".claude/skills/verify-task-mgr/features/README.md"
-      ],
-      "dependsOn": ["FEAT-002"],
-      "modifiesBehavior": true
+      ]
     },
     {
-      "id": "FEAT-004",
-      "title": "Gitignore, module note, and operator skill stop instructions",
-      "taskType": "implementation",
-      "description": "Stop the instructions that tell agents to touch a relative stop file, and ignore the files so a correct write is not committed.\n\nDO: Gitignore tasks/.stop, tasks/.stop-*, tasks/.pause, tasks/.pause-*, the .task-mgr/tasks twins, and tasks/.loop-pid-*. Add one paragraph to src/loop_engine/CLAUDE.md: canonical is resolve_paths tasks_dir (not the remapped PRD); extra dirs are prefix-only and strictly after the one process-start SystemTime; a path that canonicalizes to canonical is not an extra; a stale extra-dir prefix stop file is deleted at start with a recreate warning; exit cleanup of extras deletes .stop-<prefix> and .pause-<prefix> only and does not call cleanup_signal_files_for_prefix on an extra; batch between-PRD global lives in db_dir/tasks; do not collapse this to one directory. In /home/chris/.grok/skills/loop-operator/SKILL.md replace the STOP_FILE rows and the 'relative to the repo root' stop guidance. In /home/chris/.grok/skills/loop-operator/references/operator-playbook.md replace both Variable blocks and both Abort blocks. In /home/chris/.grok/skills/loop-monitor/SKILL.md replace the stop-file line. Abort text is task-mgr loop stop --prefix \"$PREFIX\". Say a different prefix is unaffected because the command wrote a prefix file.\nDO NOT: tell the agent to delete stop files after the pid exits. Do not leave a touch tasks/.stop-<PREFIX> recipe anywhere in those three files. Do not document deprecated flat task-mgr loop <prd> as a working loop-stop target. Do not tell operators to thread stop into account waits or to treat operator stop as HorizonStopped. Do not hand-edit the TASK_MGR:BEGIN fence in the root CLAUDE.md. Do not copy the skill files into the repo.",
       "acceptanceCriteria": [
         "Positive: rg 'touch tasks/.stop' over ~/.grok/skills/loop-operator and ~/.grok/skills/loop-monitor returns no matches",
         "Positive: both skills name task-mgr loop stop --prefix as the abort",
@@ -254,38 +254,40 @@
         "Negative: the root CLAUDE.md fenced command reference is unchanged by this task",
         "Known-bad: editing only the Abort headings leaves SKILL.md Step 1 setting STOP_FILE=tasks/.stop-<PREFIX>; grep that assignment and fail if it remains"
       ],
-      "priority": 4,
-      "estimatedEffort": "medium",
-      "passes": false,
-      "notes": "Skill files are outside the git repo. Edit these in place and do not copy them into the repo: /home/chris/.grok/skills/loop-operator/SKILL.md, /home/chris/.grok/skills/loop-operator/references/operator-playbook.md, /home/chris/.grok/skills/loop-monitor/SKILL.md. They are not in touchesFiles because loop init rejects absolute paths. Learning [1359] and [1304] describe where task JSON lives; they are not a reason to watch .task-mgr/tasks as an extra stop dir. The module note exists so a later edit does not 'simplify' check_stop_signal back to one directory.",
-      "qualityDimensions": [
-        "Every operator-facing stop instruction points at loop stop",
-        "Gitignore covers prefix and global names in both tasks trees",
-        "Module note is short and names the three directories that must stay distinct"
+      "dependsOn": [
+        "FEAT-003"
       ],
+      "description": "Stop the instructions that tell agents to touch a relative stop file, and ignore the files so a correct write is not committed.\n\nDO: Gitignore tasks/.stop, tasks/.stop-*, tasks/.pause, tasks/.pause-*, the .task-mgr/tasks twins, and tasks/.loop-pid-*. Add one paragraph to src/loop_engine/CLAUDE.md: canonical is resolve_paths tasks_dir (not the remapped PRD); extra dirs are prefix-only and strictly after the one process-start SystemTime; a path that canonicalizes to canonical is not an extra; a stale extra-dir prefix stop file is deleted at start with a recreate warning; exit cleanup of extras deletes .stop-<prefix> and .pause-<prefix> only and does not call cleanup_signal_files_for_prefix on an extra; batch between-PRD global lives in db_dir/tasks; do not collapse this to one directory. In /home/chris/.grok/skills/loop-operator/SKILL.md replace the STOP_FILE rows and the 'relative to the repo root' stop guidance. In /home/chris/.grok/skills/loop-operator/references/operator-playbook.md replace both Variable blocks and both Abort blocks. In /home/chris/.grok/skills/loop-monitor/SKILL.md replace the stop-file line. Abort text is task-mgr loop stop --prefix \"$PREFIX\". Say a different prefix is unaffected because the command wrote a prefix file.\nDO NOT: tell the agent to delete stop files after the pid exits. Do not leave a touch tasks/.stop-<PREFIX> recipe anywhere in those three files. Do not document deprecated flat task-mgr loop <prd> as a working loop-stop target. Do not tell operators to thread stop into account waits or to treat operator stop as HorizonStopped. Do not hand-edit the TASK_MGR:BEGIN fence in the root CLAUDE.md. Do not copy the skill files into the repo.",
       "edgeCases": [
         "Global tasks/.stop and prefix tasks/.stop-<id> are both ignored",
         ".task-mgr/tasks/.stop is ignored without un-ignoring the rest of .task-mgr/tasks JSON",
         "Skill text still describes per-prefix isolation, but only as a consequence of the command"
       ],
+      "estimatedEffort": "medium",
       "failureModes": [
         {
           "cause": "A skill file path is missing",
           "expectedBehavior": "Stop and report the missing path; do not recreate a second copy inside the repo"
         }
       ],
+      "id": "FEAT-004",
+      "modifiesBehavior": false,
+      "notes": "Skill files are outside the git repo. Edit these in place and do not copy them into the repo: /home/chris/.grok/skills/loop-operator/SKILL.md, /home/chris/.grok/skills/loop-operator/references/operator-playbook.md, /home/chris/.grok/skills/loop-monitor/SKILL.md. They are not in touchesFiles because loop init rejects absolute paths. Learning [1359] and [1304] describe where task JSON lives; they are not a reason to watch .task-mgr/tasks as an extra stop dir. The module note exists so a later edit does not 'simplify' check_stop_signal back to one directory.",
+      "passes": true,
+      "priority": 4,
+      "qualityDimensions": [
+        "Every operator-facing stop instruction points at loop stop",
+        "Gitignore covers prefix and global names in both tasks trees",
+        "Module note is short and names the three directories that must stay distinct"
+      ],
+      "taskType": "implementation",
+      "title": "Gitignore, module note, and operator skill stop instructions",
       "touchesFiles": [
         ".gitignore",
         "src/loop_engine/CLAUDE.md"
-      ],
-      "dependsOn": ["FEAT-003"],
-      "modifiesBehavior": false
+      ]
     },
     {
-      "id": "REFACTOR-001",
-      "title": "Review for refactoring opportunities",
-      "taskType": "review",
-      "description": "Review the stop-location helper, its three call sites, and loop stop for DRY violations, complexity, and coupling.\n\nDO: Check for a second copy of the mtime or cmdline rule, a second SystemTime::now() at run_loop entry or beside the sweep, functions over 30 lines, a SignalLocations field that leaked into account waits, cleanup_signal_files_for_prefix called on an extra, and absolute paths stuffed into format_session_banner.\nDO NOT: Skip. Do not collapse canonical and extra dirs into one exists() check. Do not spawn work that threads SignalLocations into account waits, treats flat task-mgr loop <prd> as a live loop-stop target, deletes a run record on early initialize_loop Err, untruncates the Pause row, or conflates operator stop with HorizonStopped.",
       "acceptanceCriteria": [
         "No second implementation of the mtime comparison or the cmdline token check",
         "started_at is captured once per process and copied; run_loop and the stale sweep do not call SystemTime::now()",
@@ -296,29 +298,34 @@
         "Account wait signatures are still unchanged",
         "Any issues found spawn REFACTOR-FIX-xxx tasks via task-mgr add --stdin --from-json tasks/loop-stop-locations.json --depended-on-by REVIEW-001"
       ],
-      "priority": 98,
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004"
+      ],
+      "description": "Review the stop-location helper, its three call sites, and loop stop for DRY violations, complexity, and coupling.\n\nDO: Check for a second copy of the mtime or cmdline rule, a second SystemTime::now() at run_loop entry or beside the sweep, functions over 30 lines, a SignalLocations field that leaked into account waits, cleanup_signal_files_for_prefix called on an extra, and absolute paths stuffed into format_session_banner.\nDO NOT: Skip. Do not collapse canonical and extra dirs into one exists() check. Do not spawn work that threads SignalLocations into account waits, treats flat task-mgr loop <prd> as a live loop-stop target, deletes a run record on early initialize_loop Err, untruncates the Pause row, or conflates operator stop with HorizonStopped.",
       "estimatedEffort": "high",
-      "passes": false,
-      "timeoutSecs": 1800,
+      "id": "REFACTOR-001",
       "notes": "If issues found: echo '{...}' | task-mgr add --stdin --from-json tasks/loop-stop-locations.json --depended-on-by REVIEW-001 for each (priority 50-97). If no issues, emit <task-status>REFACTOR-001:done</task-status>.",
+      "passes": false,
+      "priority": 98,
       "qualityDimensions": [
         "DRY across the loop and batch candidate builders",
         "Single-responsibility functions",
         "Pattern consistency with signals.rs tests"
       ],
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Review for refactoring opportunities",
       "touchesFiles": [
         "src/loop_engine/signals.rs",
         "src/loop_engine/batch.rs",
         "src/loop_engine/orchestrator.rs",
         "src/main.rs"
-      ],
-      "dependsOn": ["FEAT-001", "FEAT-002", "FEAT-003", "FEAT-004"]
+      ]
     },
     {
-      "id": "REVIEW-001",
-      "title": "Code review and final verification",
-      "taskType": "review",
-      "description": "Review stop locations and loop stop for wiring, safety, and docs. Run the full unscoped suite.\n\nDO: Confirm iteration, wave, and batch call the new helper; confirm account waits do not; confirm one process-start SystemTime is copied into every inner SignalLocations; confirm loop stop is reachable from main.rs; drive the loop-stop verify recipe. Fix every pre-existing failure or spawn it.\nDO NOT: Scope the suite. Do not treat a green unit test as a substitute for the verify-task-mgr recipe. Do not reopen the four accepted Low residuals: prefix stop during an account wait, flat task-mgr loop <prd> as a live loop-stop target, a prefix run record left by early initialize_loop Err, or a truncated Pause row inside the banner. Do not conflate operator stop with HorizonStopped. Do not hand-roll a second harness.",
       "acceptanceCriteria": [
         "Positive: LoopCommand::Stop is matched in src/main.rs and loop stop --help lists --prefix",
         "Positive: iteration.rs, wave_orchestration.rs, and batch.rs call the new helper; rg of check_stop_signal in reactions/account.rs is unchanged in count and still passes None; the stale sweep and run_loop entry do not call SystemTime::now() to set started_at",
@@ -330,23 +337,69 @@
         "Pre-existing test failures fixed, or one FIX-xxx spawned via task-mgr add --stdin --from-json tasks/loop-stop-locations.json --depended-on-by REVIEW-001 when more than about 12 are unrelated",
         "If issues found: FIX-xxx spawned the same way"
       ],
-      "priority": 99,
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "REFACTOR-001",
+        "REFACTOR-FIX-001",
+        "REFACTOR-FIX-002"
+      ],
+      "description": "Review stop locations and loop stop for wiring, safety, and docs. Run the full unscoped suite.\n\nDO: Confirm iteration, wave, and batch call the new helper; confirm account waits do not; confirm one process-start SystemTime is copied into every inner SignalLocations; confirm loop stop is reachable from main.rs; drive the loop-stop verify recipe. Fix every pre-existing failure or spawn it.\nDO NOT: Scope the suite. Do not treat a green unit test as a substitute for the verify-task-mgr recipe. Do not reopen the four accepted Low residuals: prefix stop during an account wait, flat task-mgr loop <prd> as a live loop-stop target, a prefix run record left by early initialize_loop Err, or a truncated Pause row inside the banner. Do not conflate operator stop with HorizonStopped. Do not hand-roll a second harness.",
       "estimatedEffort": "high",
-      "passes": false,
-      "timeoutSecs": 1800,
+      "id": "REVIEW-001",
       "notes": "Spawn fixes via echo '{...}' | task-mgr add --stdin --from-json tasks/loop-stop-locations.json --depended-on-by REVIEW-001. Follow .claude/skills/verify-task-mgr/SKILL.md and features/loop-stop.md. Helper refuses loop run and batch run; do not bypass it. Report the live-loop path skipped. Learning [1885]: operator stop exit 0 vs signal 130. Learning [5558] and [5469]: HorizonStopped is not this stop file. Do not spawn tasks for the four accepted Lows.",
+      "passes": false,
+      "priority": 99,
       "qualityDimensions": [
         "New command is reachable from main",
         "Full suite green including pre-existing failures",
         "verify-task-mgr loop-stop recipe driven without launching a loop"
       ],
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Code review and final verification",
       "touchesFiles": [
         "src/loop_engine/signals.rs",
         "src/main.rs",
         "src/loop_engine/CLAUDE.md",
         ".claude/skills/verify-task-mgr/features/loop-stop.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Single shared mtime-read helper used by file_mtime_strictly_after and sweep_stale_extra_prefix_stops",
+        "Sweep still leaves the file in place when metadata/mtime is unreadable",
+        "No second inline mtime > started_at comparison for stop freshness",
+        "Existing signals:: unit tests for stop/pause/batch/sweep still pass"
       ],
-      "dependsOn": ["FEAT-001", "FEAT-002", "FEAT-003", "FEAT-004", "REFACTOR-001"]
+      "description": "sweep_stale_extra_prefix_stops inlines fs::metadata + mtime > started_at instead of sharing the mtime rule with file_mtime_strictly_after. Extract a shared mtime reader (Option/Result) so predicates and the stale sweep cannot drift; keep sweep error semantics (unreadable mtime leaves the file in place).",
+      "estimatedEffort": "medium",
+      "id": "REFACTOR-FIX-001",
+      "passes": false,
+      "priority": 90,
+      "title": "Consolidate sweep_stale mtime onto shared helper",
+      "touchesFiles": [
+        "src/loop_engine/signals.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Each of loop_stop_with, sweep_stale_extra_prefix_stops, write_stop_and_recheck, build_signal_locations_with_cwd, remove_matching_pause_file is under 30 lines OR has an explicit doc note why it stays longer",
+        "Behavior of loop stop, stale sweep, location build, and pause-file removal is unchanged",
+        "signals:: tests still pass"
+      ],
+      "description": "Stop-location helpers exceed the 30-line target with no explicit note: loop_stop_with (69), sweep_stale_extra_prefix_stops (49), write_stop_and_recheck (42), build_signal_locations_with_cwd (37), remove_matching_pause_file (31). Split into smaller helpers or add a short doc note explaining why each longer function stays. Pre-existing read_lines_with_timeout is out of scope.",
+      "estimatedEffort": "medium",
+      "id": "REFACTOR-FIX-002",
+      "passes": false,
+      "priority": 88,
+      "title": "Split or annotate stop-location fns over 30 lines",
+      "touchesFiles": [
+        "src/loop_engine/signals.rs"
+      ]
     }
-  ]
+  ],
+  "version": "1.0"
 }
