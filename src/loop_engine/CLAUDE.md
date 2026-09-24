@@ -712,7 +712,10 @@ Exit cleanup on extras deletes `.stop-<prefix>` and `.pause-<prefix>` only —
 never call `cleanup_signal_files_for_prefix` on an extra (that would also drop
 a global `.stop` there). Batch between-PRD global `.stop` lives in
 `db_dir/tasks`, a separate directory from the inner-loop canonical; do not
-collapse check_stop / SignalLocations back to one directory.
+collapse check_stop / SignalLocations back to one directory. When the
+between-PRD check honors that canonical `.stop`, `consume_batch_canonical_stop`
+unlinks it before the batch returns. Leaving it stops the next batch. Extras
+and `.pause` stay. A failed unlink still stops the batch.
 
 ## Iteration pipeline (shared)
 
