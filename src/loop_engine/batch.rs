@@ -14,7 +14,7 @@ use crate::loop_engine::config::LoopConfig;
 use crate::loop_engine::engine::{self, LoopResult, LoopRunConfig};
 use crate::loop_engine::project_config::{preflight_validate_and_probe, read_project_config};
 use crate::loop_engine::signals::{
-    BatchRunRecordGuard, batch_stop_requested, build_signal_locations,
+    BatchRunRecordGuard, batch_stop_requested, build_signal_locations, consume_batch_canonical_stop,
 };
 use crate::loop_engine::status_queries;
 use crate::loop_engine::worktree;
@@ -672,6 +672,10 @@ pub async fn run_batch(
         // or before the batch even starts its first PRD).
         if batch_stop_requested(&batch_signal_locations) {
             ui::emit("Stop signal detected, skipping remaining PRDs");
+            // Canonical .task-mgr/tasks/.stop must not outlive the batch that
+            // honored it (next batch would skip every PRD). Extras / .pause
+            // are left alone; unlink failure still stops (warn via tracing).
+            consume_batch_canonical_stop(&batch_signal_locations);
             push_remaining_skipped(&mut results, &pairs, i, &mut skipped);
             break;
         }
@@ -1135,7 +1139,7 @@ mod tests {
     #[test]
     fn test_stop_signal_detected_between_prds() {
         use crate::loop_engine::signals::{
-            SignalLocations, batch_stop_requested, check_stop_signal,
+            SignalLocations, batch_stop_requested, check_stop_signal, consume_batch_canonical_stop,
         };
         use std::time::{Duration, SystemTime};
 
@@ -1152,6 +1156,11 @@ mod tests {
             started_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_000),
         };
         assert!(batch_stop_requested(&locs));
+        // Honoring the stop consumes the canonical file so a later batch
+        // does not skip every PRD.
+        consume_batch_canonical_stop(&locs);
+        assert!(!temp_dir.path().join(STOP_FILE).exists());
+        assert!(!batch_stop_requested(&locs));
     }
 
     // --- cleanup_worktree_after_prd tests ---

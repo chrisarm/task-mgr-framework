@@ -365,6 +365,26 @@ pub fn batch_stop_requested(locations: &SignalLocations) -> bool {
     false
 }
 
+/// Unlink the batch-canonical global `.stop` after the batch has honored it.
+///
+/// Called when the between-PRD check stops because
+/// [`batch_stop_requested`] saw a canonical `.stop`. Leaves extra-dir global
+/// `.stop` files, `.pause`, and prefix files alone. A failed unlink is warned
+/// via `tracing` and does not change the stop decision — the batch still stops.
+pub fn consume_batch_canonical_stop(locations: &SignalLocations) {
+    let path = locations.canonical.join(STOP_FILE);
+    if !path.exists() {
+        return;
+    }
+    if let Err(e) = fs::remove_file(&path) {
+        tracing::warn!(
+            path = %path.display(),
+            error = %e,
+            "failed to remove batch-canonical .stop after honoring it"
+        );
+    }
+}
+
 /// Launch `tasks/` candidate: `cwd` when its final component is `tasks`, else
 /// `cwd/tasks`. Does not create the directory.
 pub fn launch_tasks_candidate(cwd: &Path) -> PathBuf {
@@ -1667,6 +1687,61 @@ mod tests {
         write_with_mtime(&extra.path().join(".stop-P1"), epoch_plus(2_000));
         let locs = locations(canonical.path(), &[extra.path()], started);
         assert!(!batch_stop_requested(&locs));
+    }
+
+    #[test]
+    fn consume_batch_canonical_stop_unlinks_canonical_leaves_extra_and_pause() {
+        let started = epoch_plus(1_000);
+        let canonical = TempDir::new().unwrap();
+        let extra = TempDir::new().unwrap();
+        let stop = canonical.path().join(STOP_FILE);
+        let pause = canonical.path().join(PAUSE_FILE);
+        let extra_stop = extra.path().join(STOP_FILE);
+        fs::write(&stop, "").unwrap();
+        fs::write(&pause, "").unwrap();
+        write_with_mtime(&extra_stop, epoch_plus(2_000));
+
+        let locs = locations(canonical.path(), &[extra.path()], started);
+        assert!(batch_stop_requested(&locs));
+
+        consume_batch_canonical_stop(&locs);
+
+        assert!(!stop.exists(), "canonical .stop must be consumed");
+        assert!(pause.exists(), "canonical .pause must remain");
+        assert!(extra_stop.exists(), "extra-dir global .stop must remain");
+        // Extra still fresh → predicate stays true; isolating the canonical
+        // consume: a locations with no extras must now report false.
+        let locs_canonical_only = locations(canonical.path(), &[], started);
+        assert!(!batch_stop_requested(&locs_canonical_only));
+        assert!(batch_stop_requested(&locs));
+    }
+
+    #[test]
+    fn consume_batch_canonical_stop_noop_when_absent() {
+        let canonical = TempDir::new().unwrap();
+        let locs = locations(canonical.path(), &[], epoch_plus(1_000));
+        consume_batch_canonical_stop(&locs);
+        assert!(!batch_stop_requested(&locs));
+    }
+
+    #[test]
+    fn consume_batch_canonical_stop_warns_on_unlink_failure_and_leaves_stop_true() {
+        // A directory named `.stop` makes remove_file fail; the batch must
+        // still treat the signal as honored (predicate stays true).
+        let canonical = TempDir::new().unwrap();
+        let stop_as_dir = canonical.path().join(STOP_FILE);
+        fs::create_dir_all(&stop_as_dir).unwrap();
+        let locs = locations(canonical.path(), &[], epoch_plus(1_000));
+        assert!(batch_stop_requested(&locs));
+        consume_batch_canonical_stop(&locs);
+        assert!(
+            stop_as_dir.exists(),
+            "failed unlink must leave the path in place"
+        );
+        assert!(
+            batch_stop_requested(&locs),
+            "failed consume still reports stop so the batch breaks"
+        );
     }
 
     #[test]
