@@ -113,22 +113,25 @@ pub fn handle_pause(
     has_guidance
 }
 
+/// Best-effort unlink; warn on failure, never panic.
+fn try_remove_signal_file(path: &Path) {
+    if let Err(e) = fs::remove_file(path) {
+        tracing::warn!("could not remove {}: {}", path.display(), e);
+    }
+}
+
 /// Delete the pause file [`pause_requested`] would have matched (first hit).
 fn remove_matching_pause_file(locations: &SignalLocations, prefix: Option<&str>) {
     if let Some(p) = prefix {
         let prefix_path = locations.canonical.join(format!("{PAUSE_FILE}-{p}"));
         if prefix_path.exists() {
-            if let Err(e) = fs::remove_file(&prefix_path) {
-                tracing::warn!("could not remove {}: {}", prefix_path.display(), e);
-            }
+            try_remove_signal_file(&prefix_path);
             return;
         }
     }
     let global = locations.canonical.join(PAUSE_FILE);
     if global.exists() {
-        if let Err(e) = fs::remove_file(&global) {
-            tracing::warn!("could not remove {}: {}", global.display(), e);
-        }
+        try_remove_signal_file(&global);
         return;
     }
     let Some(p) = prefix else {
@@ -138,9 +141,7 @@ fn remove_matching_pause_file(locations: &SignalLocations, prefix: Option<&str>)
     for dir in &locations.extras {
         let path = dir.join(&name);
         if path.exists() && file_mtime_strictly_after(&path, locations.started_at) {
-            if let Err(e) = fs::remove_file(&path) {
-                tracing::warn!("could not remove {}: {}", path.display(), e);
-            }
+            try_remove_signal_file(&path);
             return;
         }
     }
@@ -389,6 +390,25 @@ pub fn build_signal_locations(
     )
 }
 
+/// Canonicalize `raw` candidates, drop missing/errors, drop equals-canonical, dedupe.
+fn collect_deduped_extra_tasks_dirs(raw: Vec<PathBuf>, canonical: &Path) -> Vec<PathBuf> {
+    let canonical_key = fs::canonicalize(canonical).unwrap_or_else(|_| canonical.to_path_buf());
+    let mut extras = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for cand in raw {
+        let Ok(canon) = fs::canonicalize(&cand) else {
+            continue;
+        };
+        if canon == canonical_key {
+            continue;
+        }
+        if seen.insert(canon.clone()) {
+            extras.push(canon);
+        }
+    }
+    extras
+}
+
 /// Same as [`build_signal_locations`] with an explicit launch cwd (testable).
 pub fn build_signal_locations_with_cwd(
     canonical: PathBuf,
@@ -405,27 +425,65 @@ pub fn build_signal_locations_with_cwd(
     if let Some(main) = crate::git::main_repo_root_at(source_root) {
         raw.push(main.join("tasks"));
     }
-
-    let canonical_key = fs::canonicalize(&canonical).unwrap_or_else(|_| canonical.clone());
-    let mut extras = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for cand in raw {
-        let Ok(canon) = fs::canonicalize(&cand) else {
-            continue;
-        };
-        if canon == canonical_key {
-            continue;
-        }
-        if seen.insert(canon.clone()) {
-            extras.push(canon);
-        }
-    }
-
+    let extras = collect_deduped_extra_tasks_dirs(raw, &canonical);
     SignalLocations {
         canonical,
         extras,
         started_at,
     }
+}
+
+/// Operator-facing notice after attempting to delete one stale extra-dir stop.
+fn emit_stale_stop_sweep_notice(
+    path: &Path,
+    prefix: &str,
+    canonical: &Path,
+    remove_err: Option<std::io::Error>,
+) {
+    let abs = path.display().to_string();
+    let canonical_stop = canonical
+        .join(format!("{STOP_FILE}-{prefix}"))
+        .display()
+        .to_string();
+    let lead = if remove_err.is_some() {
+        format!(
+            "Stale stop file {abs} predates this process and would have been ignored \
+(could not delete it)"
+        )
+    } else {
+        format!(
+            "Removed stale stop file {abs} because it predates this process and would have been ignored"
+        )
+    };
+    ui::emit(&format!(
+        "{lead}. To stop this run, use `task-mgr loop stop --prefix {prefix}` or create the file again at {abs} or at {canonical_stop}."
+    ));
+    if let Some(e) = remove_err {
+        tracing::warn!("failed to delete stale stop {abs}: {e}");
+    }
+}
+
+/// Delete one extra-dir `.stop-<prefix>` when mtime ≤ `started_at`, then notify.
+fn sweep_one_stale_extra_stop(path: &Path, started_at: SystemTime, prefix: &str, canonical: &Path) {
+    if !path.exists() {
+        return;
+    }
+    let mtime = match fs::metadata(path).and_then(|m| m.modified()) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(
+                "could not read mtime for stale-stop candidate {}: {}; leaving in place",
+                path.display(),
+                e
+            );
+            return;
+        }
+    };
+    if mtime > started_at {
+        return;
+    }
+    let remove_err = fs::remove_file(path).err();
+    emit_stale_stop_sweep_notice(path, prefix, canonical, remove_err);
 }
 
 /// At loop start: delete each extra-dir `.stop-<prefix>` whose mtime is before
@@ -441,47 +499,12 @@ pub fn sweep_stale_extra_prefix_stops(locations: &SignalLocations, prefix: Optio
     };
     let name = format!("{STOP_FILE}-{p}");
     for dir in &locations.extras {
-        let path = dir.join(&name);
-        if !path.exists() {
-            continue;
-        }
-        let mtime = match fs::metadata(&path).and_then(|m| m.modified()) {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!(
-                    "could not read mtime for stale-stop candidate {}: {}; leaving in place",
-                    path.display(),
-                    e
-                );
-                continue;
-            }
-        };
-        if mtime > locations.started_at {
-            continue;
-        }
-        let abs = path.display().to_string();
-        let canonical_stop = locations
-            .canonical
-            .join(format!("{STOP_FILE}-{p}"))
-            .display()
-            .to_string();
-        let remove_err = fs::remove_file(&path).err();
-        let lead = if remove_err.is_some() {
-            format!(
-                "Stale stop file {abs} predates this process and would have been ignored \
-(could not delete it)"
-            )
-        } else {
-            format!(
-                "Removed stale stop file {abs} because it predates this process and would have been ignored"
-            )
-        };
-        ui::emit(&format!(
-            "{lead}. To stop this run, use `task-mgr loop stop --prefix {p}` or create the file again at {abs} or at {canonical_stop}."
-        ));
-        if let Some(e) = remove_err {
-            tracing::warn!("failed to delete stale stop {abs}: {e}");
-        }
+        sweep_one_stale_extra_stop(
+            &dir.join(&name),
+            locations.started_at,
+            p,
+            &locations.canonical,
+        );
     }
 }
 
@@ -773,6 +796,27 @@ fn stop_file_for_batch_record(record: &RunRecord) -> PathBuf {
     record.canonical_tasks_dir.join(STOP_FILE)
 }
 
+/// Unlink a stop file written for a pid that died (or no longer qualifies)
+/// between check and write. Canonical stops have no mtime gate, so leaving the
+/// file would halt a future run.
+fn dead_pid_after_stop_write(written: &Path, record: &RunRecord) -> TaskMgrError {
+    if let Err(e) = fs::remove_file(written) {
+        tracing::warn!(
+            "could not unlink stop file after dead-pid recheck {}: {}",
+            written.display(),
+            e
+        );
+    }
+    TaskMgrError::InvalidState {
+        resource_type: "Loop run".to_string(),
+        id: record.pid.to_string(),
+        expected: "still-alive task-mgr loop/batch run".to_string(),
+        actual: "process exited or cmdline no longer qualifies after stop write; \
+                 removed the stop file this command created"
+            .to_string(),
+    }
+}
+
 /// Write the stop file, then re-check the pid. If the process is no longer a
 /// trusted live target, unlink **only** `written` and return an error.
 fn write_stop_and_recheck<FAlive, FCmd>(
@@ -797,25 +841,7 @@ where
     if record_is_live(record, is_alive, read_cmdline) {
         return Ok(written.to_path_buf());
     }
-
-    // Pid died (or cmdline no longer qualifies) between check and write —
-    // unlink only the path this command wrote. Canonical files have no mtime
-    // gate, so a stale stop would halt a future run.
-    if let Err(e) = fs::remove_file(written) {
-        tracing::warn!(
-            "could not unlink stop file after dead-pid recheck {}: {}",
-            written.display(),
-            e
-        );
-    }
-    Err(TaskMgrError::InvalidState {
-        resource_type: "Loop run".to_string(),
-        id: record.pid.to_string(),
-        expected: "still-alive task-mgr loop/batch run".to_string(),
-        actual: "process exited or cmdline no longer qualifies after stop write; \
-                 removed the stop file this command created"
-            .to_string(),
-    })
+    Err(dead_pid_after_stop_write(written, record))
 }
 
 /// Operator `task-mgr loop stop --prefix <prefix>` (production `/proc` + kill 0).
@@ -826,6 +852,125 @@ where
 /// the caller's cwd when no record is live.
 pub fn loop_stop(db_dir: &Path, prefix: &str) -> TaskMgrResult<PathBuf> {
     loop_stop_with(db_dir, prefix, pid_is_alive, read_proc_cmdline)
+}
+
+/// Emit status for one run-record path: missing, or present but not live.
+fn emit_stale_or_missing_record(
+    kind: &str,
+    path: &Path,
+    record: &Option<RunRecord>,
+    not_live_phrase: &str,
+) {
+    if let Some(rec) = record {
+        ui::emit_err(&format!(
+            "{kind} record at {} exists but pid {} is not a live task-mgr {not_live_phrase} run.",
+            path.display(),
+            rec.pid
+        ));
+        emit_candidate_dirs(rec);
+    } else {
+        ui::emit_err(&format!(
+            "No {} record at {}.",
+            kind.to_ascii_lowercase(),
+            path.display()
+        ));
+    }
+}
+
+/// Fail-closed diagnostics when no live prefix or batch record can be stopped.
+fn emit_no_live_run_diagnostics(
+    db_dir: &Path,
+    prefix: &str,
+    prefix_path: &Path,
+    batch_path: &Path,
+    prefix_record: &Option<RunRecord>,
+    batch_record: &Option<RunRecord>,
+) {
+    ui::emit_err(&format!(
+        "No live loop or batch run found for prefix '{prefix}' under {}.",
+        loop_runs_dir(db_dir).display()
+    ));
+    emit_stale_or_missing_record("Prefix", prefix_path, prefix_record, "loop/batch");
+    emit_stale_or_missing_record("Batch", batch_path, batch_record, "batch/loop");
+}
+
+/// If `record` is live, write its stop file and recheck; else `None`.
+fn try_stop_from_record<FAlive, FCmd, FPath>(
+    record: &Option<RunRecord>,
+    make_stop_path: FPath,
+    is_alive: &FAlive,
+    read_cmdline: &FCmd,
+) -> Option<TaskMgrResult<PathBuf>>
+where
+    FAlive: Fn(u32) -> bool,
+    FCmd: Fn(u32) -> Option<Vec<OsString>>,
+    FPath: FnOnce(&RunRecord) -> PathBuf,
+{
+    let Some(rec) = record else {
+        return None;
+    };
+    if !record_is_live(rec, is_alive, read_cmdline) {
+        return None;
+    }
+    let written = make_stop_path(rec);
+    Some(write_stop_and_recheck(
+        &written,
+        rec,
+        is_alive,
+        read_cmdline,
+    ))
+}
+
+/// After prefix validation: try live prefix record, then live batch record,
+/// else fail closed with diagnostics.
+///
+/// Stays as one function (above the 30-line helper target) so the
+/// prefix→batch→fail-closed order and deferred batch-record load remain
+/// obvious; further splits would only add call indirection.
+fn loop_stop_resolve_and_write<FAlive, FCmd>(
+    db_dir: &Path,
+    prefix: &str,
+    is_alive: FAlive,
+    read_cmdline: FCmd,
+) -> TaskMgrResult<PathBuf>
+where
+    FAlive: Fn(u32) -> bool,
+    FCmd: Fn(u32) -> Option<Vec<OsString>>,
+{
+    let prefix_path = loop_runs_dir(db_dir).join(format!("{prefix}.json"));
+    let prefix_record = load_run_record(&prefix_path);
+    if let Some(result) = try_stop_from_record(
+        &prefix_record,
+        |rec| stop_file_for_prefix_record(rec, prefix),
+        &is_alive,
+        &read_cmdline,
+    ) {
+        return result;
+    }
+
+    let batch_path = batch_run_record_path(db_dir);
+    let batch_record = load_run_record(&batch_path);
+    if let Some(result) = try_stop_from_record(
+        &batch_record,
+        stop_file_for_batch_record,
+        &is_alive,
+        &read_cmdline,
+    ) {
+        return result;
+    }
+
+    emit_no_live_run_diagnostics(
+        db_dir,
+        prefix,
+        &prefix_path,
+        &batch_path,
+        &prefix_record,
+        &batch_record,
+    );
+    Err(TaskMgrError::NotFound {
+        resource_type: "Live loop/batch run".to_string(),
+        id: prefix.to_string(),
+    })
 }
 
 /// Testable `loop stop` with injectable liveness and cmdline readers.
@@ -846,57 +991,7 @@ where
             message: msg,
         });
     }
-
-    let prefix_path = loop_runs_dir(db_dir).join(format!("{prefix}.json"));
-    let batch_path = batch_run_record_path(db_dir);
-
-    let prefix_record = load_run_record(&prefix_path);
-    if let Some(ref rec) = prefix_record
-        && record_is_live(rec, &is_alive, &read_cmdline)
-    {
-        let written = stop_file_for_prefix_record(rec, prefix);
-        return write_stop_and_recheck(&written, rec, &is_alive, &read_cmdline);
-    }
-
-    let batch_record = load_run_record(&batch_path);
-    if let Some(ref rec) = batch_record
-        && record_is_live(rec, &is_alive, &read_cmdline)
-    {
-        let written = stop_file_for_batch_record(rec);
-        return write_stop_and_recheck(&written, rec, &is_alive, &read_cmdline);
-    }
-
-    // Fail closed: no live target. Print candidate dirs from any readable
-    // records; never create a stop file under the caller's cwd.
-    ui::emit_err(&format!(
-        "No live loop or batch run found for prefix '{prefix}' under {}.",
-        loop_runs_dir(db_dir).display()
-    ));
-    if let Some(ref rec) = prefix_record {
-        ui::emit_err(&format!(
-            "Prefix record at {} exists but pid {} is not a live task-mgr loop/batch run.",
-            prefix_path.display(),
-            rec.pid
-        ));
-        emit_candidate_dirs(rec);
-    } else {
-        ui::emit_err(&format!("No prefix record at {}.", prefix_path.display()));
-    }
-    if let Some(ref rec) = batch_record {
-        ui::emit_err(&format!(
-            "Batch record at {} exists but pid {} is not a live task-mgr batch/loop run.",
-            batch_path.display(),
-            rec.pid
-        ));
-        emit_candidate_dirs(rec);
-    } else {
-        ui::emit_err(&format!("No batch record at {}.", batch_path.display()));
-    }
-
-    Err(TaskMgrError::NotFound {
-        resource_type: "Live loop/batch run".to_string(),
-        id: prefix.to_string(),
-    })
+    loop_stop_resolve_and_write(db_dir, prefix, is_alive, read_cmdline)
 }
 
 /// Handle a human review checkpoint after a `requires_human` task completes.
