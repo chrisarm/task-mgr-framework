@@ -113,7 +113,18 @@ fn format_archived_prd(
 }
 
 fn format_skipped_prd(out: &mut String, skip: &PrdSkipReason) {
-    out.push_str(&format!("[PRD: {}]\n", skip.project));
+    match skip
+        .task_prefix
+        .as_deref()
+        .filter(|prefix| !prefix.is_empty())
+    {
+        Some(prefix) => {
+            out.push_str(&format!("[PRD: {} (prefix: {})]\n", skip.project, prefix));
+        }
+        None => {
+            out.push_str(&format!("[PRD: {}]\n", skip.project));
+        }
+    }
     out.push_str(&format!("  Skipped: {}\n\n", skip.reason));
 }
 
@@ -211,6 +222,7 @@ mod tests {
             vec![PrdSkipReason {
                 prd_id: 2,
                 project: "other-project".to_string(),
+                task_prefix: Some("PB".to_string()),
                 reason: "incomplete (2 task(s) not in terminal state)".to_string(),
             }],
             false,
@@ -218,8 +230,25 @@ mod tests {
             0,
         );
         let text = format_text(&result);
-        assert!(text.contains("PRD: other-project"));
+        assert!(text.contains("PRD: other-project (prefix: PB)"));
         assert!(text.contains("Skipped: incomplete"));
+
+        let empty_prefix = make_result(
+            vec![],
+            vec![],
+            vec![PrdSkipReason {
+                prd_id: 3,
+                project: "other-project".to_string(),
+                task_prefix: Some(String::new()),
+                reason: "Not fully completed".to_string(),
+            }],
+            false,
+            "",
+            0,
+        );
+        let empty_text = format_text(&empty_prefix);
+        assert!(empty_text.contains("[PRD: other-project]\n"));
+        assert!(!empty_text.contains("(prefix:"));
     }
 
     #[test]
@@ -240,6 +269,7 @@ mod tests {
             vec![PrdSkipReason {
                 prd_id: 2,
                 project: "q".to_string(),
+                task_prefix: None,
                 reason: "no prefix".to_string(),
             }],
             false,
@@ -308,11 +338,13 @@ mod tests {
                 PrdSkipReason {
                     prd_id: 1,
                     project: "project-a".to_string(),
+                    task_prefix: Some("PA".to_string()),
                     reason: "Not fully completed".to_string(),
                 },
                 PrdSkipReason {
                     prd_id: 2,
                     project: "project-b".to_string(),
+                    task_prefix: None,
                     reason: "No task prefix — cannot determine completion".to_string(),
                 },
             ],
@@ -326,7 +358,10 @@ mod tests {
             "all-skipped summary incorrect: {}",
             text
         );
+        assert!(text.contains("PRD: project-a (prefix: PA)"));
         assert!(text.contains("Skipped: Not fully completed"));
+        assert!(text.contains("[PRD: project-b]\n"));
+        assert!(!text.contains("PRD: project-b (prefix:"));
         assert!(text.contains("Skipped: No task prefix"));
         // Learnings line must NOT appear when none extracted
         assert!(
@@ -356,6 +391,7 @@ mod tests {
             vec![PrdSkipReason {
                 prd_id: 2,
                 project: "project-b".to_string(),
+                task_prefix: Some("PB".to_string()),
                 reason: "Not fully completed".to_string(),
             }],
             false,
@@ -380,7 +416,7 @@ mod tests {
 
         // Skipped section
         assert!(
-            text.contains("PRD: project-b"),
+            text.contains("PRD: project-b (prefix: PB)"),
             "skipped PRD header missing"
         );
         assert!(

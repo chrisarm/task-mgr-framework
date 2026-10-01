@@ -1750,6 +1750,11 @@ fn test_archive_json_format_structure() {
         1,
         "Exactly 1 PRD (P2) should be skipped"
     );
+    assert_eq!(
+        prds_skipped[0]["task_prefix"].as_str().unwrap(),
+        "P2",
+        "Skipped PRD must name its prefix"
+    );
 }
 
 // ============================================================================

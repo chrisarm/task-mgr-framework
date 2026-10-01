@@ -61,6 +61,8 @@ pub struct PrdSkipReason {
     pub prd_id: i64,
     /// Project name
     pub project: String,
+    /// Task prefix when the PRD has one. Absent when completion cannot be scoped.
+    pub task_prefix: Option<String>,
     /// Human-readable reason for skipping
     pub reason: String,
 }
@@ -114,6 +116,7 @@ fn archive_single_prd(
             return Ok(PrdArchiveOutcome::Skipped(PrdSkipReason {
                 prd_id: prd.id,
                 project: prd.project.clone(),
+                task_prefix: None,
                 reason: "No task prefix — cannot determine completion".to_string(),
             }));
         }
@@ -124,6 +127,7 @@ fn archive_single_prd(
         return Ok(PrdArchiveOutcome::Skipped(PrdSkipReason {
             prd_id: prd.id,
             project: prd.project.clone(),
+            task_prefix: Some(prefix.to_string()),
             reason: "Not fully completed".to_string(),
         }));
     }
@@ -967,10 +971,12 @@ mod tests {
         let skip = PrdSkipReason {
             prd_id: 7,
             project: "other-project".to_string(),
+            task_prefix: Some("PB".to_string()),
             reason: "Not fully completed".to_string(),
         };
         assert_eq!(skip.prd_id, 7);
         assert_eq!(skip.project, "other-project");
+        assert_eq!(skip.task_prefix.as_deref(), Some("PB"));
         assert_eq!(skip.reason, "Not fully completed");
     }
 
@@ -2294,21 +2300,18 @@ mod tests {
         // PB and PC skipped
         assert_eq!(result.prds_skipped.len(), 2, "PB and PC should be skipped");
 
-        let skip_reasons: Vec<&str> = result
+        let pb = result
             .prds_skipped
             .iter()
-            .map(|s| s.reason.as_str())
-            .collect();
-        assert!(
-            skip_reasons
-                .iter()
-                .any(|r| r.contains("Not fully completed")),
-            "PB skip reason should mention not completed"
-        );
-        assert!(
-            skip_reasons.iter().any(|r| r.contains("No task prefix")),
-            "PC skip reason should mention no task prefix"
-        );
+            .find(|s| s.reason.contains("Not fully completed"))
+            .expect("PB skip reason should mention not completed");
+        assert_eq!(pb.task_prefix.as_deref(), Some("PB"));
+        let pc = result
+            .prds_skipped
+            .iter()
+            .find(|s| s.reason.contains("No task prefix"))
+            .expect("PC skip reason should mention no task prefix");
+        assert!(pc.task_prefix.is_none());
 
         // PA file moved, PB and PC files remain
         assert!(
@@ -2381,6 +2384,7 @@ mod tests {
             prds_skipped: vec![PrdSkipReason {
                 prd_id: 2,
                 project: "project-b".to_string(),
+                task_prefix: Some("PB".to_string()),
                 reason: "Not fully completed".to_string(),
             }],
             warnings: vec!["missing file 'gone.md'".to_string()],
@@ -2398,6 +2402,7 @@ mod tests {
         assert!(json.contains("\"warnings\""));
         assert!(json.contains("missing file 'gone.md'"));
         assert!(json.contains("\"task_prefix\":\"PA\""));
+        assert!(json.contains("\"task_prefix\":\"PB\""));
         assert!(json.contains("\"prd_id\":2"));
         assert!(json.contains("\"reason\":\"Not fully completed\""));
     }
