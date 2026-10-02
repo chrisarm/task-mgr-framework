@@ -262,6 +262,20 @@ PRD Review Agent Prompt
   - Do high-severity risks have corresponding mitigation tasks?
   - Do FEAT tasks for new APIs specify the contract (signature, returns, errors)?
 
+  ### 5d. §2.7 nouns survived
+
+  `format_task_json` shows acceptanceCriteria, description, notes, and files. `prohibitedOutcomes` is in the prompt, not the task object. `qualityDimensions`, `edgeCases`, and `failureModes` are not shown. `requiredTests` is not the proof channel.
+
+  For every §2.7 row that is not `N/A`, and for Change scope and Proof when the PRD is a `/prd-goal` phase:
+
+  - May touch paths appear in `touchesFiles` of the task that edits them.
+  - Must-not-change behavior appears in `prohibitedOutcomes`, not as a "no diff outside X" acceptance criterion.
+  - Example to copy appears as one `notes` line `follow <path>:<line>` on the task that writes the new code.
+  - Boundary, failure, observability, and rollout appear as one acceptance criterion on the owning task only when the cell names a test, a log event, or the off switch. An `N/A` row produces no criterion.
+  - Proof appears as an acceptance criterion on the FEAT that owns that FR and quotes the same test name.
+
+  Flag as critical when a required noun, or a non-N/A optional noun, is missing from those fields. Do not require all seven rows on every task.
+
   6. Code Review / Security Tasks
 
   For security-sensitive or architecturally significant code, verify review tasks exist:

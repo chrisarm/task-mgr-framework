@@ -154,6 +154,8 @@ For **all request types**, identify the top 3 risks to the design:
 
 3. **Document in PRD**: Add to the Risks & Mitigations table in Section 6.
 
+4. **Write two answers into §2.7**, not as new Inversion Checklist boxes. "What happens on retry or duplicate delivery?" fills Failure semantics. "How would we spot this failing in prod, and how do we turn it off?" fills Observability and Rollout & rollback.
+
 > **If any risk is rated High Impact + High Likelihood**: Flag it as a blocker and add to Open Questions. Do not proceed to Step 4 until the user has acknowledged the risk.
 
 ### Step 4: Explore the Codebase
@@ -213,6 +215,7 @@ Before generating the PRD, define the public interfaces this change introduces o
    - Input validation rules
    - Return type (success and error shapes)
    - Side effects (DB writes, events emitted, external calls)
+   - Entry point, validator, and bad-input result belong in §2.7, not a second copy here
 
 2. **Modified interfaces**: For each changed public function:
 
@@ -333,6 +336,24 @@ Create a markdown file at `tasks/prd-{feature-name}.md` with this structure:
 
 Create an explicit `CONTRACT-xxx` predecessor task (priority 0-1, `taskType: "contract"`) when **the decision has ramifications on more than one part of the effort** (i.e., 2+ downstream stories will implement against or call the new abstraction). The spike or PRD author is responsible for identifying this and recommending the task ID in the PRD.
 
+Entry point, validator, and bad-input result are in §2.7.
+
+---
+
+## 2.7. Production Readiness
+
+> These cells are the answers the task list is allowed to carry. Standalone `/prd`: any row may be `N/A — <reason>` when the reason names a path, function, event, setting, or test, or says "no external call", "no new entry point", "no persisted data", or "no caller-visible behavior change". A reason that names nothing is empty. `/prd-goal` phases: Change scope and Proof must not start with `N/A`. A one-file fix still names the file and one behavior that stays. Proof names the test that fails before and passes after, or the existing tests that stay green. Observability names the correlation id this project already uses and the fields the existing redactor excludes. Rollout is one of: a setting key plus the off switch, revert-the-commit when there is no migration, or a reversible migration. Do not invent a setting nothing reads. A frozen call context is not rolled back by a flag.
+
+| Dimension | Requirement for THIS PRD |
+| --- | --- |
+| Change scope | May touch: … · Must NOT change: … |
+| Example to copy | `follow <path>:<line>` |
+| Boundary validation | Entry · validator · result on bad input |
+| Failure semantics | Timeout · retry · idempotency key |
+| Observability | Event · correlation id · fields the redactor excludes |
+| Rollout & rollback | Off switch, revert-the-commit, or reversible migration |
+| Proof | FR → test that fails before and passes after |
+
 ---
 
 ## 3. User Stories
@@ -363,7 +384,7 @@ Create an explicit `CONTRACT-xxx` predecessor task (priority 0-1, `taskType: "co
 
 **Validation:**
 
-- {How to verify this requirement is met}
+- {The Proof cell in §2.7. Name that test here too.}
 
 ---
 
@@ -430,6 +451,7 @@ We deliberately call out parts of the request that deliver relatively low user (
 
 <!-- Define public interfaces introduced or modified by this change (from Step 4.5) -->
 <!-- Only public-facing: module APIs, HTTP endpoints, GenServer calls, PubSub topics -->
+<!-- Entry point, validator, and bad-input result are in §2.7 -->
 
 #### New Interfaces
 
@@ -577,6 +599,7 @@ Next step: Run `/prd-tasks tasks/prd-dark-mode.md` to generate the task breakdow
 >
 > - **Section 2.5 Quality Dimensions**: Correctness, Performance, Style, and Known Edge Cases all populated
 > - **Section 2.6 Boundary Contracts & Modularity Targets**: Public surface, ownership, coupling budget, and Data Flow Contracts documented (even if "none" or "N/A")
+> - **Section 2.7 Production Readiness**: seven rows, no empty cell. On a `/prd-goal` phase, Change scope and Proof do not start with `N/A`
 > - **Section 6 Approaches & Tradeoffs**: At least one rejected alternative + rationale (full 2-3 table only if no `/spike` was run; otherwise summarize the spike conclusion)
 > - **Section 6 Public Contracts** + **Data Flow Contracts**: Documented (or explicit "N/A")
 > - **CONTRACT-xxx recommendation**: If any boundary will be used by 2+ downstream stories, the PRD explicitly names the recommended `CONTRACT-xxx` task ID

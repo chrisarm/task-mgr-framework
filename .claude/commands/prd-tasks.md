@@ -23,6 +23,8 @@ You are converting a human-readable PRD into machine-executable task artifacts f
 > 2. **Edge cases = test cases** — every PRD Known Edge Case becomes an `edgeCases` entry on a TEST-INIT task. 1:1 mapping, no exceptions. Unnamed edge cases get discovered in production.
 > 3. **Full floor every iteration** — every iteration's quality gate is: run `bash bin/gate` (or the project's declared floor command) - the full suite - before the completion commit and paste its `GATE_OK` line as a `Gate:` trailer; a scoped run is a development convenience, never the pre-commit check. Milestones additionally fix every pre-existing failure so the trunk never degrades.
 > 4. **Project verification skills are the proof** — if the code repo ships a `.claude/skills/verif*` or `.grok/skills/verif*` skill, the loop agent must Read and follow it for covered user-facing changes. Language-level gates (fmt, type-check, lint, scoped tests) are necessary but not sufficient. Do not invent a second harness.
+>
+> `qualityDimensions` is not shown to the loop. Anything that must be enforced is an acceptance criterion.
 
 ### Step 1: Read and Parse the PRD
 
@@ -127,6 +129,15 @@ From the PRD's **Section 6 (Data Flow Contracts)**, extract the concrete access 
 > **Why this is critical**: The #1 source of silent bugs in multi-layer systems is data access path errors — using atom keys on string-keyed maps or vice versa. Tests that construct synthetic data matching the wrong key format pass even though the code is wrong. The PRD's Data Flow Contracts section provides verified access patterns; this step ensures those patterns reach the implementing agent.
 
 If the PRD lacks a Data Flow Contracts section but the feature accesses data across module boundaries, **generate one now** by reading existing code to verify the actual key types at each level.
+
+### Step 1.7: Map §2.7 into fields the loop shows
+
+The loop shows `acceptanceCriteria`, `description`, `notes`, and `files`. `prohibitedOutcomes` is rendered into the prompt. Do not use `requiredTests`. Do not copy every row onto every task.
+
+- May touch → `touchesFiles` (not a diff fence). Must NOT change → one `prohibitedOutcomes` line.
+- Example to copy → one `notes` line `follow <path>:<line>`, not an acceptance criterion.
+- Boundary, failure, observability, rollout → one acceptance criterion on the owning task, only when the cell names a test, a log event, or the off switch. An N/A row writes nothing.
+- Proof → that test name as an acceptance criterion on the FEAT for that FR. The FR Validation bullet points at this cell. On a `/prd-goal` phase, Change scope and Proof are not N/A.
 
 ---
 
@@ -509,7 +520,7 @@ You are an autonomous coding agent implementing **{{FEATURE_TITLE}}** for **{{PR
 
 Before writing code:
 
-1. **Internalize quality targets** — Read `qualityDimensions`; that's what "done well" means for THIS task.
+1. **Satisfy this task** — meet the acceptance criteria and prohibited outcomes in this prompt.
 2. **Plan edge-case handling** — For each `edgeCases` / `invariants` / `failureModes` entry on the task, decide how it'll be handled before coding.
 3. **Pick an approach** — State assumptions in your head. Only for `estimatedEffort: "high"` or `modifiesBehavior: true` tasks, name the one alternative you rejected and why.
 
@@ -521,7 +532,7 @@ After writing code, the scoped quality gate is your critic — run it (Quality C
 
 In order: **PLAN** (anticipate edge cases) → **PHASE 2 FOUNDATION** (~1 day now to save ~2+ weeks later — take it, we're pre-launch) → **FUNCTIONING CODE** (pragmatic, reliable) → **CORRECTNESS** (compiles, type-checks, scoped tests pass deterministically) → **CODE QUALITY** (clean, no warnings) → **POLISH** (docs, formatting).
 
-Non-negotiables: tests drive implementation; satisfy every `qualityDimensions` entry; handle `Option`/`Result` explicitly (no `unwrap()` in production). For `estimatedEffort: "high"` or `modifiesBehavior: true` tasks, note the one alternative you rejected and why. For everything else, pick and go.
+Non-negotiables: tests drive implementation; satisfy the acceptance criteria and prohibited outcomes in this prompt; handle `Option`/`Result` explicitly (no `unwrap()` in production). For `estimatedEffort: "high"` or `modifiesBehavior: true` tasks, note the one alternative you rejected and why. For everything else, pick and go.
 
 **Prohibited outcomes:**
 
@@ -770,7 +781,7 @@ Review-type tasks (`CODE-REVIEW-1`, `PRUNE-001`, `REFACTOR-REVIEW-FINAL`) spawn 
 
 | Review                  | Priority | Spawns (priority)                  | Before                  | Focus                                                                                                   |
 | ----------------------- | -------- | ---------------------------------- | ----------------------- | ------------------------------------------------------------------------------------------------------- |
-| CODE-REVIEW-1           | 13       | `CODE-FIX` / `WIRE-FIX` (14-20)    | early FEATs + CONTRACT  | Language idioms, security, error handling, `qualityDimensions`, wiring, respect for any CONTRACT        |
+| CODE-REVIEW-1           | 13       | `CODE-FIX` / `WIRE-FIX` (14-20)    | early FEATs + CONTRACT  | Language idioms, security, error handling, each non-N/A §2.7 assertion has evidence, wiring, respect for any CONTRACT |
 | PRUNE-001               | 60       | `PRUNE-FIX` (61-69)                | all implementation + CODE-REVIEW-1 when present | Existence. Branch diff only. Copy the PRUNE-FIX example below. Do not edit production code in this task. |
 | REFACTOR-REVIEW-FINAL   | 70       | `REFACTOR-xxx` (71-85)             | all implementation + PRUNE-001 | Code that should stay: DRY, complexity, coupling, clarity, contract fidelity. AC includes bare `PRUNE-FIX-xxx` |
 
@@ -988,7 +999,7 @@ These are **verified access patterns** for cross-module data structures. Use the
 - **Keep CI green** - never commit failing code
 - **Read before writing** - always read files first
 - **Minimal changes** - only implement what's required
-- **Check existing patterns** - see `CLAUDE.md` section 8
+- **Follow the example in this task's notes** — a `follow <path>:<line>` line is the pattern to copy
 ````
 
 </details>
@@ -1007,7 +1018,7 @@ Every task list follows a lean phased structure. The table below is the spine fo
 | 2c| 61-69    | `PRUNE-FIX-xxx`                 | implementation  | PRUNE-001        | —                                   | omit `estimatedEffort` unless the deletion is wide (`medium`) |
 | 3 | 70       | `REFACTOR-REVIEW-FINAL` (optional) | review       | —                | all implementation + PRUNE-001      | `estimatedEffort: high`; no per-task model. AC includes bare `PRUNE-FIX-xxx` |
 | 3a| 71-85    | `REFACTOR-xxx`                  | implementation  | REFACTOR-REVIEW-FINAL | —                                | `estimatedEffort: high` |
-| 4 | 99       | `REVIEW-001` (the final gate)   | review          | —                | all prior work + PRUNE-001 + REFACTOR (if any) | `estimatedEffort: high`, 1800s; review-class → frontier-forced. AC includes bare `PRUNE-FIX-xxx` |
+| 4 | 99       | `REVIEW-001` (the final gate)   | review          | —                | all prior work + PRUNE-001 + REFACTOR (if any) | `estimatedEffort: high`, 1800s; review-class → frontier-forced. AC includes bare `PRUNE-FIX-xxx`. Each non-N/A §2.7 assertion has evidence |
 
 **REVIEW-001 is the milestone.** It runs the full, unscoped quality gate and must leave the repo green (including pre-existing failures). There are no separate MILESTONE-1 / MILESTONE-2 tasks in the lean skeleton. If Step 2.6 found a project `verif*` skill, REVIEW-001 also drives every mapped feature from that skill's feature map.
 
@@ -1122,7 +1133,7 @@ All review tasks share this structure. Vary per the table below.
 
 | Review ID               | Priority | Spawns prefix         | Depends on                          | Focus (drives acceptance criteria)                                     |
 | ----------------------- | -------- | --------------------- | ----------------------------------- | ---------------------------------------------------------------------- |
-| `CODE-REVIEW-1`         | 13       | `CODE-FIX` / `WIRE-FIX` (14-20) | early FEAT/FIX + any CONTRACT-xxx   | `unwrap()`, error propagation, injection, `qualityDimensions` met, wiring, respect for any CONTRACT |
+| `CODE-REVIEW-1`         | 13       | `CODE-FIX` / `WIRE-FIX` (14-20) | early FEAT/FIX + any CONTRACT-xxx   | `unwrap()`, error propagation, injection, each non-N/A §2.7 assertion has evidence, wiring, respect for any CONTRACT |
 | `PRUNE-001`             | 60       | `PRUNE-FIX` (61-69)   | all implementation + CODE-REVIEW-1 when present | Branch diff only. See the existence checklist in the prompt. Own criteria say "spawn PRUNE-FIX tasks" and do not contain `PRUNE-FIX-` |
 | `REFACTOR-REVIEW-FINAL` | 70       | `REFACTOR-xxx`        | all implementation + PRUNE-001 | All code + tests that should stay: DRY, complexity, coupling, clarity. AC includes bare `PRUNE-FIX-xxx` |
 

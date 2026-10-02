@@ -17,6 +17,11 @@ For each proposed plan, assess:
 4. **Testability**: Can components be unit tested? DI-friendly?
 5. **Edge Cases**: Error handling, boundary conditions, race conditions
 6. **Gaps**: Missing requirements, unstated assumptions
+7. **§2.7 Production Readiness** (when the plan is a PRD): grade the table. Each defect is its own concern and includes the line `Severity: high`. Do not guess severity from prose.
+   - A blank cell is high. `N/A` whose reason names no path, function, event, setting, or test, and does not say "no external call", "no new entry point", "no persisted data", or "no caller-visible behavior change", is high.
+   - If the prompt says this is a `/prd-goal` phase, Change scope or Proof starting with `N/A` is high. A one-file fix still names the file and one behavior that stays. Proof names the test that fails before and passes after, or existing tests that stay green. A standalone `/prd` may mark those two rows `N/A` when that noun is present.
+   - Rollout may be a setting key plus the off switch, revert-the-commit when there is no migration, or a reversible migration. Do not require a new setting. A frozen call context is not rolled back by a flag.
+   - Observability names the correlation id the project already uses and the fields the existing redactor excludes, unless `N/A` names the existing event.
 
 ## Output Format
 

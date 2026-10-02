@@ -25,6 +25,8 @@ You are generating a lean, executable task list for the Claude Loop agent system
 > 4. **Data flow contracts verified** — for any data structure accessed across module boundaries, document the exact key type at each level with a copy-pasteable access pattern. Wrong-key-type bugs are silent.
 > 5. **Project verification skills are the proof** — if the code repo ships a `.claude/skills/verif*` or `.grok/skills/verif*` skill, the loop agent must Read and follow it for covered user-facing changes. Language-level gates (fmt, type-check, lint, scoped tests) are necessary but not sufficient. Do not invent a second harness.
 >
+> `qualityDimensions` is not shown to the loop. Anything that must be enforced is an acceptance criterion.
+>
 > **Core philosophy**: Group by coherent change, not by activity type. "Add functions + their tests" is one task. Minimize ceremony, maximize code output per loop iteration.
 
 ### Step 1: Understand the Request
@@ -309,8 +311,9 @@ Access: task.acceptance_criteria = serde_json::to_string(&story.acceptanceCriter
 3. **One correctness gate, at the end.** The loop's scoped per-iteration quality checks (cargo test scoped, clippy, fmt) enforce correctness each iteration; REVIEW-001 runs the FULL gate. `PRUNE-001` is a separate existence pass (delete unused or speculative code and tests). It is not a second correctness review and it is not part of `REFACTOR-001`.
 4. **No separate milestone tasks.** REVIEW-001 IS the milestone.
 5. **Every task has both positive and negative requirements.** What to do AND what not to do. What good looks like AND what bad looks like.
-6. **Quality dimensions flow to every task.** Each task carries a flat `qualityDimensions` array so the agent knows what "good" means.
-7. **Review task updates future tasks.** If issues are found, REVIEW-001 adds FIX-xxx tasks via `task-mgr add --stdin --depended-on-by REVIEW-001` (atomic DB + JSON sync) AND updates remaining task descriptions to reflect learnings.
+6. **Quality dimensions flow to every task.** Each task carries a flat `qualityDimensions` array so the agent knows what "good" means. The loop does not show that array. Anything that must be enforced is an acceptance criterion.
+7. **Readiness answers, with no PRD.** Every row may be `N/A — <reason>` when the reason names a path, function, event, setting, or test, or says "no external call", "no new entry point", "no persisted data", or "no caller-visible behavior change". Land each answer once: May touch → `touchesFiles`; Must NOT change → `prohibitedOutcomes`; example → notes `follow <path>:<line>`; boundary, failure, observability, and rollout → one acceptance criterion on the owning task only when the cell names a test, event, or off switch; Proof → the acceptance criterion that names the test. An N/A row writes nothing. Do not put all seven on every task. `requiredTests` is not the proof channel.
+8. **Review task updates future tasks.** If issues are found, REVIEW-001 adds FIX-xxx tasks via `task-mgr add --stdin --depended-on-by REVIEW-001` (atomic DB + JSON sync) AND updates remaining task descriptions to reflect learnings.
 
 **Task structure:**
 
@@ -722,7 +725,7 @@ You are an autonomous coding agent implementing **{{FEATURE_TITLE}}** for **{{PR
 
 Before writing code:
 
-1. **Internalize quality targets** — Read `qualityDimensions`; that's what "done well" means for THIS task.
+1. **Satisfy this task** — meet the acceptance criteria and prohibited outcomes in this prompt.
 2. **Plan edge-case handling** — For each `edgeCases` / `failureModes` entry on the task, decide how it'll be handled before coding.
 3. **Pick an approach** — State assumptions in your head. Only for `estimatedEffort: "high"` or `modifiesBehavior: true` tasks, name the one alternative you rejected and why.
 
@@ -734,7 +737,7 @@ After writing code, the scoped quality gate is your critic — run it (Quality C
 
 In order: **PLAN** (anticipate edge cases) → **PHASE 2 FOUNDATION** (~1 day now to save ~2+ weeks later — take it, we're pre-launch) → **FUNCTIONING CODE** (pragmatic, reliable) → **CORRECTNESS** (compiles, type-checks, scoped tests pass deterministically) → **CODE QUALITY** (clean, no warnings) → **POLISH** (docs, formatting).
 
-Non-negotiables: tests drive implementation; satisfy every `qualityDimensions` entry; handle `Option`/`Result` explicitly (no `unwrap()` in production). For `estimatedEffort: "high"` or `modifiesBehavior: true` tasks, note the one alternative you rejected and why. For everything else, pick and go.
+Non-negotiables: tests drive implementation; satisfy the acceptance criteria and prohibited outcomes in this prompt; handle `Option`/`Result` explicitly (no `unwrap()` in production). For `estimatedEffort: "high"` or `modifiesBehavior: true` tasks, note the one alternative you rejected and why. For everything else, pick and go.
 
 **Prohibited outcomes:**
 
@@ -962,7 +965,7 @@ PRUNE-001, REFACTOR-001, and REVIEW-001 spawn follow-up tasks for each issue fou
 | -------------- | -------- | ---------------------------------- | ------------------------------------------------------------------------------------------------------- |
 | PRUNE-001      | 97       | `PRUNE-FIX-xxx` (50-96)            | Branch diff only: unused or speculative code and tests. Spawn deletions; do not edit production code. Copy the PRUNE-FIX example below. |
 | REFACTOR-001   | 98       | `REFACTOR-FIX-xxx` (50-96)         | DRY, complexity, coupling, clarity, pattern adherence. Shape of code that should stay. Not existence.  |
-| REVIEW-001     | 99       | `FIX-xxx` / `WIRE-FIX-xxx` (50-96) | Language idioms, security, memory, error handling, no `unwrap()`, `qualityDimensions` met, wiring reachable, full-suite green, project `verif*` skill driven if present |
+| REVIEW-001     | 99       | `FIX-xxx` / `WIRE-FIX-xxx` (50-96) | Language idioms, security, memory, error handling, no `unwrap()`, each non-N/A readiness assertion has evidence, wiring reachable, full-suite green, project `verif*` skill driven if present |
 
 `REFACTOR-FIX` is not a soft-dep prefix. `PRUNE-FIX-xxx` is. REFACTOR-001 and REVIEW-001 acceptance criteria include that bare token so a `todo` or `in_progress` deletion holds them. A `blocked` deletion does not. PRUNE-001's own criteria must not contain that token.
 
