@@ -810,7 +810,15 @@ echo '{
 }' | task-mgr add --stdin --from-json tasks/{{FEATURE_NAME}}.json --depended-on-by MILESTONE-1
 ```
 
-`--depended-on-by` wires the new task into the milestone's `dependsOn` AND syncs the PRD JSON atomically — don't edit the JSON yourself. When a **Project Verification Skills** entry covers the issue, set `verifyCommand` to that skill's drive (the helper or recipe the SKILL.md names), not a unit-test invocation. Commit with `chore: <REVIEW-ID> - Add <FIX|REFACTOR> tasks`, then emit `<task-status><REVIEW-ID>:done</task-status>`. If no issues found, emit the status with a one-line "No issues found" in the progress file.
+`--depended-on-by` wires the new task into the milestone's `dependsOn` AND syncs the PRD JSON atomically — don't edit the JSON yourself. When a **Project Verification Skills** entry covers the issue, set `verifyCommand` to that skill's drive (the helper or recipe the SKILL.md names), not a unit-test invocation.
+
+**The proof goes in `acceptanceCriteria`.** `task-mgr add` drops `rootCause`, `exactFix`, `verifyCommand` and `completionCheck` (they have no DB column), and nothing executes them. Keep them in the JSON as a mirror, but restate every proof obligation as an AC line. Where the repo has a commit-trailer gate, the AC names the trailer the gate checks. A REVIEW task's criteria are written out in full; never write "identical to REVIEW-00n", because a reference carries no criteria.
+
+**One FIX per finding CLASS, not per site.** A fix scoped to the sites the finding named leaves the unnamed ones for the next round. In one phase this was about half of 30 findings, and a stale-literal class ran five generations. Each FIX's criteria must include a class query: a `grep` or AST query for the finding's whole class, whose hits go to 0 or are enumerated with a disposition for each, published in the commit body. If no query can express the class, as with a behavioural silent miss, name the executable check that carries it instead, such as a seeded fuzz or oracle whose SILENT key set may not grow.
+
+**Direction claims need a probe.** Any added prose saying a gap "can only over-mark", "is loud", or "is benign" must cite a probe node or recorded probe that builds the opposite-direction case. An unprobed direction claim counts as SILENT: route it as a silent finding, not as a documented residual.
+
+**Owner questions are written neutrally.** When a finding needs an owner ruling (a CLARIFY task, `requiresHuman`, or a decision): a neutral question; a table of measured facts; then options with identical fields in the fixed order DECLARE / NARROW / WIDEN (plus "revisit <ruling>" when an earlier ruling closes an option); then the recommendation in its own block after the options. Never put "(chosen)" or "(recommended)" in option text. Commit with `chore: <REVIEW-ID> - Add <FIX|REFACTOR> tasks`, then emit `<task-status><REVIEW-ID>:done</task-status>`. If no issues found, emit the status with a one-line "No issues found" in the progress file.
 
 PRUNE-001 copies this shape, not the CODE-FIX example above. The target is REVIEW-001. Priority stays inside 61-69. Shared numbers in that band are fine.
 
