@@ -2159,6 +2159,44 @@ mod soft_dep_tests {
             "archived REFACTOR-N-001 must NOT block the milestone, got: {ids:?}"
         );
     }
+
+    /// REVIEW-001 whose AC names PRUNE-FIX-xxx waits while that child is
+    /// `todo`, and is selectable once the child is `done`.
+    #[test]
+    fn test_soft_dep_prune_fix_holds_review_until_done() {
+        const REVIEW_AC: &[&str] = &["Spawned PRUNE-FIX-xxx tasks are done"];
+
+        let (_tmp, conn) = setup_test_db();
+        insert_test_task_with_criteria(&conn, "REVIEW-001", "Final", "todo", 99, REVIEW_AC);
+        insert_test_task(&conn, "PRUNE-FIX-001", "Delete unused helper", "todo", 61);
+
+        let group = select_parallel_group(&conn, &[], None, 2, &[], &[])
+            .unwrap()
+            .group;
+        let ids: Vec<&str> = group.iter().map(|s| s.task.id.as_str()).collect();
+        assert!(
+            !ids.contains(&"REVIEW-001"),
+            "review must be deferred while PRUNE-FIX-001 is todo, got: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"PRUNE-FIX-001"),
+            "the deletion itself stays selectable, got: {ids:?}"
+        );
+
+        conn.execute(
+            "UPDATE tasks SET status = 'done' WHERE id = 'PRUNE-FIX-001'",
+            [],
+        )
+        .unwrap();
+        let group = select_parallel_group(&conn, &[], None, 2, &[], &[])
+            .unwrap()
+            .group;
+        let ids: Vec<&str> = group.iter().map(|s| s.task.id.as_str()).collect();
+        assert!(
+            ids.contains(&"REVIEW-001"),
+            "review should be selectable once PRUNE-FIX-001 is done, got: {ids:?}"
+        );
+    }
 }
 
 /// Tests for FEAT-003: implicit-overlap shared-infra files + buildy heuristic.

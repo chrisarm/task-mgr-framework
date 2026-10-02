@@ -902,7 +902,7 @@ pub const PLANNING_PREFIXES: &[&str] = &["SPIKE", "PLAN"];
 
 /// Default implementation-class prefixes. This list MUST remain a SUPERSET of
 /// `commands::next::selection::SPAWNED_FIXUP_PREFIXES` so spawned fixup tasks
-/// (`CODE-FIX-`, `WIRE-FIX-`, `IMPL-FIX-`, `REFACTOR-N-`) classify as
+/// (`CODE-FIX-`, `WIRE-FIX-`, `IMPL-FIX-`, `REFACTOR-N-`, `PRUNE-FIX-`) classify as
 /// implementation rather than drifting into another class. A consistency test
 /// pins the subset relationship. Unmatched IDs also fall through to
 /// [`TaskClass::Implementation`]; this list exists to document the intent and
@@ -915,6 +915,7 @@ pub const IMPLEMENTATION_PREFIXES: &[&str] = &[
     "CODE-FIX",
     "WIRE-FIX",
     "IMPL-FIX",
+    "PRUNE-FIX",
     "TEST",
     "VERIFY",
     "CONTRACT",
@@ -1765,6 +1766,8 @@ mod tests {
         assert!(!is_frontier_class("VERIFY-001"));
         assert!(!is_frontier_class("REFACTOR-001"));
         assert!(!is_frontier_class("FEAT-001"));
+        assert!(!is_frontier_class("PRUNE-001"));
+        assert!(!is_frontier_class("PRUNE-FIX-001"));
     }
 
     #[test]
@@ -1778,6 +1781,8 @@ mod tests {
         assert!(!is_frontier_class("8d71d1f7-CODE-FIX-001"));
         assert!(!is_frontier_class("8d71d1f7-FEAT-001"));
         assert!(!is_frontier_class("8d71d1f7-MILESTONE-1"));
+        assert!(!is_frontier_class("8d71d1f7-PRUNE-001"));
+        assert!(!is_frontier_class("8d71d1f7-PRUNE-FIX-001"));
     }
 
     #[test]
@@ -2572,6 +2577,28 @@ mod tests {
                  (prefix sets drifted)"
             );
         }
+    }
+
+    /// `BUILDY_TASK_PREFIXES` is a comment-only superset of the fixup list.
+    /// The implementation-prefix test above does not cover it.
+    #[test]
+    fn spawned_fixup_prefixes_subset_of_buildy() {
+        use crate::commands::next::selection::{
+            BUILDY_TASK_PREFIXES, SPAWNED_FIXUP_PREFIXES, id_has_buildy_prefix,
+        };
+        for prefix in SPAWNED_FIXUP_PREFIXES {
+            assert!(
+                BUILDY_TASK_PREFIXES.contains(prefix),
+                "SPAWNED_FIXUP prefix {prefix:?} must be in BUILDY_TASK_PREFIXES \
+                 (prefix sets drifted)"
+            );
+        }
+        assert!(
+            !id_has_buildy_prefix("PRUNE-001"),
+            "the read-only prune audit must not take the shared-infra slot"
+        );
+        assert!(id_has_buildy_prefix("PRUNE-FIX-001"));
+        assert!(id_has_buildy_prefix("8d71d1f7-PRUNE-FIX-001"));
     }
 
     // ============ resolve_execution_plan (FR-003 six rungs) ============

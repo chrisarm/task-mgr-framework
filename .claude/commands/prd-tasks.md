@@ -83,7 +83,7 @@ Codex routes are always explicit (`byIdPrefix` or `taskClasses` in `routing`); C
 - Operator `routing` config (`task-mgr models route <prefix>`, `routing.taskClasses`) provides forced routes at rungs 2–3, ahead of the anchor window. Review-class IDs (`CODE-REVIEW-*`, `MILESTONE-FINAL`, `REVIEW-*` after prefix strip) carry a built-in, non-redefinable force to the **frontier tier**.
 - Explicit per-task `model` wins rung 1 and bypasses the above routing for that task — the whole point of config-driven selection is to stop baking model strings into task lists so operators can control routing via `task-mgr models set-*` without regenerating JSONs.
 
-**Guidance for strong-model tasks:** Set `"estimatedEffort": "high"` on CONTRACT-xxx (when complex), VERIFY-xxx, MILESTONE-*, REFACTOR-REVIEW-FINAL, and any spawned repair tasks that should start with a capable baseline. Review-class IDs are frontier-forced regardless of difficulty.
+**Guidance for strong-model tasks:** Set `"estimatedEffort": "high"` on CONTRACT-xxx (when complex), VERIFY-xxx, MILESTONE-*, REFACTOR-REVIEW-FINAL, and PRUNE-001. Review-class IDs are frontier-forced regardless of difficulty. `PRUNE-001` is not a review-class id. Omit `estimatedEffort` on spawned `PRUNE-FIX` tasks unless the deletion spans many files or rewires callers; then set `medium`.
 
 The old "stamp model snapshots into the task JSON" pattern is retired; the generator no longer reads `.task-mgr/config.json` for per-task model values.
 
@@ -93,6 +93,7 @@ The old "stamp model snapshots into the task JSON" pattern is retired; the gener
 | --------------- | ------------- | ----------------------------------------------------- |
 | `MILESTONE-xxx` | 1800          | Deep cross-PRD review + task updates can be extensive |
 | `VERIFY-xxx`    | 1800          | Same — runs complete test suite                       |
+| `PRUNE-001`     | 1800          | Reads the branch diff and may spawn several deletions |
 | All others      | _(omit)_      | Uses loop default (12 min)                            |
 
 The generated task list contains **no `model` keys at all** — not on tasks, not
@@ -241,7 +242,9 @@ Use context-appropriate prefixes. Set the `taskType` field on each task to let t
 | `ENV-xxx`             | `"implementation"` | Environment/configuration                                          |
 | `TEST-INIT-xxx`       | `"test"`           | Initial TDD tests (before implementation)                          |
 | `TEST-xxx`            | `"test"`           | Comprehensive test implementation                                  |
-| `INT-xxx`             | `"verification"`   | Integration verification                                           |
+| `INT-xxx`             | `"verification"`   | Do not emit. Removed from the lean spine; REVIEW-001 covers integration |
+| `PRUNE-001`           | `"review"`         | Existence pass. Not frontier-forced. Spawns `PRUNE-FIX` tasks      |
+| `PRUNE-FIX-xxx`       | `"implementation"` | Deletion spawned by PRUNE-001. Omit estimatedEffort unless wide    |
 | `WIRE-xxx`            | `"implementation"` | Integration wiring (spawned by CODE-REVIEW)                        |
 | `WIRE-FIX-xxx`        | `"implementation"` | Fix wiring issues (exports, registration, call sites)              |
 | `CODE-REVIEW-xxx`     | `"review"`         | Code review tasks                                                  |
@@ -318,18 +321,9 @@ Access: task.acceptance_criteria = serde_json::to_string(&story.acceptanceCriter
 
 **When to skip**: If all `touchesFiles` are in the same directory, or the task only adds new code with no cross-module dependencies.
 
-### Step 4.8: Auto-Detect Cross-Boundary Integration Gaps
+### Step 4.8: Do not emit INT-xxx
 
-After building the dependency graph (Step 4) and enriching cross-boundary tasks (Step 4.7), scan for integration paths that need INT-xxx coverage:
-
-1. **For each dependency edge** (`dependsOn` relationship), check if the two tasks' `touchesFiles` are in different top-level directories (e.g., `src/commands/` vs `src/loop_engine/`, or `src/db/` vs `src/models/`)
-2. **If cross-boundary paths exist** and no INT-xxx task already traces that specific path, generate one:
-   - Name the specific data/control path being traced
-   - List the handoff points at each module boundary
-   - Set `taskType: "verification"` and priority 55-65
-3. **Cap**: 1 INT-xxx per distinct cross-boundary data/control path, not per task pair. Multiple tasks touching the same cross-boundary path share a single INT-xxx.
-
-**When to skip**: If all tasks touch files in the same top-level directory, or the PRD is small enough (2-4 tasks) that CODE-REVIEW-1 will catch any wiring issues.
+Do not generate `INT-xxx` tasks at any priority. The lean spine removed them. Integration checks live on `REVIEW-001` and in the PRD's Boundary Contracts section. Cross-boundary data shapes still go in task `notes` (Step 4.7). An `INT-xxx` task lands on top of `PRUNE-001` (priority 60) and `PRUNE-FIX` (61-69), and soft-dep will not separate them.
 
 ### Step 5: Create JSON Task File
 
@@ -770,16 +764,33 @@ Downstream FEAT/FIX tasks that list a CONTRACT task in `dependsOn` are expected 
 
 ## Review Tasks
 
-Review-type tasks (`CODE-REVIEW-1`, `REFACTOR-REVIEW-FINAL`) spawn follow-up tasks for each issue found. The loop re-reads state every iteration, so spawned tasks are picked up automatically.
+Review-type tasks (`CODE-REVIEW-1`, `PRUNE-001`, `REFACTOR-REVIEW-FINAL`) spawn follow-up tasks for each issue found. The loop re-reads state every iteration, so spawned tasks are picked up automatically.
 
 ### What each review looks for
 
 | Review                  | Priority | Spawns (priority)                  | Before                  | Focus                                                                                                   |
 | ----------------------- | -------- | ---------------------------------- | ----------------------- | ------------------------------------------------------------------------------------------------------- |
-| CODE-REVIEW-1           | 13       | `CODE-FIX` / `WIRE-FIX` (14-16)    | early FEATs + CONTRACT  | Language idioms, security, error handling, `qualityDimensions`, wiring, respect for any CONTRACT        |
-| REFACTOR-REVIEW-FINAL   | 70       | `REFACTOR-xxx` (71-85)             | all implementation      | All code + tests: DRY, complexity, coupling, clarity, contract fidelity — full-context final pass        |
+| CODE-REVIEW-1           | 13       | `CODE-FIX` / `WIRE-FIX` (14-20)    | early FEATs + CONTRACT  | Language idioms, security, error handling, `qualityDimensions`, wiring, respect for any CONTRACT        |
+| PRUNE-001               | 60       | `PRUNE-FIX` (61-69)                | all implementation + CODE-REVIEW-1 when present | Existence. Branch diff only. Copy the PRUNE-FIX example below. Do not edit production code in this task. |
+| REFACTOR-REVIEW-FINAL   | 70       | `REFACTOR-xxx` (71-85)             | all implementation + PRUNE-001 | Code that should stay: DRY, complexity, coupling, clarity, contract fidelity. AC includes bare `PRUNE-FIX-xxx` |
 
-Use the **rust-python-code-reviewer** / equivalent language agent when reviewing code. Document findings in the progress file. If a specific prior iteration produced something ugly and you don't want to wait for REFACTOR-REVIEW-FINAL, invoke `/simplify` on that touchpoint directly — don't file a dedicated review task just for it.
+Use the **rust-python-code-reviewer** / equivalent language agent when reviewing code. Document findings in the progress file. If a specific prior iteration produced something ugly and you don't want to wait for REFACTOR-REVIEW-FINAL, invoke `/simplify` on that touchpoint directly — don't file a dedicated review task just for it. `/simplify` is not a substitute for PRUNE-001.
+
+#### PRUNE-001 existence checklist
+
+Scope is the branch diff against the merge base, plus uncommitted work in the loop worktree. Untouched files stay untouched. Inside a touched file, pre-existing items the diff did not change stay.
+
+Inventory every added or modified function, branch, config knob, type, and test. For each, name the concrete caller or the concrete failing input that needs it. "Might", "for completeness", "symmetry", "just in case", and a defensive branch against a state the types or the PRD caller contract make impossible are a failed bar.
+
+Spawn a removal when there is no production caller and the item is not the feature's public entry point, when the only reason to keep it is speculative, or when a test pins no required behavior (no panic, type-only, private-helper snapshot, duplicate, still passes if the feature is stubbed, or covers a non-goal).
+
+Keep behavior named by acceptance criteria, edge cases, known-bad discriminators, and real IO, parse, or DB error paths. Keep one-caller code that is the feature. Keep a test that fails if that required behavior is removed.
+
+One PRUNE-FIX task per coherent deletion (a function plus the tests that exist only for it), largest dead surface first. Delete. Do not invent an abstraction to tidy the dead code. Omit `estimatedEffort` and `timeoutSecs` unless the deletion spans many files or rewires callers; then set `estimatedEffort` to `medium`.
+
+This task's own acceptance criteria say "spawn PRUNE-FIX tasks" and do not contain the token `PRUNE-FIX-`. REFACTOR-REVIEW-FINAL and REVIEW-001 do contain the bare token `PRUNE-FIX-xxx`. A `todo` or `in_progress` child holds those gates. A `blocked` child does not, so leave deletions `todo`. When CODE-REVIEW-1 is in the list, this task's criteria include the bare tokens `CODE-FIX-xxx` and `WIRE-FIX-xxx`.
+
+Empty inventory: spawn nothing, append one progress line "nothing to remove", emit done. Learning [911] and [4903]: do not implement the deletion in this task. Learning [4748]: the later gates name `PRUNE-FIX-xxx`.
 
 ### Spawning follow-up tasks
 
@@ -800,6 +811,22 @@ echo '{
 ```
 
 `--depended-on-by` wires the new task into the milestone's `dependsOn` AND syncs the PRD JSON atomically — don't edit the JSON yourself. When a **Project Verification Skills** entry covers the issue, set `verifyCommand` to that skill's drive (the helper or recipe the SKILL.md names), not a unit-test invocation. Commit with `chore: <REVIEW-ID> - Add <FIX|REFACTOR> tasks`, then emit `<task-status><REVIEW-ID>:done</task-status>`. If no issues found, emit the status with a one-line "No issues found" in the progress file.
+
+PRUNE-001 copies this shape, not the CODE-FIX example above. The target is REVIEW-001. Priority stays inside 61-69. Shared numbers in that band are fine.
+
+```sh
+echo '{
+  "id": "PRUNE-FIX-001",
+  "title": "Remove: <unused or speculative item>",
+  "description": "From PRUNE-001: <why this will not be needed>",
+  "rootCause": "<file:line + why it fails the existence bar>",
+  "exactFix": "<what to delete and which callers to update>",
+  "verifyCommand": "<project floor, or the mapped verif* skill drive>",
+  "acceptanceCriteria": ["Named code and tests are gone", "Required edge-case tests still exist", "Floor is green", "Progress line says why this will not be needed"],
+  "priority": 61,
+  "touchesFiles": ["affected/file.rs"]
+}' | task-mgr add --stdin --from-json tasks/{{FEATURE_NAME}}.json --depended-on-by REVIEW-001
+```
 
 ---
 
@@ -968,9 +995,11 @@ Every task list follows a lean phased structure. The table below is the spine fo
 | 1 | 2-12     | `FEAT-xxx` / `FIX-xxx`          | implementation  | —                | relevant CONTRACT (if any)          | omit `model`; use high effort for baseline tier intent |
 | 2 | 13       | `CODE-REVIEW-1` (large PRDs only) | review        | —                | all early FEAT/FIX + CONTRACT       | `estimatedEffort: high`; review-class → frontier-forced |
 | 2a| 14-20    | `CODE-FIX-xxx` / `WIRE-FIX-xxx` | implementation  | CODE-REVIEW-1    | —                                   | `estimatedEffort: high` for repair strength (or let `routing.byIdPrefix` drive) |
-| 3 | 70       | `REFACTOR-REVIEW-FINAL` (optional) | review       | —                | all implementation                  | `estimatedEffort: high`; no per-task model |
+| 2b| 60       | `PRUNE-001`                     | review          | —                | all implementation + CODE-REVIEW-1 when present | `estimatedEffort: high`, 1800s; not frontier-forced |
+| 2c| 61-69    | `PRUNE-FIX-xxx`                 | implementation  | PRUNE-001        | —                                   | omit `estimatedEffort` unless the deletion is wide (`medium`) |
+| 3 | 70       | `REFACTOR-REVIEW-FINAL` (optional) | review       | —                | all implementation + PRUNE-001      | `estimatedEffort: high`; no per-task model. AC includes bare `PRUNE-FIX-xxx` |
 | 3a| 71-85    | `REFACTOR-xxx`                  | implementation  | REFACTOR-REVIEW-FINAL | —                                | `estimatedEffort: high` |
-| 4 | 99       | `REVIEW-001` (the final gate)   | review          | —                | all prior work + REFACTOR (if any)  | `estimatedEffort: high`, 1800s; review-class → frontier-forced |
+| 4 | 99       | `REVIEW-001` (the final gate)   | review          | —                | all prior work + PRUNE-001 + REFACTOR (if any) | `estimatedEffort: high`, 1800s; review-class → frontier-forced. AC includes bare `PRUNE-FIX-xxx` |
 
 **REVIEW-001 is the milestone.** It runs the full, unscoped quality gate and must leave the repo green (including pre-existing failures). There are no separate MILESTONE-1 / MILESTONE-2 tasks in the lean skeleton. If Step 2.6 found a project `verif*` skill, REVIEW-001 also drives every mapped feature from that skill's feature map.
 
@@ -984,7 +1013,9 @@ Every task list follows a lean phased structure. The table below is the spine fo
 
 - **Middle milestones, separate TEST-INIT, INT-xxx, and VERIFY-001 removed** — These were identified as low-ROI ceremony (see anti-pattern table in `plan-tasks.md`). The single `REVIEW-001` at the end runs the full gate and serves as the milestone. `INT-xxx` concerns are now handled inside the final review's acceptance criteria and the PRD's Boundary Contracts section. A `CONTRACT-xxx` (when present) does the deep edge-case/invariant work before any implementation begins.
 
-- **Refactoring** — The old REFACTOR-REVIEW-1 and -2 phases were removed long ago. CODE-REVIEW-1 (when used) + REFACTOR-REVIEW-FINAL before the final gate catch DRY/complexity/coupling issues. The `/simplify` skill can be invoked ad-hoc on any ugly touchpoint.
+- **PRUNE-001** (mandatory) — Existence pass after implementation and after `CODE-REVIEW-1` / its fixups, before the refactor gate. Inventory the branch diff. Spawn `PRUNE-FIX` tasks for unused or speculative code and tests. Do not edit production code in the audit itself. When `CODE-REVIEW-1` is in the list, PRUNE-001's acceptance criteria include the bare tokens `CODE-FIX-xxx` and `WIRE-FIX-xxx`. They must not include the token `PRUNE-FIX-`. Say "spawn PRUNE-FIX tasks" instead. Copy the checklist in the prompt's Review Tasks section into the task description.
+
+- **Refactoring** — The old REFACTOR-REVIEW-1 and -2 phases were removed long ago. Optional `REFACTOR-REVIEW-FINAL` shapes code that should stay (DRY, complexity, coupling). It does not decide whether the code should exist. That is `PRUNE-001`. The `/simplify` skill can still be invoked ad-hoc on an ugly touchpoint. It is not a substitute for the prune pass. `REFACTOR-REVIEW-FINAL` and `REVIEW-001` acceptance criteria include the bare token `PRUNE-FIX-xxx` so a `todo` or `in_progress` deletion holds them. A `blocked` deletion does not. Priority does not hold them.
 
 ### Step 7.1: Task Templates
 
@@ -1079,10 +1110,13 @@ All review tasks share this structure. Vary per the table below.
 }
 ```
 
+`PRUNE-001` does not use the `<FIX-PREFIX>-xxx` sentence above. That sentence would put the token `PRUNE-FIX-` on the audit task and defer a retry onto its own children. Its criteria say "spawn PRUNE-FIX tasks".
+
 | Review ID               | Priority | Spawns prefix         | Depends on                          | Focus (drives acceptance criteria)                                     |
 | ----------------------- | -------- | --------------------- | ----------------------------------- | ---------------------------------------------------------------------- |
-| `CODE-REVIEW-1`         | 13       | `CODE-FIX` / `WIRE-FIX` | early FEAT/FIX + any CONTRACT-xxx   | `unwrap()`, error propagation, injection, `qualityDimensions` met, wiring, respect for any CONTRACT |
-| `REFACTOR-REVIEW-FINAL` | 70       | `REFACTOR-xxx`        | all implementation                  | All code + tests: DRY, complexity, coupling, clarity, contract fidelity — full-context final pass |
+| `CODE-REVIEW-1`         | 13       | `CODE-FIX` / `WIRE-FIX` (14-20) | early FEAT/FIX + any CONTRACT-xxx   | `unwrap()`, error propagation, injection, `qualityDimensions` met, wiring, respect for any CONTRACT |
+| `PRUNE-001`             | 60       | `PRUNE-FIX` (61-69)   | all implementation + CODE-REVIEW-1 when present | Branch diff only. See the existence checklist in the prompt. Own criteria say "spawn PRUNE-FIX tasks" and do not contain `PRUNE-FIX-` |
+| `REFACTOR-REVIEW-FINAL` | 70       | `REFACTOR-xxx`        | all implementation + PRUNE-001 | All code + tests that should stay: DRY, complexity, coupling, clarity. AC includes bare `PRUNE-FIX-xxx` |
 
 ### Step 8: Validate and Report
 
@@ -1106,9 +1140,10 @@ After generation, verify:
 - [ ] **Implementation tasks that Step 2.6 mapped onto a `verif*` feature** include a drive-the-skill acceptance criterion and a `notes` pointer at SKILL.md + feature id
 - [ ] **No task has `synergyWith` / `batchWith` / `conflictsWith` populated** (dropped — `touchesFiles` drives synergy at selection time; conflicts expressed via `dependsOn`)
 - [ ] **No `model` fields anywhere** (no per-task models AND no top-level PRD model; the anchor window, `routing` config, and the built-in review-class frontier force drive selection)
-- [ ] Review gates, MILESTONE-*, REFACTOR-REVIEW-FINAL, complex CONTRACTs and repair FIXes carry `estimatedEffort: "high"` (so difficulty triggers opus baseline rung when no stronger config route applies)
+- [ ] Review gates, MILESTONE-*, REFACTOR-REVIEW-FINAL, PRUNE-001, complex CONTRACTs and repair FIXes carry `estimatedEffort: "high"` (so difficulty triggers opus baseline rung when no stronger config route applies). Spawned PRUNE-FIX tasks omit `estimatedEffort` unless the deletion is wide (`medium`)
 - [ ] **`qualityDimensions` is a flat array**, NOT `{correctness, performance, style}` sub-objects
-- [ ] **Only CODE-REVIEW-1 and REFACTOR-REVIEW-FINAL exist** — no REFACTOR-REVIEW-1 or -2 tasks in the JSON
+- [ ] **CODE-REVIEW-1 (large PRDs), PRUNE-001 (always), and REFACTOR-REVIEW-FINAL (optional) are the review ids** — no REFACTOR-REVIEW-1 or -2 tasks, and no INT-xxx tasks, in the JSON
+- [ ] PRUNE-001's own acceptance criteria do not contain the token `PRUNE-FIX-`. REFACTOR-REVIEW-FINAL (when present) and REVIEW-001 include the bare token `PRUNE-FIX-xxx`. PRUNE-FIX spawns use `--depended-on-by REVIEW-001`
 - [ ] **Context-economy placeholders populated in the generated prompt** (the agent can't read the JSON, so these MUST be in the prompt):
   - [ ] `{{PROHIBITED_OUTCOMES}}` — rendered from JSON `prohibitedOutcomes[]` as a bullet list
   - [ ] `{{GLOBAL_ACCEPTANCE_CRITERIA}}` — rendered from JSON `globalAcceptanceCriteria.criteria[]` as a bullet list

@@ -266,7 +266,7 @@ How the loop resolves each task's model (`resolve_execution_plan` in `src/loop_e
 
 So the ONLY model-relevant knobs a generated task list sets are `difficulty` / `estimatedEffort` (plus task IDs, which drive class/prefix routing). With the default config, `estimatedEffort: "high"` resolves to the frontier model, `medium` to the standard model.
 
-Use `estimatedEffort: "high"` (which populates task `difficulty`) on REFACTOR-001 and any other gate/spawned repair task that should receive a strong baseline via the anchor window. Review-class IDs are frontier-forced regardless of difficulty.
+Use `estimatedEffort: "high"` (which populates task `difficulty`) on REFACTOR-001, PRUNE-001, and any other gate that should receive a strong baseline via the anchor window. Review-class IDs are frontier-forced regardless of difficulty. `PRUNE-001` is not a review-class id. Omit `estimatedEffort` on spawned `PRUNE-FIX` tasks unless the deletion spans many files or rewires callers; then set `medium`.
 
 **`timeoutSecs` assignment** (set on tasks that run the full test suite):
 
@@ -274,6 +274,7 @@ Use `estimatedEffort: "high"` (which populates task `difficulty`) on REFACTOR-00
 | --------------- | ------------- | ----------------------------------------------------- |
 | `REVIEW-001`    | 1800          | Runs complete test suite + may update sibling tasks   |
 | `REFACTOR-001`  | 1800          | Full-context review; may spawn fix tasks              |
+| `PRUNE-001`     | 1800          | Reads the branch diff and may spawn several deletions |
 | All others      | _(omit)_      | Uses loop default (12 min)                            |
 
 ### Step 5.5: Define Data Flow Contracts (if applicable)
@@ -304,8 +305,8 @@ Access: task.acceptance_criteria = serde_json::to_string(&story.acceptanceCriter
 
 1. **Each task = coherent unit of change + its tests.** Don't separate "write code" from "write tests for that code."
 2. **Foundational contracts come first.** If a `/spike` or the problem description identifies an abstraction that multiple stories will depend on, create the `CONTRACT-xxx` predecessor (with full extreme details) before the dependent FEATs. This is the only time a predecessor design task is warranted in the lean path.
-2. **Target 2-10 tasks max.** If you need more, the task is probably Large — use `/prd` + `/prd-tasks`.
-3. **One review gate, at the end.** The loop's scoped per-iteration quality checks (cargo test scoped, clippy, fmt) enforce correctness each iteration; REVIEW-001 runs the FULL gate.
+2. **Target 2-10 implementation tasks.** PRUNE-001, REFACTOR-001, and REVIEW-001 sit outside that cap. If the implementation tasks need more than 10, the task is probably Large — use `/prd` + `/prd-tasks`.
+3. **One correctness gate, at the end.** The loop's scoped per-iteration quality checks (cargo test scoped, clippy, fmt) enforce correctness each iteration; REVIEW-001 runs the FULL gate. `PRUNE-001` is a separate existence pass (delete unused or speculative code and tests). It is not a second correctness review and it is not part of `REFACTOR-001`.
 4. **No separate milestone tasks.** REVIEW-001 IS the milestone.
 5. **Every task has both positive and negative requirements.** What to do AND what not to do. What good looks like AND what bad looks like.
 6. **Quality dimensions flow to every task.** Each task carries a flat `qualityDimensions` array so the agent knows what "good" means.
@@ -332,10 +333,18 @@ FEAT-002: [Second coherent change] (priority 2)
 
 ... (2-10 FEAT tasks, grouped by coherent change)
 
+PRUNE-001: Adversarial existence pass (priority 97)
+  — `estimatedEffort: "high"`, `timeoutSecs: 1800` (reads the branch diff; no per-task `model`)
+  — Inventory code and tests this loop added. Spawn PRUNE-FIX tasks for anything unused or only justified by speculative future use
+  — Does not edit production code. Empty inventory: one progress line, mark done
+  — Own acceptance criteria say "spawn PRUNE-FIX tasks" and do not contain the token `PRUNE-FIX-`
+
 REFACTOR-001: Full review for opportunities to improve code (priority 98)
   — `estimatedEffort: "high"`, `timeoutSecs: 1800` (strong tier via the anchor window; no per-task `model`)
   — DRY, testable, separation of concerns, function length/complexity
-  — Spawns REFACTOR-FIX-xxx via task-mgr add --stdin --depended-on-by REVIEW-001
+  — Spawns REFACTOR-FIX-xxx (priority 50-96) via task-mgr add --stdin --depended-on-by REVIEW-001
+  — Acceptance criteria include the bare token `PRUNE-FIX-xxx` so this gate waits while a deletion is `todo` or `in_progress`
+  — dependsOn includes PRUNE-001
 
 REVIEW-001: Code review + final verification (priority 99)
   — `estimatedEffort: "high"`, `timeoutSecs: 1800` (review-class IDs are frontier-forced built-in; no per-task `model` field)
@@ -343,7 +352,9 @@ REVIEW-001: Code review + final verification (priority 99)
   — RUNS THE FULL QUALITY GATE (unscoped test suite)
   — If a project `verif*` skill exists, drives every mapped feature (see Project Verification Skills)
   — Updates remaining task descriptions based on learnings
-  — Spawns FIX-xxx tasks if issues found (via task-mgr add --stdin --depended-on-by REVIEW-001)
+  — Spawns FIX-xxx / WIRE-FIX-xxx tasks at priority 50-96 if issues found (via task-mgr add --stdin --depended-on-by REVIEW-001)
+  — Acceptance criteria include the bare token `PRUNE-FIX-xxx`
+  — dependsOn includes PRUNE-001 and REFACTOR-001
   — Checks documentation needs (architecture docs, dev guides, CLAUDE.md)
 ```
 
@@ -526,6 +537,29 @@ The agent checks these before starting any task. If the required task hasn't pas
       "modifiesBehavior": false
     },
     {
+      "id": "PRUNE-001",
+      "title": "Remove unused or speculative code and tests",
+      "taskType": "review",
+      "description": "Adversarial existence pass over the branch diff (merge base, plus uncommitted work in the loop worktree). Inventory every function, branch, config knob, type, and test this PRD added or modified. Untouched files stay untouched. Inside a touched file, pre-existing items the diff did not change stay.\n\nFor each item, name the concrete caller or the concrete failing input that needs it. These are not needs: might, for completeness, symmetry, just in case, or a defensive branch against a state the types or the PRD caller contract make impossible.\n\nSpawn a removal when any of these is true: no production caller and the item is not the feature's public entry point named by the PRD or a task's acceptance criteria; the only reason to keep it is speculative; a test pins no required behavior (no panic, type-only, snapshot of a private helper, duplicate, still passes if the feature is stubbed, or covers a PRD non-goal).\n\nKeep behavior named by acceptance criteria, edgeCases, known-bad discriminators, and real IO/parse/DB error paths. Keep one-caller code that is the feature. Keep a test that fails if that required behavior is removed.\n\nGroup a function and the tests that exist only for it into one PRUNE-FIX task, largest dead surface first. Delete. Do not invent a new abstraction to tidy the dead code.\n\nDO: Spawn removals, or mark this task done when the inventory is clean.\nDO NOT: Edit production code in this task. Do NOT patrol the rest of the repo.",
+      "acceptanceCriteria": [
+        "Inventory covers every function, branch, knob, type, and test added or modified in the branch diff",
+        "Each kept item names a concrete caller or a concrete failing input",
+        "Speculative reasons (might, for completeness, symmetry, just in case) are a failed bar, not a reason to keep",
+        "Removals are spawned as PRUNE-FIX tasks via task-mgr add --stdin --from-json --depended-on-by REVIEW-001, one coherent deletion each, priority 50-96. Omit estimatedEffort and timeoutSecs unless the deletion spans many files or rewires callers, then set estimatedEffort to medium",
+        "Each spawned task carries rootCause (file:line), exactFix, verifyCommand, and touchesFiles. verifyCommand is the project floor, or the mapped verif* skill drive when the deletion touches a mapped feature",
+        "Empty inventory: spawn nothing, append one progress line 'nothing to remove', then mark done",
+        "This task does not edit production code"
+      ],
+      "priority": 97,
+      "estimatedEffort": "high",
+      "passes": false,
+      "timeoutSecs": 1800,
+      "notes": "Learning [911] and [4903]: spawn follow-ups, do not implement them. Say 'spawn PRUNE-FIX tasks' in this task's criteria. Do not write the token PRUNE-FIX- here; that token on this task defers a retry until the children finish and then re-runs the audit. Learning [4748]: REFACTOR-001 and REVIEW-001 name that token so a todo or in_progress child holds them. A blocked child does not. If issues found: echo the PRUNE-FIX shape from the prompt's Review Tasks section into `task-mgr add --stdin --from-json tasks/<prd>.json --depended-on-by REVIEW-001`. If none, one progress line and `<task-status>PRUNE-001:done</task-status>`.",
+      "qualityDimensions": ["Only code and tests this diff added are in scope", "A kept item has a concrete caller or failing input", "Deletions happen in spawned tasks"],
+      "touchesFiles": ["all modified files"],
+      "dependsOn": ["all FEAT-xxx"]
+    },
+    {
       "id": "REFACTOR-001",
       "title": "Review for refactoring opportunities",
       "taskType": "review",
@@ -535,16 +569,17 @@ The agent checks these before starting any task. If the required task hasn't pas
         "Functions under 30 lines (flag complex ones)",
         "Clear separation of concerns",
         "Code follows existing project patterns",
-        "Any issues found spawn REFACTOR-FIX-xxx tasks via `task-mgr add --stdin --depended-on-by REVIEW-001`"
+        "Any issues found spawn REFACTOR-FIX-xxx tasks via `task-mgr add --stdin --depended-on-by REVIEW-001`",
+        "Spawned PRUNE-FIX-xxx tasks are done before this gate runs"
       ],
       "priority": 98,
       "estimatedEffort": "high",
       "passes": false,
       "timeoutSecs": 1800,
-      "notes": "If issues found: `echo '{...}' | task-mgr add --stdin --from-json tasks/<prd>.json --depended-on-by REVIEW-001` for each (priority 50-97) — atomic DB+JSON sync, no manual JSON edit. If no issues, invoke /simplify on any ugly touchpoint, then emit `<task-status>REFACTOR-001:done</task-status>` with a one-line progress note.",
+      "notes": "If issues found: `echo '{...}' | task-mgr add --stdin --from-json tasks/<prd>.json --depended-on-by REVIEW-001` for each (priority 50-96) — atomic DB+JSON sync, no manual JSON edit. If no issues, invoke /simplify on any ugly touchpoint, then emit `<task-status>REFACTOR-001:done</task-status>` with a one-line progress note. REFACTOR-FIX is not a soft-dep prefix; the PRUNE-FIX-xxx acceptance token is what holds this gate.",
       "qualityDimensions": ["DRY across modules", "Single-responsibility functions", "Pattern consistency with existing code"],
       "touchesFiles": ["all modified files"],
-      "dependsOn": ["all FEAT-xxx"]
+      "dependsOn": ["all FEAT-xxx", "PRUNE-001"]
     },
     {
       "id": "REVIEW-001",
@@ -561,7 +596,8 @@ The agent checks these before starting any task. If the required task hasn't pas
         "Documentation: CLAUDE.md updated with quick-reference for new tooling/patterns",
         "Task update: Remaining tasks reviewed and updated if implementation changed APIs/assumptions",
         "Pre-existing test failures fixed (or spawned as FIX-xxx with verifyCommand if >~12 unrelated)",
-        "If issues found: FIX-xxx tasks spawned via `task-mgr add --stdin --depended-on-by REVIEW-001`",
+        "If issues found: FIX-xxx tasks spawned via `task-mgr add --stdin --depended-on-by REVIEW-001` at priority 50-96",
+        "Spawned PRUNE-FIX-xxx tasks are done before this gate runs",
         "If a project verification skill covers this change: SKILL.md followed, every mapped feature recipe driven, evidence captured (skipped sub-features reported skipped, not verified via a sibling path)"
       ],
       "priority": 99,
@@ -571,7 +607,7 @@ The agent checks these before starting any task. If the required task hasn't pas
       "notes": "Spawn fixes via `echo '{...}' | task-mgr add --stdin --from-json tasks/<prd>.json --depended-on-by REVIEW-001` — pin + atomic DB+JSON sync, no manual edit. If no issues: emit `<task-status>REVIEW-001:done</task-status>` with 'Clean review' note. Review remaining tasks — if implementation changed APIs, data structures, or assumptions, patch via `task-mgr update --stdin --from-json tasks/<prd>.json` or bulk-sync with `task-mgr loop init ... --append --update-existing`.",
       "qualityDimensions": ["No unwrap in production", "All new code wired to production entry point", "Full suite green including pre-existing"],
       "touchesFiles": ["all modified files"],
-      "dependsOn": ["all FEAT-xxx", "REFACTOR-001"]
+      "dependsOn": ["all FEAT-xxx", "PRUNE-001", "REFACTOR-001"]
     }
   ]
 }
@@ -581,12 +617,12 @@ The agent checks these before starting any task. If the required task hasn't pas
 
 - `prdFile`: **Required.** Basename of the lean brief written in Step 8.5 (`"{feature-name}.md"`). Auto-review and worktree copy use this first.
 - `taskPrefix`: **Do NOT set.** Omit entirely. `task-mgr init` auto-generates the deterministic hash prefix from `branchName + ":" + filename` and writes it back.
-- `id`: Use FEAT-xxx for implementation, REFACTOR-001 for refactor gate, REVIEW-001 for review gate, FIX-xxx for review-spawned fixes, REFACTOR-FIX-xxx for refactor-spawned fixes. Do NOT include a project prefix — the system adds one.
+- `id`: Use FEAT-xxx for implementation, PRUNE-001 for the existence pass, REFACTOR-001 for refactor gate, REVIEW-001 for review gate, FIX-xxx for review-spawned fixes, REFACTOR-FIX-xxx for refactor-spawned fixes, PRUNE-FIX-xxx for deletions spawned by PRUNE-001. Do NOT include a project prefix — the system adds one.
 - `taskType`: Required on every task. Use `"implementation"`, `"review"`, `"verification"`, `"milestone"`, `"test"`, or `"analysis"`.
-- `priority`: Sequential integers. REFACTOR-001 at 98, REVIEW-001 at 99.
+- `priority`: Sequential integers. PRUNE-001 at 97, REFACTOR-001 at 98, REVIEW-001 at 99. Spawned FIX / WIRE-FIX / REFACTOR-FIX / PRUNE-FIX tasks use 50-96. Shared numbers inside that band are fine. 97 is the prune gate, not a spawn slot.
 - `passes`: Always `false` (loop marks true).
 - `model`: **Omit everywhere — on every task AND at the PRD top level.** The generated task list contains no model strings at all. Runtime resolution (`resolve_execution_plan`) uses difficulty/estimatedEffort through the anchor window, plus operator `routing` config (`byIdPrefix` / `taskClasses`); review-class IDs are frontier-forced. An explicit per-task model is rung 1 and would bypass all of that; a top-level PRD model is ignored and warns.
-- `timeoutSecs`: Set `1800` on REFACTOR-001 and REVIEW-001. Omit elsewhere.
+- `timeoutSecs`: Set `1800` on PRUNE-001, REFACTOR-001, and REVIEW-001. Omit elsewhere, including spawned PRUNE-FIX tasks.
 - `estimatedEffort`: `low` (1 file, 1-3 criteria), `medium` (2-3 files, new function), `high` (3+ files, new module).
 - `touchesFiles`: Actual file paths the agent will modify. Drives scoped per-iteration tests and synergy-based selection at runtime.
 - `dependsOn`: Only hard dependencies. Don't over-constrain — let the loop pick optimal order.
@@ -918,18 +954,39 @@ New code must be reachable from production — REVIEW-001 verifies. Most common 
 
 ## Review Tasks
 
-REFACTOR-001 and REVIEW-001 spawn follow-up tasks for each issue found. The loop re-reads state every iteration, so spawned tasks are picked up automatically.
+PRUNE-001, REFACTOR-001, and REVIEW-001 spawn follow-up tasks for each issue found. The loop re-reads state every iteration, so spawned tasks are picked up automatically.
 
 ### What each review looks for
 
 | Review         | Priority | Spawns (priority)                  | Focus                                                                                                   |
 | -------------- | -------- | ---------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| REFACTOR-001   | 98       | `REFACTOR-FIX-xxx` (50-97)         | DRY, complexity, coupling, clarity, pattern adherence                                                   |
-| REVIEW-001     | 99       | `FIX-xxx` / `WIRE-FIX-xxx` (50-97) | Language idioms, security, memory, error handling, no `unwrap()`, `qualityDimensions` met, wiring reachable, full-suite green, project `verif*` skill driven if present |
+| PRUNE-001      | 97       | `PRUNE-FIX-xxx` (50-96)            | Branch diff only: unused or speculative code and tests. Spawn deletions; do not edit production code. Copy the PRUNE-FIX example below. |
+| REFACTOR-001   | 98       | `REFACTOR-FIX-xxx` (50-96)         | DRY, complexity, coupling, clarity, pattern adherence. Shape of code that should stay. Not existence.  |
+| REVIEW-001     | 99       | `FIX-xxx` / `WIRE-FIX-xxx` (50-96) | Language idioms, security, memory, error handling, no `unwrap()`, `qualityDimensions` met, wiring reachable, full-suite green, project `verif*` skill driven if present |
+
+`REFACTOR-FIX` is not a soft-dep prefix. `PRUNE-FIX-xxx` is. REFACTOR-001 and REVIEW-001 acceptance criteria include that bare token so a `todo` or `in_progress` deletion holds them. A `blocked` deletion does not. PRUNE-001's own criteria must not contain that token.
 
 Use the **rust-python-code-reviewer** / equivalent language agent when reviewing code. Document findings in the progress file. If a specific prior iteration produced something ugly and you don't want to wait for REFACTOR-001, invoke `/simplify` on that touchpoint directly — don't file a dedicated review task just for it.
 
 ### Spawning follow-up tasks
+
+PRUNE-001 copies this shape. Omit `estimatedEffort` and `timeoutSecs`. Priority stays inside 50-96.
+
+```sh
+echo '{
+  "id": "PRUNE-FIX-001",
+  "title": "Remove: <unused or speculative item>",
+  "description": "From PRUNE-001: <why this will not be needed>",
+  "rootCause": "<file:line + why it fails the existence bar>",
+  "exactFix": "<what to delete and which callers to update>",
+  "verifyCommand": "<project floor, or the mapped verif* skill drive>",
+  "acceptanceCriteria": ["Named code and tests are gone", "Required edge-case tests still exist", "Floor is green", "Progress line says why this will not be needed"],
+  "priority": 61,
+  "touchesFiles": ["affected/file.rs"]
+}' | task-mgr add --stdin --from-json tasks/<prd>.json --depended-on-by REVIEW-001
+```
+
+REVIEW-001 and REFACTOR-001 copy this shape for their own spawns (priority 50-96):
 
 ```sh
 echo '{
@@ -1097,7 +1154,10 @@ Verify:
 - [ ] Tasks with `modifiesBehavior: true` have caller impact documented in description
 - [ ] **Top-level `prdFile` set** to `"{feature}.md"` and that lean brief file exists on disk
 - [ ] **No `model` fields anywhere** (no per-task models AND no top-level PRD model; explicit models bypass the models+routing config, a top-level model is ignored and warns)
-- [ ] REFACTOR-001 and REVIEW-001 have `estimatedEffort: "high"` (strong tier via the anchor window) and `timeoutSecs: 1800`
+- [ ] PRUNE-001, REFACTOR-001, and REVIEW-001 have `estimatedEffort: "high"` (strong tier via the anchor window) and `timeoutSecs: 1800`
+- [ ] PRUNE-001 is present, depends on the implementation tasks, and its own acceptance criteria do not contain the token `PRUNE-FIX-`
+- [ ] REFACTOR-001 and REVIEW-001 depend on PRUNE-001 and their acceptance criteria include the bare token `PRUNE-FIX-xxx`
+- [ ] Spawn priorities for FIX / WIRE-FIX / REFACTOR-FIX / PRUNE-FIX are 50-96, not 97
 - [ ] REVIEW-001 (and any CODE-REVIEW etc. in full PRDs) rely on the built-in frontier force for review-class IDs; instructions do not hardcode a review model value into task entries
 - [ ] **No task has `synergyWith` / `batchWith` / `conflictsWith` populated** (dropped — `touchesFiles` drives synergy at runtime)
 - [ ] **Context-economy placeholders populated in the generated prompt** (the agent can't read the JSON, so these MUST be in the prompt):
@@ -1112,7 +1172,7 @@ Verify:
 - [ ] Prompt splits **scoped per-iteration** vs **full-suite at REVIEW-001** quality gates
 - [ ] Implementation tasks that Step 2.6 mapped onto a `verif*` feature include a drive-the-skill acceptance criterion and a `notes` pointer at SKILL.md + feature id
 - [ ] Documentation needs identified and included in REVIEW-001 criteria
-- [ ] Task count is 2-10 (if more, suggest `/prd` + `/prd-tasks`)
+- [ ] Implementation task count is 2-10, not counting PRUNE-001, REFACTOR-001, and REVIEW-001 (if more, suggest `/prd` + `/prd-tasks`)
 
 Report:
 
@@ -1124,6 +1184,7 @@ Created:
 
 Task breakdown:
   - {X} implementation tasks
+  - 1 existence pass (PRUNE-001)
   - 1 refactoring gate (REFACTOR-001)
   - 1 review task (REVIEW-001)
 
@@ -1160,6 +1221,7 @@ To run: task-mgr loop -y tasks/{feature}.json
 | Separate TEST-INIT tasks before implementation | Wastes iterations writing tests for APIs that don't exist yet | Include tests in each FEAT task                                 |
 | Multiple MILESTONE tasks                       | No-op iterations that just run cargo test                     | One REVIEW-001 at the end (IS the milestone)                    |
 | Multiple REFACTOR-REVIEW tasks                 | Reviews the same code 3 times                                 | One REFACTOR-001 + one REVIEW-001                               |
+| Asking REFACTOR-001 to delete speculative code | The shape pass keeps dead code and tidies it                  | PRUNE-001 decides existence; REFACTOR-001 shapes what stays     |
 | Vague acceptance criteria ("tests pass")       | Agent can't verify completion                                 | Specific: "Unit test: foo(empty) returns Err(Empty)"            |
 | Over-constraining dependsOn                    | Forces sequential execution when tasks could parallelize      | Only hard dependencies                                          |
 | Tasks with no negative requirements            | Agent doesn't know what to avoid                              | Every task has DO NOT section                                   |

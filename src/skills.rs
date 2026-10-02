@@ -380,6 +380,22 @@ mod tests {
     }
 
     #[test]
+    fn prune_gate_is_in_both_generators() {
+        for name in ["plan-tasks", "prd-tasks"] {
+            let body = skill(name).content;
+            assert!(body.contains("PRUNE-001"), "{name} missing PRUNE-001");
+            assert!(
+                body.contains("PRUNE-FIX-xxx"),
+                "{name} missing the bare PRUNE-FIX-xxx token"
+            );
+        }
+        assert!(
+            !skill("plan-tasks").content.contains("50-97"),
+            "plan-tasks spawn band must stay below PRUNE-001 priority 97"
+        );
+    }
+
+    #[test]
     #[test]
     fn best_practices_doc_is_nonempty_and_stages() {
         assert!(BEST_PRACTICES_DOC.contains("task-mgr update --stdin"));
