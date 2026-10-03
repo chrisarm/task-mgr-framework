@@ -18,9 +18,9 @@ services:
       - "${RECALL_BIND_ADDR:-127.0.0.1}:11435:11434"
     restart: unless-stopped
     healthcheck:
-      # /api/tags lists installed models — cheap, 200 even on empty install.
-      # ollama/ollama base image (Ubuntu) ships curl.
-      test: ["CMD-SHELL", "curl -sf http://localhost:11434/api/tags || exit 1"]
+      # `ollama list` hits the local API (/api/tags); the ollama/ollama image
+      # has no curl, so a curl probe reports unhealthy while serving fine.
+      test: ["CMD", "ollama", "list"]
       interval: 30s
       timeout: 5s
       retries: 5
@@ -83,7 +83,7 @@ services:
     restart: unless-stopped
     healthcheck:
       # Same probe as GPU variant; start_period covers model load on CPU.
-      test: ["CMD-SHELL", "curl -sf http://localhost:11434/api/tags || exit 1"]
+      test: ["CMD", "ollama", "list"]
       interval: 30s
       timeout: 5s
       retries: 5
