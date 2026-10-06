@@ -404,6 +404,21 @@ scope" note mirrors this split.
 
 ### Load-bearing invariants
 
+**CLI-error-gated detection (CONTRACT-001 / fe92ec5b):** text classifiers
+(`is_rate_limited` / `is_prompt_too_long` / `is_transient_backend`) run only
+when `has_cli_error = cli_error || (exit_code != 0 && !completion_killed)`.
+`OutputSignals { cli_error, completion_killed, error_text, task_id, run_id }`
+is the sole analyze_output signal struct (no same-typed bool pair).
+`tool_result.is_error` is ignored; Grok stays `cli_error: false`. Both paths
+snapshot the outcome before the pipeline; `react_to_outputs` and budget
+give-back read the snapshot (a post-pipeline read skips the wait after
+`record_completion` → `Completed`). Untagged `handle_overflow` stays before
+the pipeline; skip the **entire** call only when the claimed id is already in
+`parse_completed_tasks`. Grace fallback is the `arm_completion_grace` buffer
+tail on `IterationResult` / `ProcessingParams`, not head-capped `conversation`.
+OperatorStopped / StopSpend stay exit 0; StopSpend sets `account_quota_stopped`.
+Full copy-paste under `## CONTRACT-001` in `tasks/progress-fe92ec5b.txt`.
+
 - **`handle_overflow` ordering.** On a `PromptTooLong` outcome the overflow
   coordinator fires BEFORE the shared `iteration_pipeline::process_iteration_output`
   runs for that iteration/slot, in both paths. Recovery state (the `todo`/`blocked`
@@ -413,7 +428,8 @@ scope" note mirrors this split.
   `slot.rs::process_slot_result` calls `handle_overflow` then
   `process_iteration_output` a few lines later; sequential: `run_iteration`'s
   Step 8.5 runs before `run_loop` invokes the pipeline. Full ordering in
-  "Overflow recovery and diagnostics".
+  "Overflow recovery and diagnostics". (fe92ec5b adds one exception: skip the
+  **whole** call when the resolved claimed id is in `parse_completed_tasks`.)
 
 - **`iteration_consumed == false` gives the loop-bound iteration back.** A
   `RateLimit` / `Reorder` / transient-backend `WaitedAndRetry` outcome routes
