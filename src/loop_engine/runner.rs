@@ -30,7 +30,9 @@ use crate::loop_engine::claude::{ACTIVE_PREFIX_ENV, ClaudeStreamFormat, is_pty_r
 use crate::loop_engine::config::PermissionMode;
 use crate::loop_engine::model::{AuxiliaryLlmPlan, Provider};
 use crate::loop_engine::signals::SignalFlag;
-use crate::loop_engine::stream::{CodexStreamFormat, GrokStreamFormat, drive_stream};
+use crate::loop_engine::stream::{
+    CodexStreamFormat, DriveStreamResult, GrokStreamFormat, drive_stream,
+};
 use crate::loop_engine::watchdog::{TimeoutConfig, exit_code_from_status, watchdog_loop};
 use crate::output::ui;
 
@@ -143,6 +145,23 @@ pub struct RunnerResult {
     /// `Some(uuid)` for ClaudeRunner (unconditional as of FEAT-003).
     /// `None` for GrokRunner (Grok capture lands in FEAT-004).
     pub session_id: Option<Uuid>,
+    /// True when the CLI reported an error via stream-json `result.is_error`
+    /// or `StreamEvent::Error` (assistant `error`, Codex `error` /
+    /// `turn.failed`). Grok always leaves this false — the exit≠0 gate
+    /// covers Grok. `tool_result.is_error` is never read for this flag.
+    /// No `Default` derive: every literal must set the new fields explicitly.
+    pub cli_error: bool,
+    /// Retained error string for gated classifiers when `cli_error` is set:
+    /// the `result` string when `is_error`, otherwise the `StreamEvent::Error`
+    /// string. Codex `turn.failed` text lives here (it is not in
+    /// `derive_output`).
+    pub error_text: Option<String>,
+    /// Tail-retained copy of the assistant buffer that
+    /// `arm_completion_grace` already scans. FEAT-006 uses this as the
+    /// grace-fallback completion scan source; `conversation` is head-capped
+    /// and must not be used as that fallback. Empty in plain (non-stream)
+    /// mode.
+    pub grace_buffer_tail: String,
 }
 
 /// Optional settings for a runner invocation.
@@ -671,7 +690,7 @@ impl LlmRunner for ClaudeRunner {
         };
         let reader = BufReader::new(reader_source);
 
-        let (output, conversation, permission_denials) = if stream_json {
+        let driven = if stream_json {
             drive_stream(
                 reader,
                 &ClaudeStreamFormat,
@@ -680,11 +699,14 @@ impl LlmRunner for ClaudeRunner {
                 slot_label,
             )
         } else {
-            (
-                read_plain_stdout(reader, slot_label, "Claude"),
-                None,
-                Vec::new(),
-            )
+            DriveStreamResult {
+                output: read_plain_stdout(reader, slot_label, "Claude"),
+                conversation: None,
+                denials: Vec::new(),
+                cli_error: false,
+                error_text: None,
+                grace_buffer_tail: String::new(),
+            }
         };
 
         let status = child.wait().map_err(|e| TaskMgrError::IoErrorWithContext {
@@ -697,12 +719,15 @@ impl LlmRunner for ClaudeRunner {
 
         Ok(RunnerResult {
             exit_code: exit_code_from_status(status),
-            output,
-            conversation,
+            output: driven.output,
+            conversation: driven.conversation,
             timed_out,
             completion_killed,
-            permission_denials,
+            permission_denials: driven.denials,
             session_id: Some(uuid),
+            cli_error: driven.cli_error,
+            error_text: driven.error_text,
+            grace_buffer_tail: driven.grace_buffer_tail,
         })
     }
 
@@ -922,7 +947,7 @@ impl LlmRunner for GrokRunner {
                 .expect("stdout should be piped (Stdio::piped() was set on spawn)"),
         );
 
-        let (output, conversation, permission_denials) = if stream_json {
+        let driven = if stream_json {
             drive_stream(
                 reader,
                 &GrokStreamFormat,
@@ -931,12 +956,26 @@ impl LlmRunner for GrokRunner {
                 slot_label,
             )
         } else {
-            (
-                read_plain_stdout(reader, slot_label, "Grok"),
-                None,
-                Vec::new(),
-            )
+            DriveStreamResult {
+                output: read_plain_stdout(reader, slot_label, "Grok"),
+                conversation: None,
+                denials: Vec::new(),
+                cli_error: false,
+                error_text: None,
+                grace_buffer_tail: String::new(),
+            }
         };
+        // Destructure so plain-mode and stream-json share the same locals;
+        // Grok forces cli_error false / error_text None (CONTRACT-001).
+        let DriveStreamResult {
+            output,
+            conversation,
+            denials: permission_denials,
+            grace_buffer_tail,
+            ..
+        } = driven;
+        let cli_error = false;
+        let error_text = None;
 
         let status = child.wait().map_err(|e| TaskMgrError::IoErrorWithContext {
             file_path: binary.clone(),
@@ -1012,6 +1051,9 @@ impl LlmRunner for GrokRunner {
             completion_killed,
             permission_denials,
             session_id,
+            cli_error,
+            error_text,
+            grace_buffer_tail,
         })
     }
 
@@ -1119,7 +1161,7 @@ impl LlmRunner for CodexRunner {
                 .take()
                 .expect("stdout should be piped (Stdio::piped() was set on spawn)"),
         );
-        let (output, conversation, permission_denials) = if stream_json {
+        let driven = if stream_json {
             drive_stream(
                 reader,
                 &CodexStreamFormat,
@@ -1128,11 +1170,14 @@ impl LlmRunner for CodexRunner {
                 slot_label,
             )
         } else {
-            (
-                read_plain_stdout(reader, slot_label, "Codex"),
-                None,
-                Vec::new(),
-            )
+            DriveStreamResult {
+                output: read_plain_stdout(reader, slot_label, "Codex"),
+                conversation: None,
+                denials: Vec::new(),
+                cli_error: false,
+                error_text: None,
+                grace_buffer_tail: String::new(),
+            }
         };
         let status = child.wait().map_err(|e| TaskMgrError::IoErrorWithContext {
             file_path: binary.clone(),
@@ -1154,7 +1199,7 @@ impl LlmRunner for CodexRunner {
         };
         if let Some(err) = classify_codex_exit(
             exit_code,
-            conversation.as_deref().unwrap_or(""),
+            driven.conversation.as_deref().unwrap_or(""),
             &stderr_str,
         ) {
             return Err(err);
@@ -1162,12 +1207,17 @@ impl LlmRunner for CodexRunner {
 
         Ok(RunnerResult {
             exit_code,
-            output,
-            conversation,
+            output: driven.output,
+            conversation: driven.conversation,
             timed_out,
             completion_killed,
-            permission_denials,
+            permission_denials: driven.denials,
             session_id: None,
+            // Codex error / turn.failed → StreamEvent::Error → cli_error +
+            // retained error string (not present in derive_output).
+            cli_error: driven.cli_error,
+            error_text: driven.error_text,
+            grace_buffer_tail: driven.grace_buffer_tail,
         })
     }
 }
@@ -3270,6 +3320,9 @@ Assistant: I'll retry with credentials.\n";
                     completion_killed: false,
                     permission_denials: Vec::new(),
                     session_id: None,
+                    cli_error: false,
+                    error_text: None,
+                    grace_buffer_tail: String::new(),
                 })
             }),
             None,
@@ -3317,6 +3370,9 @@ Assistant: I'll retry with credentials.\n";
                     completion_killed: false,
                     permission_denials: Vec::new(),
                     session_id: None,
+                    cli_error: false,
+                    error_text: None,
+                    grace_buffer_tail: String::new(),
                 })
             }),
             None,
@@ -3367,6 +3423,9 @@ Assistant: I'll retry with credentials.\n";
                     completion_killed: false,
                     permission_denials: Vec::new(),
                     session_id: None,
+                    cli_error: false,
+                    error_text: None,
+                    grace_buffer_tail: String::new(),
                 })
             }),
             Some(Box::new(move |cwd| {

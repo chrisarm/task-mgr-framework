@@ -396,7 +396,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn best_practices_doc_is_nonempty_and_stages() {
         assert!(BEST_PRACTICES_DOC.contains("task-mgr update --stdin"));
         assert!(BEST_PRACTICES_DOC.contains("--from-json"));

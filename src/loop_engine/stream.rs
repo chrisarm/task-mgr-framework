@@ -60,10 +60,15 @@ pub(crate) enum StreamEvent {
     /// Tool result — conversation transcript only.
     ToolResult(String),
     /// Authoritative final output string (e.g. Claude's `result.result`).
-    FinalResult(String),
+    /// `is_error` is the stream-json `result.is_error` bool (missing → false);
+    /// when true, accumulate sets `cli_error` and retains `text` as
+    /// `error_text`.
+    FinalResult { text: String, is_error: bool },
     /// Permission-denial JSON values carried through to `RunnerResult`.
     PermissionDenials(Vec<Value>),
-    /// Error text — conversation transcript only (`[Error: ...]`), never teed.
+    /// Error text — conversation transcript (`[Error: ...]`), never teed.
+    /// Also sets `cli_error` and fills `error_text` when that field is still
+    /// empty (result `is_error` keeps the result string preferentially).
     Error(String),
 }
 
@@ -71,7 +76,8 @@ pub(crate) enum StreamEvent {
 #[derive(Default)]
 pub(crate) struct Accumulator {
     /// Concatenated `AssistantText` (tail-capped). The output source for
-    /// providers without a `FinalResult` line.
+    /// providers without a `FinalResult` line. Also the buffer
+    /// `arm_completion_grace` scans — copied onto `RunnerResult.grace_buffer_tail`.
     pub(crate) assistant_buf: String,
     /// Authoritative final result, if the provider emits one.
     pub(crate) final_result: Option<String>,
@@ -79,6 +85,10 @@ pub(crate) struct Accumulator {
     pub(crate) conversation: String,
     /// Permission-denial values.
     pub(crate) denials: Vec<Value>,
+    /// CLI-error provenance: `result.is_error` or `StreamEvent::Error`.
+    pub(crate) cli_error: bool,
+    /// Retained error string for gated classifiers (see `RunnerResult.error_text`).
+    pub(crate) error_text: Option<String>,
 }
 
 /// Provider-specific stdout interpretation.
@@ -131,14 +141,25 @@ pub(crate) fn accumulate(acc: &mut Accumulator, ev: StreamEvent) {
             let truncated = truncate_bytes(&content, MAX_TOOL_RESULT_BYTES);
             append_capped(&mut acc.conversation, &format!("[Result: {}]\n", truncated));
         }
-        StreamEvent::FinalResult(s) => {
-            acc.final_result = Some(s);
+        StreamEvent::FinalResult { text, is_error } => {
+            if is_error {
+                acc.cli_error = true;
+                // Result-line is_error keeps the result string as error_text
+                // (overwrites any earlier StreamEvent::Error retention).
+                acc.error_text = Some(text.clone());
+            }
+            acc.final_result = Some(text);
         }
         StreamEvent::PermissionDenials(d) => {
             acc.denials.extend(d);
         }
         StreamEvent::Error(e) => {
             append_capped(&mut acc.conversation, &format!("[Error: {}]\n", e));
+            acc.cli_error = true;
+            // Fill only when still empty — result is_error wins if it arrives.
+            if acc.error_text.as_ref().is_none_or(|s| s.is_empty()) {
+                acc.error_text = Some(e);
+            }
         }
     }
 }
@@ -239,8 +260,20 @@ fn tee_push(
     }
 }
 
+/// Result of [`drive_stream`]: derived output plus CLI-error provenance and
+/// the grace-buffer tail FEAT-006 will scan.
+pub(crate) struct DriveStreamResult {
+    pub output: String,
+    pub conversation: Option<String>,
+    pub denials: Vec<Value>,
+    pub cli_error: bool,
+    pub error_text: Option<String>,
+    /// Same buffer `arm_completion_grace` scans (`Accumulator.assistant_buf`).
+    pub grace_buffer_tail: String,
+}
+
 /// Read provider stdout, tee live output, build the transcript, and return
-/// `(output, Some(conversation), permission_denials)`.
+/// derived output plus CLI-error provenance and the grace-buffer tail.
 ///
 /// Generic over the concrete `StreamFormat` so dispatch is static (monomorphized
 /// per provider at the spawn site) — no `&dyn` on the per-line hot path.
@@ -250,7 +283,7 @@ pub(crate) fn drive_stream<F: StreamFormat>(
     target_task_id: Option<&str>,
     completion_epoch: &AtomicU64,
     slot_label: Option<&str>,
-) -> (String, Option<String>, Vec<Value>) {
+) -> DriveStreamResult {
     let buffered_tee = format.line_buffer_tee();
     let mut acc = Accumulator::default();
     // Live-tee state for fragment-streaming providers (no-op when !buffered_tee).
@@ -312,7 +345,15 @@ pub(crate) fn drive_stream<F: StreamFormat>(
     }
 
     let output = format.derive_output(&acc);
-    (output, Some(acc.conversation), acc.denials)
+    DriveStreamResult {
+        output,
+        conversation: Some(acc.conversation),
+        denials: acc.denials,
+        cli_error: acc.cli_error,
+        error_text: acc.error_text,
+        // Same buffer arm_completion_grace scans (already tail-retained).
+        grace_buffer_tail: acc.assistant_buf,
+    }
 }
 
 /// Arm the completion-grace window if the accumulated assistant buffer contains
@@ -498,6 +539,18 @@ mod tests {
     /// Fold a provider's JSONL lines through the accumulation core (no tee/grace),
     /// mirroring the production fold for assertion in tests.
     fn run_format<F: StreamFormat>(format: &F, lines: &[&str]) -> (String, String, Vec<Value>) {
+        let (output, conv, denials, _cli_error, _error_text, _grace) =
+            run_format_full(format, lines);
+        (output, conv, denials)
+    }
+
+    /// Like [`run_format`] but also returns CLI-error provenance and the
+    /// grace-buffer tail (same fields `drive_stream` exposes on
+    /// [`DriveStreamResult`]).
+    fn run_format_full<F: StreamFormat>(
+        format: &F,
+        lines: &[&str],
+    ) -> (String, String, Vec<Value>, bool, Option<String>, String) {
         let mut acc = Accumulator::default();
         {
             let mut sink = |ev| accumulate(&mut acc, ev);
@@ -511,6 +564,9 @@ mod tests {
             output,
             acc.conversation.clone(),
             std::mem::take(&mut acc.denials),
+            acc.cli_error,
+            acc.error_text.clone(),
+            acc.assistant_buf.clone(),
         )
     }
 
@@ -792,6 +848,37 @@ mod tests {
         }
     }
 
+    /// AC (FEAT-001): Codex `turn.failed` sets `cli_error` and stores that
+    /// string in `error_text`. The string is NOT in `derive_output` (Codex
+    /// output is the assistant buffer only).
+    #[test]
+    fn codex_turn_failed_sets_cli_error_and_error_text_not_in_output() {
+        let lines = [
+            r#"{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"partial reply"}}"#,
+            r#"{"type":"turn.failed","error":{"message":"turn failed: auth expired"}}"#,
+        ];
+        let (output, conv, _d, cli_error, error_text, _grace) =
+            run_format_full(&CodexStreamFormat, &lines);
+        assert!(cli_error, "turn.failed must set cli_error");
+        assert_eq!(
+            error_text.as_deref(),
+            Some("turn failed: auth expired"),
+            "error_text must be the turn.failed message"
+        );
+        assert_eq!(
+            output, "partial reply",
+            "derive_output is the assistant buffer — must not contain the error string"
+        );
+        assert!(
+            !output.contains("turn failed"),
+            "error string must not leak into derive_output"
+        );
+        assert!(
+            conv.contains("[Error: turn failed: auth expired]"),
+            "conversation still records [Error: …] for auth sniff"
+        );
+    }
+
     /// `type: "error"` with a top-level `message` surfaces as
     /// `StreamEvent::Error(message)`. Distinct shape from `turn.failed`;
     /// both must route through the same `[Error: …]` transcript line.
@@ -804,6 +891,48 @@ mod tests {
             StreamEvent::Error(m) => assert_eq!(m, "y"),
             _ => panic!("type:error must yield Error with top-level message"),
         }
+        let (_output, _conv, _d, cli_error, error_text, _grace) =
+            run_format_full(&CodexStreamFormat, &lines);
+        assert!(cli_error, "type:error must set cli_error");
+        assert_eq!(error_text.as_deref(), Some("y"));
+    }
+
+    /// AC (FEAT-001): grace_buffer_tail is the same assistant_buf that
+    /// `arm_completion_grace` scans (not the head-capped conversation).
+    #[test]
+    fn grace_buffer_tail_matches_assistant_buf_arm_scans() {
+        let lines = [
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"prefix <completed>REVIEW-1</completed> suffix"}]}}"#,
+            r#"{"type":"result","subtype":"success","result":"final"}"#,
+        ];
+        let (_output, conv, _d, _cli_error, _error_text, grace) =
+            run_format_full(&ClaudeStreamFormat, &lines);
+        assert!(
+            grace.contains("<completed>REVIEW-1</completed>"),
+            "grace_buffer_tail must retain the assistant tag buffer"
+        );
+        assert_eq!(
+            grace, "prefix <completed>REVIEW-1</completed> suffix",
+            "grace_buffer_tail is the assistant_buf copy"
+        );
+        // conversation is a different channel (also gets the text, but is
+        // head-capped separately) — presence here is fine; the contract is
+        // that grace uses assistant_buf, not conversation.
+        assert!(conv.contains("<completed>REVIEW-1</completed>"));
+    }
+
+    /// AC (FEAT-001): Grok accumulation never sets cli_error (no Error events).
+    #[test]
+    fn grok_leaves_cli_error_false() {
+        let lines = [
+            r#"{"type":"text","data":"hello"}"#,
+            r#"{"type":"end","stopReason":"EndTurn"}"#,
+        ];
+        let (_output, _conv, _d, cli_error, error_text, grace) =
+            run_format_full(&GrokStreamFormat, &lines);
+        assert!(!cli_error);
+        assert!(error_text.is_none());
+        assert_eq!(grace, "hello", "grace_buffer_tail is the assistant buffer");
     }
 
     /// Forward-compat: unknown top-level `type`, unknown item kinds, and

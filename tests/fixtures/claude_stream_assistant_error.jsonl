@@ -1,0 +1,1 @@
+{"type":"assistant","message":{"id":"msg_fixture","type":"message","role":"assistant","model":"claude-fixture","content":[{"type":"text","text":"should not appear in transcript"}]},"error":"API Error: rate_limit_error"}

@@ -243,17 +243,20 @@ fn assistant_content(val: &serde_json::Value) -> Option<&Vec<serde_json::Value>>
 ///
 /// Malformed JSON lines and unknown message types are silently skipped with a warning.
 ///
-/// Note: permission_denials are discarded here to keep existing test call sites unchanged.
-/// Use `parse_stream_json_lines_full` to get the full 3-tuple including denials.
+/// Note: permission_denials / cli_error / error_text / grace_buffer_tail are
+/// discarded here to keep existing test call sites unchanged. Use
+/// `parse_stream_json_lines_full` for the full provenance tuple.
 #[cfg(test)]
 pub(crate) fn parse_stream_json_lines<'a>(
     lines: impl Iterator<Item = &'a str>,
 ) -> (String, Option<String>) {
-    let (output, conversation, _denials) = parse_stream_json_lines_full(lines);
+    let (output, conversation, _denials, _cli_error, _error_text, _grace_tail) =
+        parse_stream_json_lines_full(lines);
     (output, conversation)
 }
 
-/// Like `parse_stream_json_lines` but also returns permission_denials.
+/// Like `parse_stream_json_lines` but also returns permission_denials plus
+/// CLI-error provenance (`cli_error`, `error_text`) and the grace-buffer tail.
 ///
 /// Test helper: folds Claude stream-json lines through the shared
 /// [`accumulate`](crate::loop_engine::stream::accumulate) core with
@@ -263,7 +266,14 @@ pub(crate) fn parse_stream_json_lines<'a>(
 #[cfg(test)]
 pub(crate) fn parse_stream_json_lines_full<'a>(
     lines: impl Iterator<Item = &'a str>,
-) -> (String, Option<String>, Vec<serde_json::Value>) {
+) -> (
+    String,
+    Option<String>,
+    Vec<serde_json::Value>,
+    bool,
+    Option<String>,
+    String,
+) {
     let format = ClaudeStreamFormat;
     let mut acc = Accumulator::default();
     {
@@ -276,7 +286,14 @@ pub(crate) fn parse_stream_json_lines_full<'a>(
         }
     }
     let output = format.derive_output(&acc);
-    (output, Some(acc.conversation), acc.denials)
+    (
+        output,
+        Some(acc.conversation),
+        acc.denials,
+        acc.cli_error,
+        acc.error_text,
+        acc.assistant_buf,
+    )
 }
 
 /// Claude `--output-format stream-json` interpretation: `{"type":"assistant",
@@ -377,7 +394,16 @@ impl StreamFormat for ClaudeStreamFormat {
                         })
                     })
                     .unwrap_or_default();
-                sink(StreamEvent::FinalResult(output));
+                // CONTRACT-001: is_error only on the result arm; missing/non-bool → false.
+                // Do not read tool_result.is_error.
+                let is_error = val
+                    .get("is_error")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                sink(StreamEvent::FinalResult {
+                    text: output,
+                    is_error,
+                });
                 if let Some(denials) = val.get("permission_denials").and_then(|d| d.as_array()) {
                     sink(StreamEvent::PermissionDenials(denials.to_vec()));
                 }
@@ -651,6 +677,9 @@ mod tests {
             completion_killed: false,
             permission_denials: vec![],
             session_id: None,
+            cli_error: false,
+            error_text: None,
+            grace_buffer_tail: String::new(),
         };
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.output, "Hello world\n");
@@ -670,6 +699,9 @@ mod tests {
             completion_killed: false,
             permission_denials: vec![],
             session_id: None,
+            cli_error: false,
+            error_text: None,
+            grace_buffer_tail: String::new(),
         };
         assert_eq!(result.exit_code, 137);
         assert!(result.output.is_empty());
@@ -719,6 +751,9 @@ mod tests {
             completion_killed: false,
             permission_denials: vec![],
             session_id: None,
+            cli_error: false,
+            error_text: None,
+            grace_buffer_tail: String::new(),
         })
     }
 
@@ -860,6 +895,9 @@ mod tests {
             completion_killed: false,
             permission_denials: vec![],
             session_id: None,
+            cli_error: false,
+            error_text: None,
+            grace_buffer_tail: String::new(),
         })
     }
 
@@ -1916,25 +1954,130 @@ mod tests {
         );
     }
 
-    /// AC: result with subtype=error is handled — output extracted from result field.
+    /// AC (FEAT-001): result subtype still extracts output; `is_error` gates
+    /// `cli_error` / `error_text`. Missing or non-bool `is_error` → false.
+    /// Fixtures: usage-limit result + assistant error shapes reconstructed from
+    /// the known Claude CLI stream-json schema (PRD E4); no live capture was
+    /// available in this environment — see progress log.
     #[rstest]
     #[case(
         r#"{"type":"result","subtype":"error","result":"fatal error occurred","session_id":"s"}"#,
-        "fatal error occurred"
+        "fatal error occurred",
+        false,
+        None
     )]
     #[case(
         r#"{"type":"result","subtype":"success","result":"<completed>T-1</completed>","session_id":"s"}"#,
-        "<completed>T-1</completed>"
+        "<completed>T-1</completed>",
+        false,
+        None
     )]
     #[case(
         r#"{"type":"result","subtype":"error","result":null,"session_id":"s"}"#,
-        ""
+        "",
+        false,
+        None
     )]
-    fn test_parse_stream_json_result_subtypes(#[case] line: &str, #[case] expected_output: &str) {
-        let (output, _) = parse_stream_json_lines(std::iter::once(line));
+    // Usage-limit result with is_error:true (fixture shape; see tests/fixtures/).
+    #[case(
+        include_str!("../../tests/fixtures/claude_stream_usage_limit_result.jsonl").trim(),
+        "You've hit your session limit · resets 4pm",
+        true,
+        Some("You've hit your session limit · resets 4pm")
+    )]
+    // is_error explicitly false → cli_error stays false even on error subtype.
+    #[case(
+        r#"{"type":"result","subtype":"error","is_error":false,"result":"looks like an error but flag false","session_id":"s"}"#,
+        "looks like an error but flag false",
+        false,
+        None
+    )]
+    // Non-bool is_error (string) → false via as_bool().
+    #[case(
+        r#"{"type":"result","subtype":"error","is_error":"yes","result":"non-bool is_error","session_id":"s"}"#,
+        "non-bool is_error",
+        false,
+        None
+    )]
+    fn test_parse_stream_json_result_subtypes(
+        #[case] line: &str,
+        #[case] expected_output: &str,
+        #[case] expected_cli_error: bool,
+        #[case] expected_error_text: Option<&str>,
+    ) {
+        let (output, _conv, _denials, cli_error, error_text, _grace) =
+            parse_stream_json_lines_full(std::iter::once(line));
         assert_eq!(
             output, expected_output,
             "Output should be extracted from result field regardless of subtype"
+        );
+        assert_eq!(
+            cli_error, expected_cli_error,
+            "cli_error must follow result.is_error (missing/non-bool → false)"
+        );
+        assert_eq!(
+            error_text.as_deref(),
+            expected_error_text,
+            "error_text retains the result string only when is_error is true"
+        );
+    }
+
+    /// AC (FEAT-001): assistant `error` → StreamEvent::Error → cli_error + retained text.
+    #[test]
+    fn test_parse_stream_json_assistant_error_sets_cli_error() {
+        let line = include_str!("../../tests/fixtures/claude_stream_assistant_error.jsonl").trim();
+        let (_output, conv, _denials, cli_error, error_text, _grace) =
+            parse_stream_json_lines_full(std::iter::once(line));
+        assert!(cli_error, "assistant error must set cli_error");
+        assert_eq!(
+            error_text.as_deref(),
+            Some("API Error: rate_limit_error"),
+            "error_text must retain the StreamEvent::Error string"
+        );
+        let conv = conv.expect("conversation present");
+        assert!(
+            conv.contains("[Error: API Error: rate_limit_error]"),
+            "transcript still records [Error: …]; got: {conv}"
+        );
+        assert!(
+            !conv.contains("should not appear in transcript"),
+            "errored assistant text stays out of the transcript"
+        );
+    }
+
+    /// AC (FEAT-001): tool_result.is_error must NOT set cli_error.
+    #[test]
+    fn test_tool_result_is_error_does_not_set_cli_error() {
+        let lines = [
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"boom","is_error":true}]}}"#,
+            r#"{"type":"result","subtype":"success","result":"ok","session_id":"s"}"#,
+        ];
+        let (output, _conv, _denials, cli_error, error_text, _grace) =
+            parse_stream_json_lines_full(lines.iter().copied());
+        assert_eq!(output, "ok");
+        assert!(
+            !cli_error,
+            "tool_result.is_error must leave cli_error false"
+        );
+        assert!(error_text.is_none());
+    }
+
+    /// AC (FEAT-001): result is_error wins over an earlier assistant Error for
+    /// error_text retention; both keep cli_error true.
+    #[test]
+    fn test_result_is_error_overwrites_assistant_error_text() {
+        let lines = [
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"x"}]},"model":"m","error":"earlier assistant err"}"#,
+            r#"{"type":"result","subtype":"error","is_error":true,"result":"authoritative result err","session_id":"s"}"#,
+        ];
+        let (output, _conv, _denials, cli_error, error_text, _grace) =
+            parse_stream_json_lines_full(lines.iter().copied());
+        assert_eq!(output, "authoritative result err");
+        assert!(cli_error);
+        assert_eq!(
+            error_text.as_deref(),
+            Some("authoritative result err"),
+            "result is_error keeps the result string, not the earlier Error"
         );
     }
 
@@ -2475,7 +2618,8 @@ mod tests {
         let lines = [
             r#"{"type":"result","result":"done","permission_denials":[{"tool_name":"Bash","tool_use_id":"t1","tool_input":{"command":"touch /tmp/foo","description":"Create file"}}]}"#,
         ];
-        let (_output, _conv, denials) = parse_stream_json_lines_full(lines.iter().copied());
+        let (_output, _conv, denials, _cli_error, _error_text, _grace) =
+            parse_stream_json_lines_full(lines.iter().copied());
         assert_eq!(denials.len(), 1);
         assert_eq!(denials[0]["tool_name"], "Bash");
         assert_eq!(denials[0]["tool_input"]["command"], "touch /tmp/foo");
@@ -2484,14 +2628,16 @@ mod tests {
     #[test]
     fn test_permission_denials_empty_array() {
         let lines = [r#"{"type":"result","result":"done","permission_denials":[]}"#];
-        let (_output, _conv, denials) = parse_stream_json_lines_full(lines.iter().copied());
+        let (_output, _conv, denials, _cli_error, _error_text, _grace) =
+            parse_stream_json_lines_full(lines.iter().copied());
         assert!(denials.is_empty());
     }
 
     #[test]
     fn test_permission_denials_missing_field() {
         let lines = [r#"{"type":"result","result":"done"}"#];
-        let (_output, _conv, denials) = parse_stream_json_lines_full(lines.iter().copied());
+        let (_output, _conv, denials, _cli_error, _error_text, _grace) =
+            parse_stream_json_lines_full(lines.iter().copied());
         assert!(denials.is_empty());
     }
 
