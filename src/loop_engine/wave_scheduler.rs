@@ -1098,7 +1098,7 @@ pub fn run_wave_iteration(
             // on Claude provider enablement — NEVER on `usage_params.enabled`
             // (which folds in the `LOOP_USAGE_CHECK_ENABLED` env switch and is
             // pre-iteration-only). Must stay byte-identical to the sequential
-            // construction in `iteration.rs`.
+            // construction in `orchestrator.rs`.
             anthropic_account_io_allowed: resolved_models
                 .is_provider_enabled(model::Provider::Claude),
             tasks_dir: params.tasks_dir,

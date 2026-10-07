@@ -396,6 +396,11 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
         // learning extraction, bandit feedback, and per-task crash-tracking.
         // Wrapper-commit, external-git reconciliation, and human-review
         // triggering stay at this call site (FEAT-005).
+        //
+        // Snapshot BEFORE the ladder. `record_completion` rewrites a RateLimit
+        // iteration to Completed; the account reaction and the budget give-back
+        // must read this copy. Reading the live outcome skips the wait.
+        let outcome_snapshot = result.outcome.clone();
         let processing_outcome =
             iteration_pipeline::process_iteration_output(iteration_pipeline::ProcessingParams {
                 conn: &mut conn,
@@ -442,80 +447,37 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
             last_claimed_task = None;
         }
 
-        // Post-completion reactions (#8 wrapper-commit, #9 external-git shadow,
-        // #10 human-review) — converged into `reactions::post_completion::
-        // react_to_completions` so the wave path fires the identical set
-        // (FEAT-010). Skipped on an `Empty` iteration: nothing completed, which
-        // matches the pre-convergence guards (the external-git + human-review
-        // blocks already short-circuited on `Empty`, and the wrapper-commit was
-        // gated on `claimed_was_completed`, false whenever the outcome is Empty).
-        if !matches!(result.outcome, IterationOutcome::Empty) {
-            let pc_params = reactions::post_completion::PostCompletionParams {
+        // Post-completion reactions, then the account rate-limit reaction on
+        // `outcome_snapshot` (not the live outcome). Wrapper commit returns
+        // before the wait. OperatorStopped / StopSpend set Empty only after
+        // that reaction returns.
+        sequential_completions_then_rate_limit(
+            &mut conn,
+            &mut ctx,
+            &mut result,
+            &mut last_claimed_task,
+            &mut tasks_completed,
+            SequentialAfterLadder {
+                snapshot: &outcome_snapshot,
+                completed_ids: &processing_outcome.completed_task_ids,
+                claimed_was_completed,
                 run_id: &run_id,
                 iteration,
                 working_root: working_root.as_path(),
                 git_status_baseline: git_baseline.as_ref(),
-                // Only the claimed task that actually completed is attributed a
-                // wrapper commit (REFACTOR-FIX-002 — one commit per iteration, not
-                // one per completed id). An iteration whose only completion is a
-                // cross-task `<task-status>` (not the claimed task) intentionally
-                // gets no wrapper commit even with dirty agent work: the wrapper
-                // commit belongs to a single owning task or to none.
-                wrapper_commit_task_id: if claimed_was_completed {
-                    result.task_id.as_deref()
-                } else {
-                    None
-                },
-                prd_file: &paths.prd_file,
+                prd_file: paths.prd_file.as_path(),
                 task_prefix: task_prefix.as_deref(),
                 default_model: default_model.as_deref(),
                 permission_mode: &permission_mode,
                 external_repo_path: external_repo_path.as_deref(),
                 external_git_scan_depth: run_config.config.external_git_scan_depth as u32,
-                wrapper_commit: true,
-            };
-            let pc_outcome = reactions::post_completion::react_to_completions(
-                &mut conn,
-                &processing_outcome.completed_task_ids,
-                &pc_params,
-                &mut ctx.session_guidance,
-            );
-
-            if let Some(hash) = pc_outcome.wrapper_commit_hash {
-                ctx.last_commit = Some(hash);
-            }
-
-            // Fold any external-git completions into iteration accounting — the
-            // same bookkeeping the inline external-git block did before the
-            // convergence.
-            if !pc_outcome.external_reconciled.is_empty() {
-                let count = pc_outcome.external_reconciled.len();
-                tasks_completed += count as u32;
-
-                // Override outcome so stale/crash trackers reset — tasks were
-                // actually completed.
-                result.outcome = IterationOutcome::Completed;
-                ctx.crash_tracker.record_success();
-
-                ui::emit(&format!(
-                    "Post-iteration reconciliation: marked {} task(s) done",
-                    count
-                ));
-                // Clear tracker if the claimed task was reconciled as done.
-                if let Some(ref claimed) = last_claimed_task {
-                    let status: Option<String> = conn
-                        .query_row(
-                            "SELECT status FROM tasks WHERE id = ?",
-                            [claimed.as_str()],
-                            |row| row.get(0),
-                        )
-                        .ok();
-                    if status.as_deref() == Some("done") {
-                        last_claimed_task = None;
-                    }
-                }
-            }
-        }
+                usage_params: &usage_params,
+                tasks_dir: paths.tasks_dir.as_path(),
+            },
+            |conn, items, params, blackout, unavailable, _live| {
+                reactions::account::react_to_outputs(conn, items, params, blackout, unavailable)
+            },
+        );
 
         // FEAT-014: sequential transient-backend reaction (account-global).
         // The single sequential call site of `react_to_transient` — the
@@ -567,18 +529,12 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
             }
         }
 
-        // Track iteration count (skip reorders, rate limits, and the
-        // transient-backend WaitedAndRetry — all give back the iteration so a
-        // persistently unavailable backend / rate-limited account doesn't burn
-        // its budget on waits). FEAT-013: the budget rule itself lives in
-        // `account_iteration_budget`, shared with the wave path above so the
-        // give-back and the stat advance cannot drift between the two paths.
-        let consumes_budget = !matches!(
-            result.outcome,
-            IterationOutcome::Reorder(_)
-                | IterationOutcome::RateLimit
-                | IterationOutcome::TransientBackend { .. }
-        );
+        // Track iteration count. Give-back follows the pre-pipeline snapshot
+        // so a RateLimit iteration that `record_completion` rewrote to
+        // Completed is not consumed. Transient escalation (snapshot
+        // TransientBackend, live Crash) still consumes. FEAT-013: the budget
+        // rule itself lives in `account_iteration_budget`.
+        let consumes_budget = sequential_consumes_budget(&outcome_snapshot, &result.outcome);
         reactions::account_iteration_budget(reactions::IterationBudgetParams {
             iteration: &mut iteration,
             iterations_completed: &mut iterations_completed,
@@ -723,16 +679,20 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                     exit_reason = "signal received".to_string();
                 }
                 IterationOutcome::Empty if result.operator_stopped => {
-                    // Operator `.stop` file (including mid-usage-wait).
-                    exit_code = 0;
-                    exit_reason = "stop signal".to_string();
-                    was_stopped = true;
+                    // Operator `.stop` file (including mid-usage-wait and a
+                    // post-output rate-limit wait).
+                    let (code, reason, stopped) = sequential_empty_stop_exit(true);
+                    exit_code = code;
+                    exit_reason = reason.to_string();
+                    was_stopped = stopped;
                 }
                 IterationOutcome::Empty => {
-                    // Quota soft-stop (horizon Stop / Deferred): end this PRD
-                    // without the operator-stop / batch-chain was_stopped flag.
-                    exit_code = 0;
-                    exit_reason = "quota soft-stop".to_string();
+                    // Quota soft-stop (horizon Stop / Deferred / StopSpend):
+                    // end this PRD without the operator-stop flag. Do not clear
+                    // a was_stopped that an earlier path already set.
+                    let (code, reason, _stopped) = sequential_empty_stop_exit(false);
+                    exit_code = code;
+                    exit_reason = reason.to_string();
                 }
                 IterationOutcome::PromptOverflow => {
                     exit_code = 3;
@@ -912,6 +872,248 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
         unavailable_rungs: ctx.unavailable_rungs.clone(),
         account_quota_stopped: ctx.account_quota_stopped,
     }
+}
+
+/// Inputs for [`sequential_completions_then_rate_limit`].
+///
+/// Built at the `run_loop` call site from locals that must not borrow
+/// `IterationContext` — the function mutably borrows `ctx` for the wrapper
+/// commit, the external-git fold, and the account reaction.
+struct SequentialAfterLadder<'a> {
+    /// Pre-pipeline outcome. The account reaction reads this, not the live
+    /// outcome `record_completion` may have rewritten to `Completed`.
+    snapshot: &'a IterationOutcome,
+    completed_ids: &'a [String],
+    claimed_was_completed: bool,
+    run_id: &'a str,
+    iteration: u32,
+    working_root: &'a Path,
+    git_status_baseline: Option<&'a std::collections::HashSet<String>>,
+    prd_file: &'a Path,
+    task_prefix: Option<&'a str>,
+    default_model: Option<&'a str>,
+    permission_mode: &'a PermissionMode,
+    external_repo_path: Option<&'a Path>,
+    external_git_scan_depth: u32,
+    usage_params: &'a UsageParams,
+    tasks_dir: &'a Path,
+}
+
+/// Exit for a sequential `Empty` + `should_stop` iteration.
+///
+/// Operator stop (including a rate-limit wait interrupted by `.stop`) is exit
+/// 0, reason `"stop signal"`, `was_stopped` true. StopSpend and the other
+/// quota soft-stops are exit 0, reason `"quota soft-stop"`, `was_stopped`
+/// false. Neither is exit 130 or 1.
+pub(crate) fn sequential_empty_stop_exit(operator_stopped: bool) -> (i32, &'static str, bool) {
+    if operator_stopped {
+        (0, "stop signal", true)
+    } else {
+        (0, "quota soft-stop", false)
+    }
+}
+
+/// Whether one sequential iteration consumes `max_iterations`.
+///
+/// Give-back follows the pre-pipeline `snapshot`. A `RateLimit` snapshot gives
+/// the iteration back even when `record_completion` rewrote the live outcome
+/// to `Completed`. Transient escalation is the exception that consumes: the
+/// reaction rewrites a `TransientBackend` snapshot to `Crash` after the
+/// ladder, and that rewrite is what counts toward `max_iterations`. Giving
+/// those iterations back would let a prolonged outage ignore the loop bound.
+pub(crate) fn sequential_consumes_budget(
+    snapshot: &IterationOutcome,
+    live: &IterationOutcome,
+) -> bool {
+    match snapshot {
+        IterationOutcome::RateLimit | IterationOutcome::Reorder(_) => false,
+        IterationOutcome::TransientBackend { .. } => {
+            matches!(live, IterationOutcome::Crash(_))
+        }
+        _ => !matches!(
+            live,
+            IterationOutcome::Reorder(_)
+                | IterationOutcome::RateLimit
+                | IterationOutcome::TransientBackend { .. }
+        ),
+    }
+}
+
+/// Map an account reaction onto the live iteration result.
+///
+/// Called only after the ladder and `react_to_completions` have returned.
+/// `OperatorStopped` / `StopSpend` set `Empty` here — not before the pipeline.
+pub(crate) fn apply_sequential_account_reaction(
+    result: &mut IterationResult,
+    reaction: &reactions::account::AccountReaction,
+    account_quota_stopped: &mut bool,
+) {
+    use reactions::account::AccountReaction;
+    match reaction {
+        AccountReaction::OperatorStopped => {
+            let mapping = reactions::account::account_stop_sequential_mapping(reaction)
+                .expect("OperatorStopped maps");
+            result.outcome = IterationOutcome::Empty;
+            result.should_stop = true;
+            result.operator_stopped = mapping.operator_stopped;
+        }
+        AccountReaction::StopSpend => {
+            // CLI spend/credits RateLimit: the account is out of credits.
+            // Apply-layer Stop already writes this via account_binding;
+            // post-output StopSpend must too so batch --chain aborts instead
+            // of seeding inherit when unavailable_rungs is non-empty.
+            *account_quota_stopped = true;
+            let mapping = reactions::account::account_stop_sequential_mapping(reaction)
+                .expect("StopSpend maps");
+            result.outcome = IterationOutcome::Empty;
+            result.should_stop = true;
+            result.operator_stopped = mapping.operator_stopped;
+        }
+        AccountReaction::None
+        | AccountReaction::WaitedAndRetry
+        | AccountReaction::RerouteAndRetry
+        | AccountReaction::ProceedWithSpillover => {}
+    }
+}
+
+/// Wrapper commit (when the claimed task completed), then the account
+/// rate-limit reaction on the pre-pipeline snapshot.
+///
+/// `react` is `react_to_outputs` in production. Tests pass
+/// `react_to_outputs_inner` with an injected wait so the Usage API is never
+/// called. The closure sees the live outcome before any stop mapping sets
+/// `Empty`. The wait, when the reaction takes the legacy path, runs inside
+/// `react` — after `react_to_completions` has returned.
+fn sequential_completions_then_rate_limit(
+    conn: &mut Connection,
+    ctx: &mut IterationContext,
+    result: &mut IterationResult,
+    last_claimed_task: &mut Option<String>,
+    tasks_completed: &mut u32,
+    args: SequentialAfterLadder<'_>,
+    react: impl FnOnce(
+        &mut Connection,
+        &[reactions::account::OutputReactionItem<'_>],
+        &reactions::account::AccountReactionParams<'_>,
+        &mut BlackoutState,
+        &mut UnavailableRungsMap,
+        &IterationOutcome,
+    ) -> reactions::account::AccountReaction,
+) {
+    // Post-completion reactions (#8 wrapper-commit, #9 external-git shadow,
+    // #10 human-review). Skipped on an `Empty` iteration: nothing completed.
+    // Runs while the live outcome is still the post-ladder value (`Completed`
+    // when the claimed task was tagged) — before the rate-limit wait and
+    // before OperatorStopped / StopSpend may set Empty.
+    if !matches!(result.outcome, IterationOutcome::Empty) {
+        // Own the id so `pc_params` does not borrow `result` across the later
+        // outcome rewrite.
+        let wrapper_owner: Option<String> = if args.claimed_was_completed {
+            result.task_id.clone()
+        } else {
+            None
+        };
+        let pc_params = reactions::post_completion::PostCompletionParams {
+            run_id: args.run_id,
+            iteration: args.iteration,
+            working_root: args.working_root,
+            git_status_baseline: args.git_status_baseline,
+            // Only the claimed task that actually completed is attributed a
+            // wrapper commit (one commit per iteration, not one per completed
+            // id). A cross-task completion gets no wrapper commit.
+            wrapper_commit_task_id: wrapper_owner.as_deref(),
+            prd_file: args.prd_file,
+            task_prefix: args.task_prefix,
+            default_model: args.default_model,
+            permission_mode: args.permission_mode,
+            external_repo_path: args.external_repo_path,
+            external_git_scan_depth: args.external_git_scan_depth,
+            wrapper_commit: true,
+        };
+        let pc_outcome = reactions::post_completion::react_to_completions(
+            conn,
+            args.completed_ids,
+            &pc_params,
+            &mut ctx.session_guidance,
+        );
+
+        if let Some(hash) = pc_outcome.wrapper_commit_hash {
+            ctx.last_commit = Some(hash);
+        }
+
+        // Fold any external-git completions into iteration accounting.
+        if !pc_outcome.external_reconciled.is_empty() {
+            let count = pc_outcome.external_reconciled.len();
+            *tasks_completed += count as u32;
+
+            // Override outcome so stale/crash trackers reset — tasks were
+            // actually completed. A later StopSpend / OperatorStopped still
+            // overwrites this with Empty after the account reaction.
+            result.outcome = IterationOutcome::Completed;
+            ctx.crash_tracker.record_success();
+
+            ui::emit(&format!(
+                "Post-iteration reconciliation: marked {} task(s) done",
+                count
+            ));
+            if let Some(ref claimed) = *last_claimed_task {
+                let status: Option<String> = conn
+                    .query_row(
+                        "SELECT status FROM tasks WHERE id = ?",
+                        [claimed.as_str()],
+                        |row| row.get(0),
+                    )
+                    .ok();
+                if status.as_deref() == Some("done") {
+                    *last_claimed_task = None;
+                }
+            }
+        }
+    }
+
+    if *args.snapshot != IterationOutcome::RateLimit {
+        return;
+    }
+
+    ui::emit("Rate limit detected in output, running account reaction...");
+    let reaction = {
+        let resolved_models = &ctx.resolved_models;
+        let account_params = reactions::account::AccountReactionParams {
+            floors: args.usage_params.floors,
+            usage_enabled: args.usage_params.enabled,
+            // FEAT-002 dual predicate: post-output Anthropic I/O is keyed ONLY
+            // on Claude provider enablement — NEVER on `usage_params.enabled`
+            // (which folds in the `LOOP_USAGE_CHECK_ENABLED` env switch and is
+            // pre-iteration-only). Must stay byte-identical to the wave
+            // construction in `wave_scheduler.rs`.
+            anthropic_account_io_allowed: resolved_models
+                .is_provider_enabled(crate::loop_engine::model::Provider::Claude),
+            tasks_dir: args.tasks_dir,
+            fallback_wait: args.usage_params.fallback_wait,
+            prefix: args.task_prefix.unwrap_or(""),
+            run_id: args.run_id,
+            permission_mode: args.permission_mode,
+            spillover_enabled: resolved_models.routing.spillover.max_difficulty.is_some(),
+            primary_provider: resolved_models.primary_provider,
+            blackout_fallback_secs: resolved_models.routing.spillover.blackout_fallback_secs,
+            now_secs: now_unix_secs(),
+            models: resolved_models,
+        };
+        let items = [reactions::account::OutputReactionItem {
+            task_id: result.task_id.as_deref(),
+            outcome: args.snapshot,
+            output: result.output.as_str(),
+        }];
+        react(
+            conn,
+            &items,
+            &account_params,
+            &mut ctx.provider_blackouts,
+            &mut ctx.unavailable_rungs,
+            &result.outcome,
+        )
+    };
+    apply_sequential_account_reaction(result, &reaction, &mut ctx.account_quota_stopped);
 }
 
 /// Context parameters for the deprecated `trigger_human_reviews` shim.
@@ -2267,5 +2469,367 @@ mod tests {
             })
             .unwrap();
         assert_eq!(status_b, "done");
+    }
+
+    // --- FEAT-003: sequential RateLimit reaction after the ladder ---
+    //
+    // Drives `process_iteration_output` then `sequential_completions_then_rate_limit`
+    // with `react_to_outputs_inner` and an injected wait. Never calls
+    // `react_to_outputs` or `run_loop`, so the Usage API is not contacted.
+
+    fn git_in(repo: &std::path::Path, args: &[&str]) -> std::process::Output {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .unwrap_or_else(|e| panic!("git {args:?} spawn failed: {e}"));
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        output
+    }
+
+    fn init_e10_repo() -> tempfile::TempDir {
+        let repo = tempfile::TempDir::new().unwrap();
+        git_in(repo.path(), &["init"]);
+        git_in(repo.path(), &["config", "user.email", "test@example.com"]);
+        git_in(repo.path(), &["config", "user.name", "Test User"]);
+        git_in(repo.path(), &["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo.path().join("README.md"), "initial\n").unwrap();
+        git_in(repo.path(), &["add", "README.md"]);
+        git_in(repo.path(), &["commit", "-m", "initial"]);
+        repo
+    }
+
+    fn git_subject(repo: &std::path::Path) -> String {
+        let output = git_in(repo, &["log", "-1", "--format=%s"]);
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn status_of(conn: &Connection, id: &str) -> String {
+        conn.query_row("SELECT status FROM tasks WHERE id = ?1", [id], |row| {
+            row.get(0)
+        })
+        .unwrap()
+    }
+
+    #[derive(Clone, Copy)]
+    enum SeqRateLimitCase {
+        /// RateLimit + `<completed>X</completed>`, wait returns true.
+        TaggedWait,
+        /// Same ladder, wait returns false (operator `.stop` during the wait).
+        OperatorStopped,
+        /// Spend banner: StopSpend, wait is not invoked.
+        StopSpend,
+        /// RateLimit with no completion tag: reset in_progress, then wait.
+        Untagged,
+    }
+
+    impl SeqRateLimitCase {
+        fn tagged(self) -> bool {
+            !matches!(self, Self::Untagged)
+        }
+
+        fn output(self) -> &'static str {
+            match self {
+                Self::StopSpend => {
+                    "<completed>E10-X</completed>\n\
+                     You've hit your spend limit. Raise usage credits.\n"
+                }
+                Self::Untagged => "You've hit your limit · resets 4pm (America/Los_Angeles)\n",
+                Self::TaggedWait | Self::OperatorStopped => {
+                    "<completed>E10-X</completed>\n\
+                     You've hit your limit · resets 4pm (America/Los_Angeles)\n"
+                }
+            }
+        }
+    }
+
+    /// Pipeline, then the snapshot reaction. The wait closure never sleeps.
+    fn drive_sequential_rate_limit(case: SeqRateLimitCase) {
+        let _no_extract = EnvGuard::set("TASK_MGR_NO_EXTRACT_LEARNINGS", "1");
+        let (db_dir, mut conn) = setup_test_db();
+        conn.execute(
+            "INSERT INTO runs (run_id, status) VALUES ('run-e10', 'active')",
+            [],
+        )
+        .unwrap();
+        seed_task_with_status(&conn, "E10-X", "in_progress");
+        seed_task_with_status(&conn, "E10-PEER", "in_progress");
+        let prd_path = write_minimal_prd(db_dir.path(), &["E10-X", "E10-PEER"]);
+        let progress_path = db_dir.path().join("progress-e10.txt");
+        std::fs::write(&progress_path, "").unwrap();
+        let repo = init_e10_repo();
+        // Empty baseline: the agent file written next is the only new path.
+        // Captured before that write so the wrapper commit can see it.
+        let baseline: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if case.tagged() {
+            std::fs::write(repo.path().join("agent-work.txt"), "work\n").unwrap();
+        }
+
+        let mut result = IterationResult {
+            outcome: IterationOutcome::RateLimit,
+            task_id: Some("E10-X".to_string()),
+            files_modified: Vec::new(),
+            should_stop: false,
+            operator_stopped: false,
+            output: case.output().to_string(),
+            effective_model: None,
+            effective_effort: None,
+            effective_runner: None,
+            key_decisions_count: 0,
+            conversation: None,
+            shown_learning_ids: Vec::new(),
+        };
+        // Stop used to return before the ladder with task_id None and empty output.
+        assert_eq!(result.task_id.as_deref(), Some("E10-X"));
+        assert!(!result.output.is_empty());
+
+        let snapshot = result.outcome.clone();
+        let signal_flag = signals::SignalFlag::new();
+        let mut ctx = IterationContext::new(3);
+        let processing =
+            iteration_pipeline::process_iteration_output(iteration_pipeline::ProcessingParams {
+                conn: &mut conn,
+                run_id: "run-e10",
+                iteration: 1,
+                task_id: result.task_id.as_deref(),
+                output: &result.output,
+                conversation: None,
+                shown_learning_ids: &[],
+                outcome: &mut result.outcome,
+                working_root: repo.path(),
+                git_scan_depth: 5,
+                skip_git_completion_detection: true,
+                prd_path: &prd_path,
+                task_prefix: None,
+                progress_path: &progress_path,
+                db_dir: db_dir.path(),
+                signal_flag: &signal_flag,
+                ctx: &mut ctx,
+                files_modified: &[],
+                effective_model: None,
+                effective_effort: None,
+                effective_runner: None,
+                slot_index: None,
+            });
+        let claimed_was_completed = result
+            .task_id
+            .as_ref()
+            .is_some_and(|tid| processing.completed_task_ids.iter().any(|id| id == tid));
+        assert_eq!(claimed_was_completed, case.tagged());
+        if case.tagged() {
+            assert_eq!(result.outcome, IterationOutcome::Completed);
+            assert_eq!(status_of(&conn, "E10-X"), "done");
+        } else {
+            assert_eq!(result.outcome, IterationOutcome::RateLimit);
+            assert_eq!(status_of(&conn, "E10-X"), "in_progress");
+        }
+
+        let wait_calls = std::cell::Cell::new(0u32);
+        let seen_live = std::cell::RefCell::new(None);
+        let commit_before_reaction = std::cell::Cell::new(false);
+        let wait = |_: u64| {
+            wait_calls.set(wait_calls.get() + 1);
+            !matches!(case, SeqRateLimitCase::OperatorStopped)
+        };
+        let usage_params = UsageParams::disabled();
+        let permission_mode = PermissionMode::Dangerous;
+        let mut last_claimed = result.task_id.clone();
+        let mut tasks_completed = processing.tasks_completed;
+        sequential_completions_then_rate_limit(
+            &mut conn,
+            &mut ctx,
+            &mut result,
+            &mut last_claimed,
+            &mut tasks_completed,
+            SequentialAfterLadder {
+                snapshot: &snapshot,
+                completed_ids: &processing.completed_task_ids,
+                claimed_was_completed,
+                run_id: "run-e10",
+                iteration: 1,
+                working_root: repo.path(),
+                git_status_baseline: Some(&baseline),
+                prd_file: &prd_path,
+                task_prefix: None,
+                default_model: None,
+                permission_mode: &permission_mode,
+                external_repo_path: None,
+                external_git_scan_depth: 0,
+                usage_params: &usage_params,
+                tasks_dir: db_dir.path(),
+            },
+            |conn, items, params, blackout, unavailable, live| {
+                assert_eq!(items.len(), 1);
+                assert_eq!(*items[0].outcome, IterationOutcome::RateLimit);
+                assert_eq!(items[0].task_id, Some("E10-X"));
+                assert!(!items[0].output.is_empty());
+                *seen_live.borrow_mut() = Some(live.clone());
+                if case.tagged() {
+                    assert_eq!(
+                        *live,
+                        IterationOutcome::Completed,
+                        "wrapper commit runs while the live outcome is still Completed"
+                    );
+                    let subject = git_subject(repo.path());
+                    assert!(
+                        subject.contains("E10-X-completed"),
+                        "wrapper commit must return before the wait; subject={subject}"
+                    );
+                    commit_before_reaction.set(true);
+                } else {
+                    assert_eq!(*live, IterationOutcome::RateLimit);
+                }
+                reactions::account::react_to_outputs_inner(
+                    conn,
+                    items,
+                    params,
+                    blackout,
+                    unavailable,
+                    None,
+                    &wait,
+                )
+            },
+        );
+
+        // A RateLimit snapshot gives the iteration back even when the ladder
+        // rewrote the live outcome to Completed, and even after a stop maps
+        // that live outcome to Empty.
+        assert!(
+            !sequential_consumes_budget(&snapshot, &result.outcome),
+            "snapshot={snapshot:?} live={:?}",
+            result.outcome
+        );
+        assert_eq!(result.task_id.as_deref(), Some("E10-X"));
+        assert!(!result.output.is_empty());
+        // Reset touches in_progress only. The peer was never completed.
+        assert_eq!(status_of(&conn, "E10-PEER"), "todo");
+
+        match case {
+            SeqRateLimitCase::TaggedWait => {
+                assert!(commit_before_reaction.get());
+                assert_eq!(
+                    seen_live.borrow().clone(),
+                    Some(IterationOutcome::Completed)
+                );
+                assert_eq!(wait_calls.get(), 1);
+                assert_eq!(status_of(&conn, "E10-X"), "done");
+                assert_eq!(result.outcome, IterationOutcome::Completed);
+                assert!(!result.should_stop);
+                assert!(!result.operator_stopped);
+                assert!(!ctx.account_quota_stopped);
+            }
+            SeqRateLimitCase::OperatorStopped => {
+                assert!(commit_before_reaction.get());
+                assert_eq!(
+                    seen_live.borrow().clone(),
+                    Some(IterationOutcome::Completed)
+                );
+                assert_eq!(wait_calls.get(), 1);
+                assert_eq!(status_of(&conn, "E10-X"), "done");
+                assert_eq!(result.outcome, IterationOutcome::Empty);
+                assert!(result.should_stop);
+                assert!(result.operator_stopped);
+                assert!(!ctx.account_quota_stopped);
+                assert_eq!(
+                    sequential_empty_stop_exit(result.operator_stopped),
+                    (0, "stop signal", true)
+                );
+            }
+            SeqRateLimitCase::StopSpend => {
+                assert!(commit_before_reaction.get());
+                assert_eq!(
+                    seen_live.borrow().clone(),
+                    Some(IterationOutcome::Completed)
+                );
+                assert_eq!(wait_calls.get(), 0, "StopSpend parks the wait");
+                assert_eq!(status_of(&conn, "E10-X"), "done");
+                assert_eq!(result.outcome, IterationOutcome::Empty);
+                assert!(result.should_stop);
+                assert!(!result.operator_stopped);
+                assert!(ctx.account_quota_stopped);
+                assert_eq!(
+                    sequential_empty_stop_exit(result.operator_stopped),
+                    (0, "quota soft-stop", false)
+                );
+            }
+            SeqRateLimitCase::Untagged => {
+                assert!(!commit_before_reaction.get());
+                assert_eq!(git_subject(repo.path()), "initial");
+                assert_eq!(
+                    seen_live.borrow().clone(),
+                    Some(IterationOutcome::RateLimit)
+                );
+                assert_eq!(wait_calls.get(), 1);
+                assert_eq!(status_of(&conn, "E10-X"), "todo");
+                assert_eq!(result.outcome, IterationOutcome::RateLimit);
+                assert!(!result.should_stop);
+                assert!(!ctx.account_quota_stopped);
+            }
+        }
+    }
+
+    #[test]
+    fn e10_sequential_completed_tag_stays_done_and_waits_once() {
+        drive_sequential_rate_limit(SeqRateLimitCase::TaggedWait);
+    }
+
+    #[test]
+    fn e10_sequential_operator_stopped_is_exit_zero_stop_signal() {
+        drive_sequential_rate_limit(SeqRateLimitCase::OperatorStopped);
+    }
+
+    #[test]
+    fn e10_sequential_stop_spend_sets_account_quota_stopped() {
+        drive_sequential_rate_limit(SeqRateLimitCase::StopSpend);
+    }
+
+    #[test]
+    fn e10_sequential_untagged_rate_limit_resets_and_waits() {
+        drive_sequential_rate_limit(SeqRateLimitCase::Untagged);
+    }
+
+    #[test]
+    fn sequential_consumes_budget_follows_the_pre_pipeline_snapshot() {
+        let rate = IterationOutcome::RateLimit;
+        let completed = IterationOutcome::Completed;
+        assert!(!sequential_consumes_budget(&rate, &completed));
+        assert!(!sequential_consumes_budget(&rate, &rate));
+        let reorder = IterationOutcome::Reorder("other".to_string());
+        assert!(!sequential_consumes_budget(&reorder, &completed));
+        let transient = IterationOutcome::TransientBackend {
+            retry_after_secs: None,
+        };
+        assert!(!sequential_consumes_budget(&transient, &transient));
+        let crash = IterationOutcome::Crash(config::CrashType::RuntimeError);
+        assert!(sequential_consumes_budget(&transient, &crash));
+        assert!(sequential_consumes_budget(&completed, &completed));
+        let empty = IterationOutcome::Empty;
+        assert!(sequential_consumes_budget(&empty, &empty));
+    }
+
+    #[test]
+    fn sequential_empty_stop_exit_is_zero_for_both_stops() {
+        assert_eq!(sequential_empty_stop_exit(true), (0, "stop signal", true));
+        assert_eq!(
+            sequential_empty_stop_exit(false),
+            (0, "quota soft-stop", false)
+        );
+    }
+
+    #[test]
+    fn iteration_does_not_map_account_stop_before_the_ladder() {
+        let src = include_str!("iteration.rs");
+        assert!(
+            !src.contains("AccountReaction::OperatorStopped"),
+            "iteration.rs must not apply OperatorStopped; that drops task_id before the ladder"
+        );
+        assert!(
+            !src.contains("AccountReaction::StopSpend"),
+            "iteration.rs must not apply StopSpend; that drops task_id before the ladder"
+        );
     }
 }

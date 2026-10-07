@@ -850,109 +850,14 @@ pub fn run_iteration(
         params.project_root,
     );
 
-    // Step 7.5: On rate-limit detection, run the converged account-global
-    // post-output reaction (`reactions::account::react_to_outputs`) — the single
-    // home both execution paths share. The sequential path folds its one output
-    // into a one-item slice; the wave path folds its N. `WaitedAndRetry` (or
-    // `None`) falls through with the outcome still `RateLimit` (`run_loop` marks
-    // it non-counting); OperatorStopped / StopSpend return early as Empty.
-    if outcome == IterationOutcome::RateLimit {
-        ui::emit("Rate limit detected in output, running account reaction...");
-        let reaction = {
-            let items = [reactions::account::OutputReactionItem {
-                task_id: Some(task_id.as_str()),
-                outcome: &outcome,
-                output: &claude_output,
-            }];
-            // FEAT-008: the reaction records a quota blackout (spillover path)
-            // instead of waiting when difficulty-spillover is enabled. Reuse the
-            // once-per-run resolution on the context rather than rebuilding it.
-            let resolved_models = &ctx.resolved_models;
-            let account_params = reactions::account::AccountReactionParams {
-                floors: params.usage_params.floors,
-                usage_enabled: params.usage_params.enabled,
-                // FEAT-002 dual predicate: post-output Anthropic I/O is keyed
-                // ONLY on Claude provider enablement — NEVER on
-                // `usage_params.enabled` (which folds in the
-                // `LOOP_USAGE_CHECK_ENABLED` env switch and is
-                // pre-iteration-only). Must stay byte-identical to the wave
-                // construction in `wave_scheduler.rs`.
-                anthropic_account_io_allowed: resolved_models.is_provider_enabled(Provider::Claude),
-                tasks_dir: params.tasks_dir,
-                fallback_wait: params.usage_params.fallback_wait,
-                prefix: params.task_prefix.unwrap_or(""),
-                run_id: params.run_id,
-                permission_mode: params.permission_mode,
-                spillover_enabled: resolved_models.routing.spillover.max_difficulty.is_some(),
-                primary_provider: resolved_models.primary_provider,
-                blackout_fallback_secs: resolved_models.routing.spillover.blackout_fallback_secs,
-                now_secs: crate::loop_engine::engine::now_unix_secs(),
-                models: resolved_models,
-            };
-            reactions::account::react_to_outputs(
-                params.conn,
-                &items,
-                &account_params,
-                &mut ctx.provider_blackouts,
-                &mut ctx.unavailable_rungs,
-            )
-        };
-        // `RerouteAndRetry` / `ProceedWithSpillover` (FEAT-008) and
-        // `WaitedAndRetry` all fall through with the outcome still `RateLimit`,
-        // which `run_loop` marks non-counting (budget give-back). The blackout
-        // recorded on `ctx.provider_blackouts` reroutes spillover-eligible work
-        // on the next iteration; the no-eligible deferral branch waits only if
-        // everything is quota-deferred. OperatorStopped / StopSpend exit early
-        // as Empty (pre-gate StopSignaled / HorizonStopped triples) — never
-        // RateLimit + operator_stopped (orchestrator `_` → exit 1).
-        match reaction {
-            reactions::account::AccountReaction::OperatorStopped => {
-                let mapping = reactions::account::account_stop_sequential_mapping(&reaction)
-                    .expect("OperatorStopped maps");
-                return Ok(IterationResult {
-                    outcome: IterationOutcome::Empty,
-                    task_id: None,
-                    files_modified: vec![],
-                    should_stop: true,
-                    operator_stopped: mapping.operator_stopped,
-                    output: String::new(),
-                    effective_model: None,
-                    effective_effort: None,
-                    effective_runner: None,
-                    key_decisions_count: 0,
-                    conversation: None,
-                    shown_learning_ids: Vec::new(),
-                });
-            }
-            reactions::account::AccountReaction::StopSpend => {
-                // CLI spend/credits RateLimit: account is out of credits.
-                // Apply-layer Stop already writes this via account_binding;
-                // post-output StopSpend must too so batch --chain aborts
-                // instead of seeding inherit when unavailable_rungs is non-empty.
-                ctx.account_quota_stopped = true;
-                let mapping = reactions::account::account_stop_sequential_mapping(&reaction)
-                    .expect("StopSpend maps");
-                return Ok(IterationResult {
-                    outcome: IterationOutcome::Empty,
-                    task_id: None,
-                    files_modified: vec![],
-                    should_stop: true,
-                    operator_stopped: mapping.operator_stopped,
-                    output: String::new(),
-                    effective_model: None,
-                    effective_effort: None,
-                    effective_runner: None,
-                    key_decisions_count: 0,
-                    conversation: None,
-                    shown_learning_ids: Vec::new(),
-                });
-            }
-            reactions::account::AccountReaction::None
-            | reactions::account::AccountReaction::WaitedAndRetry
-            | reactions::account::AccountReaction::RerouteAndRetry
-            | reactions::account::AccountReaction::ProceedWithSpillover => {}
-        }
-    }
+    // Step 7.5 used to run the account rate-limit reaction here and, on
+    // OperatorStopped / StopSpend, returned Empty with task_id None and empty
+    // output. That ran before the completion ladder, so a `<completed>` tag
+    // was dropped and `reset_in_progress` could flip a task the ladder was
+    // about to mark done. The reaction now lives in `orchestrator.rs` after
+    // the ladder, reading a snapshot of this outcome. `run_iteration` returns
+    // RateLimit with task_id and output intact. Untagged PromptTooLong still
+    // calls `handle_overflow` below, before the pipeline (learning 5347).
 
     // Step 7.7 / Step 8 (extract_learnings_from_output, record_iteration_feedback)
     // were lifted into `iteration_pipeline::process_iteration_output` (FEAT-005).
