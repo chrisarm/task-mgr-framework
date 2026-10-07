@@ -194,6 +194,8 @@ fn process_iteration_output_extracts_learnings_from_fixture_output() {
         effective_effort: None,
         effective_runner: None,
         slot_index: None,
+        grace_buffer_tail: "",
+        completion_killed: false,
     });
 
     let after: i64 = conn
@@ -260,6 +262,8 @@ fn process_iteration_output_records_bandit_feedback_for_shown_learnings() {
         effective_effort: None,
         effective_runner: None,
         slot_index: None,
+        grace_buffer_tail: "",
+        completion_killed: false,
     });
 
     let stats_a = get_window_stats(&conn, id_a).expect("window stats A");
@@ -326,6 +330,8 @@ fn process_iteration_output_skip_git_true_does_not_attempt_git_detection() {
         effective_effort: None,
         effective_runner: None,
         slot_index: None,
+        grace_buffer_tail: "",
+        completion_killed: false,
     });
 
     // Without a git-detected completion AND without any other completion
@@ -420,6 +426,8 @@ fn process_iteration_output_skip_git_false_attempts_git_detection() {
         effective_effort: None,
         effective_runner: None,
         slot_index: None,
+        grace_buffer_tail: "",
+        completion_killed: false,
     });
 
     assert_eq!(
@@ -472,6 +480,8 @@ fn already_complete_fallback_fires_in_skip_git_true_mode() {
         effective_effort: None,
         effective_runner: None,
         slot_index: None,
+        grace_buffer_tail: "",
+        completion_killed: false,
     });
 
     assert_eq!(
@@ -515,6 +525,8 @@ fn already_complete_fallback_fires_in_skip_git_false_mode() {
         effective_effort: None,
         effective_runner: None,
         slot_index: None,
+        grace_buffer_tail: "",
+        completion_killed: false,
     });
 
     assert_eq!(
@@ -570,6 +582,8 @@ fn tasks_completed_dedups_across_status_and_completed_branches() {
         effective_effort: None,
         effective_runner: None,
         slot_index: None,
+        grace_buffer_tail: "",
+        completion_killed: false,
     });
 
     assert_eq!(
@@ -630,6 +644,8 @@ fn process_iteration_output_mutates_empty_outcome_to_completed_on_retroactive_co
         effective_effort: None,
         effective_runner: None,
         slot_index: None,
+        grace_buffer_tail: "",
+        completion_killed: false,
     });
 
     assert_eq!(
@@ -686,6 +702,8 @@ fn completed_task_ids_includes_processed_task_and_cross_task_ids() {
         effective_effort: None,
         effective_runner: None,
         slot_index: None,
+        grace_buffer_tail: "",
+        completion_killed: false,
     });
 
     assert!(
@@ -759,6 +777,8 @@ fn process_iteration_output_does_not_invoke_wrapper_commit() {
         effective_effort: None,
         effective_runner: None,
         slot_index: None,
+        grace_buffer_tail: "",
+        completion_killed: false,
     });
 
     assert_eq!(
@@ -819,6 +839,8 @@ fn no_op_stub_fails_combined_contract_assertions() {
         effective_effort: None,
         effective_runner: None,
         slot_index: None,
+        grace_buffer_tail: "",
+        completion_killed: false,
     });
 
     let stats = get_window_stats(&conn, learning_id).expect("window stats");
@@ -896,6 +918,8 @@ fn crash_tracker_record_success_fires_exactly_once_after_completion_ladder() {
         effective_effort: None,
         effective_runner: None,
         slot_index: None,
+        grace_buffer_tail: "",
+        completion_killed: false,
     });
 
     assert_eq!(
@@ -960,6 +984,8 @@ fn short_task_status_done_rewrites_to_claimed_and_completes() {
         effective_effort: None,
         effective_runner: None,
         slot_index: None,
+        grace_buffer_tail: "",
+        completion_killed: false,
     });
 
     assert_eq!(
@@ -1014,6 +1040,8 @@ fn short_task_status_other_id_does_not_complete_claim() {
         effective_effort: None,
         effective_runner: None,
         slot_index: None,
+        grace_buffer_tail: "",
+        completion_killed: false,
     });
 
     assert_eq!(
@@ -1066,6 +1094,8 @@ fn full_task_status_id_still_completes_claim() {
         effective_effort: None,
         effective_runner: None,
         slot_index: None,
+        grace_buffer_tail: "",
+        completion_killed: false,
     });
 
     assert_eq!(task_status(&conn, claimed), "done");
@@ -1109,6 +1139,8 @@ fn short_task_status_failed_rewrites_and_blocks_claim() {
         effective_effort: None,
         effective_runner: None,
         slot_index: None,
+        grace_buffer_tail: "",
+        completion_killed: false,
     });
 
     assert_eq!(
@@ -1155,6 +1187,8 @@ fn short_completed_tag_rewrites_to_claimed_and_completes() {
         effective_effort: None,
         effective_runner: None,
         slot_index: None,
+        grace_buffer_tail: "",
+        completion_killed: false,
     });
 
     assert_eq!(
@@ -1205,6 +1239,8 @@ fn task_id_none_leaves_bare_status_exact_id_only() {
         effective_effort: None,
         effective_runner: None,
         slot_index: None,
+        grace_buffer_tail: "",
+        completion_killed: false,
     });
 
     assert_eq!(
@@ -1274,5 +1310,7 @@ fn processing_params_constructs_against_real_signature() {
         effective_effort: None,
         effective_runner: None,
         slot_index: None,
+        grace_buffer_tail: "",
+        completion_killed: false,
     };
 }

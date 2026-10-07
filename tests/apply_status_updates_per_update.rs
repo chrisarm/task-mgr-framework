@@ -319,6 +319,8 @@ fn pipeline_gate_uses_per_entry_success_not_global_count() {
         effective_effort: None,
         effective_runner: None,
         slot_index: None,
+        grace_buffer_tail: "",
+        completion_killed: false,
     });
 
     // With per-entry gate: CLAIMED-001's dispatch failed → NOT in completed_task_ids.

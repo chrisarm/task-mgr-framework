@@ -93,6 +93,8 @@ pub fn run_iteration(
             key_decisions_count: 0,
             conversation: None,
             shown_learning_ids: Vec::new(),
+            grace_buffer_tail: String::new(),
+            completion_killed: false,
         });
     }
 
@@ -112,6 +114,8 @@ pub fn run_iteration(
             key_decisions_count: 0,
             conversation: None,
             shown_learning_ids: Vec::new(),
+            grace_buffer_tail: String::new(),
+            completion_killed: false,
         });
     }
 
@@ -166,6 +170,8 @@ pub fn run_iteration(
                     key_decisions_count: 0,
                     conversation: None,
                     shown_learning_ids: Vec::new(),
+                    grace_buffer_tail: String::new(),
+                    completion_killed: false,
                 });
             }
             UsageCheckResult::HorizonStopped => {
@@ -185,6 +191,8 @@ pub fn run_iteration(
                     key_decisions_count: 0,
                     conversation: None,
                     shown_learning_ids: Vec::new(),
+                    grace_buffer_tail: String::new(),
+                    completion_killed: false,
                 });
             }
             UsageCheckResult::Deferred {
@@ -206,6 +214,8 @@ pub fn run_iteration(
                     key_decisions_count: 0,
                     conversation: None,
                     shown_learning_ids: Vec::new(),
+                    grace_buffer_tail: String::new(),
+                    completion_killed: false,
                 });
             }
             UsageCheckResult::ApiError(ref msg) => {
@@ -241,6 +251,8 @@ pub fn run_iteration(
             key_decisions_count: 0,
             conversation: None,
             shown_learning_ids: Vec::new(),
+            grace_buffer_tail: String::new(),
+            completion_killed: false,
         });
     }
 
@@ -349,6 +361,8 @@ pub fn run_iteration(
                     key_decisions_count: 0,
                     conversation: None,
                     shown_learning_ids: Vec::new(),
+                    grace_buffer_tail: String::new(),
+                    completion_killed: false,
                 });
             }
 
@@ -423,6 +437,8 @@ pub fn run_iteration(
                             key_decisions_count: 0,
                             conversation: None,
                             shown_learning_ids: Vec::new(),
+                            grace_buffer_tail: String::new(),
+                            completion_killed: false,
                         });
                     }
                     Err(TaskMgrError::PromptOverflow {
@@ -452,6 +468,8 @@ pub fn run_iteration(
                     key_decisions_count: 0,
                     conversation: None,
                     shown_learning_ids: Vec::new(),
+                    grace_buffer_tail: String::new(),
+                    completion_killed: false,
                 });
             }
         }
@@ -666,6 +684,8 @@ pub fn run_iteration(
                 key_decisions_count: 0,
                 conversation: None,
                 shown_learning_ids: Vec::new(),
+                grace_buffer_tail: String::new(),
+                completion_killed: false,
             });
         }
         Err(crate::error::TaskMgrError::CodexAuthFailure { hint }) => {
@@ -686,6 +706,8 @@ pub fn run_iteration(
                 key_decisions_count: 0,
                 conversation: None,
                 shown_learning_ids: Vec::new(),
+                grace_buffer_tail: String::new(),
+                completion_killed: false,
             });
         }
         // FEAT-014: surface a Grok transient backend error (HTTP 5xx /
@@ -714,6 +736,8 @@ pub fn run_iteration(
                 key_decisions_count: 0,
                 conversation: None,
                 shown_learning_ids: Vec::new(),
+                grace_buffer_tail: String::new(),
+                completion_killed: false,
             });
         }
         Err(e) => return Err(e),
@@ -797,6 +821,8 @@ pub fn run_iteration(
             key_decisions_count: 0,
             conversation: None,
             shown_learning_ids: Vec::new(),
+            grace_buffer_tail: String::new(),
+            completion_killed: false,
         });
     }
 
@@ -829,6 +855,8 @@ pub fn run_iteration(
             key_decisions_count: 0,
             conversation: None,
             shown_learning_ids: Vec::new(),
+            grace_buffer_tail: String::new(),
+            completion_killed: false,
         });
     }
 
@@ -958,6 +986,8 @@ pub fn run_iteration(
         key_decisions_count: 0,
         conversation: claude_conversation,
         shown_learning_ids,
+        grace_buffer_tail: claude_result.grace_buffer_tail,
+        completion_killed: claude_result.completion_killed,
     })
 }
 

@@ -226,6 +226,8 @@ fn wave_mode_learnings_and_bandit_feedback_sql_metrics() {
             effective_effort: None,
             effective_runner: None,
             slot_index: Some(slot_idx),
+            grace_buffer_tail: "",
+            completion_killed: false,
         });
 
         assert_eq!(

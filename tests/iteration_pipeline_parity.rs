@@ -251,6 +251,8 @@ fn run_once(
         effective_effort: None,
         effective_runner: None,
         slot_index: cfg.slot_index,
+        grace_buffer_tail: "",
+        completion_killed: false,
     });
 
     let crash_flag = cfg
@@ -1220,6 +1222,8 @@ fn sequential_call_site_destructures_full_params(params: ProcessingParams<'_>) {
         effective_effort: _,
         effective_runner: _,
         slot_index: _,
+        grace_buffer_tail: _,
+        completion_killed: _,
     } = params;
 }
 
@@ -1251,6 +1255,8 @@ fn wave_call_site_destructures_full_params(params: ProcessingParams<'_>) {
         effective_effort: _,
         effective_runner: _,
         slot_index: _,
+        grace_buffer_tail: _,
+        completion_killed: _,
     } = params;
 }
 
@@ -1292,6 +1298,8 @@ fn fr006_both_call_sites_handle_every_processing_param_field() {
         effective_effort: None,
         effective_runner: None,
         slot_index: None,
+        grace_buffer_tail: "",
+        completion_killed: false,
     };
     sequential_call_site_destructures_full_params(sequential);
 
@@ -1322,6 +1330,8 @@ fn fr006_both_call_sites_handle_every_processing_param_field() {
         effective_effort: None,
         effective_runner: None,
         slot_index: Some(1),
+        grace_buffer_tail: "",
+        completion_killed: false,
     };
     wave_call_site_destructures_full_params(wave);
 }

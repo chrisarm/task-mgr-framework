@@ -425,6 +425,8 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                 effective_effort: result.effective_effort.as_deref(),
                 effective_runner: result.effective_runner,
                 slot_index: None,
+                grace_buffer_tail: &result.grace_buffer_tail,
+                completion_killed: result.completion_killed,
             });
         tasks_completed += processing_outcome.tasks_completed;
         result.key_decisions_count = processing_outcome.key_decisions_count;
@@ -2582,6 +2584,8 @@ mod tests {
             key_decisions_count: 0,
             conversation: None,
             shown_learning_ids: Vec::new(),
+            grace_buffer_tail: String::new(),
+            completion_killed: false,
         };
         // Stop used to return before the ladder with task_id None and empty output.
         assert_eq!(result.task_id.as_deref(), Some("E10-X"));
@@ -2614,6 +2618,8 @@ mod tests {
                 effective_effort: None,
                 effective_runner: None,
                 slot_index: None,
+                grace_buffer_tail: "",
+                completion_killed: false,
             });
         let claimed_was_completed = result
             .task_id
@@ -2993,6 +2999,8 @@ mod tests {
                 effective_effort: Some("xhigh"),
                 effective_runner: Some(crate::loop_engine::runner::RunnerKind::Claude),
                 slot_index: None,
+                grace_buffer_tail: "",
+                completion_killed: false,
             });
         }
     }

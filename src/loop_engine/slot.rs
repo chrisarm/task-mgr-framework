@@ -76,6 +76,8 @@ fn slot_early_exit(slot: &SlotContext, exit: SlotEarlyExit) -> SlotResult {
             key_decisions_count: 0,
             conversation: None,
             shown_learning_ids: Vec::new(),
+            grace_buffer_tail: String::new(),
+            completion_killed: false,
         },
         // Early exit always runs after a successful claim (the slot thread
         // started); keep the id on the pending tracker until process_slot_result
@@ -410,6 +412,8 @@ pub fn run_slot_iteration(
             key_decisions_count: 0,
             conversation,
             shown_learning_ids: bundle.shown_learning_ids.clone(),
+            grace_buffer_tail: claude_result.grace_buffer_tail,
+            completion_killed: claude_result.completion_killed,
         },
         claim_succeeded: true,
         shown_learning_ids: bundle.shown_learning_ids.clone(),
@@ -491,6 +495,8 @@ pub(super) fn slot_failure_result(
             key_decisions_count: 0,
             conversation: None,
             shown_learning_ids: Vec::new(),
+            grace_buffer_tail: String::new(),
+            completion_killed: false,
         },
         claim_succeeded,
         shown_learning_ids: Vec::new(),
@@ -669,6 +675,8 @@ pub(super) fn process_slot_result(
             effective_effort: slot_result.iteration_result.effective_effort.as_deref(),
             effective_runner: slot_result.iteration_result.effective_runner,
             slot_index: Some(slot_idx),
+            grace_buffer_tail: &slot_result.iteration_result.grace_buffer_tail,
+            completion_killed: slot_result.iteration_result.completion_killed,
         });
 
     slot_result.iteration_result.key_decisions_count = processing_outcome.key_decisions_count;
@@ -846,6 +854,8 @@ mod tests {
                 key_decisions_count: 0,
                 conversation: None,
                 shown_learning_ids: Vec::new(),
+                grace_buffer_tail: String::new(),
+                completion_killed: false,
             },
             claim_succeeded: true,
             shown_learning_ids: vec![42, 77],

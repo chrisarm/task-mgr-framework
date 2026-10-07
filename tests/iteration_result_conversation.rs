@@ -61,11 +61,21 @@ fn iteration_result_carries_optional_conversation_transcript() {
         key_decisions_count: 0,
         conversation: Some("[user] go\n[assistant] done\n".into()),
         shown_learning_ids: Vec::new(),
+        grace_buffer_tail: "<completed>FEAT-004-OK</completed>".into(),
+        completion_killed: true,
     };
     assert_eq!(
         success.conversation.as_deref(),
         Some("[user] go\n[assistant] done\n"),
         "post-Claude success must carry the structured transcript",
+    );
+    assert_eq!(
+        success.grace_buffer_tail, "<completed>FEAT-004-OK</completed>",
+        "post-runner success must carry the grace-buffer tail",
+    );
+    assert!(
+        success.completion_killed,
+        "post-runner success must carry RunnerResult.completion_killed",
     );
 
     // Early-exit shape (mirrors the signal / pre-iteration error sites).
@@ -82,12 +92,22 @@ fn iteration_result_carries_optional_conversation_transcript() {
         key_decisions_count: 0,
         conversation: None,
         shown_learning_ids: Vec::new(),
+        grace_buffer_tail: String::new(),
+        completion_killed: false,
     };
     assert!(
         early_exit.conversation.is_none(),
         "every early-exit IterationResult literal must carry conversation: None — flipping any of \
          them to Some leaks fabricated transcripts into pipelines that should run learning \
          extraction against the (empty) raw output",
+    );
+    assert!(
+        early_exit.grace_buffer_tail.is_empty(),
+        "early-exit IterationResult literals carry an empty grace-buffer tail",
+    );
+    assert!(
+        !early_exit.completion_killed,
+        "early-exit IterationResult literals set completion_killed false",
     );
 }
 
@@ -124,6 +144,8 @@ fn slot_result_conversation_borrows_into_processing_params_shape() {
             key_decisions_count: 0,
             conversation: Some(transcript.into()),
             shown_learning_ids: Vec::new(),
+            grace_buffer_tail: String::new(),
+            completion_killed: false,
         },
         claim_succeeded: true,
         shown_learning_ids: Vec::new(),
@@ -161,6 +183,8 @@ fn slot_result_conversation_borrows_into_processing_params_shape() {
             key_decisions_count: 0,
             conversation: None,
             shown_learning_ids: Vec::new(),
+            grace_buffer_tail: String::new(),
+            completion_killed: false,
         },
         claim_succeeded: true,
         shown_learning_ids: Vec::new(),
@@ -255,6 +279,8 @@ fn dropping_conversation_at_caller_is_observably_different_from_threading_it() {
         key_decisions_count: 0,
         conversation: Some(transcript.into()),
         shown_learning_ids: Vec::new(),
+        grace_buffer_tail: String::new(),
+        completion_killed: false,
     };
 
     // Correct threading: the value seen by the pipeline equals the field.
@@ -290,6 +316,8 @@ fn dropping_conversation_at_caller_is_observably_different_from_threading_it() {
         key_decisions_count: 0,
         conversation: None,
         shown_learning_ids: Vec::new(),
+        grace_buffer_tail: String::new(),
+        completion_killed: false,
     };
     let early_correct: Option<&str> = early.conversation.as_deref();
     let early_broken: Option<&str> = None;
@@ -297,5 +325,112 @@ fn dropping_conversation_at_caller_is_observably_different_from_threading_it() {
         early_correct, early_broken,
         "early-exit None must look identical to the broken-caller None — the discriminator only \
          distinguishes Some-but-dropped, never punishes legitimately-None paths",
+    );
+}
+
+fn iteration_result_bodies(source: &str) -> Vec<String> {
+    let mut bodies = Vec::new();
+    let needle = "IterationResult {";
+    let mut byte_idx = 0;
+    while let Some(rel) = source[byte_idx..].find(needle) {
+        let lit_start = byte_idx + rel;
+        byte_idx = lit_start + needle.len();
+        let after = &source[byte_idx..];
+        let mut depth = 1_i32;
+        let mut end = None;
+        for (i, ch) in after.char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let end = end.unwrap_or_else(|| panic!("unclosed IterationResult at byte {lit_start}"));
+        bodies.push(after[..end].to_string());
+        byte_idx += end;
+    }
+    bodies
+}
+
+/// FEAT-008: the post-runner return copies both grace fields off `RunnerResult`.
+/// Every other `IterationResult` literal in those two modules stays empty /
+/// `completion_killed: false`. Both `process_iteration_output` call sites pass
+/// the fields through. `process_iteration_output` destructures the tail and
+/// does not scan it (that is FEAT-006).
+#[test]
+fn grace_buffer_tail_is_threaded_not_scanned() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let read = |rel: &str| -> String {
+        let path = root.join(rel);
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    };
+
+    let assert_literals = |rel: &str| {
+        let bodies = iteration_result_bodies(&read(rel));
+        assert!(!bodies.is_empty(), "{rel} has IterationResult literals");
+        let mut copies = 0;
+        for body in &bodies {
+            if body.contains("grace_buffer_tail: claude_result.grace_buffer_tail") {
+                copies += 1;
+                assert!(
+                    body.contains("completion_killed: claude_result.completion_killed"),
+                    "{rel} success literal must copy completion_killed from RunnerResult"
+                );
+            } else {
+                assert!(
+                    body.contains("grace_buffer_tail: String::new()"),
+                    "{rel} early-return literal missing empty grace_buffer_tail:\n{body}"
+                );
+                assert!(
+                    body.contains("completion_killed: false"),
+                    "{rel} early-return literal must set completion_killed false:\n{body}"
+                );
+            }
+        }
+        assert_eq!(copies, 1, "{rel} must copy RunnerResult grace fields once");
+    };
+    assert_literals("src/loop_engine/iteration.rs");
+    assert_literals("src/loop_engine/slot.rs");
+
+    let slot = read("src/loop_engine/slot.rs");
+    assert!(
+        slot.contains("grace_buffer_tail: &slot_result.iteration_result.grace_buffer_tail"),
+        "process_slot_result must pass IterationResult.grace_buffer_tail"
+    );
+    assert!(
+        slot.contains("completion_killed: slot_result.iteration_result.completion_killed"),
+        "process_slot_result must pass IterationResult.completion_killed"
+    );
+
+    let orchestrator = read("src/loop_engine/orchestrator.rs");
+    assert_eq!(
+        orchestrator
+            .matches("grace_buffer_tail: &result.grace_buffer_tail")
+            .count(),
+        1,
+        "sequential process_iteration_output must pass IterationResult.grace_buffer_tail"
+    );
+    assert_eq!(
+        orchestrator
+            .matches("completion_killed: result.completion_killed")
+            .count(),
+        1,
+        "sequential process_iteration_output must pass IterationResult.completion_killed"
+    );
+
+    let pipeline = read("src/loop_engine/iteration_pipeline.rs");
+    let fn_at = pipeline
+        .find("pub fn process_iteration_output")
+        .expect("process_iteration_output");
+    assert_eq!(
+        pipeline[fn_at..].matches("grace_buffer_tail").count(),
+        1,
+        "process_iteration_output only destructures grace_buffer_tail; it does not scan it"
     );
 }

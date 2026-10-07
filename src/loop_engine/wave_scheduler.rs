@@ -4392,6 +4392,8 @@ mod tests {
                 key_decisions_count: 0,
                 conversation: None,
                 shown_learning_ids: Vec::new(),
+                grace_buffer_tail: String::new(),
+                completion_killed: false,
             },
             claim_succeeded: true,
             shown_learning_ids: Vec::new(),

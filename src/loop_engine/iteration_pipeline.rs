@@ -196,6 +196,13 @@ pub struct ProcessingParams<'a> {
     /// the sequential `run_loop` call site. Threaded into the progress log
     /// entry header (`Slot N`) so wave entries are distinguishable.
     pub slot_index: Option<usize>,
+    /// Borrow of [`crate::loop_engine::engine::IterationResult::grace_buffer_tail`].
+    /// FEAT-006 scans this when `completion_killed` is set and `output` has no
+    /// completion tag. Threaded here only; this function does not scan it.
+    pub grace_buffer_tail: &'a str,
+    /// Copied from [`crate::loop_engine::engine::IterationResult::completion_killed`].
+    /// Gates the FEAT-006 tail scan. Early-exit results pass `false`.
+    pub completion_killed: bool,
 }
 
 /// Run the shared post-Claude pipeline.
@@ -232,6 +239,9 @@ pub fn process_iteration_output(params: ProcessingParams<'_>) -> ProcessingOutco
         effective_effort,
         effective_runner,
         slot_index,
+        // FEAT-008 threads these in. FEAT-006 scans the tail; this pass does not.
+        grace_buffer_tail: _,
+        completion_killed: _,
     } = params;
 
     let mut result = ProcessingOutcome::default();
