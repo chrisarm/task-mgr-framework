@@ -361,10 +361,13 @@ fn iteration_result_bodies(source: &str) -> Vec<String> {
 /// FEAT-008: the post-runner return copies both grace fields off `RunnerResult`.
 /// Every other `IterationResult` literal in those two modules stays empty /
 /// `completion_killed: false`. Both `process_iteration_output` call sites pass
-/// the fields through. `process_iteration_output` destructures the tail and
-/// does not scan it (that is FEAT-006).
+/// the fields through. FEAT-006 scans the tail inside the pipeline, gated on
+/// `completion_killed` and an output with no `<completed>` tag. The pipeline
+/// does not read `RunnerResult` or `conversation` for that scan. Wave keeps
+/// `skip_git_completion_detection: true`, so a `-completed` commit cannot
+/// save the wave path.
 #[test]
-fn grace_buffer_tail_is_threaded_not_scanned() {
+fn grace_buffer_tail_is_threaded_and_pipeline_scans_it() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let read = |rel: &str| -> String {
         let path = root.join(rel);
@@ -428,9 +431,26 @@ fn grace_buffer_tail_is_threaded_not_scanned() {
     let fn_at = pipeline
         .find("pub fn process_iteration_output")
         .expect("process_iteration_output");
-    assert_eq!(
-        pipeline[fn_at..].matches("grace_buffer_tail").count(),
-        1,
-        "process_iteration_output only destructures grace_buffer_tail; it does not scan it"
+    let fn_body = &pipeline[fn_at..];
+    assert!(
+        fn_body.contains("completed_tags.is_empty() && completion_killed"),
+        "tail scan runs only when output has no <completed> tag and the run was grace-killed"
+    );
+    assert!(
+        fn_body.contains("parse_completed_tasks(grace_buffer_tail)"),
+        "process_iteration_output must scan grace_buffer_tail for <completed> tags"
+    );
+    assert!(
+        !fn_body.contains("parse_completed_tasks(conversation"),
+        "completion scan must not use conversation as the grace-buffer fallback"
+    );
+    assert!(
+        !fn_body.contains("RunnerResult"),
+        "process_iteration_output must not read RunnerResult"
+    );
+
+    assert!(
+        slot.contains("skip_git_completion_detection: true"),
+        "wave process_iteration_output keeps skip_git_completion_detection true"
     );
 }

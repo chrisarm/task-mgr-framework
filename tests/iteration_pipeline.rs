@@ -34,7 +34,8 @@ use task_mgr::db::migrations::run_migrations;
 use task_mgr::db::{create_schema, open_connection};
 use task_mgr::learnings::bandit::{get_window_stats, record_learning_shown};
 use task_mgr::learnings::crud::{RecordLearningParams, record_learning};
-use task_mgr::loop_engine::config::IterationOutcome;
+use task_mgr::loop_engine::config::{CrashType, IterationOutcome};
+use task_mgr::loop_engine::detection::{OutputSignals, analyze_output};
 use task_mgr::loop_engine::engine::IterationContext;
 use task_mgr::loop_engine::iteration_pipeline::{
     ProcessingOutcome, ProcessingParams, process_iteration_output,
@@ -1250,6 +1251,425 @@ fn task_id_none_leaves_bare_status_exact_id_only() {
     );
     assert_eq!(result.status_updates_applied, 0);
     assert_ne!(outcome, IterationOutcome::Completed);
+}
+
+// ---------------------------------------------------------------------------
+// FEAT-006 / FR-004: grace-buffer tail scan.
+//
+// `output` is `result.result` and may be a summary or empty. The tag that
+// armed the grace lives on `grace_buffer_tail`. `conversation` is head-capped
+// at 50_000 bytes (`append_capped`) and is not the fallback. The classifier
+// result is not a completion signal: exit 143 stays Crash(RuntimeError)
+// until the ladder sees a `<completed>` tag or a sequential `-completed`
+// commit. Wave passes `skip_git_completion_detection: true`.
+// ---------------------------------------------------------------------------
+
+/// E2 summary. It matches `is_rate_limited` and is not itself a completion.
+const GRACE_KILL_SUMMARY: &str =
+    "One warn line per 429 with operation, headers. See rate_limit_diagnostic_headers().";
+
+struct CompletionScan<'a> {
+    output: &'a str,
+    conversation: Option<&'a str>,
+    grace_buffer_tail: &'a str,
+    completion_killed: bool,
+    skip_git: bool,
+}
+
+fn classify_grace_kill(output: &str, dir: &std::path::Path) -> IterationOutcome {
+    analyze_output(
+        output,
+        143,
+        &OutputSignals {
+            cli_error: false,
+            completion_killed: true,
+            error_text: None,
+            task_id: None,
+            run_id: None,
+        },
+        dir,
+    )
+}
+
+fn assert_grace_summary_is_crash_not_rate_limit(output: &str, dir: &std::path::Path) {
+    let classified = classify_grace_kill(output, dir);
+    assert_ne!(
+        classified,
+        IterationOutcome::RateLimit,
+        "grace-killed summary must not classify as RateLimit"
+    );
+    assert_eq!(
+        classified,
+        IterationOutcome::Crash(CrashType::RuntimeError),
+        "exit 143 with no CLI error stays Crash(RuntimeError) until a completion signal"
+    );
+}
+
+fn drive_completion(
+    conn: &mut Connection,
+    fx: &mut PipelineFixture,
+    task_id: &str,
+    scan: &CompletionScan<'_>,
+    outcome: &mut IterationOutcome,
+) -> ProcessingOutcome {
+    process_iteration_output(ProcessingParams {
+        conn,
+        run_id: "test-run",
+        iteration: 1,
+        task_id: Some(task_id),
+        output: scan.output,
+        conversation: scan.conversation,
+        shown_learning_ids: &[],
+        outcome,
+        working_root: fx.project.path(),
+        git_scan_depth: 5,
+        skip_git_completion_detection: scan.skip_git,
+        prd_path: &fx.prd_path,
+        task_prefix: None,
+        progress_path: &fx.progress_path,
+        db_dir: &fx.db_dir,
+        signal_flag: &fx.signal_flag,
+        ctx: &mut fx.ctx,
+        files_modified: &[],
+        effective_model: None,
+        effective_effort: None,
+        effective_runner: None,
+        slot_index: None,
+        grace_buffer_tail: scan.grace_buffer_tail,
+        completion_killed: scan.completion_killed,
+    })
+}
+
+/// `append_capped` stops at 50_000 bytes, so a tag written after that cap is
+/// absent from `conversation`. The grace buffer is a separate tail.
+fn head_capped_conversation_without_tag() -> String {
+    let conversation = "x".repeat(50_000);
+    assert_eq!(conversation.len(), 50_000);
+    assert!(
+        !conversation.contains("<completed>"),
+        "head-capped conversation must not contain the grace tag"
+    );
+    conversation
+}
+
+fn git_available() -> bool {
+    std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_ok()
+}
+
+fn commit_in_repo(repo: &std::path::Path, message: &str) {
+    use std::process::Command;
+    let run = |args: &[&str]| {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .status()
+            .unwrap_or_else(|e| panic!("git {args:?}: {e}"));
+        assert!(status.success(), "git {args:?} failed: {status}");
+    };
+    run(&["init", "-q"]);
+    run(&["config", "user.email", "test@example.com"]);
+    run(&["config", "user.name", "Test"]);
+    fs::write(repo.join("seed.txt"), "seed").expect("seed file");
+    run(&["add", "."]);
+    run(&["commit", "-q", "-m", message]);
+}
+
+#[test]
+fn e2_scanned_text_grace_kill_marks_db_row_done() {
+    let (db_temp, mut conn) = setup_migrated_db();
+    disable_llm_extraction();
+    let task_id = "E2-SCAN-X";
+    insert_todo_task(&conn, task_id);
+    let mut fx = PipelineFixture::new(db_temp.path());
+
+    // Tag is in the scanned output. The tail and the head-capped conversation
+    // do not carry it, so this is the output rung, not the grace fallback.
+    let output = format!("{GRACE_KILL_SUMMARY}\n<completed>{task_id}</completed>\n");
+    let conversation = head_capped_conversation_without_tag();
+    assert_grace_summary_is_crash_not_rate_limit(&output, fx.project.path());
+
+    let mut outcome = classify_grace_kill(&output, fx.project.path());
+    let result = drive_completion(
+        &mut conn,
+        &mut fx,
+        task_id,
+        &CompletionScan {
+            output: &output,
+            conversation: Some(&conversation),
+            grace_buffer_tail: "",
+            completion_killed: true,
+            skip_git: false,
+        },
+        &mut outcome,
+    );
+
+    assert_eq!(
+        task_status(&conn, task_id),
+        "done",
+        "E2 scanned text must mark the DB row done, not only the classifier"
+    );
+    assert_eq!(outcome, IterationOutcome::Completed);
+    assert!(result.completed_task_ids.iter().any(|id| id == task_id));
+}
+
+#[test]
+fn e2_sequential_completed_commit_grace_kill_marks_db_row_done() {
+    if !git_available() {
+        eprintln!("skipping: git not available");
+        return;
+    }
+    let (db_temp, mut conn) = setup_migrated_db();
+    disable_llm_extraction();
+    let task_id = "E2-COMMIT-X";
+    insert_todo_task(&conn, task_id);
+    let mut fx = PipelineFixture::new(db_temp.path());
+    commit_in_repo(fx.project.path(), &format!("feat: {task_id}-completed"));
+
+    let output = GRACE_KILL_SUMMARY;
+    let conversation = head_capped_conversation_without_tag();
+    assert!(
+        !output.contains("<completed>"),
+        "commit path must not depend on a tag in output"
+    );
+    assert_grace_summary_is_crash_not_rate_limit(output, fx.project.path());
+
+    let mut outcome = classify_grace_kill(output, fx.project.path());
+    drive_completion(
+        &mut conn,
+        &mut fx,
+        task_id,
+        &CompletionScan {
+            output,
+            conversation: Some(&conversation),
+            grace_buffer_tail: "",
+            completion_killed: true,
+            skip_git: false,
+        },
+        &mut outcome,
+    );
+
+    assert_eq!(
+        task_status(&conn, task_id),
+        "done",
+        "E2 sequential -completed commit must mark the DB row done"
+    );
+    assert_eq!(outcome, IterationOutcome::Completed);
+}
+
+#[test]
+fn e3_grace_buffer_tail_marks_task_done_without_commit() {
+    let (db_temp, mut conn) = setup_migrated_db();
+    disable_llm_extraction();
+    let conversation = head_capped_conversation_without_tag();
+    // Not a git repo, and wave skip_git stays true: no `-completed` commit.
+    let cases = [("E3-EMPTY", ""), ("E3-SUMMARY", GRACE_KILL_SUMMARY)];
+
+    for (task_id, output) in cases {
+        insert_todo_task(&conn, task_id);
+        assert!(
+            !output.contains("<completed>"),
+            "{task_id} output must not contain the tag"
+        );
+        assert!(!conversation.contains(&format!("<completed>{task_id}</completed>")));
+        if !output.is_empty() {
+            assert_grace_summary_is_crash_not_rate_limit(output, db_temp.path());
+        }
+
+        let mut fx = PipelineFixture::new(db_temp.path());
+        let tail = format!("assistant buffer that armed grace\n<completed>{task_id}</completed>\n");
+        let mut outcome = IterationOutcome::Crash(CrashType::RuntimeError);
+        drive_completion(
+            &mut conn,
+            &mut fx,
+            task_id,
+            &CompletionScan {
+                output,
+                conversation: Some(&conversation),
+                grace_buffer_tail: &tail,
+                completion_killed: true,
+                skip_git: true,
+            },
+            &mut outcome,
+        );
+
+        assert_eq!(
+            task_status(&conn, task_id),
+            "done",
+            "E3 tag only in the grace-buffer tail must mark {task_id} done without a commit"
+        );
+        assert_eq!(outcome, IterationOutcome::Completed);
+    }
+}
+
+#[test]
+fn grace_kill_without_tag_or_completed_commit_leaves_row() {
+    let (db_temp, mut conn) = setup_migrated_db();
+    disable_llm_extraction();
+    let task_id = "E3-NO-TAG";
+    insert_todo_task(&conn, task_id);
+    let mut fx = PipelineFixture::new(db_temp.path());
+
+    // Bracket mention in the tail is not a `<completed>` tag. The output
+    // scan must not be retargeted onto the grace buffer.
+    let tail = format!("mentioned [{task_id}] while wrapping up");
+    assert_grace_summary_is_crash_not_rate_limit(GRACE_KILL_SUMMARY, fx.project.path());
+    let mut outcome = classify_grace_kill(GRACE_KILL_SUMMARY, fx.project.path());
+    let result = drive_completion(
+        &mut conn,
+        &mut fx,
+        task_id,
+        &CompletionScan {
+            output: GRACE_KILL_SUMMARY,
+            conversation: Some(&format!("<completed>{task_id}</completed>")),
+            grace_buffer_tail: &tail,
+            completion_killed: true,
+            skip_git: true,
+        },
+        &mut outcome,
+    );
+
+    assert_eq!(task_status(&conn, task_id), "in_progress");
+    assert_eq!(
+        outcome,
+        IterationOutcome::Crash(CrashType::RuntimeError),
+        "exit 143 with no tag and no -completed commit stays Crash(RuntimeError)"
+    );
+    assert!(result.completed_task_ids.is_empty());
+}
+
+#[test]
+fn grace_kill_does_not_scan_conversation_for_completed() {
+    let (db_temp, mut conn) = setup_migrated_db();
+    disable_llm_extraction();
+    let task_id = "E3-CONV-ONLY";
+    insert_todo_task(&conn, task_id);
+    let mut fx = PipelineFixture::new(db_temp.path());
+
+    let conversation = format!("tail of a short transcript\n<completed>{task_id}</completed>\n");
+    let mut outcome = IterationOutcome::Crash(CrashType::RuntimeError);
+    drive_completion(
+        &mut conn,
+        &mut fx,
+        task_id,
+        &CompletionScan {
+            output: "summary with no completed tag",
+            conversation: Some(&conversation),
+            grace_buffer_tail: "assistant buffer with no completed tag",
+            completion_killed: true,
+            skip_git: true,
+        },
+        &mut outcome,
+    );
+
+    assert_eq!(
+        task_status(&conn, task_id),
+        "in_progress",
+        "conversation must not substitute for the grace-buffer tail"
+    );
+    assert_eq!(outcome, IterationOutcome::Crash(CrashType::RuntimeError));
+}
+
+#[test]
+fn grace_buffer_tail_not_scanned_unless_completion_killed() {
+    let (db_temp, mut conn) = setup_migrated_db();
+    disable_llm_extraction();
+    let task_id = "E3-NOT-KILLED";
+    insert_todo_task(&conn, task_id);
+    let mut fx = PipelineFixture::new(db_temp.path());
+
+    let tail = format!("<completed>{task_id}</completed>");
+    let mut outcome = IterationOutcome::Empty;
+    drive_completion(
+        &mut conn,
+        &mut fx,
+        task_id,
+        &CompletionScan {
+            output: "",
+            conversation: None,
+            grace_buffer_tail: &tail,
+            completion_killed: false,
+            skip_git: true,
+        },
+        &mut outcome,
+    );
+
+    assert_eq!(task_status(&conn, task_id), "in_progress");
+    assert_eq!(outcome, IterationOutcome::Empty);
+}
+
+#[test]
+fn wave_skip_git_completed_commit_does_not_mark_grace_kill_done() {
+    if !git_available() {
+        eprintln!("skipping: git not available");
+        return;
+    }
+    let (db_temp, mut conn) = setup_migrated_db();
+    disable_llm_extraction();
+    let task_id = "E3-WAVE-COMMIT";
+    insert_todo_task(&conn, task_id);
+    let mut fx = PipelineFixture::new(db_temp.path());
+    commit_in_repo(fx.project.path(), &format!("feat: {task_id}-completed"));
+
+    let mut outcome = IterationOutcome::Crash(CrashType::RuntimeError);
+    drive_completion(
+        &mut conn,
+        &mut fx,
+        task_id,
+        &CompletionScan {
+            output: GRACE_KILL_SUMMARY,
+            conversation: None,
+            grace_buffer_tail: "",
+            completion_killed: true,
+            skip_git: true,
+        },
+        &mut outcome,
+    );
+
+    assert_eq!(
+        task_status(&conn, task_id),
+        "in_progress",
+        "wave skip_git must ignore a -completed commit when the grace buffer has no tag"
+    );
+    assert_eq!(outcome, IterationOutcome::Crash(CrashType::RuntimeError));
+}
+
+#[test]
+fn grace_tail_completed_tag_for_peer_does_not_mark_claim() {
+    let (db_temp, mut conn) = setup_migrated_db();
+    disable_llm_extraction();
+    let claim = "E3-CLAIM-X";
+    let peer = "E3-PEER-Y";
+    insert_todo_task(&conn, claim);
+    insert_todo_task(&conn, peer);
+    let mut fx = PipelineFixture::new(db_temp.path());
+
+    let tail = format!("<completed>{peer}</completed>");
+    let mut outcome = IterationOutcome::Crash(CrashType::RuntimeError);
+    let result = drive_completion(
+        &mut conn,
+        &mut fx,
+        claim,
+        &CompletionScan {
+            output: GRACE_KILL_SUMMARY,
+            conversation: None,
+            grace_buffer_tail: &tail,
+            completion_killed: true,
+            skip_git: true,
+        },
+        &mut outcome,
+    );
+
+    assert_eq!(task_status(&conn, peer), "done");
+    assert_eq!(
+        task_status(&conn, claim),
+        "in_progress",
+        "a grace-buffer tag for Y must not mark the claim done"
+    );
+    assert!(result.completed_task_ids.iter().any(|id| id == peer));
+    assert!(!result.completed_task_ids.iter().any(|id| id == claim));
 }
 
 // ---------------------------------------------------------------------------
