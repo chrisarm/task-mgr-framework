@@ -606,9 +606,13 @@ pub(super) fn prompt_overflow_result(
 
 /// Probe whether the CLI rate limit has been lifted by spawning a minimal Claude call.
 ///
-/// Sends `claude -p "." --print --max-turns 1 --no-session-persistence` and checks
-/// whether the output still contains rate-limit patterns. Returns `true` if the
-/// limit appears to be lifted (Claude responds without a rate-limit error).
+/// Sends `claude -p "." --print --max-turns 1 --no-session-persistence`.
+/// Exit 0 is lifted and the probe text is not scanned: prose that contains
+/// "limit" is not a live limit when the CLI itself succeeded (E12). A non-zero
+/// exit scans the combined stdout and stderr with [`detection::is_rate_limited`]
+/// directly. This function does not call `analyze_output` and does not read
+/// `LOOP_USAGE_CHECK_ENABLED` (learning 5298: that flag is not a kill switch
+/// for the early-lift probe).
 pub(super) fn probe_rate_limit_lifted(permission_mode: &PermissionMode) -> bool {
     let binary = std::env::var("CLAUDE_BINARY").unwrap_or_else(|_| "claude".to_string());
 
@@ -656,6 +660,12 @@ pub(super) fn probe_rate_limit_lifted(permission_mode: &PermissionMode) -> bool 
             return false;
         }
     };
+
+    // E12: a clean probe is lifted. Scanning here would treat a summary that
+    // mentions "limit" as a live limit and keep the loop parked.
+    if output.status.success() {
+        return true;
+    }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -722,7 +732,7 @@ mod tests {
     use crate::loop_engine::model::{FABLE_MODEL, HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL};
     use crate::loop_engine::project_config::ProjectConfig;
     use crate::loop_engine::reactions::pre_spawn::crash_escalated_model;
-    use crate::loop_engine::test_utils::setup_test_db;
+    use crate::loop_engine::test_utils::{CLAUDE_BINARY_MUTEX, EnvGuard, setup_test_db};
 
     // --- update_trackers tests ---
 
@@ -2413,6 +2423,88 @@ mod tests {
         assert!(
             again.is_none(),
             "post-apply, the contains_key guard blocks re-promotion",
+        );
+    }
+
+    // --- E12: probe_rate_limit_lifted exit-status gate (FEAT-007) ---
+
+    /// Fake `CLAUDE_BINARY`. Prints `message` and exits `code`. Ignores the
+    /// probe's argv so permission-mode flags do not change the result.
+    fn write_probe_stub(
+        dir: &std::path::Path,
+        name: &str,
+        message: &str,
+        code: i32,
+    ) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\nprintf '%s\\n' \"{message}\"\nexit {code}\n"),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path
+    }
+
+    /// E12: exit 0 with prose that `is_rate_limited` would match is lifted
+    /// (the scan does not run). Exit 1 with a real limit sentence is not
+    /// lifted. Exit 1 with non-matching prose is lifted, so the non-zero path
+    /// still calls `is_rate_limited`. `LOOP_USAGE_CHECK_ENABLED=false` does
+    /// not silence the probe.
+    #[test]
+    fn e12_probe_exit_status_gates_rate_limit_scan() {
+        let _lock = CLAUDE_BINARY_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _usage = EnvGuard::set("LOOP_USAGE_CHECK_ENABLED", "false");
+        let dir = tempfile::tempdir().unwrap();
+        let mode = PermissionMode::Dangerous;
+
+        // Matches `is_rate_limited` ("hit your" ∧ "limit"). Exit 0 must
+        // return lifted anyway — a scan would return not-lifted.
+        let limit_sentence = "You've hit your limit";
+        assert!(
+            detection::is_rate_limited(limit_sentence),
+            "fixture must be a real limit sentence so exit 0 proves the scan was skipped"
+        );
+
+        let exit_zero = write_probe_stub(dir.path(), "probe-exit-0.sh", limit_sentence, 0);
+        let _bin = EnvGuard::set("CLAUDE_BINARY", exit_zero.to_str().unwrap());
+        assert!(
+            probe_rate_limit_lifted(&mode),
+            "E12: exit 0 with prose containing limit is lifted"
+        );
+        drop(_bin);
+
+        let exit_one = write_probe_stub(
+            dir.path(),
+            "probe-exit-1.sh",
+            "You've hit your limit · resets 4pm",
+            1,
+        );
+        let _bin = EnvGuard::set("CLAUDE_BINARY", exit_one.to_str().unwrap());
+        assert!(
+            !probe_rate_limit_lifted(&mode),
+            "exit ≠ 0 with a real limit sentence is not lifted"
+        );
+        drop(_bin);
+
+        // Word "limit" alone is not a classifier hit. Non-zero + this prose
+        // is lifted only when `is_rate_limited` still runs.
+        let benign = "I will limit the scope of this note.";
+        assert!(
+            !detection::is_rate_limited(benign),
+            "benign prose must not match is_rate_limited"
+        );
+        let exit_benign = write_probe_stub(dir.path(), "probe-exit-1-benign.sh", benign, 1);
+        let _bin = EnvGuard::set("CLAUDE_BINARY", exit_benign.to_str().unwrap());
+        assert!(
+            probe_rate_limit_lifted(&mode),
+            "exit ≠ 0 still scans: non-matching prose is lifted"
         );
     }
 }
