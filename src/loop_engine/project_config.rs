@@ -1238,7 +1238,7 @@ pub fn read_project_config(db_dir: &Path) -> ProjectConfig {
 mod tests {
     use super::*;
     use crate::loop_engine::model::{OPUS_MODEL, SONNET_MODEL};
-    use crate::loop_engine::test_utils::{CLAUDE_BINARY_MUTEX, EnvGuard};
+    use crate::loop_engine::test_utils::{CLAUDE_BINARY_MUTEX, CODEX_BINARY_MUTEX, EnvGuard};
     use std::fs;
 
     /// The built-in provider builders MUST derive their `tiers` from the
@@ -1275,19 +1275,9 @@ mod tests {
         assert_derived(CODEX_DEFAULT_TIER_MODELS, &default_codex_provider());
     }
 
-    /// Serializes tests that mutate the process-global `CODEX_BINARY` env var
-    /// and then probe it (directly or via `preflight_validate_and_probe`).
-    ///
-    /// Under `cargo test`'s default multi-threaded runner these tests race on
-    /// the shared env var and against the PATH-reading binary probe: a sibling
-    /// test removing/restoring `CODEX_BINARY` mid-flight can make the probe fall
-    /// through to a real `codex` on PATH and flip an `expect_err` to a pass.
-    /// A module-local `Mutex` is the minimal, dependency-free serializer
-    /// (no `serial_test` crate). `GROK_BINARY`-mutating tests in this module
-    /// use the cross-file [`crate::loop_engine::test_utils::GROK_BINARY_MUTEX`]
-    /// instead, because `GROK_BINARY` is also mutated by tests in other lib
-    /// modules (`runner.rs`, `commands::models::handlers`) that share this test
-    /// binary; a module-local lock would not serialize against those.
+    /// Extra serializer for this module's probe test. `CODEX_BINARY` itself is
+    /// guarded by [`CODEX_BINARY_MUTEX`] because `limit_shape` tests in this
+    /// binary also set it. A module-local lock would not see those.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
@@ -2041,6 +2031,7 @@ mod tests {
         let _guard = CLAUDE_BINARY_MUTEX
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let _codex_lock = CODEX_BINARY_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _claude_env = EnvGuard::remove("CLAUDE_BINARY");
         let _codex_env = EnvGuard::remove("CODEX_BINARY");

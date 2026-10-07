@@ -2,8 +2,8 @@
 ///
 /// Spawns `claude` with permission-mode-aware flags and `-p PROMPT` as a child
 /// process. Tees stdout to stderr (live display) while collecting it into a buffer
-/// for later analysis by the detection engine. Claude's stderr passes through
-/// directly (inherited).
+/// for later analysis by the detection engine. Claude's stderr is piped, tee'd
+/// to the terminal, and retained as a tail for the limit-shape record.
 ///
 /// When a `SignalFlag` is provided, a watchdog thread monitors for SIGINT/SIGTERM
 /// and escalates: SIGTERM → 3s grace → SIGKILL.
@@ -82,22 +82,21 @@ pub type SpawnOpts<'a> = RunnerOpts<'a>;
 
 /// Allocate a pseudo-TTY pair for piping the child's stdout+stderr through.
 ///
-/// Returns `(master, slave_stdout, slave_stderr)`. The two slave fds are
-/// duplicates of the same PTY endpoint so both of the child's output streams
-/// share it (mirrors a terminal). Termios is configured with `OPOST` cleared
+/// Returns `(master, slave_stdout)`. Termios is configured with `OPOST` cleared
 /// so the PTY doesn't map `\n` to `\r\n`, and echo bits cleared for safety
 /// (we don't write to master, but keeps state deterministic).
+///
+/// Stderr is not placed on this PTY. The caller pipes it and tees the bytes to
+/// the terminal so the limit-shape record can keep a tail. A second slave fd
+/// held open in the parent would also suppress master-side EOF.
 ///
 /// # Why a PTY
 /// Node.js — the Claude Code runtime — line-buffers stdout only when
 /// `isatty(1)` returns true. A plain pipe triggers block-buffering (~8KB),
 /// which makes stream-json lines arrive in bursts instead of live.
 #[cfg(unix)]
-pub(crate) fn open_pty_for_child_output() -> std::io::Result<(
-    std::os::fd::OwnedFd,
-    std::os::fd::OwnedFd,
-    std::os::fd::OwnedFd,
-)> {
+pub(crate) fn open_pty_for_child_output()
+-> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
     let mut master: libc::c_int = 0;
@@ -138,8 +137,7 @@ pub(crate) fn open_pty_for_child_output() -> std::io::Result<(
         }
     }
 
-    let slave_err = slave.try_clone()?;
-    Ok((master, slave, slave_err))
+    Ok((master, slave))
 }
 
 /// Treat EIO from a PTY master read as a clean EOF.
@@ -176,7 +174,7 @@ pub(crate) fn is_pty_read_eof(e: &std::io::Error) -> bool {
 /// environment variable (useful for testing with mock scripts).
 ///
 /// - stdout is piped, read line-by-line, echoed to stderr (tee), and buffered
-/// - stderr is inherited (passes through directly to the terminal)
+/// - stderr is piped, tee'd to the terminal, and tail-retained for the limit-shape record
 /// - The full environment is inherited by the subprocess
 ///
 /// When `opts.working_dir` is `Some`, the subprocess runs in that directory. This is

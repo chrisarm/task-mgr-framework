@@ -89,6 +89,12 @@ pub(crate) struct Accumulator {
     pub(crate) cli_error: bool,
     /// Retained error string for gated classifiers (see `RunnerResult.error_text`).
     pub(crate) error_text: Option<String>,
+    /// Last result line's `is_error` flag. Independent of `cli_error`, which
+    /// an assistant `StreamEvent::Error` also sets.
+    pub(crate) result_is_error: bool,
+    /// First `StreamEvent::Error` string. Not overwritten when a later result
+    /// line replaces `error_text`.
+    pub(crate) assistant_error: Option<String>,
 }
 
 /// Provider-specific stdout interpretation.
@@ -142,6 +148,7 @@ pub(crate) fn accumulate(acc: &mut Accumulator, ev: StreamEvent) {
             append_capped(&mut acc.conversation, &format!("[Result: {}]\n", truncated));
         }
         StreamEvent::FinalResult { text, is_error } => {
+            acc.result_is_error = is_error;
             if is_error {
                 acc.cli_error = true;
                 // Result-line is_error keeps the result string as error_text
@@ -156,6 +163,11 @@ pub(crate) fn accumulate(acc: &mut Accumulator, ev: StreamEvent) {
         StreamEvent::Error(e) => {
             append_capped(&mut acc.conversation, &format!("[Error: {}]\n", e));
             acc.cli_error = true;
+            // Kept even when a later result is_error overwrites error_text.
+            // First non-empty wins, matching the error_text fill below.
+            if acc.assistant_error.as_ref().is_none_or(|s| s.is_empty()) {
+                acc.assistant_error = Some(e.clone());
+            }
             // Fill only when still empty — result is_error wins if it arrives.
             if acc.error_text.as_ref().is_none_or(|s| s.is_empty()) {
                 acc.error_text = Some(e);
@@ -270,6 +282,10 @@ pub(crate) struct DriveStreamResult {
     pub error_text: Option<String>,
     /// Same buffer `arm_completion_grace` scans (`Accumulator.assistant_buf`).
     pub grace_buffer_tail: String,
+    /// Claude result line's `is_error`. False for providers that emit no result line.
+    pub result_is_error: bool,
+    /// First assistant / Codex `StreamEvent::Error` string, if any.
+    pub assistant_error: Option<String>,
 }
 
 /// Read provider stdout, tee live output, build the transcript, and return
@@ -353,6 +369,8 @@ pub(crate) fn drive_stream<F: StreamFormat>(
         error_text: acc.error_text,
         // Same buffer arm_completion_grace scans (already tail-retained).
         grace_buffer_tail: acc.assistant_buf,
+        result_is_error: acc.result_is_error,
+        assistant_error: acc.assistant_error,
     }
 }
 
@@ -535,6 +553,53 @@ impl StreamFormat for CodexStreamFormat {
 mod tests {
     use super::*;
     use crate::loop_engine::claude::ClaudeStreamFormat;
+
+    #[test]
+    fn assistant_error_is_kept_when_result_is_error_replaces_error_text() {
+        let mut acc = Accumulator::default();
+        accumulate(
+            &mut acc,
+            StreamEvent::Error("assistant-channel-error-distinct".to_string()),
+        );
+        accumulate(
+            &mut acc,
+            StreamEvent::FinalResult {
+                text: "Finished the edit and left a note.".to_string(),
+                is_error: true,
+            },
+        );
+        assert!(acc.result_is_error);
+        assert_eq!(
+            acc.assistant_error.as_deref(),
+            Some("assistant-channel-error-distinct")
+        );
+        assert_eq!(
+            acc.error_text.as_deref(),
+            Some("Finished the edit and left a note.")
+        );
+
+        let mut acc = Accumulator::default();
+        accumulate(
+            &mut acc,
+            StreamEvent::Error("assistant-channel-error-distinct".to_string()),
+        );
+        accumulate(
+            &mut acc,
+            StreamEvent::FinalResult {
+                text: "Finished the edit and left a note.".to_string(),
+                is_error: false,
+            },
+        );
+        assert!(!acc.result_is_error);
+        assert_eq!(
+            acc.assistant_error.as_deref(),
+            Some("assistant-channel-error-distinct")
+        );
+        assert_eq!(
+            acc.error_text.as_deref(),
+            Some("assistant-channel-error-distinct")
+        );
+    }
 
     /// Fold a provider's JSONL lines through the accumulation core (no tee/grace),
     /// mirroring the production fold for assertion in tests.
