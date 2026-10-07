@@ -52,7 +52,7 @@ Do **not** hardcode model IDs — they change with each Claude release and must 
 - **Opus (standard)** → `OPUS_MODEL` = `claude-opus-5`
 - **Sonnet (cost-efficient)** → `SONNET_MODEL` = `claude-sonnet-5`
 - **Haiku (cheapest)** → `HAIKU_MODEL` = `claude-haiku-4-5-20251001`
-- **Grok (standard)** → `GROK_MODEL` = `grok-4.5`
+- **Grok (explicit pin)** → `GROK_MODEL` = `grok-4.5`
 
 **Difficulty → `--effort` mapping**:
 
@@ -72,7 +72,7 @@ Default tier matrix (from the `_DEFAULT_TIER_MODELS` tables; empty = route with 
 | Tier | Claude | Grok | Codex |
 |------|--------|------|-------|
 | frontier | claude-fable-5 | (n/a) | (n/a) |
-| standard | claude-opus-5 | grok-4.5 | (no -m flag) |
+| standard | claude-opus-5 | (no -m flag) | (no -m flag) |
 | cost-efficient | claude-sonnet-5 | (n/a) | (n/a) |
 | cheapest | claude-haiku-4-5-20251001 | (n/a) | (n/a) |
 

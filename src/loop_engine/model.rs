@@ -46,7 +46,10 @@ pub const HAIKU_MODEL: &str = "claude-haiku-4-5-20251001";
 /// token, which is why substring tier classification is structurally dead and
 /// `CapabilityTier`/`tier_of` use config exact-match instead.
 pub const FABLE_MODEL: &str = "claude-fable-5";
-/// Default Grok model on the single `standard` rung of the built-in ladder.
+/// Well-known Grok model id for an explicit tier pin and for tests.
+/// The built-in ladder does not use it: `GROK_DEFAULT_TIER_MODELS` leaves
+/// `standard` empty so a run with no override omits `--model` and the CLI
+/// picks its own default.
 pub const GROK_MODEL: &str = "grok-4.5";
 /// Suffix marking a 1M-context model variant (`claude-opus-5[1m]`).
 /// Stripped by `tier_of` before the exact config match and appended by the
@@ -293,14 +296,15 @@ pub const CODEX_EFFORT_FOR_DIFFICULTY: &[(&str, &str)] =
 /// for `cargo run --bin gen-docs` tier matrix + anchor docs). These mirror the
 /// construction in `project_config::default_*_provider` but live here so docs
 /// extraction and the no-hardcoded-models rule stay confined to model.rs.
-/// Empty string value for codex "standard" signals "route with no model flag".
+/// Empty string value for a tier signals "route with no model flag"
+/// (Grok `standard`, Codex `standard`).
 pub const CLAUDE_DEFAULT_TIER_MODELS: &[(&str, &str)] = &[
     ("cheapest", HAIKU_MODEL),
     ("cost-efficient", SONNET_MODEL),
     ("standard", OPUS_MODEL),
     ("frontier", FABLE_MODEL),
 ];
-pub const GROK_DEFAULT_TIER_MODELS: &[(&str, &str)] = &[("standard", GROK_MODEL)];
+pub const GROK_DEFAULT_TIER_MODELS: &[(&str, &str)] = &[("standard", "")];
 pub const CODEX_DEFAULT_TIER_MODELS: &[(&str, &str)] = &[("standard", "")];
 
 /// Trim + lowercase a difficulty string for table lookup. Returns `None` when
@@ -1489,9 +1493,22 @@ mod tests {
 
     #[test]
     fn test_escalate_tier_grok_single_rung_self_loops() {
-        // Grok has one defined rung (Standard=GROK_MODEL); escalation self-loops.
-        let r = escalate_tier(builtin_resolved_models(), Provider::Grok, Some(GROK_MODEL));
+        // A single defined model rung self-loops. The built-in rung is null, so
+        // this uses an explicit pin; GROK_MODEL is not on the built-in ladder.
+        let r = escalate_tier(
+            &resolved_single(
+                Provider::Grok,
+                &[(CapabilityTier::Standard, Some(GROK_MODEL))],
+            ),
+            Provider::Grok,
+            Some(GROK_MODEL),
+        );
         assert_eq!(r, Some(GROK_MODEL.to_string()));
+        assert_eq!(
+            builtin_resolved_models().model_for(Provider::Grok, CapabilityTier::Standard),
+            None,
+            "built-in grok standard omits the model flag"
+        );
     }
 
     /// Full chain haiku → sonnet → opus → fable → fable (ceiling self-loop).
@@ -2299,15 +2316,12 @@ mod tests {
     fn cost_efficient_auxiliary_plan_grok_sparse_ladder_clamps_to_standard() {
         let r = resolved_single(
             Provider::Grok,
-            &[(
-                CapabilityTier::Standard,
-                Some(GROK_DEFAULT_TIER_MODELS[0].1),
-            )],
+            &[(CapabilityTier::Standard, Some(GROK_MODEL))],
         );
 
         let plan = cost_efficient_auxiliary_plan(&r);
         assert_eq!(plan.provider, Provider::Grok);
-        assert_eq!(plan.model, Some(GROK_DEFAULT_TIER_MODELS[0].1));
+        assert_eq!(plan.model, Some(GROK_MODEL));
     }
 
     #[test]
@@ -2379,12 +2393,9 @@ mod tests {
             "grok".to_string(),
             ProviderConfig {
                 enabled: true,
-                tiers: [(
-                    "standard".to_string(),
-                    Some(GROK_DEFAULT_TIER_MODELS[0].1.to_string()),
-                )]
-                .into_iter()
-                .collect(),
+                tiers: [("standard".to_string(), Some(GROK_MODEL.to_string()))]
+                    .into_iter()
+                    .collect(),
                 effort: HashMap::new(),
                 fallback: Some("claude".to_string()),
                 cli_binary: None,
@@ -2410,7 +2421,7 @@ mod tests {
         let r = resolve_models_config(&models, &RoutingConfig::default());
         let plan = merge_resolver_plan(&r);
         assert_eq!(plan.primary.provider, Provider::Grok);
-        assert_eq!(plan.primary.model, Some(GROK_DEFAULT_TIER_MODELS[0].1));
+        assert_eq!(plan.primary.model, Some(GROK_MODEL));
         let fb = plan.fallback.expect("enabled claude fallback must surface");
         assert_eq!(fb.provider, Provider::Claude);
         assert_eq!(fb.model, Some(OPUS_MODEL));
@@ -2424,12 +2435,9 @@ mod tests {
             "grok".to_string(),
             ProviderConfig {
                 enabled: true,
-                tiers: [(
-                    "standard".to_string(),
-                    Some(GROK_DEFAULT_TIER_MODELS[0].1.to_string()),
-                )]
-                .into_iter()
-                .collect(),
+                tiers: [("standard".to_string(), Some(GROK_MODEL.to_string()))]
+                    .into_iter()
+                    .collect(),
                 effort: HashMap::new(),
                 fallback: Some("claude".to_string()),
                 cli_binary: None,
@@ -2474,8 +2482,8 @@ mod tests {
         assert!(grok.enabled, "user override flips enabled");
         assert_eq!(
             grok.tiers.get("standard"),
-            Some(&Some(GROK_MODEL.to_string())),
-            "grok inherits its default tier ladder"
+            Some(&None),
+            "grok inherits a null standard rung (no model flag)"
         );
         assert!(
             !grok.effort.is_empty(),

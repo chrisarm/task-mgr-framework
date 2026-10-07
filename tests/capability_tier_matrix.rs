@@ -155,9 +155,9 @@ fn edge_case_1m_suffix_strips_before_exact_tier_match() {
 fn edge_case_sparse_grok_ladder_clamps_to_single_rung() {
     let r = resolved_default();
     let standard = r.model_for(Provider::Grok, CapabilityTier::Standard);
-    assert!(
-        standard.is_some(),
-        "grok default exposes a single `standard` rung"
+    assert_eq!(
+        standard, None,
+        "grok builtin standard is null: no model flag"
     );
 
     // Frontier (above) steps down; cheapest (below) steps up; both land on the
@@ -431,7 +431,10 @@ fn builtin_default_merge_is_canonical_and_sparse_override_inherits() {
         resolved_default().model_for(Provider::Grok, CapabilityTier::Standard),
         "a sparse enabled-only override must inherit grok's default tier ladder"
     );
-    assert!(grok_standard.is_some());
+    assert!(
+        grok_standard.is_none(),
+        "inherited grok standard is null (no model flag)"
+    );
 }
 
 // ============================================================================
