@@ -4691,4 +4691,207 @@ mod tests {
             "rate-limit reaction must not call react_to_completions"
         );
     }
+
+    // --- FEAT-005: wave PromptTooLong completed-tag skip (E11) ---
+    //
+    // Drives `process_slot_result`, which calls
+    // `handle_overflow_unless_completed` and then the pipeline. Does not
+    // spawn a runner or call `run_wave_iteration`.
+
+    fn e11_wave_slot(task_id: &str, output: &str) -> SlotResult {
+        let mut slot = e10_slot_result(
+            0,
+            task_id,
+            IterationOutcome::Crash(config::CrashType::PromptTooLong),
+            output,
+        );
+        slot.iteration_result.effective_effort = Some("xhigh".to_string());
+        // Production slots carry the assembled prompt into overflow dumps.
+        // The debug assert in process_slot_result requires it on PromptTooLong.
+        slot.prompt_for_overflow = Some("prompt\n".to_string());
+        slot
+    }
+
+    fn assert_no_overflow_context(ctx: &IterationContext, task_id: &str) {
+        assert!(
+            !ctx.overflow_recovered.contains(task_id),
+            "skip must not insert overflow_recovered for {task_id}"
+        );
+        assert!(!ctx.overflow_original_model.contains_key(task_id));
+        assert!(!ctx.overflow_original_task_model.contains_key(task_id));
+        assert!(!ctx.effort_overrides.contains_key(task_id));
+        assert!(!ctx.model_overrides.contains_key(task_id));
+        assert!(!ctx.runner_overrides.contains_key(task_id));
+    }
+
+    fn assert_overflow_entered(ctx: &IterationContext, task_id: &str) {
+        assert!(ctx.overflow_recovered.contains(task_id));
+        assert!(ctx.overflow_original_model.contains_key(task_id));
+        assert!(ctx.overflow_original_task_model.contains_key(task_id));
+        assert!(
+            ctx.effort_overrides.contains_key(task_id),
+            "xhigh must take rung 1 for {task_id}"
+        );
+    }
+
+    fn drive_e11_wave(
+        claimed: &str,
+        output: &str,
+        peers: &[&str],
+        task_prefix: Option<&str>,
+        check: impl FnOnce(&Connection, &IterationContext, &SlotResult),
+    ) {
+        use crate::loop_engine::test_utils::EnvGuard;
+
+        let _no_extract = EnvGuard::set("TASK_MGR_NO_EXTRACT_LEARNINGS", "1");
+        let (db_dir, mut conn) = setup_test_db();
+        insert_run(&conn, "run-e11-wave");
+        insert_in_progress_task(&conn, claimed);
+        for peer in peers {
+            insert_in_progress_task(&conn, peer);
+        }
+        let mut ids = vec![claimed.to_string()];
+        ids.extend(peers.iter().map(|id| (*id).to_string()));
+        let stories = ids
+            .iter()
+            .map(|id| format!(r#"{{"id":"{id}","title":"t","passes":false,"priority":1}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let prd_path = db_dir.path().join("prd.json");
+        std::fs::write(
+            &prd_path,
+            format!(r#"{{"project":"e11","userStories":[{stories}]}}"#),
+        )
+        .unwrap();
+        let progress_path = db_dir.path().join("progress-e11-wave.txt");
+        std::fs::write(&progress_path, "").unwrap();
+        let base_prompt = db_dir.path().join("base-prompt.md");
+        std::fs::write(&base_prompt, "base\n").unwrap();
+        let repo = setup_git_repo();
+        let slot_paths = [repo.path().to_path_buf()];
+        let signal = SignalFlag::new();
+        let mode = PermissionMode::Dangerous;
+        let project_cfg = crate::loop_engine::project_config::ProjectConfig::default();
+        let prd_implicit: Vec<String> = Vec::new();
+
+        let mut slot = e11_wave_slot(claimed, output);
+        let mut ctx = IterationContext::new(3);
+        {
+            let mut params = make_wave_params(
+                &mut conn,
+                db_dir.path(),
+                repo.path(),
+                "main",
+                &slot_paths,
+                &base_prompt,
+                &mode,
+                &signal,
+                db_dir.path(),
+                &prd_path,
+                &progress_path,
+                1,
+                &project_cfg,
+                &prd_implicit,
+            );
+            params.run_id = "run-e11-wave";
+            params.task_prefix = task_prefix;
+            let mut agg = WaveAggregator::new(1);
+            process_slot_result(&mut slot, &mut params, &mut ctx, &mut agg);
+        }
+        check(&conn, &ctx, &slot);
+    }
+
+    #[test]
+    fn e11_wave_completed_tag_skips_overflow_and_marks_done() {
+        let output = "<completed>E11-X</completed>\nPrompt is too long\n";
+        drive_e11_wave("E11-X", output, &[], None, |conn, ctx, slot| {
+            assert_eq!(get_task_status(conn, "E11-X"), "done");
+            assert_no_overflow_context(ctx, "E11-X");
+            assert_eq!(slot.iteration_result.outcome, IterationOutcome::Completed);
+        });
+    }
+
+    #[test]
+    fn e11_wave_short_completed_tag_resolves_and_skips() {
+        let id = "fe92ec5b-E11-X";
+        let output = "<completed>E11-X</completed>\n";
+        drive_e11_wave(id, output, &[], Some("fe92ec5b"), |conn, ctx, slot| {
+            assert_eq!(get_task_status(conn, id), "done");
+            assert_no_overflow_context(ctx, id);
+            assert_eq!(slot.iteration_result.outcome, IterationOutcome::Completed);
+        });
+    }
+
+    #[test]
+    fn e11_wave_other_task_enters_overflow_before_the_pipeline() {
+        let output = "<completed>E11-Y</completed>\nPrompt is too long\n";
+        drive_e11_wave("E11-X", output, &["E11-Y"], None, |conn, ctx, _slot| {
+            assert_eq!(
+                get_task_status(conn, "E11-X"),
+                "todo",
+                "the claim is not in the tags, so the ladder resets it"
+            );
+            assert_overflow_entered(ctx, "E11-X");
+            assert_eq!(get_task_status(conn, "E11-Y"), "done");
+            assert!(!ctx.overflow_recovered.contains("E11-Y"));
+        });
+    }
+
+    #[test]
+    fn e11_wave_output_scan_does_not_skip_overflow() {
+        let output = "I finished [E11-X] in this summary.\n";
+        drive_e11_wave("E11-X", output, &[], None, |conn, ctx, _slot| {
+            assert_eq!(
+                get_task_status(conn, "E11-X"),
+                "todo",
+                "output-scan completion must not skip handle_overflow"
+            );
+            assert_overflow_entered(ctx, "E11-X");
+        });
+    }
+
+    #[test]
+    fn e11_untagged_overflow_call_stays_before_the_pipeline() {
+        let slot_src = include_str!("slot.rs");
+        let start = slot_src
+            .find("pub(super) fn process_slot_result(")
+            .expect("process_slot_result");
+        let body = &slot_src[start..];
+        let end = body.find("\n#[cfg(test)]").expect("slot tests");
+        let body = &body[..end];
+        let overflow = body
+            .find("handle_overflow_unless_completed(")
+            .expect("wave overflow gate");
+        let pipeline = body
+            .find("process_iteration_output(")
+            .expect("wave pipeline call");
+        assert!(
+            overflow < pipeline,
+            "untagged wave overflow must stay before the pipeline"
+        );
+        assert!(
+            !body[pipeline..].contains("handle_overflow("),
+            "process_slot_result must not call the ladder after the pipeline"
+        );
+
+        let iter_src = include_str!("iteration.rs");
+        let start = iter_src
+            .find("pub fn run_iteration(")
+            .expect("run_iteration");
+        let body = &iter_src[start..];
+        let end = body.find("\n#[cfg(test)]").expect("iteration tests");
+        let body = &body[..end];
+        let overflow = body
+            .find("handle_overflow_unless_completed(")
+            .expect("sequential overflow gate");
+        assert!(
+            !body.contains("process_iteration_output("),
+            "run_iteration must leave the pipeline to the orchestrator"
+        );
+        let ret = body.rfind("Ok(IterationResult").expect("iteration return");
+        assert!(
+            overflow < ret,
+            "sequential overflow must run before run_iteration returns"
+        );
+    }
 }

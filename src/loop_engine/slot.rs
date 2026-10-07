@@ -553,9 +553,11 @@ pub(super) fn process_slot_result(
     }
 
     // Per-slot PromptTooLong recovery — mirrors the sequential Step 8.5 in
-    // `run_iteration`. Must run BEFORE `process_iteration_output` so the
-    // task row is reset to `todo` (rungs 1-3) or `blocked` (rung 4) before
-    // the pipeline's crash-tracking write. Order of operations is
+    // `run_iteration`. Untagged overflow must run BEFORE
+    // `process_iteration_output` so the task row is reset to `todo` (rungs
+    // 1-3) or `blocked` (rung 5) before the pipeline's crash-tracking write.
+    // A `<completed>` tag that resolves to this claim skips the entire call
+    // (no context rows, no rungs). Order of operations inside the ladder is
     // contractual: ctx update → DB UPDATE → stderr → dump → JSONL → rotate.
     if matches!(
         slot_result.iteration_result.outcome,
@@ -611,9 +613,10 @@ pub(super) fn process_slot_result(
         );
         // CONTRACT-001: route the per-slot overflow reaction through the shared
         // coordinator (`slot_index: Some(slot_idx)`); the direct leaf call is
-        // denied here by `#![deny(deprecated)]`.
-        let _ =
-            reactions::post_output::handle_overflow(reactions::post_output::HandleOverflowParams {
+        // denied here by `#![deny(deprecated)]`. The completed-tag gate skips
+        // the call entirely; it does not wrap only the status reset.
+        let _ = reactions::post_output::handle_overflow_unless_completed(
+            reactions::post_output::HandleOverflowParams {
                 ctx,
                 conn: params.conn,
                 task_id: tid,
@@ -626,7 +629,10 @@ pub(super) fn process_slot_result(
                 slot_index: Some(slot_idx),
                 effective_runner,
                 project_config: params.project_config,
-            });
+            },
+            &slot_result.iteration_result.output,
+            params.task_prefix,
+        );
     }
 
     // Pipeline contract requires a `working_root` even when skip_git is on

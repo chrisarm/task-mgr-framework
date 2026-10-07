@@ -858,6 +858,7 @@ pub fn run_iteration(
     // the ladder, reading a snapshot of this outcome. `run_iteration` returns
     // RateLimit with task_id and output intact. Untagged PromptTooLong still
     // calls `handle_overflow` below, before the pipeline (learning 5347).
+    // A `<completed>` tag that resolves to this claim skips that call.
 
     // Step 7.7 / Step 8 (extract_learnings_from_output, record_iteration_feedback)
     // were lifted into `iteration_pipeline::process_iteration_output` (FEAT-005).
@@ -883,6 +884,9 @@ pub fn run_iteration(
     // `todo` (clearing `started_at`) so the next iteration retries with the
     // override applied, while rung 4 sets `blocked` so it doesn't consume
     // budget.
+    // A resolved `<completed>` tag skips the entire ladder (no context rows,
+    // no rungs). Every other PromptTooLong still runs here, before the
+    // orchestrator invokes the pipeline.
     if matches!(
         outcome,
         IterationOutcome::Crash(config::CrashType::PromptTooLong)
@@ -892,8 +896,8 @@ pub fn run_iteration(
         // banner step is in scope here; shadowing it would be drift-prone.
         // CONTRACT-001: route through the shared coordinator (sequential folds 1
         // result, `slot_index: None`); the direct leaf call is denied here.
-        let _ =
-            reactions::post_output::handle_overflow(reactions::post_output::HandleOverflowParams {
+        let _ = reactions::post_output::handle_overflow_unless_completed(
+            reactions::post_output::HandleOverflowParams {
                 ctx,
                 conn: params.conn,
                 task_id: &task_id,
@@ -906,7 +910,10 @@ pub fn run_iteration(
                 slot_index: None,
                 effective_runner,
                 project_config: params.project_config,
-            });
+            },
+            &claude_output,
+            params.task_prefix,
+        );
     }
 
     // Step 9: Update trackers based on outcome

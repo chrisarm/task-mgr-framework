@@ -2832,4 +2832,272 @@ mod tests {
             "iteration.rs must not apply StopSpend; that drops task_id before the ladder"
         );
     }
+
+    // --- FEAT-005: skip handle_overflow when the claim has a completed tag ---
+    //
+    // Sequential production order is `run_iteration`'s
+    // `handle_overflow_unless_completed` (Step 8.5), then the orchestrator's
+    // `process_iteration_output`. These tests call those two functions in
+    // that order. `run_iteration` itself spawns a runner and is not driven.
+
+    fn e11_prompt(task_id: &str) -> crate::loop_engine::prompt::PromptResult {
+        crate::loop_engine::prompt::PromptResult {
+            prompt: "prompt\n".to_string(),
+            task_id: task_id.to_string(),
+            task_files: Vec::new(),
+            shown_learning_ids: Vec::new(),
+            resolved_model: None,
+            provider_hint: None,
+            dropped_sections: Vec::new(),
+            task_difficulty: None,
+            cluster_effort: None,
+            section_sizes: Vec::new(),
+        }
+    }
+
+    fn assert_no_overflow_context(ctx: &IterationContext, task_id: &str) {
+        assert!(
+            !ctx.overflow_recovered.contains(task_id),
+            "skip must not insert overflow_recovered for {task_id}"
+        );
+        assert!(
+            !ctx.overflow_original_model.contains_key(task_id),
+            "skip must not snapshot overflow_original_model for {task_id}"
+        );
+        assert!(
+            !ctx.overflow_original_task_model.contains_key(task_id),
+            "skip must not snapshot tasks.model for {task_id}"
+        );
+        assert!(
+            !ctx.effort_overrides.contains_key(task_id),
+            "rung 1 must not run for {task_id}"
+        );
+        assert!(!ctx.model_overrides.contains_key(task_id));
+        assert!(!ctx.runner_overrides.contains_key(task_id));
+    }
+
+    fn assert_overflow_entered(ctx: &IterationContext, task_id: &str) {
+        assert!(
+            ctx.overflow_recovered.contains(task_id),
+            "untagged PromptTooLong must insert overflow_recovered for {task_id}"
+        );
+        assert!(
+            ctx.overflow_original_model.contains_key(task_id),
+            "untagged PromptTooLong must snapshot the model for {task_id}"
+        );
+        assert!(
+            ctx.overflow_original_task_model.contains_key(task_id),
+            "untagged PromptTooLong must snapshot tasks.model for {task_id}"
+        );
+        assert!(
+            ctx.effort_overrides.contains_key(task_id),
+            "xhigh must take rung 1 for {task_id}"
+        );
+    }
+
+    struct E11Seq {
+        db_dir: tempfile::TempDir,
+        conn: Connection,
+        ctx: IterationContext,
+        repo: tempfile::TempDir,
+        prd_path: std::path::PathBuf,
+        progress_path: std::path::PathBuf,
+        project_cfg: crate::loop_engine::project_config::ProjectConfig,
+    }
+
+    fn setup_e11_seq(ids: &[&str]) -> E11Seq {
+        let (db_dir, conn) = setup_test_db();
+        conn.execute(
+            "INSERT INTO runs (run_id, status) VALUES ('run-e11', 'active')",
+            [],
+        )
+        .unwrap();
+        for id in ids {
+            seed_task_with_status(&conn, id, "in_progress");
+        }
+        let prd_path = write_minimal_prd(db_dir.path(), ids);
+        let progress_path = db_dir.path().join("progress-e11.txt");
+        std::fs::write(&progress_path, "").unwrap();
+        E11Seq {
+            db_dir,
+            conn,
+            ctx: IterationContext::new(3),
+            repo: init_e10_repo(),
+            prd_path,
+            progress_path,
+            project_cfg: crate::loop_engine::project_config::ProjectConfig::default(),
+        }
+    }
+
+    impl E11Seq {
+        /// The function `run_iteration` calls. Effort is `xhigh` so an entered
+        /// ladder takes rung 1 (`in_progress` → `todo`) instead of blocking.
+        fn overflow(
+            &mut self,
+            task_id: &str,
+            output: &str,
+            task_prefix: Option<&str>,
+        ) -> Option<crate::loop_engine::overflow::RecoveryAction> {
+            let prompt = e11_prompt(task_id);
+            reactions::post_output::handle_overflow_unless_completed(
+                reactions::post_output::HandleOverflowParams {
+                    ctx: &mut self.ctx,
+                    conn: &mut self.conn,
+                    task_id,
+                    effort: Some("xhigh"),
+                    effective_model: None,
+                    prompt_result: &prompt,
+                    iteration: 1,
+                    run_id: Some("run-e11"),
+                    base_dir: self.db_dir.path(),
+                    slot_index: None,
+                    effective_runner: crate::loop_engine::runner::RunnerKind::Claude,
+                    project_config: &self.project_cfg,
+                },
+                output,
+                task_prefix,
+            )
+        }
+
+        fn pipeline(
+            &mut self,
+            task_id: &str,
+            output: &str,
+            task_prefix: Option<&str>,
+            skip_git: bool,
+        ) {
+            let signal = signals::SignalFlag::new();
+            let files: Vec<String> = Vec::new();
+            let shown: Vec<i64> = Vec::new();
+            let mut outcome = IterationOutcome::Crash(config::CrashType::PromptTooLong);
+            iteration_pipeline::process_iteration_output(iteration_pipeline::ProcessingParams {
+                conn: &mut self.conn,
+                run_id: "run-e11",
+                iteration: 1,
+                task_id: Some(task_id),
+                output,
+                conversation: None,
+                shown_learning_ids: &shown,
+                outcome: &mut outcome,
+                working_root: self.repo.path(),
+                git_scan_depth: 5,
+                skip_git_completion_detection: skip_git,
+                prd_path: &self.prd_path,
+                task_prefix,
+                progress_path: &self.progress_path,
+                db_dir: self.db_dir.path(),
+                signal_flag: &signal,
+                ctx: &mut self.ctx,
+                files_modified: &files,
+                effective_model: None,
+                effective_effort: Some("xhigh"),
+                effective_runner: Some(crate::loop_engine::runner::RunnerKind::Claude),
+                slot_index: None,
+            });
+        }
+    }
+
+    #[test]
+    fn e11_sequential_completed_tag_skips_overflow_and_marks_done() {
+        let _no_extract = EnvGuard::set("TASK_MGR_NO_EXTRACT_LEARNINGS", "1");
+        let mut env = setup_e11_seq(&["E11-X"]);
+        let output = "<completed>E11-X</completed>\nPrompt is too long\n";
+
+        let action = env.overflow("E11-X", output, None);
+        assert!(
+            action.is_none(),
+            "a completed tag for the claim must skip handle_overflow"
+        );
+        assert_eq!(status_of(&env.conn, "E11-X"), "in_progress");
+        assert_no_overflow_context(&env.ctx, "E11-X");
+
+        env.pipeline("E11-X", output, None, true);
+        assert_eq!(status_of(&env.conn, "E11-X"), "done");
+        assert_no_overflow_context(&env.ctx, "E11-X");
+    }
+
+    #[test]
+    fn e11_sequential_short_completed_tag_resolves_and_skips() {
+        let _no_extract = EnvGuard::set("TASK_MGR_NO_EXTRACT_LEARNINGS", "1");
+        let id = "fe92ec5b-E11-X";
+        let mut env = setup_e11_seq(&[id]);
+        let output = "<completed>E11-X</completed>\n";
+
+        let action = env.overflow(id, output, Some("fe92ec5b"));
+        assert!(action.is_none());
+        assert_eq!(status_of(&env.conn, id), "in_progress");
+        assert_no_overflow_context(&env.ctx, id);
+
+        env.pipeline(id, output, Some("fe92ec5b"), true);
+        assert_eq!(status_of(&env.conn, id), "done");
+        assert_no_overflow_context(&env.ctx, id);
+    }
+
+    #[test]
+    fn e11_sequential_other_task_enters_overflow_before_the_pipeline() {
+        let _no_extract = EnvGuard::set("TASK_MGR_NO_EXTRACT_LEARNINGS", "1");
+        let mut env = setup_e11_seq(&["E11-X", "E11-Y"]);
+        let output = "<completed>E11-Y</completed>\nPrompt is too long\n";
+
+        let action = env.overflow("E11-X", output, None);
+        assert!(
+            action.is_some(),
+            "a tag for a different id must still enter handle_overflow"
+        );
+        assert_eq!(
+            status_of(&env.conn, "E11-X"),
+            "todo",
+            "rung 1 resets the claim before the pipeline runs"
+        );
+        assert_overflow_entered(&env.ctx, "E11-X");
+        assert_eq!(status_of(&env.conn, "E11-Y"), "in_progress");
+
+        env.pipeline("E11-X", output, None, true);
+        assert_eq!(status_of(&env.conn, "E11-X"), "todo");
+        assert_eq!(status_of(&env.conn, "E11-Y"), "done");
+        assert_overflow_entered(&env.ctx, "E11-X");
+        assert!(!env.ctx.overflow_recovered.contains("E11-Y"));
+    }
+
+    #[test]
+    fn e11_sequential_suffix_only_tag_still_enters_overflow() {
+        let _no_extract = EnvGuard::set("TASK_MGR_NO_EXTRACT_LEARNINGS", "1");
+        let id = "fe92ec5b-REFACTOR-001";
+        let mut env = setup_e11_seq(&[id]);
+        let output = "<completed>001</completed>\n";
+
+        let action = env.overflow(id, output, Some("fe92ec5b"));
+        assert!(action.is_some(), "ends_with matching must not skip");
+        assert_eq!(status_of(&env.conn, id), "todo");
+        assert_overflow_entered(&env.ctx, id);
+    }
+
+    #[test]
+    fn e11_sequential_git_only_completion_does_not_skip_overflow() {
+        let _no_extract = EnvGuard::set("TASK_MGR_NO_EXTRACT_LEARNINGS", "1");
+        let mut env = setup_e11_seq(&["E11-X"]);
+        std::fs::write(env.repo.path().join("work.txt"), "w\n").unwrap();
+        git_in(env.repo.path(), &["add", "work.txt"]);
+        git_in(
+            env.repo.path(),
+            &["commit", "-m", "feat: E11-X-completed - git only"],
+        );
+        let output = "Prompt is too long. No completed tag.\n";
+
+        let action = env.overflow("E11-X", output, None);
+        assert!(
+            action.is_some(),
+            "git-only completion must not skip handle_overflow"
+        );
+        assert_eq!(status_of(&env.conn, "E11-X"), "todo");
+        assert_overflow_entered(&env.ctx, "E11-X");
+
+        env.pipeline("E11-X", output, None, false);
+        assert_eq!(
+            status_of(&env.conn, "E11-X"),
+            "todo",
+            "git detection runs after the reset and cannot complete a todo row"
+        );
+        assert_overflow_entered(&env.ctx, "E11-X");
+    }
 }
