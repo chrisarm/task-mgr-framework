@@ -370,9 +370,17 @@ pub fn run_slot_iteration(
         ));
     }
 
+    let signals = detection::OutputSignals {
+        cli_error: claude_result.cli_error,
+        completion_killed: claude_result.completion_killed,
+        error_text: claude_result.error_text,
+        task_id: Some(task_id.to_string()),
+        run_id: params.run_id.clone(),
+    };
     let outcome = detection::analyze_output(
         &claude_result.output,
         claude_result.exit_code,
+        &signals,
         &slot.working_root,
     );
 

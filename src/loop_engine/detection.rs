@@ -28,19 +28,130 @@ fn categorize_crash(exit_code: i32) -> CrashType {
 // --- Output String Analysis ---
 // All functions below inspect Claude's stdout text to classify the iteration outcome.
 
-/// Analyze Claude subprocess output and exit code to determine iteration outcome.
+/// CLI-error provenance for [`analyze_output`].
 ///
-/// Checks output patterns in priority order:
+/// One struct so callers do not pass a same-typed bool pair. `task_id` and
+/// `run_id` are warn-event correlation only; they do not change the outcome.
+#[derive(Debug, Clone)]
+pub struct OutputSignals {
+    /// `result.is_error` or `StreamEvent::Error`. Wins over `completion_killed`.
+    pub cli_error: bool,
+    /// Post-completion grace kill. Suppresses only the bare `exit_code != 0` arm.
+    pub completion_killed: bool,
+    /// Retained CLI error string. Scanned instead of `output` when `cli_error`.
+    pub error_text: Option<String>,
+    /// Claimed task, when the call site has one.
+    pub task_id: Option<String>,
+    /// Loop run id, when the call site has one. Omitted from the warn when `None`.
+    pub run_id: Option<String>,
+}
+
+/// Text-classifier hit, in the historical step 3 / 3.5 / 3.6 order.
+///
+/// The warn event and the outcome share this order so a suppressed match
+/// names the classifier that would have been returned.
+#[derive(Clone, Copy)]
+enum GatedClassifier {
+    RateLimit,
+    PromptTooLong,
+    TransientBackend,
+}
+
+impl GatedClassifier {
+    fn name(self) -> &'static str {
+        match self {
+            Self::RateLimit => "rate_limit",
+            Self::PromptTooLong => "prompt_too_long",
+            Self::TransientBackend => "transient_backend",
+        }
+    }
+
+    fn outcome(self, text: &str) -> IterationOutcome {
+        match self {
+            Self::RateLimit => IterationOutcome::RateLimit,
+            Self::PromptTooLong => IterationOutcome::Crash(CrashType::PromptTooLong),
+            Self::TransientBackend => IterationOutcome::TransientBackend {
+                retry_after_secs: parse_retry_after_secs(text),
+            },
+        }
+    }
+}
+
+fn first_gated_classifier(text: &str) -> Option<GatedClassifier> {
+    // Step 3: rate-limit patterns (429, usage limit).
+    if is_rate_limited(text) {
+        return Some(GatedClassifier::RateLimit);
+    }
+    // Step 3.5: "Prompt is too long" before generic crash classification.
+    // The CLI emits this when the conversation exceeds the context window;
+    // the engine downgrades effort and resets the task.
+    if is_prompt_too_long(text) {
+        return Some(GatedClassifier::PromptTooLong);
+    }
+    // Step 3.6: transient backend failures (HTTP 502/503/504, Bad Gateway,
+    // Service Unavailable, overloaded_error / HTTP 529) before the generic
+    // non-zero-exit crash branch. A 5xx is "try again later", not a task
+    // failure — `reactions::account::react_to_transient` backs off.
+    if is_transient_backend(text) {
+        return Some(GatedClassifier::TransientBackend);
+    }
+    None
+}
+
+/// FR-005. Fields are provenance only — tracing has no redactor, so the
+/// event must not carry output or error text.
+fn warn_text_signal_without_cli_error(
+    classifier: &'static str,
+    exit_code: i32,
+    signals: &OutputSignals,
+) {
+    let task_id = signals.task_id.as_deref().unwrap_or("");
+    let completion_killed = signals.completion_killed;
+    if let Some(run_id) = signals.run_id.as_deref() {
+        tracing::warn!(
+            target: "task_mgr::detection",
+            event = "text_signal_without_cli_error",
+            classifier,
+            task_id,
+            exit_code,
+            completion_killed,
+            run_id,
+            "text_signal_without_cli_error"
+        );
+    } else {
+        tracing::warn!(
+            target: "task_mgr::detection",
+            event = "text_signal_without_cli_error",
+            classifier,
+            task_id,
+            exit_code,
+            completion_killed,
+            "text_signal_without_cli_error"
+        );
+    }
+}
+
+/// Analyze subprocess output and exit code to determine iteration outcome.
+///
+/// Checks patterns in priority order:
 /// 1. `<promise>COMPLETE</promise>` in last 20 lines -> Completed
 /// 2. `<promise>BLOCKED</promise>` in last 20 lines -> Blocked
 /// 3. `<reorder>TASK-ID</reorder>` anywhere in output -> Reorder(task_id)
-/// 4. Rate-limit patterns (429, usage limit) -> RateLimit
-/// 5. Non-zero exit code -> Crash (categorized by exit code)
+/// 4. Rate-limit / prompt-too-long / transient-backend, only when
+///    `signals.cli_error || (exit_code != 0 && !signals.completion_killed)`.
+///    A set `cli_error` scans `error_text`, not the agent summary.
+/// 5. Non-zero exit code -> Crash (categorized by exit code). Exit 143 stays
+///    `Crash(RuntimeError)`.
 /// 6. Empty output with exit 0 -> Empty
 ///
 /// The `dir` parameter is reserved for future DB-based verification
 /// (secondary check: query remaining tasks).
-pub fn analyze_output(output: &str, exit_code: i32, _dir: &Path) -> IterationOutcome {
+pub fn analyze_output(
+    output: &str,
+    exit_code: i32,
+    signals: &OutputSignals,
+    _dir: &Path,
+) -> IterationOutcome {
     // Step 1: Check last 20 lines for completion/blocked signals
     let last_20: Vec<&str> = output.lines().rev().take(20).collect();
 
@@ -63,33 +174,25 @@ pub fn analyze_output(output: &str, exit_code: i32, _dir: &Path) -> IterationOut
         return IterationOutcome::Reorder(task_id);
     }
 
-    // Step 3: Check for rate-limit patterns
-    if is_rate_limited(output) {
-        return IterationOutcome::RateLimit;
-    }
-
-    // Step 3.5: Detect "Prompt is too long" (Claude CLI context-window overflow)
-    // before generic crash classification. The CLI emits this on stdout when
-    // the running conversation exceeds the model context window; handled
-    // separately so the engine can downgrade effort and reset the task.
-    if is_prompt_too_long(output) {
-        return IterationOutcome::Crash(CrashType::PromptTooLong);
-    }
-
-    // Step 3.6: Detect transient backend failures (HTTP 502/503/504, Bad
-    // Gateway, Service Unavailable, Anthropic overloaded_error / HTTP 529)
-    // BEFORE the generic non-zero-exit crash branch (FEAT-014). A 5xx /
-    // overloaded response is a "try again later" signal, not a task failure —
-    // classifying it as Crash(RuntimeError) burns crash budget and resets
-    // in-flight work. The converged `reactions::account::react_to_transient`
-    // performs a bounded backoff-retry instead.
-    if is_transient_backend(output) {
-        return IterationOutcome::TransientBackend {
-            retry_after_secs: parse_retry_after_secs(output),
+    // `cli_error` wins over a grace kill. `completion_killed` suppresses only
+    // the bare non-zero-exit arm, so a grace-killed summary is not a CLI error
+    // unless the CLI itself reported one.
+    let has_cli_error = signals.cli_error || (exit_code != 0 && !signals.completion_killed);
+    if has_cli_error {
+        let scan = if signals.cli_error {
+            signals.error_text.as_deref().unwrap_or("")
+        } else {
+            output
         };
+        if let Some(class) = first_gated_classifier(scan) {
+            return class.outcome(scan);
+        }
+    } else if let Some(class) = first_gated_classifier(output) {
+        warn_text_signal_without_cli_error(class.name(), exit_code, signals);
     }
 
-    // Step 4: Check exit code for crashes
+    // Step 4: Check exit code for crashes. Unchanged by the text gate:
+    // exit 143 is still Crash(RuntimeError).
     if exit_code != 0 {
         return IterationOutcome::Crash(categorize_crash(exit_code));
     }
@@ -467,10 +570,38 @@ pub fn is_task_reported_already_complete(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     fn test_dir() -> PathBuf {
         PathBuf::from("/tmp/test-detection")
+    }
+
+    /// Pre-FEAT-002 call shape. `cli_error` and `completion_killed` stay false,
+    /// so a non-zero exit still scans `output`. Exit 0 does not. Rewritten
+    /// contract tests call [`super::analyze_output`] with explicit signals.
+    fn analyze_output(output: &str, exit_code: i32, dir: &Path) -> IterationOutcome {
+        super::analyze_output(
+            output,
+            exit_code,
+            &OutputSignals {
+                cli_error: false,
+                completion_killed: false,
+                error_text: None,
+                task_id: None,
+                run_id: None,
+            },
+            dir,
+        )
+    }
+
+    fn bare_signals() -> OutputSignals {
+        OutputSignals {
+            cli_error: false,
+            completion_killed: false,
+            error_text: None,
+            task_id: None,
+            run_id: None,
+        }
     }
 
     // --- AC 1: COMPLETE detection in last 20 lines ---
@@ -1048,9 +1179,19 @@ mod tests {
 
     #[test]
     fn test_rate_limit_429_in_middle_of_line() {
+        // PRD tasks/prd-cli-error-gated-detection.md FR-002 (E1/E14): "429"
+        // in the middle of a line is RateLimit only when has_cli_error.
+        // Exit 0 agent prose is not RateLimit. A non-zero exit with
+        // completion_killed false still scans that sentence.
         let output = "The server responded with 429 rate limiting error";
+        assert!(is_rate_limited(output));
+        let signals = bare_signals();
+        assert_ne!(
+            super::analyze_output(output, 0, &signals, &test_dir()),
+            IterationOutcome::RateLimit,
+        );
         assert_eq!(
-            analyze_output(output, 1, &test_dir()),
+            super::analyze_output(output, 1, &signals, &test_dir()),
             IterationOutcome::RateLimit,
         );
     }
@@ -1537,12 +1678,19 @@ mod tests {
 
     #[test]
     fn test_detects_prompt_too_long_regardless_of_exit_code() {
-        // Fires on exit 0 too — Claude CLI may print the error and exit cleanly
+        // PRD tasks/prd-cli-error-gated-detection.md FR-002 / E7: exit 0
+        // agent prose is not PromptTooLong. The previous assertion (exit 0
+        // still classifies) was the false positive this PRD removes. A real
+        // CLI overflow with is_error still classifies — see E8.
         let output = "Prompt is too long";
-        assert_eq!(
-            analyze_output(output, 0, &test_dir()),
+        assert!(is_prompt_too_long(output));
+        let result = super::analyze_output(output, 0, &bare_signals(), &test_dir());
+        assert_ne!(
+            result,
             IterationOutcome::Crash(CrashType::PromptTooLong),
+            "exit 0 prose must not classify as PromptTooLong"
         );
+        assert_eq!(result, IterationOutcome::NoEligibleTasks);
     }
 
     #[test]
@@ -1870,5 +2018,348 @@ mod tests {
             parse_retry_after_secs("Retry-After: Wed, 21 Oct 2025 07:28:00 GMT"),
             None
         );
+    }
+
+    // ======================================================================
+    // CLI-error gate (PRD tasks/prd-cli-error-gated-detection.md FR-002/FR-005)
+    // ======================================================================
+
+    #[test]
+    fn test_agent_summary_about_429_handling_is_not_rate_limit() {
+        // E1 + E9. Incident summary (exit 0, no CLI error) is not RateLimit.
+        // The warn names the classifier and the call-site ids, and carries
+        // no output text.
+        let output =
+            "One warn line per 429 with operation, headers. See rate_limit_diagnostic_headers().";
+        assert!(
+            is_rate_limited(output),
+            "fixture must still match the widened rate-limit patterns"
+        );
+        let task_id = "17a0ade1-FEAT-001";
+        let run_id = "run-e1";
+        let signals = OutputSignals {
+            cli_error: false,
+            completion_killed: false,
+            error_text: None,
+            task_id: Some(task_id.to_string()),
+            run_id: Some(run_id.to_string()),
+        };
+        let capture = EventCapture::new();
+        let outcome = tracing::subscriber::with_default(capture.clone(), || {
+            tracing::callsite::rebuild_interest_cache();
+            super::analyze_output(output, 0, &signals, &test_dir())
+        });
+        assert_ne!(outcome, IterationOutcome::RateLimit);
+        assert_eq!(outcome, IterationOutcome::NoEligibleTasks);
+
+        let events: Vec<CapturedEvent> = capture
+            .snapshot()
+            .into_iter()
+            .filter(|ev| {
+                ev.fields
+                    .iter()
+                    .any(|(n, v)| n == "event" && v == "text_signal_without_cli_error")
+            })
+            .collect();
+        assert_eq!(
+            events.len(),
+            1,
+            "expected exactly one gated-out warn, got {events:?}"
+        );
+        let ev = &events[0];
+        assert_eq!(ev.target, "task_mgr::detection");
+        assert_eq!(ev.level, tracing::Level::WARN);
+        let allowed = [
+            "event",
+            "classifier",
+            "task_id",
+            "exit_code",
+            "completion_killed",
+            "run_id",
+            "message",
+        ];
+        for (name, value) in &ev.fields {
+            assert!(
+                allowed.contains(&name.as_str()),
+                "unexpected field {name}={value}"
+            );
+            assert!(
+                !value.contains("rate_limit_diagnostic_headers"),
+                "warn leaked output text in {name}"
+            );
+        }
+        assert_eq!(field(ev, "classifier"), "rate_limit");
+        assert_eq!(field(ev, "task_id"), task_id);
+        assert_eq!(field(ev, "exit_code"), "0");
+        assert_eq!(field(ev, "completion_killed"), "false");
+        assert_eq!(field(ev, "run_id"), run_id);
+        assert!(
+            ev.fields
+                .iter()
+                .all(|(n, _)| n != "output" && n != "error_text")
+        );
+    }
+
+    #[test]
+    fn test_grace_kill_rate_limit_prose_is_crash_not_rate_limit() {
+        // E2 classifier half. The done-row assertion is FEAT-006.
+        // completion_killed suppresses only the bare exit != 0 arm.
+        let output =
+            "One warn line per 429 with operation, headers. See rate_limit_diagnostic_headers().";
+        assert!(is_rate_limited(output));
+        let grace = OutputSignals {
+            cli_error: false,
+            completion_killed: true,
+            error_text: None,
+            task_id: None,
+            run_id: None,
+        };
+        assert_eq!(
+            super::analyze_output(output, 143, &grace, &test_dir()),
+            IterationOutcome::Crash(CrashType::RuntimeError),
+        );
+
+        // Known-bad: cli_error wins over completion_killed. The retained
+        // error string is RateLimit even though the grace kill fired and
+        // that sentence is not in output.
+        let summary = "Post-completion grace expired, terminating the process group";
+        assert!(!is_rate_limited(summary));
+        let known_bad = OutputSignals {
+            cli_error: true,
+            completion_killed: true,
+            error_text: Some("You've hit your session limit".to_string()),
+            task_id: None,
+            run_id: None,
+        };
+        assert_eq!(
+            super::analyze_output(summary, 143, &known_bad, &test_dir()),
+            IterationOutcome::RateLimit,
+        );
+    }
+
+    #[test]
+    fn test_is_error_session_limit_exit_1_is_rate_limit() {
+        // E4: result is_error with the session-limit sentence, exit 1.
+        let sentence = "You've hit your session limit · resets 4pm";
+        let signals = OutputSignals {
+            cli_error: true,
+            completion_killed: false,
+            error_text: Some(sentence.to_string()),
+            task_id: None,
+            run_id: None,
+        };
+        assert_eq!(
+            super::analyze_output(sentence, 1, &signals, &test_dir()),
+            IterationOutcome::RateLimit,
+        );
+    }
+
+    #[test]
+    fn test_rate_limit_from_retained_error_text_not_in_output() {
+        // E5: the assistant error string is scanned. The same sentence is
+        // absent from output. The inverse (prose matches, retained text does
+        // not) must not classify — cli_error does not scan the summary.
+        let output = "Finished the diagnostics change and committed.";
+        assert!(!is_rate_limited(output));
+        let signals = OutputSignals {
+            cli_error: true,
+            completion_killed: false,
+            error_text: Some("You've hit your session limit · resets 4pm".to_string()),
+            task_id: None,
+            run_id: None,
+        };
+        assert_eq!(
+            super::analyze_output(output, 1, &signals, &test_dir()),
+            IterationOutcome::RateLimit,
+        );
+
+        let prose =
+            "One warn line per 429 with operation, headers. See rate_limit_diagnostic_headers().";
+        assert!(is_rate_limited(prose));
+        let benign = OutputSignals {
+            cli_error: true,
+            completion_killed: false,
+            error_text: Some("unrelated cli failure".to_string()),
+            task_id: None,
+            run_id: None,
+        };
+        assert_eq!(
+            super::analyze_output(prose, 1, &benign, &test_dir()),
+            IterationOutcome::Crash(CrashType::RuntimeError),
+            "cli_error must scan error_text, not the agent summary"
+        );
+    }
+
+    #[test]
+    fn test_exit_0_bad_gateway_prose_is_not_transient_backend() {
+        // E6.
+        let output = "Bad Gateway from upstream 502";
+        assert!(is_transient_backend(output));
+        let result = super::analyze_output(output, 0, &bare_signals(), &test_dir());
+        assert!(
+            !matches!(result, IterationOutcome::TransientBackend { .. }),
+            "exit 0 prose must not classify as TransientBackend, got {result:?}"
+        );
+        assert_eq!(result, IterationOutcome::NoEligibleTasks);
+    }
+
+    #[test]
+    fn test_is_error_prompt_too_long_exit_0_scans_error_text() {
+        // E8: exit 0 with is_error still classifies PromptTooLong from the
+        // retained error text, not from the summary.
+        let output = "migrated the caller and left a note";
+        assert!(!is_prompt_too_long(output));
+        let signals = OutputSignals {
+            cli_error: true,
+            completion_killed: false,
+            error_text: Some("Prompt is too long".to_string()),
+            task_id: None,
+            run_id: None,
+        };
+        assert_eq!(
+            super::analyze_output(output, 0, &signals, &test_dir()),
+            IterationOutcome::Crash(CrashType::PromptTooLong),
+        );
+    }
+
+    #[test]
+    fn test_codex_turn_failed_rate_limit_absent_from_derive_output() {
+        // E13: the rate-limit sentence lives only on the retained turn.failed
+        // string. derive_output (RunnerResult.output) does not contain it.
+        let output = "Codex finished the turn.";
+        assert!(!is_rate_limited(output));
+        let signals = OutputSignals {
+            cli_error: true,
+            completion_killed: false,
+            error_text: Some("turn.failed: You've hit your session limit".to_string()),
+            task_id: None,
+            run_id: None,
+        };
+        assert_eq!(
+            super::analyze_output(output, 1, &signals, &test_dir()),
+            IterationOutcome::RateLimit,
+        );
+    }
+
+    #[test]
+    fn test_grok_exit_0_prose_mentioning_429_is_not_rate_limit() {
+        // E14: Grok has no error events. Exit 0 prose that mentions 429 is
+        // not RateLimit when cli_error is false.
+        let output = "The grok proxy returned 429 because the upstream rate limit was exceeded.";
+        assert!(is_rate_limited(output));
+        let signals = OutputSignals {
+            cli_error: false,
+            completion_killed: false,
+            error_text: None,
+            task_id: None,
+            run_id: None,
+        };
+        let result = super::analyze_output(output, 0, &signals, &test_dir());
+        assert_ne!(result, IterationOutcome::RateLimit);
+        assert_eq!(result, IterationOutcome::NoEligibleTasks);
+    }
+
+    fn field<'a>(ev: &'a CapturedEvent, name: &str) -> &'a str {
+        ev.fields
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+            .unwrap_or_else(|| panic!("missing field {name} in {ev:?}"))
+    }
+
+    #[derive(Clone, Debug)]
+    struct CapturedEvent {
+        target: String,
+        level: tracing::Level,
+        fields: Vec<(String, String)>,
+    }
+
+    #[derive(Clone)]
+    struct EventCapture {
+        events: std::sync::Arc<std::sync::Mutex<Vec<CapturedEvent>>>,
+    }
+
+    impl EventCapture {
+        fn new() -> Self {
+            Self {
+                events: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+
+        fn snapshot(&self) -> Vec<CapturedEvent> {
+            self.events.lock().expect("event lock").clone()
+        }
+    }
+
+    #[derive(Default)]
+    struct FieldVisitor {
+        fields: Vec<(String, String)>,
+    }
+
+    impl tracing::field::Visit for FieldVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.fields
+                .push((field.name().to_string(), format!("{value:?}")));
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.fields
+                .push((field.name().to_string(), value.to_string()));
+        }
+
+        fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+            self.fields
+                .push((field.name().to_string(), value.to_string()));
+        }
+
+        fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+            self.fields
+                .push((field.name().to_string(), value.to_string()));
+        }
+
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            self.fields
+                .push((field.name().to_string(), value.to_string()));
+        }
+    }
+
+    impl tracing::Subscriber for EventCapture {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            // Always enabled so registering this subscriber cannot stick
+            // Interest::never on unrelated callsites.
+            true
+        }
+
+        fn register_callsite(
+            &self,
+            _metadata: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::always()
+        }
+
+        fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            if event.metadata().target() != "task_mgr::detection" {
+                return;
+            }
+            let mut visitor = FieldVisitor::default();
+            event.record(&mut visitor);
+            self.events.lock().expect("event lock").push(CapturedEvent {
+                target: event.metadata().target().to_string(),
+                level: *event.metadata().level(),
+                fields: visitor.fields,
+            });
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
     }
 }

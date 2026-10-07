@@ -832,11 +832,23 @@ pub fn run_iteration(
         });
     }
 
-    // Step 7: Analyze output
+    // Step 7: Analyze output. Scan target and the FR-005 warn ids come from
+    // the runner result plus this iteration's claim (CONTRACT-001).
+    let signals = detection::OutputSignals {
+        cli_error: claude_result.cli_error,
+        completion_killed: claude_result.completion_killed,
+        error_text: claude_result.error_text,
+        task_id: Some(task_id.clone()),
+        run_id: Some(params.run_id.to_string()),
+    };
     let claude_conversation = claude_result.conversation;
     let claude_output = claude_result.output;
-    let outcome =
-        detection::analyze_output(&claude_output, claude_result.exit_code, params.project_root);
+    let outcome = detection::analyze_output(
+        &claude_output,
+        claude_result.exit_code,
+        &signals,
+        params.project_root,
+    );
 
     // Step 7.5: On rate-limit detection, run the converged account-global
     // post-output reaction (`reactions::account::react_to_outputs`) — the single
