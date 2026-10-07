@@ -4405,8 +4405,10 @@ mod tests {
     }
 
     /// E10 wave: RateLimit + `<completed>X</completed>` → X stays done, wait
-    /// runs once from the snapshot, peer in_progress resets, iteration not
-    /// consumed, merge deferred.
+    /// runs once from the snapshot, peer in_progress resets. A post-pipeline
+    /// `Completed` read returns `None` and does not wait. Give-back flags and
+    /// the pre-merge return are pinned by
+    /// `e10_wave_rate_limit_retry_returns_before_merge_and_uses_snapshots`.
     #[test]
     fn e10_wave_completed_tag_stays_done_and_waits_once_from_snapshot() {
         use crate::loop_engine::test_utils::EnvGuard;
@@ -4465,7 +4467,7 @@ mod tests {
         let project_cfg = crate::loop_engine::project_config::ProjectConfig::default();
         let prd_implicit: Vec<String> = Vec::new();
         let wait_calls = Cell::new(0u32);
-        let (tasks_completed, reaction) = {
+        let reaction = {
             let mut params = make_wave_params(
                 &mut conn,
                 db_dir.path(),
@@ -4496,24 +4498,13 @@ mod tests {
                 wave_outcomes[0].iteration_result.outcome,
                 IterationOutcome::Completed
             );
+            assert_eq!(
+                outcome_snapshots[0].as_ref(),
+                Some(&IterationOutcome::RateLimit)
+            );
             assert_eq!(get_task_status(params.conn, "E10-X"), "done");
             assert_eq!(get_task_status(params.conn, "E10-PEER"), "in_progress");
-
-            let rate_limit_items: Vec<reactions::account::OutputReactionItem<'_>> = wave_outcomes
-                .iter()
-                .zip(outcome_snapshots.iter())
-                .filter_map(|(s, snap)| {
-                    let outcome = snap.as_ref()?;
-                    Some(reactions::account::OutputReactionItem {
-                        task_id: s.iteration_result.task_id.as_deref(),
-                        outcome,
-                        output: &s.iteration_result.output,
-                    })
-                })
-                .collect();
-            assert_eq!(rate_limit_items.len(), 1);
-            assert_eq!(*rate_limit_items[0].outcome, IterationOutcome::RateLimit);
-            assert_eq!(rate_limit_items[0].task_id, Some("E10-X"));
+            assert_eq!(agg.tasks_completed, 1);
 
             let wait = |_: u64| {
                 wait_calls.set(wait_calls.get() + 1);
@@ -4537,7 +4528,52 @@ mod tests {
             };
             let mut blackout = Default::default();
             let mut unavailable = Default::default();
-            let reaction = reactions::account::react_to_outputs_inner(
+
+            // Known-bad: feeding the post-pipeline outcome skips the wait.
+            // `None` writes nothing, so the peer is still in_progress.
+            {
+                let live_items: Vec<reactions::account::OutputReactionItem<'_>> = wave_outcomes
+                    .iter()
+                    .filter(|s| s.claim_succeeded)
+                    .map(|s| reactions::account::OutputReactionItem {
+                        task_id: s.iteration_result.task_id.as_deref(),
+                        outcome: &s.iteration_result.outcome,
+                        output: &s.iteration_result.output,
+                    })
+                    .collect();
+                assert_eq!(*live_items[0].outcome, IterationOutcome::Completed);
+                let missed = reactions::account::react_to_outputs_inner(
+                    params.conn,
+                    &live_items,
+                    &account_params,
+                    &mut blackout,
+                    &mut unavailable,
+                    None,
+                    &wait,
+                );
+                assert_eq!(missed, reactions::account::AccountReaction::None);
+                assert_eq!(wait_calls.get(), 0, "post-pipeline Completed does not wait");
+                assert_eq!(get_task_status(params.conn, "E10-X"), "done");
+                assert_eq!(get_task_status(params.conn, "E10-PEER"), "in_progress");
+            }
+
+            let rate_limit_items: Vec<reactions::account::OutputReactionItem<'_>> = wave_outcomes
+                .iter()
+                .zip(outcome_snapshots.iter())
+                .filter_map(|(s, snap)| {
+                    let outcome = snap.as_ref()?;
+                    Some(reactions::account::OutputReactionItem {
+                        task_id: s.iteration_result.task_id.as_deref(),
+                        outcome,
+                        output: &s.iteration_result.output,
+                    })
+                })
+                .collect();
+            assert_eq!(rate_limit_items.len(), 1);
+            assert_eq!(*rate_limit_items[0].outcome, IterationOutcome::RateLimit);
+            assert_eq!(rate_limit_items[0].task_id, Some("E10-X"));
+
+            reactions::account::react_to_outputs_inner(
                 params.conn,
                 &rate_limit_items,
                 &account_params,
@@ -4545,8 +4581,7 @@ mod tests {
                 &mut unavailable,
                 None,
                 &wait,
-            );
-            (agg.tasks_completed, reaction)
+            )
         };
 
         assert_eq!(
@@ -4558,20 +4593,6 @@ mod tests {
             1,
             "account wait seam runs once for the wave"
         );
-
-        // Production WaitedAndRetry mapping (B2/B3) — iteration given back,
-        // merge-fail streak not zeroed this wave.
-        let wave_outcome = WaveOutcome {
-            tasks_completed,
-            iteration_consumed: false,
-            terminal: None,
-            was_stopped: false,
-            failed_merges: Vec::new(),
-            rate_limited_retry: true,
-        };
-        assert!(!wave_outcome.iteration_consumed);
-        assert!(wave_outcome.rate_limited_retry);
-        assert!(wave_outcome.failed_merges.is_empty());
 
         assert_eq!(get_task_status(&conn, "E10-X"), "done");
         assert_eq!(
@@ -4631,6 +4652,29 @@ mod tests {
         assert!(
             waited < merge,
             "WaitedAndRetry early return must precede merge-back"
+        );
+        // The retry arm itself is the give-back. Do not reconstruct
+        // WaveOutcome in a test — that would pass if this return changed.
+        let arm_end = body[waited..]
+            .find("AccountReaction::OperatorStopped")
+            .map(|i| waited + i)
+            .expect("OperatorStopped follows the rate-limit retry arm");
+        let retry_arm = &body[waited..arm_end];
+        assert!(
+            retry_arm.contains("iteration_consumed: false"),
+            "a RateLimit snapshot must not consume the iteration"
+        );
+        assert!(
+            !retry_arm.contains("iteration_consumed: true"),
+            "retry arm must not consume the iteration"
+        );
+        assert!(
+            retry_arm.contains("rate_limited_retry: true"),
+            "a RateLimit snapshot must set rate_limited_retry"
+        );
+        assert!(
+            retry_arm.contains("failed_merges: Vec::new()"),
+            "retry return must not report a merge"
         );
         // Negative: reaction block must not call merge or react_to_completions.
         let reaction_block_end = body[reaction..]
