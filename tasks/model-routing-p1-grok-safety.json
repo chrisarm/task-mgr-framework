@@ -1,11 +1,19 @@
 {
-  "version": "1.0",
-  "project": "task-mgr",
   "branchName": "feat/model-routing",
-  "prdFile": "prd-model-routing.md",
-  "mergeStrategy": "Merge to main after REVIEW-001 passes, by Chris. The loop never pushes or merges.",
   "description": "Phase 1 of provider-aware routing (P1c + P1e): a Grok stderr plan rate limit becomes IterationOutcome::RateLimit instead of a crash, and Grok session cleanup passes --session-id and deletes only that run's session directory. Later phases (P1b, P1a, P1d, P2, P4a, P3, P4b) get their own task files from the same PRD.",
-  "requires": [],
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "Rust: cargo fmt --check passes",
+      "Rust: cargo check has no warnings",
+      "Rust: cargo clippy --all-targets -- -D warnings passes for the touched crate",
+      "Scoped tests for the touched modules pass",
+      "Red-first: new tests were seen failing before the production change",
+      "No per-task model field and no top-level PRD model field"
+    ],
+    "description": "These criteria apply to ALL implementation tasks"
+  },
+  "mergeStrategy": "Merge to main after REVIEW-001 passes, by Chris. The loop never pushes or merges.",
+  "prdFile": "prd-model-routing.md",
   "priorityPhilosophy": {
     "description": "Hierarchy of what matters most when implementing tasks",
     "hierarchy": [
@@ -38,31 +46,19 @@
     "Hand-editing tasks/*.json",
     "Any per-task model field or top-level PRD model field"
   ],
-  "globalAcceptanceCriteria": {
-    "description": "These criteria apply to ALL implementation tasks",
-    "criteria": [
-      "Rust: cargo fmt --check passes",
-      "Rust: cargo check has no warnings",
-      "Rust: cargo clippy --all-targets -- -D warnings passes for the touched crate",
-      "Scoped tests for the touched modules pass",
-      "Red-first: new tests were seen failing before the production change",
-      "No per-task model field and no top-level PRD model field"
-    ]
-  },
+  "project": "task-mgr",
+  "requires": [],
   "reviewGuidelines": {
     "priorityGuidelines": {
       "critical": "1-10: Blocks further work, fix immediately",
       "high": "11-20: Fix before phase completion",
-      "medium": "21-50: Fix in current phase if time permits",
-      "low": "51-99: Defer to hardening phase"
+      "low": "51-99: Defer to hardening phase",
+      "medium": "21-50: Fix in current phase if time permits"
     }
   },
+  "taskPrefix": "08489141",
   "userStories": [
     {
-      "id": "ANALYSIS-001",
-      "title": "Validate the P1c and P1e assumptions before coding",
-      "taskType": "analysis",
-      "description": "Read-only validation. Settle the facts FIX-001..FIX-003 depend on and write them under `## ANALYSIS-001` in the progress log.\n\nDO:\n1. Grok limit exit shape: find how grok exited on the 2026-07-15 plan limit (restaurant_agent_ex prefix 2df9cb39, iter1/iter2; stderr logs in ~/Documents/startat0/Projects/restaurant_agent_ex/.task-mgr/logs/2df9cb39-*-grok-stderr.log, and that project's task-mgr log/DB rows, read-only). Record exit code and whether stdout was empty. If it cannot be determined, say so and recommend scanning stderr when exit != 0 OR stdout output is empty.\n2. Trace the existing RateLimit handling (iteration.rs RateLimit block ~:847, slot.rs, reactions/account.rs react_to_outputs_inner) for a Grok-run iteration under (a) this repo's config (grok primary, claude disabled, spillover maxDifficulty high, blackoutFallbackSecs 3600) and (b) claude enabled + grok enabled. Record: is Anthropic usage I/O or the probe called, is the task reset to todo, do crash counters move, how long is the wait or blackout. No fix here (P1b owns provider attribution).\n3. Confirm `grok -s/--session-id <UUID>` names the directory `~/.grok/sessions/<urlencoded cwd>/<UUID>`: `grok --help`, then at most ONE tiny headless run (`--output-format streaming-json --no-subagents --prompt-file` with a one-line prompt) whose cwd is a fresh `mktemp -d`, never a project root. Record the path, then remove only that temp cwd's encoded directory.\n4. List every consumer of the Grok pre/post snapshot, `pick_newest_by_mtime`, and `RunnerResult.session_id` for Grok, including tests (runner.rs ~:2632 and learning 4696's flaky idempotence test).\n5. Note which hunks of FIX-002/FIX-003 overlap the unmerged branch feat/cli-error-gated-detection (`git diff main feat/cli-error-gated-detection -- src/loop_engine/runner.rs src/loop_engine/detection.rs`) so the diffs stay minimal.\n\nIf a finding contradicts a FIX task, correct that task with `task-mgr update --stdin --from-json tasks/model-routing-p1-grok-safety.json`.",
       "acceptanceCriteria": [
         "Progress log has `## ANALYSIS-001` with findings 1-5, each citing file:line or a log path",
         "Finding 1 states the stderr-scan gate FIX-002 must use (exit != 0 only, or also exit 0 with empty stdout), with evidence",
@@ -70,26 +66,26 @@
         "No production code or test edited; no grok run outside a mktemp cwd; no existing ~/.grok/sessions entry touched",
         "Any FIX task whose assumption was wrong is updated via task-mgr update"
       ],
-      "priority": 0,
+      "dependsOn": [],
+      "description": "Read-only validation. Settle the facts FIX-001..FIX-003 depend on and write them under `## ANALYSIS-001` in the progress log.\n\nDO:\n1. Grok limit exit shape: find how grok exited on the 2026-07-15 plan limit (restaurant_agent_ex prefix 2df9cb39, iter1/iter2; stderr logs in ~/Documents/startat0/Projects/restaurant_agent_ex/.task-mgr/logs/2df9cb39-*-grok-stderr.log, and that project's task-mgr log/DB rows, read-only). Record exit code and whether stdout was empty. If it cannot be determined, say so and recommend scanning stderr when exit != 0 OR stdout output is empty.\n2. Trace the existing RateLimit handling (iteration.rs RateLimit block ~:847, slot.rs, reactions/account.rs react_to_outputs_inner) for a Grok-run iteration under (a) this repo's config (grok primary, claude disabled, spillover maxDifficulty high, blackoutFallbackSecs 3600) and (b) claude enabled + grok enabled. Record: is Anthropic usage I/O or the probe called, is the task reset to todo, do crash counters move, how long is the wait or blackout. No fix here (P1b owns provider attribution).\n3. Confirm `grok -s/--session-id <UUID>` names the directory `~/.grok/sessions/<urlencoded cwd>/<UUID>`: `grok --help`, then at most ONE tiny headless run (`--output-format streaming-json --no-subagents --prompt-file` with a one-line prompt) whose cwd is a fresh `mktemp -d`, never a project root. Record the path, then remove only that temp cwd's encoded directory.\n4. List every consumer of the Grok pre/post snapshot, `pick_newest_by_mtime`, and `RunnerResult.session_id` for Grok, including tests (runner.rs ~:2632 and learning 4696's flaky idempotence test).\n5. Note which hunks of FIX-002/FIX-003 overlap the unmerged branch feat/cli-error-gated-detection (`git diff main feat/cli-error-gated-detection -- src/loop_engine/runner.rs src/loop_engine/detection.rs`) so the diffs stay minimal.\n\nIf a finding contradicts a FIX task, correct that task with `task-mgr update --stdin --from-json tasks/model-routing-p1-grok-safety.json`.",
       "estimatedEffort": "medium",
+      "id": "ANALYSIS-001",
+      "modifiesBehavior": false,
+      "notes": "PRD §1 items 3-4, §7 open question. Plan evidence: grok 1.0.50 `grok --help` lists `-s, --session-id <SESSION_ID>  Use a specific session UUID for a new conversation`. Interactive Grok sessions run in the restaurant_agent_ex and mw_integrations roots: never run grok there.",
       "passes": false,
+      "priority": 0,
       "requiresHuman": false,
+      "taskType": "analysis",
+      "title": "Validate the P1c and P1e assumptions before coding",
       "touchesFiles": [
         "src/loop_engine/runner.rs",
         "src/loop_engine/detection.rs",
         "src/loop_engine/iteration.rs",
         "src/loop_engine/slot.rs",
         "src/loop_engine/reactions/account.rs"
-      ],
-      "dependsOn": [],
-      "modifiesBehavior": false,
-      "notes": "PRD §1 items 3-4, §7 open question. Plan evidence: grok 1.0.50 `grok --help` lists `-s, --session-id <SESSION_ID>  Use a specific session UUID for a new conversation`. Interactive Grok sessions run in the restaurant_agent_ex and mw_integrations roots: never run grok there."
+      ]
     },
     {
-      "id": "FIX-001",
-      "title": "Recognize Grok's plan rate-limit phrase in is_rate_limited",
-      "taskType": "implementation",
-      "description": "is_rate_limited (src/loop_engine/detection.rs ~:151) does not match `Error: You’ve hit the rate limit for your plan. Upgrade your account or try again later.` (U+2019 apostrophe).\n\nDO:\n1. Red first: add the fixture tests/fixtures/grok_stderr_plan_rate_limit.txt (byte-exact copy of ~/Documents/startat0/Projects/restaurant_agent_ex/.task-mgr/logs/2df9cb39-fd1846b1-6284-4ac9-905f-9b295a9cbeaf-noSlot-iter1-grok-stderr.log, 91 bytes) and unit tests in detection.rs: fixture → true; straight-apostrophe and upper-case variants → true; E3 prose → false. Run them and paste the failing output into the progress block before changing production code.\n2. Add one clause: `output_lower.contains(\"rate limit for your plan\")`, with a comment citing the fixture.\n\nDO NOT: add a bare `rate limit` clause, or change or narrow any existing clause (learning 5364).",
       "acceptanceCriteria": [
         "Red first: the new tests were run and failed before the production change; failing output is in the progress block",
         "is_rate_limited returns true for the byte-exact fixture (curly apostrophe), a straight-apostrophe variant, and an upper-case variant",
@@ -98,61 +94,61 @@
         "All existing is_rate_limited tests pass unchanged; no existing clause edited",
         "cargo fmt --check, cargo clippy --all-targets -- -D warnings, and cargo test -p task-mgr detection pass"
       ],
-      "priority": 2,
-      "estimatedEffort": "low",
-      "passes": false,
-      "requiresHuman": false,
-      "touchesFiles": [
-        "src/loop_engine/detection.rs",
-        "tests/fixtures/grok_stderr_plan_rate_limit.txt"
-      ],
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/loop_engine/detection.rs",
+            "impact": "OK",
+            "line": 0,
+            "mitigation": "Phrase is specific to Grok's plan-limit copy",
+            "usage": "analyze_output step 3 on Claude/Grok stdout"
+          },
+          {
+            "file": "src/loop_engine/recovery.rs",
+            "impact": "OK",
+            "line": 0,
+            "mitigation": "Claude probe never prints this phrase",
+            "usage": "probe_rate_limit_lifted scan"
+          }
+        ]
+      },
       "dependsOn": [
         "ANALYSIS-001"
       ],
-      "modifiesBehavior": true,
-      "qualityDimensions": [
-        "Narrow contiguous phrase; recall for real CLI copy without new prose false positives",
-        "Idempotent and accurate: a limit is a limit, cleanup removes exactly one known directory"
-      ],
+      "description": "is_rate_limited (src/loop_engine/detection.rs ~:151) does not match `Error: You’ve hit the rate limit for your plan. Upgrade your account or try again later.` (U+2019 apostrophe).\n\nDO:\n1. Red first: add the fixture tests/fixtures/grok_stderr_plan_rate_limit.txt (byte-exact copy of ~/Documents/startat0/Projects/restaurant_agent_ex/.task-mgr/logs/2df9cb39-fd1846b1-6284-4ac9-905f-9b295a9cbeaf-noSlot-iter1-grok-stderr.log, 91 bytes) and unit tests in detection.rs: fixture → true; straight-apostrophe and upper-case variants → true; E3 prose → false. Run them and paste the failing output into the progress block before changing production code.\n2. Add one clause: `output_lower.contains(\"rate limit for your plan\")`, with a comment citing the fixture.\n\nDO NOT: add a bare `rate limit` clause, or change or narrow any existing clause (learning 5364).",
       "edgeCases": [
         "E1: exact fixture with U+2019 → true",
         "E2: straight apostrophe / upper case → true",
         "E3: 'the client hit the rate limit in tests' → false"
       ],
-      "invariants": [
-        "Every string that matched before still matches"
-      ],
+      "estimatedEffort": "low",
       "failureModes": [
         {
           "cause": "Pattern written with an apostrophe",
           "expectedBehavior": "E1 or E2 test fails"
         }
       ],
-      "consumerAnalysis": {
-        "consumers": [
-          {
-            "file": "src/loop_engine/detection.rs",
-            "line": 0,
-            "usage": "analyze_output step 3 on Claude/Grok stdout",
-            "impact": "OK",
-            "mitigation": "Phrase is specific to Grok's plan-limit copy"
-          },
-          {
-            "file": "src/loop_engine/recovery.rs",
-            "line": 0,
-            "usage": "probe_rate_limit_lifted scan",
-            "impact": "OK",
-            "mitigation": "Claude probe never prints this phrase"
-          }
-        ]
-      },
-      "notes": "Learning [5364]: keep widened patterns. Grep `fn is_rate_limited` for the line; line 0 in consumerAnalysis means grep the call site."
+      "id": "FIX-001",
+      "invariants": [
+        "Every string that matched before still matches"
+      ],
+      "modifiesBehavior": true,
+      "notes": "Learning [5364]: keep widened patterns. Grep `fn is_rate_limited` for the line; line 0 in consumerAnalysis means grep the call site.",
+      "passes": false,
+      "priority": 2,
+      "qualityDimensions": [
+        "Narrow contiguous phrase; recall for real CLI copy without new prose false positives",
+        "Idempotent and accurate: a limit is a limit, cleanup removes exactly one known directory"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Recognize Grok's plan rate-limit phrase in is_rate_limited",
+      "touchesFiles": [
+        "src/loop_engine/detection.rs",
+        "tests/fixtures/grok_stderr_plan_rate_limit.txt"
+      ]
     },
     {
-      "id": "FIX-002",
-      "title": "Surface a Grok stderr plan limit as RateLimit, not Crash",
-      "taskType": "implementation",
-      "description": "GrokRunner::spawn (src/loop_engine/runner.rs ~:972-1005) sniffs stderr only for auth failure and transient 5xx. A plan limit falls through to Crash.\n\nDO:\n1. Red first: (a) a runner test with a mock grok script (copy the pattern of the transient-backend test near runner.rs ~:2999) that writes the FIX-001 fixture to stderr and exits with the code ANALYSIS-001 recorded, asserting the new typed error; (b) sequential and wave mapping tests asserting IterationOutcome::RateLimit with task_id and effective_runner Grok. Paste the failing output first.\n2. Add a typed variant to TaskMgrError (src/error.rs), e.g. `RunnerRateLimited { runner: RunnerKind }`, with a Display naming the provider.\n3. In the stderr block, after the auth sniff and before the transient sniff, return it when `detection::is_rate_limited(&stderr_str)` matches. Use the gate ANALYSIS-001 chose (exit != 0, and exit 0 with empty stdout only if the analysis found that shape).\n4. Map it in iteration.rs (beside the TransientBackend arm ~:699) and slot.rs (~:310) to IterationOutcome::RateLimit, mirroring those arms, so the existing RateLimit handling runs.\n\nDO NOT: append text to output; change analyze_output; touch Claude stdout handling; add Anthropic I/O.",
       "acceptanceCriteria": [
         "Red first: new runner and mapping tests failed before the production change; failing output is in the progress block",
         "E1/E2: mock grok writing the fixture to stderr yields the typed rate-limit error, and the sequential and wave paths yield IterationOutcome::RateLimit",
@@ -161,72 +157,31 @@
         "E7: exit 0 with <completed>X</completed> on stdout and the limit line on stderr is not RateLimit",
         "The RateLimit iteration does not increment crash counters (assert the counter or the outcome branch the existing crash tests use)",
         "No new Anthropic usage I/O on this path; Claude stdout classification unchanged",
-        "cargo fmt --check, cargo clippy --all-targets -- -D warnings, and scoped cargo test for runner, iteration, and slot pass"
-      ],
-      "priority": 3,
-      "estimatedEffort": "high",
-      "passes": false,
-      "requiresHuman": false,
-      "touchesFiles": [
-        "src/loop_engine/runner.rs",
-        "src/error.rs",
-        "src/loop_engine/iteration.rs",
-        "src/loop_engine/slot.rs"
-      ],
-      "dependsOn": [
-        "ANALYSIS-001",
-        "FIX-001"
-      ],
-      "modifiesBehavior": true,
-      "qualityDimensions": [
-        "Typed error, not an output sentinel",
-        "Sequential and wave map identically",
-        "Idempotent and accurate: a limit is a limit, cleanup removes exactly one known directory"
-      ],
-      "edgeCases": [
-        "E1",
-        "E2",
-        "E4: auth wins",
-        "E5: 502 stays transient",
-        "E6: exit 0 + empty stdout handled per ANALYSIS-001",
-        "E7: completion wins"
-      ],
-      "invariants": [
-        "A Grok plan limit never reaches Crash",
-        "Auth and transient classification unchanged"
-      ],
-      "failureModes": [
-        {
-          "cause": "Limit check placed before the auth sniff",
-          "expectedBehavior": "E4 test fails"
-        },
-        {
-          "cause": "Only the sequential arm added",
-          "expectedBehavior": "wave mapping test fails"
-        }
+        "cargo fmt --check, cargo clippy --all-targets -- -D warnings, and scoped cargo test for runner, iteration, and slot pass",
+        "Gate: exit 1 with the fixture on stderr, and exit 0 with empty stdout and the fixture on stderr, both yield the typed rate-limit error. The 2026-07-15 exit code was not recorded; exit 1 is the test stand-in, not an observed status"
       ],
       "consumerAnalysis": {
         "consumers": [
           {
             "file": "src/loop_engine/iteration.rs",
-            "line": 699,
-            "usage": "Runner Err arms map to IterationOutcome",
             "impact": "NEEDS_REVIEW",
-            "mitigation": "Add one arm mirroring TransientBackend"
+            "line": 699,
+            "mitigation": "Add one arm mirroring TransientBackend",
+            "usage": "Runner Err arms map to IterationOutcome"
           },
           {
             "file": "src/loop_engine/slot.rs",
-            "line": 310,
-            "usage": "Wave runner Err arms",
             "impact": "NEEDS_REVIEW",
-            "mitigation": "Same arm"
+            "line": 310,
+            "mitigation": "Same arm",
+            "usage": "Wave runner Err arms"
           },
           {
             "file": "src/loop_engine/reactions/account.rs",
-            "line": 683,
-            "usage": "react_to_outputs_inner handles RateLimit",
             "impact": "OK",
-            "mitigation": "Behavior per ANALYSIS-001 finding 2; provider attribution is P1b"
+            "line": 683,
+            "mitigation": "Behavior per ANALYSIS-001 finding 2; provider attribution is P1b",
+            "usage": "react_to_outputs_inner handles RateLimit"
           }
         ],
         "semanticDistinctions": [
@@ -242,13 +197,55 @@
           }
         ]
       },
-      "notes": "Mirror the GrokAuthFailure and TransientBackend arms exactly (iteration.rs ~:648-720, slot.rs ~:263-330). Keep the hunk small: feat/cli-error-gated-detection rewrites the same stderr block."
+      "dependsOn": [
+        "ANALYSIS-001",
+        "FIX-001"
+      ],
+      "description": "GrokRunner::spawn (src/loop_engine/runner.rs ~:972-1005) sniffs stderr only for auth failure and transient 5xx. A plan limit falls through to Crash.\n\nDO:\n1. Red first: (a) a runner test with a mock grok script (copy the pattern of the transient-backend test near runner.rs ~:2999) that writes the FIX-001 fixture to stderr. ANALYSIS-001 did not recover an exit code or stdout for the 2026-07-15 run, so cover both gate arms: exit 1 (not an observed historical code), and exit 0 with empty stdout. Both must yield the typed error. Exit 0 with non-empty stdout is the existing E7 non-match. (b) sequential and wave mapping tests asserting IterationOutcome::RateLimit with task_id and effective_runner Grok. Paste the failing output first.\n2. Add a typed variant to TaskMgrError (src/error.rs), e.g. `RunnerRateLimited { runner: RunnerKind }`, with a Display naming the provider.\n3. In the stderr block, after the auth sniff and before the transient sniff, return it when `detection::is_rate_limited(&stderr_str)` matches. Gate: `exit_code != 0 || output.trim().is_empty()`. Do not match when exit_code == 0 and stdout is non-empty. Leave the auth sniff inside exit != 0 and the fast-fail window. Leave the transient sniff inside exit != 0.\n4. Map it in iteration.rs (beside the TransientBackend arm ~:699) and slot.rs (~:310) to IterationOutcome::RateLimit, mirroring those arms, so the existing RateLimit handling runs.\n\nDO NOT: append text to output; change analyze_output; touch Claude stdout handling; add Anthropic I/O; delete the session directory ad hoc on the Err arm (dispatch cleans up only when spawn returns Ok, runner.rs:1852, same as GrokAuthFailure and TransientBackend).",
+      "edgeCases": [
+        "E1",
+        "E2",
+        "E4: auth wins",
+        "E5: 502 stays transient",
+        "E6: exit 0 + empty stdout handled per ANALYSIS-001",
+        "E7: completion wins"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "Limit check placed before the auth sniff",
+          "expectedBehavior": "E4 test fails"
+        },
+        {
+          "cause": "Only the sequential arm added",
+          "expectedBehavior": "wave mapping test fails"
+        }
+      ],
+      "id": "FIX-002",
+      "invariants": [
+        "A Grok plan limit never reaches Crash",
+        "Auth and transient classification unchanged"
+      ],
+      "modifiesBehavior": true,
+      "notes": "Mirror the GrokAuthFailure and TransientBackend arms exactly (iteration.rs ~:648-720, slot.rs ~:263-330). Keep the hunk small: feat/cli-error-gated-detection reads stderr_str on every exit, inserts limit_shape::record_grok (that branch runner.rs:1056) before `if exit_code != 0` (branch :1070), and forces Grok cli_error false. Do not retarget auth, transient, or analyze_output.\nANALYSIS-001 gate: 2026-07-15 stderr logs are the 91-byte plan sentence; task-mgr-2df9cb39.2026-07-16.log is 0 bytes and the DB has no exit code or stdout. Sniff when exit_code != 0 OR stdout.trim().is_empty(). Non-zero test uses exit 1.",
+      "passes": false,
+      "priority": 3,
+      "qualityDimensions": [
+        "Typed error, not an output sentinel",
+        "Sequential and wave map identically",
+        "Idempotent and accurate: a limit is a limit, cleanup removes exactly one known directory"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Surface a Grok stderr plan limit as RateLimit, not Crash",
+      "touchesFiles": [
+        "src/loop_engine/runner.rs",
+        "src/error.rs",
+        "src/loop_engine/iteration.rs",
+        "src/loop_engine/slot.rs"
+      ]
     },
     {
-      "id": "FIX-003",
-      "title": "Clean up only the Grok session task-mgr created, via --session-id",
-      "taskType": "implementation",
-      "description": "GrokRunner::spawn finds its session directory by diffing ~/.grok/sessions/<encoded cwd>/ before and after the run, and picks the newest by mtime when several appear (runner.rs ~:806-823, ~:952-970, pick_newest_by_mtime ~:471). An interactive Grok session started in the same cwd can be chosen and deleted by cleanup_session.\n\nDO:\n1. Red first: a runner test with a mock grok script that records argv, creates `<HOME>/.grok/sessions/<encoded cwd>/<uuid from --session-id>` and, during the run, a second newer `<other-uuid>` directory (the interactive session), plus prompt_history.jsonl. Assert argv contains `--session-id <uuid>`, RunnerResult.session_id == that uuid, and after dispatch cleanup the other directory and prompt_history.jsonl still exist. Paste the failing output first.\n2. Generate Uuid::new_v4() per spawn, push `--session-id <uuid>` before `--prompt-file`, and return Some(uuid), mirroring Claude (runner.rs ~:601-603).\n3. Delete the pre/post snapshot, pick_newest_by_mtime, and the dir-diff test (replace it with the new test). Update the WORKAROUND(grok-cli-no-persistence-off) comment.\n\nUse a temp HOME in tests. Never touch the real ~/.grok.",
       "acceptanceCriteria": [
         "Red first: the new test failed before the production change; failing output is in the progress block",
         "E8: argv carries --session-id <uuid>; RunnerResult.session_id is that uuid; the concurrent other-uuid directory and prompt_history.jsonl survive cleanup",
@@ -256,91 +253,94 @@
         "E10: HOME unset → no cleanup, no panic",
         "Cleanup called twice for the same uuid returns Ok both times",
         "Pre/post snapshot code and pick_newest_by_mtime are gone (rg returns no hits outside git history)",
-        "cargo fmt --check, cargo clippy --all-targets -- -D warnings, and scoped cargo test for runner and runner_cleanup pass"
+        "cargo fmt --check, cargo clippy --all-targets -- -D warnings, and scoped cargo test for runner, runner_cleanup, and grok_runner_unit pass",
+        "dispatch_grok_cleanup_ok_removes_session_dir, dispatch_grok_skips_cleanup_when_session_id_is_none, and grok_runner_cleanup_session_deletes_session_directory assert the --session-id uuid rather than pre/post dir-diff discovery"
       ],
-      "priority": 4,
-      "estimatedEffort": "medium",
-      "passes": false,
-      "requiresHuman": false,
-      "touchesFiles": [
-        "src/loop_engine/runner.rs"
-      ],
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/loop_engine/runner.rs",
+            "impact": "OK",
+            "line": 1853,
+            "mitigation": "Now always Some for Grok; NotFound is Ok",
+            "usage": "dispatch calls cleanup_session when session_id is Some"
+          },
+          {
+            "file": "src/loop_engine/runner.rs",
+            "impact": "BREAKS",
+            "line": 2632,
+            "mitigation": "Replace with the E8 test",
+            "usage": "test pins the dir-diff heuristic"
+          }
+        ]
+      },
       "dependsOn": [
         "ANALYSIS-001"
       ],
-      "modifiesBehavior": true,
-      "qualityDimensions": [
-        "Exact identification beats heuristics; deletes code rather than adding it",
-        "Idempotent and accurate: a limit is a limit, cleanup removes exactly one known directory"
-      ],
+      "description": "GrokRunner::spawn finds its session directory by diffing ~/.grok/sessions/<encoded cwd>/ before and after the run, and picks the newest by mtime when several appear (runner.rs ~:806-823, ~:952-970, pick_newest_by_mtime ~:471). An interactive Grok session started in the same cwd can be chosen and deleted by cleanup_session.\n\nDO:\n1. Red first: a runner test with a mock grok script that records argv, creates `<HOME>/.grok/sessions/<encoded cwd>/<uuid from --session-id>` and, during the run, a second newer `<other-uuid>` directory (the interactive session), plus prompt_history.jsonl. Assert argv contains `--session-id <uuid>`, RunnerResult.session_id == that uuid, and after dispatch cleanup the other directory and prompt_history.jsonl still exist. Paste the failing output first.\n2. Generate Uuid::new_v4() per spawn, push `--session-id <uuid>` before `--prompt-file`, and return Some(uuid), mirroring Claude (runner.rs ~:601-603).\n3. Delete the pre/post snapshot, pick_newest_by_mtime, and the dir-diff test (replace it with the new test). Update the WORKAROUND(grok-cli-no-persistence-off) comment.\n4. Rewrite the other dir-diff consumers so they stop asserting discovery from the snapshot: tests/runner_cleanup.rs `dispatch_grok_cleanup_ok_removes_session_dir` and `dispatch_grok_skips_cleanup_when_session_id_is_none`, and tests/grok_runner_unit.rs `grok_runner_cleanup_session_deletes_session_directory`. session_id is the argv uuid even when the mock creates no directory; missing-dir cleanup stays Ok with no banner (E9). Direct cleanup_session tests (idempotence, prompt_history, other-uuid) stay. Keep RUNNER_HOME_ENV_MUTEX and RunnerHomeGuard on the idempotence test (learning 4696).\n\nUse a temp HOME in tests. Never touch the real ~/.grok.\n\nANALYSIS-001 confirmed grok 1.0.50 creates `~/.grok/sessions/<urlencoded cwd>/<passed uuid>` (summary.json info.id was the passed UUID). Help: `-s, --session-id` must be a UUID that does not already exist under the target session directory.",
       "edgeCases": [
         "E8: concurrent interactive session dir survives",
         "E9: missing dir is Ok",
         "E10: HOME unset"
       ],
-      "invariants": [
-        "cleanup_session removes at most <encoded cwd>/<uuid task-mgr generated>",
-        "prompt_history.jsonl is never removed"
-      ],
+      "estimatedEffort": "medium",
       "failureModes": [
         {
           "cause": "session_id still derived from a dir listing",
           "expectedBehavior": "E8 test fails when the interactive dir is newer"
         }
       ],
-      "consumerAnalysis": {
-        "consumers": [
-          {
-            "file": "src/loop_engine/runner.rs",
-            "line": 1853,
-            "usage": "dispatch calls cleanup_session when session_id is Some",
-            "impact": "OK",
-            "mitigation": "Now always Some for Grok; NotFound is Ok"
-          },
-          {
-            "file": "src/loop_engine/runner.rs",
-            "line": 2632,
-            "usage": "test pins the dir-diff heuristic",
-            "impact": "BREAKS",
-            "mitigation": "Replace with the E8 test"
-          }
-        ]
-      },
-      "notes": "Learnings [3754] cleanup stays a trait method called from dispatch; [4696] the idempotence test has an env/order race, so set HOME per test via the existing helper rather than mutating process env concurrently; [3204] document the workaround."
+      "id": "FIX-003",
+      "invariants": [
+        "cleanup_session removes at most <encoded cwd>/<uuid task-mgr generated>",
+        "prompt_history.jsonl is never removed"
+      ],
+      "modifiesBehavior": true,
+      "notes": "Learnings [3754] cleanup stays a trait method called from dispatch; [4696] the idempotence test has an env/order race, so set HOME per test via the existing helper rather than mutating process env concurrently; [3204] document the workaround.\nANALYSIS-001: dir-diff is also pinned by tests/runner_cleanup.rs:254 and :474 and tests/grok_runner_unit.rs:332. pick_newest_by_mtime's only call is runner.rs:968. dispatch cleanup runs only on Ok (runner.rs:1852); a FIX-002 Err does not clean the new uuid dir, same as today's auth and transient Err returns.",
+      "passes": false,
+      "priority": 4,
+      "qualityDimensions": [
+        "Exact identification beats heuristics; deletes code rather than adding it",
+        "Idempotent and accurate: a limit is a limit, cleanup removes exactly one known directory"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Clean up only the Grok session task-mgr created, via --session-id",
+      "touchesFiles": [
+        "src/loop_engine/runner.rs",
+        "tests/runner_cleanup.rs",
+        "tests/grok_runner_unit.rs"
+      ]
     },
     {
-      "id": "PRUNE-001",
-      "title": "Existence pass on the Grok limit and session-id diff",
-      "taskType": "review",
-      "description": "Inventory the branch diff against the merge base, plus uncommitted work in the loop worktree. For each added or modified function, branch, field, fixture, and test, name the concrete caller or failing input that needs it. Spawn a removal when there is no production caller and the item is not the feature's entry point, when the only reason to keep it is speculative, or when a test pins no required behavior. Confirm the old snapshot heuristic is fully gone.\n\nSpawn one PRUNE-FIX task per coherent deletion with task-mgr add --stdin --from-json tasks/model-routing-p1-grok-safety.json --depended-on-by REVIEW-001. Priority 61-69. Do not edit production code in this task. Empty inventory: progress line \"nothing to remove\" and mark done.",
       "acceptanceCriteria": [
         "Branch diff inventoried; each added item has a caller or a failing input, or a spawned deletion",
         "Spawn PRUNE-FIX tasks for items that fail the existence bar",
         "No production code edited in this task"
-      ],
-      "priority": 60,
-      "estimatedEffort": "high",
-      "timeoutSecs": 1800,
-      "passes": false,
-      "requiresHuman": false,
-      "touchesFiles": [
-        "src/loop_engine/detection.rs",
-        "src/loop_engine/runner.rs",
-        "src/error.rs"
       ],
       "dependsOn": [
         "FIX-001",
         "FIX-002",
         "FIX-003"
       ],
+      "description": "Inventory the branch diff against the merge base, plus uncommitted work in the loop worktree. For each added or modified function, branch, field, fixture, and test, name the concrete caller or failing input that needs it. Spawn a removal when there is no production caller and the item is not the feature's entry point, when the only reason to keep it is speculative, or when a test pins no required behavior. Confirm the old snapshot heuristic is fully gone.\n\nSpawn one PRUNE-FIX task per coherent deletion with task-mgr add --stdin --from-json tasks/model-routing-p1-grok-safety.json --depended-on-by REVIEW-001. Priority 61-69. Do not edit production code in this task. Empty inventory: progress line \"nothing to remove\" and mark done.",
+      "estimatedEffort": "high",
+      "id": "PRUNE-001",
       "modifiesBehavior": false,
-      "notes": "Do not implement deletions here. Say spawn PRUNE-FIX tasks; do not put that prefix token with a dash in this task's criteria."
+      "notes": "Do not implement deletions here. Say spawn PRUNE-FIX tasks; do not put that prefix token with a dash in this task's criteria.",
+      "passes": false,
+      "priority": 60,
+      "requiresHuman": false,
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Existence pass on the Grok limit and session-id diff",
+      "touchesFiles": [
+        "src/loop_engine/detection.rs",
+        "src/loop_engine/runner.rs",
+        "src/error.rs"
+      ]
     },
     {
-      "id": "REVIEW-001",
-      "title": "Full gate for Grok limit detection and session-id cleanup",
-      "taskType": "review",
-      "description": "Final gate. Run the full unscoped suite and leave the tree green, including pre-existing failures. Below about 12 unrelated failures, fix them here. Above that, spawn one FIX task via task-mgr add --stdin --from-json tasks/model-routing-p1-grok-safety.json --depended-on-by REVIEW-001 and stop blocked.\n\nConfirm E1-E10 each have a passing test named in the owning FIX task's criteria. Confirm the PRD §2.7 proof rows for P1c and P1e. Drive no verify-task-mgr feature: the harness refuses loop run and this change has no mapped CLI surface. Do not cargo install. A todo or in_progress PRUNE-FIX-xxx holds this task.",
       "acceptanceCriteria": [
         "cargo fmt --check && cargo check && cargo clippy --all-targets -- -D warnings && cargo test pass",
         "E1-E10 each have a passing test, or an explicit note matching the PRD (E6 per ANALYSIS-001)",
@@ -348,26 +348,31 @@
         "No model field anywhere in tasks/model-routing-p1-grok-safety.json; no .task-mgr/config.json changed; no new CLI flag or config key",
         "Progress log states the full-suite result and lists the commits for FIX-001..FIX-003"
       ],
-      "priority": 99,
-      "estimatedEffort": "high",
-      "timeoutSecs": 1800,
-      "passes": false,
-      "requiresHuman": false,
-      "touchesFiles": [
-        "src/loop_engine/detection.rs",
-        "src/loop_engine/runner.rs",
-        "src/error.rs",
-        "src/loop_engine/iteration.rs",
-        "src/loop_engine/slot.rs"
-      ],
       "dependsOn": [
         "PRUNE-001",
         "FIX-001",
         "FIX-002",
         "FIX-003"
       ],
+      "description": "Final gate. Run the full unscoped suite and leave the tree green, including pre-existing failures. Below about 12 unrelated failures, fix them here. Above that, spawn one FIX task via task-mgr add --stdin --from-json tasks/model-routing-p1-grok-safety.json --depended-on-by REVIEW-001 and stop blocked.\n\nConfirm E1-E10 each have a passing test named in the owning FIX task's criteria. Confirm the PRD §2.7 proof rows for P1c and P1e. Drive no verify-task-mgr feature: the harness refuses loop run and this change has no mapped CLI surface. Do not cargo install. A todo or in_progress PRUNE-FIX-xxx holds this task.",
+      "estimatedEffort": "high",
+      "id": "REVIEW-001",
       "modifiesBehavior": false,
-      "notes": "This is the milestone. Full suite. arcomp2 may be heavily loaded; a slow cargo is fine, do not kill other processes. No push, no merge."
+      "notes": "This is the milestone. Full suite. arcomp2 may be heavily loaded; a slow cargo is fine, do not kill other processes. No push, no merge.",
+      "passes": false,
+      "priority": 99,
+      "requiresHuman": false,
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Full gate for Grok limit detection and session-id cleanup",
+      "touchesFiles": [
+        "src/loop_engine/detection.rs",
+        "src/loop_engine/runner.rs",
+        "src/error.rs",
+        "src/loop_engine/iteration.rs",
+        "src/loop_engine/slot.rs"
+      ]
     }
-  ]
+  ],
+  "version": "1.0"
 }
