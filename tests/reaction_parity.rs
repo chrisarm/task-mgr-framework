@@ -3448,8 +3448,12 @@ fn account_io_assignment(rel_path: &str) -> String {
 
 #[test]
 fn both_account_reaction_param_sites_key_anthropic_io_on_claude_enablement() {
+    // FR-003 moved the sequential literal out of iteration.rs into
+    // orchestrator.rs (reaction after the completion ladder). The wave
+    // literal stayed in wave_scheduler.rs. Both still key the flag on
+    // Claude enablement alone — not on usage_params.enabled.
     for site in [
-        "src/loop_engine/iteration.rs",
+        "src/loop_engine/orchestrator.rs",
         "src/loop_engine/wave_scheduler.rs",
     ] {
         let assignment = account_io_assignment(site);
