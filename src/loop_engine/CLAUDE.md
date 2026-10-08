@@ -404,19 +404,63 @@ scope" note mirrors this split.
 
 ### Load-bearing invariants
 
-**CLI-error-gated detection (CONTRACT-001 / fe92ec5b):** text classifiers
+**CLI-error-gated detection (CONTRACT-001 / fe92ec5b):** the text classifiers
 (`is_rate_limited` / `is_prompt_too_long` / `is_transient_backend`) run only
 when `has_cli_error = cli_error || (exit_code != 0 && !completion_killed)`.
 `OutputSignals { cli_error, completion_killed, error_text, task_id, run_id }`
-is the sole analyze_output signal struct (no same-typed bool pair).
-`tool_result.is_error` is ignored; Grok stays `cli_error: false`. Both paths
-snapshot the outcome before the pipeline; `react_to_outputs` and budget
-give-back read the snapshot (a post-pipeline read skips the wait after
-`record_completion` → `Completed`). Untagged `handle_overflow` stays before
-the pipeline; skip the **entire** call only when the claimed id is already in
-`parse_completed_tasks`. Grace fallback is the `arm_completion_grace` buffer
-tail on `IterationResult` / `ProcessingParams`, not head-capped `conversation`.
-OperatorStopped / StopSpend stay exit 0; StopSpend sets `account_quota_stopped`.
+is the sole `analyze_output` signal struct (no same-typed bool pair).
+
+- **Provenance, not wording.** The gate changed *when* the classifiers run, not
+  *what* they match: the pattern sets (including the widened "reached your …
+  limit" copy) and `decide_account_rate_limit`'s wait math are unchanged. Do not
+  narrow a pattern to compensate for a misfire — fix the provenance instead.
+- **Agent prose never classifies.** With `has_cli_error` false, a successful
+  summary that merely *mentions* a 429 / "prompt is too long" / a 502 stays a
+  normal outcome; only `detection.text_signal_without_cli_error` is traced (no
+  output text — tracing has no redactor). When `cli_error` is set, the scan
+  target is the retained `error_text`, never the agent summary.
+- **A grace-kill is not a CLI error.** `completion_killed` (task-mgr's own
+  post-completion kill, exit 143/137) suppresses the exit-code leg. `cli_error`
+  still wins: a grace-kill that also carried `result.is_error` or
+  `StreamEvent::Error` is a CLI error. Exit 143 *without* `completion_killed`
+  is still the external-signal path. `tool_result.is_error` is ignored; Grok
+  stays `cli_error: false`.
+- **Snapshot contract.** Both paths clone the `IterationOutcome` *before* the
+  pipeline (`orchestrator.rs` `outcome_snapshot`, `wave_scheduler.rs`
+  `outcome_snapshots`) and feed that copy to `react_to_outputs` and the budget
+  give-back. The live outcome is not the reaction input — `record_completion`
+  rewrites it to `Completed`, and a post-pipeline read would skip a real wait.
+- **Sequential order: ladder → commit → wait.** `sequential_completions_then_rate_limit`
+  runs `react_to_completions` (#8 wrapper-commit, #9 external-git shadow,
+  #10 human review) first, then returns early unless the *snapshot* is
+  `RateLimit`, and only then reacts/waits. The wrapper commit must land before
+  the wait so an hours-long park never sits on uncommitted agent work.
+- **Wave: merge stays deferred.** The once-per-wave reaction runs after
+  `process_slot_result` and before merge-back; on `WaitedAndRetry` the wave
+  returns early with the ephemeral branches intact. Never call
+  `react_to_completions` or merge inside the reaction.
+- **Untagged `handle_overflow` stays before the pipeline** on both paths. The
+  one exception is a skip of the **entire** call (context rows and rungs 1–5
+  included) when the resolved claimed id is already in
+  `parse_completed_tasks(output)`. Do not relocate the call after
+  `process_iteration_output` to get that effect.
+- Grace fallback is the `arm_completion_grace` buffer tail threaded onto
+  `IterationResult` / `ProcessingParams`, not head-capped `conversation`.
+- `probe_rate_limit_lifted` is gated on exit status: exit 0 means lifted; text
+  is scanned only when exit ≠ 0. The probe does not call `analyze_output`.
+- OperatorStopped / StopSpend stay exit 0; StopSpend sets `account_quota_stopped`.
+- **Limit-shape record (`limit_shape.rs`).** When exit ≠ 0, `cli_error` is set,
+  or a captured channel matches a classifier, one JSON line is appended to
+  `.task-mgr/logs/limit-shape-<prefix>.jsonl` holding only that provider's
+  channels (Claude: `result_is_error` / `result_text` / `assistant_error` /
+  `stderr`; Grok: `stderr` / `output_tail`; Codex: `error_text` / `stderr` /
+  `output_tail`), each text field capped to its trailing 4096 bytes. A clean
+  exit 0 with no match writes nothing. This PRD **records** the channels; it
+  does not retarget the scan — `is_rate_limited` et al. still read the same
+  strings they read before, and a 502 is still `TransientBackend`. The jsonl
+  line is the fixture for a later scan fix, and its text never goes on a
+  tracing event.
+
 Full copy-paste under `## CONTRACT-001` in `tasks/progress-fe92ec5b.txt`.
 
 - **`handle_overflow` ordering.** On a `PromptTooLong` outcome the overflow
