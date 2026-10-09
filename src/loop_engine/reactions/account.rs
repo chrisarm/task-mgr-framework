@@ -124,8 +124,9 @@ pub fn account_usage_gate_inner(
 // not per-task state), which is why this coordinator lives in `account.rs`
 // alongside `account_usage_gate`. FEAT-006 relocated the converged reaction
 // here (the CONTRACT-001 `mod.rs` table originally sketched it under
-// `post_output`) and both engine paths now route through it: sequential at
-// `iteration.rs:703`, wave at `wave_scheduler.rs:1170`. The contract is pinned
+// `post_output`) and both engine paths now route through it: sequential in
+// `orchestrator.rs` after the completion ladder (pre-pipeline snapshot), wave
+// at `wave_scheduler.rs`. The contract is pinned
 // by the parity tests in `tests/reaction_parity.rs`.
 // ---------------------------------------------------------------------------
 

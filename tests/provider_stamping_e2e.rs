@@ -170,6 +170,8 @@ fn run_completion(
         effective_effort: None,
         effective_runner: Some(effective_runner),
         slot_index,
+        grace_buffer_tail: "",
+        completion_killed: false,
     });
 }
 
@@ -379,6 +381,8 @@ fn non_completing_iteration_does_not_stamp() {
         effective_effort: None,
         effective_runner: Some(RunnerKind::Claude),
         slot_index: None,
+        grace_buffer_tail: "",
+        completion_killed: false,
     });
 
     assert_eq!(

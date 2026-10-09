@@ -92,6 +92,21 @@ pub(crate) fn resolve_tag_id_to_claimed<'a>(
     }
 }
 
+/// True when a `<completed>` tag resolves to this iteration's claimed id.
+///
+/// Match rules are [`resolve_tag_id_to_claimed`] (identity, real prefix
+/// strip, 8-hex body). Git-only commits and output-scan `[id]` mentions are
+/// not tags and return false. Never uses `ends_with`.
+pub(crate) fn claimed_id_in_completed_tags(
+    output: &str,
+    claimed_id: &str,
+    task_prefix: Option<&str>,
+) -> bool {
+    parse_completed_tasks(output)
+        .iter()
+        .any(|tag| resolve_tag_id_to_claimed(tag, claimed_id, task_prefix) == claimed_id)
+}
+
 /// Parse `<completed>TASK-ID</completed>` tags from Claude's output.
 ///
 /// Returns a vec of full task IDs found. Multiple tags per iteration are supported.
@@ -423,6 +438,45 @@ mod tests {
         let output = "<completed>  FEAT-001  </completed>";
         let result = parse_completed_tasks(output);
         assert_eq!(result, vec!["FEAT-001"]);
+    }
+
+    #[test]
+    fn claimed_id_in_completed_tags_matches_identity_and_short_id() {
+        let claimed = "fe92ec5b-E11-X";
+        assert!(claimed_id_in_completed_tags(
+            "<completed>fe92ec5b-E11-X</completed>",
+            claimed,
+            Some("fe92ec5b"),
+        ));
+        assert!(claimed_id_in_completed_tags(
+            "<completed>E11-X</completed>",
+            claimed,
+            Some("fe92ec5b"),
+        ));
+        // 8-hex body fallback when the caller has no explicit prefix.
+        assert!(claimed_id_in_completed_tags(
+            "noise <completed>E11-X</completed> tail",
+            claimed,
+            None,
+        ));
+    }
+
+    #[test]
+    fn claimed_id_in_completed_tags_ignores_peers_suffixes_and_non_tags() {
+        let claimed = "fe92ec5b-REFACTOR-001";
+        assert!(
+            !claimed_id_in_completed_tags("<completed>001</completed>", claimed, Some("fe92ec5b"),),
+            "suffix-only tag must not match the claim"
+        );
+        assert!(!claimed_id_in_completed_tags(
+            "<completed>E11-Y</completed>",
+            "E11-X",
+            None,
+        ));
+        assert!(
+            !claimed_id_in_completed_tags("feat: E11-X-completed\n[E11-X]", "E11-X", None),
+            "git-only and output-scan mentions are not completed tags"
+        );
     }
 
     // --- scan_output_for_completed_tasks tests ---

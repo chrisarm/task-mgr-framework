@@ -76,6 +76,8 @@ fn slot_early_exit(slot: &SlotContext, exit: SlotEarlyExit) -> SlotResult {
             key_decisions_count: 0,
             conversation: None,
             shown_learning_ids: Vec::new(),
+            grace_buffer_tail: String::new(),
+            completion_killed: false,
         },
         // Early exit always runs after a successful claim (the slot thread
         // started); keep the id on the pending tracker until process_slot_result
@@ -370,9 +372,17 @@ pub fn run_slot_iteration(
         ));
     }
 
+    let signals = detection::OutputSignals {
+        cli_error: claude_result.cli_error,
+        completion_killed: claude_result.completion_killed,
+        error_text: claude_result.error_text,
+        task_id: Some(task_id.to_string()),
+        run_id: params.run_id.clone(),
+    };
     let outcome = detection::analyze_output(
         &claude_result.output,
         claude_result.exit_code,
+        &signals,
         &slot.working_root,
     );
 
@@ -402,6 +412,8 @@ pub fn run_slot_iteration(
             key_decisions_count: 0,
             conversation,
             shown_learning_ids: bundle.shown_learning_ids.clone(),
+            grace_buffer_tail: claude_result.grace_buffer_tail,
+            completion_killed: claude_result.completion_killed,
         },
         claim_succeeded: true,
         shown_learning_ids: bundle.shown_learning_ids.clone(),
@@ -483,6 +495,8 @@ pub(super) fn slot_failure_result(
             key_decisions_count: 0,
             conversation: None,
             shown_learning_ids: Vec::new(),
+            grace_buffer_tail: String::new(),
+            completion_killed: false,
         },
         claim_succeeded,
         shown_learning_ids: Vec::new(),
@@ -545,9 +559,11 @@ pub(super) fn process_slot_result(
     }
 
     // Per-slot PromptTooLong recovery — mirrors the sequential Step 8.5 in
-    // `run_iteration`. Must run BEFORE `process_iteration_output` so the
-    // task row is reset to `todo` (rungs 1-3) or `blocked` (rung 4) before
-    // the pipeline's crash-tracking write. Order of operations is
+    // `run_iteration`. Untagged overflow must run BEFORE
+    // `process_iteration_output` so the task row is reset to `todo` (rungs
+    // 1-3) or `blocked` (rung 5) before the pipeline's crash-tracking write.
+    // A `<completed>` tag that resolves to this claim skips the entire call
+    // (no context rows, no rungs). Order of operations inside the ladder is
     // contractual: ctx update → DB UPDATE → stderr → dump → JSONL → rotate.
     if matches!(
         slot_result.iteration_result.outcome,
@@ -603,9 +619,10 @@ pub(super) fn process_slot_result(
         );
         // CONTRACT-001: route the per-slot overflow reaction through the shared
         // coordinator (`slot_index: Some(slot_idx)`); the direct leaf call is
-        // denied here by `#![deny(deprecated)]`.
-        let _ =
-            reactions::post_output::handle_overflow(reactions::post_output::HandleOverflowParams {
+        // denied here by `#![deny(deprecated)]`. The completed-tag gate skips
+        // the call entirely; it does not wrap only the status reset.
+        let _ = reactions::post_output::handle_overflow_unless_completed(
+            reactions::post_output::HandleOverflowParams {
                 ctx,
                 conn: params.conn,
                 task_id: tid,
@@ -618,7 +635,10 @@ pub(super) fn process_slot_result(
                 slot_index: Some(slot_idx),
                 effective_runner,
                 project_config: params.project_config,
-            });
+            },
+            &slot_result.iteration_result.output,
+            params.task_prefix,
+        );
     }
 
     // Pipeline contract requires a `working_root` even when skip_git is on
@@ -655,6 +675,8 @@ pub(super) fn process_slot_result(
             effective_effort: slot_result.iteration_result.effective_effort.as_deref(),
             effective_runner: slot_result.iteration_result.effective_runner,
             slot_index: Some(slot_idx),
+            grace_buffer_tail: &slot_result.iteration_result.grace_buffer_tail,
+            completion_killed: slot_result.iteration_result.completion_killed,
         });
 
     slot_result.iteration_result.key_decisions_count = processing_outcome.key_decisions_count;
@@ -832,6 +854,8 @@ mod tests {
                 key_decisions_count: 0,
                 conversation: None,
                 shown_learning_ids: Vec::new(),
+                grace_buffer_tail: String::new(),
+                completion_killed: false,
             },
             claim_succeeded: true,
             shown_learning_ids: vec![42, 77],

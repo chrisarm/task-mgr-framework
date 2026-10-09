@@ -125,6 +125,8 @@ fn run_pipeline_crash(
         effective_effort: None,
         effective_runner: None,
         slot_index: None,
+        grace_buffer_tail: "",
+        completion_killed: false,
     });
     outcome
 }
@@ -160,6 +162,8 @@ fn run_pipeline_noop(
         effective_effort: None,
         effective_runner: None,
         slot_index: None,
+        grace_buffer_tail: "",
+        completion_killed: false,
     });
     outcome
 }
@@ -197,6 +201,8 @@ fn run_pipeline_completion(
         effective_effort: None,
         effective_runner: None,
         slot_index: None,
+        grace_buffer_tail: "",
+        completion_killed: false,
     });
     outcome
 }

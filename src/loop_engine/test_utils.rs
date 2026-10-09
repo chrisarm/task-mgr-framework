@@ -23,6 +23,12 @@ pub static CLAUDE_BINARY_MUTEX: Mutex<()> = Mutex::new(());
 /// a consistent order to avoid deadlock.
 pub static GROK_BINARY_MUTEX: Mutex<()> = Mutex::new(());
 
+/// Shared mutex for tests that mutate the `CODEX_BINARY` environment variable.
+///
+/// Same cross-module rule as [`GROK_BINARY_MUTEX`]. A module-local lock does
+/// not serialize against `limit_shape` and `project_config` tests in this binary.
+pub static CODEX_BINARY_MUTEX: Mutex<()> = Mutex::new(());
+
 /// RAII guard that sets an environment variable and restores it on drop.
 ///
 /// Prevents env-var leaks when a test panics before the cleanup line.

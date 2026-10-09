@@ -36,6 +36,9 @@
 //!    (`scan_output_for_completed_tasks`) →
 //!    `is_task_reported_already_complete` fallback. The fallback fires in
 //!    BOTH skip-git modes — that's the wave-mode parity fix the PRD calls out.
+//!    When `completion_killed` is set and `output` has no `<completed>` tag,
+//!    that tag rung scans `grace_buffer_tail` (empty or non-empty `output`).
+//!    `conversation` is head-capped and is not the fallback.
 //! 5. `learnings::ingestion::extract_learnings_from_output` — opt-out via the
 //!    `TASK_MGR_NO_EXTRACT_LEARNINGS=1` env var.
 //! 6. `feedback::record_iteration_feedback` — bandit reward signal for the
@@ -196,6 +199,14 @@ pub struct ProcessingParams<'a> {
     /// the sequential `run_loop` call site. Threaded into the progress log
     /// entry header (`Slot N`) so wave entries are distinguishable.
     pub slot_index: Option<usize>,
+    /// Borrow of [`crate::loop_engine::engine::IterationResult::grace_buffer_tail`].
+    /// When `completion_killed` is set and `output` has no `<completed>` tag,
+    /// the ladder scans this tail. `conversation` is not a substitute: it is
+    /// head-capped and can already have dropped the tag that armed the grace.
+    pub grace_buffer_tail: &'a str,
+    /// Copied from [`crate::loop_engine::engine::IterationResult::completion_killed`].
+    /// Gates the FEAT-006 tail scan. Early-exit results pass `false`.
+    pub completion_killed: bool,
 }
 
 /// Run the shared post-Claude pipeline.
@@ -232,6 +243,8 @@ pub fn process_iteration_output(params: ProcessingParams<'_>) -> ProcessingOutco
         effective_effort,
         effective_runner,
         slot_index,
+        grace_buffer_tail,
+        completion_killed,
     } = params;
 
     let mut result = ProcessingOutcome::default();
@@ -355,7 +368,16 @@ pub fn process_iteration_output(params: ProcessingParams<'_>) -> ProcessingOutco
         // (peer tasks Claude finished alongside the claimed one).
         // Claim-scoped short-id rewrite mirrors Step 3 so bare
         // `<completed>REFACTOR-001</completed>` marks the full claimed id done.
-        let completed_tags = parse_completed_tasks(output);
+        //
+        // A grace-kill can leave the tag only in the assistant buffer that
+        // armed the grace. `output` is `result.result` (a summary, or empty).
+        // Scan the tail for both, and only when this run was grace-killed.
+        // Do not read `conversation`: it is head-capped, so the tag can
+        // already be gone. A tag for Y still marks Y, not the claim.
+        let mut completed_tags = parse_completed_tasks(output);
+        if completed_tags.is_empty() && completion_killed {
+            completed_tags = parse_completed_tasks(grace_buffer_tail);
+        }
         for completed_id_raw in &completed_tags {
             let resolved = resolve_tag_id_to_claimed(completed_id_raw, claimed_id, task_prefix);
             if resolved != completed_id_raw.as_str() {

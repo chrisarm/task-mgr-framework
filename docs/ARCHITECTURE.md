@@ -465,6 +465,15 @@ The per-file budget (1500 chars) prevents one large file from consuming the enti
 - **Status transitions** emit a `<task-status>TASK-ID:done</task-status>` side-band tag (statuses: `done`, `failed`, `skipped`, `irrelevant`, `blocked`). `detection::extract_status_updates` parses all tags in the output; `engine::apply_status_updates` dispatches each through the existing `complete` / `fail` / `skip` / `irrelevant` / `reset_tasks` command handlers. Unknown status keywords are logged and skipped; malformed tags don't corrupt well-formed tags later in the output. Side-band tags do NOT change `IterationOutcome` — they're metadata applied alongside whatever outcome detection returned.
 - **Permission guard**: `--disallowedTools` passed to the Claude subprocess scopes-deny `Edit`/`Write` on `tasks/*.json` paths. `Read` on the PRD and `Bash(task-mgr:*)` remain allowed. The iteration prompt (`prompt_sections::task_ops`) documents the rules directly so the agent knows the intended alternative before hitting the guard.
 
+**Iteration outcome: signal capture → gate → pipeline → snapshot reaction**: classifying an iteration is four ordered steps, not one substring scan.
+
+1. **Signal capture** — `drive_stream` returns, alongside the output and conversation, an `OutputSignals` set: `cli_error` (the stream-json `result.is_error` flag or a `StreamEvent::Error`), `completion_killed` (task-mgr's own post-completion grace kill), and the retained `error_text`.
+2. **Gate** — `detection::analyze_output` runs its text classifiers (`is_rate_limited`, `is_prompt_too_long`, `is_transient_backend`) only when `has_cli_error = cli_error || (exit_code != 0 && !completion_killed)`, and when `cli_error` is set it scans the retained `error_text` rather than the agent's summary. Without a CLI-error signal, an agent summary that mentions a rate limit is just prose, so a successful iteration can no longer be reclassified into a state reset.
+3. **Pipeline** — both paths clone the `IterationOutcome` before calling `iteration_pipeline::process_iteration_output`, which runs the completion ladder and may rewrite the live outcome to `Completed`.
+4. **Snapshot reaction** — the account reactions (`reactions::account::react_to_outputs`) and the iteration-budget give-back read that pre-pipeline clone, so a genuine rate limit still waits while a task the ladder marked `done` stays `done`. Sequentially the wrapper commit (`react_to_completions`) lands before the wait; in wave mode the single per-wave reaction runs after each slot is processed and before merge-back.
+
+When any channel looks limit-shaped, a single JSON line is appended to `.task-mgr/logs/limit-shape-<prefix>.jsonl` as evidence for future scan work; it does not change what the classifiers read.
+
 ### Crash recovery strategy
 
 Recovery operates at multiple levels:

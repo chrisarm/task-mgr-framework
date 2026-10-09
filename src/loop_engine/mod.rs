@@ -20,6 +20,7 @@ pub mod git_reconcile;
 pub mod guidance;
 pub(crate) mod iteration;
 pub mod iteration_pipeline;
+pub(crate) mod limit_shape;
 pub(crate) mod merge_resolver;
 pub mod model;
 pub mod monitor;

@@ -273,6 +273,8 @@ fn wave_crash_on_task_populates_crashed_last_iteration_true() {
         effective_effort: None,
         effective_runner: None,
         slot_index: None,
+        grace_buffer_tail: "",
+        completion_killed: false,
     });
 
     assert_eq!(
@@ -367,6 +369,8 @@ fn sequential_success_clears_crashed_last_iteration_for_task() {
         effective_effort: None,
         effective_runner: None,
         slot_index: None,
+        grace_buffer_tail: "",
+        completion_killed: false,
     });
 
     // CODE-FIX-003: terminal transitions prune the entry entirely rather than
@@ -431,6 +435,8 @@ fn pipeline_pass_with_terminal_failed_status_tag_prunes_crashed_last_iteration()
         effective_effort: None,
         effective_runner: None,
         slot_index: None,
+        grace_buffer_tail: "",
+        completion_killed: false,
     });
 
     assert!(
@@ -491,6 +497,8 @@ fn pipeline_loop_keeps_crashed_last_iteration_bounded_by_task_count() {
             effective_effort: None,
             effective_runner: None,
             slot_index: None,
+            grace_buffer_tail: "",
+            completion_killed: false,
         });
     }
 

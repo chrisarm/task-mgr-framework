@@ -15,12 +15,15 @@
 //! primitives, exercised by that module's own unit tests as the equivalence
 //! oracle for this relocation.
 //!
-//! **Ordering relative to the shared pipeline**: `handle_overflow` fires on the
-//! `PromptTooLong` crash outcome BEFORE
+//! **Ordering relative to the shared pipeline**: untagged `handle_overflow`
+//! fires on the `PromptTooLong` crash outcome BEFORE
 //! [`crate::loop_engine::iteration_pipeline::process_iteration_output`] runs for
 //! that iteration/slot — in both paths. The recovery state (the `todo`/`blocked`
 //! DB reset and the ctx overrides) must be durable before the pipeline's
-//! crash-tracking write observes the outcome. See
+//! crash-tracking write observes the outcome. One exception:
+//! [`handle_overflow_unless_completed`] skips the entire call when a
+//! `<completed>` tag resolves to the claimed id (no context rows, no rungs).
+//! Git-only and output-scan completions are not that exception. See
 //! `src/loop_engine/CLAUDE.md` → "Overflow recovery and diagnostics".
 //!
 //! The post-output **rate-limit** reaction (`react_to_outputs`) was relocated
@@ -35,6 +38,7 @@ use rusqlite::Connection;
 use crate::lifecycle::TaskLifecycle;
 use crate::loop_engine::engine::{IterationContext, active_rungs, now_unix_secs};
 use crate::loop_engine::model::{self, Provider, ResolvedModelsConfig};
+use crate::loop_engine::output_parsing::claimed_id_in_completed_tags;
 use crate::loop_engine::overflow::{
     DumpHeader, OverflowEvent, RecoveryAction, append_event_log, dump_prompt, rotate_dumps_keep_n,
     sanitize_id_for_filename,
@@ -141,9 +145,31 @@ pub struct HandleOverflowParams<'a> {
     pub project_config: &'a ProjectConfig,
 }
 
+/// Run [`handle_overflow`] unless a `<completed>` tag already names this claim.
+///
+/// Returns `None` when the call is skipped: no `overflow_recovered` insert,
+/// no model snapshot, no rungs 1–5. Otherwise returns the ladder's action.
+///
+/// Both execution paths call this **before** `process_iteration_output`.
+/// A tag that does not resolve to `params.task_id` still enters the ladder.
+/// Git commit subjects and output-scan `[id]` mentions are not tags.
+pub fn handle_overflow_unless_completed(
+    params: HandleOverflowParams<'_>,
+    output: &str,
+    task_prefix: Option<&str>,
+) -> Option<RecoveryAction> {
+    if claimed_id_in_completed_tags(output, params.task_id, task_prefix) {
+        return None;
+    }
+    Some(handle_overflow(params))
+}
+
 /// Overflow recovery coordinator: the single home both execution paths call
 /// when a task hits "Prompt is too long". Sequential passes `slot_index: None`
 /// and folds the one result; wave passes `slot_index: Some(n)` per slot.
+///
+/// Production paths call [`handle_overflow_unless_completed`], which skips
+/// this function entirely when the claim already has a `<completed>` tag.
 ///
 /// Handles a `PromptTooLong` outcome end-to-end: pick a recovery rung, mutate
 /// `IterationContext`, update the task row, emit the stderr message, and write

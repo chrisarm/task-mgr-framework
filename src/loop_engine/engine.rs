@@ -249,6 +249,16 @@ pub struct IterationResult {
     /// `iteration_pipeline::process_iteration_output` consumes this via
     /// `ProcessingParams.shown_learning_ids` to record bandit feedback.
     pub shown_learning_ids: Vec<i64>,
+    /// Assistant-buffer tail that `arm_completion_grace` scans. Copied from
+    /// `RunnerResult.grace_buffer_tail` only on the post-runner return of
+    /// `run_iteration` / `run_slot_iteration`. Empty on every early return:
+    /// those paths have no runner buffer to forward. The pipeline never sees
+    /// `RunnerResult`, so FEAT-006 reads this off `ProcessingParams`.
+    pub grace_buffer_tail: String,
+    /// Whether the watchdog's post-completion grace kill terminated the runner.
+    /// Copied from `RunnerResult.completion_killed` on that same post-runner
+    /// return; `false` on every early return.
+    pub completion_killed: bool,
 }
 
 /// Current wall-clock time as whole seconds since the Unix epoch.
@@ -1485,6 +1495,8 @@ mod tests {
             key_decisions_count: 0,
             conversation: None,
             shown_learning_ids: Vec::new(),
+            grace_buffer_tail: String::new(),
+            completion_killed: false,
         };
         assert_eq!(result.task_id, Some("FEAT-001".to_string()));
         assert!(!result.should_stop);

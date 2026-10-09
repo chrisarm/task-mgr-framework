@@ -1054,6 +1054,23 @@ pub fn run_wave_iteration(
         }
     }
 
+    // Snapshot BEFORE the pipeline. `record_completion` rewrites a RateLimit
+    // slot to Completed when the output carries `<completed>`; the account
+    // reaction and the budget give-back must read this copy. Reading the live
+    // post-pipeline outcome skips the wait (E10). Only claim_succeeded slots
+    // participate — failure entries never executed and stay out of the slice.
+    let outcome_snapshots: Vec<Option<IterationOutcome>> = wave_result
+        .outcomes
+        .iter()
+        .map(|s| {
+            if s.claim_succeeded {
+                Some(s.iteration_result.outcome.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+
     // Per-slot post-processing on the main thread. The pipeline mutates each
     // slot's `IterationOutcome` in place when retroactive completion is
     // detected, so the iteration borrows mutably.
@@ -1067,23 +1084,29 @@ pub fn run_wave_iteration(
     // wave (never once per rate-limited slot). Runs AFTER `process_slot_result`
     // — so completed slots are already `done` and the reset's
     // `status='in_progress'` guard cannot clobber them (B1) — and BEFORE
-    // `handle_task_failure` / crash policy / merge-back. On `WaitedAndRetry` the
-    // wave returns early WITHOUT consuming the loop-bound iteration (B2,
+    // `handle_task_failure` / crash policy / merge-back. Items carry the
+    // pre-pipeline snapshot (FEAT-004), not the live post-pipeline outcome:
+    // a tagged RateLimit slot still waits. On `WaitedAndRetry` the wave
+    // returns early WITHOUT consuming the loop-bound iteration (B2,
     // `iteration_consumed: false`) and WITHOUT zeroing the merge-fail streak
     // (B3, `rate_limited_retry: true` makes the orchestrator skip the FEAT-002
     // reset/halt check this wave). The completed-but-unmerged slots' ephemeral
     // branches persist; next wave's `ephemeral_overlay` (built at the top of
     // `run_wave_iteration`) re-discovers them, so deferred-merge affinity is
-    // preserved without extra work here.
+    // preserved without extra work here. Merge stays deferred — do not call
+    // `react_to_completions` or merge inside this reaction.
     {
         let rate_limit_items: Vec<reactions::account::OutputReactionItem<'_>> = wave_result
             .outcomes
             .iter()
-            .filter(|s| s.claim_succeeded)
-            .map(|s| reactions::account::OutputReactionItem {
-                task_id: s.iteration_result.task_id.as_deref(),
-                outcome: &s.iteration_result.outcome,
-                output: &s.iteration_result.output,
+            .zip(outcome_snapshots.iter())
+            .filter_map(|(s, snap)| {
+                let outcome = snap.as_ref()?;
+                Some(reactions::account::OutputReactionItem {
+                    task_id: s.iteration_result.task_id.as_deref(),
+                    outcome,
+                    output: &s.iteration_result.output,
+                })
             })
             .collect();
         // FEAT-008: the reaction records a quota blackout (spillover path)
@@ -1098,7 +1121,7 @@ pub fn run_wave_iteration(
             // on Claude provider enablement — NEVER on `usage_params.enabled`
             // (which folds in the `LOOP_USAGE_CHECK_ENABLED` env switch and is
             // pre-iteration-only). Must stay byte-identical to the sequential
-            // construction in `iteration.rs`.
+            // construction in `orchestrator.rs`.
             anthropic_account_io_allowed: resolved_models
                 .is_provider_enabled(model::Provider::Claude),
             tasks_dir: params.tasks_dir,
@@ -4338,6 +4361,539 @@ mod tests {
         assert_eq!(
             crate::loop_engine::test_utils::get_task_status(&conn, "FEAT-001"),
             "in_progress"
+        );
+    }
+
+    // --- FEAT-004: wave RateLimit reaction from pre-pipeline snapshot (E10) ---
+    //
+    // Drives `process_slot_result` then `react_to_outputs_inner` with an
+    // injected wait on the snapshotted outcomes. Never calls
+    // `react_to_outputs` or `run_wave_iteration`, so the Usage API is not
+    // contacted and merge-back never runs.
+
+    fn e10_slot_result(
+        slot_index: usize,
+        task_id: &str,
+        outcome: IterationOutcome,
+        output: &str,
+    ) -> SlotResult {
+        SlotResult {
+            slot_index,
+            iteration_result: crate::loop_engine::engine::IterationResult {
+                outcome,
+                task_id: Some(task_id.to_string()),
+                files_modified: Vec::new(),
+                should_stop: false,
+                operator_stopped: false,
+                output: output.to_string(),
+                effective_model: None,
+                effective_effort: None,
+                effective_runner: Some(RunnerKind::Claude),
+                key_decisions_count: 0,
+                conversation: None,
+                shown_learning_ids: Vec::new(),
+                grace_buffer_tail: String::new(),
+                completion_killed: false,
+            },
+            claim_succeeded: true,
+            shown_learning_ids: Vec::new(),
+            prompt_for_overflow: None,
+            section_sizes: Vec::new(),
+            dropped_sections: Vec::new(),
+            task_difficulty: None,
+            effective_runner: RunnerKind::Claude,
+            pre_dispatch_provider_hint: None,
+        }
+    }
+
+    /// E10 wave: RateLimit + `<completed>X</completed>` → X stays done, wait
+    /// runs once from the snapshot, peer in_progress resets. A post-pipeline
+    /// `Completed` read returns `None` and does not wait. Give-back flags and
+    /// the pre-merge return are pinned by
+    /// `e10_wave_rate_limit_retry_returns_before_merge_and_uses_snapshots`.
+    #[test]
+    fn e10_wave_completed_tag_stays_done_and_waits_once_from_snapshot() {
+        use crate::loop_engine::test_utils::EnvGuard;
+        use std::cell::Cell;
+
+        let _no_extract = EnvGuard::set("TASK_MGR_NO_EXTRACT_LEARNINGS", "1");
+        let (db_dir, mut conn) = setup_test_db();
+        insert_run(&conn, "run-e10-wave");
+        insert_in_progress_task(&conn, "E10-X");
+        insert_in_progress_task(&conn, "E10-PEER");
+
+        let repo = setup_git_repo();
+        let slot_paths = [repo.path().to_path_buf()];
+        let base_prompt = db_dir.path().join("base-prompt.md");
+        std::fs::write(&base_prompt, "base\n").unwrap();
+        let progress_path = db_dir.path().join("progress-e10-wave.txt");
+        std::fs::write(&progress_path, "").unwrap();
+        let prd_path = db_dir.path().join("prd.json");
+        std::fs::write(
+            &prd_path,
+            r#"{"project":"e10","userStories":[
+                {"id":"E10-X","title":"X","passes":false,"priority":1},
+                {"id":"E10-PEER","title":"Peer","passes":false,"priority":2}
+            ]}"#,
+        )
+        .unwrap();
+
+        let output = "<completed>E10-X</completed>\n\
+                      You've hit your limit · resets 4pm (America/Los_Angeles)\n";
+        let mut wave_outcomes = vec![e10_slot_result(
+            0,
+            "E10-X",
+            IterationOutcome::RateLimit,
+            output,
+        )];
+
+        // Snapshot BEFORE the pipeline — production mirrors this in
+        // `run_wave_iteration`.
+        let outcome_snapshots: Vec<Option<IterationOutcome>> = wave_outcomes
+            .iter()
+            .map(|s| {
+                if s.claim_succeeded {
+                    Some(s.iteration_result.outcome.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            outcome_snapshots[0].as_ref(),
+            Some(&IterationOutcome::RateLimit)
+        );
+
+        let signal = SignalFlag::new();
+        let mode = PermissionMode::Dangerous;
+        let project_cfg = crate::loop_engine::project_config::ProjectConfig::default();
+        let prd_implicit: Vec<String> = Vec::new();
+        let wait_calls = Cell::new(0u32);
+        let reaction = {
+            let mut params = make_wave_params(
+                &mut conn,
+                db_dir.path(),
+                repo.path(),
+                "main",
+                &slot_paths,
+                &base_prompt,
+                &mode,
+                &signal,
+                db_dir.path(),
+                &prd_path,
+                &progress_path,
+                1,
+                &project_cfg,
+                &prd_implicit,
+            );
+            // process_slot_result / react read params.run_id; align with seed.
+            params.run_id = "run-e10-wave";
+
+            let mut ctx = IterationContext::new(3);
+            let mut agg = WaveAggregator::new(wave_outcomes.len());
+            for slot_result in &mut wave_outcomes {
+                process_slot_result(slot_result, &mut params, &mut ctx, &mut agg);
+            }
+
+            // Ladder rewrote the live outcome; the snapshot stays RateLimit.
+            assert_eq!(
+                wave_outcomes[0].iteration_result.outcome,
+                IterationOutcome::Completed
+            );
+            assert_eq!(
+                outcome_snapshots[0].as_ref(),
+                Some(&IterationOutcome::RateLimit)
+            );
+            assert_eq!(get_task_status(params.conn, "E10-X"), "done");
+            assert_eq!(get_task_status(params.conn, "E10-PEER"), "in_progress");
+            assert_eq!(agg.tasks_completed, 1);
+
+            let wait = |_: u64| {
+                wait_calls.set(wait_calls.get() + 1);
+                true
+            };
+            let models = model::builtin_resolved_models();
+            let account_params = reactions::account::AccountReactionParams {
+                floors: params.usage_params.floors,
+                usage_enabled: params.usage_params.enabled,
+                anthropic_account_io_allowed: models.is_provider_enabled(model::Provider::Claude),
+                tasks_dir: params.tasks_dir,
+                fallback_wait: params.usage_params.fallback_wait,
+                prefix: params.task_prefix.unwrap_or(""),
+                run_id: params.run_id,
+                permission_mode: params.permission_mode,
+                spillover_enabled: false,
+                primary_provider: models.primary_provider,
+                blackout_fallback_secs: models.routing.spillover.blackout_fallback_secs,
+                now_secs: 0,
+                models,
+            };
+            let mut blackout = Default::default();
+            let mut unavailable = Default::default();
+
+            // Known-bad: feeding the post-pipeline outcome skips the wait.
+            // `None` writes nothing, so the peer is still in_progress.
+            {
+                let live_items: Vec<reactions::account::OutputReactionItem<'_>> = wave_outcomes
+                    .iter()
+                    .filter(|s| s.claim_succeeded)
+                    .map(|s| reactions::account::OutputReactionItem {
+                        task_id: s.iteration_result.task_id.as_deref(),
+                        outcome: &s.iteration_result.outcome,
+                        output: &s.iteration_result.output,
+                    })
+                    .collect();
+                assert_eq!(*live_items[0].outcome, IterationOutcome::Completed);
+                let missed = reactions::account::react_to_outputs_inner(
+                    params.conn,
+                    &live_items,
+                    &account_params,
+                    &mut blackout,
+                    &mut unavailable,
+                    None,
+                    &wait,
+                );
+                assert_eq!(missed, reactions::account::AccountReaction::None);
+                assert_eq!(wait_calls.get(), 0, "post-pipeline Completed does not wait");
+                assert_eq!(get_task_status(params.conn, "E10-X"), "done");
+                assert_eq!(get_task_status(params.conn, "E10-PEER"), "in_progress");
+            }
+
+            let rate_limit_items: Vec<reactions::account::OutputReactionItem<'_>> = wave_outcomes
+                .iter()
+                .zip(outcome_snapshots.iter())
+                .filter_map(|(s, snap)| {
+                    let outcome = snap.as_ref()?;
+                    Some(reactions::account::OutputReactionItem {
+                        task_id: s.iteration_result.task_id.as_deref(),
+                        outcome,
+                        output: &s.iteration_result.output,
+                    })
+                })
+                .collect();
+            assert_eq!(rate_limit_items.len(), 1);
+            assert_eq!(*rate_limit_items[0].outcome, IterationOutcome::RateLimit);
+            assert_eq!(rate_limit_items[0].task_id, Some("E10-X"));
+
+            reactions::account::react_to_outputs_inner(
+                params.conn,
+                &rate_limit_items,
+                &account_params,
+                &mut blackout,
+                &mut unavailable,
+                None,
+                &wait,
+            )
+        };
+
+        assert_eq!(
+            reaction,
+            reactions::account::AccountReaction::WaitedAndRetry
+        );
+        assert_eq!(
+            wait_calls.get(),
+            1,
+            "account wait seam runs once for the wave"
+        );
+
+        assert_eq!(get_task_status(&conn, "E10-X"), "done");
+        assert_eq!(
+            get_task_status(&conn, "E10-PEER"),
+            "todo",
+            "in_progress peer that did not complete is still reset"
+        );
+        assert_eq!(
+            wave_outcomes[0].iteration_result.outcome,
+            IterationOutcome::Completed,
+            "live outcome stays Completed after the snapshot reaction"
+        );
+    }
+
+    /// Structural: WaitedAndRetry early-return precedes merge-back, and the
+    /// rate-limit items are built from `outcome_snapshots`.
+    #[test]
+    fn e10_wave_rate_limit_retry_returns_before_merge_and_uses_snapshots() {
+        let src = std::fs::read_to_string("src/loop_engine/wave_scheduler.rs")
+            .expect("read wave_scheduler.rs");
+        let start = src
+            .find("pub fn run_wave_iteration(")
+            .expect("run_wave_iteration");
+        let after = &src[start..];
+        let end = after.find("\n#[cfg(test)]").unwrap_or(after.len());
+        let body = &after[..end];
+
+        let snap = body
+            .find("let outcome_snapshots:")
+            .expect("pre-pipeline outcome_snapshots");
+        let process = body
+            .find("process_slot_result(")
+            .expect("process_slot_result call");
+        assert!(
+            snap < process,
+            "outcome_snapshots must be captured before process_slot_result"
+        );
+
+        let items = body
+            .find("zip(outcome_snapshots.iter())")
+            .expect("rate_limit_items zip outcome_snapshots");
+        let reaction = body
+            .find("reactions::account::react_to_outputs(")
+            .expect("react_to_outputs call");
+        assert!(
+            items < reaction,
+            "rate_limit_items must bind snapshots before react_to_outputs"
+        );
+
+        // First WaitedAndRetry arm (rate-limit) must return before merge-back.
+        let waited = body
+            .find("AccountReaction::WaitedAndRetry")
+            .expect("AccountReaction::WaitedAndRetry");
+        let merge = body
+            .find("merge_slot_branches_with_resolver(")
+            .expect("merge_slot_branches_with_resolver");
+        assert!(
+            waited < merge,
+            "WaitedAndRetry early return must precede merge-back"
+        );
+        // The retry arm itself is the give-back. Do not reconstruct
+        // WaveOutcome in a test — that would pass if this return changed.
+        let arm_end = body[waited..]
+            .find("AccountReaction::OperatorStopped")
+            .map(|i| waited + i)
+            .expect("OperatorStopped follows the rate-limit retry arm");
+        let retry_arm = &body[waited..arm_end];
+        assert!(
+            retry_arm.contains("iteration_consumed: false"),
+            "a RateLimit snapshot must not consume the iteration"
+        );
+        assert!(
+            !retry_arm.contains("iteration_consumed: true"),
+            "retry arm must not consume the iteration"
+        );
+        assert!(
+            retry_arm.contains("rate_limited_retry: true"),
+            "a RateLimit snapshot must set rate_limited_retry"
+        );
+        assert!(
+            retry_arm.contains("failed_merges: Vec::new()"),
+            "retry return must not report a merge"
+        );
+        // Negative: reaction block must not call merge or react_to_completions.
+        let reaction_block_end = body[reaction..]
+            .find("\n    // FEAT-014:")
+            .map(|i| reaction + i)
+            .expect("FEAT-014 transient block follows rate-limit reaction");
+        let reaction_block = &body[items..reaction_block_end];
+        assert!(
+            !reaction_block.contains("merge_slot_branches"),
+            "rate-limit reaction must not merge"
+        );
+        assert!(
+            !reaction_block.contains("react_to_completions"),
+            "rate-limit reaction must not call react_to_completions"
+        );
+    }
+
+    // --- FEAT-005: wave PromptTooLong completed-tag skip (E11) ---
+    //
+    // Drives `process_slot_result`, which calls
+    // `handle_overflow_unless_completed` and then the pipeline. Does not
+    // spawn a runner or call `run_wave_iteration`.
+
+    fn e11_wave_slot(task_id: &str, output: &str) -> SlotResult {
+        let mut slot = e10_slot_result(
+            0,
+            task_id,
+            IterationOutcome::Crash(config::CrashType::PromptTooLong),
+            output,
+        );
+        slot.iteration_result.effective_effort = Some("xhigh".to_string());
+        // Production slots carry the assembled prompt into overflow dumps.
+        // The debug assert in process_slot_result requires it on PromptTooLong.
+        slot.prompt_for_overflow = Some("prompt\n".to_string());
+        slot
+    }
+
+    fn assert_no_overflow_context(ctx: &IterationContext, task_id: &str) {
+        assert!(
+            !ctx.overflow_recovered.contains(task_id),
+            "skip must not insert overflow_recovered for {task_id}"
+        );
+        assert!(!ctx.overflow_original_model.contains_key(task_id));
+        assert!(!ctx.overflow_original_task_model.contains_key(task_id));
+        assert!(!ctx.effort_overrides.contains_key(task_id));
+        assert!(!ctx.model_overrides.contains_key(task_id));
+        assert!(!ctx.runner_overrides.contains_key(task_id));
+    }
+
+    fn assert_overflow_entered(ctx: &IterationContext, task_id: &str) {
+        assert!(ctx.overflow_recovered.contains(task_id));
+        assert!(ctx.overflow_original_model.contains_key(task_id));
+        assert!(ctx.overflow_original_task_model.contains_key(task_id));
+        assert!(
+            ctx.effort_overrides.contains_key(task_id),
+            "xhigh must take rung 1 for {task_id}"
+        );
+    }
+
+    fn drive_e11_wave(
+        claimed: &str,
+        output: &str,
+        peers: &[&str],
+        task_prefix: Option<&str>,
+        check: impl FnOnce(&Connection, &IterationContext, &SlotResult),
+    ) {
+        use crate::loop_engine::test_utils::EnvGuard;
+
+        let _no_extract = EnvGuard::set("TASK_MGR_NO_EXTRACT_LEARNINGS", "1");
+        let (db_dir, mut conn) = setup_test_db();
+        insert_run(&conn, "run-e11-wave");
+        insert_in_progress_task(&conn, claimed);
+        for peer in peers {
+            insert_in_progress_task(&conn, peer);
+        }
+        let mut ids = vec![claimed.to_string()];
+        ids.extend(peers.iter().map(|id| (*id).to_string()));
+        let stories = ids
+            .iter()
+            .map(|id| format!(r#"{{"id":"{id}","title":"t","passes":false,"priority":1}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let prd_path = db_dir.path().join("prd.json");
+        std::fs::write(
+            &prd_path,
+            format!(r#"{{"project":"e11","userStories":[{stories}]}}"#),
+        )
+        .unwrap();
+        let progress_path = db_dir.path().join("progress-e11-wave.txt");
+        std::fs::write(&progress_path, "").unwrap();
+        let base_prompt = db_dir.path().join("base-prompt.md");
+        std::fs::write(&base_prompt, "base\n").unwrap();
+        let repo = setup_git_repo();
+        let slot_paths = [repo.path().to_path_buf()];
+        let signal = SignalFlag::new();
+        let mode = PermissionMode::Dangerous;
+        let project_cfg = crate::loop_engine::project_config::ProjectConfig::default();
+        let prd_implicit: Vec<String> = Vec::new();
+
+        let mut slot = e11_wave_slot(claimed, output);
+        let mut ctx = IterationContext::new(3);
+        {
+            let mut params = make_wave_params(
+                &mut conn,
+                db_dir.path(),
+                repo.path(),
+                "main",
+                &slot_paths,
+                &base_prompt,
+                &mode,
+                &signal,
+                db_dir.path(),
+                &prd_path,
+                &progress_path,
+                1,
+                &project_cfg,
+                &prd_implicit,
+            );
+            params.run_id = "run-e11-wave";
+            params.task_prefix = task_prefix;
+            let mut agg = WaveAggregator::new(1);
+            process_slot_result(&mut slot, &mut params, &mut ctx, &mut agg);
+        }
+        check(&conn, &ctx, &slot);
+    }
+
+    #[test]
+    fn e11_wave_completed_tag_skips_overflow_and_marks_done() {
+        let output = "<completed>E11-X</completed>\nPrompt is too long\n";
+        drive_e11_wave("E11-X", output, &[], None, |conn, ctx, slot| {
+            assert_eq!(get_task_status(conn, "E11-X"), "done");
+            assert_no_overflow_context(ctx, "E11-X");
+            assert_eq!(slot.iteration_result.outcome, IterationOutcome::Completed);
+        });
+    }
+
+    #[test]
+    fn e11_wave_short_completed_tag_resolves_and_skips() {
+        let id = "fe92ec5b-E11-X";
+        let output = "<completed>E11-X</completed>\n";
+        drive_e11_wave(id, output, &[], Some("fe92ec5b"), |conn, ctx, slot| {
+            assert_eq!(get_task_status(conn, id), "done");
+            assert_no_overflow_context(ctx, id);
+            assert_eq!(slot.iteration_result.outcome, IterationOutcome::Completed);
+        });
+    }
+
+    #[test]
+    fn e11_wave_other_task_enters_overflow_before_the_pipeline() {
+        let output = "<completed>E11-Y</completed>\nPrompt is too long\n";
+        drive_e11_wave("E11-X", output, &["E11-Y"], None, |conn, ctx, _slot| {
+            assert_eq!(
+                get_task_status(conn, "E11-X"),
+                "todo",
+                "the claim is not in the tags, so the ladder resets it"
+            );
+            assert_overflow_entered(ctx, "E11-X");
+            assert_eq!(get_task_status(conn, "E11-Y"), "done");
+            assert!(!ctx.overflow_recovered.contains("E11-Y"));
+        });
+    }
+
+    #[test]
+    fn e11_wave_output_scan_does_not_skip_overflow() {
+        let output = "I finished [E11-X] in this summary.\n";
+        drive_e11_wave("E11-X", output, &[], None, |conn, ctx, _slot| {
+            assert_eq!(
+                get_task_status(conn, "E11-X"),
+                "todo",
+                "output-scan completion must not skip handle_overflow"
+            );
+            assert_overflow_entered(ctx, "E11-X");
+        });
+    }
+
+    #[test]
+    fn e11_untagged_overflow_call_stays_before_the_pipeline() {
+        let slot_src = include_str!("slot.rs");
+        let start = slot_src
+            .find("pub(super) fn process_slot_result(")
+            .expect("process_slot_result");
+        let body = &slot_src[start..];
+        let end = body.find("\n#[cfg(test)]").expect("slot tests");
+        let body = &body[..end];
+        let overflow = body
+            .find("handle_overflow_unless_completed(")
+            .expect("wave overflow gate");
+        let pipeline = body
+            .find("process_iteration_output(")
+            .expect("wave pipeline call");
+        assert!(
+            overflow < pipeline,
+            "untagged wave overflow must stay before the pipeline"
+        );
+        assert!(
+            !body[pipeline..].contains("handle_overflow("),
+            "process_slot_result must not call the ladder after the pipeline"
+        );
+
+        let iter_src = include_str!("iteration.rs");
+        let start = iter_src
+            .find("pub fn run_iteration(")
+            .expect("run_iteration");
+        let body = &iter_src[start..];
+        let end = body.find("\n#[cfg(test)]").expect("iteration tests");
+        let body = &body[..end];
+        let overflow = body
+            .find("handle_overflow_unless_completed(")
+            .expect("sequential overflow gate");
+        assert!(
+            !body.contains("process_iteration_output("),
+            "run_iteration must leave the pipeline to the orchestrator"
+        );
+        let ret = body.rfind("Ok(IterationResult").expect("iteration return");
+        assert!(
+            overflow < ret,
+            "sequential overflow must run before run_iteration returns"
         );
     }
 }

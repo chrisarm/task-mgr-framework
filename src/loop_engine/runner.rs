@@ -28,9 +28,12 @@ use crate::error::{TaskMgrError, TaskMgrResult};
 use crate::loop_engine::claude::open_pty_for_child_output;
 use crate::loop_engine::claude::{ACTIVE_PREFIX_ENV, ClaudeStreamFormat, is_pty_read_eof};
 use crate::loop_engine::config::PermissionMode;
+use crate::loop_engine::limit_shape::{self, RecordMeta};
 use crate::loop_engine::model::{AuxiliaryLlmPlan, Provider};
 use crate::loop_engine::signals::SignalFlag;
-use crate::loop_engine::stream::{CodexStreamFormat, GrokStreamFormat, drive_stream};
+use crate::loop_engine::stream::{
+    CodexStreamFormat, DriveStreamResult, GrokStreamFormat, drive_stream,
+};
 use crate::loop_engine::watchdog::{TimeoutConfig, exit_code_from_status, watchdog_loop};
 use crate::output::ui;
 
@@ -143,6 +146,23 @@ pub struct RunnerResult {
     /// `Some(uuid)` for ClaudeRunner (unconditional as of FEAT-003).
     /// `None` for GrokRunner (Grok capture lands in FEAT-004).
     pub session_id: Option<Uuid>,
+    /// True when the CLI reported an error via stream-json `result.is_error`
+    /// or `StreamEvent::Error` (assistant `error`, Codex `error` /
+    /// `turn.failed`). Grok always leaves this false — the exit≠0 gate
+    /// covers Grok. `tool_result.is_error` is never read for this flag.
+    /// No `Default` derive: every literal must set the new fields explicitly.
+    pub cli_error: bool,
+    /// Retained error string for gated classifiers when `cli_error` is set:
+    /// the `result` string when `is_error`, otherwise the `StreamEvent::Error`
+    /// string. Codex `turn.failed` text lives here (it is not in
+    /// `derive_output`).
+    pub error_text: Option<String>,
+    /// Tail-retained copy of the assistant buffer that
+    /// `arm_completion_grace` already scans. FEAT-006 uses this as the
+    /// grace-fallback completion scan source; `conversation` is head-capped
+    /// and must not be used as that fallback. Empty in plain (non-stream)
+    /// mode.
+    pub grace_buffer_tail: String,
 }
 
 /// Optional settings for a runner invocation.
@@ -186,7 +206,7 @@ pub struct RunnerOpts<'a> {
     /// Claude Code) line-buffers stdout only when `isatty(1)` is true, so
     /// a pipe causes block-buffered bursts while a PTY streams per line.
     /// stdin remains a pipe (unchanged prompt delivery + no echo).
-    /// Ignored on non-Unix — falls back to piped stdout / inherited stderr.
+    /// Ignored on non-Unix — falls back to piped stdout and piped stderr.
     pub use_pty: bool,
     /// The task ID this spawn is working on. When `Some`, the stream-json
     /// tee scans assistant text for `<completed>TARGET</completed>` and,
@@ -202,8 +222,9 @@ pub struct RunnerOpts<'a> {
     /// warnings). Used by parallel-wave callers to disambiguate which
     /// slot's Claude is talking when multiple subprocesses tee to stderr
     /// concurrently. Sequential callers pass `None` and output is unprefixed.
-    /// Note: child stderr is inherited (not piped) and therefore cannot be
-    /// prefixed — only output that flows through our tee paths is tagged.
+    /// Child stderr is piped and tee'd without a slot prefix so the CLI's own
+    /// bytes stay intact on the terminal. Only stdout that flows through our
+    /// tee paths is tagged.
     pub slot_label: Option<&'a str>,
     /// Active PRD prefix to forward to the child via `TASK_MGR_ACTIVE_PREFIX`.
     /// The loop engine sets this to the iteration's `task_prefix` so that
@@ -524,7 +545,7 @@ impl LlmRunner for ClaudeRunner {
     /// environment variable (useful for testing with mock scripts).
     ///
     /// - stdout is piped, read line-by-line, echoed to stderr (tee), and buffered
-    /// - stderr is inherited (passes through directly to the terminal)
+    /// - stderr is piped, tee'd to the terminal, and tail-retained for the limit-shape record
     /// - The full environment is inherited by the subprocess
     ///
     /// # Errors
@@ -608,12 +629,15 @@ impl LlmRunner for ClaudeRunner {
 
         // PTY: Node.js line-buffers only when isatty(1). `pty_master` must stay
         // in scope through the read loop — dropping it early causes EIO mid-run.
+        // Stderr is always a pipe, including when stdout is a PTY. Mixing it
+        // onto the PTY would drop the bytes the limit-shape line has to store.
+        // The tee thread writes those bytes to the parent terminal.
         #[cfg(unix)]
         let pty_master: Option<std::os::fd::OwnedFd> = if use_pty {
             match open_pty_for_child_output() {
-                Ok((master, slave_out, slave_err)) => {
+                Ok((master, slave_out)) => {
                     cmd.stdout(Stdio::from(slave_out));
-                    cmd.stderr(Stdio::from(slave_err));
+                    cmd.stderr(Stdio::piped());
                     Some(master)
                 }
                 Err(e) => {
@@ -621,18 +645,18 @@ impl LlmRunner for ClaudeRunner {
                         error = %e,
                         "failed to allocate PTY for streaming (falling back to pipe)",
                     );
-                    cmd.stdout(Stdio::piped()).stderr(Stdio::inherit());
+                    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
                     None
                 }
             }
         } else {
-            cmd.stdout(Stdio::piped()).stderr(Stdio::inherit());
+            cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
             None
         };
         #[cfg(not(unix))]
         {
             let _ = use_pty;
-            cmd.stdout(Stdio::piped()).stderr(Stdio::inherit());
+            cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         }
 
         apply_common_env(
@@ -643,6 +667,9 @@ impl LlmRunner for ClaudeRunner {
             RunnerKind::Claude,
         );
         let mut child = spawn_with_context(&mut cmd, &binary, "Claude")?;
+        // Start before stdin write and stdout read so a fast child cannot fill
+        // the stderr pipe and stall before we drain it.
+        let (stderr_buf, stderr_handle) = spawn_claude_stderr_tee(&mut child);
         write_prompt_to_stdin(&mut child, prompt, &binary, "Claude")?;
         let watchdog = spawn_watchdog(child.id(), signal_flag, timeout, target_task_id);
 
@@ -671,7 +698,7 @@ impl LlmRunner for ClaudeRunner {
         };
         let reader = BufReader::new(reader_source);
 
-        let (output, conversation, permission_denials) = if stream_json {
+        let driven = if stream_json {
             drive_stream(
                 reader,
                 &ClaudeStreamFormat,
@@ -680,11 +707,16 @@ impl LlmRunner for ClaudeRunner {
                 slot_label,
             )
         } else {
-            (
-                read_plain_stdout(reader, slot_label, "Claude"),
-                None,
-                Vec::new(),
-            )
+            DriveStreamResult {
+                output: read_plain_stdout(reader, slot_label, "Claude"),
+                conversation: None,
+                denials: Vec::new(),
+                cli_error: false,
+                error_text: None,
+                grace_buffer_tail: String::new(),
+                result_is_error: false,
+                assistant_error: None,
+            }
         };
 
         let status = child.wait().map_err(|e| TaskMgrError::IoErrorWithContext {
@@ -694,15 +726,46 @@ impl LlmRunner for ClaudeRunner {
         })?;
 
         let (timed_out, completion_killed) = watchdog.teardown();
+        let _ = stderr_handle.join();
+        let stderr_bytes = stderr_buf.lock().map(|b| b.clone()).unwrap_or_default();
+        let stderr = claude_stderr_tail(&stderr_bytes);
+        // Plain mode has no result line. result_text stays empty there so the
+        // record does not relabel raw stdout as result.result.
+        let result_text = if stream_json {
+            driven.output.as_str()
+        } else {
+            ""
+        };
+        let assistant_error = if stream_json {
+            driven.assistant_error.as_deref()
+        } else {
+            None
+        };
+        limit_shape::record_claude(
+            &RecordMeta {
+                db_dir,
+                active_prefix,
+                exit_code: exit_code_from_status(status),
+                cli_error: driven.cli_error,
+                completion_killed,
+            },
+            stream_json && driven.result_is_error,
+            result_text,
+            assistant_error,
+            &stderr,
+        );
 
         Ok(RunnerResult {
             exit_code: exit_code_from_status(status),
-            output,
-            conversation,
+            output: driven.output,
+            conversation: driven.conversation,
             timed_out,
             completion_killed,
-            permission_denials,
+            permission_denials: driven.denials,
             session_id: Some(uuid),
+            cli_error: driven.cli_error,
+            error_text: driven.error_text,
+            grace_buffer_tail: driven.grace_buffer_tail,
         })
     }
 
@@ -922,7 +985,7 @@ impl LlmRunner for GrokRunner {
                 .expect("stdout should be piped (Stdio::piped() was set on spawn)"),
         );
 
-        let (output, conversation, permission_denials) = if stream_json {
+        let driven = if stream_json {
             drive_stream(
                 reader,
                 &GrokStreamFormat,
@@ -931,12 +994,28 @@ impl LlmRunner for GrokRunner {
                 slot_label,
             )
         } else {
-            (
-                read_plain_stdout(reader, slot_label, "Grok"),
-                None,
-                Vec::new(),
-            )
+            DriveStreamResult {
+                output: read_plain_stdout(reader, slot_label, "Grok"),
+                conversation: None,
+                denials: Vec::new(),
+                cli_error: false,
+                error_text: None,
+                grace_buffer_tail: String::new(),
+                result_is_error: false,
+                assistant_error: None,
+            }
         };
+        // Destructure so plain-mode and stream-json share the same locals;
+        // Grok forces cli_error false / error_text None (CONTRACT-001).
+        let DriveStreamResult {
+            output,
+            conversation,
+            denials: permission_denials,
+            grace_buffer_tail,
+            ..
+        } = driven;
+        let cli_error = false;
+        let error_text = None;
 
         let status = child.wait().map_err(|e| TaskMgrError::IoErrorWithContext {
             file_path: binary.clone(),
@@ -948,6 +1027,9 @@ impl LlmRunner for GrokRunner {
         let _ = stderr_handle.join();
         let elapsed = spawn_instant.elapsed();
         let exit_code = exit_code_from_status(status);
+        // Same buffer the auth and transient sniffs read. Read it on exit 0
+        // too so a channel match can be recorded without classifying it.
+        let stderr_str = stderr_buf.lock().map(|b| b.clone()).unwrap_or_default();
 
         // Post-spawn snapshot: diff against before to find the new session dir.
         let session_id: Option<Uuid> = grok_dir_opt.as_ref().and_then(|grok_dir| {
@@ -969,11 +1051,23 @@ impl LlmRunner for GrokRunner {
             }
         });
 
-        // Post-exit stderr classification. Read the buffered stderr ONCE for
-        // both sniffs (auth-failure + transient-backend).
-        if exit_code != 0 {
-            let stderr_str = stderr_buf.lock().map(|b| b.clone()).unwrap_or_default();
+        // Record before the early returns. Auth and transient still see this
+        // same `stderr_str`; the line does not retarget those checks.
+        limit_shape::record_grok(
+            &RecordMeta {
+                db_dir,
+                active_prefix,
+                exit_code,
+                cli_error,
+                completion_killed,
+            },
+            &stderr_str,
+            &output,
+        );
 
+        // Post-exit stderr classification. The buffered stderr was read once
+        // above for both sniffs (auth-failure + transient-backend).
+        if exit_code != 0 {
             // Auth-failure sniff: only credible when the child died fast AND
             // with a known auth-phrase on stderr. The fast-fail timing window
             // distinguishes a real auth lapse (errors at startup) from a
@@ -1012,6 +1106,9 @@ impl LlmRunner for GrokRunner {
             completion_killed,
             permission_denials,
             session_id,
+            cli_error,
+            error_text,
+            grace_buffer_tail,
         })
     }
 
@@ -1119,7 +1216,7 @@ impl LlmRunner for CodexRunner {
                 .take()
                 .expect("stdout should be piped (Stdio::piped() was set on spawn)"),
         );
-        let (output, conversation, permission_denials) = if stream_json {
+        let driven = if stream_json {
             drive_stream(
                 reader,
                 &CodexStreamFormat,
@@ -1128,11 +1225,16 @@ impl LlmRunner for CodexRunner {
                 slot_label,
             )
         } else {
-            (
-                read_plain_stdout(reader, slot_label, "Codex"),
-                None,
-                Vec::new(),
-            )
+            DriveStreamResult {
+                output: read_plain_stdout(reader, slot_label, "Codex"),
+                conversation: None,
+                denials: Vec::new(),
+                cli_error: false,
+                error_text: None,
+                grace_buffer_tail: String::new(),
+                result_is_error: false,
+                assistant_error: None,
+            }
         };
         let status = child.wait().map_err(|e| TaskMgrError::IoErrorWithContext {
             file_path: binary.clone(),
@@ -1147,27 +1249,48 @@ impl LlmRunner for CodexRunner {
         let _ = writer_handle.join();
         let exit_code = exit_code_from_status(status);
 
-        let stderr_str = if exit_code != 0 {
-            stderr_buf.lock().map(|b| b.clone()).unwrap_or_default()
+        let stderr_full = stderr_buf.lock().map(|b| b.clone()).unwrap_or_default();
+        // classify_codex_exit only consults stderr when exit ≠ 0. Keep passing
+        // an empty string on exit 0 so that gate stays byte-identical.
+        let stderr_for_classify = if exit_code != 0 {
+            stderr_full.as_str()
         } else {
-            String::new()
+            ""
         };
+        // error_text is the turn.failed / error string, not derive_output.
+        limit_shape::record_codex(
+            &RecordMeta {
+                db_dir,
+                active_prefix,
+                exit_code,
+                cli_error: driven.cli_error,
+                completion_killed,
+            },
+            driven.error_text.as_deref(),
+            &stderr_full,
+            &driven.output,
+        );
         if let Some(err) = classify_codex_exit(
             exit_code,
-            conversation.as_deref().unwrap_or(""),
-            &stderr_str,
+            driven.conversation.as_deref().unwrap_or(""),
+            stderr_for_classify,
         ) {
             return Err(err);
         }
 
         Ok(RunnerResult {
             exit_code,
-            output,
-            conversation,
+            output: driven.output,
+            conversation: driven.conversation,
             timed_out,
             completion_killed,
-            permission_denials,
+            permission_denials: driven.denials,
             session_id: None,
+            // Codex error / turn.failed → StreamEvent::Error → cli_error +
+            // retained error string (not present in derive_output).
+            cli_error: driven.cli_error,
+            error_text: driven.error_text,
+            grace_buffer_tail: driven.grace_buffer_tail,
         })
     }
 }
@@ -1341,6 +1464,59 @@ impl WatchdogHandles {
             self.completion_killed.load(Ordering::Acquire),
         )
     }
+}
+
+/// Pipe Claude stderr, copy each chunk to the parent terminal, and keep the
+/// trailing [`limit_shape::TAIL_BYTES`] raw bytes.
+///
+/// The terminal write is the child's own bytes, unprefixed, so operators still
+/// see CLI stderr. A slot prefix would change that stream.
+fn spawn_claude_stderr_tee(
+    child: &mut std::process::Child,
+) -> (Arc<Mutex<Vec<u8>>>, std::thread::JoinHandle<()>) {
+    let mut stderr_pipe = child
+        .stderr
+        .take()
+        .expect("stderr should be piped (Stdio::piped() was set on spawn)");
+    let stderr_buf = Arc::new(Mutex::new(Vec::new()));
+    let buf = Arc::clone(&stderr_buf);
+    let handle = std::thread::spawn(move || {
+        let mut chunk = [0u8; 8192];
+        loop {
+            match stderr_pipe.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let bytes = &chunk[..n];
+                    {
+                        let mut out = std::io::stderr().lock();
+                        let _ = out.write_all(bytes);
+                        let _ = out.flush();
+                    }
+                    if let Ok(mut kept) = buf.lock() {
+                        kept.extend_from_slice(bytes);
+                        if kept.len() > limit_shape::TAIL_BYTES {
+                            let drop_n = kept.len() - limit_shape::TAIL_BYTES;
+                            kept.drain(..drop_n);
+                        }
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+    });
+    (stderr_buf, handle)
+}
+
+/// Lossy UTF-8 of the retained stderr tail. Skips a leading continuation byte
+/// so a char cut by the cap does not become a replacement character in the
+/// middle of a limit sentence, then caps the string at [`limit_shape::TAIL_BYTES`].
+fn claude_stderr_tail(bytes: &[u8]) -> String {
+    let mut start = 0;
+    while start < bytes.len() && bytes[start] & 0b1100_0000 == 0b1000_0000 {
+        start += 1;
+    }
+    limit_shape::tail_text(&String::from_utf8_lossy(&bytes[start..]))
 }
 
 /// Grok-specific: spawn a stderr-capture thread that writes child stderr to a
@@ -3270,6 +3446,9 @@ Assistant: I'll retry with credentials.\n";
                     completion_killed: false,
                     permission_denials: Vec::new(),
                     session_id: None,
+                    cli_error: false,
+                    error_text: None,
+                    grace_buffer_tail: String::new(),
                 })
             }),
             None,
@@ -3317,6 +3496,9 @@ Assistant: I'll retry with credentials.\n";
                     completion_killed: false,
                     permission_denials: Vec::new(),
                     session_id: None,
+                    cli_error: false,
+                    error_text: None,
+                    grace_buffer_tail: String::new(),
                 })
             }),
             None,
@@ -3367,6 +3549,9 @@ Assistant: I'll retry with credentials.\n";
                     completion_killed: false,
                     permission_denials: Vec::new(),
                     session_id: None,
+                    cli_error: false,
+                    error_text: None,
+                    grace_buffer_tail: String::new(),
                 })
             }),
             Some(Box::new(move |cwd| {
