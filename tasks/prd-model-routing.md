@@ -24,9 +24,9 @@ task-mgr already has the pieces for two backends: the `LlmRunner` trait (`Runner
 
 ### Background
 
-- arcomp2 runs `task-mgr 0.3.4` built from `0e673bd` (this branch's base). `grok 1.0.50` supports every flag task-mgr passes, plus `-s/--session-id <UUID>` ("use a specific session UUID for a new conversation").
+- arcomp2 runs `task-mgr 0.3.4` built from `0e673bd` (not rebuilt; this branch now includes main `eded39d`). `grok 1.0.50` supports every flag task-mgr passes, plus `-s/--session-id <UUID>` ("use a specific session UUID for a new conversation").
 - mw_integrations is Claude-only. restaurant_agent_ex is Grok-primary with Claude disabled. This repo is Grok-primary with Claude disabled.
-- Unmerged branch `feat/cli-error-gated-detection` (prefix `fe92ec5b`, REVIEW-001 done) rewrites `detection.rs` (`OutputSignals`, classifiers gated on CLI-error provenance) and the Grok stderr block in `runner.rs`. It deliberately does not scan Grok stderr for limits. This PRD branches from `main`; the P1c/P1e diffs stay small and local so the later merge is mechanical.
+- Branch `feat/cli-error-gated-detection` (prefix `fe92ec5b`) landed on `main` as `eded39d` (2026-10-09) and is merged into this branch. It rewrote `detection.rs` (`OutputSignals`, classifiers gated on CLI-error provenance) and the Grok stderr block in `runner.rs`. It deliberately does not scan Grok stderr for limits. P1c/P1e build on top of it with small, local hunks.
 
 ### Decisions (Chris, 2026-10-08 2:56 PM PT)
 

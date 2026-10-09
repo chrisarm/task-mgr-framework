@@ -211,7 +211,7 @@ Learnings: [1-3 one-line bullets]
 - Never run `grok` in a project root, and never touch an existing `~/.grok/sessions` directory. Interactive Grok sessions run in other project roots on this machine. Tests use a temp HOME and a mock grok script.
 - Never `cargo install` or replace the installed `task-mgr` binary; other loops use it.
 - Do not edit any `.task-mgr/config.json`.
-- The unmerged branch `feat/cli-error-gated-detection` rewrites the same Grok stderr block and `detection.rs`. Keep hunks small and local.
+- `feat/cli-error-gated-detection` is landed on `main` (`eded39d`) and merged into this branch. Build on its Grok stderr block and `detection.rs`; keep hunks small and local.
 
 ---
 
