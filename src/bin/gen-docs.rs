@@ -258,7 +258,7 @@ fn render_block(model_rs: &Path) -> Result<String, String> {
             "OPUS_MODEL" => "Opus (standard)",
             "SONNET_MODEL" => "Sonnet (cost-efficient)",
             "HAIKU_MODEL" => "Haiku (cheapest)",
-            "GROK_MODEL" => "Grok (standard)",
+            "GROK_MODEL" => "Grok (explicit pin)",
             _ => name.as_str(),
         };
         out.push_str(&format!("- **{tier}** → `{name}` = `{value}`\n"));
@@ -315,22 +315,15 @@ fn render_block(model_rs: &Path) -> Result<String, String> {
             .find(|(k, _)| k == t)
             .map(|(_, v)| v.as_str())
             .unwrap_or("(n/a)");
-        let grok = grok_tiers
-            .iter()
-            .find(|(k, _)| k == t)
-            .map(|(_, v)| v.as_str())
-            .unwrap_or("(n/a)");
-        let codex = codex_tiers
-            .iter()
-            .find(|(k, _)| k == t)
-            .map(|(_, v)| {
-                if v.is_empty() {
-                    "(no -m flag)"
-                } else {
-                    v.as_str()
-                }
-            })
-            .unwrap_or("(n/a)");
+        let cell = |tiers: &[(String, String)]| -> String {
+            match tiers.iter().find(|(k, _)| k == t) {
+                Some((_, v)) if v.is_empty() => "(no -m flag)".to_string(),
+                Some((_, v)) => v.clone(),
+                None => "(n/a)".to_string(),
+            }
+        };
+        let grok = cell(&grok_tiers);
+        let codex = cell(&codex_tiers);
         out.push_str(&format!("| {t} | {claude} | {grok} | {codex} |\n"));
     }
     out.push('\n');

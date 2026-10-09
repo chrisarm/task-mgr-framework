@@ -257,8 +257,9 @@ fn default_claude_provider() -> ProviderConfig {
     }
 }
 
-/// Built-in default Grok provider: a single `standard` rung (the only model the
-/// grok CLI exposes), disabled. One rung keeps the reverse lookup unambiguous.
+/// Built-in default Grok provider: a single `standard` rung with a null model
+/// (spawn with no `--model` flag; the CLI picks its default), disabled.
+/// One rung keeps the reverse lookup unambiguous.
 fn default_grok_provider() -> ProviderConfig {
     ProviderConfig {
         enabled: false,
@@ -2136,8 +2137,8 @@ mod tests {
         assert!(merged.providers["grok"].enabled);
         assert_eq!(
             merged.providers["grok"].tiers.get("standard"),
-            Some(&Some(crate::loop_engine::model::GROK_MODEL.to_string())),
-            "grok keeps its default ladder under field-wise merge"
+            Some(&None),
+            "grok keeps its null standard rung under field-wise merge"
         );
         assert!(merged.providers["claude"].enabled, "claude untouched");
         // None / explicit null → pure default.
