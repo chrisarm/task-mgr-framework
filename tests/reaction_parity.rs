@@ -1286,11 +1286,14 @@ fn read_overflow_events(base_dir: &Path) -> Vec<OverflowEvent> {
 /// A `ProjectConfig` wiring the Claude → Grok cross-provider fallback via the
 /// provider-first surface (`providers.claude.fallback = "grok"`, grok enabled) —
 /// the precondition for rung 4 (`FallbackToProvider`) on the Claude → Grok
-/// direction.
+/// direction. Grok's Standard rung is pinned to `GROK_MODEL` because the
+/// builtin rung is empty (no `--model`).
 fn config_with_fallback_enabled() -> ProjectConfig {
     let mut models = ModelsConfig::builtin_default();
     if let Some(p) = models.providers.get_mut("grok") {
         p.enabled = true;
+        p.tiers
+            .insert("standard".to_string(), Some(GROK_MODEL.to_string()));
     }
     if let Some(p) = models.providers.get_mut("claude") {
         p.fallback = Some("grok".to_string());
