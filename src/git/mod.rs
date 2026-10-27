@@ -163,11 +163,24 @@ pub fn remap_into_worktree(registered: &Path, source_root: &Path, worktree_root:
     }
 }
 
+/// Canonicalize `path` when it exists. A missing path is returned unchanged
+/// so identity can still compare a not-yet-created remap.
+fn canonicalize_existing(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 /// Pin-19 path identity: (b)+(c) only.
 ///
 /// Hit if `canonicalize(flag) == canonicalize(resolved)` **or**
-/// `canonicalize(flag) == remap_into_worktree(registered, source_root, worktree_root)`,
-/// where `resolved` is `registered` when absolute, else `source_root.join(registered)`.
+/// `canonicalize(flag)` matches the worktree remap. The remap is
+/// canonicalized when that file exists; otherwise the comparison is the
+/// raw remap (the dest need not exist).
+///
+/// `source_root` and `worktree_root` are canonicalized when those
+/// directories exist. A symlink prefix such as macOS `/var` →
+/// `/private/var` still identifies the live file.
+///
+/// `resolved` is `registered` when absolute, else `source_root.join(registered)`.
 ///
 /// Match (a) (JSON `taskPrefix` in `prd_metadata`) is a **separate** predicate
 /// and must not be folded into this function.
@@ -182,6 +195,9 @@ pub fn paths_identify(
     let Ok(canon_flag) = std::fs::canonicalize(flag) else {
         return false;
     };
+    // Symlink prefixes (macOS temp dirs) must not split one file into two identities.
+    let source_root = canonicalize_existing(source_root);
+    let worktree_root = canonicalize_existing(worktree_root);
     let resolved = if registered.is_absolute() {
         registered.to_path_buf()
     } else {
@@ -194,8 +210,11 @@ pub fn paths_identify(
         return true;
     }
     // (c) live path is the worktree remap of the registered row
-    let remapped = remap_into_worktree(registered, source_root, worktree_root);
-    canon_flag == remapped
+    let remapped = remap_into_worktree(registered, &source_root, &worktree_root);
+    match std::fs::canonicalize(&remapped) {
+        Ok(canon_remapped) => canon_flag == canon_remapped,
+        Err(_) => canon_flag == remapped,
+    }
 }
 
 #[cfg(test)]
@@ -443,6 +462,29 @@ mod tests {
         let flag_b = std::fs::canonicalize(&file_b).unwrap();
         // Registered relative to A must not identify B's foo.json (basename trap).
         assert!(!paths_identify(&flag_b, registered, &source_a, &source_a));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn paths_identify_symlink_prefix_matches_worktree_file() {
+        let real = TempDir::new().unwrap();
+        let link_dir = TempDir::new().unwrap();
+        let link = link_dir.path().join("via-link");
+        std::os::unix::fs::symlink(real.path(), &link).unwrap();
+
+        let source = link.join("main");
+        let wt = link.join("wt");
+        std::fs::create_dir_all(source.join("tasks")).unwrap();
+        std::fs::create_dir_all(wt.join("tasks")).unwrap();
+        let wt_prd = wt.join("tasks/foo.json");
+        std::fs::write(&wt_prd, "{}").unwrap();
+
+        let flag = std::fs::canonicalize(&wt_prd).unwrap();
+        assert_ne!(flag, wt_prd, "fixture must exercise a symlink prefix");
+        assert!(
+            paths_identify(&flag, Path::new("tasks/foo.json"), &source, &wt),
+            "symlink prefix must still identify the worktree file"
+        );
     }
 
     #[test]

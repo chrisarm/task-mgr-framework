@@ -161,7 +161,8 @@ cleanup() {
   # Optional dump to an unregistered path (never --force onto "$PRD_FILE";
   # export is a lossy dump, not a merge — DB + doctor recover the live PRD)
   if [ -n "$PRD_FILE" ]; then
-    local dump="/tmp/task-mgr-dump-$(basename "$PRD_FILE")"
+    local dump
+    dump="/tmp/task-mgr-dump-$(basename "$PRD_FILE")"
     echo "Dumping state to $dump (lossy export; not smashing $PRD_FILE)..."
     task-mgr --dir "$TASK_MGR_DIR" export --from-json "$PRD_FILE" --to-json "$dump" 2>/dev/null || true
   fi
@@ -534,7 +535,8 @@ ${prompt_content}"
     # Never --to-json "$PRD_FILE" without --force, and do not add --force onto
     # the live PRD (lossy smash). DB + doctor recover.
     if [ -n "$PRD_FILE" ]; then
-      local dump="/tmp/task-mgr-dump-$(basename "$PRD_FILE")"
+      local dump
+      dump="/tmp/task-mgr-dump-$(basename "$PRD_FILE")"
       task-mgr --dir "$TASK_MGR_DIR" export --from-json "$PRD_FILE" --to-json "$dump" 2>/dev/null || true
     fi
 
@@ -554,7 +556,8 @@ ${prompt_content}"
   # Final dump to an unregistered path (never --force onto "$PRD_FILE";
   # export is a lossy dump, not a merge)
   if [ -n "$PRD_FILE" ]; then
-    local dump="/tmp/task-mgr-dump-$(basename "$PRD_FILE")"
+    local dump
+    dump="/tmp/task-mgr-dump-$(basename "$PRD_FILE")"
     echo "Final dump to $dump (lossy export; not smashing $PRD_FILE)"
     task-mgr --dir "$TASK_MGR_DIR" export --from-json "$PRD_FILE" --to-json "$dump" 2>/dev/null || true
   fi

@@ -26,8 +26,8 @@ use task_mgr::loop_engine::prompt::PromptResult;
 use task_mgr::loop_engine::reactions::post_output::{HandleOverflowParams, handle_overflow};
 use task_mgr::loop_engine::runner::RunnerKind;
 
-/// Default Grok model id for the fallback rung — the model the builtin Grok
-/// provider ladder maps its single (Standard) rung to.
+/// Grok model id for the fallback rung. The builtin Grok Standard rung is
+/// empty (no `--model`), so [`models_with_fallbacks`] pins this id there.
 const GROK_DEFAULT_MODEL: &str = GROK_MODEL;
 
 /// The new Claude overflow ceiling: the 1M-context variant of the frontier
@@ -40,8 +40,9 @@ fn fable_1m() -> String {
 /// Build a `ProjectConfig` whose provider-first `models` block wires the
 /// cross-provider fallbacks the overflow rung-4 pivot reads
 /// (`providers.<source>.fallback`). Grok is enabled so a `claude → grok` pivot
-/// target resolves; Claude is enabled by the builtin default. A `None` fallback
-/// means that provider has no rung-4 pivot.
+/// target resolves, and its Standard rung is pinned to [`GROK_DEFAULT_MODEL`]
+/// so the pivot writes a concrete model; Claude is enabled by the builtin
+/// default. A `None` fallback means that provider has no rung-4 pivot.
 fn models_with_fallbacks(
     claude_fallback: Option<&str>,
     grok_fallback: Option<&str>,
@@ -49,6 +50,8 @@ fn models_with_fallbacks(
     let mut models = ModelsConfig::builtin_default();
     if let Some(p) = models.providers.get_mut("grok") {
         p.enabled = true;
+        p.tiers
+            .insert("standard".to_string(), Some(GROK_DEFAULT_MODEL.to_string()));
         p.fallback = grok_fallback.map(str::to_string);
     }
     if let Some(p) = models.providers.get_mut("claude") {
