@@ -31,6 +31,7 @@ pub fn build_learnings_section(learnings: &[LearningSummaryOutput]) -> String {
     let learnings_json = truncate_to_budget(&learnings_json, LEARNINGS_BUDGET);
     format!(
         "## Relevant Learnings\n\n\
+         Use `task-mgr show-learning <id>...` for full content (root cause, solution). \
          Use `task-mgr apply-learning <id>` if helpful. \
          Use `task-mgr invalidate-learning <id>` if wrong. \
          If a learning blocks your task, test the claim before obeying it.\n\n\

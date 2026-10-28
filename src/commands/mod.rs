@@ -21,6 +21,7 @@
 //! - `migrate` - Database schema migrations
 //! - `import-learnings` - Import learnings from JSON
 //! - `apply-learning` - Record that a learning was applied
+//! - `show-learning` - Print full learning records by ID
 
 pub mod add;
 pub mod apply_learning;
@@ -54,6 +55,7 @@ pub mod reset;
 pub mod review;
 pub mod run;
 pub mod show;
+pub mod show_learning;
 pub mod skip;
 pub mod stats;
 pub mod unblock;
@@ -139,6 +141,9 @@ pub use run::{
     format_update_text, update,
 };
 pub use show::{ShowResult, format_text as format_show_text, show};
+pub use show_learning::{
+    LearningDetail, ShowLearningResult, format_text as format_show_learning_text, show_learnings,
+};
 pub use skip::{SkipResult, TaskSkipResult, format_text as format_skip_text, skip};
 pub use stats::{
     ActiveRunInfo, LearningCounts, StatsResult, TaskCounts, format_text as format_stats_text, stats,

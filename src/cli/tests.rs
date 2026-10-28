@@ -1505,6 +1505,23 @@ fn test_apply_learning() {
     }
 }
 
+// Show-learning command tests
+#[test]
+fn test_show_learning_multiple_ids() {
+    let cli = Cli::parse_from(["task-mgr", "show-learning", "554", "940", "1657"]);
+    match cli.command {
+        Commands::ShowLearning { learning_ids } => {
+            assert_eq!(learning_ids, vec![554, 940, 1657]);
+        }
+        _ => panic!("Expected ShowLearning command"),
+    }
+}
+
+#[test]
+fn test_show_learning_requires_id() {
+    assert!(Cli::try_parse_from(["task-mgr", "show-learning"]).is_err());
+}
+
 // Skip command tests
 #[test]
 fn test_skip_with_reason() {

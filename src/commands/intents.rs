@@ -103,6 +103,9 @@ pub const INTENTS: &[(&[&str], &str)] = &[
          task-mgr recall --query \"<text>\" --allow-degraded   # offline-tolerant\n\
          ```\n\
          \n\
+         Full record (untruncated content, root cause, solution):\n\
+         `task-mgr show-learning <id> [<id>...]`.\n\
+         \n\
          Confirm useful results with `task-mgr apply-learning <id>`; invalidate\n\
          wrong ones with `task-mgr invalidate-learning <id>`.\n",
     ),

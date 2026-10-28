@@ -654,6 +654,19 @@ RERANKER:
         recent: Option<usize>,
     },
 
+    /// Show the full record for one or more learnings by ID
+    ///
+    /// Prints untruncated content, root cause, solution, tags, applicability,
+    /// and retired/supersession status. Use after `recall` (which previews
+    /// content) or on IDs from the loop prompt's Relevant Learnings block.
+    /// Read-only: does not count as the learning being shown.
+    #[command(name = "show-learning")]
+    ShowLearning {
+        /// Learning ID(s) to show
+        #[arg(required = true, num_args = 1..)]
+        learning_ids: Vec<i64>,
+    },
+
     /// Record that a learning was applied (confirmed useful)
     ///
     /// This provides feedback for the UCB bandit ranking system.
