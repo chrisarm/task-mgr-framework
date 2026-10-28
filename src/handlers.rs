@@ -31,8 +31,8 @@ use crate::commands::{
     DoctorResult, EndResult, EnhanceResult, ExportResult, FailResult, HistoryResult, HowResult,
     ImportLearningsResult, InitResult, InvalidateLearningResult, IrrelevantResult, LearnResult,
     LearningsListResult, ListResult, MigrateResult, NextResult, RecallCmdResult, ResetResult,
-    ReviewResult, RunDetailResult, SetupAuditResult, ShowResult, SkipResult, StatsResult,
-    StatusResult, UnblockResult, UnskipResult, UpdateResult, WorktreesResult,
+    ReviewResult, RunDetailResult, SetupAuditResult, ShowLearningResult, ShowResult, SkipResult,
+    StatsResult, StatusResult, UnblockResult, UnskipResult, UpdateResult, WorktreesResult,
     format_apply_learning_text, format_begin_text, format_cheatsheet_text, format_complete_text,
     format_current_text, format_decisions_list_text, format_decline_text, format_doctor_text,
     format_end_text, format_enhance_text, format_export_text, format_fail_text,
@@ -40,9 +40,9 @@ use crate::commands::{
     format_init_text, format_invalidate_learning_text, format_irrelevant_text, format_learn_text,
     format_learnings_text, format_list_text, format_migrate_text, format_next_text,
     format_recall_text, format_reset_text, format_resolve_text, format_revert_text,
-    format_review_text, format_setup_text, format_show_text, format_skip_text, format_stats_text,
-    format_status_text, format_unblock_text, format_unskip_text, format_update_text,
-    format_worktrees_text,
+    format_review_text, format_setup_text, format_show_learning_text, format_show_text,
+    format_skip_text, format_stats_text, format_status_text, format_unblock_text,
+    format_unskip_text, format_update_text, format_worktrees_text,
 };
 use crate::learnings::{
     DeleteLearningResult, EditLearningResult, format_delete_text, format_edit_text,
@@ -85,6 +85,7 @@ impl_text_formattable!(HowResult, format_how_text);
 impl_text_formattable!(InitResult, format_init_text);
 impl_text_formattable!(ListResult, format_list_text);
 impl_text_formattable!(ShowResult, format_show_text);
+impl_text_formattable!(ShowLearningResult, format_show_learning_text);
 impl_text_formattable!(NextResult, format_next_text);
 impl_text_formattable!(CompleteResult, format_complete_text);
 impl_text_formattable!(FailResult, format_fail_text);

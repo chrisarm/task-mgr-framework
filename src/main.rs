@@ -22,8 +22,8 @@ use task_mgr::commands::{
     get_reviewable_tasks, history, history_detail, how, import_learnings, init_with_opts,
     invalidate_learning, irrelevant, learn, list, list_decisions, list_learnings, migrate_all,
     migrate_down_cmd, migrate_status, migrate_up_cmd, next, recall, reset_all_tasks, reset_tasks,
-    resolve_decision_cmd, revert_decision_cmd, show, skip, stats, unblock, unskip, update,
-    worktrees_list, worktrees_prune, worktrees_remove,
+    resolve_decision_cmd, revert_decision_cmd, show, show_learnings, skip, stats, unblock, unskip,
+    update, worktrees_list, worktrees_prune, worktrees_remove,
 };
 use task_mgr::db::{DbDirSource, LockGuard, ResolvedDbDir, open_connection, resolve_db_dir};
 use task_mgr::handlers::{
@@ -823,6 +823,13 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
             let conn = open_connection(&cli.dir)?;
             let params = LearningsListParams { recent };
             let result = list_learnings(&conn, params)?;
+            output_result(&result, cli.format);
+            Ok(())
+        }
+
+        Commands::ShowLearning { learning_ids } => {
+            let conn = open_connection(&cli.dir)?;
+            let result = show_learnings(&conn, &learning_ids)?;
             output_result(&result, cli.format);
             Ok(())
         }

@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.3.5] - 2026-10-28
+
+### Added
+- `task-mgr show-learning <id> [<id>...]` prints the full record for one or more learnings: untruncated content, root cause, solution, tags, applicability, stats, and retired/superseded status (`--format json` for every field). It is read-only and does not count as the learning being shown. When some IDs exist, the missing ones are listed and it exits 0; when none exist, it fails with `Learning not found`. `recall` text output now ends with a `Full details: task-mgr show-learning <ids>` line, and the loop prompt's Relevant Learnings block, `task-mgr how recall`, and the `tm-recall` skill point agents to it instead of the SQLite database.
+
 ### Changed
 - `task-mgr init` stages `~/.claude/docs/task-mgr-best-practices.md` (add/update `--from-json`, `update --stdin`, scoped export). Slash-command skills (`prd-tasks`, `plan-tasks`, `spike`, `review-loop`) pin spawn-fixups with `--from-json`.
 

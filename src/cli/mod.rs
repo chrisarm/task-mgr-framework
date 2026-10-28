@@ -75,6 +75,7 @@ COMMAND REFERENCE (by category):
     learn              Record a learning from a task outcome
     recall             Find relevant learnings for a task or query
     learnings          List all learnings
+    show-learning      Show full learning record(s) by ID
     apply-learning     Record that a learning was applied (confirmed useful)
     invalidate-learning  Invalidate a learning via two-step degradation
     delete-learning    Delete a learning from the database
