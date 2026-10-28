@@ -280,6 +280,16 @@ pub fn runner_kind_for(provider: Provider) -> RunnerKind {
     }
 }
 
+impl std::fmt::Display for RunnerKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            RunnerKind::Claude => "claude",
+            RunnerKind::Grok => "grok",
+            RunnerKind::Codex => "codex",
+        })
+    }
+}
+
 impl RunnerKind {
     /// Whether this backend supports `cap`, without constructing a trait
     /// object. Delegates to the zero-sized runner `supports` impls so the
@@ -1066,16 +1076,37 @@ impl LlmRunner for GrokRunner {
         );
 
         // Post-exit stderr classification. The buffered stderr was read once
-        // above for both sniffs (auth-failure + transient-backend).
+        // above. Auth and the transient sniff stay inside `exit_code != 0`.
+        // The plan-limit sniff sits between them. Its exit-0 arm is the
+        // empty-stdout check after this block.
+        //
+        // Plan phrase only — do not call `detection::is_rate_limited`. A
+        // buffer that contains `429` and `rate` but not this phrase is not a
+        // plan limit, and that helper stays the Claude stdout classifier.
+        // A `<completed>` tag stays on the Ok result on either exit arm.
+        let plan_limited = stderr_str
+            .to_ascii_lowercase()
+            .contains("rate limit for your plan");
+        let has_completed_tag = output
+            .find("<completed>")
+            .is_some_and(|at| output[at + "<completed>".len()..].contains("</completed>"));
+        let plan_limit_hit = plan_limited && !has_completed_tag;
         if exit_code != 0 {
             // Auth-failure sniff: only credible when the child died fast AND
             // with a known auth-phrase on stderr. The fast-fail timing window
             // distinguishes a real auth lapse (errors at startup) from a
             // long-running tool-use error that happens to mention auth strings.
-            // Window is overridable via env var for tests.
+            // Window is overridable via env var for tests. Auth wins over the
+            // plan-limit return below.
             if elapsed < grok_auth_failure_window() && stderr_contains_auth_failure(&stderr_str) {
                 return Err(TaskMgrError::GrokAuthFailure {
                     hint: GROK_AUTH_FAILURE_HINT.to_string(),
+                });
+            }
+
+            if plan_limit_hit {
+                return Err(TaskMgrError::RunnerRateLimited {
+                    runner: RunnerKind::Grok,
                 });
             }
 
@@ -1096,6 +1127,10 @@ impl LlmRunner for GrokRunner {
                     ),
                 });
             }
+        } else if output.trim().is_empty() && plan_limit_hit {
+            return Err(TaskMgrError::RunnerRateLimited {
+                runner: RunnerKind::Grok,
+            });
         }
 
         Ok(RunnerResult {
@@ -2945,6 +2980,213 @@ mod tests {
             Ok(r) => assert_eq!(r.exit_code, 0),
             Err(other) => panic!("expected Ok(success), got Err({other:?})"),
         }
+    }
+
+    /// Mock grok that writes the FIX-001 plan-limit fixture to stderr.
+    /// `stdout` is emitted as plain text (`stream_json: false` at the call).
+    /// The fixture path is `cat`'d so the U+2019 byte is not shell-quoted.
+    fn plan_limit_grok_script(dir: &Path, name: &str, stdout: &str, exit_code: i32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let fixture_path = dir.join(format!("{name}.fixture"));
+        std::fs::write(
+            &fixture_path,
+            include_str!("../../tests/fixtures/grok_stderr_plan_rate_limit.txt"),
+        )
+        .unwrap();
+        let stdout_line = if stdout.is_empty() {
+            String::new()
+        } else {
+            format!("printf '%s' '{stdout}'\n")
+        };
+        let path = dir.join(name);
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\ncat '{}' >&2\n{stdout_line}exit {exit_code}\n",
+                fixture_path.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// Spawn the plan-limit stub under a temp HOME and temp cwd. Lock order is
+    /// HOME then `GROK_BINARY` (learning 4696 / the session-id test).
+    fn dispatch_plan_limit_stub(stdout: &str, exit_code: i32) -> TaskMgrResult<RunnerResult> {
+        use crate::loop_engine::test_utils::EnvGuard;
+        let _home_lock = RUNNER_HOME_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _bin_lock = GROK_BINARY_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let cwd = tmp.path().join("cwd");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        let script = plan_limit_grok_script(tmp.path(), "grok-plan-limit.sh", stdout, exit_code);
+        let _bin = EnvGuard::set("GROK_BINARY", script.to_str().unwrap());
+        let _home = RunnerHomeGuard::set(&home);
+        dispatch(
+            RunnerKind::Grok,
+            "plan-limit-probe",
+            &PermissionMode::Dangerous,
+            RunnerOpts {
+                working_dir: Some(&cwd),
+                stream_json: false,
+                ..RunnerOpts::default()
+            },
+        )
+    }
+
+    fn assert_runner_rate_limited(result: TaskMgrResult<RunnerResult>) {
+        let Err(err) = result else {
+            panic!("expected RunnerRateLimited, got Ok");
+        };
+        let shown = err.to_string();
+        match err {
+            TaskMgrError::RunnerRateLimited { runner } => {
+                assert_eq!(runner, RunnerKind::Grok);
+                assert!(
+                    shown.contains("grok"),
+                    "Display must name the provider, got {shown}"
+                );
+            }
+            other => panic!("expected RunnerRateLimited, got {other:?}"),
+        }
+    }
+
+    /// Gate arm: exit 1 (stand-in; the 2026-07-15 status was not recorded)
+    /// with the plan-limit fixture on stderr.
+    #[test]
+    fn grok_plan_limit_exit_1_yields_typed_error() {
+        assert_runner_rate_limited(dispatch_plan_limit_stub("", 1));
+    }
+
+    /// Gate arm: exit 0 and empty stdout, same fixture on stderr.
+    #[test]
+    fn grok_plan_limit_exit_0_empty_stdout_yields_typed_error() {
+        assert_runner_rate_limited(dispatch_plan_limit_stub("", 0));
+    }
+
+    /// E7: exit 0 with a completion tag on stdout is not a rate limit, even
+    /// when the plan sentence is also on stderr. Stderr must not be appended
+    /// onto the runner output.
+    #[test]
+    fn grok_plan_limit_exit_0_completed_stdout_is_not_rate_limit() {
+        let result = dispatch_plan_limit_stub("<completed>X</completed>\n", 0)
+            .expect("exit 0 with completion stdout must not be a runner error");
+        assert_eq!(result.exit_code, 0);
+        assert!(result.output.contains("<completed>X</completed>"));
+        assert!(
+            !result.output.contains("rate limit"),
+            "stderr plan sentence must not be appended to output, got {}",
+            result.output
+        );
+    }
+
+    /// E7: exit non-zero with a completion tag on stdout is not a rate limit
+    /// either. The tag stays on the Ok result; stderr is not appended.
+    #[test]
+    fn grok_plan_limit_exit_nonzero_completed_stdout_is_not_rate_limit() {
+        let result = dispatch_plan_limit_stub("<completed>X</completed>\n", 1)
+            .expect("exit 1 with completion stdout must not be a runner error");
+        assert_ne!(result.exit_code, 0);
+        assert!(result.output.contains("<completed>X</completed>"));
+        assert!(
+            !result.output.contains("rate limit"),
+            "stderr plan sentence must not be appended to output, got {}",
+            result.output
+        );
+    }
+
+    /// Exit 0 with other non-empty stdout (no completion tag) is not this
+    /// error. The plan sentence on stderr stays off the runner output.
+    #[test]
+    fn grok_plan_limit_exit_0_other_stdout_is_not_rate_limit() {
+        let result = dispatch_plan_limit_stub("still working\n", 0)
+            .expect("exit 0 with other non-empty stdout must not be a runner error");
+        assert_eq!(result.exit_code, 0);
+        assert!(result.output.contains("still working"));
+        assert!(
+            !result.output.contains("rate limit"),
+            "stderr plan sentence must not be appended to output, got {}",
+            result.output
+        );
+    }
+
+    /// A non-zero stderr buffer that contains `429` and `rate` but not the
+    /// plan phrase is not `RunnerRateLimited`. The sniff must not call
+    /// `is_rate_limited`, which would match this buffer.
+    #[test]
+    fn grok_plan_limit_429_and_rate_without_phrase_is_not_rate_limited() {
+        let stderr = "HTTP 429\nrate exceeded for this minute\n";
+        assert!(stderr.contains("429") && stderr.contains("rate"));
+        assert!(
+            !stderr
+                .to_ascii_lowercase()
+                .contains("rate limit for your plan")
+        );
+        let result = dispatch_grok_stderr_stub(stderr, "", 1);
+        match result {
+            Ok(r) => {
+                assert_ne!(r.exit_code, 0);
+                assert!(
+                    !r.output.contains("429"),
+                    "stderr must not be appended to output, got {}",
+                    r.output
+                );
+            }
+            Err(err) => panic!("expected Ok, not RunnerRateLimited, got {err:?}"),
+        }
+    }
+
+    /// Spawn a mock grok whose stderr is `stderr` (not the plan fixture).
+    /// Same HOME / `GROK_BINARY` lock order as [`dispatch_plan_limit_stub`].
+    fn dispatch_grok_stderr_stub(
+        stderr: &str,
+        stdout: &str,
+        exit_code: i32,
+    ) -> TaskMgrResult<RunnerResult> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        use crate::loop_engine::test_utils::EnvGuard;
+        let _home_lock = RUNNER_HOME_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _bin_lock = GROK_BINARY_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let cwd = tmp.path().join("cwd");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        let stderr_path = tmp.path().join("stderr.txt");
+        let stdout_path = tmp.path().join("stdout.txt");
+        std::fs::write(&stderr_path, stderr).unwrap();
+        std::fs::write(&stdout_path, stdout).unwrap();
+        let script = tmp.path().join("grok-custom-stderr.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ncat '{}' >&2\ncat '{}'\nexit {exit_code}\n",
+                stderr_path.display(),
+                stdout_path.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _bin = EnvGuard::set("GROK_BINARY", script.to_str().unwrap());
+        let _home = RunnerHomeGuard::set(&home);
+        dispatch(
+            RunnerKind::Grok,
+            "plan-limit-probe",
+            &PermissionMode::Dangerous,
+            RunnerOpts {
+                working_dir: Some(&cwd),
+                stream_json: false,
+                ..RunnerOpts::default()
+            },
+        )
     }
 
     /// AC #7 (positive): a structured `[Error: 401 unauthorized]` line in the
