@@ -152,36 +152,108 @@ fn make_claude_dir_artifact_script(name: &str, marker: &str) -> PathBuf {
     path
 }
 
-/// Create a Grok mock script that creates `$GROK_TEST_SESSION_DIR/<uuid>/`
-/// and echoes the marker. Mirrors the pattern in runner.rs unit test
-/// `grok_runner_discovers_session_id_from_pre_post_dir_diff`.
-fn make_grok_session_script(name: &str, marker: &str, uuid: &str) -> PathBuf {
+/// Create a Grok mock that records argv to `$GROK_ARGV_OUT` and creates
+/// `$GROK_TEST_SESSION_DIR/<uuid-from---session-id>/`.
+fn make_grok_session_script(name: &str, marker: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!("task_mgr_cleanup_{name}.sh"));
     {
         let mut f = std::fs::File::create(&path).expect("create grok session script");
         writeln!(f, "#!/bin/sh").unwrap();
-        writeln!(f, r#"PROMPT=$(cat)"#).unwrap();
-        writeln!(f, r#"mkdir -p "$GROK_TEST_SESSION_DIR/{uuid}""#).unwrap();
-        writeln!(f, r#"echo "{marker} $PROMPT""#).unwrap();
+        writeln!(f, r#": > "$GROK_ARGV_OUT""#).unwrap();
+        writeln!(
+            f,
+            r#"for a in "$@"; do printf '%s\n' "$a" >> "$GROK_ARGV_OUT"; done"#
+        )
+        .unwrap();
+        writeln!(f, r#"SESSION_ID="""#).unwrap();
+        writeln!(f, r#"while [ $# -gt 0 ]; do"#).unwrap();
+        writeln!(f, r#"  if [ "$1" = "--session-id" ]; then"#).unwrap();
+        writeln!(f, r#"    SESSION_ID="$2"; shift 2"#).unwrap();
+        writeln!(f, r#"  else"#).unwrap();
+        writeln!(f, r#"    shift"#).unwrap();
+        writeln!(f, r#"  fi"#).unwrap();
+        writeln!(f, r#"done"#).unwrap();
+        writeln!(f, r#"if [ -n "$SESSION_ID" ]; then"#).unwrap();
+        writeln!(f, r#"  mkdir -p "$GROK_TEST_SESSION_DIR/$SESSION_ID""#).unwrap();
+        writeln!(
+            f,
+            r#"  printf '%s\n' '{{}}' > "$GROK_TEST_SESSION_DIR/$SESSION_ID/session.json""#
+        )
+        .unwrap();
+        writeln!(f, r#"fi"#).unwrap();
+        writeln!(f, r#"echo "{marker}""#).unwrap();
     }
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
         .expect("chmod grok session script");
     path
 }
 
-/// Create a Grok mock script that exits 0 WITHOUT creating any session dir.
-/// GrokRunner's pre/post diff finds no new UUID directories → `session_id: None`.
+/// Create a Grok mock that records argv and exits 0 without creating a
+/// session directory. Cleanup of that missing directory must stay `Ok`.
 fn make_grok_no_session_script(name: &str, marker: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!("task_mgr_cleanup_{name}.sh"));
     {
         let mut f = std::fs::File::create(&path).expect("create grok no-session script");
         writeln!(f, "#!/bin/sh").unwrap();
-        writeln!(f, r#"PROMPT=$(cat)"#).unwrap();
-        writeln!(f, r#"echo "{marker} $PROMPT""#).unwrap();
+        writeln!(f, r#": > "$GROK_ARGV_OUT""#).unwrap();
+        writeln!(
+            f,
+            r#"for a in "$@"; do printf '%s\n' "$a" >> "$GROK_ARGV_OUT"; done"#
+        )
+        .unwrap();
+        writeln!(f, r#"echo "{marker}""#).unwrap();
     }
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
         .expect("chmod grok no-session script");
     path
+}
+
+/// Restores one env var on drop. Used when a test unsets `HOME`.
+struct RestoreEnv {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl RestoreEnv {
+    fn set(key: &'static str, value: &std::ffi::OsStr) -> Self {
+        let previous = std::env::var_os(key);
+        unsafe { std::env::set_var(key, value) };
+        Self { key, previous }
+    }
+
+    fn unset(key: &'static str) -> Self {
+        let previous = std::env::var_os(key);
+        unsafe { std::env::remove_var(key) };
+        Self { key, previous }
+    }
+}
+
+impl Drop for RestoreEnv {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(v) => unsafe { std::env::set_var(self.key, v) },
+            None => unsafe { std::env::remove_var(self.key) },
+        }
+    }
+}
+
+/// UUID passed as `--session-id`, which must sit immediately before
+/// `--prompt-file`.
+fn recorded_session_id(argv_path: &Path) -> uuid::Uuid {
+    let argv = std::fs::read_to_string(argv_path)
+        .unwrap_or_else(|e| panic!("read argv record {}: {e}", argv_path.display()));
+    let lines: Vec<&str> = argv.lines().collect();
+    let pos = lines
+        .iter()
+        .position(|line| *line == "--session-id")
+        .unwrap_or_else(|| panic!("argv must contain --session-id, got {argv:?}"));
+    assert_eq!(
+        lines.get(pos + 2).copied(),
+        Some("--prompt-file"),
+        "--session-id must sit immediately before --prompt-file, got {lines:?}"
+    );
+    uuid::Uuid::parse_str(lines[pos + 1])
+        .unwrap_or_else(|e| panic!("--session-id value {:?} is not a uuid: {e}", lines[pos + 1]))
 }
 
 // ---------------------------------------------------------------------------
@@ -244,32 +316,32 @@ fn dispatch_claude_cleanup_ok_returns_spawn_result_unchanged() {
 // AC2 — Test 2 (Grok shape): session dir present post-spawn, absent post-dispatch
 // ---------------------------------------------------------------------------
 
-/// Mock Grok binary creates `<session-parent>/<uuid>/`; dispatch discovers
-/// the UUID via pre/post diff, then calls cleanup_session which removes it.
+/// Mock Grok creates the directory named by `--session-id`. Dispatch returns
+/// that uuid and `cleanup_session` removes only that directory.
 /// Verifies:
 /// (a) spawn result round-trips unchanged.
-/// (b) uuid subdir is absent after dispatch returns Ok.
-/// (c) session parent dir still exists (only the uuid subdir was removed).
+/// (b) `session_id` is the argv uuid.
+/// (c) that subdir is absent after dispatch returns Ok.
+/// (d) session parent dir still exists.
 #[test]
 fn dispatch_grok_cleanup_ok_removes_session_dir() {
     let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let marker = "CLEANUP_OK_GROK_A3F72C91";
-    // Known UUID the mock binary creates as a subdir.
-    let known_uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
 
     let temp_home = tempfile::tempdir().expect("create temp HOME");
     let temp_cwd = tempfile::tempdir().expect("create temp cwd");
 
-    // Pre-create the session parent dir so the pre-snapshot is "empty, not absent".
     let session_parent = grok_encoded_session_dir(temp_cwd.path(), temp_home.path());
     std::fs::create_dir_all(&session_parent).expect("create grok session parent");
+    let argv_out = temp_home.path().join("argv.txt");
 
-    let script = make_grok_session_script("cleanup_ok_grok", marker, known_uuid);
+    let script = make_grok_session_script("cleanup_ok_grok", marker);
 
     // SAFETY: serialized via ENV_MUTEX.
     unsafe {
         std::env::set_var("GROK_BINARY", script.to_str().unwrap());
-        std::env::set_var("GROK_TEST_SESSION_DIR", session_parent.to_str().unwrap());
+        std::env::set_var("GROK_ARGV_OUT", argv_out.as_os_str());
+        std::env::set_var("GROK_TEST_SESSION_DIR", session_parent.as_os_str());
         std::env::set_var("HOME", temp_home.path());
     }
 
@@ -282,6 +354,7 @@ fn dispatch_grok_cleanup_ok_removes_session_dir() {
 
     unsafe {
         std::env::remove_var("GROK_BINARY");
+        std::env::remove_var("GROK_ARGV_OUT");
         std::env::remove_var("GROK_TEST_SESSION_DIR");
         std::env::remove_var("HOME");
     }
@@ -294,13 +367,14 @@ fn dispatch_grok_cleanup_ok_removes_session_dir() {
         "spawn result must round-trip through dispatch unchanged, got: {:?}",
         r.output
     );
-    assert!(
-        r.session_id.is_some(),
-        "GrokRunner must discover session_id from pre/post dir diff"
+    let sid = recorded_session_id(&argv_out);
+    assert_eq!(
+        r.session_id,
+        Some(sid),
+        "session_id must be the --session-id uuid"
     );
 
-    // AC2 contract: uuid subdir removed; parent dir survives.
-    let session_uuid_dir = session_parent.join(known_uuid);
+    let session_uuid_dir = session_parent.join(sid.to_string());
     assert!(
         !session_uuid_dir.exists(),
         "dispatch must remove grok session dir {} after spawn",
@@ -467,9 +541,9 @@ fn two_dispatches_with_cleanup_err_emit_only_one_banner_line() {
 // AC6 — session_id None → cleanup skipped entirely
 // ---------------------------------------------------------------------------
 
-/// GrokRunner returns `session_id: None` when no new UUID directory appears
-/// in the pre/post snapshot diff (mock exits 0 without creating any dir).
-/// dispatch must skip cleanup in that case — no banner, no errant rmdir.
+/// E9: the mock exits 0 before creating a session directory. `session_id` is
+/// still the `--session-id` argv uuid. Cleanup of that missing directory
+/// returns Ok, so dispatch emits no cleanup warning.
 #[test]
 fn dispatch_grok_skips_cleanup_when_session_id_is_none() {
     let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
@@ -483,13 +557,14 @@ fn dispatch_grok_skips_cleanup_when_session_id_is_none() {
     let temp_home = tempfile::tempdir().expect("create temp HOME");
     let temp_cwd = tempfile::tempdir().expect("create temp cwd");
 
-    // Pre-create the session parent so the pre-snapshot is an empty dir, not absent.
     let session_parent = grok_encoded_session_dir(temp_cwd.path(), temp_home.path());
     std::fs::create_dir_all(&session_parent).expect("create grok session parent");
+    let argv_out = temp_home.path().join("argv.txt");
 
     // SAFETY: serialized via ENV_MUTEX.
     unsafe {
         std::env::set_var("GROK_BINARY", script.to_str().unwrap());
+        std::env::set_var("GROK_ARGV_OUT", argv_out.as_os_str());
         std::env::set_var("HOME", temp_home.path());
     }
 
@@ -502,6 +577,7 @@ fn dispatch_grok_skips_cleanup_when_session_id_is_none() {
 
     unsafe {
         std::env::remove_var("GROK_BINARY");
+        std::env::remove_var("GROK_ARGV_OUT");
         std::env::remove_var("HOME");
     }
     let _ = std::fs::remove_file(&script);
@@ -513,21 +589,74 @@ fn dispatch_grok_skips_cleanup_when_session_id_is_none() {
         "spawn result must round-trip unchanged, got: {:?}",
         r.output
     );
-    // AC6: session_id must be None when no new dir appeared.
-    assert!(
-        r.session_id.is_none(),
-        "GrokRunner must return session_id=None when no session dir was created, got {:?}",
-        r.session_id
+    let sid = recorded_session_id(&argv_out);
+    assert_eq!(
+        r.session_id,
+        Some(sid),
+        "session_id is the argv uuid even when grok created no directory"
     );
-    // No cleanup attempted → CLEANUP_WARN_ONCE stays false.
+    assert!(
+        !session_parent.join(sid.to_string()).exists(),
+        "missing session directory stays absent"
+    );
+    // Missing-dir cleanup is Ok → CLEANUP_WARN_ONCE stays false.
     assert!(
         !cleanup_warn_once_was_triggered(),
-        "no banner expected when session_id is None (cleanup was skipped)"
+        "no cleanup warning when the session directory was never created"
     );
-    // Session parent intact — cleanup never touched it.
     assert!(
         session_parent.exists(),
-        "session parent dir must survive when cleanup was skipped"
+        "session parent dir must survive a missing-directory cleanup"
+    );
+}
+
+/// E10: `HOME` unset. Spawn still returns the argv uuid. Cleanup does not
+/// panic and does not warn.
+#[test]
+fn dispatch_grok_home_unset_skips_cleanup_without_warning() {
+    let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _banner = BANNER_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    reset_cleanup_warn_once_for_test();
+
+    let marker = "HOME_UNSET_GROK_C4E81B22";
+    let script = make_grok_no_session_script("home_unset_grok", marker);
+    let scratch = tempfile::tempdir().expect("create scratch dir");
+    let temp_cwd = tempfile::tempdir().expect("create temp cwd");
+    let argv_out = scratch.path().join("argv.txt");
+
+    // Drop restores HOME even if dispatch panics. Serialized via ENV_MUTEX.
+    let _grok_bin = RestoreEnv::set("GROK_BINARY", script.as_os_str());
+    let _argv_env = RestoreEnv::set("GROK_ARGV_OUT", argv_out.as_os_str());
+    let _home = RestoreEnv::unset("HOME");
+
+    let perm = scoped_coding();
+    let opts = RunnerOpts {
+        working_dir: Some(temp_cwd.path()),
+        ..RunnerOpts::default()
+    };
+    let result = dispatch(RunnerKind::Grok, "home-unset-grok-prompt", &perm, opts);
+
+    drop(_home);
+    drop(_argv_env);
+    drop(_grok_bin);
+    let _ = std::fs::remove_file(&script);
+
+    let r: RunnerResult = result.expect("HOME unset must not panic or return Err");
+    assert_eq!(r.exit_code, 0);
+    assert!(
+        r.output.contains(marker),
+        "spawn result must round-trip unchanged, got: {:?}",
+        r.output
+    );
+    let sid = recorded_session_id(&argv_out);
+    assert_eq!(
+        r.session_id,
+        Some(sid),
+        "session_id is the argv uuid even when HOME is unset"
+    );
+    assert!(
+        !cleanup_warn_once_was_triggered(),
+        "unset HOME must not emit a cleanup warning"
     );
 }
 
