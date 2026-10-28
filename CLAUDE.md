@@ -24,6 +24,8 @@
 
 **Gotcha — sticky path identity (one path → one prefix).** First `PrefixMode::Auto` registration always hashes `md5(branchName:filename)[:8]` and freezes that into `prd_metadata`; JSON `taskPrefix` is not read on first Auto. Re-import / `loop run` restore the registered prefix (do not re-hash). Path-identity twins (relative + absolute `prd_files` for the same live JSON) refuse at init — run `task-mgr doctor` (never `LIMIT 1`, never `archive` to collapse twins). Scoped `--force` soft-archives identity ∪ about-to-apply (`archived_at`); it does not `DELETE FROM tasks` or move JSON files.
 
+**Gotcha — Grok plan-limit sniff is one stderr phrase.** `GrokRunner::spawn` returns `RunnerRateLimited` only when stderr contains `rate limit for your plan` (case-insensitive), after the auth sniff and before the transient sniff. It does not call `detection::is_rate_limited`. A buffer with `429` and `rate` but not that phrase is not this error. A `<completed>` tag with a real id stays `Ok` on either exit arm. `session_id` is set only on `Ok`, and cleanup deletes only `~/.grok/sessions/<encoded-cwd>/<that-uuid>/`. Do not bring back `pick_newest_by_mtime`. (learnings #5947, #5952)
+
 ## Subsystem design notes
 
 Module-level CLAUDE.md files (auto-loaded when files in the module are read):
