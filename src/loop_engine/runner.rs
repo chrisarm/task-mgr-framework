@@ -13,7 +13,6 @@
 //! `SpawnOpts` / `ClaudeResult` names remain valid as `pub type` aliases in
 //! `claude.rs`, so existing call sites compile unchanged.
 
-use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -143,8 +142,10 @@ pub struct RunnerResult {
     /// Each entry is a raw JSON value from the stream-json `permission_denials` array.
     pub permission_denials: Vec<serde_json::Value>,
     /// Session UUID injected via `--session-id` into the LLM CLI invocation.
-    /// `Some(uuid)` for ClaudeRunner (unconditional as of FEAT-003).
-    /// `None` for GrokRunner (Grok capture lands in FEAT-004).
+    /// `Some(uuid)` on the `Ok` path for Claude and Grok. Grok's auth,
+    /// plan-limit, and transient errors return `Err` before this field is
+    /// set, so `dispatch` does not clean those runs up. Codex leaves it
+    /// `None`.
     pub session_id: Option<Uuid>,
     /// True when the CLI reported an error via stream-json `result.is_error`
     /// or `StreamEvent::Error` (assistant `error`, Codex `error` /
@@ -277,6 +278,16 @@ pub fn runner_kind_for(provider: Provider) -> RunnerKind {
         Provider::Claude => RunnerKind::Claude,
         Provider::Grok => RunnerKind::Grok,
         Provider::Codex => RunnerKind::Codex,
+    }
+}
+
+impl std::fmt::Display for RunnerKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            RunnerKind::Claude => "claude",
+            RunnerKind::Grok => "grok",
+            RunnerKind::Codex => "codex",
+        })
     }
 }
 
@@ -482,28 +493,6 @@ pub(crate) fn grok_encoded_session_dir(cwd: &Path, home: &Path) -> PathBuf {
     let trimmed = cwd_str.trim_end_matches('/');
     let encoded = urlencoding::encode(trimmed).into_owned();
     home.join(".grok").join("sessions").join(encoded)
-}
-
-/// Tiebreaker for the FEAT-004 pre/post dir diff when multiple new UUID
-/// subdirectories appear under `grok_dir` after the child exits (rare
-/// parallel-slot race). Returns the UUID whose directory has the latest
-/// modification time (last-write-wins). Returns `None` if mtime is
-/// unreadable for every candidate — safest outcome under unexpected FS state.
-fn pick_newest_by_mtime(grok_dir: &Path, ids: &[Uuid]) -> Option<Uuid> {
-    let mut best: Option<(std::time::SystemTime, Uuid)> = None;
-    for &id in ids {
-        let dir_path = grok_dir.join(id.to_string());
-        if let Ok(meta) = std::fs::metadata(&dir_path)
-            && let Ok(mtime) = meta.modified()
-        {
-            match &best {
-                None => best = Some((mtime, id)),
-                Some((prev, _)) if mtime > *prev => best = Some((mtime, id)),
-                _ => {}
-            }
-        }
-    }
-    best.map(|(_, id)| id)
 }
 
 /// Claude CLI runner.
@@ -805,14 +794,14 @@ impl LlmRunner for ClaudeRunner {
 ///   ai-title-jsonl leak and the `TitleArtifactCleanup` capability is
 ///   `false` on [`GrokRunner`].
 ///
-/// Session capture: `spawn` snapshots `~/.grok/sessions/<encoded-cwd>/`
-/// immediately before and after the child exits (pre/post diff). Entries
-/// that are valid UUIDs and appear only in the post-snapshot are the
-/// candidate session ids. Zero new ids → `session_id: None`. Exactly one
-/// → `session_id: Some(uuid)`. Multiple (rare parallel-slot race) →
-/// the UUID directory with the most recent mtime is chosen
-/// (last-write-wins heuristic; see `pick_newest_by_mtime`). `HOME` absent
-/// → snapshot is skipped and `session_id` stays `None` (best-effort).
+/// Session id: each spawn generates a fresh [`Uuid::new_v4`] and passes
+/// `--session-id <uuid>` immediately before `--prompt-file`. On the `Ok`
+/// path, `RunnerResult.session_id` is that uuid. `dispatch` then deletes
+/// only `<HOME>/.grok/sessions/<encoded-cwd>/<uuid>/`. An interactive
+/// session under the same encoded cwd is a different uuid and is left
+/// alone. `HOME` unset skips cleanup. A missing directory is `Ok`. Early
+/// `Err` returns (auth, plan limit, transient) do not carry the uuid, so
+/// `dispatch` does not delete that directory.
 ///
 /// Auth-failure detection (FR-007): stderr is captured into a bounded buffer
 /// while still being tee'd to the parent process. After the child exits, if
@@ -865,25 +854,6 @@ impl LlmRunner for GrokRunner {
             // this destructure consumes only the fields Grok actively uses.
             ..
         } = opts;
-
-        // Resolve cwd and HOME for the session-dir snapshot. HOME absence
-        // suppresses the snapshot (best-effort; mirrors Claude helper behavior).
-        let cwd = working_dir
-            .map(|p| p.to_path_buf())
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_default();
-        let home_opt = std::env::var("HOME").ok().map(PathBuf::from);
-        let grok_dir_opt = home_opt.as_ref().map(|h| grok_encoded_session_dir(&cwd, h));
-        // Pre-spawn snapshot of entry names; missing dir → empty set (first run).
-        let before: HashSet<String> = grok_dir_opt
-            .as_ref()
-            .and_then(|d| std::fs::read_dir(d).ok())
-            .map(|rd| {
-                rd.filter_map(|e| e.ok())
-                    .map(|e| e.file_name().to_string_lossy().into_owned())
-                    .collect()
-            })
-            .unwrap_or_default();
 
         let binary = resolve_grok_binary(fallback_cli_binary);
 
@@ -946,6 +916,13 @@ impl LlmRunner for GrokRunner {
         // unlinks the temp file (owned values drop at end of this scope,
         // which is past `child.wait()` below).
         let prompt_file = write_prompt_to_tempfile(prompt, &binary, "Grok")?;
+        // WORKAROUND(grok-cli-no-persistence-off): grok 1.0.50 has no
+        // --no-session-persistence. A fresh UUID lets post-wait cleanup
+        // delete that exact directory. Keep this immediately before
+        // --prompt-file, mirroring Claude's --session-id before -p.
+        let uuid = Uuid::new_v4();
+        args.push("--session-id".to_string());
+        args.push(uuid.to_string());
         args.push("--prompt-file".to_string());
         args.push(prompt_file.path().to_string_lossy().into_owned());
 
@@ -1031,26 +1008,6 @@ impl LlmRunner for GrokRunner {
         // too so a channel match can be recorded without classifying it.
         let stderr_str = stderr_buf.lock().map(|b| b.clone()).unwrap_or_default();
 
-        // Post-spawn snapshot: diff against before to find the new session dir.
-        let session_id: Option<Uuid> = grok_dir_opt.as_ref().and_then(|grok_dir| {
-            let after: HashSet<String> = std::fs::read_dir(grok_dir)
-                .map(|rd| {
-                    rd.filter_map(|e| e.ok())
-                        .map(|e| e.file_name().to_string_lossy().into_owned())
-                        .collect()
-                })
-                .unwrap_or_default();
-            let new_ids: Vec<Uuid> = after
-                .difference(&before)
-                .filter_map(|s| Uuid::parse_str(s).ok())
-                .collect();
-            match new_ids.len() {
-                0 => None,
-                1 => Some(new_ids[0]),
-                _ => pick_newest_by_mtime(grok_dir, &new_ids),
-            }
-        });
-
         // Record before the early returns. Auth and transient still see this
         // same `stderr_str`; the line does not retarget those checks.
         limit_shape::record_grok(
@@ -1066,16 +1023,37 @@ impl LlmRunner for GrokRunner {
         );
 
         // Post-exit stderr classification. The buffered stderr was read once
-        // above for both sniffs (auth-failure + transient-backend).
+        // above. Auth and the transient sniff stay inside `exit_code != 0`.
+        // The plan-limit sniff sits between them. Its exit-0 arm is the
+        // empty-stdout check after this block.
+        //
+        // Plan phrase only — do not call `detection::is_rate_limited`. A
+        // buffer that contains `429` and `rate` but not this phrase is not a
+        // plan limit, and that helper stays the Claude stdout classifier.
+        // A `<completed>` tag stays on the Ok result on either exit arm.
+        let plan_limited = stderr_str
+            .to_ascii_lowercase()
+            .contains("rate limit for your plan");
+        let has_completed_tag = output
+            .find("<completed>")
+            .is_some_and(|at| output[at + "<completed>".len()..].contains("</completed>"));
+        let plan_limit_hit = plan_limited && !has_completed_tag;
         if exit_code != 0 {
             // Auth-failure sniff: only credible when the child died fast AND
             // with a known auth-phrase on stderr. The fast-fail timing window
             // distinguishes a real auth lapse (errors at startup) from a
             // long-running tool-use error that happens to mention auth strings.
-            // Window is overridable via env var for tests.
+            // Window is overridable via env var for tests. Auth wins over the
+            // plan-limit return below.
             if elapsed < grok_auth_failure_window() && stderr_contains_auth_failure(&stderr_str) {
                 return Err(TaskMgrError::GrokAuthFailure {
                     hint: GROK_AUTH_FAILURE_HINT.to_string(),
+                });
+            }
+
+            if plan_limit_hit {
+                return Err(TaskMgrError::RunnerRateLimited {
+                    runner: RunnerKind::Grok,
                 });
             }
 
@@ -1096,6 +1074,10 @@ impl LlmRunner for GrokRunner {
                     ),
                 });
             }
+        } else if output.trim().is_empty() && plan_limit_hit {
+            return Err(TaskMgrError::RunnerRateLimited {
+                runner: RunnerKind::Grok,
+            });
         }
 
         Ok(RunnerResult {
@@ -1105,7 +1087,7 @@ impl LlmRunner for GrokRunner {
             timed_out,
             completion_killed,
             permission_denials,
-            session_id,
+            session_id: Some(uuid),
             cli_error,
             error_text,
             grace_buffer_tail,
@@ -1113,10 +1095,10 @@ impl LlmRunner for GrokRunner {
     }
 
     // WORKAROUND(grok-cli-no-persistence-off): grok has no --no-session-persistence
-    // equivalent and writes a directory of artifacts per session at
-    // ~/.grok/sessions/<percent-encoded-cwd>/<uuid>/. Remove only the uuid subdir;
-    // prompt_history.jsonl in the parent dir accumulates across sessions by design
-    // and must be preserved.
+    // flag. spawn passes `--session-id <uuid>` (grok 1.0.50) and this deletes
+    // only ~/.grok/sessions/<percent-encoded-cwd>/<uuid>/. prompt_history.jsonl
+    // in the parent dir accumulates across sessions by design and must be
+    // preserved. Unset HOME and a missing directory are both Ok.
     fn cleanup_session(&self, session_id: Uuid, cwd: &Path) -> TaskMgrResult<()> {
         let home = match std::env::var("HOME") {
             Ok(h) if !h.is_empty() => PathBuf::from(h),
@@ -2531,15 +2513,19 @@ mod tests {
     /// (claude.rs:1221) so future tests adding GrokRunner coverage have a
     /// drop-in helper symmetric with the Claude side.
     ///
-    /// Holds [`GROK_BINARY_MUTEX`] for the duration (env-var mutation is
-    /// process-global). Cleans up the env var and the temp script on every
-    /// exit path.
+    /// Holds [`RUNNER_HOME_ENV_MUTEX`] then [`GROK_BINARY_MUTEX`]. A temp HOME
+    /// keeps cleanup off the real `~/.grok`.
     fn spawn_grok_echo(
         prompt: &str,
         permission_mode: &PermissionMode,
         stream_json: bool,
     ) -> TaskMgrResult<RunnerResult> {
+        let _home_lock = RUNNER_HOME_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _guard = GROK_BINARY_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = RunnerHomeGuard::set(home.path());
         let marker = "GROK_ECHO_HELPER_MARKER";
         let script = make_grok_marker_script("spawn_grok_echo", marker);
         unsafe { std::env::set_var("GROK_BINARY", script.to_str().unwrap()) };
@@ -2667,13 +2653,19 @@ mod tests {
     }
 
     /// Run `dispatch(Grok)` against the argv-recorder mock and return the
-    /// recorded argv lines. Holds [`GROK_BINARY_MUTEX`]; cleans up env + files.
+    /// recorded argv lines. Holds [`RUNNER_HOME_ENV_MUTEX`] then
+    /// [`GROK_BINARY_MUTEX`]. A temp HOME keeps cleanup off the real `~/.grok`.
     fn dispatch_grok_recording_argv(
         prompt: &str,
         perm: &PermissionMode,
         stream_json: bool,
     ) -> Vec<String> {
+        let _home_lock = RUNNER_HOME_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _guard = GROK_BINARY_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = RunnerHomeGuard::set(home.path());
         let script = make_grok_argv_recorder();
         let argv_out = std::env::temp_dir().join("task_mgr_grok_argv_out.txt");
         unsafe { std::env::set_var("GROK_BINARY", script.to_str().unwrap()) };
@@ -2774,7 +2766,12 @@ mod tests {
     /// proceeds to spawn rather than returning `UnsupportedRunnerCapability`.
     #[test]
     fn grok_dispatch_accepts_capability_gated_cleanup_title_artifact() {
+        let _home_lock = RUNNER_HOME_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _guard = GROK_BINARY_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = RunnerHomeGuard::set(home.path());
         let gated = RunnerKind::Grok.supports(RunnerCapability::TitleArtifactCleanup);
         assert!(!gated, "Grok must not advertise TitleArtifactCleanup");
         let script = make_grok_marker_script("cleanup_gate", "GATE_OK");
@@ -2795,55 +2792,73 @@ mod tests {
         assert_eq!(r.exit_code, 0, "expected clean exit, got {r:?}");
     }
 
-    /// TEST-INIT-002 — GrokRunner discovers session id from pre/post dir diff.
-    ///
-    /// The mock grok binary reads `GROK_TEST_SESSION_DIR` and creates a fixed
-    /// UUID subdirectory there (simulating what the real Grok CLI does). After
-    /// child exit, GrokRunner computes the diff and populates
-    /// `RunnerResult::session_id` with the discovered UUID.
+    /// E8: spawn passes `--session-id <uuid>` and cleanup removes only that
+    /// directory. A newer other-uuid directory created during the run (an
+    /// interactive session in the same cwd) and `prompt_history.jsonl` survive.
     ///
     /// Lock ordering: `RUNNER_HOME_ENV_MUTEX` first, then `GROK_BINARY_MUTEX`.
     /// Any future test that holds both must use the same order to avoid deadlock.
     #[test]
-    fn grok_runner_discovers_session_id_from_pre_post_dir_diff() {
-        use std::io::Write as _;
+    fn grok_runner_session_id_argv_spares_other_uuid_and_prompt_history() {
         use std::os::unix::fs::PermissionsExt as _;
-        // HOME mutex first, then GROK_BINARY mutex — consistent acquisition order.
+
+        use crate::loop_engine::test_utils::EnvGuard;
+
         let _guard_home = RUNNER_HOME_ENV_MUTEX
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let _guard_bin = GROK_BINARY_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
 
         let tmp = tempfile::TempDir::new().unwrap();
-        let fake_home = tmp.path().to_path_buf();
-        let fake_cwd = fake_home.join("workspace");
+        let fake_home = tmp.path().join("home");
+        let fake_cwd = tmp.path().join("workspace");
+        std::fs::create_dir_all(&fake_home).unwrap();
         std::fs::create_dir_all(&fake_cwd).unwrap();
 
-        // Pre-create the encoded session dir (empty). Simulates a cwd with prior
-        // Grok activity but no session dirs from THIS run.
         let session_dir = grok_encoded_session_dir(&fake_cwd, &fake_home);
         std::fs::create_dir_all(&session_dir).unwrap();
 
-        // Known UUID the mock binary creates as a subdir during its execution.
-        let expected_uuid_str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
-        let expected_uuid = Uuid::parse_str(expected_uuid_str).unwrap();
+        // Interactive session. Created after the argv uuid inside the mock so
+        // its mtime is newer — the collision a newest-mtime pick would delete.
+        let other_uuid = "cccccccc-dddd-4eee-8fff-000000000001";
+        let other_dir = session_dir.join(other_uuid);
+        let prompt_history = session_dir.join("prompt_history.jsonl");
+        let argv_out = tmp.path().join("argv.txt");
 
-        // Mock grok: create $GROK_TEST_SESSION_DIR/<uuid>/ then exit 0.
-        let script_path = std::env::temp_dir().join("task_mgr_grok_session_id_capture_test.sh");
-        {
-            let mut f = std::fs::File::create(&script_path).unwrap();
-            writeln!(f, "#!/bin/sh").unwrap();
-            writeln!(
-                f,
-                r#"mkdir -p "$GROK_TEST_SESSION_DIR/{expected_uuid_str}""#
-            )
-            .unwrap();
-            writeln!(f, r#"echo "session-capture-ok""#).unwrap();
-        }
+        let script_path = tmp.path().join("grok.sh");
+        std::fs::write(
+            &script_path,
+            r#"#!/bin/sh
+: > "$GROK_ARGV_OUT"
+for a in "$@"; do printf '%s\n' "$a" >> "$GROK_ARGV_OUT"; done
+SESSION_ID=""
+while [ $# -gt 0 ]; do
+  if [ "$1" = "--session-id" ]; then
+    SESSION_ID="$2"
+    shift 2
+  else
+    shift
+  fi
+done
+if [ -n "$SESSION_ID" ]; then
+  mkdir -p "$GROK_TEST_SESSION_DIR/$SESSION_ID"
+  printf '%s\n' '{}' > "$GROK_TEST_SESSION_DIR/$SESSION_ID/session.json"
+fi
+mkdir -p "$GROK_TEST_SESSION_DIR/$GROK_TEST_OTHER_UUID"
+printf '%s\n' '{"interactive":true}' > "$GROK_TEST_SESSION_DIR/$GROK_TEST_OTHER_UUID/session.json"
+touch "$GROK_TEST_SESSION_DIR/$GROK_TEST_OTHER_UUID"
+printf '%s\n' '{"keep":"me"}' > "$GROK_TEST_SESSION_DIR/prompt_history.jsonl"
+echo session-capture-ok
+exit 0
+"#,
+        )
+        .unwrap();
         std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        unsafe { std::env::set_var("GROK_BINARY", script_path.to_str().unwrap()) };
-        unsafe { std::env::set_var("GROK_TEST_SESSION_DIR", session_dir.to_str().unwrap()) };
+        let _bin = EnvGuard::set("GROK_BINARY", script_path.to_str().unwrap());
+        let _argv = EnvGuard::set("GROK_ARGV_OUT", argv_out.to_str().unwrap());
+        let _session = EnvGuard::set("GROK_TEST_SESSION_DIR", session_dir.to_str().unwrap());
+        let _other = EnvGuard::set("GROK_TEST_OTHER_UUID", other_uuid);
         let _home = RunnerHomeGuard::set(&fake_home);
 
         let perm = scoped_coding();
@@ -2857,17 +2872,48 @@ mod tests {
             },
         );
 
-        unsafe { std::env::remove_var("GROK_BINARY") };
-        unsafe { std::env::remove_var("GROK_TEST_SESSION_DIR") };
-        let _ = std::fs::remove_file(&script_path);
-
         let r = result.expect("dispatch(Grok) returned Err");
         assert_eq!(r.exit_code, 0, "expected clean exit, got {r:?}");
+        assert!(
+            r.output.contains("session-capture-ok"),
+            "mock grok must have run, got {:?}",
+            r.output
+        );
+
+        let argv = std::fs::read_to_string(&argv_out)
+            .unwrap_or_else(|e| panic!("read argv record {}: {e}", argv_out.display()));
+        let lines: Vec<&str> = argv.lines().collect();
+        let pos = lines
+            .iter()
+            .position(|line| *line == "--session-id")
+            .unwrap_or_else(|| panic!("argv must contain --session-id, got {argv:?}"));
+        assert_eq!(
+            lines.get(pos + 2).copied(),
+            Some("--prompt-file"),
+            "--session-id must sit immediately before --prompt-file, got {lines:?}"
+        );
+        let sid = Uuid::parse_str(lines[pos + 1]).unwrap_or_else(|e| {
+            panic!("--session-id value {:?} is not a uuid: {e}", lines[pos + 1])
+        });
         assert_eq!(
             r.session_id,
-            Some(expected_uuid),
-            "GrokRunner must discover session_id from pre/post dir diff, got {:?}",
+            Some(sid),
+            "RunnerResult.session_id must be the --session-id uuid, got {:?}",
             r.session_id
+        );
+        assert!(
+            !session_dir.join(sid.to_string()).exists(),
+            "cleanup must remove only the --session-id directory"
+        );
+        assert!(
+            other_dir.join("session.json").exists(),
+            "newer other-uuid directory must survive cleanup, path {}",
+            other_dir.display()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&prompt_history).unwrap_or_default(),
+            "{\"keep\":\"me\"}\n",
+            "prompt_history.jsonl must survive cleanup"
         );
     }
 
@@ -2917,7 +2963,12 @@ mod tests {
     fn dispatch_grok_clean_exit_is_not_auth_failure() {
         use std::io::Write as _;
         use std::os::unix::fs::PermissionsExt as _;
+        let _home_lock = RUNNER_HOME_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _guard = GROK_BINARY_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = RunnerHomeGuard::set(home.path());
         let path = std::env::temp_dir().join("task_mgr_grok_test_clean_exit.sh");
         {
             let mut f = std::fs::File::create(&path).unwrap();
@@ -2945,6 +2996,213 @@ mod tests {
             Ok(r) => assert_eq!(r.exit_code, 0),
             Err(other) => panic!("expected Ok(success), got Err({other:?})"),
         }
+    }
+
+    /// Mock grok that writes the FIX-001 plan-limit fixture to stderr.
+    /// `stdout` is emitted as plain text (`stream_json: false` at the call).
+    /// The fixture path is `cat`'d so the U+2019 byte is not shell-quoted.
+    fn plan_limit_grok_script(dir: &Path, name: &str, stdout: &str, exit_code: i32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let fixture_path = dir.join(format!("{name}.fixture"));
+        std::fs::write(
+            &fixture_path,
+            include_str!("../../tests/fixtures/grok_stderr_plan_rate_limit.txt"),
+        )
+        .unwrap();
+        let stdout_line = if stdout.is_empty() {
+            String::new()
+        } else {
+            format!("printf '%s' '{stdout}'\n")
+        };
+        let path = dir.join(name);
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\ncat '{}' >&2\n{stdout_line}exit {exit_code}\n",
+                fixture_path.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// Spawn the plan-limit stub under a temp HOME and temp cwd. Lock order is
+    /// HOME then `GROK_BINARY` (learning 4696 / the session-id test).
+    fn dispatch_plan_limit_stub(stdout: &str, exit_code: i32) -> TaskMgrResult<RunnerResult> {
+        use crate::loop_engine::test_utils::EnvGuard;
+        let _home_lock = RUNNER_HOME_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _bin_lock = GROK_BINARY_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let cwd = tmp.path().join("cwd");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        let script = plan_limit_grok_script(tmp.path(), "grok-plan-limit.sh", stdout, exit_code);
+        let _bin = EnvGuard::set("GROK_BINARY", script.to_str().unwrap());
+        let _home = RunnerHomeGuard::set(&home);
+        dispatch(
+            RunnerKind::Grok,
+            "plan-limit-probe",
+            &PermissionMode::Dangerous,
+            RunnerOpts {
+                working_dir: Some(&cwd),
+                stream_json: false,
+                ..RunnerOpts::default()
+            },
+        )
+    }
+
+    fn assert_runner_rate_limited(result: TaskMgrResult<RunnerResult>) {
+        let Err(err) = result else {
+            panic!("expected RunnerRateLimited, got Ok");
+        };
+        let shown = err.to_string();
+        match err {
+            TaskMgrError::RunnerRateLimited { runner } => {
+                assert_eq!(runner, RunnerKind::Grok);
+                assert!(
+                    shown.contains("grok"),
+                    "Display must name the provider, got {shown}"
+                );
+            }
+            other => panic!("expected RunnerRateLimited, got {other:?}"),
+        }
+    }
+
+    /// Gate arm: exit 1 (stand-in; the 2026-07-15 status was not recorded)
+    /// with the plan-limit fixture on stderr.
+    #[test]
+    fn grok_plan_limit_exit_1_yields_typed_error() {
+        assert_runner_rate_limited(dispatch_plan_limit_stub("", 1));
+    }
+
+    /// Gate arm: exit 0 and empty stdout, same fixture on stderr.
+    #[test]
+    fn grok_plan_limit_exit_0_empty_stdout_yields_typed_error() {
+        assert_runner_rate_limited(dispatch_plan_limit_stub("", 0));
+    }
+
+    /// E7: exit 0 with a completion tag on stdout is not a rate limit, even
+    /// when the plan sentence is also on stderr. Stderr must not be appended
+    /// onto the runner output.
+    #[test]
+    fn grok_plan_limit_exit_0_completed_stdout_is_not_rate_limit() {
+        let result = dispatch_plan_limit_stub("<completed>X</completed>\n", 0)
+            .expect("exit 0 with completion stdout must not be a runner error");
+        assert_eq!(result.exit_code, 0);
+        assert!(result.output.contains("<completed>X</completed>"));
+        assert!(
+            !result.output.contains("rate limit"),
+            "stderr plan sentence must not be appended to output, got {}",
+            result.output
+        );
+    }
+
+    /// E7: exit non-zero with a completion tag on stdout is not a rate limit
+    /// either. The tag stays on the Ok result; stderr is not appended.
+    #[test]
+    fn grok_plan_limit_exit_nonzero_completed_stdout_is_not_rate_limit() {
+        let result = dispatch_plan_limit_stub("<completed>X</completed>\n", 1)
+            .expect("exit 1 with completion stdout must not be a runner error");
+        assert_ne!(result.exit_code, 0);
+        assert!(result.output.contains("<completed>X</completed>"));
+        assert!(
+            !result.output.contains("rate limit"),
+            "stderr plan sentence must not be appended to output, got {}",
+            result.output
+        );
+    }
+
+    /// Exit 0 with other non-empty stdout (no completion tag) is not this
+    /// error. The plan sentence on stderr stays off the runner output.
+    #[test]
+    fn grok_plan_limit_exit_0_other_stdout_is_not_rate_limit() {
+        let result = dispatch_plan_limit_stub("still working\n", 0)
+            .expect("exit 0 with other non-empty stdout must not be a runner error");
+        assert_eq!(result.exit_code, 0);
+        assert!(result.output.contains("still working"));
+        assert!(
+            !result.output.contains("rate limit"),
+            "stderr plan sentence must not be appended to output, got {}",
+            result.output
+        );
+    }
+
+    /// A non-zero stderr buffer that contains `429` and `rate` but not the
+    /// plan phrase is not `RunnerRateLimited`. The sniff must not call
+    /// `is_rate_limited`, which would match this buffer.
+    #[test]
+    fn grok_plan_limit_429_and_rate_without_phrase_is_not_rate_limited() {
+        let stderr = "HTTP 429\nrate exceeded for this minute\n";
+        assert!(stderr.contains("429") && stderr.contains("rate"));
+        assert!(
+            !stderr
+                .to_ascii_lowercase()
+                .contains("rate limit for your plan")
+        );
+        let result = dispatch_grok_stderr_stub(stderr, "", 1);
+        match result {
+            Ok(r) => {
+                assert_ne!(r.exit_code, 0);
+                assert!(
+                    !r.output.contains("429"),
+                    "stderr must not be appended to output, got {}",
+                    r.output
+                );
+            }
+            Err(err) => panic!("expected Ok, not RunnerRateLimited, got {err:?}"),
+        }
+    }
+
+    /// Spawn a mock grok whose stderr is `stderr` (not the plan fixture).
+    /// Same HOME / `GROK_BINARY` lock order as [`dispatch_plan_limit_stub`].
+    fn dispatch_grok_stderr_stub(
+        stderr: &str,
+        stdout: &str,
+        exit_code: i32,
+    ) -> TaskMgrResult<RunnerResult> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        use crate::loop_engine::test_utils::EnvGuard;
+        let _home_lock = RUNNER_HOME_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _bin_lock = GROK_BINARY_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let cwd = tmp.path().join("cwd");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        let stderr_path = tmp.path().join("stderr.txt");
+        let stdout_path = tmp.path().join("stdout.txt");
+        std::fs::write(&stderr_path, stderr).unwrap();
+        std::fs::write(&stdout_path, stdout).unwrap();
+        let script = tmp.path().join("grok-custom-stderr.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ncat '{}' >&2\ncat '{}'\nexit {exit_code}\n",
+                stderr_path.display(),
+                stdout_path.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _bin = EnvGuard::set("GROK_BINARY", script.to_str().unwrap());
+        let _home = RunnerHomeGuard::set(&home);
+        dispatch(
+            RunnerKind::Grok,
+            "plan-limit-probe",
+            &PermissionMode::Dangerous,
+            RunnerOpts {
+                working_dir: Some(&cwd),
+                stream_json: false,
+                ..RunnerOpts::default()
+            },
+        )
     }
 
     /// AC #7 (positive): a structured `[Error: 401 unauthorized]` line in the
@@ -4111,6 +4369,40 @@ Assistant: I'll retry with credentials.\n";
         );
     }
 
+    /// E10: `HOME` unset. No cleanup and no panic. A directory that would be
+    /// the target under some other home stays on disk.
+    #[test]
+    fn grok_runner_cleanup_session_home_unset_is_ok() {
+        use crate::loop_engine::test_utils::EnvGuard;
+
+        let _guard = RUNNER_HOME_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake_home = tmp.path().to_path_buf();
+        let fake_cwd = fake_home.join("workspace");
+        std::fs::create_dir_all(&fake_cwd).unwrap();
+
+        let encoded = grok_encoded_session_dir(&fake_cwd, &fake_home);
+        let target_uuid = Uuid::new_v4();
+        let target_dir = encoded.join(target_uuid.to_string());
+        std::fs::create_dir_all(&target_dir).unwrap();
+        std::fs::write(target_dir.join("session.json"), "keep").unwrap();
+
+        let _home = EnvGuard::remove("HOME");
+        let result = GrokRunner.cleanup_session(target_uuid, &fake_cwd);
+
+        assert!(
+            result.is_ok(),
+            "unset HOME must return Ok without panicking, got {result:?}"
+        );
+        assert!(
+            target_dir.join("session.json").exists(),
+            "unset HOME must not delete the session directory"
+        );
+    }
+
     /// AC (TEST-INIT-002 #8): both impls accept an absolute, path-resolved
     /// `&Path` for `cwd` — the shape dispatch will hand them in FEAT-006
     /// after resolving `RunnerOpts.working_dir` or falling back to
@@ -4280,7 +4572,12 @@ Assistant: I'll retry with credentials.\n";
     fn grok_telemetry_trace_upload_set_on_grok_child() {
         use std::io::Write as _;
         use std::os::unix::fs::PermissionsExt as _;
+        let _home_lock = RUNNER_HOME_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _guard = GROK_BINARY_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = RunnerHomeGuard::set(home.path());
 
         let out_file = std::env::temp_dir().join("task_mgr_grok_telemetry_env_check.txt");
         let script = std::env::temp_dir().join("task_mgr_grok_telemetry_env_check.sh");

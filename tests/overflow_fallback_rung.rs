@@ -4,8 +4,9 @@
 //!   * Disabled / absent fallback config → byte-identical to today's 4-rung
 //!     ladder ending in `Blocked` at the Opus[1M]+high ceiling.
 //!   * Enabled + effective_runner Claude → promotes to Grok: writes
-//!     `runner_overrides[task] = Grok`, `model_overrides[task] = cfg.model`,
-//!     UPDATEs `tasks.model = cfg.model`, status reset to `'todo'`, and a
+//!     `runner_overrides[task] = Grok`, `model_overrides[task] = ""` (builtin
+//!     Grok `standard` is a null rung, so `--model` is omitted), UPDATEs
+//!     `tasks.model` to that empty string, status reset to `'todo'`, and a
 //!     `FallbackToProvider` JSONL event lands.
 //!   * Enabled + effective_runner already Grok → idempotency guard skips
 //!     rung 4 and lands on `Blocked` (no re-promote, no second tasks.model
@@ -26,9 +27,13 @@ use task_mgr::loop_engine::prompt::PromptResult;
 use task_mgr::loop_engine::reactions::post_output::{HandleOverflowParams, handle_overflow};
 use task_mgr::loop_engine::runner::RunnerKind;
 
-/// Default Grok model id for the fallback rung — the model the builtin Grok
-/// provider ladder maps its single (Standard) rung to.
+/// Explicit Grok id for fixtures that are already on Grok. The builtin ladder
+/// does not use it: `GROK_DEFAULT_TIER_MODELS` leaves `standard` empty.
 const GROK_DEFAULT_MODEL: &str = GROK_MODEL;
+
+/// Persisted form of the builtin Grok null `standard` rung. Empty omits
+/// `--model` (`push_optional_flag`).
+const BUILTIN_GROK_NULL_MODEL: &str = "";
 
 /// The new Claude overflow ceiling: the 1M-context variant of the frontier
 /// (fable) model. The legacy ceiling was the 1M Opus variant; the provider-first
@@ -272,7 +277,7 @@ fn fallback_enabled_claude_at_ceiling_promotes_to_grok() {
         matches!(
             action,
             RecoveryAction::FallbackToProvider { ref provider, ref model }
-                if provider == "grok" && model == GROK_DEFAULT_MODEL
+                if provider == "grok" && model == BUILTIN_GROK_NULL_MODEL
         ),
         "rung 4 must fire when providers.claude.fallback=grok AND runner==Claude, got {action:?}",
     );
@@ -283,13 +288,13 @@ fn fallback_enabled_claude_at_ceiling_promotes_to_grok() {
     );
     assert_eq!(
         ctx.model_overrides.get(task_id).map(String::as_str),
-        Some(GROK_DEFAULT_MODEL),
-        "model_overrides MUST be set to cfg.model",
+        Some(BUILTIN_GROK_NULL_MODEL),
+        "model_overrides records the null Grok rung (omit --model)",
     );
     assert_eq!(
         task_model(&conn, task_id).as_deref(),
-        Some(GROK_DEFAULT_MODEL),
-        "tasks.model UPDATE must run so model resolution picks Grok next iter",
+        Some(BUILTIN_GROK_NULL_MODEL),
+        "tasks.model UPDATE persists the null Grok rung so the next iter omits --model",
     );
     assert_eq!(
         task_status(&conn, task_id),
@@ -309,7 +314,7 @@ fn fallback_enabled_claude_at_ceiling_promotes_to_grok() {
     assert!(matches!(
         events[0].recovery,
         RecoveryAction::FallbackToProvider { ref provider, ref model }
-            if provider == "grok" && model == GROK_DEFAULT_MODEL
+            if provider == "grok" && model == BUILTIN_GROK_NULL_MODEL
     ));
 }
 
@@ -525,14 +530,14 @@ fn claude_to_grok_byte_identical_when_primary_runner_none() {
         matches!(
             action,
             RecoveryAction::FallbackToProvider { ref provider, ref model }
-                if provider == "grok" && model == GROK_DEFAULT_MODEL
+                if provider == "grok" && model == BUILTIN_GROK_NULL_MODEL
         ),
         "Claude→Grok promotion must be unchanged when no inverse is wired, got {action:?}",
     );
     assert_eq!(ctx.runner_overrides.get(task_id), Some(&RunnerKind::Grok));
     assert_eq!(
         task_model(&conn, task_id).as_deref(),
-        Some(GROK_DEFAULT_MODEL),
+        Some(BUILTIN_GROK_NULL_MODEL),
     );
     assert_eq!(task_status(&conn, task_id), "todo");
 }

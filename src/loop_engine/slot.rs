@@ -326,6 +326,25 @@ pub fn run_slot_iteration(
                 },
             ));
         }
+        // FIX-002: same `RateLimit` mapping as the sequential path. Empty
+        // output; the wave aggregator does not count this outcome as a crash.
+        Err(crate::error::TaskMgrError::RunnerRateLimited { runner }) => {
+            ui::emit(&format!(
+                "[slot {}] {runner} rate limited for task {task_id}; will retry after the limit lifts",
+                slot.slot_index,
+            ));
+            return Ok(slot_early_exit(
+                slot,
+                SlotEarlyExit {
+                    outcome: IterationOutcome::RateLimit,
+                    files_modified: task_files,
+                    should_stop: false,
+                    output: String::new(),
+                    effective_model,
+                    effective_effort: effort.clone(),
+                },
+            ));
+        }
         Err(e) => return Err(e),
     };
 
@@ -1038,5 +1057,54 @@ mod tests {
             })
             .unwrap();
         assert_eq!(status, "blocked", "row must not change on failed claim");
+    }
+
+    /// Wave path: the same plan-limit stub maps to `RateLimit` with the slot's
+    /// task id and Grok as the effective runner. Output stays empty so the
+    /// existing account reaction does not see the stderr sentence.
+    #[test]
+    fn grok_plan_limit_wave_maps_to_rate_limit() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        use crate::loop_engine::test_utils::{EnvGuard, GROK_BINARY_MUTEX};
+
+        let _bin_lock = GROK_BINARY_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let (db_dir, _conn) = setup_test_db();
+        let work = tempfile::TempDir::new().unwrap();
+        let fixture_path = work.path().join("plan-limit.fixture");
+        std::fs::write(
+            &fixture_path,
+            include_str!("../../tests/fixtures/grok_stderr_plan_rate_limit.txt"),
+        )
+        .unwrap();
+        let script = work.path().join("grok-plan-limit.sh");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\ncat '{}' >&2\nexit 1\n", fixture_path.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _bin = EnvGuard::set("GROK_BINARY", script.to_str().unwrap());
+
+        let cwd = work.path().join("cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let task_id = "FIX-002-WAVE";
+        let mut slot = make_slot(1, cwd, dummy_bundle(task_id));
+        slot.effective_runner = RunnerKind::Grok;
+        let params = make_slot_params(db_dir.path(), SignalFlag::new());
+
+        let result = run_slot_iteration(&slot, &params).expect("run_slot_iteration");
+        assert_eq!(result.iteration_result.outcome, IterationOutcome::RateLimit);
+        assert_eq!(result.iteration_result.task_id.as_deref(), Some(task_id));
+        assert_eq!(
+            result.iteration_result.effective_runner,
+            Some(RunnerKind::Grok)
+        );
+        assert_eq!(result.effective_runner, RunnerKind::Grok);
+        assert!(
+            result.iteration_result.output.is_empty(),
+            "RateLimit output must stay empty, got {}",
+            result.iteration_result.output
+        );
     }
 }

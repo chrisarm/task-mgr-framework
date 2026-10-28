@@ -54,6 +54,7 @@ use std::sync::Mutex;
 use task_mgr::error::TaskMgrError;
 use task_mgr::loop_engine::config::{CODING_ALLOWED_TOOLS, PermissionMode};
 use task_mgr::loop_engine::runner::{RunnerKind, RunnerOpts, dispatch};
+use uuid::Uuid;
 
 /// Serialize `GROK_BINARY` env-var mutations within this integration-test
 /// binary. Independent of the `CLAUDE_BINARY` mutex elsewhere; both lock
@@ -144,11 +145,24 @@ fn dispatch_grok_with_mock(
     perm: &PermissionMode,
     opts: RunnerOpts<'_>,
 ) -> task_mgr::error::TaskMgrResult<task_mgr::loop_engine::runner::RunnerResult> {
+    // HOME first, then GROK_BINARY. A temp HOME keeps cleanup off the real ~/.grok.
+    let _home_lock = HOME_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let _guard = GROK_BINARY_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-    // SAFETY: env mutation is process-global; serialized via GROK_BINARY_MUTEX.
-    unsafe { std::env::set_var("GROK_BINARY", script) };
+    let home = tempfile::tempdir().expect("temp HOME");
+    let prior_home = std::env::var_os("HOME");
+    // SAFETY: env mutation is process-global; serialized by the mutexes above.
+    unsafe {
+        std::env::set_var("HOME", home.path());
+        std::env::set_var("GROK_BINARY", script);
+    }
     let result = dispatch(RunnerKind::Grok, prompt, perm, opts);
-    unsafe { std::env::remove_var("GROK_BINARY") };
+    unsafe {
+        std::env::remove_var("GROK_BINARY");
+        match prior_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+    }
     result
 }
 
@@ -300,21 +314,36 @@ fn expected_grok_session_dir(cwd: &std::path::Path, home: &std::path::Path) -> s
     home.join(".grok").join("sessions").join(encoded)
 }
 
-/// Mock grok that simulates Grok CLI persistence: creates a fixed UUID
-/// subdir under `$GROK_TEST_SESSION_DIR/` with a session.json file, then
-/// exits 0. Used by the post-spawn cleanup integration test below.
-fn make_session_creating_script(name: &str, uuid_str: &str) -> ScriptGuard {
+/// Mock grok that records argv and creates
+/// `$GROK_TEST_SESSION_DIR/<uuid-from---session-id>/`.
+fn make_session_creating_script(name: &str) -> ScriptGuard {
     let path = std::env::temp_dir().join(format!("task_mgr_grok_{name}.sh"));
     {
         let mut f = std::fs::File::create(&path).expect("create grok mock");
         writeln!(f, "#!/bin/sh").unwrap();
-        writeln!(f, r#"mkdir -p "$GROK_TEST_SESSION_DIR/{uuid_str}""#).unwrap();
+        writeln!(f, r#": > "$GROK_ARGV_OUT""#).unwrap();
         writeln!(
             f,
-            r#"echo '{{}}' > "$GROK_TEST_SESSION_DIR/{uuid_str}/session.json""#
+            r#"for a in "$@"; do printf '%s\n' "$a" >> "$GROK_ARGV_OUT"; done"#
         )
         .unwrap();
-        writeln!(f, r#"cat > /dev/null"#).unwrap();
+        writeln!(f, r#"SESSION_ID="""#).unwrap();
+        writeln!(f, r#"while [ $# -gt 0 ]; do"#).unwrap();
+        writeln!(f, r#"  if [ "$1" = "--session-id" ]; then"#).unwrap();
+        writeln!(f, r#"    SESSION_ID="$2"; shift 2"#).unwrap();
+        writeln!(f, r#"  else"#).unwrap();
+        writeln!(f, r#"    shift"#).unwrap();
+        writeln!(f, r#"  fi"#).unwrap();
+        writeln!(f, r#"done"#).unwrap();
+        writeln!(f, r#"if [ -n "$SESSION_ID" ]; then"#).unwrap();
+        writeln!(f, r#"  mkdir -p "$GROK_TEST_SESSION_DIR/$SESSION_ID""#).unwrap();
+        writeln!(
+            f,
+            r#"  printf '%s\n' '{{}}' > "$GROK_TEST_SESSION_DIR/$SESSION_ID/session.json""#
+        )
+        .unwrap();
+        writeln!(f, r#"fi"#).unwrap();
+        writeln!(f, r#"echo cleanup-session-ok"#).unwrap();
         writeln!(f, "exit 0").unwrap();
     }
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
@@ -340,19 +369,19 @@ fn grok_runner_cleanup_session_deletes_session_directory() {
 
     let session_dir = expected_grok_session_dir(&fake_cwd, &fake_home);
     std::fs::create_dir_all(&session_dir).unwrap();
+    let argv_out = tmp.path().join("argv.txt");
 
-    let uuid_str = "11111111-2222-4333-8444-555555555555";
-    let target_subdir = session_dir.join(uuid_str);
-
-    let script = make_session_creating_script("cleanup_session_e2e", uuid_str);
+    let script = make_session_creating_script("cleanup_session_e2e");
 
     let prior_home = std::env::var_os("HOME");
     let prior_session = std::env::var_os("GROK_TEST_SESSION_DIR");
+    let prior_argv = std::env::var_os("GROK_ARGV_OUT");
     // SAFETY: env mutations are process-global; serialized via HOME_MUTEX
     // and GROK_BINARY_MUTEX (acquired above in that order).
     unsafe {
         std::env::set_var("HOME", &fake_home);
         std::env::set_var("GROK_TEST_SESSION_DIR", &session_dir);
+        std::env::set_var("GROK_ARGV_OUT", &argv_out);
         std::env::set_var("GROK_BINARY", script.as_os_str());
     }
 
@@ -370,6 +399,10 @@ fn grok_runner_cleanup_session_deletes_session_directory() {
     // Restore env before any assertions so a panic doesn't leak state.
     unsafe {
         std::env::remove_var("GROK_BINARY");
+        match prior_argv {
+            Some(v) => std::env::set_var("GROK_ARGV_OUT", v),
+            None => std::env::remove_var("GROK_ARGV_OUT"),
+        }
         match prior_session {
             Some(v) => std::env::set_var("GROK_TEST_SESSION_DIR", v),
             None => std::env::remove_var("GROK_TEST_SESSION_DIR"),
@@ -382,13 +415,22 @@ fn grok_runner_cleanup_session_deletes_session_directory() {
 
     let r = result.expect("dispatch(Grok) returned Err");
     assert_eq!(r.exit_code, 0, "expected clean exit, got {r:?}");
-    // FEAT-004: pre/post dir diff captured the new UUID.
-    assert!(
-        r.session_id.is_some(),
-        "expected session_id to be captured from pre/post dir diff, got None",
+    let argv = std::fs::read_to_string(&argv_out)
+        .unwrap_or_else(|e| panic!("read argv record {}: {e}", argv_out.display()));
+    let lines: Vec<&str> = argv.lines().collect();
+    let pos = lines
+        .iter()
+        .position(|line| *line == "--session-id")
+        .unwrap_or_else(|| panic!("argv must contain --session-id, got {argv:?}"));
+    let sid = Uuid::parse_str(lines[pos + 1])
+        .unwrap_or_else(|e| panic!("--session-id value {:?} is not a uuid: {e}", lines[pos + 1]));
+    assert_eq!(
+        r.session_id,
+        Some(sid),
+        "session_id must be the --session-id uuid, got {:?}",
+        r.session_id
     );
-    // FEAT-005 + FEAT-006: dispatch invoked cleanup_session, which removed
-    // the per-session directory.
+    let target_subdir = session_dir.join(sid.to_string());
     assert!(
         !target_subdir.exists(),
         "session subdir {:?} must be removed by post-spawn cleanup",

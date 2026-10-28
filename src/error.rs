@@ -240,6 +240,22 @@ pub enum TaskMgrError {
         /// Parsed `Retry-After` seconds, when the backend supplied one.
         retry_after_secs: Option<u64>,
     },
+
+    /// A runner printed a plan or account rate limit (FIX-002).
+    ///
+    /// Returned by `GrokRunner` when captured stderr contains the
+    /// case-insensitive phrase `rate limit for your plan` and the child
+    /// exited non-zero, or exited 0 with empty stdout. The sniff does not
+    /// call `detection::is_rate_limited`. A `<completed>` tag on stdout is
+    /// left on the `Ok` result. The sequential and wave paths map this to
+    /// `IterationOutcome::RateLimit` with empty output, so crash counters do
+    /// not move and the existing account reaction runs. A 5xx page with no
+    /// limit line stays [`TransientBackend`].
+    #[error("{runner} rate limited")]
+    RunnerRateLimited {
+        /// Provider whose CLI printed the limit.
+        runner: RunnerKind,
+    },
 }
 
 /// Default hint for lock errors when a specific PID is known.
