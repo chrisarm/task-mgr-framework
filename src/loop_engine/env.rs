@@ -316,7 +316,7 @@ pub fn resolve_paths(
     project_dir: &Path,
     prefix: Option<&str>,
 ) -> TaskMgrResult<ResolvedPaths> {
-    // Resolve PRD file to absolute path, falling back to sibling worktrees
+    // Resolve PRD file to absolute path, falling back to other registered worktrees.
     let prd_absolute = if prd_file.is_absolute() {
         prd_file.to_path_buf()
     } else {
@@ -324,7 +324,7 @@ pub fn resolve_paths(
         if local.exists() {
             local
         } else {
-            // Try sibling worktrees
+            // Try every other worktree from `git worktree list` (any placement).
             let mut found = None;
             for root in super::worktree::list_other_roots(project_dir) {
                 let candidate = root.join(prd_file);

@@ -14,6 +14,9 @@ jobs:
     name: Build and Test
     runs-on: ${{ matrix.os }}
     strategy:
+      # Report every OS: with fail-fast, an ubuntu failure cancels macOS and
+      # hides macOS-only breakage (e.g. /private/var tempdir paths).
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
         rust: [stable]
@@ -56,8 +59,9 @@ jobs:
         # `task-mgr init`, which on the GHA runner's filesystem occasionally
         # races on SQLite locking even with busy_timeout=5000ms. Locally
         # (faster disk) the race never fires. Serializing trades ~2x CI
-        # runtime for deterministic test execution.
-        run: cargo test --all-targets -- --test-threads=1
+        # runtime for deterministic test execution. --no-fail-fast runs every
+        # test binary, so one failing binary does not mask failures in later ones.
+        run: cargo test --no-fail-fast --all-targets -- --test-threads=1
 
   shellcheck:
     name: Shellcheck

@@ -743,4 +743,57 @@ mod tests {
             err
         );
     }
+
+    #[test]
+    // TODO(macos-paths): see test_list_shows_locked_when_lock_file_present.
+    #[cfg_attr(target_os = "macos", ignore)]
+    fn test_worktree_root_list_prune_remove_finds_both_locations() {
+        let (tmp, repo, db_dir) = setup_worktree_test_env();
+        let repo_name = repo.file_name().unwrap();
+
+        // Legacy sibling shape and a nested `<root>/<repo>/<name>` shape.
+        // Neither path is discovered by scanning a directory — list/prune/remove
+        // follow `git worktree list`.
+        let old_wt = tmp
+            .path()
+            .join(format!("{}-worktrees", repo_name.to_string_lossy()))
+            .join("old-feat");
+        fs::create_dir_all(old_wt.parent().unwrap()).unwrap();
+        create_test_worktree(&repo, &old_wt, "feat/old-location");
+
+        let new_wt = tmp
+            .path()
+            .join("configured-root")
+            .join(repo_name)
+            .join("new-feat");
+        fs::create_dir_all(new_wt.parent().unwrap()).unwrap();
+        create_test_worktree(&repo, &new_wt, "feat/new-location");
+
+        let listed = list(&db_dir, &repo).expect("list");
+        let listed_paths: Vec<PathBuf> = listed
+            .worktrees
+            .iter()
+            .map(|w| w.path.canonicalize().unwrap_or_else(|_| w.path.clone()))
+            .collect();
+        assert!(
+            listed_paths.contains(&old_wt.canonicalize().unwrap()),
+            "list missed old location {old_wt:?} in {listed_paths:?}"
+        );
+        assert!(
+            listed_paths.contains(&new_wt.canonicalize().unwrap()),
+            "list missed new location {new_wt:?} in {listed_paths:?}"
+        );
+
+        remove(&db_dir, &repo, "feat/old-location").expect("remove old by branch");
+        assert!(!old_wt.exists(), "old worktree should be gone");
+
+        let pruned = prune(&db_dir, &repo).expect("prune");
+        assert!(
+            pruned.worktrees.iter().any(|w| w.path == new_wt),
+            "prune should remove the new-location worktree, got {:?}",
+            pruned.worktrees
+        );
+        assert!(!new_wt.exists(), "new worktree should be gone after prune");
+        assert!(repo.exists(), "prune must keep the main checkout");
+    }
 }

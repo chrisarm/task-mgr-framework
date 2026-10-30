@@ -34,7 +34,7 @@ Backward-looking review of code produced by a completed autonomous loop run. Che
 
 The cwd you launch `/review-loop` from is almost always the main repo checkout on `main`. `main` is push-protected via repo rules ("changes must come through a pull request"). A commit landing on local `main` becomes homeless: it can't be pushed, and the work has to be cherry-picked onto the PRD branch later (with all the disk/conflict friction that implies). Captures and inline fixes belong on the worktree branch so they ship with the PRD's PR.
 
-The two repos (main + worktree) share an identical relative file layout. If you Edit `/.../codebase/CLAUDE.md` instead of `/.../codebase-worktrees/<branch>/CLAUDE.md`, the tool will succeed and the change will go to the wrong branch silently. There is no warning. Path discipline is the only defense.
+The two repos (main + worktree) share an identical relative file layout. If you Edit `/.../<repo>/CLAUDE.md` instead of `$WORKTREE/CLAUDE.md`, the tool will succeed and the change will go to the wrong branch silently. `$WORKTREE` is the path `git worktree list --porcelain` prints for `branchName`: `<worktreeRoot>/<repo-name>/<sanitized-branch>` when `worktreeRoot` or `TASK_MGR_WORKTREE_ROOT` is set, otherwise `{repo-parent}/{repo-name}-worktrees/<sanitized-branch>`. There is no warning. Path discipline is the only defense.
 
 **Mechanics — do all four:**
 
@@ -56,12 +56,14 @@ Given the PRD filename argument (e.g., `tasks/prd-phase1-demo-loop.md`):
 1. **Read the PRD** to understand what was supposed to be built.
 2. **Derive the task JSON path** — same basename, `.json` extension.
 3. **Extract `branchName`** via `jq -r '.branchName' tasks/<feature>.json`. Do NOT Read the full JSON.
-4. **Find the worktree** — parent-directory-sibling `-worktrees/` directory, with `/` in the branch name replaced by `-`:
+4. **Find the worktree** from `git worktree list --porcelain` (do not scan a sibling `*-worktrees` directory; that misses a configured `worktreeRoot` / `TASK_MGR_WORKTREE_ROOT` of `<root>/<repo-name>/<sanitized-branch>`, and `sibling` is only the fallback layout):
+   ```bash
+   BRANCH=$(jq -r '.branchName' tasks/<feature>.json)
+   WORKTREE=$(git worktree list --porcelain | awk -v b="$BRANCH" '
+     /^worktree / { wt=$2 }
+     $0 == "branch refs/heads/" b { print wt; exit }
+   ')
    ```
-   # If cwd is /home/chris/Dropbox/startat0/DeskMaiT/codebase
-   # Look in /home/chris/Dropbox/startat0/DeskMaiT/codebase-worktrees/feat-phase1-harmony-console
-   ```
-   Fallback: `git worktree list`.
 5. **Verify the worktree has commits beyond main**:
    ```bash
    cd <worktree-path> && git log --oneline main..HEAD | head -5

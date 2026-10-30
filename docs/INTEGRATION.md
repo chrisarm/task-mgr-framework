@@ -691,16 +691,33 @@ By default, `task-mgr loop` uses git worktrees to isolate work for each PRD bran
 When you run `task-mgr loop tasks/my-project.json`, the engine:
 
 1. Reads the branch name from the PRD metadata
-2. Creates a worktree at `{repo-parent}/{repo-name}-worktrees/{sanitized-branch}/`
+2. Creates a worktree for the branch. With no `worktreeRoot`, that is
+   `{repo-parent}/{repo-name}-worktrees/{sanitized-branch}/`. With
+   `worktreeRoot` or `TASK_MGR_WORKTREE_ROOT` set to an absolute path, it is
+   `<root>/<repo-name>/<sanitized-branch>/` (`sibling` keeps the first layout).
 3. Runs Claude Code in the worktree directory (not your main checkout)
 4. Database and PRD files remain in the original repo
 
-For example:
+For example, with the default sibling layout:
 ```
 /home/user/myproject/                    # Your main checkout
 /home/user/myproject-worktrees/
   └── feature-auth/                      # Worktree for feature/auth branch
 ```
+
+With `"worktreeRoot": "/var/worktrees"` in the user config
+(`$XDG_CONFIG_HOME/task-mgr/config.json`):
+```
+/var/worktrees/myproject/feature-auth/
+```
+
+The configured root must already be a mountpoint (its device must differ from
+its parent). task-mgr does not create that directory. `task-mgr worktrees`
+list, prune, and remove follow `git worktree list`, so a worktree created
+under the sibling layout is still found after you switch. task-mgr does not
+create `.env` or build-directory symlinks; if a repo adds those inside a
+worktree, point them at absolute paths. A relative link back to the sibling
+checkout breaks once the worktree lives on another filesystem.
 
 ### Benefits
 

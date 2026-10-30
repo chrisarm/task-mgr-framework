@@ -1987,10 +1987,13 @@ mod tests {
 
         let res = add_with_conn(&conn, minimal_input("FIX-001"), None, &[], Some(&file)).unwrap();
         assert_eq!(res.task_id, "FIX-001");
+        // `--from-json` stores the canonical flag path (pin 13). On macOS the
+        // temp path is `/var/...` and canonicalize yields `/private/var/...`.
+        let canon = file.canonicalize().unwrap();
         assert_eq!(
             res.prd_path.as_deref(),
-            Some(file.as_path()),
-            "failed sync still reports the write target path"
+            Some(canon.as_path()),
+            "failed sync still reports the canonical write target path"
         );
 
         let count: i64 = conn
