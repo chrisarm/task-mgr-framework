@@ -2,28 +2,21 @@
 
 Started: 2026-09-09 Source: `/prd-goal` on plan `agent task-ops UX: make add / update / export match the docs` (user: 3 PRDs, one per PR; do not re-confirm)
 Worktree root: ../task-mgr-worktrees/
-Pipeline overrides: none. Open GitHub PRs: no (local merge onto `main`).
+Pipeline overrides: phase 2: rerun production-code-architect and md-to-json-prd-reviewer to update the PRD, prompt, and tasks based on the new code / PR-1 implementation; then recreate `feat/agent-task-ops-pr2` off this main and loop `tasks/agent-task-ops-pr2.json`. Open GitHub PRs: no (`#43` merged sticky + PR-1 onto `origin/main`).
 Author-ahead: OK
 Verification skill: `.claude/skills/verify-task-mgr/SKILL.md`
 
 ## Now
 
-Phase: 1 PR-1 remapper + context + add/current --from-json
-State: paused
-Next: operator resume — see pause reason
-PRD / JSON / prompt: tasks/prd-agent-task-ops-pr1.md / tasks/agent-task-ops-pr1.json / tasks/agent-task-ops-pr1-prompt.md
-Architect / JSON-review: tasks/prd-agent-task-ops-pr1-architect.md / tasks/prd-agent-task-ops-pr1-json-review.md
-Worktree / prefix / branch: ../task-mgr-worktrees/feat-agent-task-ops-pr1 / a410d276 / feat/agent-task-ops-pr1
+Phase: 3 PR-3 export scoped + docs/prompt alignment
+State: ticked
+Next: goal exit gates — check remaining criteria; no bonus phase
+PRD / JSON / prompt: tasks/prd-agent-task-ops-pr3.md / tasks/agent-task-ops-pr3.json / tasks/agent-task-ops-pr3-prompt.md
+Architect / JSON-review: tasks/prd-agent-task-ops-pr3-architect.md / tasks/prd-agent-task-ops-pr3-json-review.md
+Worktree / prefix / branch: /home/chris/Documents/startat0/Projects/task-mgr-worktrees/feat-agent-task-ops-pr3 / c3c1c195 / feat/agent-task-ops-pr3
 Live writer id: none
 Fix cycle: 1
-Last event: 2026-09-09 operator pause after PR-3 architect pass 2 APPROVED. PR-1 fix-cycle loop PID 563876 exited with all 19 done (not reviewed/compounded). No second loop. No /prd-tasks for PR-3.
-Author-ahead track:
-Phase: 2 PR-2 task-mgr update + humanReviewOutcome
-State: authored
-Next: D. Execute — after phase 1 merged (no second loop)
-PRD / JSON / prompt: tasks/prd-agent-task-ops-pr2.md / tasks/agent-task-ops-pr2.json / tasks/agent-task-ops-pr2-prompt.md
-Architect / JSON-review: tasks/prd-agent-task-ops-pr2-architect.md / tasks/prd-agent-task-ops-pr2-json-review.md
-Live writer id: none
+Last event: 2026-09-18 PR-3 merged locally `78f34d0` (v0.3.3). CODE-FIX-002 dest identity delta-verified. Compound 2d250bf. Not pushed.
 
 ## Pins (verbatim — law for every phase)
 
@@ -55,36 +48,36 @@ Three serial PRs, one PRD each: PR-1 remapper + context module + `add --from-jso
 
 ## Goal exit gates
 
-- [ ] `task-mgr add --from-json tasks/<prd>.json --stdin` from a linked worktree with untracked-only JSON appends **that** file; main DB has the prefixed row; main JSON bytes unchanged when the worktree copy exists
-- [ ] `task-mgr current --from-json` prints the write path; unregistered path refuses
-- [ ] ≥2 prefixes, no env, no `--from-json`: add refuses; `--no-prefix` / 0-prefix add still inserts
-- [ ] `task-mgr update --stdin` notes-only does not clobber priority/title/`archived_at`; full story blob with `passes` is rejected
-- [ ] `humanReviewOutcome` survives update + `loop init --append --update-existing` and is absent from `tasks.*` columns
-- [ ] `export --to-json` defaults to the active PRD; writing onto a registered task-list requires `--force`
-- [ ] Cheatsheet contains `add --from-json`; loop `task_ops` jq example is `.userStories[]`; JSON-sync failure copy never names `export`
+- [x] `task-mgr add --from-json tasks/<prd>.json --stdin` from a linked worktree with untracked-only JSON appends **that** file; main DB has the prefixed row; main JSON bytes unchanged when the worktree copy exists
+- [x] `task-mgr current --from-json` prints the write path; unregistered path refuses
+- [x] ≥2 prefixes, no env, no `--from-json`: add refuses; `--no-prefix` / 0-prefix add still inserts
+- [x] `task-mgr update --stdin` notes-only does not clobber priority/title/`archived_at`; full story blob with `passes` is rejected
+- [x] `humanReviewOutcome` survives update + `loop init --append --update-existing` and is absent from `tasks.*` columns
+- [x] `export --to-json` defaults to the active PRD; writing onto a registered task-list requires `--force`
+- [x] Cheatsheet contains `add --from-json`; loop `task_ops` jq example is `.userStories[]`; JSON-sync failure copy never names `export`
 
 ## Phases
 
 | #   | Phase  | PRD            | JSON         | State   | Land | Notes |
 | --- | ------ | -------------- | ------------ | ------- | ---- | ----- |
-| 1   | PR-1 remapper + context + add/current --from-json | tasks/prd-agent-task-ops-pr1.md | tasks/agent-task-ops-pr1.json | fixing(1) | —    | H1 CODE-FIX-002/003; loop PID 563876 |
-| 2   | PR-2 task-mgr update + humanReviewOutcome | tasks/prd-agent-task-ops-pr2.md | tasks/agent-task-ops-pr2.json | authored | —    | handoff 5e7f26e; wait for PR-1 merge |
-| 3   | PR-3 export scoped + docs/prompt alignment | tasks/prd-agent-task-ops-pr3.md | tasks/agent-task-ops-pr3.json | authoring | —    | PRD folded; architect pass 2 APPROVED; JSON not written (paused) |
+| 1   | PR-1 remapper + context + add/current --from-json | tasks/prd-agent-task-ops-pr1.md | tasks/agent-task-ops-pr1.json | merged | 3fc38b4 / #43 | squash in #43; CODE-FIX-002/003 in squash; verify 2026-09-18 |
+| 2   | PR-2 task-mgr update + humanReviewOutcome | tasks/prd-agent-task-ops-pr2.md | tasks/agent-task-ops-pr2.json | ticked | 9447a21 | 15/15; auto-review CLEAN; compound 1d22b1f; local --no-ff |
+| 3   | PR-3 export scoped + docs/prompt alignment | tasks/prd-agent-task-ops-pr3.md | tasks/agent-task-ops-pr3.json | ticked | 78f34d0 | CODE-FIX-002 dest identity; compound 2d250bf; v0.3.3; local --no-ff |
 
 States: pending → authoring → authored → looping → reviewing →
 fixing(n) → compounding → merging → merged → ticked
 Also: paused | skipped (STATUS already Done)
 
-## Pause reason (2026-09-09)
+## Pause reason (cleared 2026-09-18)
 
-Operator: “pause after this review finishes” (PR-3 architect pass 2). Do not continue until unpaused.
+PR-1 pause is lifted. PR-3 author-ahead unpaused because PR-2 is looping.
 
 Resume map (disk table):
-- **PR-1** `fixing(1)` counts clean (19 done) but **not** delta-verified / compounded / merged. Next: D. Review (delta-verify CODE-FIX-002/003 vs H1/M1) → `/compound` → independent gate → merge. Auto-review of the first loop: `tasks/prd-agent-task-ops-pr1-loop-review.md`.
-- **PR-2** `authored` (`feat/agent-task-ops-pr2` @ `5e7f26e`). Next: D. Loop **after PR-1 merge**.
-- **PR-3** `authoring` with folded PRD + architect APPROVED. Next: A. Author — Tasks author (`/prd-tasks`), then JSON reviewer. No JSON/prompt yet.
+- **PR-1** `merged` (`3fc38b4`, GitHub `#43`). Prefix `a410d276` 19/19 done.
+- **PR-2** `looping` prefix `a8855e28` PID 590882 worktree `feat-agent-task-ops-pr2`. Sequential fallback.
+- **PR-3** `authored` (`feat/agent-task-ops-pr3` @ `73633f4`). Isolated `loop init` 17/17. Do not loop until PR-2 is merged and post-merge CI is green.
 
-No live loop PID. Stop files unused.
+Stop files unused.
 
 ## Residuals (human gates — not merge-blocking unless the goal says so)
 
@@ -103,3 +96,15 @@ No live loop PID. Stop files unused.
 - 2026-09-09 author-ahead: phase 3 PRD author starting while auto-review runs
 - 2026-09-09 auto-review NEEDS WORK: H1 NULL-prefix 3-segment JSON strip (CODE-FIX-001→FIX-001); M1 skip-note. Spawned CODE-FIX-002/003 via worktree `add --from-json`. Restarted loop PID 563876. No /compound until H1 closed. Findings: tasks/prd-agent-task-ops-pr1-loop-review.md
 - 2026-09-09 PR-3 architect pass 2 APPROVED (folded 7 revisions). Operator: pause after this review. Pipeline stopped. PR-1 fix-cycle counts: 19 done (CODE-FIX-002/003 included); delta-verify + /compound + merge not started.
+- 2026-09-18 operator resume to finish PR-1: no loop to relaunch (`a410d276` 19/19 done, 0 todo/blocked). Local `main` already squash-merged PR-1 as `3fc38b4` (tree identical to `feat/agent-task-ops-pr1` tip). Independent gate: `commands::add` 52, `commands::context` 27, `commands::prd_json` 6, `add_integration` 23, `cheatsheet_drift` 9, `worktree_db_resolution` 11 — all pass. `cargo install --path .` so PATH `task-mgr` has add/current `--from-json`. verify-task-mgr `add-and-current-from-json`: pin/append, current pin, unregistered/missing/dir refuse, ≥2-prefix unpinned refuse, `--no-prefix` `BARE-001` insert. Artifacts `20260918T162350-414971` + `20260918T162507-422568`. `/compound` not run (no new code this resume). Next: PR-2 loop from a fresh `feat/agent-task-ops-pr2` off this `main`.
+- 2026-09-18 operator override: re-author PR-2 before loop. Rerun production-code-architect then fold, then tasks author (JSON+prompt), then md-to-json-prd-reviewer, against PR-1 on `main` (`120c5a2` / squash `3fc38b4` / GitHub `#43`). Then recreate `feat/agent-task-ops-pr2` off this main and loop `tasks/agent-task-ops-pr2.json`. PR-3 stays authoring (folded PRD + architect APPROVED; JSON not written).
+- 2026-09-18 PR-2 re-author complete: architect re-pass NEEDS_CHANGES → fold → pass 2 APPROVED; tasks author refreshed JSON+prompt; JSON-review pass 3 five apply warnings folded; pass 4 nothing material. Isolated `loop init` 14/14. Next: recreate `feat/agent-task-ops-pr2` + loop.
+- 2026-09-18 C+D: recreated `feat/agent-task-ops-pr2` @ `7528b86` (docs-only authoring commit) worktree `.../task-mgr-worktrees/feat-agent-task-ops-pr2`. `loop init` 14 tasks prefix `a8855e28`. Loop PID 590882 `--parallel 2 --hours 12`; slot worktrees failed (already inside feature worktree) → sequential fallback. Monitor on main `.task-mgr`. Author-ahead: PR-3 tasks author may start.
+- 2026-09-18 PR-3 tasks author (`01a0b6fd-d71e-7cd1-b23c-3de6b5e490ce`) wrote `tasks/agent-task-ops-pr3.json` (17 tasks) + prompt. JSON reviewer spawned. PR-2 at that moment: 4 done, FEAT-002 in progress.
+- 2026-09-18 PR-3 JSON-review pass 1: 2 criticals (FEAT-001 `export/mod.rs`, FEAT-002 `main.rs`) + 4 apply warnings; folded; pass 2 nothing material. Isolated loop init 17/17 prefix `c3c1c195` (sandbox). Committed `feat/agent-task-ops-pr3` @ `73633f4`. No PR-3 loop.
+- 2026-09-18 PR-2 loop complete: 15/15, 16 iterations, 1h8m, tip `e4f2bcd` REVIEW-001. Auto-review grok pid 1019212 (do not start a second /review-loop). Dirty JSON reconcile committed.
+- 2026-09-18 PR-2 auto-review CLEAN (0 C/H/M, 3 Low). `/compound` `1d22b1f` (commands/CLAUDE.md gotchas, learning #5761 supersedes #5631, changelog). Independent gate green. Local `--no-ff` merge `9447a21`. Not pushed (goal: no GitHub PR).
+- 2026-09-18 PR-3: rebased onto `9447a21` as `2b58dc3`; worktree `feat-agent-task-ops-pr3`; loop init 17 prefix `c3c1c195`; PID 1104024 sequential fallback.
+- 2026-09-18 operator `.stop-c3c1c195`: loop finished FEAT-002 then `Exit reason: stop signal` (5 iterations, 21m35s). 4 done / 13 todo / 0 in_progress. Monitor reported FAILED because work remains — expected for a stop, not a crash. Do not relaunch until asked.
+- 2026-09-18 operator resume: doctor orphan-only; loop init updated 17; relaunch PID 31090 starting FEAT-003. Sequential fallback expected.
+- 2026-09-18 PR-3 loop complete 18/18 then auto-review NEEDS WORK (High dest-cwd). CODE-FIX-002 `d263194` + delta-verify (worktree_export_dest 5/5, export 47, context 29). Compound `2d250bf`. Local merge `78f34d0`; dropped accidental committed `.stop-c3c1c195` as `fed6f46`. v0.3.3. Not pushed. Goal exit gates ticked. Residual BP remains.
