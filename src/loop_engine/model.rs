@@ -37,15 +37,19 @@ use crate::loop_engine::project_config::{
     ModelsConfig, RouteSpec, RoutingConfig, SpilloverConfig, TaskClassRoute, TierFallback,
 };
 
-/// Well-known model identifiers.
-pub const OPUS_MODEL: &str = "claude-opus-5";
-pub const SONNET_MODEL: &str = "claude-sonnet-5";
-pub const HAIKU_MODEL: &str = "claude-haiku-4-5-20251001";
-/// Claude Fable 5 — the frontier-tier Claude model, above Opus. Added by the
-/// model-selection redesign (FR-001); `claude-fable-5` contains no legacy tier
-/// token, which is why substring tier classification is structurally dead and
-/// `CapabilityTier`/`tier_of` use config exact-match instead.
-pub const FABLE_MODEL: &str = "claude-fable-5";
+/// Claude Code family aliases for the built-in ladder. A fresh `models` block
+/// from `task-mgr init` / `task-mgr models init` is sparse; merge fills these
+/// from [`CLAUDE_DEFAULT_TIER_MODELS`] and the loop passes them through as
+/// `--model`. Claude Code resolves each alias to the latest model in that
+/// family and moves the alias when a newer model ships. A full id such as
+/// `claude-opus-5-5` is a snapshot pin (`task-mgr models set-tier`).
+///
+/// `tier_of` stays config exact-match: the alias `fable` is not the same rung
+/// entry as a pinned `claude-fable-5-1`.
+pub const OPUS_MODEL: &str = "opus";
+pub const SONNET_MODEL: &str = "sonnet";
+pub const HAIKU_MODEL: &str = "haiku";
+pub const FABLE_MODEL: &str = "fable";
 /// Well-known Grok model id for an explicit tier pin and for tests.
 /// The built-in ladder does not use it: `GROK_DEFAULT_TIER_MODELS` leaves
 /// `standard` empty so a run with no override omits `--model` and the CLI
@@ -2176,7 +2180,7 @@ mod tests {
         );
         // [1m] suffix stripped before the exact match.
         assert_eq!(
-            r.tier_of(Provider::Claude, "claude-fable-5[1m]"),
+            r.tier_of(Provider::Claude, &format!("{FABLE_MODEL}{ONE_M_SUFFIX}"),),
             Some(CapabilityTier::Frontier)
         );
         assert_eq!(
@@ -2964,10 +2968,10 @@ mod tests {
 
     #[test]
     fn off_ladder_explicit_family_match_defers_when_include_forced_false() {
-        // (c) claude-fable-5-1 is off-ladder (tier_of None) but family-maps to
-        // frontier; includeForced=false → no clamp (defer via exclusion).
+        // (c) A previous Fable id is off-ladder (tier_of None) but family-maps
+        // to frontier; includeForced=false → no clamp (defer via exclusion).
         let models = builtin_resolved_models();
-        let off_ladder = "claude-fable-5-1";
+        let off_ladder = "claude-fable-5";
         assert!(
             models.tier_of(Provider::Claude, off_ladder).is_none(),
             "precondition: off-ladder model has tier_of None"
@@ -3002,7 +3006,7 @@ mod tests {
     fn off_ladder_explicit_include_forced_true_clamps_to_standard() {
         // (d) includeForced=true may clamp off-ladder explicit pins.
         let models = builtin_resolved_models();
-        let off_ladder = "claude-fable-5-1";
+        let off_ladder = "claude-fable-5";
         let empty_blackouts = HashSet::new();
         let mut unavailable = HashSet::new();
         unavailable.insert((Provider::Claude, CapabilityTier::Frontier));
