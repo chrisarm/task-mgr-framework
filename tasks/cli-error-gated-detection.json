@@ -1,0 +1,800 @@
+{
+  "branchName": "feat/cli-error-gated-detection",
+  "description": "Gate RateLimit, PromptTooLong, and TransientBackend on a CLI-error provenance signal so agent prose about HTTP 429 cannot reset a finished task or park the loop. Record <completed> before any state-resetting reaction, and feed that reaction a pre-pipeline outcome snapshot so the account wait still runs.",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "Rust: cargo fmt --check passes",
+      "Rust: cargo check has no warnings",
+      "Rust: cargo clippy --all-targets -- -D warnings passes for the touched crate",
+      "Scoped tests for the touched modules pass",
+      "No unwrap() on stream-json fields; missing is_error is false",
+      "No per-task model field and no top-level PRD model field"
+    ],
+    "description": "These criteria apply to ALL implementation tasks"
+  },
+  "mergeStrategy": "Merge to main after REVIEW-001 passes. Squash commits optional.",
+  "prdFile": "prd-cli-error-gated-detection.md",
+  "priorityPhilosophy": {
+    "description": "Hierarchy of what matters most when implementing tasks",
+    "hierarchy": [
+      "1. PLAN — Anticipate edge cases before coding",
+      "2. PHASE 2 FOUNDATION — provenance in the type, one gate, one snapshot",
+      "3. FUNCTIONING CODE — sequential and wave stay on the shared coordinators",
+      "4. CORRECTNESS — scoped tests pass; existing exit≠0 classifier tests stay green",
+      "5. CODE QUALITY — flat qualityDimensions, no unwrap on stream fields",
+      "6. POLISH — CLAUDE.md and ARCHITECTURE.md match the new order"
+    ],
+    "principles": [
+      "Quality dimensions explicit — qualityDimensions on every implementation task",
+      "Edge cases live on the owning implementation task (lean spine; no separate TEST-INIT)",
+      "Scoped per-iteration tests; full suite at REVIEW-001, including pre-existing failures",
+      "Pattern sets and decide_account_rate_limit wait math stay unchanged",
+      "Ship working code with tests; handle Option/Result explicitly; no unwrap() in production"
+    ]
+  },
+  "prohibitedOutcomes": [
+    "Classifying agent prose as RateLimit, PromptTooLong, or TransientBackend when has_cli_error is false",
+    "Scanning the agent summary when cli_error is set (scan the retained error text)",
+    "Treating tool_result.is_error as a CLI error",
+    "Treating a grace-kill (completion_killed, exit 143 or 137) as a CLI error",
+    "A magic prefix or sentinel inside output instead of a typed RunnerResult field",
+    "Reading the post-pipeline outcome inside react_to_outputs (record_completion rewrites it to Completed and the wait is skipped)",
+    "Letting a flipped Completed consume the iteration budget",
+    "Restoring OperatorStopped or StopSpend exit 130 or exit 1",
+    "Returning task_id None and empty output before the completion ladder on a stop",
+    "StopSpend that does not set account_quota_stopped",
+    "A skip that wraps only recover_in_progress inside handle_overflow (context rows and rungs 1-5 still run)",
+    "Moving an untagged handle_overflow call to after process_iteration_output",
+    "Scanning the head-capped conversation alone for the grace-kill <completed> tag",
+    "Putting output text on detection.text_signal_without_cli_error (tracing has no redactor)",
+    "Changing classifier pattern sets or decide_account_rate_limit wait math",
+    "Collapsing pre-iteration and post-output usage I/O onto one flag",
+    "Tests that only assert no crash, or that call the live Usage API",
+    "Hand-editing tasks/*.json"
+  ],
+  "project": "task-mgr",
+  "requires": [],
+  "reviewGuidelines": {
+    "priorityGuidelines": {
+      "critical": "1-10: Blocks further work, fix immediately",
+      "high": "11-20: Fix before phase completion",
+      "low": "51-99: Defer to hardening phase",
+      "medium": "21-50: Fix in current phase if time permits"
+    }
+  },
+  "taskPrefix": "fe92ec5b",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "Progress log ## CONTRACT-001 contains OutputSignals including task_id and run_id, the has_cli_error formula, and which string is scanned",
+        "Contract names tool_result.is_error as ignored and Grok cli_error as false",
+        "Contract states the pre-pipeline snapshot feeds react_to_outputs and the budget give-back on both paths",
+        "Contract states OperatorStopped and StopSpend stay exit 0, and StopSpend sets account_quota_stopped",
+        "Contract states the whole handle_overflow call is skipped only for a claimed id already in parse_completed_tasks, and untagged overflow stays before the pipeline",
+        "Contract states the grace fallback is the arm_completion_grace buffer tail copied onto IterationResult and ProcessingParams, not conversation and not a direct RunnerResult read inside the pipeline",
+        "Contract lists FEAT-001 through FEAT-008 as dependents",
+        "Known-bad: a post-pipeline outcome read would skip the wait after record_completion sets Completed",
+        "No production code in this task"
+      ],
+      "dependsOn": [],
+      "description": "Design-only. Write the contract into the progress log under ## CONTRACT-001. Do not change production code.\n\nThe contract must state:\n1. OutputSignals { cli_error: bool, completion_killed: bool, error_text: Option<String>, task_id: Option<String>, run_id: Option<String> } passed to analyze_output. Callers in iteration.rs and slot.rs fill task_id and run_id. No same-typed bool pair at the call. The warn event cannot see fields that are not on this struct.\n2. has_cli_error = cli_error || (exit_code != 0 && !completion_killed). Steps 3, 3.5, and 3.6 run only then. When cli_error is set, scan error_text, not output. Otherwise scan output. Step 4 (exit 143 → Crash(RuntimeError)) is unchanged. Not-RateLimit is not done.\n3. cli_error is true only for result.is_error or StreamEvent::Error (assistant error, Codex error / turn.failed). tool_result.is_error is ignored. Missing is_error is false. Grok stays cli_error false.\n4. RunnerResult also carries a tail-retained copy of the buffer arm_completion_grace scans. drive_stream returns it. conversation is head-capped and is not the fallback.\n5. Both paths snapshot the outcome before process_iteration_output / process_slot_result. react_to_outputs reads the snapshot. consumes_budget and wave iteration_consumed follow the snapshot.\n6. Sequential order: snapshot, ladder, react_to_completions (wrapper commit) when the claimed task completed, then react_to_outputs. Wave keeps merge deferred.\n7. OperatorStopped: Empty + should_stop + operator_stopped → exit 0 \"stop signal\". StopSpend: set account_quota_stopped, operator_stopped false → exit 0 \"quota soft-stop\". Keep task_id and output through the ladder. Do not restore 130 or 1.\n8. Skip the entire handle_overflow call when the resolved claimed id is in parse_completed_tasks(output). Untagged overflow stays before the pipeline. Git-only and output-scan completions are out of scope.\n9. Warn event detection.text_signal_without_cli_error with task_id, classifier, exit_code, completion_killed, run_id when the call site has it. No output text. Correlation id is active_prefix on task-mgr-<prefix>.log.\n\nDownstream: FEAT-001, FEAT-002, FEAT-003, FEAT-004, FEAT-005, FEAT-006, FEAT-007, FEAT-008.",
+      "estimatedEffort": "high",
+      "id": "CONTRACT-001",
+      "modifiesBehavior": false,
+      "notes": "PRD tasks/prd-cli-error-gated-detection.md §2.6 and FR-001 through FR-006 are the source. Learning [5347]: untagged handle_overflow stays before the pipeline. Learning [5298]: do not collapse usage flags. Learning [5373]: stop exits are 0, not 130 vs 1.",
+      "passes": false,
+      "priority": 1,
+      "qualityDimensions": [
+        "One typed signal, not a string sentinel in output",
+        "The gate decision lives only in analyze_output",
+        "Runners report facts and do not classify"
+      ],
+      "requiresHuman": false,
+      "taskType": "contract",
+      "title": "Record the CLI-error signal, scan target, snapshot, and stop mapping",
+      "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": [
+        "is_error true on a result line sets cli_error and retains the result string",
+        "Missing or non-bool is_error leaves cli_error false",
+        "A tool_result with is_error true and no result or assistant error leaves cli_error false",
+        "StreamEvent::Error sets cli_error and retains that error string",
+        "Codex turn.failed sets cli_error and stores that turn.failed string in error_text, not from derive_output",
+        "Grok RunnerResult sets cli_error false",
+        "grace_buffer_tail is populated from the same buffer arm_completion_grace scans",
+        "All 10 RunnerResult literals compile with the new fields set explicitly",
+        "cargo test -p task-mgr claude:: and runner:: for the new parser tests pass"
+      ],
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/loop_engine/iteration.rs",
+            "impact": "NEEDS_REVIEW",
+            "line": 839,
+            "mitigation": "FEAT-002 passes OutputSignals; this task only adds fields",
+            "usage": "analyze_output(output, exit_code, project_root)"
+          },
+          {
+            "file": "src/loop_engine/slot.rs",
+            "impact": "NEEDS_REVIEW",
+            "line": 373,
+            "mitigation": "FEAT-002 passes OutputSignals",
+            "usage": "analyze_output on the wave path"
+          }
+        ],
+        "semanticDistinctions": [
+          {
+            "context": "result.is_error",
+            "currentBehavior": "unread",
+            "requiredBehavior": "cli_error true and error_text is the result string"
+          },
+          {
+            "context": "tool_result.is_error",
+            "currentBehavior": "parsed for tool failures",
+            "requiredBehavior": "does not set cli_error"
+          }
+        ]
+      },
+      "dependsOn": [
+        "CONTRACT-001"
+      ],
+      "description": "Implement the CONTRACT-001 fields. Do not gate analyze_output in this task.\n\nDO:\n1. Add cli_error: bool, error_text: Option<String>, and grace_buffer_tail: String (name them to match the progress-log contract) on RunnerResult. No Default derive. Update all 10 struct literals (runner.rs Claude/Grok/Codex constructors and three test literals; claude.rs four ClaudeResult literals). The ignore doc example is not a compile site.\n2. Claude result arm: is_error via as_bool(), missing → false. On true, keep the result string as error_text. StreamEvent::Error sets cli_error and stores that string when error_text is still empty. Do not read tool_result.is_error.\n3. Codex error / turn.failed → cli_error and the retained error string (the text that is not in derive_output).\n4. Grok constructor: cli_error false, error_text None.\n5. drive_stream returns a tail-retained copy of the buffer arm_completion_grace scans. Thread it onto RunnerResult. FEAT-006 consumes it; this task only plumbs it.\n6. Extend test_parse_stream_json_result_subtypes. First, add a fixture for a usage-limit result line and an assistant error line. If a live capture is unavailable, commit the fixture shape from a saved transcript and state that in the progress log. If is_error is absent, cli_error stays false.\n\nDO NOT: Change is_rate_limited patterns. Do not move reactions. Do not scan classifiers.",
+      "edgeCases": [
+        "E5: assistant message error field with exit 1 retains the error text and sets cli_error",
+        "E13: Codex turn.failed retains the error string that derive_output does not contain"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "tool_result.is_error is copied onto cli_error",
+          "expectedBehavior": "The tool_result fixture test fails"
+        }
+      ],
+      "id": "FEAT-001",
+      "invariants": [
+        "cli_error is true only for result.is_error or StreamEvent::Error",
+        "Missing is_error is false"
+      ],
+      "modifiesBehavior": true,
+      "notes": "follow src/loop_engine/claude.rs result arm and src/loop_engine/stream.rs StreamEvent::Error. Data contract: val.get(\"is_error\").and_then(Value::as_bool).unwrap_or(false) inside the result arm only. Learning [5364]: do not narrow patterns in this task. Consumer analysis is not a separate ANALYSIS task; callers are the two analyze_output sites updated in FEAT-002.",
+      "passes": false,
+      "priority": 2,
+      "qualityDimensions": [
+        "Typed signal on RunnerResult, never a magic prefix in output",
+        "No unwrap on stream fields",
+        "Grok and Codex constructors updated explicitly",
+        "Grace-buffer tail is the arm_completion_grace buffer, not the head-capped conversation"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Carry cli_error, error text, and the grace-buffer tail on RunnerResult",
+      "touchesFiles": [
+        "src/loop_engine/runner.rs",
+        "src/loop_engine/claude.rs",
+        "src/loop_engine/stream.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "E1: test_agent_summary_about_429_handling_is_not_rate_limit — summary about 429 with exit 0 is not RateLimit",
+        "E2: exit 143 and completion_killed with cli_error false is not RateLimit and is still Crash(RuntimeError). Known-bad: exit 143, completion_killed true, and cli_error true with retained text You've hit your session limit is still RateLimit. completion_killed suppresses only the bare exit != 0 arm",
+        "E4: is_error true and You've hit your session limit with exit 1 is RateLimit",
+        "E5: RateLimit comes from the retained assistant error string, and that sentence is not in output",
+        "E6 exit 0 Bad Gateway prose is not TransientBackend",
+        "E7 rewrites test_detects_prompt_too_long_regardless_of_exit_code; exit 0 prose is not PromptTooLong",
+        "E8: is_error true and Prompt is too long with exit 0 is PromptTooLong via the retained error text",
+        "E9: exactly one text_signal_without_cli_error warn whose fields are classifier=rate_limit, the passed task_id, exit_code=0, completion_killed=false, and run_id when provided; no output or error_text field",
+        "E13: rate-limit text present only in the retained Codex turn.failed string, and absent from derive_output, classifies as RateLimit",
+        "E14: exit 0 prose mentioning 429 is not RateLimit when cli_error is false",
+        "test_rate_limit_429_in_middle_of_line matches the new contract and cites the PRD, and every other existing exit≠0 classifier test stays green",
+        "Pattern function bodies are unchanged (git diff does not edit the match arms inside is_rate_limited, is_prompt_too_long, is_transient_backend)"
+      ],
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/loop_engine/iteration.rs",
+            "impact": "NEEDS_REVIEW",
+            "line": 839,
+            "mitigation": "Pass OutputSignals from RunnerResult",
+            "usage": "sequential classify"
+          },
+          {
+            "file": "src/loop_engine/slot.rs",
+            "impact": "NEEDS_REVIEW",
+            "line": 373,
+            "mitigation": "Pass OutputSignals from RunnerResult",
+            "usage": "wave classify"
+          },
+          {
+            "file": "src/loop_engine/recovery.rs",
+            "impact": "OK",
+            "line": 664,
+            "mitigation": "FEAT-007 gates the probe; this task does not change the probe",
+            "usage": "probe calls is_rate_limited directly"
+          }
+        ],
+        "semanticDistinctions": [
+          {
+            "context": "exit 143 with completion_killed",
+            "currentBehavior": "text scanned; step 4 is Crash(RuntimeError)",
+            "requiredBehavior": "text not scanned; step 4 unchanged"
+          },
+          {
+            "context": "exit 143 without completion_killed",
+            "currentBehavior": "signal path sets the stop flag for 130 or 143",
+            "requiredBehavior": "unchanged; exit 137 does not set the stop flag"
+          }
+        ]
+      },
+      "dependsOn": [
+        "FEAT-001"
+      ],
+      "description": "Change analyze_output so agent prose cannot classify as RateLimit, PromptTooLong, or TransientBackend.\n\nDO:\n1. Add OutputSignals per CONTRACT-001, including task_id and run_id filled by iteration.rs and slot.rs. Signature (output, exit_code, signals, dir). Update the two production callers and the detection.rs tests (about 70). A test helper preserves today's exit≠0 behavior for tests that are not being rewritten.\n2. has_cli_error = signals.cli_error || (exit_code != 0 && !signals.completion_killed). Run is_rate_limited, is_prompt_too_long, and is_transient_backend only when has_cli_error. When cli_error is set, scan error_text. Otherwise scan output. Do not change the pattern function bodies.\n3. Leave step 4 unchanged: exit 143 is still Crash(RuntimeError). test_exit_code_143_sigterm stays green.\n4. Rewrite test_rate_limit_429_in_middle_of_line (detection.rs:1050) and test_detects_prompt_too_long_regardless_of_exit_code (detection.rs:1539) to the new contract, with a comment citing the PRD.\n5. Add regression tests: E1 exit 0 prose is not RateLimit; E2 grace-kill (exit 143, completion_killed) is not RateLimit (the done-row assertion is FEAT-006); E6 exit 0 \"Bad Gateway\" is not TransientBackend; E7 exit 0 \"prompt is too long\" prose is not PromptTooLong; E8 is_error true with \"Prompt is too long\" and exit 0 is PromptTooLong; E14 Grok-shaped exit 0 prose is not RateLimit; E4 and E5 still RateLimit.\n6. FR-005: when !has_cli_error and a classifier would have matched, emit warn target task_mgr::detection event text_signal_without_cli_error with classifier, task_id, exit_code, completion_killed, and run_id when the call site has it. No output text. E1 log test asserts exactly one event with classifier rate_limit and no output field.\n\nDO NOT: Move the account reaction (FEAT-003). Do not change decide_account_rate_limit. Do not narrow patterns (learning 5364).",
+      "edgeCases": [
+        "E1: summary 'One warn line per 429' and rate_limit_diagnostic_headers, exit 0 → not RateLimit",
+        "E2: same summary, exit 143, completion_killed true → not RateLimit (done row is FEAT-006)",
+        "E4: is_error true, result 'You've hit your session limit · resets 4pm', exit 1 → RateLimit",
+        "E6: 'Bad Gateway from upstream 502', exit 0, cli_error false → not TransientBackend",
+        "E7: 'the prompt is too long for the old API', exit 0 → not PromptTooLong",
+        "E8: real 'Prompt is too long', exit 0, is_error true → PromptTooLong",
+        "E9: limit prose, exit 0, is_error false → not RateLimit, one warn event",
+        "E13: rate-limit text only in the retained Codex turn.failed string, absent from derive_output → RateLimit",
+        "E14: Grok assistant text mentions 429, exit 0, cli_error false → not RateLimit"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "Gate uses bare exit_code != 0 and treats the grace-kill as an error",
+          "expectedBehavior": "E2 classifier test fails"
+        },
+        {
+          "cause": "cli_error true still scans the agent summary, which lacks the CLI sentence",
+          "expectedBehavior": "E8 fails"
+        }
+      ],
+      "id": "FEAT-002",
+      "invariants": [
+        "Classifiers run only when has_cli_error",
+        "cli_error scans error_text; the exit≠0 arm scans output",
+        "completion_killed suppresses the exit≠0 arm and does not suppress cli_error"
+      ],
+      "modifiesBehavior": true,
+      "notes": "follow src/loop_engine/detection.rs analyze_output. Learning [5364]: keep widened patterns. Learning [5386]: do not call the live Usage API from these tests. Consumer table is the PRD §6 table; no ANALYSIS task (single directory). Pass signals from RunnerResult at iteration.rs and slot.rs.",
+      "passes": false,
+      "priority": 3,
+      "qualityDimensions": [
+        "Provenance over text; pattern sets unchanged",
+        "A grace-kill is not a CLI error",
+        "cli_error still wins over completion_killed",
+        "Warn event has no output text; correlation id is active_prefix",
+        "Not-RateLimit is not done"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Gate the three text classifiers on the CLI-error signal",
+      "touchesFiles": [
+        "src/loop_engine/detection.rs",
+        "src/loop_engine/iteration.rs",
+        "src/loop_engine/slot.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "E10 sequential: X is done in the DB, reset_in_progress does not flip X back to todo, and the wait seam is invoked once",
+        "E10 sequential: consumes_budget is false when the snapshot was RateLimit even if the live outcome is Completed",
+        "OperatorStopped during the wait is exit 0 reason stop signal",
+        "StopSpend sets account_quota_stopped and is exit 0 reason quota soft-stop",
+        "task_id and output are still present when process_iteration_output runs on the stop path",
+        "When the ladder completed the claimed task, react_to_completions runs while the live outcome is still Completed, and only then may OperatorStopped or StopSpend set Empty. The wait seam is invoked after that commit returns",
+        "A RateLimit iteration with no <completed> tag still resets in_progress rows and waits",
+        "decide_account_rate_limit is not modified",
+        "No live Usage API call in the new tests"
+      ],
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/loop_engine/orchestrator.rs",
+            "impact": "BREAKS",
+            "line": 576,
+            "mitigation": "Match the pre-pipeline snapshot for RateLimit give-back",
+            "usage": "consumes_budget matches on the live outcome"
+          },
+          {
+            "file": "src/loop_engine/reactions/account.rs",
+            "impact": "BREAKS",
+            "line": 693,
+            "mitigation": "Pass the snapshot, not the rewritten outcome",
+            "usage": "returns None when no item is still RateLimit"
+          }
+        ],
+        "semanticDistinctions": [
+          {
+            "context": "Sequential RateLimit before this change",
+            "currentBehavior": "Reaction runs inside run_iteration, before the pipeline, and can reset a task that is about to be marked done",
+            "requiredBehavior": "Ladder and wrapper commit first; reaction uses the snapshot"
+          },
+          {
+            "context": "OperatorStopped / StopSpend",
+            "currentBehavior": "Early return drops task_id and output; exits are already 0",
+            "requiredBehavior": "Same exit 0 mapping after the ladder; StopSpend still sets account_quota_stopped"
+          }
+        ]
+      },
+      "dependsOn": [
+        "FEAT-002"
+      ],
+      "description": "Move the sequential account reaction out of iteration.rs into orchestrator.rs so a <completed> tag is recorded before any reset, without dropping the wait.\n\nDO:\n1. Remove the RateLimit react_to_outputs block from iteration.rs (the block that today returns Empty and drops task_id and output on OperatorStopped / StopSpend). run_iteration returns the RateLimit outcome with task_id and output intact.\n2. In orchestrator.rs, snapshot result.outcome before process_iteration_output. Run the ladder. If the ladder completed the claimed task, run react_to_completions (wrapper commit) before the wait.\n3. Call react_to_outputs with the snapshot, not the live outcome. record_completion sets Completed; reading that skips the wait.\n4. consumes_budget follows the snapshot. A RateLimit snapshot gives the iteration back even when the live outcome is Completed.\n5. OperatorStopped after the ladder: Empty, should_stop, operator_stopped true → exit 0 reason \"stop signal\". StopSpend: set ctx.account_quota_stopped, operator_stopped false → exit 0 \"quota soft-stop\". Do not restore exit 130 or 1.\n6. Tests: E10 sequential — RateLimit plus <completed>X</completed> leaves X done, the wait seam runs, and the iteration is not consumed. Existing OperatorStopped test still expects exit 0 \"stop signal\". StopSpend test expects account_quota_stopped and exit 0 \"quota soft-stop\". Inject the wait; do not sleep and do not call the live Usage API (learning 5386).\n\nDO NOT: Change the wave path (FEAT-004). Do not skip handle_overflow here (FEAT-005). Do not change decide_account_rate_limit math. Untagged PromptTooLong still calls handle_overflow inside run_iteration, before the pipeline (learning 5347).",
+      "edgeCases": [
+        "E10 sequential: RateLimit outcome and <completed>X</completed> → X done, wait runs, iteration not consumed"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "Reaction reads the outcome after record_completion",
+          "expectedBehavior": "E10 wait-seam assertion fails"
+        },
+        {
+          "cause": "Stop returns before the ladder and drops task_id",
+          "expectedBehavior": "The completed-tag test leaves X in_progress or todo"
+        }
+      ],
+      "id": "FEAT-003",
+      "invariants": [
+        "react_to_outputs reads the pre-pipeline snapshot",
+        "Wrapper commit runs before the multi-hour wait on the sequential path",
+        "Stop exits stay 0"
+      ],
+      "modifiesBehavior": true,
+      "notes": "follow orchestrator.rs react_to_transient (after the ladder) for call-site shape, and wave_scheduler.rs for folding one item into react_to_outputs. Do not copy the wave path's post-pipeline outcome read. Learning [4126]: seq and wave share the account reaction inner. Learning [5373]: exit 0 split. Learning [5391]: spend banners park the wait; StopSpend still sets account_quota_stopped. Learning [5386]: hermetic wait seam.",
+      "passes": false,
+      "priority": 4,
+      "qualityDimensions": [
+        "A completion is never lost to a reaction",
+        "The wait still runs from the snapshot",
+        "Budget give-back follows the snapshot",
+        "Stop mapping stays exit 0",
+        "Untagged overflow ordering is unchanged"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Run the sequential RateLimit reaction after the ladder, from a snapshot",
+      "touchesFiles": [
+        "src/loop_engine/iteration.rs",
+        "src/loop_engine/orchestrator.rs",
+        "src/loop_engine/reactions/account.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "E10 wave: X is done and the account wait seam runs once",
+        "E10 wave: iteration_consumed is false and rate_limited_retry is true when any pre-pipeline snapshot was RateLimit",
+        "A done row is not reset to todo",
+        "An in_progress row that was not completed is still reset",
+        "Merge-back does not run on the rate-limit retry return",
+        "No live Usage API call"
+      ],
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/loop_engine/wave_scheduler.rs",
+            "impact": "BREAKS",
+            "line": 1079,
+            "mitigation": "Snapshot before process_slot_result",
+            "usage": "builds OutputReactionItem from post-pipeline outcomes"
+          },
+          {
+            "file": "src/loop_engine/wave_scheduler.rs",
+            "impact": "OK",
+            "line": 1130,
+            "mitigation": "Keep that return when any pre-pipeline snapshot was RateLimit",
+            "usage": "WaitedAndRetry returns iteration_consumed false"
+          }
+        ],
+        "semanticDistinctions": [
+          {
+            "context": "Wave RateLimit after the ladder",
+            "currentBehavior": "Order is correct; a tagged slot's outcome is Completed so the wait is skipped",
+            "requiredBehavior": "Same order; reaction input is the snapshot"
+          }
+        ]
+      },
+      "dependsOn": [
+        "FEAT-002"
+      ],
+      "description": "The wave path already runs process_slot_result before react_to_outputs. record_completion rewrites a tagged slot to Completed, so the reaction returns None and the wave never waits.\n\nDO:\n1. Before process_slot_result, snapshot each slot's outcome (only claim_succeeded slots need to be passed through).\n2. Pass those snapshots into react_to_outputs. Do not read the post-pipeline outcome.\n3. iteration_consumed follows the snapshot: a RateLimit snapshot returns iteration_consumed false and rate_limited_retry true, even when the live outcome is Completed.\n4. Leave merge deferred. Do not call react_to_completions or merge inside the reaction.\n5. E10 wave test: one slot is RateLimit and its output contains <completed>X</completed>. X is done. The wait seam runs once for the wave. The iteration is not consumed. A second in_progress task that did not complete is reset. Hermetic wait. No live Usage API.\n\nDO NOT: Change sequential orchestrator.rs (FEAT-003). Do not merge slot branches in this task.",
+      "edgeCases": [
+        "E10 wave: RateLimit slot also emitted <completed>X</completed> → X done, wait runs, iteration not consumed"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "Items are built from outcomes after process_slot_result",
+          "expectedBehavior": "The wait seam is not called and the test fails"
+        }
+      ],
+      "id": "FEAT-004",
+      "invariants": [
+        "One react_to_outputs call per wave",
+        "The reaction reads snapshots taken before process_slot_result",
+        "Wave merge stays deferred on WaitedAndRetry"
+      ],
+      "modifiesBehavior": true,
+      "notes": "follow wave_scheduler.rs the block that maps outcomes into OutputReactionItem, but snapshot first. Learning [4126] and [4866]: one account reaction per wave. Learning [5386]: hermetic usage seam. The in_progress guard in reset_in_progress_tasks is necessary and not sufficient — the snapshot is what keeps the wait.",
+      "passes": false,
+      "priority": 5,
+      "qualityDimensions": [
+        "Wave wait is not dropped when a slot is both RateLimit and tagged",
+        "Merge stays deferred",
+        "Budget give-back follows the snapshot"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Feed the wave RateLimit reaction the pre-pipeline snapshot",
+      "touchesFiles": [
+        "src/loop_engine/wave_scheduler.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "E11 sequential: claimed id in parse_completed_tasks skips the entire handle_overflow call and the ladder marks X done",
+        "E11 wave: same skip and X is done",
+        "A PromptTooLong task whose id is not in the completed tags still runs handle_overflow before the pipeline",
+        "The skip does not insert overflow_recovered or a model snapshot for X",
+        "Git-only completion is not specially handled"
+      ],
+      "dependsOn": [
+        "FEAT-003"
+      ],
+      "description": "PromptTooLong currently runs handle_overflow while the row is still in_progress, including context inserts, before the pipeline can record <completed>.\n\nDO:\n1. On both paths, when the outcome is Crash(PromptTooLong) and the resolved claimed id (resolve_tag_id_to_claimed) is in parse_completed_tasks(output), do not call handle_overflow at all. No overflow_recovered insert, no model snapshot, no rungs 1-5.\n2. Leave the call where it is for every other PromptTooLong: still before process_iteration_output (learning 5347, CLAUDE.md handle_overflow ordering). The pipeline then records the tagged task done.\n3. E11 sequential and wave tests: output contains <completed>X</completed>, outcome would be PromptTooLong, X ends done, and no overflow context row is written for X. A different task id that is not in the tags still enters handle_overflow.\n\nDO NOT: Protect git-only or output-scan completions. That is a non-goal. Do not move the untagged call to after the pipeline.",
+      "edgeCases": [
+        "E11 sequential: PromptTooLong with <completed>X</completed> → whole handle_overflow skipped, X done",
+        "E11 wave: same for the slot's claimed id"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Only recover_in_progress is skipped",
+          "expectedBehavior": "The test that asserts no overflow context row fails"
+        }
+      ],
+      "id": "FEAT-005",
+      "invariants": [
+        "Untagged overflow stays before the shared pipeline",
+        "A tag skip covers context inserts and rungs 1-5, not only the status update"
+      ],
+      "modifiesBehavior": true,
+      "notes": "follow slot.rs process_slot_result overflow-then-pipeline order. Learning [5347]. Learning [5350]: rungs 1-3 recover, 4 overrides the model, 5 auto-blocks — none of those run on a tag skip. Use output_parsing::parse_completed_tasks and resolve_tag_id_to_claimed. Do not reimplement ends_with id matching.",
+      "passes": false,
+      "priority": 6,
+      "qualityDimensions": [
+        "A <completed> tag is not undone by overflow context writes",
+        "Untagged overflow ordering stays the CLAUDE.md contract",
+        "Git-only overflow protection stays out of scope"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Skip handle_overflow entirely when the claim already has a completed tag",
+      "touchesFiles": [
+        "src/loop_engine/iteration.rs",
+        "src/loop_engine/slot.rs",
+        "src/loop_engine/reactions/post_output.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "E3: grace-killed, tag only in the grace-buffer tail, absent from conversation and from output → task is done",
+        "E2: grace-killed run whose scanned text or sequential -completed commit names X → DB status is done",
+        "A grace-kill with no tag and no -completed commit does not mark the task done",
+        "The fallback does not read conversation as a substitute for the grace buffer",
+        "Wave skip_git_completion_detection still true; E3 passes without a commit"
+      ],
+      "dependsOn": [
+        "FEAT-008"
+      ],
+      "description": "A grace-kill can leave the <completed> tag only in the assistant buffer that armed the grace. output is result.result and may be a summary or empty. conversation is head-capped at 50_000 bytes, so the tag can already be gone from it. Wave sets skip_git_completion_detection, so a -completed commit will not save the wave path.\n\nprocess_iteration_output does not see RunnerResult. FEAT-008 copies grace_buffer_tail and completion_killed onto IterationResult and into ProcessingParams. This task only scans those ProcessingParams fields.\n\nDO:\n1. When ProcessingParams.completion_killed is set and parse_completed_tasks(output) is empty, scan ProcessingParams.grace_buffer_tail for <completed> tags. Do this for empty and non-empty output.\n2. Do not use conversation as the fallback.\n3. E3 test: grace-killed, output has no <completed>, the tag exists only in the grace-buffer tail and is absent from a head-capped conversation → the task row is done.\n4. E2 done-row test: grace-killed summary that is not RateLimit (FEAT-002) and that contains <completed>X</completed> in the scanned text, or a sequential X-completed commit → the DB row is done. Assert the row, not only the classifier.\n\nDO NOT: Read RunnerResult inside the pipeline. Do not treat the classifier result as completion. Exit 143 remains Crash(RuntimeError) when no tag is found.",
+      "edgeCases": [
+        "E2: grace-killed summary plus a <completed> tag or a sequential -completed commit → DB row done",
+        "E3: grace-killed, output lacks the tag, tag only in the grace-buffer tail → done"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Fallback scans conversation only",
+          "expectedBehavior": "E3 fails when the tag was truncated from the head-capped transcript"
+        }
+      ],
+      "id": "FEAT-006",
+      "invariants": [
+        "completion_killed plus an empty parse of output scans the grace-buffer tail",
+        "Not-RateLimit does not by itself write done"
+      ],
+      "modifiesBehavior": true,
+      "notes": "The tail is already on RunnerResult from FEAT-001 and on ProcessingParams from FEAT-008. Scan the params field. Learning [3870]: the DB updates only from an explicit completion signal. Learning [2188]: a tag for Y marks Y, not the claim, when they differ.",
+      "passes": false,
+      "priority": 10,
+      "qualityDimensions": [
+        "The scan uses the buffer that armed the grace",
+        "Head-capped conversation is not the source of truth",
+        "Wave cannot rely on git completion detection for this case"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Scan the grace-buffer tail when output has no completed tag",
+      "touchesFiles": [
+        "src/loop_engine/iteration_pipeline.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "E12: probe exit 0 with prose containing limit returns lifted",
+        "Probe exit ≠ 0 with a real limit sentence returns not lifted",
+        "The probe still calls is_rate_limited only on the exit ≠ 0 path",
+        "LOOP_USAGE_CHECK_ENABLED is not used as a kill switch for this probe"
+      ],
+      "dependsOn": [
+        "FEAT-002"
+      ],
+      "description": "probe_rate_limit_lifted calls is_rate_limited on the probe output and ignores the exit code. A probe that prints the word limit and exits 0 must count as lifted.\n\nDO:\n1. Return lifted when the probe exits 0, without scanning text.\n2. Scan text only when exit ≠ 0.\n3. E12 test uses a fake CLAUDE_BINARY script. Exit 0 and prose containing limit → lifted. Exit 1 and a real limit sentence → not lifted.\n\nDO NOT: Route the probe through analyze_output. Do not change the early-lift vs usage-API split (learning 5298).",
+      "edgeCases": [
+        "E12: probe prose contains limit and exit is 0 → lifted; text is scanned only when exit ≠ 0"
+      ],
+      "estimatedEffort": "low",
+      "failureModes": [
+        {
+          "cause": "Exit 0 still scans and matches limit",
+          "expectedBehavior": "E12 fails"
+        }
+      ],
+      "id": "FEAT-007",
+      "invariants": [
+        "Exit 0 probe is lifted regardless of prose"
+      ],
+      "modifiesBehavior": true,
+      "notes": "Function is probe_rate_limit_lifted in src/loop_engine/recovery.rs. The is_rate_limited return is the scan site. Learning [5298]: post-output probe stays keyed on Claude enabled, not on the env flag alone. Do not collapse those.",
+      "passes": false,
+      "priority": 8,
+      "qualityDimensions": [
+        "Probe text is not a CLI error when exit is 0",
+        "Usage-gate and probe split stays as learning 5298"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Gate the rate-limit lift probe on exit status",
+      "touchesFiles": [
+        "src/loop_engine/recovery.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Both process_iteration_output call sites pass grace_buffer_tail and completion_killed from IterationResult",
+        "Early-return IterationResult literals set an empty tail and completion_killed false",
+        "The success path copies both fields from RunnerResult",
+        "cargo check passes, including tests/iteration_result_conversation.rs"
+      ],
+      "dependsOn": [
+        "FEAT-005",
+        "FEAT-007"
+      ],
+      "description": "process_iteration_output does not see RunnerResult. FEAT-001 put grace_buffer_tail and completion_killed on RunnerResult. This task copies them onto IterationResult and into both ProcessingParams literals so FEAT-006 can scan them.\n\nDO:\n1. Add grace_buffer_tail: String and completion_killed: bool to IterationResult. Update every literal, including early returns (empty tail, completion_killed false) and tests/iteration_result_conversation.rs.\n2. On the success return of run_iteration and run_slot_iteration, copy the fields from the RunnerResult.\n3. Add the same two fields to ProcessingParams. Both call sites pass them: orchestrator.rs sequential process_iteration_output, and slot.rs process_slot_result.\n4. cargo check is green. Do not implement the scan (FEAT-006).\n\nDO NOT: Scan for tags here. Do not change conversation capping.",
+      "estimatedEffort": "medium",
+      "id": "FEAT-008",
+      "modifiesBehavior": false,
+      "notes": "IterationResult is in src/loop_engine/engine.rs. ProcessingParams is in iteration_pipeline.rs but the scan stays in FEAT-006; this task may add the two fields on the struct and the two call sites. If adding the struct fields requires editing iteration_pipeline.rs, do only the field and the call-site wiring, not the scan. Learning [3870]: plumbing is not completion.",
+      "passes": false,
+      "priority": 9,
+      "qualityDimensions": [
+        "The pipeline never reads RunnerResult directly",
+        "Early returns cannot leak a stale grace tail",
+        "Both paths pass the same fields"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Thread the grace-buffer tail into the pipeline params",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/iteration.rs",
+        "src/loop_engine/slot.rs",
+        "src/loop_engine/orchestrator.rs",
+        "src/loop_engine/iteration_pipeline.rs",
+        "src/loop_engine/recovery.rs",
+        "tests/iteration_result_conversation.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "CLAUDE.md states the has_cli_error gate and that pattern sets are unchanged",
+        "CLAUDE.md states the snapshot contract and the sequential commit-before-wait order",
+        "CLAUDE.md states untagged overflow stays before the pipeline and the tag skip is the whole call",
+        "docs/ARCHITECTURE.md describes signal capture → gate → pipeline → snapshot reaction",
+        "CLAUDE.md names limit-shape-<prefix>.jsonl and says the scan is not retargeted from that file"
+      ],
+      "dependsOn": [
+        "FEAT-003",
+        "FEAT-004",
+        "FEAT-005",
+        "FEAT-006",
+        "FEAT-007",
+        "FEAT-008",
+        "FEAT-009"
+      ],
+      "description": "Update the design notes so the next change does not move the reaction back in front of the ladder or scan agent prose again.\n\nDO:\n1. src/loop_engine/CLAUDE.md: classifiers are gated on CLI-error provenance; agent prose never classifies; grace-kill is not a CLI error; react_to_outputs reads a pre-pipeline snapshot on both paths; sequential wrapper commit happens before the wait; wave merge stays deferred; untagged handle_overflow stays before the pipeline; a claimed id in parse_completed_tasks skips the whole call.\n2. docs/ARCHITECTURE.md: a short iteration-outcome paragraph — signal capture, gate, pipeline, snapshot reaction. Match the names used in code.\n\nDO NOT: Rewrite unrelated CLAUDE.md sections.\n\n3. Name .task-mgr/logs/limit-shape-<prefix>.jsonl. State that this PRD records the channels and does not retarget the scan.",
+      "estimatedEffort": "low",
+      "id": "DOC-001",
+      "modifiesBehavior": false,
+      "notes": "Edit only the reaction-framework and overflow-ordering sections plus a short ARCHITECTURE paragraph. Do not paste this PRD into CLAUDE.md.",
+      "passes": false,
+      "priority": 12,
+      "qualityDimensions": [
+        "Docs name the snapshot and the grace-buffer tail",
+        "Docs do not tell the reader to restore exit 130 or 1"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Document the classifier gate and reaction-after-ladder order",
+      "touchesFiles": [
+        "src/loop_engine/CLAUDE.md",
+        "docs/ARCHITECTURE.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Each non-N/A §2.7 assertion has evidence in the progress log or a spawned fix",
+        "Any issues found have corresponding CODE-FIX-xxx or WIRE-FIX-xxx tasks added via task-mgr add --stdin --from-json",
+        "No production code edited in this task"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "FEAT-005",
+        "FEAT-006",
+        "FEAT-007",
+        "FEAT-008",
+        "DOC-001",
+        "FEAT-009"
+      ],
+      "description": "Read the branch diff against the merge base. Check language idioms, unwrap on stream fields, the CONTRACT-001 record, and each non-N/A §2.7 row in tasks/prd-cli-error-gated-detection.md (change scope, boundary validation, failure semantics, observability, rollout, proof). Confirm both paths pass a pre-pipeline snapshot, StopSpend sets account_quota_stopped, and untagged handle_overflow is still before the pipeline.\n\nSpawn one CODE-FIX or WIRE-FIX per finding class via task-mgr add --stdin --from-json tasks/cli-error-gated-detection.json --depended-on-by REVIEW-001. Priority 14-20. Do not implement fixes in this task. If nothing is wrong, say so in the progress log and mark done.",
+      "estimatedEffort": "high",
+      "id": "CODE-REVIEW-1",
+      "modifiesBehavior": false,
+      "notes": "Use the rust-python-code-reviewer agent. Spawn target is REVIEW-001. Learning [5386]: a test that calls the live Usage API is a finding.",
+      "passes": false,
+      "priority": 13,
+      "requiresHuman": false,
+      "taskType": "review",
+      "title": "Review the CLI-error gate and reaction ordering",
+      "touchesFiles": [
+        "src/loop_engine/detection.rs",
+        "src/loop_engine/orchestrator.rs",
+        "src/loop_engine/wave_scheduler.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Branch diff inventoried; each added item has a caller or a failing input, or a spawned deletion",
+        "Spawn PRUNE-FIX tasks for items that fail the existence bar",
+        "CODE-FIX-xxx and WIRE-FIX-xxx from CODE-REVIEW-1 are done or absent before this task completes",
+        "No production code edited in this task"
+      ],
+      "dependsOn": [
+        "CODE-REVIEW-1",
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "FEAT-005",
+        "FEAT-006",
+        "FEAT-007",
+        "FEAT-008",
+        "DOC-001",
+        "FEAT-009"
+      ],
+      "description": "Inventory the branch diff against the merge base, plus uncommitted work in the loop worktree. Untouched files stay untouched. For each added or modified function, branch, field, and test, name the concrete caller or the concrete failing input that needs it. Spawn a removal when there is no production caller and the item is not the feature's public entry point, when the only reason to keep it is speculative, or when a test pins no required behavior.\n\nKeep behavior named by acceptance criteria, edge cases, and real parse or DB paths. Keep one-caller code that is the feature.\n\nSpawn one PRUNE-FIX task per coherent deletion with task-mgr add --stdin --from-json tasks/cli-error-gated-detection.json --depended-on-by REVIEW-001. Priority 61-69. Omit estimatedEffort unless the deletion spans many files. Do not edit production code in this task. Do not implement the deletion here. Empty inventory: progress line \"nothing to remove\" and mark done.\n\nThis task waits while any CODE-FIX-xxx or WIRE-FIX-xxx is still todo or in_progress.",
+      "estimatedEffort": "high",
+      "id": "PRUNE-001",
+      "modifiesBehavior": false,
+      "notes": "Learning [911] and [4903]: do not implement the deletion in this task. Learning [4748]: later gates name the spawned deletions. Say spawn PRUNE-FIX tasks. Do not put the token PRUNE-FIX- in this task's acceptance criteria.",
+      "passes": false,
+      "priority": 60,
+      "requiresHuman": false,
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Existence pass on the CLI-error gate diff",
+      "touchesFiles": [
+        "src/loop_engine/detection.rs",
+        "src/loop_engine/runner.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Stayed code checked for a second snapshot shape or a copied classifier gate",
+        "Any simplification is a REFACTOR-xxx task, not an edit in this task",
+        "PRUNE-FIX-xxx spawned by PRUNE-001 are done or absent before this task completes",
+        "No production code edited in this task"
+      ],
+      "dependsOn": [
+        "PRUNE-001"
+      ],
+      "description": "Review the code that survived PRUNE-001 for DRY, complexity, coupling, and contract fidelity. Do not decide whether the code should exist. Spawn REFACTOR-xxx at priority 71-85 via task-mgr add --stdin --from-json tasks/cli-error-gated-detection.json --depended-on-by REVIEW-001 when a stayed function is duplicated across the sequential and wave paths or the snapshot is rebuilt in two shapes.\n\nA todo or in_progress PRUNE-FIX-xxx holds this task. A blocked deletion does not. Do not edit production code here.",
+      "estimatedEffort": "high",
+      "id": "REFACTOR-REVIEW-FINAL",
+      "modifiesBehavior": false,
+      "notes": "Existence was PRUNE-001. This pass only shapes what remains.",
+      "passes": false,
+      "priority": 70,
+      "requiresHuman": false,
+      "taskType": "review",
+      "title": "Shape the gate and snapshot code that should stay",
+      "touchesFiles": [
+        "src/loop_engine/detection.rs",
+        "src/loop_engine/orchestrator.rs",
+        "src/loop_engine/wave_scheduler.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "cargo fmt --check && cargo check && cargo clippy --all-targets -- -D warnings && cargo test pass",
+        "E1 through E14 each have a passing test or an explicit out-of-scope note that matches the PRD non-goals",
+        "§2.7 proof rows have evidence: prose-not-RateLimit, grace-kill done row, sequential and wave snapshot wait, grace-buffer tail scan",
+        "PRUNE-FIX-xxx, CODE-FIX-xxx, and WIRE-FIX-xxx are done or absent",
+        "No new CLI flag, config key, or DB column",
+        "Progress log states the full-suite result"
+      ],
+      "dependsOn": [
+        "REFACTOR-REVIEW-FINAL",
+        "PRUNE-001",
+        "CODE-REVIEW-1",
+        "DOC-001"
+      ],
+      "description": "Final gate. Run the full unscoped suite and leave the trunk green, including pre-existing failures. Below about 12 unrelated failures, fix them in this task. Above that, and only when they are clearly unrelated, spawn one FIX task via task-mgr add --stdin --from-json tasks/cli-error-gated-detection.json --depended-on-by REVIEW-001 and stop blocked.\n\nConfirm E1 through E14 are covered by a passing test named from the owning FEAT acceptance criteria. Confirm §2.7 proof rows. Drive no verify-task-mgr feature: the harness refuses loop run, and this PRD does not change a mapped CLI surface.\n\nA todo or in_progress PRUNE-FIX-xxx, CODE-FIX-xxx, or WIRE-FIX-xxx holds this task.",
+      "estimatedEffort": "high",
+      "id": "REVIEW-001",
+      "modifiesBehavior": false,
+      "notes": "This is the milestone. Full suite, not a scoped cargo test. verify-task-mgr does not map onto this PRD; do not launch loop run from the harness.",
+      "passes": false,
+      "priority": 99,
+      "requiresHuman": false,
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Full gate for the CLI-error provenance fix",
+      "touchesFiles": [
+        "src/loop_engine/detection.rs",
+        "src/loop_engine/orchestrator.rs",
+        "src/loop_engine/wave_scheduler.rs",
+        "src/loop_engine/iteration_pipeline.rs",
+        "src/loop_engine/recovery.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "A non-zero exit or cli_error appends one JSON object to .task-mgr/logs/limit-shape-<prefix>.jsonl",
+        "A clean exit 0 with no classifier match writes nothing",
+        "Claude line stores result_is_error, result_text, assistant_error, and stderr as separate fields, each at most 4096 trailing bytes",
+        "Grok line stores stderr and output_tail and no Claude or Codex fields",
+        "Codex line stores error_text from turn.failed, stderr, and output_tail, and error_text is not derive_output",
+        "A CLAUDE_BINARY stub with the session-limit sentence only on stderr does not change the FR-002 outcome",
+        "A stderr 502 is still TransientBackend and the same stderr is in the jsonl line",
+        "No tracing event contains the channel text"
+      ],
+      "dependsOn": [
+        "FEAT-002"
+      ],
+      "description": "Append a limit-shape record so the next real CLI limit shows which stream held the sentence. Do not change which string is_rate_limited, is_prompt_too_long, or is_transient_backend scan.\n\nDO:\n1. When exit_code != 0, cli_error is set, or any captured channel matches one of those three classifiers, append one JSON object to .task-mgr/logs/limit-shape-<prefix>.jsonl. A clean exit 0 with no match writes nothing.\n2. Each object has provider, exit_code, cli_error, completion_killed, and only that provider's channels. Each text field is the trailing 4096 bytes. Do not put the text on a tracing event.\n3. Claude channels: result_is_error, result_text, assistant_error, stderr. Stderr is Stdio::inherit today. Pipe it, tee it to the terminal, and store the tail. result_text is result.result. assistant_error is the StreamEvent::Error string.\n4. Grok channels: stderr (the buffer already scanned for auth and transient 5xx) and output_tail (assistant text).\n5. Codex channels: error_text (the turn.failed / error string, not derive_output), stderr (the buffer used for the transient check), and output_tail.\n6. Tests: one jsonl line per provider has only that provider's keys. A CLAUDE_BINARY stub prints \"You've hit your session limit\" on stderr and a different sentence in result.result; the line stores each sentence in its own field. The iteration outcome still follows FR-002's scan string, not stderr. A stderr 502 is still TransientBackend and is also recorded.\n\nDO NOT: Retarget the rate-limit scan onto stderr. Do not change Grok or Codex transient classification. Do not log the channel text through tracing. Do not exhaust an account to capture a live limit.",
+      "estimatedEffort": "medium",
+      "id": "FEAT-009",
+      "notes": "PRD FR-007. Fixture tests do not prove which live stream carries a limit. This record is the fixture for a later scan change. Learning [5364]: do not narrow patterns. Claude stderr must still be visible on the operator terminal (tee).",
+      "passes": false,
+      "priority": 7,
+      "requiresHuman": false,
+      "title": "Record each provider's limit channels without retargeting the scan",
+      "touchesFiles": [
+        "src/loop_engine/claude.rs",
+        "src/loop_engine/runner.rs",
+        "src/loop_engine/limit_shape.rs"
+      ]
+    }
+  ],
+  "version": "1.0"
+}
