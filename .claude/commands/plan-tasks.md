@@ -15,7 +15,7 @@ Generate a task list and prompt directly from a plan or description, skipping th
 >
 > **CLI (embed in the generated prompt):** `--from-json` pins an already-registered PRD. Spawn: `task-mgr add --stdin --from-json tasks/<prd>.json --depended-on-by REVIEW-001`. Patch: `task-mgr update --stdin --from-json tasks/<prd>.json`. Bulk sync: `task-mgr loop init <prd>.json --append --update-existing` — never bare `init --from-json`. Export onto a registered dest needs `--force`. Never hand-edit JSON.
 
-You are generating a lean, executable task list for the Claude Loop agent system. This skill combines planning and task generation into one step — no intermediate PRD artifact.
+You are generating a lean, executable task list for the Claude Loop agent system. This skill combines planning and task generation into one step — no intermediate PRD artifact. Do not spawn `first-principles-architect`. A one-line check, "what happens if this part does not exist?", is the shape step for this path.
 
 > **CRITICAL — These principles must be embedded in every task and the prompt file:**
 >

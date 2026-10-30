@@ -39,6 +39,8 @@ Determine if this is:
 
 ### Step 3: Ask Clarifying Questions
 
+**Shape first.** Before the questions below, spawn `first-principles-architect` on the request (persona `~/.claude/agents/first-principles-architect.md`). It questions the requirement and names what to delete. The questions and the later PRD use that reduced shape. Skip this spawn when the prompt says this is a `/prd-goal` phase: that spawn already ran at intake, and the pins are law. `/plan-tasks` does not use this agent.
+
 Ask 3-5 questions to fill gaps. Use lettered options (A, B, C, D) when possible:
 
 **For Features:**
