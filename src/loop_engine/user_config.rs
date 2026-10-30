@@ -4,12 +4,15 @@
 //! Stores personal preferences that should follow the user across projects.
 //!
 //! Read-only surface: `read_user_config()` returns defaults when the file is
-//! missing or invalid. The only remaining field, `defaultModel`, is DEPRECATED
-//! under the provider-first `models`/`routing` config — it never feeds model
-//! resolution and is read solely so preflight can emit the deprecation warning
-//! (see `project_config::preflight_validate_and_probe`). The legacy writers
-//! (`write_default_model` / `write_review_model`) were removed with the
-//! FR-001 hard break; the `models` CLI owns all config writes now.
+//! missing or invalid. `defaultModel` is DEPRECATED under the provider-first
+//! `models`/`routing` config — it never feeds model resolution and is read
+//! solely so preflight can emit the deprecation warning (see
+//! `project_config::preflight_validate_and_probe`). `worktreeRoot` selects
+//! where new git worktrees are created (see `worktree::resolve_worktree_placement`).
+//! The legacy writers (`write_default_model` / `write_review_model`) were
+//! removed with the FR-001 hard break; the `models` CLI owns model writes.
+//! `worktreeRoot` is edited in this JSON file (or overridden by
+//! `TASK_MGR_WORKTREE_ROOT`).
 
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -26,6 +29,12 @@ pub struct UserConfig {
     /// preflight deprecation warning.
     #[serde(default)]
     pub default_model: Option<String>,
+
+    /// Absolute directory for new git worktrees, or the string `sibling` to
+    /// keep `{repo-parent}/{repo-name}-worktrees/`. Absent or JSON null keeps
+    /// the sibling layout. `TASK_MGR_WORKTREE_ROOT` overrides this.
+    #[serde(default)]
+    pub worktree_root: Option<String>,
 }
 
 /// Return the file path where user config lives, or `None` if neither
@@ -77,6 +86,15 @@ mod tests {
             UserConfig::default()
         };
         assert!(config.default_model.is_none());
+        assert!(config.worktree_root.is_none());
+    }
+
+    #[test]
+    fn worktree_root_parses_and_null_is_absent() {
+        let set: UserConfig = serde_json::from_str(r#"{"worktreeRoot":"/var/worktrees"}"#).unwrap();
+        assert_eq!(set.worktree_root.as_deref(), Some("/var/worktrees"));
+        let absent: UserConfig = serde_json::from_str(r#"{"worktreeRoot":null}"#).unwrap();
+        assert!(absent.worktree_root.is_none());
     }
 
     #[test]

@@ -54,8 +54,8 @@ BRANCH=$(jq -r '.branchName' tasks/<feature>.json)
 PRD_TITLE=$(jq -r '.description // .project' tasks/<feature>.json)
 TODAY=$(date -I)  # YYYY-MM-DD
 
-# Resolve WORKTREE — parent-directory-sibling -worktrees/, with / replaced by -
-# Fallback: git worktree list | grep "$BRANCH" | awk '{print $1}'
+# Resolve WORKTREE from git's registry. Covers the sibling layout and
+# worktreeRoot / TASK_MGR_WORKTREE_ROOT (<root>/<repo-name>/<branch>).
 WORKTREE=$(git worktree list --porcelain | awk -v b="$BRANCH" '
   /^worktree / { wt=$2 }
   $0 == "branch refs/heads/" b { print wt; exit }

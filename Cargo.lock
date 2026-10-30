@@ -1600,7 +1600,7 @@ dependencies = [
 
 [[package]]
 name = "task-mgr"
-version = "0.3.4"
+version = "1.0.0"
 dependencies = [
  "assert_cmd",
  "chrono",

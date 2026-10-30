@@ -1043,9 +1043,32 @@ worktree — `compute_slot_worktree_path` re-derives a path under
 worktree IS the project root. Engine threads the paths returned by
 `ensure_slot_worktrees` through `WaveParams::slot_worktree_paths`.
 
-`compute_slot_worktree_path` is still correct for slots 1+ inside
-`merge_slot_branches_with_resolver` and for `cleanup_slot_worktrees` — only
-the slot 0 lookup was wrong.
+`compute_slot_worktree_path` is still the pure sibling helper. Production
+cleanup, ephemeral classification, and auto-recovery call `slot_disk_path`:
+a worktree already registered for that branch in `git worktree list` wins
+(so an older sibling path is still removed), otherwise the path is
+`compute_slot_worktree_path_with` under `current_placement`. Only the slot 0
+lookup inside merge-back was wrong, and that path stays threaded.
+
+### Worktree placement
+
+`current_placement` is the only production reader of where new worktrees go.
+Precedence: `TASK_MGR_WORKTREE_ROOT`, then user-config `worktreeRoot`
+(`$XDG_CONFIG_HOME/task-mgr/config.json`, else `~/.config/task-mgr/config.json`),
+then sibling. `sibling` (any case) forces
+`{parent}/{repo-name}-worktrees/{sanitized-branch}`. An absolute path selects
+`<root>/<main-repo-basename>/<sanitized-branch>`. The basename comes from
+`git::main_repo_root_at`, so a path computed from a linked worktree matches
+the main checkout. Empty or relative values error. There is no `~` expansion
+and no silent fallback.
+
+Before creating (not when reusing a branch `git worktree list` already
+knows), a rooted placement must exist, be a directory, and have a different
+device from its parent (`assert_own_mount`). task-mgr never `mkdir`s the root.
+`<root>/<repo-name>` is refused when any child worktree's git common dir
+belongs to a different repository. `cfg(test)` ignores the env var and the
+user config unless a thread-local `PlacementOverride` is set, so sibling
+path fixtures stay put when a developer config points at a real root.
 
 ### 2. Consecutive-merge-fail halt threshold
 

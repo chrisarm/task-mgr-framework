@@ -311,7 +311,9 @@ By default, `task-mgr loop` creates a git worktree for the PRD's branch instead 
 - **Parallel work**: Multiple loops can run on different branches simultaneously
 - **Isolation**: Changes in the worktree don't affect your main checkout
 
-Worktrees are created at `{repo-parent}/{repo-name}-worktrees/{branch-name}/`. For example, if your repo is at `/home/user/myproject` and the PRD branch is `feature/auth`, the worktree will be at `/home/user/myproject-worktrees/feature-auth/`.
+By default, worktrees are created at `{repo-parent}/{repo-name}-worktrees/{branch-name}/`. For example, if your repo is at `/home/user/myproject` and the PRD branch is `feature/auth`, the worktree will be at `/home/user/myproject-worktrees/feature-auth/`.
+
+Set `worktreeRoot` in the user config (`$XDG_CONFIG_HOME/task-mgr/config.json`, otherwise `~/.config/task-mgr/config.json`) or the `TASK_MGR_WORKTREE_ROOT` environment variable (env wins) to an absolute directory. New worktrees then go to `<root>/<repo-name>/<sanitized-branch>/`. The value `sibling` forces the default layout. The root must already exist and be its own mounted filesystem; task-mgr will not create it and will not fall back to the sibling layout when that check fails. `task-mgr worktrees list` follows `git worktree list`, so worktrees already in the sibling directory stay visible. Two repositories that share a basename cannot share `<root>/<repo-name>/`.
 
 Use `--no-worktree` to revert to the old behavior of checking out branches directly (useful for CI/CD or when you prefer the simpler model).
 

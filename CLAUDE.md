@@ -4,8 +4,8 @@
 
 - Database: `.task-mgr/tasks.db` (per worktree; schema migrations under `src/db/migrations/v*.rs` — most recent: v21 multi-model `learning_embeddings` PK `(learning_id, model)`; v19 added `tasks.claims_shared_infra` for the parallel-slot shared-infra heuristic)
 - Main worktree: `$HOME/projects/task-mgr`
-- Feature worktrees: `$HOME/projects/task-mgr-worktrees/<branch-name>/`
-- Parallel-slot worktrees: `$HOME/projects/task-mgr-worktrees/<branch-name>-slot-<N>/` for slots 1+ (slot 0 reuses the feature worktree directly; see `src/loop_engine/CLAUDE.md` "Parallel-slot scheduling")
+- Feature worktrees: `{repo-parent}/{repo-name}-worktrees/<branch-name>/` unless user-config `worktreeRoot` or `TASK_MGR_WORKTREE_ROOT` is an absolute path, in which case new worktrees are `<root>/<repo-name>/<branch-name>/`. The value `sibling` forces the sibling layout. The root must already be its own mount. This machine's user config may set `worktreeRoot` to `/home/chris/.worktrees`.
+- Parallel-slot worktrees: same directory, `<branch-name>-slot-<N>/` for slots 1+ (slot 0 reuses the feature worktree directly; see `src/loop_engine/CLAUDE.md` "Parallel-slot scheduling")
 - PRD task lists: `.task-mgr/tasks/<prd-name>.json`
 - Loop prompts: `.task-mgr/tasks/<prd-name>-prompt.md`
 - Progress log: `.task-mgr/tasks/progress-<prefix>.txt` (gitignored — managed by `task-mgr init`)

@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-10-29
+
+### Added
+- New git worktrees go to `<worktreeRoot>/<repo-name>/<sanitized-branch>/` when `worktreeRoot` is set in the user config (`$XDG_CONFIG_HOME/task-mgr/config.json`, otherwise `~/.config/task-mgr/config.json`) or `TASK_MGR_WORKTREE_ROOT` is an absolute path. The value `sibling` keeps `{repo-parent}/{repo-name}-worktrees/`. The root must already exist and be its own mounted filesystem; task-mgr does not create it and does not fall back when that check fails. `task-mgr worktrees` follows `git worktree list`, so worktrees already in the sibling directory stay listed. Two repositories that share a basename cannot share one `<root>/<repo-name>/` directory.
+
 ### Changed
 - `task-mgr init` stages `~/.claude/docs/task-mgr-best-practices.md` (add/update `--from-json`, `update --stdin`, scoped export). Slash-command skills (`prd-tasks`, `plan-tasks`, `spike`, `review-loop`) pin spawn-fixups with `--from-json`.
 
