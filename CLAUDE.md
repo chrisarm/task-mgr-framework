@@ -4,8 +4,8 @@
 
 - Database: `.task-mgr/tasks.db` (per worktree; schema migrations under `src/db/migrations/v*.rs` — most recent: v21 multi-model `learning_embeddings` PK `(learning_id, model)`; v19 added `tasks.claims_shared_infra` for the parallel-slot shared-infra heuristic)
 - Main worktree: `$HOME/projects/task-mgr`
-- Feature worktrees: `$HOME/projects/task-mgr-worktrees/<branch-name>/`
-- Parallel-slot worktrees: `$HOME/projects/task-mgr-worktrees/<branch-name>-slot-<N>/` for slots 1+ (slot 0 reuses the feature worktree directly; see `src/loop_engine/CLAUDE.md` "Parallel-slot scheduling")
+- Feature worktrees: `{repo-parent}/{repo-name}-worktrees/<branch-name>/` unless user-config `worktreeRoot` or `TASK_MGR_WORKTREE_ROOT` is an absolute path, in which case new worktrees are `<root>/<repo-name>/<branch-name>/`. The value `sibling` forces the sibling layout. The root must already be its own mount. This machine's user config may set `worktreeRoot` to `/home/chris/.worktrees`.
+- Parallel-slot worktrees: same directory, `<branch-name>-slot-<N>/` for slots 1+ (slot 0 reuses the feature worktree directly; see `src/loop_engine/CLAUDE.md` "Parallel-slot scheduling")
 - PRD task lists: `.task-mgr/tasks/<prd-name>.json`
 - Loop prompts: `.task-mgr/tasks/<prd-name>-prompt.md`
 - Progress log: `.task-mgr/tasks/progress-<prefix>.txt` (gitignored — managed by `task-mgr init`)
@@ -23,6 +23,8 @@
 **Gotcha — stop the loop with `task-mgr loop stop --prefix <prefix>`.** The running process watches the PRD parent's tasks directory, plus a prefix file created after process start in the launch `tasks/`, the feature worktree `tasks/`, or the main checkout `tasks/`. A prefix file that predates the process in those extra directories is deleted at start, and the warning names how to create a fresh one. Do not `touch tasks/.stop-<prefix>` from whichever checkout the operator shell happens to be in. A batch between-PRD stop is `.task-mgr/tasks/.stop`; once that batch honors the file, it is unlinked so the next batch is not stuck stopped.
 
 **Gotcha — sticky path identity (one path → one prefix).** First `PrefixMode::Auto` registration always hashes `md5(branchName:filename)[:8]` and freezes that into `prd_metadata`; JSON `taskPrefix` is not read on first Auto. Re-import / `loop run` restore the registered prefix (do not re-hash). Path-identity twins (relative + absolute `prd_files` for the same live JSON) refuse at init — run `task-mgr doctor` (never `LIMIT 1`, never `archive` to collapse twins). Scoped `--force` soft-archives identity ∪ about-to-apply (`archived_at`); it does not `DELETE FROM tasks` or move JSON files.
+
+**Gotcha — Grok plan-limit sniff is one stderr phrase.** `GrokRunner::spawn` returns `RunnerRateLimited` only when stderr contains `rate limit for your plan` (case-insensitive), after the auth sniff and before the transient sniff. It does not call `detection::is_rate_limited`. A buffer with `429` and `rate` but not that phrase is not this error. A `<completed>` tag with a real id stays `Ok` on either exit arm. `session_id` is set only on `Ok`, and cleanup deletes only `~/.grok/sessions/<encoded-cwd>/<that-uuid>/`. Do not bring back `pick_newest_by_mtime`. (learnings #5947, #5952)
 
 ## Subsystem design notes
 

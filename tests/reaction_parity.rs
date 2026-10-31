@@ -824,7 +824,7 @@ fn harness_fixtures_are_production_shaped_and_setup_works() {
 
 use task_mgr::loop_engine::engine::IterationContext;
 use task_mgr::loop_engine::model::{
-    FABLE_MODEL, GROK_MODEL, HAIKU_MODEL, ONE_M_SUFFIX, OPUS_MODEL, SONNET_MODEL,
+    FABLE_MODEL, HAIKU_MODEL, ONE_M_SUFFIX, OPUS_MODEL, SONNET_MODEL,
 };
 use task_mgr::loop_engine::reactions::account::{
     AccountUsageGateParams, UsageGateFn, account_usage_gate_inner,
@@ -1472,7 +1472,8 @@ fn handle_overflow_rung_ladder_matches_pre_relocation() {
 // AC1 (rung 4): FallbackToProvider fires through the coordinator when the
 // Claude ladder is exhausted AND the Grok fallback runner is enabled. The task
 // row is reset to todo and `tasks.model` is rewritten to the cross-provider
-// target so the next iteration picks up the Grok model.
+// target. Builtin Grok `standard` is a null rung, so that target is `""`
+// (omit `--model`).
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -1501,7 +1502,7 @@ fn handle_overflow_rung4_fallback_to_provider_when_enabled() {
         action,
         RecoveryAction::FallbackToProvider {
             provider: "grok".to_string(),
-            model: GROK_MODEL.to_string(),
+            model: String::new(),
         },
         "rung 4: Claude ladder exhausted + fallback enabled ⇒ pivot to the Grok runner",
     );
@@ -1509,8 +1510,8 @@ fn handle_overflow_rung4_fallback_to_provider_when_enabled() {
     assert_eq!(task_status(&conn, "OF-R4").as_deref(), Some("todo"));
     assert_eq!(
         ctx.model_overrides.get("OF-R4").map(String::as_str),
-        Some(GROK_MODEL),
-        "rung 4 must record the cross-provider model override on ctx",
+        Some(""),
+        "rung 4 records the null Grok rung as an empty model override (omit --model)",
     );
     assert_eq!(
         ctx.runner_overrides.get("OF-R4"),

@@ -31,7 +31,7 @@ use tempfile::TempDir;
 use task_mgr::loop_engine::engine::{
     EffectiveRunnerInput, IterationContext, resolve_effective_runner,
 };
-use task_mgr::loop_engine::model::{FABLE_MODEL, GROK_MODEL, ONE_M_SUFFIX, SONNET_MODEL};
+use task_mgr::loop_engine::model::{FABLE_MODEL, ONE_M_SUFFIX, SONNET_MODEL};
 use task_mgr::loop_engine::overflow::RecoveryAction;
 use task_mgr::loop_engine::project_config::{ModelsConfig, ProjectConfig};
 use task_mgr::loop_engine::prompt::PromptResult;
@@ -210,10 +210,12 @@ fn null_model_escalation_then_operator_edit_clears_six_channels_full_path() {
     );
 
     // The ladder wrote tasks.model AND snapshotted the pre-pivot NULL.
+    // Builtin Grok `standard` is a null rung, so the tier-preserving model is
+    // empty: `push_optional_flag` omits `--model` and the CLI picks its default.
     assert_eq!(
         task_model(&conn, task_id).as_deref(),
-        Some(GROK_MODEL),
-        "rung 4 writes the tier-preserving fallback model into tasks.model",
+        Some(""),
+        "rung 4 writes the null Grok rung as an empty tasks.model (omit --model)",
     );
     assert_eq!(
         ctx.overflow_original_task_model.get(task_id),
@@ -299,8 +301,8 @@ fn null_model_escalation_without_operator_edit_never_clears() {
 
 /// SOME-original rung-4 pivot: a task that carried an EXPLICIT model (here the
 /// Claude ceiling `fable[1m]`) and pivots cross-provider to Grok at rung 4. The
-/// pivot writes `tasks.model = grok` (the same value it recorded in
-/// `model_overrides`) and snapshots the pre-pivot `Some(fable[1m])`. The escape
+/// pivot writes `tasks.model = ""` (the builtin null Grok rung, the same value
+/// it recorded in `model_overrides`) and snapshots the pre-pivot `Some(fable[1m])`. The escape
 /// valve must recognize the pivot's own write — NOT treat it as an operator edit
 /// — even though the snapshot's inner value is `Some(...)`, not `None`. Without
 /// the generalized ladder-write absorb this self-trips and wipes the just-
@@ -344,8 +346,8 @@ fn some_original_model_rung4_pivot_does_not_self_trip_escape_valve() {
     );
     assert_eq!(
         task_model(&conn, task_id).as_deref(),
-        Some(GROK_MODEL),
-        "rung 4 writes the tier-preserving fallback model into tasks.model",
+        Some(""),
+        "rung 4 writes the null Grok rung as an empty tasks.model (omit --model)",
     );
     assert_recovery_channels_present(&ctx, task_id);
 

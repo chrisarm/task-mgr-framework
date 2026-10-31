@@ -740,6 +740,32 @@ pub fn run_iteration(
                 completion_killed: false,
             });
         }
+        // FIX-002: a Grok plan-limit sentence on stderr is `RateLimit`, not a
+        // crash. Empty output so the existing account reaction runs and the
+        // stderr sentence is not treated as runner output. Crash counters do
+        // not move (`update_trackers` is not reached; its `RateLimit` arm
+        // would not record a crash either).
+        Err(crate::error::TaskMgrError::RunnerRateLimited { runner }) => {
+            ui::emit(&format!(
+                "{runner} rate limited for task {task_id}; will retry after the limit lifts",
+            ));
+            return Ok(IterationResult {
+                outcome: IterationOutcome::RateLimit,
+                task_id: Some(task_id),
+                files_modified: task_files,
+                should_stop: false,
+                operator_stopped: false,
+                output: String::new(),
+                effective_model,
+                effective_effort: effort.clone(),
+                effective_runner: Some(effective_runner),
+                key_decisions_count: 0,
+                conversation: None,
+                shown_learning_ids: Vec::new(),
+                grace_buffer_tail: String::new(),
+                completion_killed: false,
+            });
+        }
         Err(e) => return Err(e),
     };
 
@@ -1056,5 +1082,114 @@ mod tests {
             !flag.is_signaled(),
             "exit 143 from post-completion grace kill must not set signal flag"
         );
+    }
+
+    /// Sequential path: a mock grok that prints the plan-limit fixture on
+    /// stderr (exit 1) must come back as `RateLimit` for the claimed task on
+    /// the Grok runner, and must not move the crash counter. Exit 1 is the
+    /// stand-in for the unrecorded 2026-07-15 status.
+    #[test]
+    fn grok_plan_limit_sequential_maps_to_rate_limit() {
+        use std::time::{Duration, SystemTime};
+
+        use crate::loop_engine::config::{IterationOutcome, PermissionMode};
+        use crate::loop_engine::engine::{IterationContext, IterationParams, UsageParams};
+        use crate::loop_engine::project_config::ProjectConfig;
+        use crate::loop_engine::runner::RunnerKind;
+        use crate::loop_engine::signals::{SignalFlag, SignalLocations};
+        use crate::loop_engine::test_utils::{
+            EnvGuard, GROK_BINARY_MUTEX, insert_run, insert_task, setup_test_db,
+        };
+
+        let _bin_lock = GROK_BINARY_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (db_dir, mut conn) = setup_test_db();
+        let task_id = "FIX-002-MAP";
+        insert_run(&conn, "run-fix-002");
+        insert_task(&conn, task_id, "surface the plan limit", "todo", 10);
+        let base_prompt = db_dir.path().join("prompt.md");
+        std::fs::write(&base_prompt, "base\n").unwrap();
+        let tasks_dir = db_dir.path().join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        let script = plan_limit_grok_script(tmp.path(), "grok-plan-limit.sh", 1);
+        let _bin = EnvGuard::set("GROK_BINARY", script.to_str().unwrap());
+
+        let mut ctx = IterationContext::new(5);
+        ctx.runner_overrides
+            .insert(task_id.to_string(), RunnerKind::Grok);
+        let crashes_before = ctx.crash_tracker.count();
+        let signal_flag = SignalFlag::new();
+        let usage = UsageParams::disabled();
+        let permission = PermissionMode::Dangerous;
+        let project_config = ProjectConfig::default();
+        let siblings: Vec<std::path::PathBuf> = Vec::new();
+        let signal_locations = SignalLocations {
+            canonical: tasks_dir.clone(),
+            extras: Vec::new(),
+            started_at: SystemTime::now(),
+        };
+        let mut params = IterationParams {
+            conn: &mut conn,
+            db_dir: db_dir.path(),
+            project_root: tmp.path(),
+            tasks_dir: &tasks_dir,
+            signal_locations,
+            iteration: 1,
+            max_iterations: 1,
+            run_id: "run-fix-002",
+            base_prompt_path: &base_prompt,
+            steering_path: None,
+            inter_iteration_delay: Duration::ZERO,
+            signal_flag: &signal_flag,
+            elapsed_secs: 0,
+            verbose: false,
+            usage_params: &usage,
+            prd_path: None,
+            task_prefix: None,
+            default_model: None,
+            permission_mode: &permission,
+            batch_sibling_prds: &siblings,
+            project_config: &project_config,
+        };
+
+        let result = super::run_iteration(&mut ctx, &mut params).expect("run_iteration");
+        assert_eq!(result.outcome, IterationOutcome::RateLimit);
+        assert_eq!(result.task_id.as_deref(), Some(task_id));
+        assert_eq!(result.effective_runner, Some(RunnerKind::Grok));
+        assert!(
+            result.output.is_empty(),
+            "RateLimit output must stay empty, got {}",
+            result.output
+        );
+        assert_eq!(
+            ctx.crash_tracker.count(),
+            crashes_before,
+            "RateLimit must not increment the crash counter"
+        );
+    }
+
+    fn plan_limit_grok_script(
+        dir: &std::path::Path,
+        name: &str,
+        exit_code: i32,
+    ) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let fixture_path = dir.join("plan-limit.fixture");
+        std::fs::write(
+            &fixture_path,
+            include_str!("../../tests/fixtures/grok_stderr_plan_rate_limit.txt"),
+        )
+        .unwrap();
+        let path = dir.join(name);
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\ncat '{}' >&2\nexit {exit_code}\n",
+                fixture_path.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
     }
 }

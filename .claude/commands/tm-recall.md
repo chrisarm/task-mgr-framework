@@ -49,7 +49,7 @@ task-mgr --format json recall --query "..." --limit 5
 
 ### Step 3: Present Results
 
-Show the learnings with their IDs. Remind the user:
+Show the learnings with their IDs. Text output previews content (100 chars) and omits root cause / solution — fetch the full record with `task-mgr show-learning <id> [<id>...]` (never query `.task-mgr/tasks.db` directly). Remind the user:
 
 - **If a learning is helpful**: Run `task-mgr apply-learning <id>` to boost its ranking
 - **If a learning is wrong**: Run `task-mgr invalidate-learning <id>` to degrade it

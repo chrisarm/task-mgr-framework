@@ -654,6 +654,19 @@ RERANKER:
         recent: Option<usize>,
     },
 
+    /// Show the full record for one or more learnings by ID
+    ///
+    /// Prints untruncated content, root cause, solution, tags, applicability,
+    /// and retired/supersession status. Use after `recall` (which previews
+    /// content) or on IDs from the loop prompt's Relevant Learnings block.
+    /// Read-only: does not count as the learning being shown.
+    #[command(name = "show-learning")]
+    ShowLearning {
+        /// Learning ID(s) to show
+        #[arg(required = true, num_args = 1..)]
+        learning_ids: Vec<i64>,
+    },
+
     /// Record that a learning was applied (confirmed useful)
     ///
     /// This provides feedback for the UCB bandit ranking system.
@@ -986,6 +999,14 @@ EXAMPLES:
     # Run without git worktrees (use branch checkout instead)
     task-mgr loop run tasks/my-prd.json --no-worktree
 
+New worktrees go to `<root>/<repo-name>/<branch>`. Set `worktreeRoot` in the
+user config (`$XDG_CONFIG_HOME/task-mgr/config.json`, else
+`~/.config/task-mgr/config.json`) or override it with `TASK_MGR_WORKTREE_ROOT`.
+The value `sibling` keeps the legacy `{repo-parent}/{repo-name}-worktrees/`
+layout. A configured root must already exist and be its own mounted filesystem.
+`task-mgr worktrees list` follows `git worktree list`, so worktrees in the old
+location stay visible until they are removed.
+
 NOTE: a positional named `init` or `run` collides with the subcommand. Pass an
 absolute or `./`-prefixed path (e.g. `task-mgr loop run ./init`) if your PRD
 file is literally called `init` or `run`.
@@ -1277,7 +1298,13 @@ EXAMPLES:
         run_id: Option<String>,
     },
 
-    /// Manage git worktrees (list, prune, remove)
+    /// Manage git worktrees (list, prune, remove).
+    ///
+    /// Paths come from `git worktree list`, so both the legacy sibling
+    /// directory and a configured `worktreeRoot` / `TASK_MGR_WORKTREE_ROOT`
+    /// (`<root>/<repo-name>/<branch>`, or `sibling` for the old layout) are
+    /// listed. The root must be an existing mountpoint; task-mgr does not
+    /// create it.
     Worktrees {
         #[command(subcommand)]
         action: WorktreesAction,

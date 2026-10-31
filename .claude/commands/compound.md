@@ -54,8 +54,8 @@ BRANCH=$(jq -r '.branchName' tasks/<feature>.json)
 PRD_TITLE=$(jq -r '.description // .project' tasks/<feature>.json)
 TODAY=$(date -I)  # YYYY-MM-DD
 
-# Resolve WORKTREE — parent-directory-sibling -worktrees/, with / replaced by -
-# Fallback: git worktree list | grep "$BRANCH" | awk '{print $1}'
+# Resolve WORKTREE from git's registry. Covers the sibling layout and
+# worktreeRoot / TASK_MGR_WORKTREE_ROOT (<root>/<repo-name>/<branch>).
 WORKTREE=$(git worktree list --porcelain | awk -v b="$BRANCH" '
   /^worktree / { wt=$2 }
   $0 == "branch refs/heads/" b { print wt; exit }
@@ -222,11 +222,22 @@ Count the results where confidence ≥ 50%. If **count ≥ 12**, the pattern has
 
 **Graduation steps:**
 
-1. **Draft a new agent** at `~/.claude/agents/<proposed-name>.md.draft`:
+1. **Draft a new agent** as `<proposed-name>.md.draft`:
    - Name based on the pattern's subject (e.g., `adp-timecard-specialist.md.draft`, `workflow-condition-expert.md.draft`).
    - Frontmatter with `name`, `description`, `tools`, `model`.
    - System prompt that encodes the accumulated expertise — distill the ≥12 source learnings into a coherent persona and ruleset.
    - Include in the prompt body: `This agent was graduated from <N> accumulated learnings on <date>. See task-mgr learnings tagged superseded-by:<pointer-id>.`
+   - **Pick the scope before writing.** A global agent is offered in every repo, so an agent whose law only holds in this repo misroutes everywhere else.
+     - **Repo-scoped** (the default for graduations) if the body cites at least one repo-relative path that exists (`lib/…`, `src/…`, `test/…`, `scripts/…`, `docs/…`, a migrations dir), or names this repo, its modules, or its domain types. Write to the **main checkout**, not the worktree: the worktree is deleted after merge, and the draft needs human approval before it is committed.
+       ```bash
+       MAIN_REPO=$(dirname "$(git -C $WORKTREE rev-parse --path-format=absolute --git-common-dir)")
+       DRAFT="$MAIN_REPO/.claude/agents/<name>.md.draft"
+       mkdir -p "$MAIN_REPO/.claude/agents"
+       ```
+       Name the repo in the `description` (e.g. "…in restaurant_agent_ex") so the router does not offer it on unrelated work.
+     - **Global** only if the body is repo-agnostic: tool/language/workflow craft with no repo paths, module names or domain types. `DRAFT="$HOME/.claude/agents/<name>.md.draft"`.
+     - Before writing either one, check that `<name>.md` does not already exist in `$MAIN_REPO/.claude/agents/` or `~/.claude/agents/`. If it does, extend that agent instead of adding a second one.
+   - Verify every repo path the draft cites: `for p in $(grep -oE '(lib|src|test|tests|scripts|docs|config|priv|migrations)/[A-Za-z0-9_./-]+' "$DRAFT" | sed 's/[.,:;)]*$//' | sort -u); do [ -e "$MAIN_REPO/$p" ] || echo "MISSING $p"; done`. Fix or delete every cite that comes back `MISSING`.
 
 2. **Record a pointer learning** that supersedes the cluster:
    ```bash
@@ -256,8 +267,8 @@ Count the results where confidence ≥ 50%. If **count ≥ 12**, the pattern has
 4. **Flag in the compound report:**
    ```
    AGENT GRADUATION READY
-   - Draft: ~/.claude/agents/<name>.md.draft
-   - Review, edit if needed, rename to .md to activate.
+   - Draft: $DRAFT  (scope: repo | global — one-line reason)
+   - Review, edit if needed, rename to .md to activate. Repo-scoped: then `git -C $MAIN_REPO add .claude/agents/<name>.md` and commit.
    - Superseded learnings: <list of IDs>
    - Pointer learning: <pointer-id>
    ```
@@ -273,7 +284,7 @@ For every artifact written, confirm it's retrievable by the system that'll consu
 | `tm-decisions`     | `task-mgr decisions list` (scan for the relevant decision; `--tag` filter is not yet supported) |
 | Copy voice         | `grep -n '<pattern name>' $WORKTREE/docs/architecture/copy-voice.md`                 |
 | Changelog          | `grep -n '<PRD title>' $WORKTREE/docs/change_logs/CHANGELOG_$TODAY.md`               |
-| Agent draft        | `ls ~/.claude/agents/<name>.md.draft`                                                |
+| Agent draft        | `ls "$DRAFT"` (repo-scoped: under `$MAIN_REPO/.claude/agents/`, not `$WORKTREE`)     |
 
 Any verify that fails goes into the compound report as a warning — do not silently continue.
 
@@ -301,7 +312,7 @@ Follow-ups for humans: <list — e.g. "propagate copy-voice entries to configs/b
 
 ## Step 5: Commit and present
 
-Commit the captured artifacts **inside the worktree** (NOT the agent drafts — those are global and require human approval; and NOT the progress log — that's gitignored):
+Commit the captured artifacts **inside the worktree** (NOT the agent drafts — repo-scoped or global, they require human approval and are committed by the human after the rename; and NOT the progress log — that's gitignored):
 
 ```bash
 git -C $WORKTREE add CLAUDE.md docs/architecture/copy-voice.md docs/change_logs/

@@ -81,32 +81,250 @@ fn lexical_normalize(p: &Path) -> PathBuf {
     stack.iter().collect()
 }
 
-/// Return `{repo-parent}/{repo-name}-worktrees/{sanitized-branch-name}/`.
-pub(crate) fn compute_worktree_path(project_root: &Path, branch_name: &str) -> PathBuf {
-    let repo_name = project_root
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "repo".to_string());
+/// Where new worktrees are created.
+///
+/// `Sibling` is the historical `{repo-parent}/{repo-name}-worktrees/` layout
+/// and the factory default. `Rooted` is `<root>/<repo-name>/<sanitized-branch>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WorktreePlacement {
+    Sibling,
+    Rooted(PathBuf),
+}
 
+/// Resolve placement from an env value and a user-config value.
+///
+/// Precedence is env, then config, then [`WorktreePlacement::Sibling`]. The
+/// whole string `sibling` (any ASCII case) forces the sibling layout. Any
+/// other value must be an absolute path. Empty and relative values are
+/// errors. `~` is not expanded.
+pub(crate) fn resolve_worktree_placement(
+    env_value: Option<&str>,
+    config_value: Option<&str>,
+) -> Result<WorktreePlacement, String> {
+    let (source, raw) = if let Some(value) = env_value {
+        ("TASK_MGR_WORKTREE_ROOT", value)
+    } else if let Some(value) = config_value {
+        ("worktreeRoot", value)
+    } else {
+        return Ok(WorktreePlacement::Sibling);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(format!(
+            "{source} is empty; set an absolute path or \"sibling\""
+        ));
+    }
+    if trimmed.eq_ignore_ascii_case("sibling") {
+        return Ok(WorktreePlacement::Sibling);
+    }
+    let path = PathBuf::from(trimmed);
+    if !path.is_absolute() {
+        return Err(format!(
+            "{source} must be an absolute path or \"sibling\" (no ~ expansion), got {trimmed:?}"
+        ));
+    }
+    Ok(WorktreePlacement::Rooted(path))
+}
+
+fn directory_basename(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "repo".to_string())
+}
+
+/// Basename of the main checkout. A path computed from inside a linked
+/// worktree must match one computed from the main repo, so rooted layout
+/// does not use the worktree directory's own name.
+fn rooted_repo_basename(project_root: &Path) -> String {
+    crate::git::main_repo_root_at(project_root)
+        .map(|root| directory_basename(&root))
+        .unwrap_or_else(|| directory_basename(project_root))
+}
+
+/// Return `{repo-parent}/{repo-name}-worktrees/{sanitized-branch-name}/`.
+///
+/// Uses `project_root`'s own directory name, including when that path is
+/// already a linked worktree. Rooted layout goes through
+/// [`compute_worktree_path_with`] instead.
+pub(crate) fn compute_worktree_path(project_root: &Path, branch_name: &str) -> PathBuf {
+    let repo_name = directory_basename(project_root);
     let parent = project_root.parent().unwrap_or(project_root);
-    let worktrees_dir = parent.join(format!("{}-worktrees", repo_name));
-    let sanitized = sanitize_branch_name(branch_name);
-    let result = worktrees_dir.join(sanitized);
+    let worktrees_dir = parent.join(format!("{repo_name}-worktrees"));
+    let result = worktrees_dir.join(sanitize_branch_name(branch_name));
 
     // Defense-in-depth: the result must resolve under the worktrees parent even
     // after lexical `.`/`..` collapse. `sanitize_branch_name` already neutralizes
     // traversal segments; this `assert!` (release-build drift sentinel, NOT
     // `debug_assert!`) guarantees a future looser sanitizer can't silently let a
-    // worktree escape and clobber a sibling directory. `compute_slot_worktree_path`
-    // routes every slot through here, so it inherits the same guarantee.
+    // worktree escape and clobber a sibling directory.
     assert!(
-        lexical_normalize(&result).starts_with(&worktrees_dir),
+        lexical_normalize(&result).starts_with(lexical_normalize(&worktrees_dir)),
         "branch-derived worktree path escaped the worktrees parent: {} (branch {:?})",
         result.display(),
         branch_name,
     );
 
     result
+}
+
+/// Return the worktree directory for `branch_name` under `placement`.
+///
+/// Sibling layout delegates to [`compute_worktree_path`]. Rooted layout is
+/// `<root>/<main-repo-basename>/<sanitized-branch>`.
+pub(crate) fn compute_worktree_path_with(
+    project_root: &Path,
+    branch_name: &str,
+    placement: &WorktreePlacement,
+) -> PathBuf {
+    let WorktreePlacement::Rooted(root) = placement else {
+        return compute_worktree_path(project_root, branch_name);
+    };
+    let worktrees_dir = root.join(rooted_repo_basename(project_root));
+    let result = worktrees_dir.join(sanitize_branch_name(branch_name));
+    assert!(
+        lexical_normalize(&result).starts_with(lexical_normalize(&worktrees_dir)),
+        "branch-derived worktree path escaped the worktrees parent: {} (branch {:?})",
+        result.display(),
+        branch_name,
+    );
+    result
+}
+
+/// Placement for this process.
+///
+/// Under `cfg(test)` the library never reads `TASK_MGR_WORKTREE_ROOT` or the
+/// operator's user config (parallel tests share the process, and a later
+/// machine config must not move sibling-path fixtures). Tests opt in with
+/// [`PlacementOverride`]. Production reads the env var, then user-config
+/// `worktreeRoot`, then the sibling default.
+fn current_placement() -> TaskMgrResult<WorktreePlacement> {
+    #[cfg(test)]
+    {
+        Ok(PLACEMENT_OVERRIDE
+            .with(|slot| slot.borrow().clone().unwrap_or(WorktreePlacement::Sibling)))
+    }
+    #[cfg(not(test))]
+    {
+        placement_from_process_env()
+    }
+}
+
+#[cfg(not(test))]
+fn placement_from_process_env() -> TaskMgrResult<WorktreePlacement> {
+    let env_var = std::env::var("TASK_MGR_WORKTREE_ROOT").ok();
+    let config = crate::loop_engine::user_config::read_user_config().worktree_root;
+    let source_value = env_var.clone().or(config.clone());
+    resolve_worktree_placement(env_var.as_deref(), config.as_deref()).map_err(|message| {
+        TaskMgrError::invalid_state(
+            "worktree root",
+            source_value.unwrap_or_default(),
+            "an absolute path or \"sibling\"",
+            message,
+        )
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static PLACEMENT_OVERRIDE: std::cell::RefCell<Option<WorktreePlacement>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Restores the previous test placement when dropped.
+#[cfg(test)]
+pub(crate) struct PlacementOverride {
+    previous: Option<WorktreePlacement>,
+}
+
+#[cfg(test)]
+impl PlacementOverride {
+    pub(crate) fn set(placement: WorktreePlacement) -> Self {
+        let previous = PLACEMENT_OVERRIDE.with(|slot| slot.replace(Some(placement)));
+        Self { previous }
+    }
+}
+
+#[cfg(test)]
+impl Drop for PlacementOverride {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        PLACEMENT_OVERRIDE.with(|slot| *slot.borrow_mut() = previous);
+    }
+}
+
+fn worktree_root_error(path: &Path, expected: impl Into<String>, actual: String) -> TaskMgrError {
+    TaskMgrError::invalid_state(
+        "worktree root",
+        path.display().to_string(),
+        expected,
+        actual,
+    )
+}
+
+/// Refuse to create worktrees when `root` is missing or sits on the same
+/// filesystem as its parent. A plain `create_dir_all` on an unmounted dataset
+/// would silently land on the parent filesystem.
+fn assert_own_mount(root: &Path) -> TaskMgrResult<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let meta = match std::fs::metadata(root) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(worktree_root_error(
+                root,
+                "an existing directory that is its own mounted filesystem",
+                format!(
+                    "{} does not exist; refusing to create it (an unmounted dataset would land on the parent filesystem)",
+                    root.display()
+                ),
+            ));
+        }
+        Err(e) => {
+            return Err(worktree_root_error(
+                root,
+                "an existing directory that is its own mounted filesystem",
+                format!("cannot stat {}: {e}", root.display()),
+            ));
+        }
+    };
+    if !meta.is_dir() {
+        return Err(worktree_root_error(
+            root,
+            "an existing directory that is its own mounted filesystem",
+            format!("{} is not a directory", root.display()),
+        ));
+    }
+    let Some(parent) = root.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return Err(worktree_root_error(
+            root,
+            "a directory whose parent is on a different device",
+            format!("{} has no parent filesystem to compare", root.display()),
+        ));
+    };
+    let parent_meta = std::fs::metadata(parent).map_err(|e| {
+        worktree_root_error(
+            root,
+            "a parent directory that can be stat'd",
+            format!("cannot stat parent {}: {e}", parent.display()),
+        )
+    })?;
+    if meta.dev() == parent_meta.dev() {
+        return Err(worktree_root_error(
+            root,
+            format!(
+                "a mountpoint whose device differs from {}",
+                parent.display()
+            ),
+            format!(
+                "{} is on the same filesystem as {} (device {}); refusing to create worktrees here",
+                root.display(),
+                parent.display(),
+                meta.dev()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn is_inside_worktree(dir: &Path) -> TaskMgrResult<bool> {
@@ -171,8 +389,13 @@ pub(crate) fn list_other_roots(exclude_root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Create a worktree at `{repo-parent}/{repo-name}-worktrees/{sanitized-branch}/`
-/// if one doesn't already exist for this branch.
+/// Create a worktree for `branch_name` if one doesn't already exist.
+///
+/// New directories follow [`current_placement`]: the sibling
+/// `{repo-parent}/{repo-name}-worktrees/` layout, or
+/// `<worktreeRoot>/<repo-name>/`. An existing worktree for the branch (from
+/// `git worktree list`) is reused wherever it lives, including the legacy
+/// sibling directory, and does not require the configured root to be mounted.
 ///
 /// # Arguments
 ///
@@ -219,7 +442,8 @@ pub fn ensure_worktree(
         }
     }
 
-    let worktree_path = compute_worktree_path(project_root, branch_name);
+    let placement = current_placement()?;
+    let worktree_path = compute_worktree_path_with(project_root, branch_name, &placement);
 
     // Check if worktree already exists via git worktree list
     let list_output = Command::new("git")
@@ -280,7 +504,35 @@ pub fn ensure_worktree(
         }
     }
 
-    // Need to create the worktree
+    // Need to create the worktree. Mount and basename checks run only on this
+    // path so an already-registered worktree (old sibling location included)
+    // stays usable when the configured root is absent.
+    if let WorktreePlacement::Rooted(root) = &placement {
+        assert_own_mount(root)?;
+        let repo_dir = worktree_path.parent().ok_or_else(|| {
+            worktree_root_error(
+                root,
+                "a per-repo directory under the worktree root",
+                "computed worktree path has no parent".to_string(),
+            )
+        })?;
+        if repo_dir == root.as_path() {
+            return Err(worktree_root_error(
+                root,
+                "a per-repo subdirectory of the worktree root",
+                "refusing to use the worktree root itself as a repo directory".to_string(),
+            ));
+        }
+        assert_per_repo_dir_same_repository(repo_dir, project_root)?;
+        if !root.is_dir() {
+            return Err(worktree_root_error(
+                root,
+                "an existing worktree root directory",
+                format!("{} disappeared before create", root.display()),
+            ));
+        }
+    }
+
     if !yes_mode {
         ui::emit(&format!(
             "Creating git worktree for branch '{}' at {}",
@@ -303,8 +555,10 @@ pub fn ensure_worktree(
         ));
     }
 
-    // Create parent directory for worktrees; track if we created it so we can
-    // remove it on failure (avoids leaving orphan directories behind).
+    // Create only the immediate parent (`<repo>-worktrees` or `<root>/<repo>`).
+    // Never `create_dir_all` the configured root: that would recreate it on
+    // the parent filesystem when the dataset is unmounted. The root was
+    // required to exist above.
     let worktrees_parent = worktree_path.parent().unwrap_or(&worktree_path);
     let parent_created = if !worktrees_parent.exists() {
         std::fs::create_dir_all(worktrees_parent).map_err(|e| {
@@ -468,7 +722,8 @@ pub fn remove_worktree(project_root: &Path, worktree_path: &Path) -> TaskMgrResu
         .current_dir(project_root)
         .output();
 
-    // Remove empty parent dir (the {repo}-worktrees/ container)
+    // Remove the empty immediate parent only (`<repo>-worktrees` or
+    // `<root>/<repo>`). Do not walk up to a configured worktree root.
     if let Some(parent) = worktree_path.parent() {
         cleanup_empty_dir(parent);
     }
@@ -522,6 +777,92 @@ fn git_common_dir(repo_path: &Path) -> Result<PathBuf, String> {
     } else {
         repo_path.join(candidate)
     })
+}
+
+fn canonical_git_common_dir(repo_path: &Path) -> TaskMgrResult<PathBuf> {
+    let raw = git_common_dir(repo_path).map_err(|e| {
+        worktree_root_error(repo_path, "git rev-parse --git-common-dir to succeed", e)
+    })?;
+    std::fs::canonicalize(&raw).map_err(|e| {
+        worktree_root_error(
+            repo_path,
+            "a canonical git common dir",
+            format!("cannot canonicalize {}: {e}", raw.display()),
+        )
+    })
+}
+
+/// Refuse to share `<root>/<repo-name>` between two different repositories.
+///
+/// An empty directory, or children that are not worktrees, is fine. A `.git`
+/// whose common dir cannot be read is an error, not a skip.
+fn assert_per_repo_dir_same_repository(repo_dir: &Path, project_root: &Path) -> TaskMgrResult<()> {
+    if !repo_dir.exists() {
+        return Ok(());
+    }
+    let ours = canonical_git_common_dir(project_root)?;
+    let mut candidates = Vec::new();
+    if repo_dir.join(".git").exists() {
+        candidates.push(repo_dir.to_path_buf());
+    }
+    let entries = std::fs::read_dir(repo_dir).map_err(|e| {
+        worktree_root_error(
+            repo_dir,
+            "a readable per-repo worktree directory",
+            format!("cannot read {}: {e}", repo_dir.display()),
+        )
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|e| {
+            worktree_root_error(
+                repo_dir,
+                "readable directory entries",
+                format!("cannot read an entry under {}: {e}", repo_dir.display()),
+            )
+        })?;
+        let path = entry.path();
+        if path.join(".git").exists() {
+            candidates.push(path);
+        }
+    }
+    let basename = directory_basename(repo_dir);
+    for path in candidates {
+        let theirs = canonical_git_common_dir(&path)?;
+        if theirs != ours {
+            return Err(worktree_root_error(
+                repo_dir,
+                format!("worktrees for this repository ({})", ours.display()),
+                format!(
+                    "basename collision on '{basename}': {} belongs to git common dir {}, which is not this repository's common dir {}",
+                    path.display(),
+                    theirs.display(),
+                    ours.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Path registered for `branch_name` in `git worktree list`, if any.
+///
+/// `None` when git cannot be asked or the branch has no worktree. Callers
+/// that remove or classify a slot use this first so a worktree created under
+/// an older placement is still found.
+fn registered_worktree_path(project_root: &Path, branch_name: &str) -> Option<PathBuf> {
+    let output = Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(project_root)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let list_str = String::from_utf8_lossy(&output.stdout);
+    parse_worktree_list(&list_str)
+        .into_iter()
+        .find(|(_, branch)| branch.as_deref() == Some(branch_name))
+        .map(|(path, _)| path)
 }
 
 /// Compute the new contents of `info/attributes` after ensuring the task-mgr
@@ -590,6 +931,61 @@ pub(crate) fn compute_slot_worktree_path(
     } else {
         compute_worktree_path(project_root, &ephemeral_slot_branch(branch_name, slot))
     }
+}
+
+pub(crate) fn compute_slot_worktree_path_with(
+    project_root: &Path,
+    branch_name: &str,
+    slot: usize,
+    placement: &WorktreePlacement,
+) -> PathBuf {
+    if matches!(placement, WorktreePlacement::Sibling) {
+        return compute_slot_worktree_path(project_root, branch_name, slot);
+    }
+    if slot == 0 {
+        compute_worktree_path_with(project_root, branch_name, placement)
+    } else {
+        compute_worktree_path_with(
+            project_root,
+            &ephemeral_slot_branch(branch_name, slot),
+            placement,
+        )
+    }
+}
+
+fn resolved_slot_worktree_path(
+    project_root: &Path,
+    branch_name: &str,
+    slot: usize,
+) -> TaskMgrResult<PathBuf> {
+    let placement = current_placement()?;
+    Ok(compute_slot_worktree_path_with(
+        project_root,
+        branch_name,
+        slot,
+        &placement,
+    ))
+}
+
+/// On-disk path for a slot worktree.
+///
+/// A path already registered for the slot branch wins, so cleanup and
+/// classification still see worktrees created under the sibling layout after
+/// placement changes. Otherwise the path is the one [`current_placement`]
+/// would create. Slot 0's merge path is threaded by the caller and is not
+/// recomputed here.
+fn slot_disk_path(project_root: &Path, branch_name: &str, slot: usize) -> TaskMgrResult<PathBuf> {
+    let branch = if slot == 0 {
+        branch_name.to_string()
+    } else {
+        ephemeral_slot_branch(branch_name, slot)
+    };
+    if let Some(path) = registered_worktree_path(project_root, &branch)
+        && path.exists()
+    {
+        return Ok(path);
+    }
+    resolved_slot_worktree_path(project_root, branch_name, slot)
 }
 
 /// Create per-slot worktrees for parallel execution.
@@ -931,7 +1327,8 @@ fn attempt_auto_recovery_for_branch(
         // happens first because `git branch -D` refuses to delete a branch
         // that's checked out in any worktree.
         (Ok(()), CleanupOutcome::Restored) | (Ok(()), CleanupOutcome::PopConflict { .. }) => {
-            let worktree_path = compute_slot_worktree_path(project_root, branch_name, slot);
+            let worktree_path =
+                slot_disk_path(project_root, branch_name, slot).map_err(|e| e.to_string())?;
             // FEAT-006: fold the recovered slot's untracked progress file into
             // slot 0's record before the worktree/branch are removed. If the
             // worktree was already gone, `union_slot_progress_files` no-ops.
@@ -1110,7 +1507,8 @@ fn classify_ephemeral_branch(
         return Err("slot index must be >= 1; slot-0 is not a valid ephemeral".to_string());
     }
 
-    let worktree_path = compute_slot_worktree_path(project_root, base_branch, slot);
+    let worktree_path =
+        slot_disk_path(project_root, base_branch, slot).map_err(|e| e.to_string())?;
 
     if !worktree_path.exists() {
         return Ok(EphemeralCase::OrphanBranch);
@@ -2545,7 +2943,7 @@ pub(crate) fn cleanup_slot_worktrees(
     let mut removed_slots = Vec::new();
 
     for slot in 1..num_slots {
-        let slot_path = compute_slot_worktree_path(project_root, branch_name, slot);
+        let slot_path = slot_disk_path(project_root, branch_name, slot)?;
         if !slot_path.exists() {
             // Worktree was never created or was already cleaned up — its
             // ephemeral branch (if any) is still eligible for deletion.
@@ -6887,6 +7285,284 @@ detached
         assert!(
             outcomes.pre_merge_head.is_none(),
             "validation-failure early-return path must yield pre_merge_head=None"
+        );
+    }
+
+    fn init_git_repo(path: &Path) {
+        fs::create_dir_all(path).unwrap();
+        let run = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(path)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["init", "-b", "main"]);
+        run(&["config", "user.email", "test@test.com"]);
+        run(&["config", "user.name", "Test"]);
+        fs::write(path.join("README.md"), "# Test").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-m", "init"]);
+    }
+
+    /// A directory that is its own mount, or `None` when this host has no
+    /// writable one (`/tmp` on macOS is often the same APFS volume as `/`).
+    fn distinct_mount() -> Option<PathBuf> {
+        use std::os::unix::fs::MetadataExt;
+        for candidate in ["/dev/shm", "/tmp"] {
+            let path = Path::new(candidate);
+            let (Ok(meta), Some(parent)) = (fs::metadata(path), path.parent()) else {
+                continue;
+            };
+            let Ok(parent_meta) = fs::metadata(parent) else {
+                continue;
+            };
+            if meta.is_dir() && meta.dev() != parent_meta.dev() {
+                return Some(path.to_path_buf());
+            }
+        }
+        None
+    }
+
+    struct RemoveOnDrop(PathBuf);
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn worktree_root_resolve_precedence() {
+        assert_eq!(
+            resolve_worktree_placement(None, None).unwrap(),
+            WorktreePlacement::Sibling
+        );
+        assert_eq!(
+            resolve_worktree_placement(None, Some("sibling")).unwrap(),
+            WorktreePlacement::Sibling
+        );
+        assert_eq!(
+            resolve_worktree_placement(Some("SIBLING"), Some("/var/wt")).unwrap(),
+            WorktreePlacement::Sibling
+        );
+        assert_eq!(
+            resolve_worktree_placement(None, Some("/var/wt")).unwrap(),
+            WorktreePlacement::Rooted(PathBuf::from("/var/wt"))
+        );
+        assert_eq!(
+            resolve_worktree_placement(Some("/env/wt"), Some("/cfg/wt")).unwrap(),
+            WorktreePlacement::Rooted(PathBuf::from("/env/wt"))
+        );
+        let relative = resolve_worktree_placement(Some("relative/path"), None).unwrap_err();
+        assert!(relative.contains("TASK_MGR_WORKTREE_ROOT"), "{relative}");
+        assert!(relative.contains("absolute"), "{relative}");
+        let empty = resolve_worktree_placement(None, Some("  ")).unwrap_err();
+        assert!(empty.contains("worktreeRoot"), "{empty}");
+    }
+
+    #[test]
+    fn worktree_root_compute_sibling_and_rooted() {
+        let project = Path::new("/home/user/myproject");
+        assert_eq!(
+            compute_worktree_path_with(project, "feature/auth", &WorktreePlacement::Sibling),
+            PathBuf::from("/home/user/myproject-worktrees/feature-auth")
+        );
+        assert_eq!(
+            compute_worktree_path(project, "feature/auth"),
+            PathBuf::from("/home/user/myproject-worktrees/feature-auth")
+        );
+        let rooted = WorktreePlacement::Rooted(PathBuf::from("/var/worktrees"));
+        assert_eq!(
+            compute_worktree_path_with(project, "feature/auth", &rooted),
+            PathBuf::from("/var/worktrees/myproject/feature-auth")
+        );
+        assert_eq!(
+            compute_worktree_path_with(project, "..", &rooted),
+            PathBuf::from("/var/worktrees/myproject/--")
+        );
+        assert_eq!(
+            compute_slot_worktree_path_with(project, "feature/auth", 1, &rooted),
+            PathBuf::from("/var/worktrees/myproject/feature-auth-slot-1")
+        );
+    }
+
+    #[test]
+    fn worktree_root_basename_uses_main_repo_from_a_linked_worktree() {
+        let tmp = setup_git_repo_with_file();
+        let branch = "feature/from-main";
+        let linked = ensure_worktree(tmp.path(), branch, true, None).unwrap();
+        let rooted = WorktreePlacement::Rooted(PathBuf::from("/var/worktrees"));
+        assert_eq!(
+            compute_worktree_path_with(tmp.path(), branch, &rooted),
+            compute_worktree_path_with(&linked, branch, &rooted),
+        );
+        let expected = PathBuf::from("/var/worktrees")
+            .join(tmp.path().file_name().unwrap())
+            .join("feature-from-main");
+        assert_eq!(
+            compute_worktree_path_with(&linked, branch, &rooted),
+            expected
+        );
+    }
+
+    #[test]
+    fn worktree_root_missing_root_is_not_created() {
+        let tmp = setup_git_repo_with_file();
+        let missing = std::env::temp_dir().join(format!(
+            "task-mgr-no-such-worktree-root-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        assert!(!missing.exists());
+        let _guard = PlacementOverride::set(WorktreePlacement::Rooted(missing.clone()));
+        let err = ensure_worktree(tmp.path(), "feature/missing-root", true, None).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains(&missing.display().to_string()), "{text}");
+        assert!(text.contains("does not exist"), "{text}");
+        assert!(!missing.exists(), "missing root must not be created");
+    }
+
+    #[test]
+    fn worktree_root_same_device_is_refused() {
+        let tmp = setup_git_repo_with_file();
+        let root = tmp.path().join("not-a-mount");
+        fs::create_dir(&root).unwrap();
+        let _guard = PlacementOverride::set(WorktreePlacement::Rooted(root.clone()));
+        let err = ensure_worktree(tmp.path(), "feature/same-device", true, None).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains(&root.display().to_string()), "{text}");
+        assert!(text.contains("same filesystem"), "{text}");
+        let repo_dir = root.join(tmp.path().file_name().unwrap());
+        assert!(
+            !repo_dir.exists(),
+            "same-device refusal must not create {}",
+            repo_dir.display()
+        );
+    }
+
+    #[test]
+    fn worktree_root_reuse_skips_mount_check() {
+        let tmp = setup_git_repo_with_file();
+        let existing = ensure_worktree(tmp.path(), "feature/already", true, None).unwrap();
+        let missing = PathBuf::from("/no/such/task-mgr-worktree-root");
+        let _guard = PlacementOverride::set(WorktreePlacement::Rooted(missing));
+        let again = ensure_worktree(tmp.path(), "feature/already", true, None).unwrap();
+        assert_eq!(again, existing);
+    }
+
+    #[test]
+    fn worktree_root_creates_on_distinct_mount() {
+        let Some(mount) = distinct_mount() else {
+            eprintln!("skip: no distinct writable mount");
+            return;
+        };
+        let tmp = setup_git_repo_with_file();
+        let repo_dir = mount.join(tmp.path().file_name().unwrap());
+        let _cleanup = RemoveOnDrop(repo_dir.clone());
+        let _guard = PlacementOverride::set(WorktreePlacement::Rooted(mount.clone()));
+        let branch = "feature/on-mount";
+        let created = ensure_worktree(tmp.path(), branch, true, None).expect("create on mount");
+        assert_eq!(
+            created,
+            repo_dir.join("feature-on-mount"),
+            "created {}",
+            created.display()
+        );
+        let status = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&created)
+            .output()
+            .unwrap();
+        assert!(
+            status.status.success(),
+            "{}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+        assert!(remove_worktree(tmp.path(), &created).unwrap());
+        assert!(!created.exists());
+        assert!(
+            !repo_dir.exists(),
+            "empty per-repo dir should be removed, mount {} must remain",
+            mount.display()
+        );
+        assert!(mount.exists());
+    }
+
+    #[test]
+    fn worktree_root_collision_and_same_repo_reuse() {
+        let Some(mount) = distinct_mount() else {
+            eprintln!("skip: no distinct writable mount");
+            return;
+        };
+        let scratch = tempfile::tempdir().unwrap();
+        let name = scratch.path().file_name().unwrap().to_owned();
+        let repo_a = scratch.path().join("left").join(&name);
+        let repo_b = scratch.path().join("right").join(&name);
+        init_git_repo(&repo_a);
+        init_git_repo(&repo_b);
+        let repo_dir = mount.join(&name);
+        let _cleanup = RemoveOnDrop(repo_dir);
+        let _guard = PlacementOverride::set(WorktreePlacement::Rooted(mount));
+
+        let first = ensure_worktree(&repo_a, "feature/one", true, None).expect("first repo");
+        let second_branch =
+            ensure_worktree(&repo_a, "feature/two", true, None).expect("same repo, second branch");
+        assert!(second_branch.starts_with(first.parent().unwrap()));
+
+        let err = ensure_worktree(&repo_b, "feature/other", true, None).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("basename collision"), "{text}");
+        assert!(text.contains(&name.to_string_lossy().to_string()), "{text}");
+        assert!(text.contains("common dir"), "{text}");
+
+        fs::create_dir_all(first.parent().unwrap().join("bogus")).unwrap();
+        fs::write(
+            first.parent().unwrap().join("bogus/.git"),
+            "gitdir: /nowhere\n",
+        )
+        .unwrap();
+        let broken = ensure_worktree(&repo_a, "feature/three", true, None).unwrap_err();
+        let broken_text = broken.to_string();
+        assert!(
+            broken_text.contains("git rev-parse") || broken_text.contains("common dir"),
+            "{broken_text}"
+        );
+    }
+
+    #[test]
+    fn worktree_root_cleanup_finds_registered_path_not_the_new_layout() {
+        let tmp = setup_git_repo_with_file();
+        let branch = "feature/slots";
+        let old_slot = tmp.path().join("legacy-slot-location");
+        fs::create_dir_all(old_slot.parent().unwrap()).unwrap();
+        let ephemeral = ephemeral_slot_branch(branch, 1);
+        let add = Command::new("git")
+            .args(["worktree", "add", "-b", &ephemeral])
+            .arg(&old_slot)
+            .arg("HEAD")
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert!(
+            add.status.success(),
+            "{}",
+            String::from_utf8_lossy(&add.stderr)
+        );
+
+        let mount = distinct_mount().unwrap_or_else(|| PathBuf::from("/no/such/worktree-root"));
+        let _guard = PlacementOverride::set(WorktreePlacement::Rooted(mount));
+        cleanup_slot_worktrees(tmp.path(), branch, 2).expect("cleanup uses registered path");
+        assert!(
+            !old_slot.exists(),
+            "registered legacy slot worktree should be removed"
         );
     }
 }

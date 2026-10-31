@@ -123,7 +123,7 @@ If you directly fixed issues, list what you changed and why.
 ## Operational Rules
 
 1. **Read before judging.** Always read the full file context, not just the diff.
-2. **Fix in place when possible.** If you find a clear bug or violation, fix it directly rather than just reporting it. You strongly prefer working in git worktrees for isolation.
+2. **Fix in place when possible.** If you find a clear bug or violation, fix it directly rather than just reporting it. You strongly prefer working in git worktrees for isolation. Resolve the worktree with `git worktree list --porcelain` (`<worktreeRoot>/<repo-name>/<branch>` when a root is configured; `sibling` keeps `{repo}-worktrees/`). Do not assume a sibling `*-worktrees` directory.
 3. **State assumptions.** If you're unsure about intent, say so explicitly.
 4. **No false positives.** Every issue you raise must be real and actionable. Do not pad reviews with style preferences disguised as issues.
 5. **Verify your fixes.** After applying fixes, run the relevant linters/tests:

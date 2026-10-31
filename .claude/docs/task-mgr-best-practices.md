@@ -109,7 +109,7 @@ For multiple PRDs: `task-mgr batch init 'tasks/*.json' --append --update-existin
 
 Preserves status on existing rows; refreshes descriptions, criteria, notes, relationships; adds new tasks. Safe on in-progress loops.
 
-**Worktree rule:** operate in the **loop worktree**, not the main repo. Find it with `task-mgr worktrees list`, `cd` there.
+**Worktree rule:** operate in the **loop worktree**, not the main repo. Find it with `task-mgr worktrees list` (`git worktree list` is the source of truth), then `cd` there. New worktrees go to `<worktreeRoot>/<repo-name>/<branch>/`. Set `worktreeRoot` in `$XDG_CONFIG_HOME/task-mgr/config.json` (else `~/.config/task-mgr/config.json`) or override it with `TASK_MGR_WORKTREE_ROOT` (env wins). `sibling` keeps `{repo-parent}/{repo-name}-worktrees/`. The root must already be its own mount; task-mgr will not create it and will not fall back if it is missing. Older sibling worktrees stay listed until they age out. task-mgr does not create `.env`, `_build`, or `deps` links — those must be absolute paths (a relative link into the sibling checkout breaks from the new location).
 
 ---
 

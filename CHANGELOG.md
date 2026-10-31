@@ -27,6 +27,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `task-mgr archive` names the task prefix on skip lines.
 - The dev-container Ollama health check uses `ollama list`.
 
+## [1.0.0] - 2026-10-29
+
+### Added
+- New git worktrees go to `<worktreeRoot>/<repo-name>/<sanitized-branch>/` when `worktreeRoot` is set in the user config (`$XDG_CONFIG_HOME/task-mgr/config.json`, otherwise `~/.config/task-mgr/config.json`) or `TASK_MGR_WORKTREE_ROOT` is an absolute path. The value `sibling` keeps `{repo-parent}/{repo-name}-worktrees/`. The root must already exist and be its own mounted filesystem; task-mgr does not create it and does not fall back when that check fails. `task-mgr worktrees` follows `git worktree list`, so worktrees already in the sibling directory stay listed. Two repositories that share a basename cannot share one `<root>/<repo-name>/` directory.
+
+## [0.3.5] - 2026-10-28
+
+### Added
+- `task-mgr show-learning <id> [<id>...]` prints the full record for one or more learnings: untruncated content, root cause, solution, tags, applicability, stats, and retired/superseded status (`--format json` for every field). It is read-only and does not count as the learning being shown. When some IDs exist, the missing ones are listed and it exits 0; when none exist, it fails with `Learning not found`. `recall` text output now ends with a `Full details: task-mgr show-learning <ids>` line, and the loop prompt's Relevant Learnings block, `task-mgr how recall`, and the `tm-recall` skill point agents to it instead of the SQLite database.
+
 ## [0.3.4] - 2026-09-23
 
 ### Added

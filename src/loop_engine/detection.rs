@@ -271,6 +271,10 @@ pub(crate) fn is_rate_limited(output: &str) -> bool {
         // here; the narrow 3600 Wait override lives in
         // `reactions::account::is_rung_scoped_rate_limit_message`.
         || output_lower.contains("reached your") && output_lower.contains("limit")
+        // Grok plan limit: tests/fixtures/grok_stderr_plan_rate_limit.txt
+        // ("You've hit the rate limit for your plan", U+2019). "hit the",
+        // not "hit your"; no "reached your" and no "usage limit".
+        || output_lower.contains("rate limit for your plan")
 }
 
 /// Check if `text` reports a transient backend failure (FEAT-014).
@@ -1043,6 +1047,40 @@ mod tests {
         assert!(!is_rate_limited("normal output"));
         assert!(!is_rate_limited("task completed successfully"));
         assert!(!is_rate_limited(""));
+    }
+
+    /// Grok plan-limit stderr (U+2019). Byte-exact
+    /// `tests/fixtures/grok_stderr_plan_rate_limit.txt`.
+    #[test]
+    fn test_is_rate_limited_grok_plan_phrase_fixture() {
+        let fixture = include_str!("../../tests/fixtures/grok_stderr_plan_rate_limit.txt");
+        assert_eq!(fixture.len(), 91);
+        assert!(fixture.contains('\u{2019}'));
+        assert!(
+            is_rate_limited(fixture),
+            "curly-apostrophe plan sentence must be a rate limit"
+        );
+    }
+
+    #[test]
+    fn test_is_rate_limited_grok_plan_phrase_straight_apostrophe() {
+        assert!(is_rate_limited(
+            "Error: You've hit the rate limit for your plan. Upgrade your account or try again later.\n"
+        ));
+    }
+
+    #[test]
+    fn test_is_rate_limited_grok_plan_phrase_upper_case() {
+        assert!(is_rate_limited(
+            "ERROR: YOU'VE HIT THE RATE LIMIT FOR YOUR PLAN. UPGRADE YOUR ACCOUNT OR TRY AGAIN LATER.\n"
+        ));
+    }
+
+    /// E3 prose: nearby wording that must stay a non-match.
+    #[test]
+    fn test_is_rate_limited_grok_plan_phrase_known_bad_prose() {
+        assert!(!is_rate_limited("the client hit the rate limit in tests"));
+        assert!(!is_rate_limited("rate limiting plan for the API"));
     }
 
     #[test]

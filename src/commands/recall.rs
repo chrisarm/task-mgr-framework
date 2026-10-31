@@ -261,6 +261,20 @@ pub fn format_text(result: &RecallCmdResult) -> String {
         output.push('\n');
     }
 
+    // Content above is a 100-char preview and omits root cause / solution;
+    // point agents at the full lookup instead of raw SQLite.
+    let ids: Vec<String> = result
+        .learnings
+        .iter()
+        .filter_map(|l| l.id.map(|id| id.to_string()))
+        .collect();
+    if !ids.is_empty() {
+        output.push_str(&format!(
+            "Full details: task-mgr show-learning {}\n",
+            ids.join(" ")
+        ));
+    }
+
     output
 }
 
