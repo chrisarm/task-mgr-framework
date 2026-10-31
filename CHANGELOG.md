@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-## [0.3.5] - 2026-10-30
+## [1.0.1] - 2026-10-30
 
 ### Added
 - Rate-limit text is classified only after the child CLI reports an error. The rate-limit reaction runs after the ladder, from a pre-pipeline snapshot, and a completed task tag skips overflow handling. When output has no completed tag, the grace-buffer tail is scanned.
