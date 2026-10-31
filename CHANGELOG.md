@@ -6,8 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.3.5] - 2026-10-30
+
+### Added
+- Rate-limit text is classified only after the child CLI reports an error. The rate-limit reaction runs after the ladder, from a pre-pipeline snapshot, and a completed task tag skips overflow handling. When output has no completed tag, the grace-buffer tail is scanned.
+- Generated loops have a prune gate.
+
 ### Changed
+- The built-in Claude ladder uses family aliases (`fable`, `opus`, `sonnet`, `haiku`). Claude Code resolves each alias to the current model in that family. A full model id remains a snapshot pin via `task-mgr models set-tier`.
+- The built-in Grok `standard` rung omits `--model`, so the Grok CLI uses its own default.
 - `task-mgr init` stages `~/.claude/docs/task-mgr-best-practices.md` (add/update `--from-json`, `update --stdin`, scoped export). Slash-command skills (`prd-tasks`, `plan-tasks`, `spike`, `review-loop`) pin spawn-fixups with `--from-json`.
+
+### Fixed
+- PRD path identity follows a symlink temp prefix.
+- `task-mgr archive` names the task prefix on skip lines.
+- The dev-container Ollama health check uses `ollama list`.
 
 ## [0.3.4] - 2026-09-23
 
