@@ -274,12 +274,42 @@ fn relocate_archive_file(source: &Path, dest: &Path) -> TaskMgrResult<RelocateOu
     match fs::rename(source, dest) {
         Ok(()) => Ok(RelocateOutcome::Moved),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(RelocateOutcome::Missing),
+        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => copy_then_remove(source, dest)
+            .map(|()| RelocateOutcome::Moved)
+            .map_err(|e| {
+                crate::TaskMgrError::io_error(
+                    source.display().to_string(),
+                    "moving file to archive (cross-device copy)",
+                    e,
+                )
+            }),
         Err(e) => Err(crate::TaskMgrError::io_error(
             source.display().to_string(),
             "moving file to archive",
             e,
         )),
     }
+}
+
+/// Cross-filesystem move (rename(2) fails with EXDEV when a worktree sits on a
+/// different mount than the archive). Stages beside `dest` so a failed copy
+/// never leaves a truncated archive file, and the source is removed only after
+/// the archive copy is in place.
+fn copy_then_remove(source: &Path, dest: &Path) -> std::io::Result<()> {
+    let file_name = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let staging = dest.with_file_name(format!(".{file_name}.partial"));
+    if let Err(e) = fs::copy(source, &staging).and_then(|_| fs::rename(&staging, dest)) {
+        let _ = fs::remove_file(&staging);
+        return Err(e);
+    }
+    if let Err(e) = fs::remove_file(source) {
+        let _ = fs::remove_file(dest);
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// Run the archive command.
@@ -515,12 +545,23 @@ fn discover_archivable_files(
     let prd_file_paths = query_prd_files(conn, prd_id)?;
 
     if !prd_file_paths.is_empty() {
-        for stored in &prd_file_paths {
-            let resolved = crate::commands::init::import::resolve_prd_file_path(
+        let resolve = |stored: &str| {
+            crate::commands::init::import::resolve_prd_file_path(
                 Path::new(stored),
                 source_root,
                 worktree_root,
-            );
+            )
+        };
+        // Older init stored a JSON's `prdFile` verbatim, which is relative to
+        // the task list's directory, not the source root.
+        let registered_dirs: Vec<PathBuf> = prd_file_paths
+            .iter()
+            .map(|stored| resolve(stored))
+            .filter(|path| path.is_file())
+            .filter_map(|path| path.parent().map(Path::to_path_buf))
+            .collect();
+        for stored in &prd_file_paths {
+            let resolved = resolve(stored);
             let chosen = if resolved.exists() {
                 Some(resolved.clone())
             } else {
@@ -530,6 +571,11 @@ fn discover_archivable_files(
                 let legacy = tasks_dir.join(stored);
                 if legacy != resolved && legacy.exists() {
                     Some(legacy)
+                } else if Path::new(stored).is_relative() {
+                    registered_dirs
+                        .iter()
+                        .map(|dir| dir.join(stored))
+                        .find(|path| path.is_file())
                 } else {
                     None
                 }
@@ -1168,6 +1214,57 @@ mod tests {
     }
 
     #[test]
+    fn test_copy_then_remove_moves_content() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("prompt.md");
+        fs::write(&source, "body").unwrap();
+        let archive = dir.path().join("archive");
+        fs::create_dir(&archive).unwrap();
+        let dest = archive.join("prompt.md");
+
+        copy_then_remove(&source, &dest).unwrap();
+
+        assert!(!source.exists());
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "body");
+        assert!(!archive.join(".prompt.md.partial").exists());
+    }
+
+    /// Exercises EXDEV only where the system temp dir and `target/` are on
+    /// different mounts (e.g. tmpfs /tmp); elsewhere it covers plain rename.
+    #[test]
+    fn test_relocate_archive_file_across_temp_and_target_dirs() {
+        let src_dir = TempDir::new().unwrap();
+        let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+        fs::create_dir_all(&target).unwrap();
+        let dest_dir = TempDir::new_in(&target).unwrap();
+        let source = src_dir.path().join("prompt.md");
+        fs::write(&source, "body").unwrap();
+        let dest = dest_dir.path().join("prompt.md");
+
+        match relocate_archive_file(&source, &dest).unwrap() {
+            RelocateOutcome::Moved => {}
+            RelocateOutcome::Missing => panic!("expected moved"),
+        }
+        assert!(!source.exists());
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "body");
+    }
+
+    #[test]
+    fn test_copy_then_remove_failure_keeps_source_and_no_staging() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("keep.md");
+        fs::write(&source, "x").unwrap();
+        let dest = dir.path().join("dest-dir");
+        fs::create_dir(&dest).unwrap();
+
+        assert!(copy_then_remove(&source, &dest).is_err());
+
+        assert_eq!(fs::read_to_string(&source).unwrap(), "x");
+        assert!(!dir.path().join(".dest-dir.partial").exists());
+        assert!(dest.is_dir());
+    }
+
+    #[test]
     fn test_relocate_archive_file_other_io_errors_still_fail() {
         let dir = TempDir::new().unwrap();
         let source = dir.path().join("keep.md");
@@ -1362,6 +1459,54 @@ mod tests {
             .unwrap();
         // No tags were added, but table should still be accessible
         assert_eq!(tag_count, 0);
+    }
+
+    #[test]
+    fn test_bare_prd_row_resolves_beside_its_task_list() {
+        let dir = TempDir::new().unwrap();
+        let conn = setup_db(dir.path());
+        insert_prd(&conn, 1, "p", "", None);
+        insert_prd_file(&conn, 1, "tasks/p.json", "task_list");
+        // init stored the JSON's `prdFile` verbatim; it is relative to tasks/.
+        insert_prd_file(&conn, 1, "prd-p.md", "prd");
+        let tasks = dir.path().join("tasks");
+        fs::create_dir_all(&tasks).unwrap();
+        fs::write(tasks.join("p.json"), "{}").unwrap();
+        fs::write(tasks.join("prd-p.md"), "# PRD").unwrap();
+        let task_mgr_tasks = dir.path().join(".task-mgr/tasks");
+
+        let files =
+            discover_archivable_files(&conn, &task_mgr_tasks, dir.path(), dir.path(), 1, "p")
+                .unwrap();
+
+        assert!(
+            files.missing.is_empty(),
+            "missing: {:?}",
+            files.missing.len()
+        );
+        assert!(files.present.contains(&tasks.join("prd-p.md")));
+        assert_eq!(files.present.len(), 2);
+    }
+
+    #[test]
+    fn test_bare_prd_row_with_no_file_anywhere_is_still_missing() {
+        let dir = TempDir::new().unwrap();
+        let conn = setup_db(dir.path());
+        insert_prd(&conn, 1, "p", "", None);
+        insert_prd_file(&conn, 1, "tasks/p.json", "task_list");
+        insert_prd_file(&conn, 1, "prd-p.md", "prd");
+        let tasks = dir.path().join("tasks");
+        fs::create_dir_all(&tasks).unwrap();
+        fs::write(tasks.join("p.json"), "{}").unwrap();
+        let task_mgr_tasks = dir.path().join(".task-mgr/tasks");
+
+        let files =
+            discover_archivable_files(&conn, &task_mgr_tasks, dir.path(), dir.path(), 1, "p")
+                .unwrap();
+
+        assert_eq!(files.present, vec![tasks.join("p.json")]);
+        assert_eq!(files.missing.len(), 1);
+        assert_eq!(files.missing[0].stored, "prd-p.md");
     }
 
     #[test]

@@ -789,18 +789,35 @@ pub fn register_prd_files(
         }
     }
 
-    // Store PRD markdown file if specified (already a project-relative string
-    // from JSON metadata — keep as-is when relative; normalize when absolute).
     if let Some(ref prd_file) = prd.prd_file {
-        let stored = if Path::new(prd_file).is_absolute() {
-            path_for_prd_files_storage(Path::new(prd_file), source_root)
-        } else {
-            prd_file.replace('\\', "/")
-        };
+        let stored = prd_markdown_storage_path(prd_file, json_path, source_root);
         insert_prd_file(conn, prd_id, &stored, "prd")?;
     }
 
     Ok(())
+}
+
+/// Task lists write `prdFile` relative to the JSON's own directory
+/// (`tasks/x.json` → `"prdFile": "prd-x.md"`), though some spell it
+/// source-root-relative (`"tasks/prd-x.md"`). Store the JSON-sibling reading
+/// when that file exists; otherwise keep the value as given.
+fn prd_markdown_storage_path(prd_file: &str, json_path: &Path, source_root: &Path) -> String {
+    let given = Path::new(prd_file);
+    if given.is_absolute() {
+        return path_for_prd_files_storage(given, source_root);
+    }
+    if let Some(json_dir) = json_path.parent() {
+        let sibling = json_dir.join(given);
+        let on_disk = if sibling.is_absolute() {
+            sibling.clone()
+        } else {
+            source_root.join(&sibling)
+        };
+        if on_disk.is_file() {
+            return path_for_prd_files_storage(&on_disk, source_root);
+        }
+    }
+    prd_file.replace('\\', "/")
 }
 
 /// Find `prd_files` task_list rows whose pin-19 identity matches `live`.
@@ -1221,6 +1238,63 @@ mod tests {
             "outside source_root must store absolute form, got {stored}"
         );
         assert_eq!(stored, file.to_string_lossy().replace('\\', "/"));
+    }
+
+    fn stored_prd_markdown(prd_file: &str, files: &[&str]) -> String {
+        let tmp = TempDir::new().unwrap();
+        let source = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir_all(source.join("tasks")).unwrap();
+        for f in files {
+            std::fs::write(source.join(f), "x").unwrap();
+        }
+        let (_db_tmp, conn) = setup_db();
+        let prd = PrdFile {
+            project: "p".into(),
+            branch_name: None,
+            description: None,
+            priority_philosophy: None,
+            global_acceptance_criteria: None,
+            review_guidelines: None,
+            user_stories: vec![],
+            external_git_repo: None,
+            task_prefix: Some("abc12345".into()),
+            prd_file: Some(prd_file.into()),
+            model: None,
+            default_max_retries: None,
+            implicit_overlap_files: None,
+        };
+        let prd_id = insert_prd_metadata(&conn, &prd, None).unwrap();
+        register_prd_files(&conn, prd_id, &source.join("tasks/p.json"), &prd, &source).unwrap();
+        conn.query_row(
+            "SELECT file_path FROM prd_files WHERE prd_id = ? AND file_type = 'prd'",
+            [prd_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn register_prd_file_relative_to_json_dir_is_stored_source_root_relative() {
+        assert_eq!(
+            stored_prd_markdown("prd-p.md", &["tasks/p.json", "tasks/prd-p.md"]),
+            "tasks/prd-p.md"
+        );
+    }
+
+    #[test]
+    fn register_prd_file_already_source_root_relative_is_kept() {
+        assert_eq!(
+            stored_prd_markdown("tasks/prd-p.md", &["tasks/p.json", "tasks/prd-p.md"]),
+            "tasks/prd-p.md"
+        );
+    }
+
+    #[test]
+    fn register_prd_file_not_on_disk_is_stored_as_given() {
+        assert_eq!(
+            stored_prd_markdown("prd-p.md", &["tasks/p.json"]),
+            "prd-p.md"
+        );
     }
 
     #[test]
