@@ -651,12 +651,13 @@ pub(crate) fn initialize_loop(
     // One canonicalize(source_root); all dest path math via `git::remap_into_worktree`
     // (no inline strip_prefix remap). exists()/copy and the re-import exists() gate
     // below are worktree policy — not CLI `choose_cli_write_path` (pin 15).
+    let canonical_source = run_config
+        .source_root
+        .canonicalize()
+        .unwrap_or_else(|_| run_config.source_root.clone());
+    let source_task_files =
+        loop_task_files(&paths.prd_file, &paths.prompt_file, &run_config.source_root);
     let live_prd_file = if working_root != run_config.source_root {
-        let canonical_source = run_config
-            .source_root
-            .canonicalize()
-            .unwrap_or_else(|_| run_config.source_root.clone());
-
         // Step 8.4: copy PRD JSON / prompt / PRD markdown into the worktree when missing.
         let copy_if_missing = |src: &Path| {
             let dest = crate::git::remap_into_worktree(src, &canonical_source, &working_root);
@@ -676,18 +677,8 @@ pub(crate) fn initialize_loop(
             }
         };
 
-        copy_if_missing(&paths.prd_file);
-        copy_if_missing(&paths.prompt_file);
-        if let Ok(content) = std::fs::read_to_string(&paths.prd_file)
-            && let Ok(json) = serde_json::from_str::<serde_json::Value>(&content)
-            && let Some(prd_md) = json.get("prdFile").and_then(|v| v.as_str())
-        {
-            let prd_md_path = paths
-                .prd_file
-                .parent()
-                .unwrap_or(&paths.prd_file)
-                .join(prd_md);
-            copy_if_missing(&prd_md_path);
+        for file in &source_task_files {
+            copy_if_missing(file);
         }
 
         // Step 8.5: unconditional live PRD remap (path math only).
@@ -729,6 +720,21 @@ pub(crate) fn initialize_loop(
     // Override paths.prd_file so all iteration code (mark_task_done, reconcile, etc.)
     // reads/writes the worktree copy, not the source_root copy.
     paths.prd_file = live_prd_file.clone();
+
+    // Step 8.6: commit the task files before Step 9 sees them staged and before
+    // slot worktrees branch from HEAD, even where .gitignore excludes them.
+    let live_task_files: Vec<PathBuf> = source_task_files
+        .iter()
+        .map(|f| crate::git::remap_into_worktree(f, &canonical_source, &working_root))
+        .collect();
+    match env::commit_task_files(&working_root, &live_task_files) {
+        Ok(true) => ui::emit("Committed loop task files"),
+        Ok(false) => {}
+        Err(e) => ui::emit_err(&format!(
+            "Warning: could not commit loop task files: {} (continuing)",
+            e
+        )),
+    }
 
     // Step 9: Check uncommitted changes (in working_root)
     if let Err(e) = env::check_uncommitted_changes(&working_root, run_config.config.yes_mode) {
@@ -1101,6 +1107,27 @@ pub(crate) fn initialize_loop(
     })
 }
 
+/// Source-side task files a loop owns: PRD JSON, prompt, and the JSON's
+/// `prdFile` markdown when named.
+///
+/// `prdFile` is normally JSON-dir relative, but some lists spell it
+/// source-root relative; the JSON-dir reading wins when that file exists.
+fn loop_task_files(prd_file: &Path, prompt_file: &Path, source_root: &Path) -> Vec<PathBuf> {
+    let mut files = vec![prd_file.to_path_buf(), prompt_file.to_path_buf()];
+    if let Ok(content) = std::fs::read_to_string(prd_file)
+        && let Ok(json) = serde_json::from_str::<serde_json::Value>(&content)
+        && let Some(prd_md) = json.get("prdFile").and_then(|v| v.as_str())
+    {
+        let sibling = prd_file.parent().unwrap_or(prd_file).join(prd_md);
+        files.push(if sibling.exists() {
+            sibling
+        } else {
+            source_root.join(prd_md)
+        });
+    }
+    files
+}
+
 /// Resolve the prefix for `loop-{prefix}.lock` via the shared sticky resolver.
 ///
 /// Caller must hold `tasks.db.lock` and pass an open/migrated connection.
@@ -1152,6 +1179,62 @@ mod tests {
     use crate::db::open_connection;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn test_loop_task_files_resolves_sibling_prd_markdown() {
+        let tmp = TempDir::new().unwrap();
+        let tasks = tmp.path().join("tasks");
+        fs::create_dir_all(&tasks).unwrap();
+        let prd = tasks.join("x.json");
+        fs::write(&prd, r#"{"prdFile": "prd-x.md"}"#).unwrap();
+        fs::write(tasks.join("prd-x.md"), "# x").unwrap();
+        let prompt = tasks.join("x-prompt.md");
+
+        let files = loop_task_files(&prd, &prompt, tmp.path());
+        assert_eq!(files, vec![prd, prompt, tasks.join("prd-x.md")]);
+    }
+
+    #[test]
+    fn test_loop_task_files_falls_back_to_source_root_relative_prd_markdown() {
+        let tmp = TempDir::new().unwrap();
+        let tasks = tmp.path().join("tasks");
+        fs::create_dir_all(&tasks).unwrap();
+        let prd = tasks.join("x.json");
+        fs::write(&prd, r#"{"prdFile": "tasks/prd-x.md"}"#).unwrap();
+        let prompt = tasks.join("x-prompt.md");
+
+        let files = loop_task_files(&prd, &prompt, tmp.path());
+        assert_eq!(files[2], tmp.path().join("tasks/prd-x.md"));
+    }
+
+    #[test]
+    fn test_loop_task_files_without_prd_file_field() {
+        let tmp = TempDir::new().unwrap();
+        let prd = tmp.path().join("x.json");
+        fs::write(&prd, "{}").unwrap();
+        let prompt = tmp.path().join("x-prompt.md");
+        assert_eq!(
+            loop_task_files(&prd, &prompt, tmp.path()),
+            vec![prd, prompt]
+        );
+    }
+
+    #[test]
+    fn test_step_8_6_commits_task_files_before_step_9() {
+        let src = fs::read_to_string(file!()).unwrap();
+        let step_86 = src.find("// Step 8.6:").expect("Step 8.6 present");
+        let step_9 = src.find("// Step 9:").expect("Step 9 present");
+        let slots = src
+            .find("ensure_slot_worktrees(")
+            .expect("slot setup present");
+        let commit = src
+            .find("env::commit_task_files(")
+            .expect("commit call present");
+        assert!(
+            step_86 < commit && commit < step_9 && step_9 < slots,
+            "task files must be committed before the uncommitted check and slot creation"
+        );
+    }
 
     fn write_minimal_prd(path: &Path, prefix: Option<&str>, branch: &str) {
         let prefix_field = match prefix {

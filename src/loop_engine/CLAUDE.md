@@ -971,6 +971,21 @@ and `untrack_progress_files`. **The `git rm --cached` (NOT bare `git rm`)
 distinction is load-bearing** — bare `git rm` would delete the file on disk
 and lose the operator's loop history.
 
+### Loop task files are force-committed at startup
+
+Repos may gitignore `tasks/*.json` / `*-prompt.md` and keep only PRD markdown
+long-term. `initialize_loop` Step 8.6 (`env::commit_task_files`) runs
+`git add --force` plus a pathspec-limited commit of the PRD JSON, prompt, and
+`prdFile` markdown in `working_root`. It runs before Step 9's uncommitted check
+and before slot worktrees branch from HEAD. It is best effort: on failure it
+unstages those paths and warns. Mid-loop the JSON stays dirty on purpose,
+because wrapper commits exclude it (`orchestrator_wrapper_exclude_paths`).
+The next loop start snapshots it. Two consequences: a fresh worktree on a
+branch that already holds the JSON checks out the committed copy, and
+`copy_if_missing` skips it. Merging the branch into a checkout where the
+JSON is ignored overwrites that checkout's copy, because git treats ignored
+files as expendable.
+
 ### Stash-based preflight (FEAT-003 / FEAT-004, slot-merge-preflight PRD)
 
 For residual non-progress dirtiness (log files, build artifacts the project

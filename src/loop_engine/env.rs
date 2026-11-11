@@ -175,6 +175,73 @@ pub fn check_uncommitted_changes(dir: &Path, yes_mode: bool) -> TaskMgrResult<()
     }
 }
 
+/// Force-add and commit the loop's task files (PRD JSON, prompt, PRD markdown).
+///
+/// Repos may gitignore task files so only PRD markdown stays tracked long-term;
+/// committing them at loop start keeps them in history while the loop runs and
+/// lets slot worktrees see them. The commit is pathspec-limited so other staged
+/// work stays staged and uncommitted.
+///
+/// Files that are missing or outside `dir` are skipped. Returns `Ok(true)` when
+/// a commit was made, `Ok(false)` when every file was already committed as-is.
+/// On commit failure the paths are unstaged again before returning `Err`.
+pub fn commit_task_files(dir: &Path, files: &[PathBuf]) -> Result<bool, String> {
+    let root = dir
+        .canonicalize()
+        .map_err(|e| format!("canonicalize {}: {}", dir.display(), e))?;
+    let mut rels: Vec<PathBuf> = files
+        .iter()
+        .filter_map(|f| f.canonicalize().ok())
+        .filter_map(|f| f.strip_prefix(&root).ok().map(Path::to_path_buf))
+        .collect();
+    rels.sort();
+    rels.dedup();
+    if rels.is_empty() {
+        return Ok(false);
+    }
+
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args(args)
+            .arg("--")
+            .args(&rels)
+            .current_dir(&root)
+            .output()
+            .map_err(|e| format!("git {}: {}", args.join(" "), e))
+    };
+
+    let add = git(&["add", "--force"])?;
+    if !add.status.success() {
+        return Err(format!(
+            "git add --force failed: {}",
+            String::from_utf8_lossy(&add.stderr).trim()
+        ));
+    }
+
+    if git(&["diff", "--cached", "--quiet"])?.status.success() {
+        return Ok(false);
+    }
+
+    let commit = git(&[
+        "commit",
+        "--quiet",
+        "-m",
+        "chore(task-mgr): track loop task files",
+    ])?;
+    if commit.status.success() {
+        return Ok(true);
+    }
+    // Restore the index so Step 9's uncommitted-changes check sees what it did before.
+    let _ = git(&["reset", "--quiet"]);
+    let stderr = String::from_utf8_lossy(&commit.stderr);
+    let detail = if stderr.trim().is_empty() {
+        String::from_utf8_lossy(&commit.stdout)
+    } else {
+        stderr
+    };
+    Err(format!("git commit failed: {}", detail.trim()))
+}
+
 /// Ensure the working directory is on the correct git branch.
 ///
 /// If the current branch doesn't match `branch_name`:
@@ -957,6 +1024,103 @@ mod tests {
 
     fn setup_git_repo() -> tempfile::TempDir {
         crate::loop_engine::test_utils::setup_git_repo()
+    }
+
+    // --- commit_task_files ---
+
+    fn git_out(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("run git");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn repo_with_ignored_task_files() -> (tempfile::TempDir, Vec<PathBuf>) {
+        let tmp = setup_git_repo();
+        let root = tmp.path();
+        fs::write(
+            root.join(".gitignore"),
+            "/tasks/**/*.json\n/tasks/**/*.md\n",
+        )
+        .expect("write gitignore");
+        git_out(root, &["add", ".gitignore"]);
+        git_out(root, &["commit", "-qm", "ignore tasks"]);
+        fs::create_dir_all(root.join("tasks")).expect("mkdir tasks");
+        let files = vec![root.join("tasks/x.json"), root.join("tasks/x-prompt.md")];
+        for f in &files {
+            fs::write(f, "{}").expect("write task file");
+        }
+        (tmp, files)
+    }
+
+    #[test]
+    fn test_commit_task_files_commits_ignored_files() {
+        let (tmp, files) = repo_with_ignored_task_files();
+        assert_eq!(commit_task_files(tmp.path(), &files), Ok(true));
+        assert_eq!(
+            git_out(tmp.path(), &["ls-files", "tasks"]),
+            "tasks/x-prompt.md\ntasks/x.json"
+        );
+        assert_eq!(git_out(tmp.path(), &["status", "--porcelain"]), "");
+    }
+
+    #[test]
+    fn test_commit_task_files_noop_when_already_committed() {
+        let (tmp, files) = repo_with_ignored_task_files();
+        commit_task_files(tmp.path(), &files).unwrap();
+        let head = git_out(tmp.path(), &["rev-parse", "HEAD"]);
+        assert_eq!(commit_task_files(tmp.path(), &files), Ok(false));
+        assert_eq!(git_out(tmp.path(), &["rev-parse", "HEAD"]), head);
+    }
+
+    #[test]
+    fn test_commit_task_files_commits_edit_to_tracked_file() {
+        let (tmp, files) = repo_with_ignored_task_files();
+        commit_task_files(tmp.path(), &files).unwrap();
+        fs::write(&files[0], "{\"edited\":true}").unwrap();
+        assert_eq!(commit_task_files(tmp.path(), &files), Ok(true));
+        assert_eq!(git_out(tmp.path(), &["status", "--porcelain"]), "");
+    }
+
+    #[test]
+    fn test_commit_task_files_leaves_other_staged_work_uncommitted() {
+        let (tmp, files) = repo_with_ignored_task_files();
+        fs::write(tmp.path().join("other.txt"), "wip").unwrap();
+        git_out(tmp.path(), &["add", "other.txt"]);
+        assert_eq!(commit_task_files(tmp.path(), &files), Ok(true));
+        assert_eq!(
+            git_out(tmp.path(), &["status", "--porcelain"]),
+            "A  other.txt"
+        );
+    }
+
+    #[test]
+    fn test_commit_task_files_skips_missing_and_outside_paths() {
+        let (tmp, _) = repo_with_ignored_task_files();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("y.json");
+        fs::write(&outside_file, "{}").unwrap();
+        let files = vec![tmp.path().join("tasks/missing.json"), outside_file];
+        assert_eq!(commit_task_files(tmp.path(), &files), Ok(false));
+        assert_eq!(git_out(tmp.path(), &["ls-files", "tasks"]), "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_commit_task_files_unstages_on_commit_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let (tmp, files) = repo_with_ignored_task_files();
+        git_out(tmp.path(), &["config", "core.hooksPath", ".git/hooks"]);
+        let hook = tmp.path().join(".git/hooks/pre-commit");
+        fs::write(&hook, "#!/bin/sh\necho rejected >&2\nexit 1\n").unwrap();
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let err = commit_task_files(tmp.path(), &files).unwrap_err();
+        assert!(err.contains("rejected"), "got: {err}");
+        assert_eq!(git_out(tmp.path(), &["ls-files", "tasks"]), "");
+        assert_eq!(git_out(tmp.path(), &["status", "--porcelain"]), "");
     }
 
     #[test]
