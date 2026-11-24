@@ -149,7 +149,8 @@ pub use stats::{
     ActiveRunInfo, LearningCounts, StatsResult, TaskCounts, format_text as format_stats_text, stats,
 };
 pub use unblock::{
-    UnblockResult, UnskipResult, format_unblock_text, format_unskip_text, unblock, unskip,
+    UnblockResult, UnskipResult, format_unblock_text, format_unskip_text, unblock, unblock_many,
+    unskip, unskip_many,
 };
 pub use worktrees::{
     WorktreesResult, format_text as format_worktrees_text, list as worktrees_list,

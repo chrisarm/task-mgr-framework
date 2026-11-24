@@ -69,6 +69,49 @@ pub fn unskip(conn: &mut Connection, task_id: &str) -> TaskMgrResult<UnskipResul
     })
 }
 
+/// Unblock several tasks. Every id is checked (exists, is `blocked`) before
+/// any row changes, so a typo or wrong-status id mid-list cannot leave the
+/// batch half-applied.
+pub fn unblock_many(
+    conn: &mut Connection,
+    task_ids: &[String],
+) -> TaskMgrResult<Vec<UnblockResult>> {
+    precheck_status(conn, task_ids, TaskStatus::Blocked)?;
+    task_ids.iter().map(|id| unblock(conn, id)).collect()
+}
+
+/// Unskip several tasks; same all-checked-first semantics as [`unblock_many`].
+pub fn unskip_many(conn: &mut Connection, task_ids: &[String]) -> TaskMgrResult<Vec<UnskipResult>> {
+    precheck_status(conn, task_ids, TaskStatus::Skipped)?;
+    task_ids.iter().map(|id| unskip(conn, id)).collect()
+}
+
+/// Read-only gate: every id must exist and be in `expected`. Errors carry
+/// the same typed shapes the single-id path returns.
+fn precheck_status(
+    conn: &Connection,
+    task_ids: &[String],
+    expected: TaskStatus,
+) -> TaskMgrResult<()> {
+    for id in task_ids {
+        let status: String = conn
+            .query_row("SELECT status FROM tasks WHERE id = ?", [id], |r| r.get(0))
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => TaskMgrError::task_not_found(id),
+                _ => TaskMgrError::from(e),
+            })?;
+        if status != expected.as_db_str() {
+            return Err(TaskMgrError::invalid_state(
+                "Task",
+                id,
+                expected.as_db_str(),
+                status,
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn apply_single(
     conn: &mut Connection,
     task_id: &str,
@@ -147,6 +190,58 @@ mod tests {
             rusqlite::params![id, status],
         )
         .unwrap();
+    }
+
+    fn status_of(conn: &Connection, id: &str) -> String {
+        conn.query_row("SELECT status FROM tasks WHERE id = ?", [id], |r| r.get(0))
+            .unwrap()
+    }
+
+    // ============ Batch tests ============
+
+    #[test]
+    fn test_unblock_many_applies_all() {
+        let (_dir, mut conn) = setup_test_db();
+        insert_test_task(&conn, "A", "blocked");
+        insert_test_task(&conn, "B", "blocked");
+
+        let results = unblock_many(&mut conn, &["A".into(), "B".into()]).unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(status_of(&conn, "A"), "todo");
+        assert_eq!(status_of(&conn, "B"), "todo");
+    }
+
+    /// A bad id anywhere in the list must leave every row untouched.
+    #[test]
+    fn test_unblock_many_is_all_or_nothing() {
+        let (_dir, mut conn) = setup_test_db();
+        insert_test_task(&conn, "A", "blocked");
+        insert_test_task(&conn, "B", "todo");
+
+        let err = unblock_many(&mut conn, &["A".into(), "B".into()]).unwrap_err();
+        assert!(matches!(err, TaskMgrError::InvalidState { .. }), "{err:?}");
+        assert_eq!(status_of(&conn, "A"), "blocked");
+
+        let err = unblock_many(&mut conn, &["A".into(), "NOPE".into()]).unwrap_err();
+        assert!(matches!(err, TaskMgrError::NotFound { .. }), "{err:?}");
+        assert_eq!(status_of(&conn, "A"), "blocked");
+    }
+
+    #[test]
+    fn test_unskip_many_is_all_or_nothing() {
+        let (_dir, mut conn) = setup_test_db();
+        insert_test_task(&conn, "A", "skipped");
+        insert_test_task(&conn, "B", "skipped");
+        insert_test_task(&conn, "C", "blocked");
+
+        assert!(unskip_many(&mut conn, &["A".into(), "C".into()]).is_err());
+        assert_eq!(status_of(&conn, "A"), "skipped");
+
+        let results = unskip_many(&mut conn, &["A".into(), "B".into()]).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(status_of(&conn, "A"), "todo");
+        assert_eq!(status_of(&conn, "B"), "todo");
     }
 
     // ============ Unblock tests ============

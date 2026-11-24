@@ -51,6 +51,9 @@ pub fn complete(
     // here preserves the legacy all-or-nothing semantics.
     let mut previous_statuses = Vec::with_capacity(task_ids.len());
     let mut warnings = Vec::with_capacity(task_ids.len());
+    // Collected across the whole batch so one error names every gated id and
+    // the rerun command — not just the first offender.
+    let mut gated: Vec<(&str, TaskStatus)> = Vec::new();
     for task_id in task_ids {
         let prev_str: String = conn
             .query_row("SELECT status FROM tasks WHERE id = ?", [task_id], |r| {
@@ -68,20 +71,17 @@ pub fn complete(
             check_required_tests_pass(conn, task_id)?;
         }
         if needs_force && !force {
-            return Err(invalid_transition_error(task_id, previous));
+            gated.push((task_id, previous));
         }
-        warnings.push(if needs_force && force {
-            Some(format!(
+        warnings.push(needs_force.then(|| {
+            format!(
                 "Forced completion: task was in '{previous}' status (invalid transition, overridden with --force)."
-            ))
-        } else if needs_force {
-            Some(format!(
-                "Task was in '{previous}' status, not 'in_progress'. Completing anyway."
-            ))
-        } else {
-            None
-        });
+            )
+        }));
         previous_statuses.push(previous);
+    }
+    if !gated.is_empty() {
+        return Err(invalid_transition_error(&gated, task_ids));
     }
 
     // Force-advance non-InProgress / non-Done rows to InProgress via the
@@ -192,26 +192,31 @@ pub fn complete(
 /// CLI-side invalid-transition hint. Lives here (not in the lifecycle
 /// service) because it names CLI flags.
 ///
+/// The hint must be a single copy-pasteable command: agents and operators
+/// completing human-resolved tasks (blocked CLARIFY, todo sign-offs) used to
+/// take several attempts via `unblock` → `complete` → `complete --force`.
+/// `--force` works from todo / blocked / skipped / irrelevant directly.
+/// `--commit` is optional and must not be implied as required.
+///
 /// Never suggest `task-mgr next --claim {task_id}`: `--claim` is a bare
 /// boolean and `next` takes no task id. That command would claim the
 /// highest-priority ready task across all prefixes in a shared DB.
-fn invalid_transition_error(task_id: &str, previous: TaskStatus) -> TaskMgrError {
-    let valid = previous.valid_transitions();
-    let hint = if valid.is_empty() {
-        format!(
-            "Task '{task_id}' is in '{previous}' status which is a terminal state. No transitions allowed."
-        )
-    } else if previous == TaskStatus::Todo {
-        format!(
-            "Task '{task_id}' is in 'todo' status. Use 'task-mgr complete {task_id} --commit <sha> --force' to complete it from todo. `next --claim` takes no task id and would claim the highest-priority ready task across all prefixes."
-        )
-    } else {
-        format!(
-            "Task '{task_id}' is in '{previous}' status. Valid transitions: {}. Use --force to override.",
-            valid.join(", ")
-        )
-    };
-    TaskMgrError::invalid_transition(task_id, previous.to_string(), "done", hint)
+fn invalid_transition_error(gated: &[(&str, TaskStatus)], all_ids: &[String]) -> TaskMgrError {
+    let (first_id, first_status) = gated[0];
+    let listed = gated
+        .iter()
+        .map(|(id, status)| format!("{id} ({status})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let hint = format!(
+        "Not claimed (in_progress), so completion needs --force: {listed}. \
+         No unblock/unskip step is needed first. Nothing was written. Rerun:\n\n  \
+         task-mgr complete --force {}\n\n\
+         --force also skips dependency and required-test checks. \
+         --commit <sha> is optional.",
+        all_ids.join(" ")
+    );
+    TaskMgrError::invalid_transition(first_id, first_status.to_string(), "done", hint)
 }
 
 /// Check that all required tests pass for a task. Queries `required_tests`;
@@ -411,8 +416,12 @@ mod tests {
                 assert_eq!(from, "todo");
                 assert_eq!(to, "done");
                 assert!(
-                    hint.contains("task-mgr complete US-001 --commit <sha> --force"),
+                    hint.contains("task-mgr complete --force US-001"),
                     "hint must name the id-scoped force complete, got: {hint}"
+                );
+                assert!(
+                    !hint.contains("--commit <sha> --force"),
+                    "--commit is optional; the rerun command must not include it: {hint}"
                 );
                 assert!(
                     !hint.contains("next --claim US-001"),
@@ -421,6 +430,81 @@ mod tests {
             }
             _ => panic!("Expected InvalidTransition error"),
         }
+    }
+
+    /// Human-resolved tasks (CLARIFY etc.) sit in `blocked` because the loop
+    /// parked them. The hint must hand back ONE command that completes them —
+    /// not a detour through `unblock`, which then still needs --force.
+    #[test]
+    fn test_complete_blocked_hint_names_single_force_command() {
+        let (_dir, mut conn) = setup_test_db();
+        insert_test_task(&conn, "US-001", "blocked");
+
+        let err = complete(&mut conn, &["US-001".to_string()], None, None, false).unwrap_err();
+        let TaskMgrError::InvalidTransition { from, hint, .. } = err else {
+            panic!("Expected InvalidTransition error, got {err:?}");
+        };
+        assert_eq!(from, "blocked");
+        assert!(
+            hint.contains("task-mgr complete --force US-001"),
+            "got: {hint}"
+        );
+        assert!(
+            !hint.contains("task-mgr unblock"),
+            "unblock is a detour; got: {hint}"
+        );
+    }
+
+    /// Mixed batch: every gated id is reported up front (not just the first),
+    /// the rerun command carries ALL requested ids, and nothing is written.
+    #[test]
+    fn test_complete_batch_reports_all_gated_ids_and_writes_nothing() {
+        let (_dir, mut conn) = setup_test_db();
+        insert_test_task(&conn, "A", "blocked");
+        insert_test_task(&conn, "B", "in_progress");
+        insert_test_task(&conn, "C", "todo");
+        let ids: Vec<String> = ["A", "B", "C"].iter().map(|s| s.to_string()).collect();
+
+        let err = complete(&mut conn, &ids, None, None, false).unwrap_err();
+        let TaskMgrError::InvalidTransition { hint, .. } = err else {
+            panic!("Expected InvalidTransition error, got {err:?}");
+        };
+        assert!(hint.contains("A (blocked)"), "got: {hint}");
+        assert!(hint.contains("C (todo)"), "got: {hint}");
+        assert!(
+            !hint.contains("B ("),
+            "in_progress B is not gated; got: {hint}"
+        );
+        assert!(
+            hint.contains("task-mgr complete --force A B C"),
+            "got: {hint}"
+        );
+
+        let statuses: Vec<String> = ids
+            .iter()
+            .map(|id| {
+                conn.query_row("SELECT status FROM tasks WHERE id = ?", [id], |r| r.get(0))
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(statuses, ["blocked", "in_progress", "todo"]);
+    }
+
+    #[test]
+    fn test_complete_blocked_task_with_force() {
+        let (_dir, mut conn) = setup_test_db();
+        insert_test_task(&conn, "US-001", "blocked");
+
+        let result = complete(&mut conn, &["US-001".to_string()], None, None, true).unwrap();
+
+        assert_eq!(result.completed_count, 1);
+        assert_eq!(result.tasks[0].previous_status, TaskStatus::Blocked);
+        let status: String = conn
+            .query_row("SELECT status FROM tasks WHERE id = 'US-001'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(status, "done");
     }
 
     #[test]

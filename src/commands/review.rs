@@ -277,7 +277,8 @@ pub fn format_text(result: &ReviewResult) -> String {
             result.skipped_tasks.len()
         ));
         output.push_str(
-            "Use 'task-mgr unblock <id>' or 'task-mgr unskip <id>' to return tasks to todo.\n",
+            "Use 'task-mgr unblock <id>...' or 'task-mgr unskip <id>...' to return tasks to todo,\n\
+             or 'task-mgr complete --force <id>...' if they were resolved outside the loop.\n",
         );
     } else if !result.actions_taken.is_empty() {
         output.push_str(&format!(

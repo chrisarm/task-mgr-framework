@@ -302,7 +302,10 @@ echo '{"id":"CLARIFY-001","humanReviewOutcome":{
   "deltasFromProposed": [ ],
   "additionalRequirements": [ ]
 }}' | task-mgr update --stdin --from-json tasks/<prd>.json
-task-mgr complete CLARIFY-001
+# Human tasks are never claimed (the loop leaves them todo or blocked),
+# so --force is required. It works straight from blocked: no unblock step.
+# It also skips dependency checks. List several ids to close them together.
+task-mgr complete --force CLARIFY-001
 ```
 
 Downstream task field updates in the same resolution also go through
@@ -370,8 +373,8 @@ yourself.
 | `task-mgr learnings` | List all learnings |
 | `task-mgr apply-learning` | Record that a learning was applied (confirmed useful) |
 | `task-mgr invalidate-learning` | Invalidate a learning via two-step degradation |
-| `task-mgr unblock` | Return a blocked task to todo status for retry |
-| `task-mgr unskip` | Return a skipped task to todo status for retry |
+| `task-mgr unblock` | Return one or more blocked tasks to todo status for retry |
+| `task-mgr unskip` | Return one or more skipped tasks to todo status for retry |
 | `task-mgr add` | Add a single task from JSON (stdin or --json) |
 | `task-mgr update` | Update whitelist fields on an existing task (overlay JSON) |
 | `task-mgr reset` | Reset task(s) to todo status for re-running |

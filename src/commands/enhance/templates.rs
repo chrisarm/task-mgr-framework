@@ -106,7 +106,10 @@ echo '{"id":"CLARIFY-001","humanReviewOutcome":{
   "deltasFromProposed": [ ],
   "additionalRequirements": [ ]
 }}' | task-mgr update --stdin --from-json tasks/<prd>.json
-task-mgr complete CLARIFY-001
+# Human tasks are never claimed (the loop leaves them todo or blocked),
+# so --force is required. It works straight from blocked: no unblock step.
+# It also skips dependency checks. List several ids to close them together.
+task-mgr complete --force CLARIFY-001
 ```
 
 Downstream task field updates in the same resolution also go through

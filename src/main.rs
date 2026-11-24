@@ -22,8 +22,8 @@ use task_mgr::commands::{
     get_reviewable_tasks, history, history_detail, how, import_learnings, init_with_opts,
     invalidate_learning, irrelevant, learn, list, list_decisions, list_learnings, migrate_all,
     migrate_down_cmd, migrate_status, migrate_up_cmd, next, recall, reset_all_tasks, reset_tasks,
-    resolve_decision_cmd, revert_decision_cmd, show, show_learnings, skip, stats, unblock, unskip,
-    update, worktrees_list, worktrees_prune, worktrees_remove,
+    resolve_decision_cmd, revert_decision_cmd, show, show_learnings, skip, stats, unblock_many,
+    unskip_many, update, worktrees_list, worktrees_prune, worktrees_remove,
 };
 use task_mgr::db::{DbDirSource, LockGuard, ResolvedDbDir, open_connection, resolve_db_dir};
 use task_mgr::handlers::{
@@ -850,19 +850,27 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
             Ok(())
         }
 
-        Commands::Unblock { task_id } => {
+        Commands::Unblock { task_ids } => {
             let _lock = LockGuard::acquire(&cli.dir)?;
             let mut conn = open_connection(&cli.dir)?;
-            let result = unblock(&mut conn, &task_id)?;
-            output_result(&result, cli.format);
+            let results = unblock_many(&mut conn, &task_ids)?;
+            // One id keeps the historical single-object JSON shape.
+            match results.as_slice() {
+                [single] => output_result(single, cli.format),
+                _ => output_result(&results, cli.format),
+            }
             Ok(())
         }
 
-        Commands::Unskip { task_id } => {
+        Commands::Unskip { task_ids } => {
             let _lock = LockGuard::acquire(&cli.dir)?;
             let mut conn = open_connection(&cli.dir)?;
-            let result = unskip(&mut conn, &task_id)?;
-            output_result(&result, cli.format);
+            let results = unskip_many(&mut conn, &task_ids)?;
+            // One id keeps the historical single-object JSON shape.
+            match results.as_slice() {
+                [single] => output_result(single, cli.format),
+                _ => output_result(&results, cli.format),
+            }
             Ok(())
         }
 

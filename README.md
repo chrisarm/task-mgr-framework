@@ -135,8 +135,8 @@ task-mgr loop tasks/my-project.json --yes --hours 4
 | `fail` | Mark task as blocked |
 | `skip` | Defer task for later |
 | `irrelevant` | Mark task as no longer needed |
-| `unblock` | Return blocked task to todo |
-| `unskip` | Return skipped task to todo |
+| `unblock` | Return blocked task(s) to todo |
+| `unskip` | Return skipped task(s) to todo |
 | `reset` | Reset task(s) to todo for re-running |
 
 ### Run Management
