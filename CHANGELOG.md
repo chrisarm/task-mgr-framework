@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-24
+
+### Added
+- `task-mgr unblock` and `task-mgr unskip` accept several task ids. Every id is checked before any task changes.
+- At startup, the loop force-commits its task files (PRD JSON, prompt, PRD markdown), so repos that gitignore them still have them committed before slot worktrees branch.
+
+### Changed
+- When `task-mgr complete` refuses tasks that were never claimed, the error lists every such id with its status and prints one rerun line with `--force` and all the ids. It says that no `unblock` step is needed and that `--commit` is optional.
+- The documented way to close a resolved CLARIFY or other human-review task is `task-mgr complete --force <id>`.
+
+### Fixed
+- `task-mgr --dir X init` writes the database and config to `X`, not to a `.task-mgr` folder beside it.
+- A fresh database waits for a lock while switching to WAL, instead of failing at once with "database is locked".
+- `archive` moves files across filesystems and finds the PRD markdown that sits next to the task list.
+- Repaired stale tests that broke `cargo clippy --all-targets` and the library test suite.
+
 ## [1.0.2] - 2026-10-30
 
 ### Changed
