@@ -1763,6 +1763,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                     dry_run,
                     batch_size,
                     field,
+                    reset_examined,
                 } => {
                     let field_filter = field
                         .map(|s| {
@@ -1781,6 +1782,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                         dry_run,
                         batch_size,
                         field_filter,
+                        reset_examined,
                     };
                     let result = curate_enrich(&conn, params)?;
                     output_result(&result, cli.format);

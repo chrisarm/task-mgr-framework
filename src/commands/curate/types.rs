@@ -69,6 +69,8 @@ pub struct EnrichParams {
     pub batch_size: usize,
     /// Restrict enrichment to a specific metadata field (None = all fields)
     pub field_filter: Option<EnrichFieldFilter>,
+    /// If true, clear the `enrich_examined` table before running
+    pub reset_examined: bool,
 }
 
 impl Default for EnrichParams {
@@ -77,6 +79,7 @@ impl Default for EnrichParams {
             dry_run: false,
             batch_size: 20,
             field_filter: None,
+            reset_examined: false,
         }
     }
 }
