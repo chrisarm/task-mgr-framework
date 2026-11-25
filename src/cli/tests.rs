@@ -1722,11 +1722,25 @@ fn test_verbose_with_format() {
 fn test_unblock_command() {
     let cli = Cli::parse_from(["task-mgr", "unblock", "US-001"]);
     match cli.command {
-        Commands::Unblock { task_id } => {
-            assert_eq!(task_id, "US-001");
+        Commands::Unblock { task_ids } => {
+            assert_eq!(task_ids, ["US-001"]);
         }
         _ => panic!("Expected Unblock command"),
     }
+}
+
+#[test]
+fn test_unblock_command_accepts_multiple_ids() {
+    let cli = Cli::parse_from(["task-mgr", "unblock", "A", "B", "C"]);
+    match cli.command {
+        Commands::Unblock { task_ids } => assert_eq!(task_ids, ["A", "B", "C"]),
+        _ => panic!("Expected Unblock command"),
+    }
+}
+
+#[test]
+fn test_unblock_command_requires_an_id() {
+    assert!(Cli::try_parse_from(["task-mgr", "unblock"]).is_err());
 }
 
 // Unskip command tests
@@ -1734,8 +1748,8 @@ fn test_unblock_command() {
 fn test_unskip_command() {
     let cli = Cli::parse_from(["task-mgr", "unskip", "US-002"]);
     match cli.command {
-        Commands::Unskip { task_id } => {
-            assert_eq!(task_id, "US-002");
+        Commands::Unskip { task_ids } => {
+            assert_eq!(task_ids, ["US-002"]);
         }
         _ => panic!("Expected Unskip command"),
     }

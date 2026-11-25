@@ -172,8 +172,10 @@ task-mgr complete US-001 --run-id "$RUN_ID" --commit "abc123"
 # Complete multiple tasks at once
 task-mgr complete US-001 US-002 US-003 --run-id "$RUN_ID"
 
-# Force completion (skip status validation)
-task-mgr complete US-001 --force
+# Complete tasks that were never claimed (todo / blocked / skipped), e.g.
+# human-resolved CLARIFY tasks. No unblock step needed. Also skips
+# dependency and required-test checks.
+task-mgr complete --force US-001 US-002
 ```
 
 ### Task Failure/Skip
@@ -192,10 +194,10 @@ task-mgr irrelevant US-001 --reason "Feature cancelled" --run-id "$RUN_ID"
 ### Recovery Commands
 
 ```bash
-# Return blocked task to todo
-task-mgr unblock US-001
+# Return blocked task(s) to todo (all ids are checked before any change)
+task-mgr unblock US-001 US-002
 
-# Return skipped task to todo
+# Return skipped task(s) to todo
 task-mgr unskip US-001
 
 # Reset any task to todo (for re-running)
@@ -465,8 +467,11 @@ task-mgr list --status blocked
 # Review interactively (JSON mode for scripting)
 task-mgr --format json review --blocked
 
-# Unblock specific task
-task-mgr unblock US-001
+# Unblock specific task(s)
+task-mgr unblock US-001 US-002
+
+# Resolved outside the loop (e.g. a CLARIFY decision)? Complete directly:
+task-mgr complete --force US-001
 
 # Unblock all blocked tasks
 task-mgr review --blocked --auto
@@ -582,14 +587,16 @@ task-mgr unskip US-002
 task-mgr doctor --auto-fix
 ```
 
-### "Invalid transition: todo -> done"
+### "Invalid transition: todo -> done" (or blocked/skipped -> done)
 
-**Cause**: Trying to complete a task without claiming it first.
+**Cause**: Trying to complete a task that was never claimed. Human-resolved
+tasks (CLARIFY, sign-offs) always hit this: the loop leaves them `todo` or
+`blocked`.
 
-**Solution**:
+**Solution**: the error prints the exact rerun command for every id you passed.
 ```bash
-# Force-complete this id (does not claim a different task)
-task-mgr complete US-001 --commit <sha> --force
+# Force-complete these ids directly; no unblock step. --commit is optional.
+task-mgr complete --force US-001 US-002
 ```
 
 Do **not** run `task-mgr next --claim US-001`. `--claim` is a boolean; `next` takes no task id and would claim the highest-priority ready task across all prefixes in a shared DB.

@@ -275,7 +275,10 @@ EXAMPLES:
         #[arg(long)]
         commit: Option<String>,
 
-        /// Force completion even if status transition is invalid (e.g., todo->done)
+        /// Complete a task that was never claimed: works directly from todo,
+        /// blocked, skipped, or irrelevant (no unblock step). Required for
+        /// human-resolved tasks (CLARIFY, sign-offs). Also skips dependency
+        /// and required-test checks.
         #[arg(long, default_value_t = false)]
         force: bool,
     },
@@ -688,16 +691,21 @@ RERANKER:
         learning_id: i64,
     },
 
-    /// Return a blocked task to todo status for retry
+    /// Return one or more blocked tasks to todo status for retry.
+    ///
+    /// Not needed before completing a human-resolved task: use
+    /// `task-mgr complete --force <id>...` directly from blocked.
     Unblock {
-        /// Task ID to unblock
-        task_id: String,
+        /// Task ID(s) to unblock (all are checked before any changes)
+        #[arg(required = true)]
+        task_ids: Vec<String>,
     },
 
-    /// Return a skipped task to todo status for retry
+    /// Return one or more skipped tasks to todo status for retry
     Unskip {
-        /// Task ID to unskip
-        task_id: String,
+        /// Task ID(s) to unskip (all are checked before any changes)
+        #[arg(required = true)]
+        task_ids: Vec<String>,
     },
 
     /// Add a single task from JSON (stdin or --json).

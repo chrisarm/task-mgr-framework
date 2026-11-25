@@ -22,8 +22,8 @@ use task_mgr::commands::{
     get_reviewable_tasks, history, history_detail, how, import_learnings, init_with_opts,
     invalidate_learning, irrelevant, learn, list, list_decisions, list_learnings, migrate_all,
     migrate_down_cmd, migrate_status, migrate_up_cmd, next, recall, reset_all_tasks, reset_tasks,
-    resolve_decision_cmd, revert_decision_cmd, show, show_learnings, skip, stats, unblock, unskip,
-    update, worktrees_list, worktrees_prune, worktrees_remove,
+    resolve_decision_cmd, revert_decision_cmd, show, show_learnings, skip, stats, unblock_many,
+    unskip_many, update, worktrees_list, worktrees_prune, worktrees_remove,
 };
 use task_mgr::db::{DbDirSource, LockGuard, ResolvedDbDir, open_connection, resolve_db_dir};
 use task_mgr::handlers::{
@@ -193,10 +193,11 @@ fn stage_global_skills(force_skills: bool) {
     }
 }
 
-/// Resolve the project root for `init_project`.
+/// Resolve the project root for `init_project_at` (`.gitignore` and
+/// progress-untrack work). The DB itself goes to the resolved DB dir, so a
+/// `--dir` not named `.task-mgr` keeps its DB where the operator put it.
 ///
-/// `init_project(dir)` appends `.task-mgr/`, so we need the *parent* of the
-/// resolved DB dir. `resolve_db_dir` guarantees `cli.dir` is absolute, so
+/// The project root is the *parent* of the resolved DB dir. `resolve_db_dir` guarantees `cli.dir` is absolute, so
 /// `.parent()` returns `Some(_)` except in the pathological case of `/`.
 fn project_root_for_init(cli_dir: &Path) -> PathBuf {
     cli_dir
@@ -255,11 +256,11 @@ fn dispatch_init_project(
     enhance: bool,
     force_skills: bool,
 ) -> Result<(), TaskMgrError> {
-    use task_mgr::commands::init::init_project;
+    use task_mgr::commands::init::init_project_at;
 
     let project_root = project_root_for_init(db_dir);
     let _lock = LockGuard::acquire(db_dir)?;
-    let result = init_project(&project_root)?;
+    let result = init_project_at(&project_root, db_dir)?;
     stage_global_skills(force_skills);
 
     if enhance {
@@ -298,7 +299,7 @@ fn dispatch_init_shim(
     format: OutputFormat,
     args: DispatchInitArgs,
 ) -> Result<(), TaskMgrError> {
-    use task_mgr::commands::init::init_project;
+    use task_mgr::commands::init::init_project_at;
 
     ui::emit(
         "DEPRECATED: `task-mgr init --from-json X` keeps working indefinitely but the \
@@ -315,7 +316,7 @@ fn dispatch_init_shim(
     let project_root = project_root_for_init(db_dir);
     {
         let _lock = LockGuard::acquire(db_dir)?;
-        init_project(&project_root)?;
+        init_project_at(&project_root, db_dir)?;
     }
     if !args.dry_run {
         stage_global_skills(args.force_skills);
@@ -850,19 +851,27 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
             Ok(())
         }
 
-        Commands::Unblock { task_id } => {
+        Commands::Unblock { task_ids } => {
             let _lock = LockGuard::acquire(&cli.dir)?;
             let mut conn = open_connection(&cli.dir)?;
-            let result = unblock(&mut conn, &task_id)?;
-            output_result(&result, cli.format);
+            let results = unblock_many(&mut conn, &task_ids)?;
+            // One id keeps the historical single-object JSON shape.
+            match results.as_slice() {
+                [single] => output_result(single, cli.format),
+                _ => output_result(&results, cli.format),
+            }
             Ok(())
         }
 
-        Commands::Unskip { task_id } => {
+        Commands::Unskip { task_ids } => {
             let _lock = LockGuard::acquire(&cli.dir)?;
             let mut conn = open_connection(&cli.dir)?;
-            let result = unskip(&mut conn, &task_id)?;
-            output_result(&result, cli.format);
+            let results = unskip_many(&mut conn, &task_ids)?;
+            // One id keeps the historical single-object JSON shape.
+            match results.as_slice() {
+                [single] => output_result(single, cli.format),
+                _ => output_result(&results, cli.format),
+            }
             Ok(())
         }
 

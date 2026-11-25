@@ -106,14 +106,12 @@ fn make_prompt_result(task_id: &str) -> PromptResult {
 
 /// `ProjectConfig` whose provider-first `models` block wires `claude.fallback =
 /// "grok"` (the rung-4 pivot target) with Grok enabled. Grok's standard rung
-/// is pinned to `GROK_MODEL` because the built-in rung is empty (no `--model`),
-/// and these tests assert the pivot writes the target-tier model.
+/// stays the built-in null rung, so the pivot writes an empty `tasks.model`
+/// (production behavior: `--model` is omitted and the CLI picks its default).
 fn models_claude_fallback_grok() -> ProjectConfig {
     let mut models = ModelsConfig::builtin_default();
     if let Some(p) = models.providers.get_mut("grok") {
         p.enabled = true;
-        p.tiers
-            .insert("standard".to_string(), Some(GROK_MODEL.to_string()));
     }
     if let Some(p) = models.providers.get_mut("claude") {
         p.fallback = Some("grok".to_string());

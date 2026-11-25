@@ -256,7 +256,7 @@ Schema migrations are versioned (v1, v2, v3) and tracked in a `schema_migrations
 
 **Decay mechanism**: Blocked and skipped tasks record the iteration number when they entered that state. After a configurable threshold (default: 32 iterations), they automatically return to `todo`. This prevents tasks from being permanently stuck due to transient issues.
 
-**`--force` flag**: The `complete` and `fail` commands accept `--force` to override invalid transitions (e.g., `todo` directly to `done`). This is an escape hatch for recovery scenarios, not normal workflow.
+**`--force` flag**: The `complete` and `fail` commands accept `--force` to override invalid transitions (e.g., `todo` or `blocked` directly to `done`). It is the normal way to close human-resolved tasks (CLARIFY, sign-offs), which the loop never claims; otherwise it is an escape hatch for recovery. On `complete` it also skips dependency and required-test checks.
 
 ### Human review checkpoints
 

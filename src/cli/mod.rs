@@ -58,8 +58,8 @@ COMMAND REFERENCE (by category):
     fail               Mark tasks as failed (blocked, skipped, or irrelevant)
     skip               Skip tasks intentionally (defer for later)
     irrelevant         Mark tasks as irrelevant (no longer needed)
-    unblock            Return a blocked task to todo status
-    unskip             Return a skipped task to todo status
+    unblock            Return blocked task(s) to todo status
+    unskip             Return skipped task(s) to todo status
     reset              Reset task(s) to todo status for re-running
     review             Review blocked and skipped tasks
 

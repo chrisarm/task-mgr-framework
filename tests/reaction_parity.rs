@@ -1286,14 +1286,12 @@ fn read_overflow_events(base_dir: &Path) -> Vec<OverflowEvent> {
 /// A `ProjectConfig` wiring the Claude → Grok cross-provider fallback via the
 /// provider-first surface (`providers.claude.fallback = "grok"`, grok enabled) —
 /// the precondition for rung 4 (`FallbackToProvider`) on the Claude → Grok
-/// direction. Grok's Standard rung is pinned to `GROK_MODEL` because the
-/// builtin rung is empty (no `--model`).
+/// direction. Grok's Standard rung stays the builtin null rung (no `--model`),
+/// so the pivot target model is empty.
 fn config_with_fallback_enabled() -> ProjectConfig {
     let mut models = ModelsConfig::builtin_default();
     if let Some(p) = models.providers.get_mut("grok") {
         p.enabled = true;
-        p.tiers
-            .insert("standard".to_string(), Some(GROK_MODEL.to_string()));
     }
     if let Some(p) = models.providers.get_mut("claude") {
         p.fallback = Some("grok".to_string());
@@ -4269,8 +4267,12 @@ fn model_id_in_session_rate_limit_stdout_still_blackouts_not_3600() {
     insert_run(&conn);
     insert_in_progress_task(&conn, "RP-HYPHEN-0");
 
-    // Realistic capture: model id in the banner + ordinary account RateLimit.
-    let output = format!("Running with {OPUS_MODEL}\nYou've hit your limit · resets 4pm");
+    // Realistic capture: a full hyphenated model id in the banner + ordinary
+    // account RateLimit. `OPUS_MODEL` became the bare alias `opus` in the model
+    // redesign, so the hyphenated id is built around it: the bare alias on its
+    // own IS a whitespace-bounded rung token and correctly forces the 3600 Wait.
+    let output =
+        format!("Running with claude-{OPUS_MODEL}-5-5\nYou've hit your limit · resets 4pm");
     let rate = IterationOutcome::RateLimit;
     let items = [OutputReactionItem {
         task_id: Some("RP-HYPHEN-0"),

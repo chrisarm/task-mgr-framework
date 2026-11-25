@@ -104,6 +104,13 @@ impl_text_formattable!(LearningsListResult, format_learnings_text);
 impl_text_formattable!(ImportLearningsResult, format_import_learnings_text);
 impl_text_formattable!(UnblockResult, format_unblock_text);
 impl_text_formattable!(UnskipResult, format_unskip_text);
+
+/// Batch commands (`unblock A B`, `unskip A B`) print each result in order.
+impl<T: TextFormattable> TextFormattable for Vec<T> {
+    fn format_text(&self) -> String {
+        self.iter().map(TextFormattable::format_text).collect()
+    }
+}
 impl_text_formattable!(ResetResult, format_reset_text);
 impl_text_formattable!(StatsResult, format_stats_text);
 impl_text_formattable!(HistoryResult, format_history_text);

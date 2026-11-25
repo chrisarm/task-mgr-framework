@@ -21,8 +21,9 @@ pub const INTENTS: &[(&[&str], &str)] = &[
          | complete | task is finished and verified | `task-mgr complete <id>` (alias `done`) |\n\
          | fail | task hit an unrecoverable error | `task-mgr fail <id> --status blocked` |\n\
          | skip | defer for later, not failed | `task-mgr skip <id> --reason '...'` |\n\
-         | unblock | retry a previously blocked task | `task-mgr unblock <id>` |\n\
-         | unskip | retry a previously skipped task | `task-mgr unskip <id>` |\n\
+         | complete unclaimed | close a human-resolved / blocked / todo task | `task-mgr complete --force <id>...` |\n\
+         | unblock | retry previously blocked task(s) | `task-mgr unblock <id>...` |\n\
+         | unskip | retry previously skipped task(s) | `task-mgr unskip <id>...` |\n\
          | irrelevant | no longer needed | `task-mgr irrelevant <id> --reason '...'` |\n\
          | reset | force back to todo for re-run | `task-mgr reset <id>` |\n\
          \n\
