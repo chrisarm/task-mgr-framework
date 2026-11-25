@@ -61,6 +61,7 @@ pub const CURATED_RECIPES: &str = "## Common Recipes\n\
 - Record a learning: `task-mgr learn --outcome <success|failure|workaround|pattern> --title \"...\"`\n\
 - Recall learnings for THIS task: `task-mgr recall --for-task <task-id>`\n\
 - Recall learnings by query (offline OK with `--allow-degraded`): `task-mgr recall --query \"<text>\"`\n\
+- Read full learnings by ID (recall only previews): `task-mgr show-learning <id> [<id>...]`\n\
 - Initialize from a PRD JSON: `task-mgr loop init <prd>.json` (mid-loop sync: add `--append --update-existing`)\n\
 - Run the autonomous loop: `task-mgr loop run <prd>.json --yes`\n\
 - Run multiple PRDs: `task-mgr batch init '<glob>'` then `task-mgr batch run '<glob>' --yes`\n\

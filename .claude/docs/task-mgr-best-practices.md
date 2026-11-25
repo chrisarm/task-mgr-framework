@@ -49,6 +49,7 @@ PRDs should include **§2.6 Boundary Contracts & Modularity Targets** for `CONTR
 | Export (active PRD) | `task-mgr export --to-json /tmp/dump.json` (registered dest needs `--force`) |
 | Complete / fail / skip | `task-mgr complete \| fail \| skip <id>` |
 | Recall learnings | `task-mgr recall --for-task <id>` or `--query "…"` |
+| Read full learnings | `task-mgr show-learning <id> [<id>...]` |
 | Record a learning | `task-mgr learn --outcome <success\|failure\|workaround\|pattern> --title …` |
 | Health check | `task-mgr doctor --auto-fix` |
 | Show routing | `task-mgr models show` |
@@ -187,6 +188,7 @@ Do **not** `export --to-json` onto the live PRD as crash recovery. Loop persiste
 - `task-mgr learn` — record patterns, failures, workarounds (feeds future recall)
 - `task-mgr recall --for-task <id>` — scored for this task (tags, files, errors)
 - `task-mgr recall --query "…"` — semantic search (needs Ollama; `--allow-degraded` offline)
+- `task-mgr show-learning <id> [<id>...]` — full record for recalled IDs (untruncated content, root cause, solution); recall output is a preview, so use this instead of scripting over it
 - `task-mgr apply-learning` / `invalidate-learning` — UCB bandit feedback
 
 Run recall **before** planning or implementing in unfamiliar areas.
