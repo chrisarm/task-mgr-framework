@@ -15,6 +15,6 @@ A learning used to be re-sent on every run whenever a metadata field stayed empt
 
 ### Breaking changes
 
-None. Schema migration v22 adds one table and applies on first open. Older binaries still open a v22 database (checked with the 1.0.2 binary and `curate count`). Markers start empty, so the first run after upgrading still examines every candidate once.
+None. Schema migration v22 adds one table and applies on first open. Older binaries still open a v22 database (checked with the previously installed binary and `curate count`). Markers start empty, so the first run after upgrading still examines every candidate once.
 
 ---
