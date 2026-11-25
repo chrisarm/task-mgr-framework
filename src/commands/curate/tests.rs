@@ -1437,6 +1437,7 @@ fn test_curate_enrich_zero_candidates_returns_immediately() {
             dry_run: false,
             batch_size: 20,
             field_filter: None,
+            reset_examined: false,
         },
     )
     .expect("curate_enrich with 0 candidates");
@@ -1489,6 +1490,141 @@ fn test_curate_enrich_rerun_excludes_already_enriched() {
 }
 
 #[test]
+fn test_enrich_examined_learning_is_skipped_even_with_null_fields() {
+    // Known-bad discriminator: "no error patterns apply" leaves the field NULL,
+    // so NULL-ness alone re-selects the learning on every run.
+    use super::enrich::apply_and_mark_examined;
+    let (_dir, conn) = setup_db();
+
+    let id = insert_learning(
+        &conn,
+        "No errors apply",
+        Confidence::High,
+        LearningOutcome::Pattern,
+    );
+    let untouched = insert_learning(
+        &conn,
+        "Never sent",
+        Confidence::High,
+        LearningOutcome::Pattern,
+    );
+
+    let enriched = apply_and_mark_examined(&conn, &[make_enrich_proposal(id, "No errors apply")])
+        .expect("apply");
+    assert_eq!(enriched, 1);
+
+    let errors_still_null: bool = conn
+        .query_row(
+            "SELECT applies_to_errors IS NULL FROM learnings WHERE id = ?1",
+            [id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        errors_still_null,
+        "empty proposal must leave the field NULL"
+    );
+
+    for field_filter in [None, Some(EnrichFieldFilter::AppliesToErrors)] {
+        let params = EnrichParams {
+            field_filter,
+            ..EnrichParams::default()
+        };
+        let ids: Vec<i64> = find_enrichment_candidates(&conn, &params)
+            .expect("candidates")
+            .iter()
+            .map(|c| c.id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![untouched],
+            "examined learning must not be re-selected"
+        );
+    }
+}
+
+#[test]
+fn test_enrich_all_empty_answer_still_marks_examined() {
+    use super::enrich::apply_and_mark_examined;
+    let (_dir, conn) = setup_db();
+    let id = insert_learning(
+        &conn,
+        "Nothing applies",
+        Confidence::High,
+        LearningOutcome::Pattern,
+    );
+
+    let mut proposal = make_enrich_proposal(id, "Nothing applies");
+    proposal.proposed_files.clear();
+    proposal.proposed_task_types.clear();
+
+    let enriched = apply_and_mark_examined(&conn, &[proposal]).expect("apply");
+    assert_eq!(enriched, 0, "nothing was written to the learning");
+    assert!(
+        find_enrichment_candidates(&conn, &EnrichParams::default())
+            .expect("candidates")
+            .is_empty(),
+        "an all-empty answer is still an answer"
+    );
+}
+
+#[test]
+fn test_enrich_failed_batch_marks_nothing() {
+    // A proposal for a learning deleted mid-run is skipped; one that fails to
+    // write must leave the whole batch unmarked so the next run retries it.
+    use super::enrich::apply_and_mark_examined;
+    use super::record_enrich_examined;
+    let (_dir, conn) = setup_db();
+    let id = insert_learning(&conn, "Kept", Confidence::High, LearningOutcome::Pattern);
+
+    let gone = apply_and_mark_examined(&conn, &[make_enrich_proposal(id + 1000, "Deleted")])
+        .expect("missing learning is skipped, not an error");
+    assert_eq!(gone, 0);
+
+    record_enrich_examined(&conn, &[id, id + 1000])
+        .expect_err("a marker for a missing learning must fail the batch");
+    let marked: i64 = conn
+        .query_row("SELECT COUNT(*) FROM enrich_examined", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(marked, 0, "a failed marker write must not half-commit");
+}
+
+#[test]
+fn test_enrich_reset_examined_restores_candidates() {
+    use super::enrich::apply_and_mark_examined;
+    let (_dir, conn) = setup_db();
+    let id = insert_fully_enriched_learning(&conn, "Complete");
+    let partial = insert_learning(&conn, "Partial", Confidence::High, LearningOutcome::Pattern);
+    apply_and_mark_examined(&conn, &[make_enrich_proposal(partial, "Partial")]).expect("apply");
+    // Repeat marking is idempotent.
+    apply_and_mark_examined(&conn, &[make_enrich_proposal(partial, "Partial")]).expect("re-apply");
+
+    // Fully enriched → zero candidates → returns before any LLM call.
+    set_applies_to_files(&conn, partial, Some("[\"a\"]"));
+    set_applies_to_task_types(&conn, partial, Some("[\"FEAT-\"]"));
+    set_applies_to_errors(&conn, partial, Some("[\"E1\"]"));
+    let result = curate_enrich(
+        &conn,
+        EnrichParams {
+            dry_run: true,
+            reset_examined: true,
+            ..EnrichParams::default()
+        },
+    )
+    .expect("reset run");
+    assert_eq!(result.total_candidates, 0);
+    let _ = id;
+
+    let marked: i64 = conn
+        .query_row("SELECT COUNT(*) FROM enrich_examined", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        marked, 0,
+        "--reset-examined clears markers even on a dry run"
+    );
+}
+
+#[test]
 fn test_curate_enrich_field_filter_zero_candidates_when_all_have_field() {
     // AC: --field=applies_to_files with all learnings having applies_to_files set → 0 candidates.
     let (_dir, conn) = setup_db();
@@ -1508,6 +1644,7 @@ fn test_curate_enrich_field_filter_zero_candidates_when_all_have_field() {
             dry_run: false,
             batch_size: 20,
             field_filter: Some(EnrichFieldFilter::AppliesToFiles),
+            reset_examined: false,
         },
     )
     .expect("curate_enrich with field filter");
@@ -1679,6 +1816,7 @@ fn test_enrich_single_batch_when_candidates_lt_batch_size() {
             batch_size: 20,
             dry_run: true,
             field_filter: None,
+            reset_examined: false,
         },
     )
     .expect("curate_enrich single batch");
@@ -1708,6 +1846,7 @@ fn test_enrich_multiple_batches_when_candidates_gt_batch_size() {
             batch_size: 1,
             dry_run: true,
             field_filter: None,
+            reset_examined: false,
         },
     )
     .expect("curate_enrich multiple batches");
@@ -1735,6 +1874,7 @@ fn test_enrich_dry_run_makes_no_db_changes() {
             batch_size: 20,
             dry_run: true,
             field_filter: None,
+            reset_examined: false,
         },
     )
     .expect("curate_enrich dry_run");
@@ -1782,6 +1922,7 @@ fn test_enrich_llm_error_for_one_batch_other_batches_succeed() {
             batch_size: 1,
             dry_run: false,
             field_filter: None,
+            reset_examined: false,
         },
     );
     // assertions depend on stub behavior

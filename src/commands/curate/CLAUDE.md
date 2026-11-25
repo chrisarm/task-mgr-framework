@@ -164,6 +164,33 @@ the crate): `load_dismissals`, `record_dismissals`, `clear_dismissals`,
 `is_fully_dismissed`, `compute_dismissal_pairs`, plus the private `normalize_pair`
 / `unordered_pairs`.
 
+## Enrich Examined Memory
+
+`curate enrich` records every learning the LLM has answered for in the
+`enrich_examined` table (migration v22: `learning_id` PK with
+`ON DELETE CASCADE`, `examined_at`). `find_enrichment_candidates` excludes
+those rows, so a re-run or a resumed run pays only for learnings no batch has
+answered yet.
+
+- **Why a table, not the metadata columns**: a NULL field cannot mean "not yet
+  enriched". The LLM often answers that nothing applies (most learnings have no
+  error pattern), and `edit_learning` normalizes an empty list back to NULL.
+- **When a marker is written**: after a batch's edits all succeed, for each
+  learning the LLM returned an object for, including an all-empty answer.
+  Writer: `apply_and_mark_examined()` in `enrich.rs`.
+- **When it is NOT written**: `dry_run=true`, an LLM error or non-zero exit, an
+  unparseable response, a failed edit (the whole batch stays unmarked), or a
+  learning the LLM left out of its answer.
+- **The marker is per learning, not per field**: the prompt always asks for
+  every field, so `--field` narrows which learnings are selected, not what a
+  pass covers.
+- **Forcing re-examination**: `task-mgr curate enrich --reset-examined` clears
+  the table first, even with `--dry-run`. Editing a learning's content does not
+  clear its marker.
+
+Helpers `record_enrich_examined` / `clear_enrich_examined` live in
+`src/commands/curate/mod.rs` as `pub(crate)`.
+
 ## Session cleanup workaround
 
 Claude Code 2.1.110 writes an `ai-title` jsonl to `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl`

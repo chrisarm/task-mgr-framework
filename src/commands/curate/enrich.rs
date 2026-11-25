@@ -2,8 +2,6 @@
 //!
 //! Builds a prompt that instructs Claude to suggest missing metadata fields for
 //! a batch of learnings, and parses the JSON array response.
-//!
-//! NOTE: `parse_enrich_response` is a stub deferred to FEAT-005.
 
 use rusqlite::Connection;
 
@@ -17,7 +15,10 @@ use crate::output::ui;
 use std::collections::HashSet;
 
 use super::json_utils::extract_json_array;
-use super::{find_enrichment_candidates, types::EnrichFieldFilter};
+use super::{
+    clear_enrich_examined, find_enrichment_candidates, record_enrich_examined,
+    types::EnrichFieldFilter,
+};
 
 /// Raw LLM response object before mapping to `EnrichProposal`.
 #[derive(serde::Deserialize)]
@@ -192,7 +193,19 @@ pub fn proposal_to_edit_params(
 /// - Continues to next batch on LLM failure (best-effort).
 /// - Per-batch transactions: a transaction failure increments `llm_errors` and continues.
 /// - `dry_run=true`: generates proposals but makes no DB changes.
+/// - Every learning the LLM answered for is recorded in `enrich_examined` once
+///   its batch applies, so an interrupted run resumes at the first unanswered
+///   batch. Learnings the LLM left out of its answer stay candidates.
 pub fn curate_enrich(conn: &Connection, params: EnrichParams) -> TaskMgrResult<EnrichResult> {
+    // Applies even with `dry_run=true`: a reset is an explicit administrative
+    // action, not an LLM pass (same rule as `curate dedup --reset-dismissals`).
+    if params.reset_examined {
+        let removed = clear_enrich_examined(conn)?;
+        if removed > 0 {
+            ui::emit(&format!("Cleared {removed} marker(s) from enrich_examined"));
+        }
+    }
+
     let candidates = find_enrichment_candidates(conn, &params)?;
     let total_candidates = candidates.len();
 
@@ -288,8 +301,7 @@ pub fn curate_enrich(conn: &Connection, params: EnrichParams) -> TaskMgrResult<E
         }
 
         if !params.dry_run && !proposals.is_empty() {
-            let enriched = apply_proposals_in_transaction(conn, &proposals);
-            match enriched {
+            match apply_and_mark_examined(conn, &proposals) {
                 Ok(n) => learnings_enriched += n,
                 Err(e) => {
                     ui::emit_err(&format!(
@@ -339,15 +351,17 @@ fn build_batch_items(
     Ok(items)
 }
 
-/// Applies a slice of proposals, one `edit_learning` call per proposal.
-/// Returns the number of learnings actually enriched.
-/// Each `edit_learning` manages its own transaction; this avoids nesting BEGIN
-/// inside the unchecked_transaction that `edit_learning` opens internally.
-fn apply_proposals_in_transaction(
+/// Applies a batch of proposals, then marks every learning in it as examined.
+///
+/// The marker is written only after all edits succeed, so a failed batch is
+/// retried on the next run. A proposal that changed nothing still gets a
+/// marker: "nothing applies" is an answer.
+pub(crate) fn apply_and_mark_examined(
     conn: &Connection,
     proposals: &[EnrichProposal],
 ) -> TaskMgrResult<usize> {
     let mut enriched = 0usize;
+    let mut examined: Vec<i64> = Vec::with_capacity(proposals.len());
     for proposal in proposals {
         let Some(learning) = get_learning(conn, proposal.learning_id)? else {
             continue;
@@ -356,13 +370,16 @@ fn apply_proposals_in_transaction(
         let current_task_types = learning.applies_to_task_types.as_deref();
         let current_errors = learning.applies_to_errors.as_deref();
 
+        // Each `edit_learning` opens its own transaction, so no outer one here.
         if let Some(edit_params) =
             proposal_to_edit_params(current_files, current_task_types, current_errors, proposal)
         {
             edit_learning(conn, proposal.learning_id, edit_params)?;
             enriched += 1;
         }
+        examined.push(proposal.learning_id);
     }
+    record_enrich_examined(conn, &examined)?;
     Ok(enriched)
 }
 

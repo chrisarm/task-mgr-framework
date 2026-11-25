@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-11-25
+
+### Added
+- `task-mgr curate enrich --reset-examined` clears the record of learnings already examined, so the next run looks at all of them again.
+
+### Fixed
+- `task-mgr curate enrich` no longer re-sends learnings it has already examined. A learning the model has answered for is recorded (schema v22, `enrich_examined`) and skipped on later runs, even when a field stays empty because nothing applies. An interrupted run resumes at the first unanswered batch.
+
 ## [1.1.0] - 2026-11-24
 
 ### Added

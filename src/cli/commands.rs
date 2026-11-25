@@ -2274,6 +2274,14 @@ EXAMPLES:
     # Use a smaller batch size
     task-mgr curate enrich --batch-size 5 --dry-run
 
+    # Re-examine learnings a previous run already answered for
+    task-mgr curate enrich --reset-examined
+
+RE-RUNS:
+    A learning the LLM has answered for is recorded and skipped on later runs,
+    even when a field stays empty because nothing applies. Interrupting a run
+    loses only the batch in flight. Dry runs record nothing.
+
 FIELD VALUES:
     applies_to_files       - File glob patterns the learning applies to
     applies_to_task_types  - Task type prefixes (e.g., FEAT-, FIX-)
@@ -2294,6 +2302,11 @@ FIELD VALUES:
         /// Accepted values: applies_to_files, applies_to_task_types, applies_to_errors
         #[arg(long)]
         field: Option<String>,
+
+        /// Clear the enrich_examined table before running (forces re-examination
+        /// of learnings a previous run already answered for)
+        #[arg(long = "reset-examined", default_value_t = false)]
+        reset_examined: bool,
     },
 
     /// Generate and store Ollama embeddings for active learnings

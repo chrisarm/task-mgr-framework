@@ -300,62 +300,34 @@ pub fn find_enrichment_candidates(
 ) -> crate::TaskMgrResult<Vec<EnrichCandidate>> {
     use types::EnrichFieldFilter;
 
-    let sql = match &params.field_filter {
+    let missing_clause = match &params.field_filter {
         None => {
-            "
-            SELECT id, title,
-                   applies_to_files IS NULL AS missing_files,
-                   applies_to_task_types IS NULL AS missing_task_types,
-                   applies_to_errors IS NULL AS missing_errors
-            FROM learnings
-            WHERE retired_at IS NULL
-              AND (
-                applies_to_files IS NULL
-                OR applies_to_task_types IS NULL
-                OR applies_to_errors IS NULL
-              )
-            ORDER BY id ASC
-        "
+            "(applies_to_files IS NULL
+              OR applies_to_task_types IS NULL
+              OR applies_to_errors IS NULL)"
         }
-        Some(EnrichFieldFilter::AppliesToFiles) => {
-            "
-            SELECT id, title,
-                   applies_to_files IS NULL AS missing_files,
-                   applies_to_task_types IS NULL AS missing_task_types,
-                   applies_to_errors IS NULL AS missing_errors
-            FROM learnings
-            WHERE retired_at IS NULL
-              AND applies_to_files IS NULL
-            ORDER BY id ASC
-        "
-        }
-        Some(EnrichFieldFilter::AppliesToTaskTypes) => {
-            "
-            SELECT id, title,
-                   applies_to_files IS NULL AS missing_files,
-                   applies_to_task_types IS NULL AS missing_task_types,
-                   applies_to_errors IS NULL AS missing_errors
-            FROM learnings
-            WHERE retired_at IS NULL
-              AND applies_to_task_types IS NULL
-            ORDER BY id ASC
-        "
-        }
-        Some(EnrichFieldFilter::AppliesToErrors) => {
-            "
-            SELECT id, title,
-                   applies_to_files IS NULL AS missing_files,
-                   applies_to_task_types IS NULL AS missing_task_types,
-                   applies_to_errors IS NULL AS missing_errors
-            FROM learnings
-            WHERE retired_at IS NULL
-              AND applies_to_errors IS NULL
-            ORDER BY id ASC
-        "
-        }
+        Some(EnrichFieldFilter::AppliesToFiles) => "applies_to_files IS NULL",
+        Some(EnrichFieldFilter::AppliesToTaskTypes) => "applies_to_task_types IS NULL",
+        Some(EnrichFieldFilter::AppliesToErrors) => "applies_to_errors IS NULL",
     };
 
-    let mut stmt = conn.prepare(sql)?;
+    // A NULL field alone cannot mean "not yet enriched": the LLM often answers
+    // that nothing applies, which leaves the field NULL.
+    let sql = format!(
+        "
+        SELECT id, title,
+               applies_to_files IS NULL AS missing_files,
+               applies_to_task_types IS NULL AS missing_task_types,
+               applies_to_errors IS NULL AS missing_errors
+        FROM learnings
+        WHERE retired_at IS NULL
+          AND {missing_clause}
+          AND id NOT IN (SELECT learning_id FROM enrich_examined)
+        ORDER BY id ASC
+        "
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
     let candidates = stmt
         .query_map([], |row| {
             Ok(EnrichCandidate {
@@ -1581,6 +1553,34 @@ pub(crate) fn record_dismissals(conn: &Connection, pairs: &[(i64, i64)]) -> Task
 /// Deletes all rows from dedup_dismissals. Returns the number of rows removed.
 pub(crate) fn clear_dismissals(conn: &Connection) -> TaskMgrResult<usize> {
     let rows = conn.execute("DELETE FROM dedup_dismissals", [])?;
+    Ok(rows)
+}
+
+/// Marks learnings as answered by an enrich LLM pass so later runs skip them.
+///
+/// Idempotent on repeat IDs; an ID with no `learnings` row still fails the FK.
+/// No-op when `ids` is empty.
+pub(crate) fn record_enrich_examined(conn: &Connection, ids: &[i64]) -> TaskMgrResult<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    const CHUNK_IDS: usize = 500;
+    let tx = conn.unchecked_transaction()?;
+    for chunk in ids.chunks(CHUNK_IDS) {
+        let placeholders = vec!["(?)"; chunk.len()].join(", ");
+        let sql = format!(
+            "INSERT INTO enrich_examined (learning_id) VALUES {placeholders} \
+             ON CONFLICT (learning_id) DO NOTHING"
+        );
+        tx.execute(&sql, rusqlite::params_from_iter(chunk.iter()))?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Deletes all rows from `enrich_examined`. Returns the number of rows removed.
+pub(crate) fn clear_enrich_examined(conn: &Connection) -> TaskMgrResult<usize> {
+    let rows = conn.execute("DELETE FROM enrich_examined", [])?;
     Ok(rows)
 }
 
