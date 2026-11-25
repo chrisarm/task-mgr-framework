@@ -1425,26 +1425,34 @@ fn unstage_paths(project_root: &Path, files: &[&str]) {
 ///
 /// * `dir` - Project root directory; `.task-mgr/` is created inside it.
 pub fn init_project(dir: &Path) -> TaskMgrResult<InitResult> {
-    let db_dir = dir.join(".task-mgr");
+    init_project_at(dir, &dir.join(".task-mgr"))
+}
 
+/// [`init_project`] with the DB directory given explicitly.
+///
+/// The CLI's `--dir` need not be named `.task-mgr`, so it cannot be rebuilt
+/// as `project_root/.task-mgr`: that put the DB and config beside the
+/// directory the operator named. `db_dir` gets the DB + config;
+/// `project_root` gets the `.gitignore` / progress-untrack work.
+pub fn init_project_at(project_root: &Path, db_dir: &Path) -> TaskMgrResult<InitResult> {
     let created_dirs = !db_dir.exists();
 
-    // Create .task-mgr/, tasks.db, and run migrations (all idempotent).
-    let _ = open_connection(&db_dir)?;
+    // Create the DB dir, tasks.db, and run migrations (all idempotent).
+    let _ = open_connection(db_dir)?;
 
     // Write default config, preserving any existing fields.
     // FR-002 hard break: no legacy-config auto-migration on init — legacy model
     // keys hard-error at the loop/batch preflight (operators migrate explicitly
     // via `models init --force-replace-legacy`, FEAT-009).
-    let created_config = write_project_defaults(&db_dir).map_err(TaskMgrError::IoError)?;
+    let created_config = write_project_defaults(db_dir).map_err(TaskMgrError::IoError)?;
 
     // Fire the anchor-tier picker only when stdin+stderr are both TTYs and no
     // models config exists yet; skip silently (with a hint) otherwise (FR-009).
-    let _ = crate::commands::models::ensure_default::ensure_models_anchor(&db_dir, false);
+    let _ = crate::commands::models::ensure_default::ensure_models_anchor(db_dir, false);
 
     // Ensure .gitignore ignores per-PRD progress files. Non-fatal: a warning is
     // printed if the file can't be written, but init_project still succeeds.
-    if let Err(e) = ensure_progress_gitignore(dir) {
+    if let Err(e) = ensure_progress_gitignore(project_root) {
         ui::emit_err(&format!(
             "task-mgr: warning: could not update .gitignore: {e}"
         ));
@@ -1454,7 +1462,7 @@ pub fn init_project(dir: &Path) -> TaskMgrResult<InitResult> {
     // non-fatal — any failure (not a git repo, no git identity, hook rejection)
     // is reported as a warning and any staged removals are rolled back inside
     // `untrack_progress_files`, so `init` still succeeds with a clean index.
-    if let Err(e) = untrack_progress_files(dir) {
+    if let Err(e) = untrack_progress_files(project_root) {
         ui::emit_err(&format!(
             "task-mgr: warning: progress migration failed: {e}"
         ));

@@ -94,6 +94,11 @@ pub fn open_connection(db_dir: &Path) -> TaskMgrResult<Connection> {
     let db_path = db_dir.join("tasks.db");
     let conn = Connection::open(&db_path)?;
 
+    // busy_timeout FIRST: switching a fresh DB to WAL takes an exclusive lock,
+    // and with SQLite's default timeout of 0 any concurrent opener fails
+    // instantly with "database is locked" instead of waiting.
+    conn.pragma_update(None, "busy_timeout", 5000)?;
+
     // Set pragmas for reliability and performance
     // WAL mode enables crash recovery and better concurrent reads
     conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -103,9 +108,6 @@ pub fn open_connection(db_dir: &Path) -> TaskMgrResult<Connection> {
 
     // Enable foreign key enforcement
     conn.pragma_update(None, "foreign_keys", "ON")?;
-
-    // Wait up to 5 seconds for locks before returning SQLITE_BUSY
-    conn.pragma_update(None, "busy_timeout", 5000)?;
 
     // 64MB page cache (negative value = KB, so -64000 = ~64MB)
     conn.pragma_update(None, "cache_size", -64000)?;

@@ -79,6 +79,33 @@ fn setup_initialized_tempdir() -> TempDir {
 // Test: task-mgr --help shows usage
 // ============================================================================
 
+/// `--dir <path> init` must create the DB in `<path>`, not `<parent>/.task-mgr`.
+/// A bare tempdir as `--dir` used to make every test share `/tmp/.task-mgr`.
+#[test]
+fn test_init_with_custom_dir_creates_db_in_that_dir() {
+    let root = TempDir::new().unwrap();
+    let db_dir = root.path().join("state");
+    let prd_path = sample_prd_path();
+
+    Command::new(cargo_bin("task-mgr"))
+        .env("HOME", root.path())
+        .args(["--dir", db_dir.to_str().unwrap()])
+        .args(["init", "--no-prefix", "--from-json"])
+        .arg(&prd_path)
+        .assert()
+        .success();
+
+    assert!(db_dir.join("tasks.db").exists(), "DB must be in --dir");
+    assert!(
+        db_dir.join("config.json").exists(),
+        "config must be in --dir"
+    );
+    assert!(
+        !root.path().join(".task-mgr").exists(),
+        "init must not create a .task-mgr beside --dir"
+    );
+}
+
 #[test]
 fn test_help_shows_usage() {
     Command::new(cargo_bin("task-mgr"))

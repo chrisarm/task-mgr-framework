@@ -2629,6 +2629,29 @@ mod multi_prd_import_tests {
 // init_project tests
 // ============================================================================
 
+/// `--dir` need not be named `.task-mgr`. The DB and config must land in the
+/// directory the operator named, never in a `.task-mgr` beside it. Before the
+/// split, every CLI test passing a bare tempdir as `--dir` initialized the
+/// SAME `/tmp/.task-mgr/tasks.db`, and parallel tests collided on its lock.
+#[test]
+fn test_init_project_at_writes_db_into_named_dir_not_sibling() {
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = project_dir.path().join("custom-state");
+
+    let result = super::init_project_at(project_dir.path(), &db_dir).unwrap();
+
+    assert!(result.created_dirs);
+    assert!(db_dir.join("tasks.db").exists(), "DB must be in --dir");
+    assert!(
+        db_dir.join("config.json").exists(),
+        "config must be in --dir"
+    );
+    assert!(
+        !project_dir.path().join(".task-mgr").exists(),
+        "must not create a sibling .task-mgr"
+    );
+}
+
 #[test]
 fn test_init_project_fresh_creates_db_and_config() {
     let project_dir = TempDir::new().unwrap();
