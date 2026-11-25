@@ -140,6 +140,9 @@ up in an unrelated PRD's JSON during merge-back review.
   (file pattern + task type + error pattern matches).
 - `task-mgr recall --query "<text>"` runs the vector backend (requires
   Ollama; pass `--allow-degraded` for offline runs).
+- `task-mgr show-learning <id> [<id>...]` prints the full record for the
+  IDs recall returned (untruncated content, root cause, solution). Use it
+  instead of scripting over recall output or querying the database.
 - `task-mgr apply-learning <id>` and `task-mgr invalidate-learning <id>`
   feed the UCB bandit ranking.
 - `task-mgr decisions list` shows pending architectural decisions;

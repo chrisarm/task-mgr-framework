@@ -56,6 +56,20 @@ pub struct RecallCmdResult {
     pub outcome_filter: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tags_filter: Option<Vec<String>>,
+    /// Command that prints the full record (root cause, solution, tags) for
+    /// every returned learning. Carried in JSON so agents that dump recall to
+    /// a file still learn the lookup exists instead of scripting around it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_details: Option<String>,
+}
+
+/// Builds the `task-mgr show-learning <ids>` command for a result set.
+fn show_learning_command(learnings: &[LearningSummary]) -> Option<String> {
+    let ids: Vec<String> = learnings
+        .iter()
+        .filter_map(|l| l.id.map(|id| id.to_string()))
+        .collect();
+    (!ids.is_empty()).then(|| format!("task-mgr show-learning {}", ids.join(" ")))
 }
 
 /// Summary of a learning for recall output.
@@ -192,10 +206,11 @@ impl RecallCmdResult {
                 combined_score: s.combined_score,
                 match_reason: s.match_reason,
             })
-            .collect();
+            .collect::<Vec<_>>();
 
         RecallCmdResult {
             count: result.count,
+            full_details: show_learning_command(&learnings),
             learnings,
             query: params.query.clone(),
             for_task: params.for_task.clone(),
@@ -263,16 +278,8 @@ pub fn format_text(result: &RecallCmdResult) -> String {
 
     // Content above is a 100-char preview and omits root cause / solution;
     // point agents at the full lookup instead of raw SQLite.
-    let ids: Vec<String> = result
-        .learnings
-        .iter()
-        .filter_map(|l| l.id.map(|id| id.to_string()))
-        .collect();
-    if !ids.is_empty() {
-        output.push_str(&format!(
-            "Full details: task-mgr show-learning {}\n",
-            ids.join(" ")
-        ));
+    if let Some(command) = show_learning_command(&result.learnings) {
+        output.push_str(&format!("Full details: {command}\n"));
     }
 
     output
@@ -597,6 +604,56 @@ mod tests {
     }
 
     #[test]
+    fn test_show_learning_command_lists_every_id() {
+        let learnings = vec![
+            LearningSummary {
+                id: Some(7),
+                ..Default::default()
+            },
+            LearningSummary {
+                id: None,
+                ..Default::default()
+            },
+            LearningSummary {
+                id: Some(42),
+                ..Default::default()
+            },
+        ];
+
+        assert_eq!(
+            show_learning_command(&learnings).as_deref(),
+            Some("task-mgr show-learning 7 42")
+        );
+    }
+
+    #[test]
+    fn test_show_learning_command_none_without_ids() {
+        assert_eq!(show_learning_command(&[]), None);
+    }
+
+    #[test]
+    fn test_json_carries_full_details_only_when_set() {
+        let mut result = RecallCmdResult {
+            count: 1,
+            learnings: vec![LearningSummary {
+                id: Some(7),
+                ..Default::default()
+            }],
+            query: None,
+            for_task: None,
+            outcome_filter: None,
+            tags_filter: None,
+            full_details: Some("task-mgr show-learning 7".to_string()),
+        };
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["full_details"], "task-mgr show-learning 7");
+
+        result.full_details = None;
+        let json = serde_json::to_value(&result).unwrap();
+        assert!(json.get("full_details").is_none());
+    }
+
+    #[test]
     fn test_format_text_empty() {
         let result = RecallCmdResult {
             count: 0,
@@ -605,6 +662,7 @@ mod tests {
             for_task: None,
             outcome_filter: None,
             tags_filter: None,
+            full_details: None,
         };
 
         let text = format_text(&result);
@@ -631,6 +689,7 @@ mod tests {
             for_task: None,
             outcome_filter: None,
             tags_filter: None,
+            full_details: None,
         };
 
         let text = format_text(&result);
@@ -662,6 +721,7 @@ mod tests {
             for_task: None,
             outcome_filter: None,
             tags_filter: None,
+            full_details: None,
         };
 
         let text = format_text(&result);
@@ -691,6 +751,7 @@ mod tests {
             for_task: None,
             outcome_filter: None,
             tags_filter: None,
+            full_details: None,
         };
 
         let text = format_text(&result);
@@ -738,6 +799,7 @@ mod tests {
             for_task: None,
             outcome_filter: None,
             tags_filter: None,
+            full_details: None,
         };
 
         let json = serde_json::to_string(&result).unwrap();
@@ -860,6 +922,7 @@ mod tests {
             for_task: None,
             outcome_filter: None,
             tags_filter: None,
+            full_details: None,
         };
 
         let text = format_text(&result);
@@ -897,6 +960,7 @@ mod tests {
             for_task: None,
             outcome_filter: None,
             tags_filter: None,
+            full_details: None,
         };
 
         let text = format_text(&result);
@@ -927,6 +991,7 @@ mod tests {
             for_task: None,
             outcome_filter: None,
             tags_filter: None,
+            full_details: None,
         };
 
         let verbose = format_verbose(&result);
@@ -960,6 +1025,7 @@ mod tests {
             for_task: None,
             outcome_filter: None,
             tags_filter: None,
+            full_details: None,
         };
 
         let verbose = format_verbose(&result);

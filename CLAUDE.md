@@ -336,6 +336,9 @@ up in an unrelated PRD's JSON during merge-back review.
   (file pattern + task type + error pattern matches).
 - `task-mgr recall --query "<text>"` runs the vector backend (requires
   Ollama; pass `--allow-degraded` for offline runs).
+- `task-mgr show-learning <id> [<id>...]` prints the full record for the
+  IDs recall returned (untruncated content, root cause, solution). Use it
+  instead of scripting over recall output or querying the database.
 - `task-mgr apply-learning <id>` and `task-mgr invalidate-learning <id>`
   feed the UCB bandit ranking.
 - `task-mgr decisions list` shows pending architectural decisions;
@@ -371,6 +374,7 @@ yourself.
 | `task-mgr learn` | Record a learning from a task outcome |
 | `task-mgr recall` | Find relevant learnings for a task or query |
 | `task-mgr learnings` | List all learnings |
+| `task-mgr show-learning` | Show the full record for one or more learnings by ID |
 | `task-mgr apply-learning` | Record that a learning was applied (confirmed useful) |
 | `task-mgr invalidate-learning` | Invalidate a learning via two-step degradation |
 | `task-mgr unblock` | Return one or more blocked tasks to todo status for retry |
@@ -392,6 +396,7 @@ yourself.
 | `task-mgr loop` | Run autonomous agent loop |
 | `task-mgr loop init` | Initialize a database from a single PRD JSON file |
 | `task-mgr loop run` | Run the autonomous agent loop against a PRD |
+| `task-mgr loop stop` | Request a graceful stop of a live `loop run` / `batch run` for a prefix |
 | `task-mgr status` | Show status dashboard for PRD projects |
 | `task-mgr batch` | Run multiple PRDs in sequence |
 | `task-mgr batch init` | Initialize a database from multiple PRD JSON files (one per glob match) |
