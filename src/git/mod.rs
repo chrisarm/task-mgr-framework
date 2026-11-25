@@ -529,11 +529,11 @@ mod tests {
         let after_sig = &src[start..];
         let body_start = after_sig.find('{').expect("body");
         let rest = &after_sig[body_start..];
-        let next = rest[1..]
-            .find("\npub fn ")
-            .map(|i| i + 1)
-            .unwrap_or(rest.len());
-        let body = &rest[..next];
+        // End at the fn's own closing brace (column-0 `}`). Scanning to the
+        // next `pub fn` swallowed the private `canonicalize_existing` helper
+        // that follows it and false-positived on its `canonicalize` call.
+        let end = rest.find("\n}").map(|i| i + 2).unwrap_or(rest.len());
+        let body = &rest[..end];
         // Strip // line comments so doc/prose mentions of canonicalize/exists
         // do not trip the guard.
         let code: String = body

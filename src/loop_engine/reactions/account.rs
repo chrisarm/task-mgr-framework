@@ -3184,17 +3184,23 @@ mod tests {
         assert!(!is_rung_scoped_rate_limit_message(mixed));
         // Hyphen/underscore are NOT word boundaries — model ids in ordinary
         // session RateLimit stdout must not force Wait 3600.
-        let opus_banner = format!("model: {OPUS_MODEL}\nYou've hit your limit · resets 4pm");
+        // `OPUS_MODEL` / `FABLE_MODEL` are bare aliases since the model
+        // redesign (a bare alias IS a rung token), so build the full
+        // hyphenated ids the CLI prints around them.
+        let opus_banner =
+            format!("model: claude-{OPUS_MODEL}-5-5\nYou've hit your limit · resets 4pm");
         assert!(
             !is_rung_scoped_rate_limit_message(&opus_banner),
             "OPUS_MODEL must not match token opus"
         );
-        let fable_banner = format!("model: {FABLE_MODEL}\nYou've hit your limit · resets 4pm");
+        let fable_banner =
+            format!("model: claude-{FABLE_MODEL}-5-2\nYou've hit your limit · resets 4pm");
         assert!(
             !is_rung_scoped_rate_limit_message(&fable_banner),
             "FABLE_MODEL must not match token fable"
         );
-        let opus_later = format!("use {OPUS_MODEL} for this task; you hit a rate limit later");
+        let opus_later =
+            format!("use claude-{OPUS_MODEL}-5-5 for this task; you hit a rate limit later");
         assert!(
             !is_rung_scoped_rate_limit_message(&opus_later),
             "hyphenated model id + later 'limit' must not match"
@@ -3314,7 +3320,9 @@ mod tests {
         // Full CLI stdout often embeds OPUS_MODEL / FABLE_MODEL alongside
         // ordinary account RateLimit copy. Hyphen must not create a false
         // rung-scoped Wait 3600; spillover still Blackouts.
-        let with_opus = format!("Running {OPUS_MODEL}\nYou've hit your limit · resets 4pm");
+        // Hyphenated full id built around the bare `OPUS_MODEL` alias.
+        let with_opus =
+            format!("Running claude-{OPUS_MODEL}-5-5\nYou've hit your limit · resets 4pm");
         let action = decide_account_rate_limit(None, Some(500), &with_opus, true, 300, 3600);
         assert_eq!(
             action,
@@ -3322,7 +3330,8 @@ mod tests {
             "model id + account hit-your-limit must use output_secs Blackout, not Wait 3600"
         );
 
-        let with_fable = format!("Running {FABLE_MODEL}\nYou've hit your limit · resets 4pm");
+        let with_fable =
+            format!("Running claude-{FABLE_MODEL}-5-2\nYou've hit your limit · resets 4pm");
         let action = decide_account_rate_limit(Some(7200), Some(500), &with_fable, true, 300, 3600);
         assert_eq!(
             action,
