@@ -1517,9 +1517,11 @@ pub enum EnhanceCommand {
         #[arg(long, default_value_t = false)]
         create: bool,
 
-        /// Which template to render into the block.
-        #[arg(long, value_enum, default_value_t = crate::commands::enhance::templates::EnhanceProfile::Workflow)]
-        profile: crate::commands::enhance::templates::EnhanceProfile,
+        /// Which template to render into the block. When omitted, each
+        /// target keeps the profile of its existing block; a target with no
+        /// block gets `workflow`.
+        #[arg(long, value_enum)]
+        profile: Option<crate::commands::enhance::templates::EnhanceProfile>,
     },
 
     /// Render the chosen profile to stdout. Never writes to disk.

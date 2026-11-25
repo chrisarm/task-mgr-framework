@@ -270,7 +270,7 @@ fn dispatch_init_project(
             targets: Vec::new(),
             dry_run: false,
             create: true,
-            profile: EnhanceProfile::Full,
+            profile: Some(EnhanceProfile::Full),
             cwd: project_root,
         })?;
         if !enhance_result.no_errors() {

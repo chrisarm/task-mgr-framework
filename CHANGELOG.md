@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.1.2] - 2026-11-25
+
+### Fixed
+- `task-mgr enhance agents` without `--profile` keeps the profile of each file's existing block. Before, it rewrote a full-profile block as workflow-only and dropped the "LLM coding guidelines" section. A file with no block still gets `workflow`, and an explicit `--profile` still wins.
+
+### Changed
+- CI no longer runs the macOS test job. It has been failing on `main` without reporting a failed test; it is off until that is fixed. Release builds for macOS are unchanged.
+
 ## [1.1.1] - 2026-11-25
 
 ### Added
