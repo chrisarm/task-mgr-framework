@@ -200,7 +200,7 @@ fn agents_create_writes_marker_block_into_fresh_target() {
         targets: vec![target.clone()],
         dry_run: false,
         create: true,
-        profile: EnhanceProfile::Workflow,
+        profile: Some(EnhanceProfile::Workflow),
         cwd: dir.path().to_path_buf(),
     })
     .unwrap();
@@ -235,7 +235,7 @@ fn agents_idempotent_second_run_produces_byte_identical_file() {
         targets: vec![target.clone()],
         dry_run: false,
         create: false,
-        profile: EnhanceProfile::Workflow,
+        profile: Some(EnhanceProfile::Workflow),
         cwd: dir.path().to_path_buf(),
     };
 
@@ -264,7 +264,7 @@ fn agents_preserves_prelude_and_postlude_byte_for_byte() {
         targets: vec![target.clone()],
         dry_run: false,
         create: false,
-        profile: EnhanceProfile::Workflow,
+        profile: Some(EnhanceProfile::Workflow),
         cwd: dir.path().to_path_buf(),
     })
     .unwrap();
@@ -296,7 +296,7 @@ fn agents_appends_block_when_target_has_no_markers() {
         targets: vec![target.clone()],
         dry_run: false,
         create: false,
-        profile: EnhanceProfile::Workflow,
+        profile: Some(EnhanceProfile::Workflow),
         cwd: dir.path().to_path_buf(),
     })
     .unwrap();
@@ -322,7 +322,7 @@ fn agents_default_targets_touch_both_claude_and_agents_md_when_present() {
         targets: vec![],
         dry_run: false,
         create: false,
-        profile: EnhanceProfile::Workflow,
+        profile: Some(EnhanceProfile::Workflow),
         cwd: dir.path().to_path_buf(),
     })
     .unwrap();
@@ -362,7 +362,7 @@ fn agents_explicit_target_does_not_process_defaults() {
         targets: vec![custom.clone()],
         dry_run: false,
         create: false,
-        profile: EnhanceProfile::Workflow,
+        profile: Some(EnhanceProfile::Workflow),
         cwd: dir.path().to_path_buf(),
     })
     .unwrap();
@@ -384,7 +384,7 @@ fn agents_missing_files_without_create_skips_both_and_exit_2() {
         targets: vec![],
         dry_run: false,
         create: false,
-        profile: EnhanceProfile::Workflow,
+        profile: Some(EnhanceProfile::Workflow),
         cwd: dir.path().to_path_buf(),
     })
     .unwrap();
@@ -413,7 +413,7 @@ fn agents_dry_run_writes_nothing_and_populates_preview() {
         targets: vec![target.clone()],
         dry_run: true,
         create: false,
-        profile: EnhanceProfile::Workflow,
+        profile: Some(EnhanceProfile::Workflow),
         cwd: dir.path().to_path_buf(),
     })
     .unwrap();
@@ -437,7 +437,7 @@ fn agents_dry_run_does_not_exit_2_even_when_files_missing() {
         targets: vec![],
         dry_run: true,
         create: false,
-        profile: EnhanceProfile::Workflow,
+        profile: Some(EnhanceProfile::Workflow),
         cwd: dir.path().to_path_buf(),
     })
     .unwrap();
@@ -461,7 +461,7 @@ fn agents_unbalanced_markers_returns_error_outcome() {
         targets: vec![target.clone()],
         dry_run: false,
         create: false,
-        profile: EnhanceProfile::Workflow,
+        profile: Some(EnhanceProfile::Workflow),
         cwd: dir.path().to_path_buf(),
     })
     .unwrap();
@@ -491,7 +491,7 @@ fn agents_create_in_missing_parent_dir_returns_per_target_error() {
         targets: vec![bad.clone(), good.clone()],
         dry_run: false,
         create: true,
-        profile: EnhanceProfile::Workflow,
+        profile: Some(EnhanceProfile::Workflow),
         cwd: dir.path().to_path_buf(),
     })
     .unwrap();
@@ -684,4 +684,136 @@ fn strip_test_module(src: &str) -> String {
         out.push('\n');
     }
     out
+}
+
+// ─── enhance_agents — profile kept when --profile is omitted ─────────────
+
+/// Writes `target` with a block rendered from `profile`, then re-runs
+/// `enhance agents` with `rerun_profile` and returns the file content.
+fn rerun_over_existing_block(
+    profile: EnhanceProfile,
+    rerun_profile: Option<EnhanceProfile>,
+    outside_block: &str,
+) -> (EnhanceResult, String) {
+    let dir = TempDir::new().unwrap();
+    let target = dir.path().join("CLAUDE.md");
+    // A stale body forces a rewrite, the case that used to drop the profile.
+    fs::write(
+        &target,
+        format!(
+            "{outside_block}{MARKER_BEGIN}\nstale {}\n{MARKER_END}\n",
+            match profile {
+                EnhanceProfile::Full => FULL_PROFILE_TOKEN,
+                EnhanceProfile::Workflow => WORKFLOW_PROFILE_TOKEN,
+            }
+        ),
+    )
+    .unwrap();
+
+    let result = enhance_agents(AgentsParams {
+        targets: vec![target.clone()],
+        dry_run: false,
+        create: false,
+        profile: rerun_profile,
+        cwd: dir.path().to_path_buf(),
+    })
+    .unwrap();
+    (result, fs::read_to_string(&target).unwrap())
+}
+
+#[test]
+fn agents_without_profile_keeps_existing_full_block() {
+    let (result, on_disk) = rerun_over_existing_block(EnhanceProfile::Full, None, "");
+
+    assert_eq!(result.targets[0].action, ActionTaken::Replaced);
+    assert_eq!(result.profile, Some(EnhanceProfile::Full));
+    assert!(
+        on_disk.contains(FULL_PROFILE_TOKEN),
+        "a full-profile block must stay full when --profile is omitted"
+    );
+}
+
+#[test]
+fn agents_without_profile_keeps_existing_workflow_block() {
+    let (result, on_disk) = rerun_over_existing_block(EnhanceProfile::Workflow, None, "");
+
+    assert_eq!(result.profile, Some(EnhanceProfile::Workflow));
+    assert!(!on_disk.contains(FULL_PROFILE_TOKEN));
+}
+
+#[test]
+fn agents_explicit_profile_overrides_existing_block() {
+    let (result, on_disk) =
+        rerun_over_existing_block(EnhanceProfile::Full, Some(EnhanceProfile::Workflow), "");
+
+    assert_eq!(result.profile, Some(EnhanceProfile::Workflow));
+    assert!(!on_disk.contains(FULL_PROFILE_TOKEN));
+}
+
+#[test]
+fn agents_profile_detection_ignores_text_outside_the_block() {
+    // The guidelines heading in the user's own prose must not turn a
+    // workflow block into a full one.
+    let outside = format!("## {FULL_PROFILE_TOKEN}\n\nhand-written\n\n");
+    let (result, on_disk) = rerun_over_existing_block(EnhanceProfile::Workflow, None, &outside);
+
+    assert_eq!(result.profile, Some(EnhanceProfile::Workflow));
+    assert_eq!(on_disk.matches(FULL_PROFILE_TOKEN).count(), 1);
+    assert!(on_disk.starts_with(&outside));
+}
+
+#[test]
+fn agents_without_profile_defaults_to_workflow_when_no_block_exists() {
+    let dir = TempDir::new().unwrap();
+    let target = dir.path().join("fresh.md");
+
+    let result = enhance_agents(AgentsParams {
+        targets: vec![target.clone()],
+        dry_run: false,
+        create: true,
+        profile: None,
+        cwd: dir.path().to_path_buf(),
+    })
+    .unwrap();
+
+    assert_eq!(result.profile, Some(EnhanceProfile::Workflow));
+    assert!(
+        !fs::read_to_string(&target)
+            .unwrap()
+            .contains(FULL_PROFILE_TOKEN)
+    );
+}
+
+#[test]
+fn agents_mixed_profiles_report_no_single_profile() {
+    let dir = TempDir::new().unwrap();
+    let full = dir.path().join("CLAUDE.md");
+    let workflow = dir.path().join("AGENTS.md");
+    fs::write(
+        &full,
+        format!("{MARKER_BEGIN}\nstale {FULL_PROFILE_TOKEN}\n{MARKER_END}\n"),
+    )
+    .unwrap();
+    fs::write(&workflow, format!("{MARKER_BEGIN}\nstale\n{MARKER_END}\n")).unwrap();
+
+    let result = enhance_agents(AgentsParams {
+        targets: Vec::new(),
+        dry_run: false,
+        create: false,
+        profile: None,
+        cwd: dir.path().to_path_buf(),
+    })
+    .unwrap();
+
+    assert_eq!(result.profile, None);
+    assert!(
+        fs::read_to_string(&full)
+            .unwrap()
+            .contains(FULL_PROFILE_TOKEN)
+    );
+    assert!(
+        !fs::read_to_string(&workflow)
+            .unwrap()
+            .contains(FULL_PROFILE_TOKEN)
+    );
 }

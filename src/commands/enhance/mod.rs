@@ -180,8 +180,10 @@ pub struct AgentsParams {
     pub dry_run: bool,
     /// When `true`, create missing files instead of skipping them.
     pub create: bool,
-    /// Which profile to render.
-    pub profile: EnhanceProfile,
+    /// Which profile to render. `None` keeps the profile of each target's
+    /// existing block (workflow when it has none), so a routine refresh
+    /// cannot drop the full profile's guidelines section.
+    pub profile: Option<EnhanceProfile>,
     /// Working directory for default-target resolution. Tests pass an
     /// isolated tempdir; CLI passes `std::env::current_dir()`.
     pub cwd: PathBuf,
@@ -435,12 +437,16 @@ fn remove_marker_block(content: &str) -> Option<String> {
 
 /// Entry point for `task-mgr enhance agents`.
 pub fn enhance_agents(params: AgentsParams) -> Result<EnhanceResult, TaskMgrError> {
-    let body = params.profile.body();
     let targets = resolve_targets(&params.targets, &params.cwd);
 
     let mut outcomes = Vec::with_capacity(targets.len());
+    let mut profiles = Vec::with_capacity(targets.len());
     for target in &targets {
-        let outcome = agents_one(target, &body, params.create, params.dry_run);
+        let profile = params
+            .profile
+            .unwrap_or_else(|| existing_block_profile(target));
+        profiles.push(profile);
+        let outcome = agents_one(target, &profile.body(), params.create, params.dry_run);
         if matches!(outcome.action, ActionTaken::Skipped) {
             ui::emit(&format!(
                 "skipping {} (not found; pass --create to create)",
@@ -452,13 +458,36 @@ pub fn enhance_agents(params: AgentsParams) -> Result<EnhanceResult, TaskMgrErro
         outcomes.push(outcome);
     }
 
+    // One profile for the run only when every target agreed on it.
+    let first = profiles.first().copied().unwrap_or_default();
+    let profile = profiles.iter().all(|p| *p == first).then_some(first);
+
     Ok(EnhanceResult {
         kind: EnhanceKind::Agents,
-        profile: Some(params.profile),
+        profile,
         dry_run: params.dry_run,
         targets: outcomes,
         rendered: None,
     })
+}
+
+/// Profile of the block already in `target`: full when the block carries
+/// the guidelines section, workflow otherwise (including a missing or
+/// unreadable file, or one with no block). Only text between the markers
+/// counts, so a guidelines heading in the user's own prose is ignored.
+fn existing_block_profile(target: &Path) -> EnhanceProfile {
+    let Ok(content) = std::fs::read_to_string(target) else {
+        return EnhanceProfile::default();
+    };
+    let block = content
+        .find(MARKER_BEGIN)
+        .zip(content.find(MARKER_END))
+        .filter(|(begin, end)| begin < end)
+        .map(|(begin, end)| &content[begin..end]);
+    match block {
+        Some(block) if block.contains(templates::FULL_PROFILE_TOKEN) => EnhanceProfile::Full,
+        _ => EnhanceProfile::default(),
+    }
 }
 
 /// Entry point for `task-mgr enhance show`. Renders the profile body to

@@ -260,7 +260,8 @@ The deprecated `task-mgr init --from-json <prd>` shim runs both steps (project s
 `task-mgr enhance` writes and manages a marker-fenced task-mgr workflow block in `CLAUDE.md` and `AGENTS.md`. The markers (`<!-- TASK_MGR:BEGIN -->` / `<!-- TASK_MGR:END -->`) let the block be updated in place without touching surrounding content.
 
 ```bash
-# Write (or update) the workflow block in CLAUDE.md and AGENTS.md
+# Write (or update) the block in CLAUDE.md and AGENTS.md. An update keeps the
+# profile each file already has; a new block gets the workflow profile.
 task-mgr enhance agents
 
 # Write a full profile (workflow + general LLM-coding guidelines)
